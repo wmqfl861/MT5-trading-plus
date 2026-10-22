@@ -1,0 +1,89 @@
+import threading
+
+import pytest
+
+from mt5gw.config import GatewayConfig
+from mt5gw.connection import MT5Connection
+from mt5gw.errors import NotConnectedError
+
+from tests.fakes import FakeMT5
+
+
+def make_conn(fake=None, **cfg):
+    fake = fake or FakeMT5()
+    return MT5Connection(GatewayConfig(**cfg) if cfg else GatewayConfig(), mt5_module=fake), fake
+
+
+def test_call_returns_raw_result():
+    conn, fake = make_conn()
+    sentinel = object()
+    fake.set_behavior("symbol_info_tick", value=sentinel)
+    conn.connect()
+    assert conn.call(fake.symbol_info_tick, "EURUSD") is sentinel
+
+
+def test_reconnects_once_when_terminal_disconnected():
+    conn, fake = make_conn()
+    fake.terminal_connected_value = False  # 终端重启/掉线场景
+    fake.initialize_result = True
+    fake.set_behavior("symbol_info_tick", value=1.1)
+    result = conn.call(fake.symbol_info_tick, "EURUSD")
+    assert result == 1.1
+    assert fake.calls("initialize") == 1   # 恰好重连一次
+    assert fake.calls("symbol_info_tick") == 1  # fn 恰被调一次
+
+
+def test_raises_not_connected_when_reconnect_fails():
+    conn, fake = make_conn()
+    fake.terminal_connected_value = False
+    fake.initialize_result = False
+    fake.last_error_value = (-6, "terminal is not connected")
+    with pytest.raises(NotConnectedError):
+        conn.call(fake.symbol_info_tick, "EURUSD")
+    assert fake.calls("symbol_info_tick") == 0  # fn 从未被触达
+
+
+def test_connect_failure_raises_not_connected():
+    conn, fake = make_conn()
+    fake.initialize_result = False
+    with pytest.raises(NotConnectedError):
+        conn.connect()
+    assert conn.connected is False
+
+
+def test_shutdown_is_idempotent():
+    conn, fake = make_conn()
+    conn.connect()
+    conn.shutdown()
+    conn.shutdown()
+    assert fake.calls("shutdown") == 1
+    assert conn.connected is False
+
+
+def test_concurrent_calls_are_serialized():
+    conn, fake = make_conn()
+    fake.set_behavior("symbol_info_tick", value=1.2345, delay=0.02)
+    conn.connect()
+
+    errors = []
+
+    def worker():
+        try:
+            conn.call(fake.symbol_info_tick, "EURUSD")
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert fake.max_concurrent == 1  # 任意时刻至多一个调用在 mt5 侧执行
+
+
+def test_lazy_connect_on_first_call():
+    conn, fake = make_conn()
+    fake.set_behavior("symbol_info_tick", value=2.0)
+    assert conn.call(fake.symbol_info_tick, "EURUSD") == 2.0  # 未显式 connect 也自动初始化
+    assert fake.calls("initialize") == 1
