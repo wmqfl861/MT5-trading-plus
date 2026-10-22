@@ -2,3 +2,4 @@ MetaTrader5==5.0.6231
 duckdb==2.0.0
 pandas==3.0.6
 pyarrow==26.0.0
+mcp==2.3.0

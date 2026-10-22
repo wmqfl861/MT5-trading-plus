@@ -103,3 +103,21 @@ UTF-16 编码，改前需先关终端再改再启动）。当前各序列已取�
 2021 年中（券商上线/留存的起点）。M1 级全量约 2,820 万根、786MB。
 注：新品种首次深挖 M1 时，第一笔大请求可能因终端向服务器同步历史而超时
 返回"无数据"，等一两分钟重跑同序列即可（缓存已暖，秒级完成）。
+
+## MCP 数据服务（mt5mcp，给远程 agent 用）
+
+本机建模**直读 Parquet/DuckDB，不要走 MCP**；MCP 是给远程服务器上的 agent
+开的一扇有界的门：四个工具 `list_series` / `get_bars`（≤500 根）/
+`describe_series` / `compute_indicator`（服务端现算 sma/ema/rsi/atr，只回
+尾部若干点）。指标不落库，参数随便改。
+
+```bash
+.venv/Scripts/python.exe scripts/run_mcp_server.py --init     # 生成 mcp.json（随机令牌，默认只听 127.0.0.1:8310）
+.venv/Scripts/python.exe scripts/run_mcp_server.py            # HTTP 模式（Bearer 令牌鉴权）
+.venv/Scripts/python.exe scripts/run_mcp_server.py --stdio    # 本机 agent 用 stdio
+```
+
+对远程开放：把 `mcp.json` 的 `host` 改为 `"0.0.0.0"`，放行防火墙对应端口，
+令牌务必保管好（≥32 字符，弱令牌会被配置加载当场拒绝）。跨公网建议套
+反向代理加 TLS；端点为 `http://<主机>:8310/mcp`。数据不会自动更新——
+远程 agent 看到的是库的最近一次 `download_bars.py --refresh`。
