@@ -52,6 +52,20 @@ def server_now(market: MarketData, symbol: str) -> datetime:
     return wall + offset
 
 
+def _is_weekend_gap(start, end) -> bool:
+    """缺口 [start, end) 是否全部落在服务器时间的周六/周日（休市，非数据洞）。
+
+    小时粒度扫描；注意周日傍晚开市后的真实缺口也会被放行——由下一次
+    全量回填兜底（节假日整日休市同理，需手动重跑回填治愈）。
+    """
+    cur = start
+    while cur < end:
+        if cur.weekday() not in (5, 6):
+            return False
+        cur += timedelta(hours=1)
+    return True
+
+
 def _to_df(bars) -> pd.DataFrame:
     return pd.DataFrame([{
         "time": b.time, "open": b.open, "high": b.high, "low": b.low,
@@ -154,12 +168,18 @@ def refresh_series(root, market: MarketData, symbol: str, timeframe: str,
     if len(new_part) > 0:
         oldest_new = new_part["time"].iloc[0]
         expected_next = old_last + pd.to_timedelta(tf_seconds, unit="s")
-        if oldest_new > expected_next:  # I6：空洞检测
-            raise DataUnavailableError(
-                f"{symbol} {timeframe} 刷新存在空洞：旧末根 {old_last} 之后直接跳到 "
-                f"{oldest_new}（缺约 {int((oldest_new - expected_next).total_seconds() / tf_seconds)} 根）。"
-                "请重跑全量回填（backfill）。"
-            )
+        if oldest_new > expected_next:  # I6：空洞检测（周末休市放行）
+            if _is_weekend_gap(expected_next, oldest_new):
+                logger.info(
+                    "%s %s 缺口 %s → %s 全部落在周末（休市），按正常处理",
+                    symbol, timeframe, expected_next, oldest_new,
+                )
+            else:
+                raise DataUnavailableError(
+                    f"{symbol} {timeframe} 刷新存在空洞：旧末根 {old_last} 之后直接跳到 "
+                    f"{oldest_new}（缺约 {int((oldest_new - expected_next).total_seconds() / tf_seconds)} 根）。"
+                    "请重跑全量回填（backfill）。"
+                )
     combined = merge_bars(old, merged)
     closed = drop_unclosed(combined, timeframe, now)
     # 只动新数据：已入库的旧 bar 未经重新裁决，不因本次刷新被删

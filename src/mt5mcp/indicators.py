@@ -1,10 +1,12 @@
 """纯 pandas 指标计算（不落库、服务端现算——参数变了随时重算）。
 
-口径与 MT5 内置对齐（I15/M8 修复后）：
-- RSI/ATR 用 Wilder 平滑，种子 = 前 period 个值的简单平均（此前 period 根为 NaN）；
-  全平（涨跌均为 0）时 RSI 取 50（MT5 口径）。
-- Bollinger 用总体标准差（ddof=0，MT5 iBands 口径）。
-- MACD 信号线用 EMA（Appel 标准；注意 MT5 内置 MACD 用 SMA，口径差异在文档注明）。
+口径说明（与 MT5 内置的异同一目了然）：
+- RSI：Wilder 平滑（种子=前 period 根均值，种子期 NaN），与 MT5 iRSI 一致；
+  全平（涨跌均为 0）取 50（MT5 口径）。
+- ATR：Wilder 平滑——注意 MT5 内置 iATR 是 TR 的**简单平均**，两者在小样本
+  上有差异，长序列收敛；如需严格对齐 iATR 请另行计算。
+- Bollinger：总体标准差（ddof=0），与 MT5 iBands 一致。
+- MACD：信号线用 EMA（Appel 标准）——MT5 内置 MACD 信号线用 SMA。
 """
 from __future__ import annotations
 

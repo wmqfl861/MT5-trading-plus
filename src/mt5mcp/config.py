@@ -15,7 +15,7 @@ class MCPServerConfig:
     host: str = "127.0.0.1"
     port: int = 8310
     token: str = ""
-    # Host 头防 DNS 重绑定校验；真门锁是 Bearer 令牌，默认关闭（SDK 同此默认）
+    # Host 头防 DNS 重绑定校验；真门锁是 Bearer 令牌，默认关闭（SDK 在本机监听且未显式传参会自动开启，本实现总是显式传参）
     dns_rebinding_protection: bool = False
     allowed_hosts: tuple[str, ...] = ()
 

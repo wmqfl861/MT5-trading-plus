@@ -23,12 +23,14 @@ MAX_INDICATOR_POINTS = 500
 # 品种名白名单：MT5 品种只含字母数字与 . _ # + -（如 XAUUSD.m、BTCUSD#)
 _SYMBOL_RE = re.compile(r"^[A-Za-z0-9._#+-]{1,32}$")
 
-_INDICATOR_WARMUP = 260  # 预热根数：period≤100 时 Wilder 残余影响 <1e-4 量级
+_INDICATOR_WARMUP = 260  # 基础预热；实际按 max(260, 5*period) 缩放（残余 <1e-4）
 
 
 def _validate_symbol(symbol: str) -> str:
     if not isinstance(symbol, str) or not _SYMBOL_RE.match(symbol):
         raise ValueError(f"非法品种名 {symbol!r}（只接受 MT5 品名字符集）")
+    if symbol.strip("._") == "":  # 拒绝 "."、".." 等纯点号路径组件
+        raise ValueError(f"非法品种名 {symbol!r}")
     return symbol.upper()
 
 
@@ -158,12 +160,15 @@ def compute_indicator(root, symbol: str, timeframe: str, indicator: str,
     """服务端现算指标，只回最后 limit 个点（只读尾部 limit+预热期，不碰全量）。"""
     limit = max(1, min(int(limit), MAX_INDICATOR_POINTS))
     params = params or {}
+    period = max(int(params.get("period", 0) or 0),
+                 int(params.get("slow", 0) or 0))  # macd 的 slow 决定预热长度
+    warmup = max(_INDICATOR_WARMUP, 5 * period)
     path = _parquet_path(root, symbol, timeframe)
     con = duckdb.connect()
     try:
         df = con.execute(
             f"SELECT * FROM read_parquet('{_sql_literal(str(path))}') "
-            f"ORDER BY time DESC LIMIT {limit + _INDICATOR_WARMUP}"
+            f"ORDER BY time DESC LIMIT {limit + warmup}"
         ).fetchdf()
     finally:
         con.close()

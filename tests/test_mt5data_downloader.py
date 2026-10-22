@@ -31,7 +31,10 @@ EUR = SymRow(
 BASE = datetime(2023, 10, 22, 12, 0)
 
 
-def make_gateway(total_history, now_min, now_sec=30, skip_positions=()):
+MONDAY = datetime(2023, 10, 23, 12, 0)  # 周一基线：构造"交易日内的数据洞"
+
+
+def make_gateway(total_history, now_min, now_sec=30, skip_positions=(), base=None):
     """伪造 total_history 根连续 M1 历史；'现在'在 now_min 分 now_sec 秒处。
 
     真实语义：pos 0 最新，越大越老；p 号 bar 时间 = now - p 分钟。
@@ -39,8 +42,9 @@ def make_gateway(total_history, now_min, now_sec=30, skip_positions=()):
     """
     fake = FakeMT5()
     conn = MT5Connection(mt5_module=fake)
+    anchor = base or BASE
     state = {
-        "now": BASE + timedelta(minutes=now_min, seconds=now_sec),
+        "now": anchor + timedelta(minutes=now_min, seconds=now_sec),
         "wall": None,  # None → 跟随 tick（offset=0）
         "total": total_history,
         "fail_at_chunk": None,  # {chunk序号: 异常}
@@ -76,6 +80,7 @@ def make_gateway(total_history, now_min, now_sec=30, skip_positions=()):
         return state["wall"] or state["now"]
 
     fake.state = state
+    fake.anchor = anchor
     return fake, MarketData(conn, fake), SymbolCatalog(conn, fake), fake_wall
 
 
@@ -181,17 +186,32 @@ def test_refresh_appends_new_bars(tmp_path, pinned_wall):
 
 
 def test_refresh_detects_hole_and_raises(tmp_path, pinned_wall):
-    fake, market, symbols, wall = make_gateway(total_history=100, now_min=99)
+    # 周一基线：交易日内的 5 根缺口必须报错
+    fake, market, symbols, wall = make_gateway(total_history=100, now_min=99, base=MONDAY)
     pinned_wall(wall())
     backfill_series(tmp_path, market, "EURUSD", "M1", chunk=100)
-    # 前进 10 分钟但中间缺 5 根（p 6..10 = 旧末根之后的 5 根）→ 空洞必须报错
-    fake.state["now"] = BASE + timedelta(minutes=109, seconds=30)
+    fake.state["now"] = MONDAY + timedelta(minutes=109, seconds=30)
     fake.state["total"] = 110
     fake.state["skip"] = set(range(6, 11))
     fake.state["counter"]["n"] = 0
     pinned_wall(fake.state["now"])
     with pytest.raises(DataUnavailableError, match="空洞"):
         refresh_series(tmp_path, market, "EURUSD", "M1", lookback=50)
+
+
+def test_refresh_weekend_gap_is_allowed(tmp_path, pinned_wall):
+    # 周日基线：休市造成的缺口按正常放行（新问题1 的回归测试）
+    fake, market, symbols, wall = make_gateway(total_history=100, now_min=99)  # BASE=周日
+    pinned_wall(wall())
+    backfill_series(tmp_path, market, "EURUSD", "M1", chunk=100)
+    fake.state["now"] = BASE + timedelta(minutes=109, seconds=30)
+    fake.state["total"] = 110
+    fake.state["skip"] = set(range(6, 11))
+    fake.state["counter"]["n"] = 0
+    pinned_wall(fake.state["now"])
+    stats = refresh_series(tmp_path, market, "EURUSD", "M1", lookback=50)
+    assert stats["rows"] == 104  # 旧 99 根 + 5 根新收盘（缺口 5 根休市不计）
+    assert stats["new_bars"] == 5
 
 
 def test_refresh_without_old_file_falls_back_to_backfill(tmp_path, pinned_wall):

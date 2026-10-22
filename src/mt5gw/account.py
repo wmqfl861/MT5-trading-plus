@@ -57,7 +57,9 @@ def _position(row) -> Position:
 def _pending(row) -> PendingOrder:
     return PendingOrder(
         ticket=row.ticket, symbol=row.symbol, kind=_kind(row.type),
-        volume=row.volume, price_open=row.price_open,
+        # 真包字段为 volume_current（ORDER_VOLUME_CURRENT）；fake 兼容旧名 volume
+        volume=getattr(row, "volume_current", getattr(row, "volume", 0.0)),
+        price_open=row.price_open,
         price_current=row.price_current, sl=row.sl, tp=row.tp,
         time_setup=_utc(row.time_setup), comment=row.comment,
     )

@@ -99,35 +99,53 @@ def main() -> int:
             step(False, "冒烟跳过下单", "行情未就绪，拒绝盲目下单")
             return 1
 
-        # ④ 下单（最小手数×2 市价买入，为部分平仓留余量）+ 二次核身
-        print("④ 下单（市价买入）")
         res = None
-        try:
-            again = gw.account.state()  # 二次核身：账户不得在间隙被切换
-            if again.login != st.login or again.trade_mode != st.trade_mode:
-                step(False, "下单前账户发生变化，中止",
-                     f"{st.login}/{st.trade_mode} → {again.login}/{again.trade_mode}")
-                return 1
-            volume = round(spec.volume_min * 2, 8)
-            res = gw.trading.market_order(symbol, "buy", volume, comment="smoke")
-            if not res.confirmed:
-                step(False, f"retcode={res.retcode} 成交未确认", str(res))
-                res = None
-            else:
-                slip = round(abs(res.deal_price - quote.ask) / spec.point, 1)
-                step(res.ok, f"retcode={res.retcode} 成交价={res.deal_price}",
-                     f"下单时 ask={quote.ask} 滑点≈{slip}点 "
-                     f"order={res.order_ticket} deal={res.deal_ticket}")
-        except GatewayError as e:
-            step(False, "下单", str(e))
-
-        if res is None:
-            print("⑤⑥⑦ 跳过 — ④ 未成交")
-            return 1
-
-        # 开了仓就必须尽力平掉：后续步骤全部包在 try/finally 里
         pos_ticket = None
         try:
+            # ④ 下单（最小手数×2 市价买入，为部分平仓留余量）+ 二次核身
+            print("④ 下单（市价买入）")
+            try:
+                again = gw.account.state()  # 二次核身：账户不得在间隙被切换
+                if again.login != st.login or again.trade_mode != st.trade_mode:
+                    step(False, "下单前账户发生变化，中止",
+                         f"{st.login}/{st.trade_mode} → {again.login}/{again.trade_mode}")
+                    return 1
+                volume = round(spec.volume_min * 2, 8)
+                res = gw.trading.market_order(symbol, "buy", volume, comment="smoke")
+                if not res.confirmed:
+                    step(False, f"retcode={res.retcode} 成交未确认", str(res))
+                    res = None
+                else:
+                    slip = (round(abs(res.deal_price - quote.ask) / spec.point, 1)
+                            if res.deal_price else None)
+                    step(res.ok, f"retcode={res.retcode} 成交价={res.deal_price}",
+                         f"下单时 ask={quote.ask} 滑点≈{slip}点 "
+                         f"order={res.order_ticket} deal={res.deal_ticket}")
+            except GatewayError as e:
+                step(False, "下单", str(e))
+
+            if res is None:
+                print("④b⑤⑥ 跳过 — ④ 未成交")
+                return 1
+
+            # ④b 挂单 + 撤单（真机验收 cancel_order）
+            print("④b 挂单+撤单（远端限价单）")
+            try:
+                far = round(quote.ask * 0.99, spec.digits)  # 距现价 1%，远超 stops level
+                pend = gw.trading.pending_order(symbol, "buy", "limit",
+                                                spec.volume_min, far, comment="smoke-pend")
+                if not pend.ok:
+                    step(False, f"挂单失败 retcode={pend.retcode}", pend.comment)
+                else:
+                    cancelled = gw.trading.cancel_order(pend.order_ticket)
+                    gone = all(o.ticket != pend.order_ticket
+                               for o in gw.account.pending_orders(symbol))
+                    step(cancelled.ok and gone,
+                         f"挂单 {pend.order_ticket} 已撤（retcode={cancelled.retcode}）",
+                         "挂单列表中已不存在" if gone else "警告：挂单列表仍可见！")
+            except GatewayError as e:
+                step(False, "挂单/撤单", str(e))
+
             # ⑤ 改持仓 SL/TP（只改一侧，另一侧保持现值——真机验证 C1 修复）
             print("⑤ 改持仓（只设 TP，SL 应保持 0）")
             try:
@@ -144,7 +162,7 @@ def main() -> int:
             except GatewayError as e:
                 step(False, "改持仓", str(e))
 
-            # ⑥ 部分平仓（一半）再全平
+            # ⑥ 平仓（一半）再全平
             print("⑥ 平仓（先半仓后全平）")
             try:
                 pos = gw.account.position(pos_ticket or res.order_ticket)
@@ -164,15 +182,21 @@ def main() -> int:
             except GatewayError as e:
                 step(False, "平仓", str(e))
         finally:
-            # C2：无论 ⑤⑥ 成败，兜底清掉可能残留的持仓
+            # C2：无论 ④⑤⑥ 成败（含"结果未知"异常），兜底清掉可能残留的仓位/挂单
             try:
-                remaining = gw.account.positions(symbol)
-                for p in remaining:
-                    if p.magic == gw.config.magic:
-                        gw.trading.close_position(p.ticket)
-                        print(f"  · 兜底平仓 {p.ticket}")
+                for p_ in gw.account.positions(symbol):
+                    if p_.magic == gw.config.magic:
+                        gw.trading.close_position(p_.ticket)
+                        print(f"  · 兜底平仓 {p_.ticket}")
+                for o_ in gw.account.pending_orders(symbol):
+                    if o_.magic == gw.config.magic:
+                        gw.trading.cancel_order(o_.ticket)
+                        print(f"  · 兜底撤单 {o_.ticket}")
             except GatewayError as e:
-                step(False, "兜底平仓失败（可能仍有残留持仓！）", str(e))
+                step(False, "兜底清理失败（可能仍有残留！）", str(e))
+
+        if res is None:
+            return 1
 
         # ⑦ 成交回查
         print("⑦ 成交回查")
