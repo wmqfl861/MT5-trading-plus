@@ -1,15 +1,16 @@
 """账户状态、持仓、挂单与历史。
 
-包的歧义约定：positions_get/orders_get 返回 None 既可能是"没有"也可能
-是"出错"——本层按空集处理并记 debug 日志（见 README 已知约定）。
-时间窗参数统一转整数秒传入，避开宿主机时区解释（见台账 Task5 裁决）。
+包的歧义裁决：positions_get/orders_get/history_*_get 返回 None 既可能是
+"没有"也可能是"出错"——在同一次持锁内读取 last_error：成功码 (1,'Success')
+视为空集，否则如实抛错。绝不把查询失败伪装成"空仓"。
+时间窗参数统一转整数秒传入，避开宿主机时区解释（见 README 时区约定）。
 """
 from __future__ import annotations
 
 import logging
 from datetime import datetime
 
-from mt5gw.connection import MT5Connection
+from mt5gw.connection import MT5Connection, _is_success
 from mt5gw.errors import DataUnavailableError
 from mt5gw.models import (
     AccountState, Deal, HistoryOrder, PendingOrder, Position,
@@ -22,6 +23,7 @@ _SIDES = {0: "buy", 1: "sell"}  # POSITION_TYPE_*
 # DEAL_TYPE_*：除买卖外还有出入金等流水（volume=0, price=0）
 _DEAL_SIDES = {0: "buy", 1: "sell", 2: "balance", 3: "credit", 4: "charge",
                5: "correction", 6: "bonus"}
+_DEAL_ENTRIES = {0: "in", 1: "out", 2: "inout", 3: "out_by"}
 # ORDER_TYPE_*：0/1 是市价单（历史委托里最常见），2-5 挂单，6/7 止损限价等
 _ORDER_KINDS = {0: "buy", 1: "sell", 2: "buy_limit", 3: "sell_limit",
                 4: "buy_stop", 5: "sell_stop"}
@@ -45,9 +47,10 @@ def _state(row) -> AccountState:
 def _position(row) -> Position:
     return Position(
         ticket=row.ticket, symbol=row.symbol, side=_SIDES[row.type],
-        volume=row.volume, price_open=row.price_open, sl=row.sl, tp=row.tp,
-        profit=row.profit, time=_utc(row.time), comment=row.comment,
-        magic=row.magic,
+        volume=row.volume, price_open=row.price_open,
+        price_current=row.price_current, sl=row.sl, tp=row.tp,
+        swap=row.swap, profit=row.profit, time=_utc(row.time),
+        comment=row.comment, magic=row.magic,
     )
 
 
@@ -62,20 +65,25 @@ def _pending(row) -> PendingOrder:
 
 def _deal(row) -> Deal:
     side = _DEAL_SIDES.get(row.type, f"type{row.type}")
+    entry = _DEAL_ENTRIES.get(getattr(row, "entry", -1), None)
     return Deal(
-        ticket=row.ticket, order=row.order, symbol=row.symbol,
-        side=side, volume=row.volume, price=row.price,
+        ticket=row.ticket, order=row.order,
+        position_id=getattr(row, "position_id", 0),
+        symbol=row.symbol, side=side, entry=entry,
+        volume=row.volume, price=row.price,
         profit=row.profit, commission=row.commission, swap=row.swap,
         fee=row.fee, time=_utc(row.time), comment=row.comment,
+        magic=getattr(row, "magic", 0),
     )
 
 
 def _history_order(row) -> HistoryOrder:
+    done_raw = getattr(row, "time_done", 0)
     return HistoryOrder(
         ticket=row.ticket, symbol=row.symbol, kind=_kind(row.type),
         volume=row.volume, price_open=row.price_open, state=row.state,
         time_setup=_utc(row.time_setup),
-        time_done=_utc(row.time_done) if row.time_done else _utc(row.time_setup),
+        time_done=_utc(done_raw) if done_raw else None,  # 0 = 未成交/未完成，如实给 None
         comment=row.comment,
     )
 
@@ -91,42 +99,76 @@ class AccountService:
             raise DataUnavailableError(f"账户信息不可用：{self._conn.last_error()}")
         return _state(row)
 
-    def positions(self, symbol: str | None = None) -> list[Position]:
-        rows = (
-            self._conn.call(self._mt5.positions_get, symbol=symbol)
-            if symbol is not None
-            else self._conn.call(self._mt5.positions_get)
-        )
+    def position(self, ticket: int) -> Position:
+        """按 ticket 精确取单个持仓；不存在或查询失败都如实抛错。"""
+        rows, err = self._conn.call_status(self._mt5.positions_get, ticket=ticket)
         if rows is None:
-            logger.debug("positions_get 返回 None（无持仓或查询失败），按空集处理")
-            return []
-        return [_position(r) for r in rows]
+            if _is_success(err):
+                raise DataUnavailableError(f"持仓 {ticket} 不存在（可能已平仓）")
+            raise DataUnavailableError(f"查询持仓失败：{err}")
+        for r in rows:
+            if r.ticket == ticket:
+                return _position(r)
+        raise DataUnavailableError(f"持仓 {ticket} 不存在（可能已平仓）")
+
+    def pending_order(self, ticket: int) -> PendingOrder:
+        rows, err = self._conn.call_status(self._mt5.orders_get, ticket=ticket)
+        if rows is None:
+            if _is_success(err):
+                raise DataUnavailableError(f"挂单 {ticket} 不存在（可能已成交/已撤销）")
+            raise DataUnavailableError(f"查询挂单失败：{err}")
+        for r in rows:
+            if r.ticket == ticket:
+                return _pending(r)
+        raise DataUnavailableError(f"挂单 {ticket} 不存在（可能已成交/已撤销）")
+
+    def positions(self, symbol: str | None = None) -> list[Position]:
+        return self._list_amb(
+            "positions_get",
+            lambda: (
+                self._conn.call_status(self._mt5.positions_get, symbol=symbol)
+                if symbol is not None
+                else self._conn.call_status(self._mt5.positions_get)
+            ),
+            _position, "持仓",
+        )
 
     def pending_orders(self, symbol: str | None = None) -> list[PendingOrder]:
-        rows = (
-            self._conn.call(self._mt5.orders_get, symbol=symbol)
-            if symbol is not None
-            else self._conn.call(self._mt5.orders_get)
+        return self._list_amb(
+            "pending_orders",
+            lambda: (
+                self._conn.call_status(self._mt5.orders_get, symbol=symbol)
+                if symbol is not None
+                else self._conn.call_status(self._mt5.orders_get)
+            ),
+            _pending, "挂单",
         )
-        if rows is None:
-            logger.debug("orders_get 返回 None（无挂单或查询失败），按空集处理")
-            return []
-        return [_pending(r) for r in rows]
 
     def deals(self, since: datetime, to: datetime) -> list[Deal]:
-        rows = self._conn.call(
-            self._mt5.history_deals_get,
-            _epoch_seconds(since), _epoch_seconds(to),
+        return self._list_amb(
+            "deals",
+            lambda: self._conn.call_status(
+                self._mt5.history_deals_get,
+                _epoch_seconds(since), _epoch_seconds(to),
+            ),
+            _deal, "成交历史",
         )
-        if rows is None:
-            return []
-        return [_deal(r) for r in rows]
 
     def order_history(self, since: datetime, to: datetime) -> list[HistoryOrder]:
-        rows = self._conn.call(
-            self._mt5.history_orders_get,
-            _epoch_seconds(since), _epoch_seconds(to),
+        return self._list_amb(
+            "order_history",
+            lambda: self._conn.call_status(
+                self._mt5.history_orders_get,
+                _epoch_seconds(since), _epoch_seconds(to),
+            ),
+            _history_order, "委托历史",
         )
+
+    def _list_amb(self, label, fetch, mapper, cn):
+        rows, err = fetch()
         if rows is None:
-            return []
-        return [_history_order(r) for r in rows]
+            if _is_success(err):
+                logger.debug("%s 返回 None 且 last_error 为成功码，按空集处理", label)
+                return []
+            raise DataUnavailableError(f"查询{cn}失败：{err}")
+        return [mapper(r) for r in rows]

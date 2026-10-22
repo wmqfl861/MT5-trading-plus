@@ -16,7 +16,12 @@ def _utc(ts_seconds: float) -> datetime:
 
 
 def _epoch_seconds(dt: datetime) -> int:
-    # 把 naive UTC 标签 datetime 转回整数秒；传给 mt5 时避免宿主机时区解释
+    # 只接受 naive（UTC 标签）datetime；带时区的输入会被静默错移，当场拒绝
+    if dt.tzinfo is not None:
+        raise ValueError(
+            "只接受不带时区的 naive datetime（服务器时间贴 UTC 标签），"
+            f"收到 tzinfo={dt.tzinfo}"
+        )
     return int(dt.replace(tzinfo=timezone.utc).timestamp())
 
 
@@ -91,8 +96,10 @@ class Position:
     side: str  # "buy"/"sell"
     volume: float
     price_open: float
+    price_current: float
     sl: float
     tp: float
+    swap: float
     profit: float
     time: datetime
     comment: str
@@ -117,8 +124,10 @@ class PendingOrder:
 class Deal:
     ticket: int
     order: int
+    position_id: int
     symbol: str
     side: str
+    entry: str | None  # "in"/"out"/"inout"/"out_by"，出入金流水为 None
     volume: float
     price: float
     profit: float
@@ -127,6 +136,7 @@ class Deal:
     fee: float
     time: datetime
     comment: str
+    magic: int
 
 
 @dataclass(frozen=True)
@@ -138,16 +148,17 @@ class HistoryOrder:
     price_open: float
     state: int
     time_setup: datetime
-    time_done: datetime
+    time_done: datetime | None  # 0（未完成）如实为 None
     comment: str
 
 
 @dataclass(frozen=True)
 class OrderResult:
-    ok: bool  # retcode == 10009 (TRADE_RETCODE_DONE)
+    ok: bool  # retcode ∈ {DONE, DONE_PARTIAL, PLACED}
+    confirmed: bool  # PLACED（已受理未确认成交）为 False，调用方需自行核对
     retcode: int
     comment: str
     order_ticket: int | None
     deal_ticket: int | None
     deal_price: float | None
-    volume: float | None
+    volume: float | None  # 服务器回报的实际成交量（部分成交时 < 请求量）

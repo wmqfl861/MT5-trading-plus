@@ -5,7 +5,7 @@ import pytest
 from mt5gw.account import AccountService
 from mt5gw.config import GatewayConfig, LiveTradingBlockedError
 from mt5gw.connection import MT5Connection
-from mt5gw.errors import RETCode, TradeRejectedError
+from mt5gw.errors import RETCode, OrderResultUnknownError, TradeRejectedError
 from mt5gw.symbols import SymbolCatalog
 from mt5gw.trading import TradingService, clamp_volume, pick_filling
 
@@ -22,10 +22,25 @@ SymRow = namedtuple(
     "trade_contract_size volume_min volume_max volume_step filling_mode visible",
 )
 PosRow = namedtuple(
-    "PosRow", "ticket symbol type volume price_open sl tp profit time comment magic"
+    "PosRow",
+    "ticket symbol type volume price_open price_current sl tp swap profit time comment magic",
+)
+OrdRow = namedtuple(
+    "OrdRow", "ticket symbol type volume price_open price_current sl tp time_setup comment"
 )
 
 ACC = AccRow(1, "s", "c", "USD", 100, 10000, 10000, 0, 10000, 2, 0)
+
+# 多头：有 SL 也有 TP（改单"现值回填"测试依赖这两个现值）
+LONG = PosRow(
+    ticket=9001, symbol="EURUSD", type=0, volume=0.5, price_open=1.1000,
+    price_current=1.1050, sl=1.0900, tp=1.1200, swap=-0.02, profit=12.5,
+    time=1698000000, comment="", magic=20261022,
+)
+PEND = OrdRow(
+    ticket=8001, symbol="EURUSD", type=2, volume=0.5, price_open=1.0900,
+    price_current=1.1000, sl=1.0800, tp=1.1200, time_setup=1698000000, comment="bot",
+)
 
 
 def sym(filling=1, v_min=0.01, v_max=100.0, step=0.01):
@@ -37,9 +52,6 @@ def sym(filling=1, v_min=0.01, v_max=100.0, step=0.01):
     )
 
 
-LONG = PosRow(9001, "EURUSD", 0, 0.5, 1.1000, 1.09, 1.12, 12.5, 1698000000, "", 20261022)
-
-
 def make(trade_mode=0, filling=1, allow_live=False, **sym_kw):
     fake = FakeMT5()
     conn = MT5Connection(mt5_module=fake)
@@ -49,6 +61,14 @@ def make(trade_mode=0, filling=1, allow_live=False, **sym_kw):
     fake.set_behavior("symbol_select", value=True)
     fake.set_behavior(
         "symbol_info_tick", value=TickInfo(1698000000, 1.10450, 1.10462, 1.10460, 7)
+    )
+    fake.set_behavior(
+        "positions_get",
+        value=lambda symbol=None, ticket=None: (LONG,) if ticket in (None, 9001) else (),
+    )
+    fake.set_behavior(
+        "orders_get",
+        value=lambda symbol=None, ticket=None: (PEND,) if ticket == 8001 else (),
     )
     svc = TradingService(conn, config, AccountService(conn, fake),
                          SymbolCatalog(conn, fake), fake)
@@ -70,44 +90,81 @@ def capture_request(fake, result=None):
 # ---- 纯函数 ----
 
 def test_pick_filling_first_supported_mode():
-    assert pick_filling(1) == FakeMT5.ORDER_FILLING_FOK      # 仅 FOK
-    assert pick_filling(2) == FakeMT5.ORDER_FILLING_IOC      # 仅 IOC
-    assert pick_filling(3) == FakeMT5.ORDER_FILLING_FOK      # 两者都有 → FOK 优先
-    assert pick_filling(0) == FakeMT5.ORDER_FILLING_RETURN   # 都不支持 → RETURN
+    assert pick_filling(1) == FakeMT5.ORDER_FILLING_FOK
+    assert pick_filling(2) == FakeMT5.ORDER_FILLING_IOC
+    assert pick_filling(3) == FakeMT5.ORDER_FILLING_FOK
+    assert pick_filling(0) == FakeMT5.ORDER_FILLING_RETURN
 
 
-def test_clamp_volume_rounds_down_to_step_and_bounds():
+def test_clamp_volume_rounds_down_to_step():
     assert clamp_volume(0.015, 0.01, 100.0, 0.01) == 0.01
-    assert clamp_volume(150.0, 0.01, 100.0, 0.01) == 100.0
     with pytest.raises(ValueError):
-        clamp_volume(0.005, 0.01, 100.0, 0.01)  # 取整后低于最小量
+        clamp_volume(0.005, 0.01, 100.0, 0.01)
     with pytest.raises(ValueError):
         clamp_volume(0.0, 0.01, 100.0, 0.01)
     with pytest.raises(ValueError):
         clamp_volume(-1.0, 0.01, 100.0, 0.01)
+    with pytest.raises(ValueError):
+        clamp_volume(float("nan"), 0.01, 100.0, 0.01)
+    with pytest.raises(ValueError):
+        clamp_volume(float("inf"), 0.01, 100.0, 0.01)
+    with pytest.raises(ValueError):
+        clamp_volume(0.05, 0.01, 100.0, 0.0)  # 步长非法
+
+
+def test_clamp_rejects_over_max_instead_of_silent_shrink():
+    with pytest.raises(ValueError, match="最大交易量"):
+        clamp_volume(150.0, 0.01, 100.0, 0.01)  # 要 150 手不许静默下 100 手
 
 
 # ---- 保险丝 ----
 
-def test_fuse_blocks_before_order_send_on_real_account():
-    tr, fake = make(trade_mode=2)  # 实盘
+def test_fuse_blocks_every_trading_entry_on_real_account():
+    tr, fake = make(trade_mode=2)
     capture_request(fake)
     with pytest.raises(LiveTradingBlockedError):
         tr.market_order("EURUSD", "buy", 0.01)
-    assert fake.calls("order_send") == 0  # 请求从未触达 order_send
-
-
-def test_fuse_blocks_close_and_modify_too():
-    tr, fake = make(trade_mode=2)
-    fake.set_behavior("positions_get", value=(LONG,))
-    capture_request(fake)
+    with pytest.raises(LiveTradingBlockedError):
+        tr.pending_order("EURUSD", "buy", "limit", 0.01, 1.0900)
     with pytest.raises(LiveTradingBlockedError):
         tr.close_position(9001)
     with pytest.raises(LiveTradingBlockedError):
-        tr.modify(9001, sl=1.08)
+        tr.modify(8001, sl=1.08)
     with pytest.raises(LiveTradingBlockedError):
-        tr.pending_order("EURUSD", "buy", "limit", 0.01, 1.0900)
+        tr.modify_position(9001, sl=1.08)
+    with pytest.raises(LiveTradingBlockedError):
+        tr.cancel_order(8001)
+    assert fake.calls("order_send") == 0  # 全部在触达 order_send 之前被拦
+
+
+def test_fuse_fails_closed_when_account_unreadable():
+    tr, fake = make()
+    fake.set_behavior("account_info", value=None)  # 下单前读不到账户
+    fake.last_error_value = (-6, "terminal not connected")
+    capture_request(fake)
+    from mt5gw.errors import DataUnavailableError
+    with pytest.raises(DataUnavailableError, match="拒绝发送"):
+        tr.market_order("EURUSD", "buy", 0.01)
     assert fake.calls("order_send") == 0
+
+
+def test_fuse_blocks_contest_account_by_default():  # 白名单：只有模拟盘放行
+    from mt5gw.config import ensure_trade_allowed
+    with pytest.raises(LiveTradingBlockedError):
+        ensure_trade_allowed(1, False)
+    ensure_trade_allowed(0, False)
+    ensure_trade_allowed(1, True)
+
+
+def test_fuse_immune_to_truthy_string_unlock():  # I1：非严格布尔解锁一律无效
+    from mt5gw.config import ensure_trade_allowed
+    with pytest.raises(LiveTradingBlockedError):
+        ensure_trade_allowed(2, "false")  # 字符串真值不解锁
+    with pytest.raises(ValueError):
+        GatewayConfig(allow_live_trading="false")  # 构造时当场拒绝
+    import dataclasses
+    with pytest.raises(ValueError):
+        dataclasses.replace(GatewayConfig(), allow_live_trading=1)
 
 
 def test_fuse_allows_real_when_unlocked():
@@ -135,7 +192,7 @@ def test_market_order_sends_correct_request():
     assert req["comment"] == "hello"
     assert req["type_filling"] == FakeMT5.ORDER_FILLING_FOK  # bits=1：仅 FOK 可用
     assert req["price"] == 1.10462  # 买入带当前 ask（Exness 要求显式参考价）
-    assert res.ok and res.retcode == RETCode.DONE
+    assert res.ok and res.confirmed
     assert res.deal_ticket == 777 and res.order_ticket == 888 and res.deal_price == 1.1010
 
 
@@ -166,6 +223,14 @@ def test_volume_clamped_in_market_order():
     assert box["req"]["volume"] == 0.01
 
 
+def test_over_max_volume_rejected_not_shrunk():
+    tr, fake = make()
+    capture_request(fake)
+    with pytest.raises(TradeRejectedError, match="最大交易量"):
+        tr.market_order("EURUSD", "buy", 150.0)
+    assert fake.calls("order_send") == 0
+
+
 def test_below_min_volume_raises_invalid_volume():
     tr, fake = make()
     capture_request(fake)
@@ -184,14 +249,32 @@ def test_rejected_retcode_raises_with_readable_message():
     assert "市场关闭" in str(ei.value)
 
 
-def test_order_send_none_raises_with_last_error():
+# ---- 成交结果语义（I3）----
+
+def test_done_partial_is_success_and_confirmed():
     tr, fake = make()
-    fake.last_error_value = (-6, "send failed")
-    with pytest.raises(TradeRejectedError, match="send failed"):
+    capture_request(fake, result=ok_send()._replace(retcode=10010, volume=0.006))
+    res = tr.market_order("EURUSD", "buy", 0.01)
+    assert res.ok and res.confirmed  # 部分成交：仓位已建立，绝不能当"被拒"
+    assert res.volume == 0.006
+
+
+def test_placed_is_ok_but_unconfirmed():
+    tr, fake = make()
+    capture_request(fake, result=ok_send()._replace(retcode=10008, order=999, deal=0, price=0.0))
+    res = tr.pending_order("EURUSD", "buy", "limit", 0.01, 1.0900)
+    assert res.ok and res.confirmed is False
+    assert res.deal_ticket is None and res.deal_price is None
+
+
+def test_order_send_none_raises_unknown_result():
+    tr, fake = make()
+    fake.set_behavior("order_send", value=None)  # order_send 无返回
+    with pytest.raises(OrderResultUnknownError, match="核对持仓"):
         tr.market_order("EURUSD", "buy", 0.01)
 
 
-# ---- 挂单 ----
+# ---- 挂单 / 撤单 ----
 
 def test_pending_order_sends_correct_request():
     tr, fake = make()
@@ -206,18 +289,79 @@ def test_pending_order_sends_correct_request():
     assert res.ok
 
 
-def test_pending_order_sell_stop_type():
+def test_cancel_order_sends_remove_action():
     tr, fake = make()
     box = capture_request(fake)
-    tr.pending_order("EURUSD", "sell", "stop", 0.02, 1.0900)
-    assert box["req"]["type"] == FakeMT5.ORDER_TYPE_SELL_STOP
+    res = tr.cancel_order(8001)
+    req = box["req"]
+    assert req["action"] == FakeMT5.TRADE_ACTION_REMOVE
+    assert req["order"] == 8001
+    assert res.ok
 
 
-# ---- 平仓 / 改单 ----
+def test_cancel_unknown_order_raises():
+    tr, fake = make()
+    capture_request(fake)
+    with pytest.raises(Exception, match="8002"):
+        tr.cancel_order(8002)
+    assert fake.calls("order_send") == 0
+
+
+# ---- 改单：未传字段回填现值（C1）----
+
+def test_modify_position_only_tp_keeps_current_sl():
+    tr, fake = make()
+    box = capture_request(fake)
+    res = tr.modify_position(9001, tp=1.1300)
+    req = box["req"]
+    assert req["action"] == FakeMT5.TRADE_ACTION_SLTP
+    assert req["position"] == 9001
+    assert req["symbol"] == "EURUSD"
+    assert req["sl"] == 1.0900  # 未传的 SL 保持现值，绝不发 0
+    assert req["tp"] == 1.1300
+    assert res.ok
+
+
+def test_modify_position_only_sl_keeps_current_tp():
+    tr, fake = make()
+    box = capture_request(fake)
+    tr.modify_position(9001, sl=1.0800)
+    assert box["req"]["sl"] == 1.0800
+    assert box["req"]["tp"] == 1.1200  # 未传的 TP 保持现值
+
+
+def test_modify_position_requires_sl_or_tp():
+    tr, fake = make()
+    with pytest.raises(ValueError):
+        tr.modify_position(9001)
+
+
+def test_modify_position_unknown_ticket_raises():
+    tr, fake = make()
+    capture_request(fake)
+    with pytest.raises(Exception, match="9002"):
+        tr.modify_position(9002, sl=1.08)
+    assert fake.calls("order_send") == 0
+
+
+def test_modify_pending_fills_current_values():
+    tr, fake = make()
+    box = capture_request(fake)
+    res = tr.modify(8001, tp=1.1500)
+    req = box["req"]
+    assert req["action"] == FakeMT5.TRADE_ACTION_MODIFY
+    assert req["order"] == 8001
+    assert req["symbol"] == "EURUSD"
+    assert req["price"] == 1.0900  # 未传 price 用现挂单价
+    assert req["sl"] == 1.0800     # 未传 sl 保持现值
+    assert req["tp"] == 1.1500
+    assert res.ok
+
+
+# ---- 平仓 ----
 
 def test_close_position_full_uses_opposite_side_with_position_ticket():
     tr, fake = make()
-    fake.set_behavior("positions_get", value=(LONG,))
     box = capture_request(fake)
     res = tr.close_position(9001)
     req = box["req"]
@@ -232,43 +376,13 @@ def test_close_position_full_uses_opposite_side_with_position_ticket():
 
 def test_partial_close_sends_clamped_volume():
     tr, fake = make()
-    fake.set_behavior("positions_get", value=(LONG,))
     box = capture_request(fake)
     tr.close_position(9001, 0.037)
     assert box["req"]["volume"] == 0.03
 
 
-def test_close_unknown_position_raises():
-    tr, fake = make()
-    fake.set_behavior("positions_get", value=())
-    capture_request(fake)
-    with pytest.raises(Exception, match="9001"):
-        tr.close_position(9001)
-    assert fake.calls("order_send") == 0
-
-
-def test_modify_position_uses_sltp_action():
-    tr, fake = make()
-    fake.set_behavior("positions_get", value=(LONG,))
-    box = capture_request(fake)
-    res = tr.modify_position(9001, sl=1.0800, tp=1.1300)
-    req = box["req"]
-    assert req["action"] == FakeMT5.TRADE_ACTION_SLTP  # 持仓改 SL/TP 专用动作
-    assert req["position"] == 9001
-    assert req["sl"] == 1.0800 and req["tp"] == 1.1300
-    assert "order" not in req  # 不得误走挂单改单通道
-    assert res.ok
-
-
-def test_modify_position_requires_sl_or_tp():
-    tr, fake = make()
-    with pytest.raises(ValueError):
-        tr.modify_position(9001)
-
-
 def test_partial_close_over_remaining_rejected():
     tr, fake = make()
-    fake.set_behavior("positions_get", value=(LONG,))  # 持仓 0.5 手
     capture_request(fake)
     with pytest.raises(TradeRejectedError) as ei:
         tr.close_position(9001, 0.7)
@@ -276,28 +390,17 @@ def test_partial_close_over_remaining_rejected():
     assert fake.calls("order_send") == 0
 
 
-def test_placed_retcode_is_success_for_pending():
-    tr, fake = make()
-    capture_request(fake, result=ok_send()._replace(retcode=10008, order=999, deal=0))
-    res = tr.pending_order("EURUSD", "buy", "limit", 0.01, 1.0900)
-    assert res.ok  # PLACED（已受理）不是拒绝——误判会诱发策略重复下单
-    assert res.retcode == 10008
-
-
 def test_close_position_deviation_configurable():
     tr, fake = make()
-    fake.set_behavior("positions_get", value=(LONG,))
     box = capture_request(fake)
     tr.close_position(9001, deviation=50)
     assert box["req"]["deviation"] == 50
 
 
-def test_modify_updates_sl_tp_price():
+def test_close_unknown_position_raises():
     tr, fake = make()
-    box = capture_request(fake)
-    res = tr.modify(8001, sl=1.08, tp=1.13, price=1.0950)
-    req = box["req"]
-    assert req["action"] == FakeMT5.TRADE_ACTION_MODIFY
-    assert req["order"] == 8001
-    assert req["sl"] == 1.08 and req["tp"] == 1.13 and req["price"] == 1.0950
-    assert res.ok
+    fake.set_behavior("positions_get", value=lambda symbol=None, ticket=None: ())
+    capture_request(fake)
+    with pytest.raises(Exception, match="9002"):
+        tr.close_position(9002)
+    assert fake.calls("order_send") == 0

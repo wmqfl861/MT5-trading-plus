@@ -1,12 +1,26 @@
 """与 MT5 终端的连接：串行化、懒连接、有界自动重连。
 
 MetaTrader5 包为同步调用且非线程安全——本类是它唯一的入口，
-所有调用经 call() 在同一把锁下执行，对上层呈现线程安全。
+所有调用在同一把锁下执行，对上层呈现线程安全。
+
+实测（见 README）：该 C 扩展对"单个位置参数经 *args 解包传入"的形态报
+(-2, 'Unnamed arguments not allowed')，单参数调用一律用直接位置调用。
 """
+from __future__ import annotations
+
 import threading
 
 from mt5gw.config import GatewayConfig
-from mt5gw.errors import NotConnectedError
+from mt5gw.errors import DataUnavailableError, NotConnectedError
+
+
+def _is_success(error_tuple) -> bool:
+    """last_error 的成功形态是 (1, 'Success')；兼容旧 fake 的 (0, 'success')。"""
+    if not error_tuple:
+        return False
+    code = error_tuple[0]
+    desc = str(error_tuple[1]).lower() if len(error_tuple) > 1 else ""
+    return code in (0, 1) and "success" in desc
 
 
 class MT5Connection:
@@ -34,20 +48,37 @@ class MT5Connection:
 
     def call(self, fn, *args, **kwargs):
         with self._lock:
-            if not self._initialized or not self._terminal_ok():
-                self._ensure_initialized()
-            # 实测（见台账 Task9）：MetaTrader5 的 C 扩展对"单个位置参数经
-            # *args 解包传入"的形态报 (-2, 'Unnamed arguments not allowed')
-            # （order_send 如此；直调/关键字/多参数解包均正常）。
-            # 单参数时用直接位置调用，等价于 mt5.order_send(req)。
+            self._ready_or_raise()
             if len(args) == 1 and not kwargs:
                 return fn(args[0])
             return fn(*args, **kwargs)
 
-    def _terminal_ok(self) -> bool:
-        # Python 包没有 terminal_connected()（MQL5 专有）；等价物是 terminal_info().connected
-        info = self._mt5.terminal_info()
-        return bool(info is not None and info.connected)
+    def call_status(self, fn, *args, **kwargs):
+        """原子地执行调用并取回 last_error（None 歧义由调用方按成功码裁决）。"""
+        with self._lock:
+            self._ready_or_raise()
+            if kwargs or len(args) != 1:
+                result = fn(*args, **kwargs)
+            else:
+                result = fn(args[0])
+            error = self._mt5.last_error()
+            return result, error
+
+    def trade_send(self, request: dict, fuse_check) :
+        """交易唯一出口：同一次持锁内完成 重连检查→保险丝→order_send。
+
+        fuse_check(trade_mode) 在 order_send 之前执行；账户状态取不到时
+        fail-closed（拒单），杜绝"账户切换竞态"与"漏调保险丝"两类绕过。
+        """
+        with self._lock:
+            self._ready_or_raise()
+            account = self._mt5.account_info()
+            if account is None:
+                raise DataUnavailableError(
+                    f"下单前无法确认账户状态，拒绝发送：{self._mt5.last_error()}"
+                )
+            fuse_check(account.trade_mode)
+            return self._mt5.order_send(request)  # 直接位置调用（C 扩展解包限制）
 
     def last_error(self) -> str:
         # 同样要过锁：C 扩展非线程安全，错误路径也不能与在途调用并发
@@ -60,6 +91,21 @@ class MT5Connection:
             self._initialized = False
             raise NotConnectedError(f"MT5 终端初始化失败：{self.last_error()}")
         self._initialized = True
+
+    def _terminal_ok(self) -> bool:
+        # Python 包没有 terminal_connected()（MQL5 专有）；等价物是 terminal_info().connected
+        info = self._mt5.terminal_info()
+        return bool(info is not None and info.connected)
+
+    def _ready_or_raise(self) -> None:
+        if not self._initialized or not self._terminal_ok():
+            self._ensure_initialized()
+            # 重连成功 ≠ 交易服务器在线；仍掉线必须如实暴露（陈旧数据比无数据更危险）
+            if not self._terminal_ok():
+                self._initialized = False
+                raise NotConnectedError(
+                    f"终端已初始化但交易服务器未连接：{self.last_error()}"
+                )
 
     def __enter__(self) -> "MT5Connection":
         self.connect()

@@ -66,8 +66,9 @@ class FakeMT5:
 
     def __init__(self):
         self.initialize_result = True
+        self.initialize_restores_connection = True  # 镜像真实包：重连成功后 connected=True
         self.terminal_info_value = TerminalInfo(connected=True, trade_allowed=True)
-        self.last_error_value = (0, "success")
+        self.last_error_value = (1, "Success")  # 真实包的成功码
         self.behaviors = {}  # name -> {"value":..., "error":..., "delay":...}
         self.call_counts = {}
         self._guard = threading.Lock()
@@ -104,6 +105,8 @@ class FakeMT5:
     # ---- 生命周期 ----
     def initialize(self, path=None, **kwargs):
         ok = self.initialize_result
+        if ok and self.initialize_restores_connection:
+            self.terminal_info_value = TerminalInfo(connected=True, trade_allowed=True)
         self.call_counts["initialize"] = self.call_counts.get("initialize", 0) + 1
         return ok
 
@@ -152,11 +155,11 @@ class FakeMT5:
     def account_info(self):
         return self._record("account_info")
 
-    def positions_get(self, symbol=None):
-        return self._record("positions_get", symbol)
+    def positions_get(self, symbol=None, ticket=None):
+        return self._record("positions_get", symbol=symbol, ticket=ticket)
 
-    def orders_get(self, symbol=None):
-        return self._record("orders_get", symbol)
+    def orders_get(self, symbol=None, ticket=None):
+        return self._record("orders_get", symbol=symbol, ticket=ticket)
 
     def history_deals_get(self, date_from, date_to, **kwargs):
         return self._record("history_deals_get", date_from, date_to, **kwargs)

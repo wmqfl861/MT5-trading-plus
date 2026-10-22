@@ -25,9 +25,9 @@ def test_defaults_cover_every_field():
     assert all(getattr(cfg, f.name) is not None for f in fields(cfg))
 
 
-def test_load_missing_file_gives_defaults(tmp_path):
-    cfg = load(str(tmp_path / "nope.json"))
-    assert cfg == GatewayConfig()
+def test_load_missing_file_raises(tmp_path):  # M1：路径写错当场暴露，不静默用默认
+    with pytest.raises(FileNotFoundError):
+        load(str(tmp_path / "nope.json"))
 
 
 def test_load_json_overrides(tmp_path):
@@ -39,10 +39,11 @@ def test_load_json_overrides(tmp_path):
     assert cfg.terminal_path == GatewayConfig().terminal_path
 
 
-def test_load_ignores_unknown_keys(tmp_path):
+def test_load_ignores_unknown_keys_but_warns(tmp_path, caplog):
     p = tmp_path / "config.json"
     p.write_text(json.dumps({"nonsense": 1}), encoding="utf-8")
     assert load(str(p)) == GatewayConfig()
+    assert any("未知键" in r.message for r in caplog.records)
 
 
 def test_load_rejects_non_bool_allow_live_trading(tmp_path):
@@ -64,10 +65,14 @@ def test_fuse_blocks_real_account():
         ensure_trade_allowed(2, False)
 
 
+def test_fuse_blocks_contest_and_unknown_modes():  # 白名单：只有模拟盘免检放行
+    with pytest.raises(LiveTradingBlockedError):
+        ensure_trade_allowed(1, False)  # 竞赛盘
+    with pytest.raises(LiveTradingBlockedError):
+        ensure_trade_allowed(99, False)  # 未知值 fail-closed
+
+
 def test_fuse_allows_real_when_unlocked():
     ensure_trade_allowed(2, True)  # must not raise
-
-
-def test_fuse_allows_demo_and_contest():
-    ensure_trade_allowed(0, False)
-    ensure_trade_allowed(1, False)
+    ensure_trade_allowed(1, True)
+    ensure_trade_allowed(0, False)  # 模拟盘永远放行
