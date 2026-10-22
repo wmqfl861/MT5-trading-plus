@@ -96,7 +96,10 @@ con = duckdb.connect()
 df = con.execute("SELECT * FROM read_parquet('data/bars/*/*/data.parquet', filename=true) WHERE ...").fetchdf()
 ```
 
-已知上限：MT5 终端"图表最大柱数"（默认 10 万）限制了单次可见历史——M1~M30
-各周期最多取回约 10 万根（M1 ≈ 最近 10 周；H1 及以上通常已到券商完整历史）。
-要更深的小周期历史，需在终端 工具→选项→图表 把"图表最大柱数"调大
-（或设为无限制）并重启终端后重跑全量回填。
+历史深度：终端"图表最大柱数"已从默认 10 万调大到 1 亿
+（`%APPDATA%\MetaQuotes\Terminal\<实例>\config\common.ini` 的 `[Charts] MaxBars`，
+UTF-16 编码，改前需先关终端再改再启动）。当前各序列已取到 Exness 服务器
+留存的最深历史：XAUUSD 全周期回到 2014-01；BTCUSD/USTEC/EURUSD 回到
+2021 年中（券商上线/留存的起点）。M1 级全量约 2,820 万根、786MB。
+注：新品种首次深挖 M1 时，第一笔大请求可能因终端向服务器同步历史而超时
+返回"无数据"，等一两分钟重跑同序列即可（缓存已暖，秒级完成）。
