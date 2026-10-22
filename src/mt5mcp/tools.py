@@ -48,7 +48,7 @@ def list_series(root) -> list[dict]:
                 "symbol": wm["symbol"], "timeframe": wm["timeframe"],
                 "rows": wm["rows"],
                 "first_time": wm["first_time"], "last_time": wm["last_closed_time"],
-                "updated_at": wm["updated_at"],
+                "updated_at_utc": wm.get("updated_at_utc"),
             })
     return out
 

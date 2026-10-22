@@ -24,6 +24,8 @@ def main() -> int:
     ap.add_argument("--timeframes", default=",".join(ALL_TIMEFRAMES))
     ap.add_argument("--refresh", action="store_true", help="增量刷新已有序列")
     ap.add_argument("--chunk", type=int, default=500_000)
+    ap.add_argument("--force", action="store_true",
+                    help="允许回填覆盖更短/更晚起步的既有历史（截断保护的对冲开关）")
     args = ap.parse_args()
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
@@ -31,16 +33,23 @@ def main() -> int:
     failed = []
 
     with MT5Gateway() as gw:
+        try:
+            st = gw.account.state()
+            meta_info = {"server": st.server, "login": st.login}
+        except Exception:
+            meta_info = None
         for sym in symbols:
             for tf in tfs:
                 t0 = time.time()
                 try:
                     if args.refresh:
-                        stats = refresh_series(args.data_dir, gw.market, sym, tf)
+                        stats = refresh_series(args.data_dir, gw.market, sym, tf,
+                                               meta_info=meta_info)
                         extra = f" 新增={stats.get('new_bars', 0):>6,}"
                     else:
                         stats = backfill_series(args.data_dir, gw.market, sym, tf,
-                                                chunk=args.chunk)
+                                                chunk=args.chunk, force=args.force,
+                                                meta_info=meta_info)
                         extra = f" 块数={stats['chunks_fetched']}"
                 except Exception as e:  # 单序列失败不中断其余下载
                     print(f"✗ {sym:8s} {tf:4s} {type(e).__name__}: {e}", flush=True)

@@ -2,11 +2,13 @@
 
 布局：{root}/bars/{SYMBOL}/{TF}/data.parquet + meta.json（水位）。
 约定（与 mt5gw 一致）：time 为服务器时间贴 UTC 标签的 naive datetime。
+写入一律原子（临时文件 + os.replace 带重试），读者不会看到半截文件。
 """
 from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -22,7 +24,6 @@ TIMEFRAME_SECONDS = {
 
 _COLUMNS = ["time", "open", "high", "low", "close",
             "tick_volume", "spread", "real_volume"]
-_CLOSED_SLACK = pd.Timedelta(seconds=5)  # 行情冻结（周末）时收盘时刻==最后tick时刻
 
 
 def series_dir(root, symbol: str, timeframe: str) -> str:
@@ -45,21 +46,37 @@ def merge_bars(old: pd.DataFrame | None, new: pd.DataFrame) -> pd.DataFrame:
     return merged[_COLUMNS]
 
 
-def drop_unclosed(df: pd.DataFrame, timeframe: str, now: datetime) -> pd.DataFrame:
-    """剔除未收盘的 K 线：收盘时刻（time+周期）须 <= now+5s。
+def drop_unclosed(df: pd.DataFrame, timeframe: str, now_server: datetime) -> pd.DataFrame:
+    """剔除未收盘的 K 线。
 
-    5 秒宽容是为了周末行情冻结时不误删最后一根已收盘 bar
-    （最后 tick 时刻恰好早于收盘时刻）。
+    规则：非末行的 bar 必已收盘（其后已有新 bar）；末行收盘当且仅当
+    time+周期 <= now_server。now_server 用"墙钟 UTC + 券商时差"估算
+    （由 downloader._server_now 自校准），与 tick 时钟解耦——周末行情
+    冻结时墙钟仍在走，最后一根已收盘 bar 不会被误删，也不需要宽容秒数。
     """
     if df is None or len(df) == 0:
         return df
     tf = TIMEFRAME_SECONDS[timeframe.upper()]
-    close_time = df["time"] + pd.to_timedelta(tf, unit="s")
-    keep = close_time <= pd.Timestamp(now) + _CLOSED_SLACK
-    return df[keep].reset_index(drop=True)
+    head = df.iloc[:-1]
+    last = df.iloc[[-1]]
+    last_closed = last["time"] + pd.to_timedelta(tf, unit="s") <= pd.Timestamp(now_server)
+    return pd.concat([head, last[last_closed]]).reset_index(drop=True)
 
 
-def save_bars(root, symbol: str, timeframe: str, df: pd.DataFrame) -> None:
+def _atomic_replace(tmp_path: str, final_path: str) -> None:
+    for attempt in range(5):
+        try:
+            os.replace(tmp_path, final_path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.2 * (attempt + 1))  # Windows：读者占着句柄时稍候重试
+
+
+def save_bars(root, symbol: str, timeframe: str, df: pd.DataFrame,
+              *, server: str | None = None, login: int | None = None) -> None:
+    """原子写入 data.parquet 与 meta.json（先数据后水位，临时文件过渡）。"""
     d = series_dir(root, symbol, timeframe)
     os.makedirs(d, exist_ok=True)
     out = df.copy()
@@ -68,17 +85,26 @@ def save_bars(root, symbol: str, timeframe: str, df: pd.DataFrame) -> None:
         out[c] = out[c].astype("float64")
     for c in ("tick_volume", "spread", "real_volume"):
         out[c] = out[c].astype("int64")
-    out[_COLUMNS].to_parquet(os.path.join(d, "data.parquet"), index=False)
+    out = out[_COLUMNS]
+
+    parquet_tmp = os.path.join(d, "data.parquet.tmp")
+    out.to_parquet(parquet_tmp, index=False)
+    _atomic_replace(parquet_tmp, os.path.join(d, "data.parquet"))
+
     wm = {
         "symbol": symbol.upper(),
         "timeframe": timeframe.upper(),
         "rows": int(len(out)),
         "first_time": out["time"].iloc[0].isoformat(),
         "last_closed_time": out["time"].iloc[-1].isoformat(),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "server": server,
+        "login": login,
     }
-    with open(os.path.join(d, "meta.json"), "w", encoding="utf-8") as f:
+    meta_tmp = os.path.join(d, "meta.json.tmp")
+    with open(meta_tmp, "w", encoding="utf-8") as f:
         json.dump(wm, f, ensure_ascii=False, indent=2)
+    _atomic_replace(meta_tmp, os.path.join(d, "meta.json"))
 
 
 def load_bars(root, symbol: str, timeframe: str) -> pd.DataFrame | None:
