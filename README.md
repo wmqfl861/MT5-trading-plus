@@ -72,3 +72,31 @@ with MT5Gateway() as gw:                # 终端路径可用 config 定制
 - `modify()` 只改挂单；持仓的 SL/TP 用 `modify_position()`（纯透传，
   移动止损等由策略层驱动）。
 - 历史委托/挂单里出现未知订单类型时如实标注为 `typeN`，不崩溃。
+
+## K 线数据库（mt5data）
+
+存储为 Parquet 文件，布局 `data/bars/{品种}/{周期}/data.parquet`（另带 `meta.json`
+水位：行数、首末时间、更新时间）。列：`time, open, high, low, close,
+tick_volume, spread, real_volume`；只存**已收盘**的 bar（形成中的最后一根
+不入库，避免建模"偷看未来"）。时间戳为服务器时间贴 UTC 标签的 naive datetime。
+
+下载/刷新（终端须在线）：
+
+```bash
+.venv/Scripts/python.exe scripts/download_bars.py --symbols XAUUSD,BTCUSD,USTEC,EURUSD          # 全量回填
+.venv/Scripts/python.exe scripts/download_bars.py --symbols XAUUSD,BTCUSD,USTEC,EURUSD --refresh  # 增量刷新
+```
+
+本机建模直接读文件（不要走 MCP）：
+
+```python
+import duckdb, pandas as pd
+df = pd.read_parquet("data/bars/XAUUSD/H1/data.parquet")            # 全速 pandas
+con = duckdb.connect()
+df = con.execute("SELECT * FROM read_parquet('data/bars/*/*/data.parquet', filename=true) WHERE ...").fetchdf()
+```
+
+已知上限：MT5 终端"图表最大柱数"（默认 10 万）限制了单次可见历史——M1~M30
+各周期最多取回约 10 万根（M1 ≈ 最近 10 周；H1 及以上通常已到券商完整历史）。
+要更深的小周期历史，需在终端 工具→选项→图表 把"图表最大柱数"调大
+（或设为无限制）并重启终端后重跑全量回填。
