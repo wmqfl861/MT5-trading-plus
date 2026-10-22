@@ -68,8 +68,39 @@ def test_get_bars_unknown_symbol_raises(tmp_path):
 def test_describe_series_gives_gap_stats(tmp_path):
     out = describe_series(make_db(tmp_path), "EURUSD", "M1")
     assert out["rows"] == 300
-    assert out["missing_bars"] == 0  # 连续数据
+    assert out["max_gap_seconds"] == 60  # 连续 M1：最大间隔恰为步长
     assert out["expected_step_minutes"] == 1
+
+
+def test_symbol_traversal_rejected(tmp_path):  # I12：路径穿越/UNC 注入一律拒绝
+    root = make_db(tmp_path)
+    for evil in ("..\..\windows", "\\attacker\share", "EUR/USD", "XAUUSD;moo", "x" * 40):
+        with pytest.raises(ValueError):
+            get_bars(root, evil, "M1", limit=5)
+        with pytest.raises(ValueError):
+            compute_indicator(root, evil, "M1", "rsi", {}, limit=5)
+
+
+def test_list_series_raises_when_data_dir_missing(tmp_path):  # M12：不再静默空表
+    import os
+    with pytest.raises(ValueError, match="数据目录"):
+        list_series(os.path.join(tmp_path, "nope"))
+
+
+def test_compute_macd_multi_output(tmp_path):
+    out = compute_indicator(make_db(tmp_path), "EURUSD", "M1", "macd",
+                            {"fast": 3, "slow": 6, "signal": 3}, limit=5)
+    v = out["values"][-1]
+    assert set(v) == {"time", "macd", "signal", "hist"}
+    assert abs(v["hist"] - (v["macd"] - v["signal"])) < 1e-6  # 值域按 8 位小数舍入
+
+
+def test_compute_bbands_multi_output(tmp_path):
+    out = compute_indicator(make_db(tmp_path), "EURUSD", "M1", "bbands",
+                            {"period": 20}, limit=5)
+    v = out["values"][-1]
+    assert set(v) == {"time", "mid", "upper", "lower"}
+    assert v["upper"] > v["mid"] > v["lower"]
 
 
 def test_compute_indicator_bounded_and_aligned(tmp_path):
@@ -90,4 +121,6 @@ def test_compute_indicator_rejects_unknown_name(tmp_path):
 
 def test_compute_indicator_list_names_in_error(tmp_path):
     with pytest.raises(ValueError, match="sma"):
+        compute_indicator(make_db(tmp_path), "EURUSD", "M1", "unicorn", {}, limit=5)
+    with pytest.raises(ValueError, match="macd"):
         compute_indicator(make_db(tmp_path), "EURUSD", "M1", "unicorn", {}, limit=5)

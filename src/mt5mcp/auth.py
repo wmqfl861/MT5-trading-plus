@@ -24,8 +24,12 @@ def bearer_auth_middleware(app, token: str):
 
     async def guarded(scope, receive, send):
         if scope["type"] != "http":
-            return await app(scope, receive, send)
-        headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
+            if scope["type"] == "lifespan":
+                return await app(scope, receive, send)
+            return  # 其余类型（websocket 等）直接拒绝，不做代理
+        # HTTP 头按 latin-1 解码（RFC），遇到任意字节也不会 500
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1")
+                   for k, v in scope.get("headers", [])}
         provided = _extract_bearer(headers.get("authorization"))
         if not token_matches(provided, token):
             body = b'{"error": "unauthorized: missing or invalid bearer token"}'

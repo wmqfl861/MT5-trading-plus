@@ -18,14 +18,28 @@ def test_ema_matches_recursive_definition():
 
 
 def test_rsi_hand_computed_period2():
+    # Wilder：种子=前2个涨跌幅均值（close idx2 起才有值），之后递推
     closes = pd.Series([1.0, 2, 3, 2, 3])
     out = rsi(closes, 2)
-    assert list(out) == pytest.approx([np.nan, 100, 100, 50, 75], nan_ok=True)
+    assert list(out) == pytest.approx([np.nan, np.nan, 100, 50, 75], nan_ok=True)
+
+
+def test_rsi_warmup_is_n_nan():
+    closes = pd.Series(np.linspace(1, 50, 60))
+    out = rsi(closes, 14)
+    assert out.iloc[:14].isna().all()  # 种子期 NaN（MT5/TA-Lib 口径）
+    assert out.iloc[14:].notna().all()
+
+
+def test_rsi_flat_market_is_50():  # MT5 口径：涨跌均为 0 → 50
+    closes = pd.Series([5.0] * 30)
+    out = rsi(closes, 14)
+    assert out.iloc[-1] == 50.0
 
 
 def test_rsi_extremes():
-    up = rsi(pd.Series([1.0, 2, 3, 4, 5, 6, 7]), 3)
-    down = rsi(pd.Series([7.0, 6, 5, 4, 3, 2, 1]), 3)
+    up = rsi(pd.Series([1.0, 2, 3, 4, 5, 6, 7, 8]), 3)
+    down = rsi(pd.Series([8.0, 7, 6, 5, 4, 3, 2, 1]), 3)
     assert up.iloc[-1] == 100  # 只涨不跌
     assert down.iloc[-1] == 0  # 只跌不涨
 
@@ -53,10 +67,10 @@ def test_bbands_envelope_around_middle():
     closes = pd.Series([1.0, 2, 3, 4, 5, 6, 7, 8, 9, 10])
     mid, upper, lower = bbands(closes, 5, 2)
     assert upper.iloc[-1] > mid.iloc[-1] > lower.iloc[-1]
-    # 均值±2倍样本标准差（ddof=1）
+    # 均值±2倍总体标准差（ddof=0，MT5 iBands 口径）
     win = closes.iloc[-5:]
     assert mid.iloc[-1] == win.mean()
-    assert upper.iloc[-1] == win.mean() + 2 * win.std(ddof=1)
+    assert upper.iloc[-1] == win.mean() + 2 * win.std(ddof=0)
 
 
 def test_atr_constant_range_bars():
@@ -72,4 +86,6 @@ def test_atr_zero_range():
     n = 20
     s = pd.Series([5.0] * n)
     out = atr(s, s, s, 5)
-    assert (out.iloc[1:] == 0).all()
+    # TR 首根=H-L（合法值），种子落在第 5 根 TR（索引 4）：此前 NaN，此后恒 0
+    assert out.iloc[:4].isna().all()
+    assert (out.iloc[4:] == 0).all()

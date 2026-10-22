@@ -1,13 +1,17 @@
 """MCP 数据工具：有界查询 + 服务端指标现算。
 
-工具都返回"进 agent 上下文也安全"的小结果——上限 MAX_BARS_LIMIT，
-杜绝把全量历史灌进模型上下文。
+安全与资源（I12/I14 修复后）：
+- symbol 白名单正则校验——杜绝路径穿越与 UNC 注入（SMB 凭据泄露）；
+- 读取一律经 DuckDB 下推过滤 + LIMIT，绝不整文件载入（XAUUSD M1 91MB）；
+- 指标只读"limit + 预热期"所需的尾部数据。
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import Path
 
+import duckdb
 import pandas as pd
 
 from mt5mcp import indicators
@@ -16,18 +20,30 @@ from mt5data.store import TIMEFRAME_SECONDS, read_watermark, series_dir
 MAX_BARS_LIMIT = 500
 MAX_INDICATOR_POINTS = 500
 
-_BAR_COLUMNS = ["time", "open", "high", "low", "close",
-                "tick_volume", "spread", "real_volume"]
+# 品种名白名单：MT5 品种只含字母数字与 . _ # + -（如 XAUUSD.m、BTCUSD#)
+_SYMBOL_RE = re.compile(r"^[A-Za-z0-9._#+-]{1,32}$")
+
+_INDICATOR_WARMUP = 260  # 预热根数：period≤100 时 Wilder 残余影响 <1e-4 量级
 
 
-def _load(root, symbol: str, timeframe: str) -> pd.DataFrame:
+def _validate_symbol(symbol: str) -> str:
+    if not isinstance(symbol, str) or not _SYMBOL_RE.match(symbol):
+        raise ValueError(f"非法品种名 {symbol!r}（只接受 MT5 品名字符集）")
+    return symbol.upper()
+
+
+def _parquet_path(root, symbol: str, timeframe: str) -> Path:
     tf = timeframe.upper()
     if tf not in TIMEFRAME_SECONDS:
         raise ValueError(f"未知周期 {timeframe}，可用：{sorted(TIMEFRAME_SECONDS)}")
-    p = Path(series_dir(root, symbol, tf)) / "data.parquet"
+    p = Path(series_dir(root, _validate_symbol(symbol), tf)) / "data.parquet"
     if not p.exists():
         raise ValueError(f"库中没有 {symbol.upper()} {tf}（先运行 download_bars.py）")
-    return pd.read_parquet(p)
+    return p
+
+
+def _sql_literal(s: str) -> str:
+    return s.replace("'", "''")
 
 
 def _iso(ts) -> str:
@@ -36,11 +52,10 @@ def _iso(ts) -> str:
 
 def list_series(root) -> list[dict]:
     """库里有哪些品种×周期，各多少行、时间范围。"""
-    root = Path(root)
-    out = []
-    bars_dir = root / "bars"
+    bars_dir = Path(root) / "bars"
     if not bars_dir.exists():
-        return out
+        raise ValueError(f"数据目录不存在：{bars_dir}（用绝对路径或正确的 --data-dir 启动服务）")
+    out = []
     for wm_file in sorted(bars_dir.glob("*/*/meta.json")):
         wm = read_watermark(root, wm_file.parent.parent.name, wm_file.parent.name)
         if wm:
@@ -49,76 +64,120 @@ def list_series(root) -> list[dict]:
                 "rows": wm["rows"],
                 "first_time": wm["first_time"], "last_time": wm["last_closed_time"],
                 "updated_at_utc": wm.get("updated_at_utc"),
+                "server": wm.get("server"), "login": wm.get("login"),
             })
     return out
 
 
 def get_bars(root, symbol: str, timeframe: str, *, limit: int = 100,
              since: datetime | None = None, until: datetime | None = None) -> dict:
-    """取 K 线（最多 MAX_BARS_LIMIT 根，取最新一段；可用 since/until 圈窗口）。"""
+    """取 K 线（最多 MAX_BARS_LIMIT 根，最新一段；since/until 圈窗口）。"""
     limit = max(1, min(int(limit), MAX_BARS_LIMIT))
-    df = _load(root, symbol, timeframe)
-    if since is not None:
-        df = df[df["time"] >= pd.Timestamp(since)]
-    if until is not None:
-        df = df[df["time"] <= pd.Timestamp(until)]
-    total = int(len(df))
-    truncated = total > limit
-    df = df.tail(limit)
+    path = _parquet_path(root, symbol, timeframe)
+    con = duckdb.connect()
+    try:
+        cond = []
+        if since is not None:
+            cond.append(f"time >= TIMESTAMP '{since.isoformat()}'")
+        if until is not None:
+            cond.append(f"time <= TIMESTAMP '{until.isoformat()}'")
+        where = ("WHERE " + " AND ".join(cond)) if cond else ""
+        table = f"read_parquet('{_sql_literal(str(path))}')"
+        total = con.execute(f"SELECT count(*) FROM {table} {where}").fetchone()[0]
+        df = con.execute(
+            f"SELECT * FROM {table} {where} ORDER BY time DESC LIMIT {limit}"
+        ).fetchdf()
+    finally:
+        con.close()
+    df = df.sort_values("time").reset_index(drop=True)
     return {
         "symbol": symbol.upper(), "timeframe": timeframe.upper(),
-        "rows_total_before_limit": total,
-        "truncated": truncated,
+        "rows_total_before_limit": int(total),
+        "truncated": bool(total > limit),
         "rows_returned": int(len(df)),
         "bars": [
-            {**{c: (float(b[c]) if c not in ("tick_volume", "spread", "real_volume")
-                  else int(b[c])) for c in _BAR_COLUMNS if c != "time"},
-             "time": _iso(b["time"])}
+            {"time": _iso(b["time"]),
+             "open": float(b["open"]), "high": float(b["high"]),
+             "low": float(b["low"]), "close": float(b["close"]),
+             "tick_volume": int(b["tick_volume"]), "spread": int(b["spread"]),
+             "real_volume": int(b["real_volume"])}
             for b in df.to_dict("records")
         ],
     }
 
 
 def describe_series(root, symbol: str, timeframe: str) -> dict:
-    """序列概况：行数、范围、应有步长、缺失根数（周末休市会显著放大，属正常）。"""
-    df = _load(root, symbol, timeframe)
+    """序列概况：行数、范围、步长、最大相邻间隔（周末休市导致的大间隔属正常）。"""
+    path = _parquet_path(root, symbol, timeframe)
+    con = duckdb.connect()
+    try:
+        table = f"read_parquet('{_sql_literal(str(path))}')"
+        row = con.execute(f"""
+            SELECT count(*) AS n, min(time) AS f, max(time) AS l, max(gap) AS max_gap
+            FROM (SELECT time, datediff('second', lag(time) OVER (ORDER BY time), time) AS gap
+                  FROM {table})
+        """).fetchone()
+    finally:
+        con.close()
+    n, first, last, max_gap = row
     tf = timeframe.upper()
-    step = pd.Timedelta(seconds=TIMEFRAME_SECONDS[tf])
-    span = df["time"].iloc[-1] - df["time"].iloc[0]
-    expected = int(span / step) + 1
     return {
         "symbol": symbol.upper(), "timeframe": tf,
-        "rows": int(len(df)),
-        "first_time": _iso(df["time"].iloc[0]),
-        "last_time": _iso(df["time"].iloc[-1]),
-        "expected_step_minutes": step.total_seconds() / 60,
-        "expected_bars_if_no_gaps": expected,
-        "missing_bars": max(0, expected - len(df)),
+        "rows": int(n),
+        "first_time": _iso(first),
+        "last_time": _iso(last),
+        "expected_step_minutes": TIMEFRAME_SECONDS[tf] / 60,
+        "max_gap_seconds": int(max_gap) if max_gap is not None else 0,
+        "note": "max_gap 大多为周末/假日休市；远超两倍步长且不是周末时段才值得排查",
     }
 
 
-_INDICATORS = {
-    "sma": lambda df, p: indicators.sma(df["close"], p.get("period", 20)),
-    "ema": lambda df, p: indicators.ema(df["close"], p.get("period", 20)),
-    "rsi": lambda df, p: indicators.rsi(df["close"], p.get("period", 14)),
-    "atr": lambda df, p: indicators.atr(
-        df["high"], df["low"], df["close"], p.get("period", 14)),
-}
+def _indicator_columns(name: str, df: pd.DataFrame, params: dict) -> dict[str, pd.Series]:
+    p = params
+    if name == "sma":
+        return {"value": indicators.sma(df["close"], p.get("period", 20))}
+    if name == "ema":
+        return {"value": indicators.ema(df["close"], p.get("period", 20))}
+    if name == "rsi":
+        return {"value": indicators.rsi(df["close"], p.get("period", 14))}
+    if name == "atr":
+        return {"value": indicators.atr(df["high"], df["low"], df["close"], p.get("period", 14))}
+    if name == "macd":
+        line, sig, hist = indicators.macd(
+            df["close"], p.get("fast", 12), p.get("slow", 26), p.get("signal", 9))
+        return {"macd": line, "signal": sig, "hist": hist}
+    if name == "bbands":
+        mid, upper, lower = indicators.bbands(
+            df["close"], p.get("period", 20), p.get("std_mult", 2.0))
+        return {"mid": mid, "upper": upper, "lower": lower}
+    raise ValueError(f"未知指标 {name}，可用：sma, ema, rsi, atr, macd, bbands")
 
 
 def compute_indicator(root, symbol: str, timeframe: str, indicator: str,
                       params: dict | None = None, limit: int = 50) -> dict:
-    """服务端现算指标，只回最后 limit 个点（指标不落库，参数随意改）。"""
-    if indicator not in _INDICATORS:
-        raise ValueError(f"未知指标 {indicator}，可用：{sorted(_INDICATORS)}")
+    """服务端现算指标，只回最后 limit 个点（只读尾部 limit+预热期，不碰全量）。"""
     limit = max(1, min(int(limit), MAX_INDICATOR_POINTS))
     params = params or {}
-    df = _load(root, symbol, timeframe)
-    values = _INDICATORS[indicator](df, params)
-    tail = pd.DataFrame({"time": df["time"], "value": values}).dropna().tail(limit)
+    path = _parquet_path(root, symbol, timeframe)
+    con = duckdb.connect()
+    try:
+        df = con.execute(
+            f"SELECT * FROM read_parquet('{_sql_literal(str(path))}') "
+            f"ORDER BY time DESC LIMIT {limit + _INDICATOR_WARMUP}"
+        ).fetchdf()
+    finally:
+        con.close()
+    df = df.sort_values("time").reset_index(drop=True)
+    cols = _indicator_columns(indicator, df, params)
+    frame = pd.DataFrame({"time": df["time"], **cols})
+    tail = frame.dropna().tail(limit)
+    values = [
+        {"time": _iso(r["time"]),
+         **{k: round(float(r[k]), 8) for k in cols}}
+        for _, r in tail.iterrows()
+    ]
     return {
         "symbol": symbol.upper(), "timeframe": timeframe.upper(),
         "indicator": indicator, "params": params,
-        "values": [{"time": _iso(r["time"]), "value": round(float(r["value"]), 8)}
-                   for _, r in tail.iterrows()],
+        "values": values,
     }

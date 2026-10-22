@@ -31,12 +31,22 @@ def load_mcp_config(path: str | Path) -> MCPServerConfig:
             f"token 缺失或弱于 {MIN_TOKEN_LEN} 字符——对外服务的唯一门锁，不能弱。"
             "用 secrets.token_urlsafe(32) 生成一个。"
         )
+    host = data.get("host", "127.0.0.1")
+    port = data.get("port", 8310)
+    dns_flag = data.get("dns_rebinding_protection", False)
+    hosts = data.get("allowed_hosts", [])
+    if not isinstance(host, str):
+        raise ValueError(f"host 应为字符串，实际 {type(host).__name__}")
+    if not isinstance(port, int) or isinstance(port, bool) or not (1 <= port <= 65535):
+        raise ValueError(f"port 应为 1-65535 的整数，实际 {port!r}")
+    if not isinstance(dns_flag, bool):
+        raise ValueError(f"dns_rebinding_protection 应为 true/false，实际 {dns_flag!r}")
+    if not isinstance(hosts, list) or not all(isinstance(h, str) for h in hosts):
+        raise ValueError("allowed_hosts 应为字符串数组")
     return MCPServerConfig(
-        host=str(data.get("host", "127.0.0.1")),
-        port=int(data.get("port", 8310)),
-        token=token,
-        dns_rebinding_protection=bool(data.get("dns_rebinding_protection", False)),
-        allowed_hosts=tuple(data.get("allowed_hosts", [])),
+        host=host, port=port, token=token,
+        dns_rebinding_protection=dns_flag,
+        allowed_hosts=tuple(hosts),
     )
 
 

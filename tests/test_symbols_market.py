@@ -181,8 +181,8 @@ def test_ticks_returns_latest_n_of_window():
     fake.set_behavior("copy_ticks_range", value=window)
     ticks = mkt.ticks("EURUSD", 50)
     assert len(ticks) == 50
-    assert ticks[-1].time == datetime(2023, 10, 22, 18, 41, 39)  # 窗口最后一笔
-    assert ticks[0].time == datetime(2023, 10, 22, 18, 40, 30)   # 而非窗口第一笔
+    assert ticks[-1].time == datetime(2023, 10, 22, 18, 36, 19)  # 窗口最后一笔（18:35:00+79s）
+    assert ticks[0].time == datetime(2023, 10, 22, 18, 35, 30)   # 而非窗口第一笔 18:35:00
 
 
 def test_symbol_select_failure_raises():

@@ -56,6 +56,61 @@ def test_config_rejects_weak_or_missing_token(tmp_path):
         load_mcp_config(p)
 
 
+def test_middleware_survives_non_utf8_headers():
+    # HTTP 头按 latin-1 解码：恶意字节头不得引发 500（虽不构成绕过）
+    import asyncio
+    from mt5mcp.auth import bearer_auth_middleware
+    seen = []
+
+    async def app(scope, receive, send):
+        seen.append(scope["type"])
+
+    guarded = bearer_auth_middleware(app, "right-token-0123456789abcdef")
+
+    async def run():
+        scope = {
+            "type": "http", "method": "GET", "path": "/mcp",
+            "headers": [(b"authorization", b"Bearer " + bytes([255, 254, 128]) + b"bad")],
+        }
+        sent = []
+
+        async def receive():
+            return {"type": "http.request", "body": b""}
+
+        async def send(msg):
+            sent.append(msg)
+
+        await guarded(scope, receive, send)
+        return sent
+
+    sent = asyncio.run(run())
+    assert sent[0]["status"] == 401  # 拒绝但不崩溃
+    assert seen == []  # 未透传给内层应用
+
+
+def test_middleware_rejects_websocket_scope():
+    import asyncio
+    from mt5mcp.auth import bearer_auth_middleware
+
+    async def app(scope, receive, send):
+        raise AssertionError("不得透传 websocket 作用域")
+
+    guarded = bearer_auth_middleware(app, "t" * 40)
+
+    async def run():
+        scope = {"type": "websocket", "path": "/mcp", "headers": []}
+
+        async def receive():
+            return {}
+
+        async def send(msg):
+            pass
+
+        await guarded(scope, receive, send)  # 静默拒绝（不发任何东西）
+
+    asyncio.run(run())  # 无异常即通过
+
+
 def test_middleware_blocks_without_or_wrong_token():
     import starlette.responses
     from mt5mcp.auth import bearer_auth_middleware
