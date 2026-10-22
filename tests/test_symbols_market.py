@@ -152,6 +152,22 @@ def test_ticks_explicit_since_passed_as_epoch_seconds():
     assert ticks[0].bid == 1.1045 and ticks[0].volume == 3
 
 
+def test_bars_end_pos_forwarded_for_backfill():
+    conn, _, mkt, fake = make()
+    fake.set_behavior("symbol_info", value=EUR)
+
+    def check_pos(symbol, timeframe, start_pos, count):
+        assert start_pos == 5000  # 回填时从更早的位置取
+        assert count == 1000
+        return ()
+
+    fake.set_behavior("copy_rates_from_pos", value=check_pos)
+    mkt.bars("EURUSD", "M1", 1000, end_pos=5000)
+    # 缺省仍从 0（最新）取
+    fake.set_behavior("copy_rates_from_pos", value=())
+    mkt.bars("EURUSD", "M1", 100)
+
+
 def test_ticks_latest_anchor_uses_quote_time_minus_window():
     conn, _, mkt, fake = make()
     fake.set_behavior("symbol_info", value=EUR)

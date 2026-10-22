@@ -46,10 +46,13 @@ class MarketData:
             volume=t.volume,
         )
 
-    def bars(self, symbol: str, timeframe: str, count: int) -> list[Bar]:
+    def bars(self, symbol: str, timeframe: str, count: int, *, end_pos: int = 0) -> list[Bar]:
+        """自 end_pos（0=最新一根，向过去数）起取 count 根 K 线；回填时用 end_pos 翻页。"""
         tf = self._timeframe(timeframe)
         self._ensure_visible(symbol)
-        rows = self._conn.call(self._mt5.copy_rates_from_pos, symbol, tf, 0, count)
+        rows = self._conn.call(
+            self._mt5.copy_rates_from_pos, symbol, tf, end_pos, count
+        )
         if rows is None:
             raise DataUnavailableError(
                 f"{symbol} {timeframe} K线不可用：{self._conn.last_error()}"
