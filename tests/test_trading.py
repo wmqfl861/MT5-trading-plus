@@ -247,6 +247,51 @@ def test_close_unknown_position_raises():
     assert fake.calls("order_send") == 0
 
 
+def test_modify_position_uses_sltp_action():
+    tr, fake = make()
+    fake.set_behavior("positions_get", value=(LONG,))
+    box = capture_request(fake)
+    res = tr.modify_position(9001, sl=1.0800, tp=1.1300)
+    req = box["req"]
+    assert req["action"] == FakeMT5.TRADE_ACTION_SLTP  # 持仓改 SL/TP 专用动作
+    assert req["position"] == 9001
+    assert req["sl"] == 1.0800 and req["tp"] == 1.1300
+    assert "order" not in req  # 不得误走挂单改单通道
+    assert res.ok
+
+
+def test_modify_position_requires_sl_or_tp():
+    tr, fake = make()
+    with pytest.raises(ValueError):
+        tr.modify_position(9001)
+
+
+def test_partial_close_over_remaining_rejected():
+    tr, fake = make()
+    fake.set_behavior("positions_get", value=(LONG,))  # 持仓 0.5 手
+    capture_request(fake)
+    with pytest.raises(TradeRejectedError) as ei:
+        tr.close_position(9001, 0.7)
+    assert ei.value.retcode == RETCode.INVALID_VOLUME
+    assert fake.calls("order_send") == 0
+
+
+def test_placed_retcode_is_success_for_pending():
+    tr, fake = make()
+    capture_request(fake, result=ok_send()._replace(retcode=10008, order=999, deal=0))
+    res = tr.pending_order("EURUSD", "buy", "limit", 0.01, 1.0900)
+    assert res.ok  # PLACED（已受理）不是拒绝——误判会诱发策略重复下单
+    assert res.retcode == 10008
+
+
+def test_close_position_deviation_configurable():
+    tr, fake = make()
+    fake.set_behavior("positions_get", value=(LONG,))
+    box = capture_request(fake)
+    tr.close_position(9001, deviation=50)
+    assert box["req"]["deviation"] == 50
+
+
 def test_modify_updates_sl_tp_price():
     tr, fake = make()
     box = capture_request(fake)

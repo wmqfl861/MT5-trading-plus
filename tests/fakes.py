@@ -114,7 +114,18 @@ class FakeMT5:
         return self.terminal_info_value
 
     def last_error(self):
-        return self.last_error_value
+        # 走与 _record 相同的并发追踪，供序列化测试观测
+        beh = self.behaviors.get("last_error")
+        value = beh["value"] if beh else self.last_error_value
+        with self._guard:
+            self.call_counts["last_error"] = self.call_counts.get("last_error", 0) + 1
+            self._inside += 1
+            self.max_concurrent = max(self.max_concurrent, self._inside)
+        try:
+            return value
+        finally:
+            with self._guard:
+                self._inside -= 1
 
     # ---- 数据 / 交易接口（默认 None，按需配置）----
     def symbols_total(self):

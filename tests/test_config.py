@@ -45,6 +45,20 @@ def test_load_ignores_unknown_keys(tmp_path):
     assert load(str(p)) == GatewayConfig()
 
 
+def test_load_rejects_non_bool_allow_live_trading(tmp_path):
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps({"allow_live_trading": "false"}), encoding="utf-8")
+    with pytest.raises(ValueError, match="allow_live_trading"):
+        load(str(p))  # 字符串 "false" 为真值，会静默武装实盘——必须当场拒绝
+
+
+def test_load_rejects_wrong_types(tmp_path):
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps({"magic": "x", "terminal_path": 5}), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load(str(p))
+
+
 def test_fuse_blocks_real_account():
     with pytest.raises(LiveTradingBlockedError):
         ensure_trade_allowed(2, False)

@@ -16,6 +16,7 @@ from mt5gw.symbols import SymbolCatalog
 
 _FILL_FOK, _FILL_IOC, _FILL_RETURN = 0, 1, 2  # ORDER_FILLING_*，与包一致
 _TIME_GTC = 0  # ORDER_TIME_GTC
+_OK_RETCODES = frozenset({RETCode.DONE, RETCode.PLACED})  # 完成与已受理都是成功
 
 _PENDING_TYPE = {
     ("buy", "limit"): "ORDER_TYPE_BUY_LIMIT",
@@ -136,6 +137,7 @@ class TradingService:
         tp: float | None = None,
         price: float | None = None,
     ) -> OrderResult:
+        """改挂单（价格/SL/TP）。持仓的 SL/TP 用 modify_position。"""
         self._fuse()
         request: dict = {"action": self._mt5.TRADE_ACTION_MODIFY, "order": ticket}
         if price is not None:
@@ -146,13 +148,41 @@ class TradingService:
             request["tp"] = tp
         return self._send(request)
 
-    def close_position(self, ticket: int, volume: float | None = None) -> OrderResult:
+    def modify_position(
+        self,
+        ticket: int,
+        *,
+        sl: float | None = None,
+        tp: float | None = None,
+    ) -> OrderResult:
+        """改持仓的 SL/TP（纯透传，移动止损之类由策略层决定）。"""
+        if sl is None and tp is None:
+            raise ValueError("modify_position 至少要给 sl 或 tp 之一")
+        self._fuse()
+        request: dict = {"action": self._mt5.TRADE_ACTION_SLTP, "position": ticket}
+        if sl is not None:
+            request["sl"] = sl
+        if tp is not None:
+            request["tp"] = tp
+        return self._send(request)
+
+    def close_position(
+        self, ticket: int, volume: float | None = None, *, deviation: int = 20
+    ) -> OrderResult:
         self._fuse()
         pos = next((p for p in self._account.positions() if p.ticket == ticket), None)
         if pos is None:
             raise DataUnavailableError(f"持仓 {ticket} 不存在（可能已平仓）")
         spec = self._symbols.get(pos.symbol)
-        vol = pos.volume if volume is None else self._volume(volume, spec)
+        if volume is None:
+            vol = pos.volume
+        else:
+            vol = self._volume(volume, spec)
+            if vol > pos.volume:
+                raise TradeRejectedError(
+                    RETCode.INVALID_VOLUME,
+                    f"请求平仓 {vol} 手超出持仓余量 {pos.volume} 手",
+                )
         close_side = "sell" if pos.side == "buy" else "buy"
         request = {
             "action": self._mt5.TRADE_ACTION_DEAL,
@@ -160,7 +190,7 @@ class TradingService:
             "type": self._mt5.ORDER_TYPE_BUY if close_side == "buy" else self._mt5.ORDER_TYPE_SELL,
             "position": ticket,
             "volume": vol,
-            "deviation": 20,
+            "deviation": deviation,
             "magic": self._config.magic,
             "comment": f"close #{ticket}",
             "type_time": _TIME_GTC,
@@ -195,7 +225,7 @@ class TradingService:
         result = self._conn.call(self._mt5.order_send, request)
         if result is None:
             raise TradeRejectedError(0, f"order_send 无返回：{self._conn.last_error()}")
-        if result.retcode != RETCode.DONE:
+        if result.retcode not in _OK_RETCODES:
             raise TradeRejectedError(result.retcode, result.comment)
         return OrderResult(
             ok=True,

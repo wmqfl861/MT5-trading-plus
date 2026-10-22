@@ -22,9 +22,14 @@ _SIDES = {0: "buy", 1: "sell"}  # POSITION_TYPE_*
 # DEAL_TYPE_*：除买卖外还有出入金等流水（volume=0, price=0）
 _DEAL_SIDES = {0: "buy", 1: "sell", 2: "balance", 3: "credit", 4: "charge",
                5: "correction", 6: "bonus"}
-_ORDER_KINDS = {  # ORDER_TYPE_*
-    2: "buy_limit", 3: "sell_limit", 4: "buy_stop", 5: "sell_stop",
-}
+# ORDER_TYPE_*：0/1 是市价单（历史委托里最常见），2-5 挂单，6/7 止损限价等
+_ORDER_KINDS = {0: "buy", 1: "sell", 2: "buy_limit", 3: "sell_limit",
+                4: "buy_stop", 5: "sell_stop"}
+
+
+def _kind(order_type: int) -> str:
+    # 未知类型如实标注而非崩溃（券商自定义类型）
+    return _ORDER_KINDS.get(order_type, f"type{order_type}")
 
 
 def _state(row) -> AccountState:
@@ -48,7 +53,7 @@ def _position(row) -> Position:
 
 def _pending(row) -> PendingOrder:
     return PendingOrder(
-        ticket=row.ticket, symbol=row.symbol, kind=_ORDER_KINDS[row.type],
+        ticket=row.ticket, symbol=row.symbol, kind=_kind(row.type),
         volume=row.volume, price_open=row.price_open,
         price_current=row.price_current, sl=row.sl, tp=row.tp,
         time_setup=_utc(row.time_setup), comment=row.comment,
@@ -67,7 +72,7 @@ def _deal(row) -> Deal:
 
 def _history_order(row) -> HistoryOrder:
     return HistoryOrder(
-        ticket=row.ticket, symbol=row.symbol, kind=_ORDER_KINDS[row.type],
+        ticket=row.ticket, symbol=row.symbol, kind=_kind(row.type),
         volume=row.volume, price_open=row.price_open, state=row.state,
         time_setup=_utc(row.time_setup),
         time_done=_utc(row.time_done) if row.time_done else _utc(row.time_setup),

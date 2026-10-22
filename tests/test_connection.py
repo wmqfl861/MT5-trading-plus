@@ -82,6 +82,27 @@ def test_concurrent_calls_are_serialized():
     assert fake.max_concurrent == 1  # 任意时刻至多一个调用在 mt5 侧执行
 
 
+def test_last_error_is_serialized():
+    conn, fake = make_conn()
+    fake.set_behavior("symbol_info_tick", value=1.0, delay=0.05)
+    conn.connect()
+    errors = []
+
+    def poller():
+        try:
+            for _ in range(10):
+                conn.last_error()
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    t = threading.Thread(target=poller)
+    t.start()
+    conn.call(fake.symbol_info_tick, "EURUSD")
+    t.join()
+    assert errors == []
+    assert fake.max_concurrent == 1  # last_error 与 call 互斥进入 mt5 侧
+
+
 def test_lazy_connect_on_first_call():
     conn, fake = make_conn()
     fake.set_behavior("symbol_info_tick", value=2.0)

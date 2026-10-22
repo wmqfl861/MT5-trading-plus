@@ -31,13 +31,29 @@ class GatewayConfig:
     magic: int = 20261022
 
 
+_EXPECTED_TYPES = {"terminal_path": str, "allow_live_trading": bool, "magic": int}
+
+
 def load(path: str) -> GatewayConfig:
-    """从 JSON 文件读配置；文件缺失或键未知时用默认值。"""
+    """从 JSON 文件读配置；文件缺失或键未知时用默认值，类型不对当场拒绝。"""
     cfg = GatewayConfig()
     if not os.path.exists(path):
         return cfg
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
+    for key, expected in _EXPECTED_TYPES.items():
+        if key in data:
+            value = data[key]
+            # bool 是 int 的子类，但 magic 不该接受 True/False
+            if not isinstance(value, expected) or (
+                expected is int and isinstance(value, bool)
+            ):
+                raise ValueError(
+                    f"配置项 {key} 类型应为 {expected.__name__}，"
+                    f"实际为 {type(value).__name__}：{value!r}。"
+                    "（例如 allow_live_trading 必须写 true/false，不能是字符串——"
+                    "字符串 \"false\" 为真值，会静默解锁实盘。）"
+                )
     known = {k: v for k, v in data.items() if k in cfg.__dataclass_fields__}
     return GatewayConfig(**known)
 

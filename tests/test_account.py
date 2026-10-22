@@ -136,6 +136,23 @@ def test_deals_include_balance_operations():
     assert deals[0].profit == 10000.0
 
 
+def test_order_history_maps_market_and_unknown_types():
+    acct, fake = make()
+    mk = HistRow(8002, "EURUSD", 0, 0.02, 0.0, 3, 1698000000, 1698000100, "market")
+    exotic = HistRow(8003, "XAUUSD", 6, 0.1, 1960.0, 3, 1698000000, 1698000100, "")
+    fake.set_behavior("history_orders_get", value=(mk, exotic))
+    rows = acct.order_history(datetime(2023, 10, 22, 15, 0), datetime(2023, 10, 22, 19, 0))
+    assert rows[0].kind == "buy"        # 市价单：最常见的类型
+    assert rows[1].kind == "type6"      # 未知类型不崩溃，如实标注
+
+
+def test_pending_orders_unknown_type_does_not_crash():
+    acct, fake = make()
+    stoplim = OrdRow(8003, "EURUSD", 7, 0.5, 1.0800, 1.1000, 0.0, 0.0, 1698000000, "")
+    fake.set_behavior("orders_get", value=(stoplim,))
+    assert acct.pending_orders()[0].kind == "type7"
+
+
 def test_order_history_maps_fields():
     acct, fake = make()
     h = HistRow(8001, "EURUSD", 2, 0.5, 1.0900, 3, 1698000000, 1698000100, "done")

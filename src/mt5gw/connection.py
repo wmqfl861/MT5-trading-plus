@@ -19,7 +19,8 @@ class MT5Connection:
         self._initialized = False
 
     def connect(self) -> None:
-        self._ensure_initialized()
+        with self._lock:
+            self._ensure_initialized()
 
     def shutdown(self) -> None:
         with self._lock:
@@ -49,7 +50,9 @@ class MT5Connection:
         return bool(info is not None and info.connected)
 
     def last_error(self) -> str:
-        return str(self._mt5.last_error())
+        # 同样要过锁：C 扩展非线程安全，错误路径也不能与在途调用并发
+        with self._lock:
+            return str(self._mt5.last_error())
 
     def _ensure_initialized(self) -> None:
         ok = self._mt5.initialize(self.config.terminal_path)

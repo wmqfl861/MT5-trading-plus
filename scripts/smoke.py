@@ -69,6 +69,7 @@ def main() -> int:
 
         # ③ 账户
         print("③ 账户")
+        st = None
         try:
             st = gw.account.state()
             mode = {0: "模拟", 1: "竞赛", 2: "实盘"}.get(st.trade_mode, st.trade_mode)
@@ -77,6 +78,12 @@ def main() -> int:
                  f"服务器={st.server}")
         except GatewayError as e:
             step(False, "账户", str(e))
+
+        # 冒烟自己的硬闸：无论保险丝解没解锁，测试单只允许模拟盘（设计文档反目标）
+        if st is not None and st.trade_mode != 0:
+            step(False, "冒烟拒绝在非模拟盘账户下单",
+                 f"trade_mode={st.trade_mode}（0=模拟）。测试单永远不下在实盘。")
+            return 1
 
         # ④ 真实下单（模拟盘）
         print("④ 下单（最小手数市价买入）")
