@@ -48,8 +48,3 @@ class SymbolCatalog:
             )
         return _to_spec(row)
 
-    def ensure_visible(self, name: str) -> None:
-        """不在 Market Watch 里的品种先加入，否则 copy_* 取不到数据。"""
-        row = self._conn.call(self._mt5.symbol_info, name)
-        if row is not None and not getattr(row, "visible", False):
-            self._conn.call(self._mt5.symbol_select, name, True)

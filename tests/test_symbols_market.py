@@ -138,18 +138,19 @@ def test_symbol_select_called_before_copy():
 def test_ticks_explicit_since_passed_as_epoch_seconds():
     conn, _, mkt, fake = make()
     fake.set_behavior("symbol_info", value=EUR)
+    fake.set_behavior("symbol_info_tick", value=TickInfo(1698000000, 1.1, 1.2, 1.15, 7))
     since = datetime(2023, 10, 22, 15, 0, 0)
 
-    def check_from(symbol, from_time, count, flags):
-        assert from_time == 1697986800  # 2023-10-22 15:00:00 UTC，无时区偏移的整数秒
-        assert count == 50 and flags == FakeMT5.COPY_TICKS_ALL
-        return (TickRec(1698000000000, 1.1045, 1.1046, 1.1046, 3),)
+    def check_range(symbol, from_time, to_time, flags):
+        assert from_time == 1697986800  # 2023-10-22 15:00:00 UTC，无时区偏移
+        assert to_time == 1698000060    # 最新报价 + 60s 上界
+        assert flags == FakeMT5.COPY_TICKS_ALL
+        return (TickRec(1697986800000, 1.1044, 1.1045, 1.1045, 1),)
 
-    fake.set_behavior("copy_ticks_from", value=check_from)
+    fake.set_behavior("copy_ticks_range", value=check_range)
     ticks = mkt.ticks("EURUSD", 50, since=since)
     assert len(ticks) == 1 and isinstance(ticks[0], Tick)
-    assert ticks[0].time == datetime(2023, 10, 22, 18, 40, 0)  # time_msc/1000
-    assert ticks[0].bid == 1.1045 and ticks[0].volume == 3
+    assert ticks[0].bid == 1.1044
 
 
 def test_bars_end_pos_forwarded_for_backfill():
@@ -168,14 +169,27 @@ def test_bars_end_pos_forwarded_for_backfill():
     mkt.bars("EURUSD", "M1", 100)
 
 
-def test_ticks_latest_anchor_uses_quote_time_minus_window():
+def test_ticks_returns_latest_n_of_window():
+    # I9：窗口 80 笔取 count=50 → 必须是最后 50 笔（旧实现给的是最早 50 笔）
     conn, _, mkt, fake = make()
     fake.set_behavior("symbol_info", value=EUR)
     fake.set_behavior("symbol_info_tick", value=TickInfo(1698000000, 1.1, 1.2, 1.15, 7))
+    window = tuple(
+        TickRec(1697999700000 + i * 1000, 1.10 + i * 0.0001, 1.11, 1.10, i)
+        for i in range(80)
+    )
+    fake.set_behavior("copy_ticks_range", value=window)
+    ticks = mkt.ticks("EURUSD", 50)
+    assert len(ticks) == 50
+    assert ticks[-1].time == datetime(2023, 10, 22, 18, 41, 39)  # 窗口最后一笔
+    assert ticks[0].time == datetime(2023, 10, 22, 18, 40, 30)   # 而非窗口第一笔
 
-    def check_anchor(symbol, from_time, count, flags):
-        assert from_time == 1698000000 - 300  # 最新报价前推 5 分钟
-        return ()
 
-    fake.set_behavior("copy_ticks_from", value=check_anchor)
-    mkt.ticks("EURUSD", 50)
+def test_symbol_select_failure_raises():
+    conn, _, mkt, fake = make()
+    hidden = EUR._replace(visible=False)
+    fake.set_behavior("symbol_info", value=hidden)
+    fake.set_behavior("symbol_select", value=False)  # M7：加入 Market Watch 失败
+    fake.last_error_value = (-2, "select failed")
+    with pytest.raises(DataUnavailableError, match="Market Watch"):
+        mkt.bars("EURUSD", "M1", 10)

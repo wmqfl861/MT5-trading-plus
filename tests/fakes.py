@@ -152,6 +152,9 @@ class FakeMT5:
     def copy_ticks_from(self, symbol, from_time, count, flags):
         return self._record("copy_ticks_from", symbol, from_time, count, flags)
 
+    def copy_ticks_range(self, symbol, from_time, to_time, flags):
+        return self._record("copy_ticks_range", symbol, from_time, to_time, flags)
+
     def account_info(self):
         return self._record("account_info")
 

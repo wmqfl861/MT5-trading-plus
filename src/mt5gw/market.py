@@ -69,25 +69,25 @@ class MarketData:
         ]
 
     def ticks(self, symbol: str, count: int, *, since: datetime | None = None) -> list[Tick]:
-        """取自 since（含）起向后的至多 count 个 tick。
+        """取窗口内**最新**的 count 个 tick（旧实现取到的是窗口最早的 N 个）。
 
-        since 缺省时以最新报价时间前推 5 分钟为锚点——copy_ticks_from 没有
-        "取最新 N 个"原语，从 0 起取会拿到库里最早的 tick（见台账裁决）。
+        做法：copy_ticks_range 取整窗（锚点=since 或最新报价前推 5 分钟，
+        上界=最新报价+60s），再裁尾部 count 个——窗口内有缺口/流动性极高时
+        也不依赖"从锚点数 N 个"的错误假设。
         """
         self._ensure_visible(symbol)
-        if since is None:
-            anchor = self.quote(symbol).time - _LATEST_TICK_WINDOW
-        else:
-            anchor = since
+        latest = self.quote(symbol).time
+        anchor = (since if since is not None else latest - _LATEST_TICK_WINDOW)
         rows = self._conn.call(
-            self._mt5.copy_ticks_from, symbol, _epoch_seconds(anchor), count,
+            self._mt5.copy_ticks_range, symbol,
+            _epoch_seconds(anchor), _epoch_seconds(latest + timedelta(seconds=60)),
             self._mt5.COPY_TICKS_ALL,
         )
         if rows is None:
             raise DataUnavailableError(
                 f"{symbol} tick 不可用：{self._conn.last_error()}"
             )
-        return [
+        ticks = [
             Tick(
                 time=_utc(_get(r, "time_msc") / 1000.0),
                 bid=_get(r, "bid"), ask=_get(r, "ask"),
@@ -95,6 +95,7 @@ class MarketData:
             )
             for r in rows
         ]
+        return ticks[-count:] if count and len(ticks) > count else ticks
 
     def _timeframe(self, timeframe: str):
         key = timeframe.upper()
@@ -105,4 +106,8 @@ class MarketData:
     def _ensure_visible(self, symbol: str) -> None:
         row = self._conn.call(self._mt5.symbol_info, symbol)
         if row is not None and not getattr(row, "visible", False):
-            self._conn.call(self._mt5.symbol_select, symbol, True)
+            ok = self._conn.call(self._mt5.symbol_select, symbol, True)
+            if not ok:  # M7：失败如实上抛，别让后续报错指向错误原因
+                raise DataUnavailableError(
+                    f"{symbol} 无法加入 Market Watch：{self._conn.last_error()}"
+                )
