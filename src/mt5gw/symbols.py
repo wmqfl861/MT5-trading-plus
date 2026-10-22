@@ -20,7 +20,7 @@ def _to_spec(row) -> SymbolSpec:
         trade_mode=row.trade_mode,
         currency_profit=row.currency_profit,
         currency_margin=row.currency_margin,
-        contract_size=row.contract_size,
+        contract_size=row.trade_contract_size,  # 包内字段名为 trade_contract_size
         volume_min=row.volume_min,
         volume_max=row.volume_max,
         volume_step=row.volume_step,

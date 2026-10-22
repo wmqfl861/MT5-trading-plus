@@ -86,6 +86,9 @@ class TradingService:
             "type_time": _TIME_GTC,
             "type_filling": pick_filling(spec.filling_mode),
         }
+        ref = self._ref_price(symbol, side)  # Exness 等券商要求市价单也带参考价
+        if ref is not None:
+            request["price"] = ref
         if sl is not None:
             request["sl"] = sl
         if tp is not None:
@@ -150,10 +153,11 @@ class TradingService:
             raise DataUnavailableError(f"持仓 {ticket} 不存在（可能已平仓）")
         spec = self._symbols.get(pos.symbol)
         vol = pos.volume if volume is None else self._volume(volume, spec)
+        close_side = "sell" if pos.side == "buy" else "buy"
         request = {
             "action": self._mt5.TRADE_ACTION_DEAL,
             "symbol": pos.symbol,
-            "type": self._mt5.ORDER_TYPE_BUY if pos.side == "sell" else self._mt5.ORDER_TYPE_SELL,
+            "type": self._mt5.ORDER_TYPE_BUY if close_side == "buy" else self._mt5.ORDER_TYPE_SELL,
             "position": ticket,
             "volume": vol,
             "deviation": 20,
@@ -162,7 +166,17 @@ class TradingService:
             "type_time": _TIME_GTC,
             "type_filling": pick_filling(spec.filling_mode),
         }
+        ref = self._ref_price(pos.symbol, close_side)
+        if ref is not None:
+            request["price"] = ref
         return self._send(request)
+
+    def _ref_price(self, symbol: str, side: str) -> float | None:
+        """下单参考价：买用 ask，卖用 bid；取不到就省略，让服务器如实拒绝。"""
+        tick = self._conn.call(self._mt5.symbol_info_tick, symbol)
+        if tick is None:
+            return None
+        return tick.ask if side == "buy" else tick.bid
 
     def _fuse(self) -> None:
         ensure_trade_allowed(

@@ -33,9 +33,20 @@ class MT5Connection:
 
     def call(self, fn, *args, **kwargs):
         with self._lock:
-            if not self._initialized or not self._mt5.terminal_connected():
+            if not self._initialized or not self._terminal_ok():
                 self._ensure_initialized()
+            # 实测（见台账 Task9）：MetaTrader5 的 C 扩展对"单个位置参数经
+            # *args 解包传入"的形态报 (-2, 'Unnamed arguments not allowed')
+            # （order_send 如此；直调/关键字/多参数解包均正常）。
+            # 单参数时用直接位置调用，等价于 mt5.order_send(req)。
+            if len(args) == 1 and not kwargs:
+                return fn(args[0])
             return fn(*args, **kwargs)
+
+    def _terminal_ok(self) -> bool:
+        # Python 包没有 terminal_connected()（MQL5 专有）；等价物是 terminal_info().connected
+        info = self._mt5.terminal_info()
+        return bool(info is not None and info.connected)
 
     def last_error(self) -> str:
         return str(self._mt5.last_error())

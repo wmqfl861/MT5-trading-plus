@@ -11,6 +11,7 @@ SendResult = namedtuple(
     "SendResult",
     "retcode deal order volume price bid ask comment request_id retcode_external request",
 )
+TerminalInfo = namedtuple("TerminalInfo", "connected trade_allowed")
 
 
 def ok_send(price=1.1010, deal=777, order=888, volume=0.01, comment="done"):
@@ -65,7 +66,7 @@ class FakeMT5:
 
     def __init__(self):
         self.initialize_result = True
-        self.terminal_connected_value = True
+        self.terminal_info_value = TerminalInfo(connected=True, trade_allowed=True)
         self.last_error_value = (0, "success")
         self.behaviors = {}  # name -> {"value":..., "error":..., "delay":...}
         self.call_counts = {}
@@ -109,8 +110,8 @@ class FakeMT5:
     def shutdown(self):
         self.call_counts["shutdown"] = self.call_counts.get("shutdown", 0) + 1
 
-    def terminal_connected(self):
-        return self.terminal_connected_value
+    def terminal_info(self):
+        return self.terminal_info_value
 
     def last_error(self):
         return self.last_error_value

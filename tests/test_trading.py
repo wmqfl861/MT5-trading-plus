@@ -15,10 +15,11 @@ AccRow = namedtuple(
     "AccRow",
     "login server company currency leverage balance equity margin margin_free margin_mode trade_mode",
 )
+TickInfo = namedtuple("TickInfo", "time bid ask last volume")  # 包的 tick 无 symbol 字段
 SymRow = namedtuple(
     "SymRow",
     "name description digits point spread trade_mode currency_profit currency_margin "
-    "contract_size volume_min volume_max volume_step filling_mode visible",
+    "trade_contract_size volume_min volume_max volume_step filling_mode visible",
 )
 PosRow = namedtuple(
     "PosRow", "ticket symbol type volume price_open sl tp profit time comment magic"
@@ -31,7 +32,7 @@ def sym(filling=1, v_min=0.01, v_max=100.0, step=0.01):
     return SymRow(
         name="EURUSD", description="", digits=5, point=0.00001, spread=12,
         trade_mode=4, currency_profit="USD", currency_margin="USD",
-        contract_size=100000.0, volume_min=v_min, volume_max=v_max,
+        trade_contract_size=100000.0, volume_min=v_min, volume_max=v_max,
         volume_step=step, filling_mode=filling, visible=True,
     )
 
@@ -46,6 +47,9 @@ def make(trade_mode=0, filling=1, allow_live=False, **sym_kw):
     fake.set_behavior("account_info", value=ACC._replace(trade_mode=trade_mode))
     fake.set_behavior("symbol_info", value=sym(filling=filling, **sym_kw))
     fake.set_behavior("symbol_select", value=True)
+    fake.set_behavior(
+        "symbol_info_tick", value=TickInfo(1698000000, 1.10450, 1.10462, 1.10460, 7)
+    )
     svc = TradingService(conn, config, AccountService(conn, fake),
                          SymbolCatalog(conn, fake), fake)
     return svc, fake
@@ -130,15 +134,17 @@ def test_market_order_sends_correct_request():
     assert req["magic"] == 20261022
     assert req["comment"] == "hello"
     assert req["type_filling"] == FakeMT5.ORDER_FILLING_FOK  # bits=1：仅 FOK 可用
+    assert req["price"] == 1.10462  # 买入带当前 ask（Exness 要求显式参考价）
     assert res.ok and res.retcode == RETCode.DONE
     assert res.deal_ticket == 777 and res.order_ticket == 888 and res.deal_price == 1.1010
 
 
-def test_market_order_sell_type():
+def test_market_order_sell_uses_bid_price():
     tr, fake = make()
     box = capture_request(fake)
     tr.market_order("EURUSD", "sell", 0.01)
     assert box["req"]["type"] == FakeMT5.ORDER_TYPE_SELL
+    assert box["req"]["price"] == 1.10450  # 卖出带当前 bid
 
 
 def test_invalid_fill_uses_symbol_supported_mode():
@@ -220,6 +226,7 @@ def test_close_position_full_uses_opposite_side_with_position_ticket():
     assert req["type"] == FakeMT5.ORDER_TYPE_SELL  # 多头平仓 → 卖出
     assert req["position"] == 9001
     assert req["volume"] == 0.5  # 缺省全平
+    assert req["price"] == 1.10450  # 平多卖出 → bid
     assert res.ok
 
 

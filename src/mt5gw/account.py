@@ -18,7 +18,10 @@ from mt5gw.models import (
 
 logger = logging.getLogger(__name__)
 
-_SIDES = {0: "buy", 1: "sell"}  # POSITION_TYPE_*/DEAL_TYPE_*
+_SIDES = {0: "buy", 1: "sell"}  # POSITION_TYPE_*
+# DEAL_TYPE_*：除买卖外还有出入金等流水（volume=0, price=0）
+_DEAL_SIDES = {0: "buy", 1: "sell", 2: "balance", 3: "credit", 4: "charge",
+               5: "correction", 6: "bonus"}
 _ORDER_KINDS = {  # ORDER_TYPE_*
     2: "buy_limit", 3: "sell_limit", 4: "buy_stop", 5: "sell_stop",
 }
@@ -53,9 +56,10 @@ def _pending(row) -> PendingOrder:
 
 
 def _deal(row) -> Deal:
+    side = _DEAL_SIDES.get(row.type, f"type{row.type}")
     return Deal(
         ticket=row.ticket, order=row.order, symbol=row.symbol,
-        side=_SIDES[row.type], volume=row.volume, price=row.price,
+        side=side, volume=row.volume, price=row.price,
         profit=row.profit, commission=row.commission, swap=row.swap,
         fee=row.fee, time=_utc(row.time), comment=row.comment,
     )

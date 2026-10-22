@@ -14,15 +14,15 @@ from tests.fakes import FakeMT5
 SymRow = namedtuple(
     "SymRow",
     "name description digits point spread trade_mode currency_profit currency_margin "
-    "contract_size volume_min volume_max volume_step filling_mode visible",
+    "trade_contract_size volume_min volume_max volume_step filling_mode visible",
 )
-TickInfo = namedtuple("TickInfo", "symbol time bid ask last volume")
+TickInfo = namedtuple("TickInfo", "time bid ask last volume")  # 包的 tick 无 symbol 字段
 RateRow = namedtuple("RateRow", "time open high low close tick_volume spread real_volume")
 TickRec = namedtuple("TickRec", "time_msc bid ask last volume")
 
 EUR = SymRow(
     name="EURUSD", description="Euro vs US Dollar", digits=5, point=0.00001, spread=12,
-    trade_mode=4, currency_profit="USD", currency_margin="USD", contract_size=100000.0,
+    trade_mode=4, currency_profit="USD", currency_margin="USD", trade_contract_size=100000.0,
     volume_min=0.01, volume_max=100.0, volume_step=0.01, filling_mode=1, visible=True,
 )
 
@@ -74,7 +74,7 @@ def test_get_single_symbol_maps_fields():
 def test_quote_returns_fresh_tick_fields():
     conn, _, mkt, fake = make()
     fake.set_behavior("symbol_info", value=EUR)
-    fake.set_behavior("symbol_info_tick", value=TickInfo("EURUSD", 1698000000, 1.10450, 1.10462, 1.10460, 7))
+    fake.set_behavior("symbol_info_tick", value=TickInfo(1698000000, 1.10450, 1.10462, 1.10460, 7))
     q = mkt.quote("EURUSD")
     assert isinstance(q, Quote)
     assert q.symbol == "EURUSD"
@@ -155,7 +155,7 @@ def test_ticks_explicit_since_passed_as_epoch_seconds():
 def test_ticks_latest_anchor_uses_quote_time_minus_window():
     conn, _, mkt, fake = make()
     fake.set_behavior("symbol_info", value=EUR)
-    fake.set_behavior("symbol_info_tick", value=TickInfo("EURUSD", 1698000000, 1.1, 1.2, 1.15, 7))
+    fake.set_behavior("symbol_info_tick", value=TickInfo(1698000000, 1.1, 1.2, 1.15, 7))
 
     def check_anchor(symbol, from_time, count, flags):
         assert from_time == 1698000000 - 300  # 最新报价前推 5 分钟

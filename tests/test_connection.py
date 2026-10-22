@@ -6,7 +6,7 @@ from mt5gw.config import GatewayConfig
 from mt5gw.connection import MT5Connection
 from mt5gw.errors import NotConnectedError
 
-from tests.fakes import FakeMT5
+from tests.fakes import FakeMT5, TerminalInfo
 
 
 def make_conn(fake=None, **cfg):
@@ -24,7 +24,7 @@ def test_call_returns_raw_result():
 
 def test_reconnects_once_when_terminal_disconnected():
     conn, fake = make_conn()
-    fake.terminal_connected_value = False  # 终端重启/掉线场景
+    fake.terminal_info_value = TerminalInfo(connected=False, trade_allowed=False)  # 终端重启/掉线场景
     fake.initialize_result = True
     fake.set_behavior("symbol_info_tick", value=1.1)
     result = conn.call(fake.symbol_info_tick, "EURUSD")
@@ -35,7 +35,7 @@ def test_reconnects_once_when_terminal_disconnected():
 
 def test_raises_not_connected_when_reconnect_fails():
     conn, fake = make_conn()
-    fake.terminal_connected_value = False
+    fake.terminal_info_value = TerminalInfo(connected=False, trade_allowed=False)
     fake.initialize_result = False
     fake.last_error_value = (-6, "terminal is not connected")
     with pytest.raises(NotConnectedError):

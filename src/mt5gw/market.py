@@ -13,6 +13,14 @@ from mt5gw.models import Bar, Quote, Tick, _epoch_seconds, _utc
 _LATEST_TICK_WINDOW = timedelta(minutes=5)
 
 
+def _get(row, name):
+    """numpy.void 行用下标，namedtuple 行用属性——两种来源都兼容。"""
+    try:
+        return row[name]
+    except (TypeError, KeyError, IndexError):
+        return getattr(row, name)
+
+
 class MarketData:
     def __init__(self, conn: MT5Connection, mt5_module):
         self._conn = conn
@@ -29,8 +37,8 @@ class MarketData:
         t = self._conn.call(self._mt5.symbol_info_tick, symbol)
         if t is None:
             raise DataUnavailableError(f"{symbol} 报价不可用：{self._conn.last_error()}")
-        return Quote(
-            symbol=t.symbol,
+        return Quote(  # 包的 tick 对象没有 symbol 字段，用入参
+            symbol=symbol,
             time=_utc(t.time),
             bid=t.bid,
             ask=t.ask,
@@ -48,9 +56,11 @@ class MarketData:
             )
         return [
             Bar(
-                time=_utc(r.time),
-                open=r.open, high=r.high, low=r.low, close=r.close,
-                tick_volume=r.tick_volume, spread=r.spread, real_volume=r.real_volume,
+                time=_utc(_get(r, "time")),
+                open=_get(r, "open"), high=_get(r, "high"),
+                low=_get(r, "low"), close=_get(r, "close"),
+                tick_volume=_get(r, "tick_volume"),
+                spread=_get(r, "spread"), real_volume=_get(r, "real_volume"),
             )
             for r in rows
         ]
@@ -76,8 +86,9 @@ class MarketData:
             )
         return [
             Tick(
-                time=_utc(r.time_msc / 1000.0),
-                bid=r.bid, ask=r.ask, last=r.last, volume=r.volume,
+                time=_utc(_get(r, "time_msc") / 1000.0),
+                bid=_get(r, "bid"), ask=_get(r, "ask"),
+                last=_get(r, "last"), volume=_get(r, "volume"),
             )
             for r in rows
         ]

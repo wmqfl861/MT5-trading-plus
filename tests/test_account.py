@@ -127,6 +127,15 @@ def test_deals_pass_epoch_window_and_map_fields():
     assert d.commission == 0.0 and d.fee == -0.35 and d.comment == "smoke"
 
 
+def test_deals_include_balance_operations():
+    acct, fake = make()
+    deposit = DealRow(7000, 0, "", 2, 0.0, 0.0, 10000.0, 0.0, 0.0, 0.0, 1697000000, "deposit")
+    fake.set_behavior("history_deals_get", value=(deposit,))
+    deals = acct.deals(datetime(2023, 10, 1), datetime(2023, 10, 23))
+    assert deals[0].side == "balance"  # 出入金流水不是买卖方向
+    assert deals[0].profit == 10000.0
+
+
 def test_order_history_maps_fields():
     acct, fake = make()
     h = HistRow(8001, "EURUSD", 2, 0.5, 1.0900, 3, 1698000000, 1698000100, "done")
