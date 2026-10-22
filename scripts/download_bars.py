@@ -23,7 +23,7 @@ def main() -> int:
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--timeframes", default=",".join(ALL_TIMEFRAMES))
     ap.add_argument("--refresh", action="store_true", help="增量刷新已有序列")
-    ap.add_argument("--chunk", type=int, default=50_000)
+    ap.add_argument("--chunk", type=int, default=500_000)
     args = ap.parse_args()
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]

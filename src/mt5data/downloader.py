@@ -29,11 +29,10 @@ def _now(market: MarketData, symbol: str):
 
 
 def backfill_series(root, market: MarketData, symbol: str, timeframe: str,
-                    chunk: int = 50_000, max_chunks: int = 2000) -> dict:
-    """从最新往回分块取尽历史，合并去重、剔除未收盘 bar 后落库。"""
+                    chunk: int = 500_000, max_chunks: int = 2000) -> dict:
+    """从最新往回分块取尽历史，逐块合并去重（控制内存）、剔除未收盘 bar 后落库。"""
     now = _now(market, symbol)
-    rows: list = []
-    seen: set = set()
+    merged = None
     pos = 0
     chunks = 0
     while chunks < max_chunks:
@@ -44,14 +43,12 @@ def backfill_series(root, market: MarketData, symbol: str, timeframe: str,
         chunks += 1
         if not batch:
             break
-        new_times = {b.time for b in batch}
-        rows.extend(batch)
-        progress = bool(new_times - seen)
-        seen |= new_times
+        before = 0 if merged is None else len(merged)
+        merged = merge_bars(merged, _to_df(batch))
+        added = len(merged) - before
         pos += len(batch)
-        if len(batch) < chunk or not progress:
+        if len(batch) < chunk or added == 0:
             break  # 取尽，或只剩重叠（服务器分页上限等情形）
-    merged = merge_bars(None, _to_df(rows)) if rows else None
     closed = drop_unclosed(merged, timeframe, now) if merged is not None else None
     if closed is None or len(closed) == 0:
         return {"symbol": symbol, "timeframe": timeframe, "rows": 0,
