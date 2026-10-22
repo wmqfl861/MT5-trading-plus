@@ -15,6 +15,9 @@ class MCPServerConfig:
     host: str = "127.0.0.1"
     port: int = 8310
     token: str = ""
+    # Host 头防 DNS 重绑定校验；真门锁是 Bearer 令牌，默认关闭（SDK 同此默认）
+    dns_rebinding_protection: bool = False
+    allowed_hosts: tuple[str, ...] = ()
 
 
 def load_mcp_config(path: str | Path) -> MCPServerConfig:
@@ -32,6 +35,8 @@ def load_mcp_config(path: str | Path) -> MCPServerConfig:
         host=str(data.get("host", "127.0.0.1")),
         port=int(data.get("port", 8310)),
         token=token,
+        dns_rebinding_protection=bool(data.get("dns_rebinding_protection", False)),
+        allowed_hosts=tuple(data.get("allowed_hosts", [])),
     )
 
 

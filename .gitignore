@@ -5,3 +5,6 @@ __pycache__/
 .superpowers/
 data/
 mcp.json
+mcp-remote-prompt.txt
+mcp_server.log
+mcp_server.err

@@ -68,7 +68,13 @@ def run_stdio(data_root: str | Path) -> None:
 
 def run_http(cfg, data_root: str | Path) -> None:
     import uvicorn
+    from mcp.server.transport_security import TransportSecuritySettings
 
-    app = build_server(data_root).streamable_http_app()
+    app = build_server(data_root).streamable_http_app(
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=cfg.dns_rebinding_protection,
+            allowed_hosts=list(cfg.allowed_hosts),
+        ),
+    )
     guarded = bearer_auth_middleware(app, cfg.token)
     uvicorn.run(guarded, host=cfg.host, port=cfg.port, log_level="info")
