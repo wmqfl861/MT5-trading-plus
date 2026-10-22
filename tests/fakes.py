@@ -5,6 +5,20 @@
 - 未配置的行为默认返回 None（贴近真实包的失败形态）
 """
 import threading
+from collections import namedtuple
+
+SendResult = namedtuple(
+    "SendResult",
+    "retcode deal order volume price bid ask comment request_id retcode_external request",
+)
+
+
+def ok_send(price=1.1010, deal=777, order=888, volume=0.01, comment="done"):
+    return SendResult(
+        retcode=10009, deal=deal, order=order, volume=volume, price=price,
+        bid=price - 0.0001, ask=price + 0.0001, comment=comment,
+        request_id=1, retcode_external=0, request=None,
+    )
 
 
 class FakeMT5:

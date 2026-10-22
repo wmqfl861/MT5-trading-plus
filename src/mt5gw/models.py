@@ -140,3 +140,14 @@ class HistoryOrder:
     time_setup: datetime
     time_done: datetime
     comment: str
+
+
+@dataclass(frozen=True)
+class OrderResult:
+    ok: bool  # retcode == 10009 (TRADE_RETCODE_DONE)
+    retcode: int
+    comment: str
+    order_ticket: int | None
+    deal_ticket: int | None
+    deal_price: float | None
+    volume: float | None
