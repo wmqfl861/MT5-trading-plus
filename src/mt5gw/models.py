@@ -67,3 +67,76 @@ class Tick:
     ask: float
     last: float
     volume: float
+
+
+@dataclass(frozen=True)
+class AccountState:
+    login: int
+    server: str
+    company: str
+    currency: str
+    leverage: int
+    balance: float
+    equity: float
+    margin: float
+    margin_free: float
+    margin_mode: int
+    trade_mode: int  # 0=DEMO 1=CONTEST 2=REAL，实盘保险丝依赖
+
+
+@dataclass(frozen=True)
+class Position:
+    ticket: int
+    symbol: str
+    side: str  # "buy"/"sell"
+    volume: float
+    price_open: float
+    sl: float
+    tp: float
+    profit: float
+    time: datetime
+    comment: str
+    magic: int
+
+
+@dataclass(frozen=True)
+class PendingOrder:
+    ticket: int
+    symbol: str
+    kind: str  # buy_limit/sell_limit/buy_stop/sell_stop
+    volume: float
+    price_open: float
+    price_current: float
+    sl: float
+    tp: float
+    time_setup: datetime
+    comment: str
+
+
+@dataclass(frozen=True)
+class Deal:
+    ticket: int
+    order: int
+    symbol: str
+    side: str
+    volume: float
+    price: float
+    profit: float
+    commission: float
+    swap: float
+    fee: float
+    time: datetime
+    comment: str
+
+
+@dataclass(frozen=True)
+class HistoryOrder:
+    ticket: int
+    symbol: str
+    kind: str
+    volume: float
+    price_open: float
+    state: int
+    time_setup: datetime
+    time_done: datetime
+    comment: str
