@@ -7,13 +7,21 @@ import json
 import os
 from dataclasses import dataclass
 
+from mt5gw.errors import LiveTradingBlockedError  # noqa: F401 — 本模块是既有导入路径的重导出点
+
+__all__ = [
+    "GatewayConfig",
+    "load",
+    "ensure_trade_allowed",
+    "LiveTradingBlockedError",
+    "ACCOUNT_TRADE_MODE_DEMO",
+    "ACCOUNT_TRADE_MODE_CONTEST",
+    "ACCOUNT_TRADE_MODE_REAL",
+]
+
 ACCOUNT_TRADE_MODE_DEMO = 0
 ACCOUNT_TRADE_MODE_CONTEST = 1
 ACCOUNT_TRADE_MODE_REAL = 2
-
-
-class LiveTradingBlockedError(Exception):
-    """账户为实盘且未显式解锁时，一切交易调用被拒。"""
 
 
 @dataclass(frozen=True)
