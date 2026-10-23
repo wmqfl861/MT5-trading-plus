@@ -26,6 +26,8 @@ def load_mcp_config(path: str | Path) -> MCPServerConfig:
         raise ValueError(f"配置不存在：{p}（先运行 run_mcp_server.py --init 生成）")
     data = json.loads(p.read_text(encoding="utf-8"))
     token = data.get("token", "")
+    if not isinstance(token, str):
+        raise ValueError(f"token 应为字符串，实际 {type(token).__name__}")
     if not token or len(token) < MIN_TOKEN_LEN:
         raise ValueError(
             f"token 缺失或弱于 {MIN_TOKEN_LEN} 字符——对外服务的唯一门锁，不能弱。"

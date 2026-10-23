@@ -10,6 +10,17 @@ from mt5gw.errors import DataUnavailableError
 from mt5gw.models import SymbolSpec
 
 
+def ensure_symbol_visible(conn, mt5_module, name: str) -> None:
+    """不在 Market Watch 里的品种先加入，否则 copy_* 取不到数据；失败如实上抛。"""
+    row = conn.call(mt5_module.symbol_info, name)
+    if row is not None and not getattr(row, "visible", False):
+        ok = conn.call(mt5_module.symbol_select, name, True)
+        if not ok:
+            raise DataUnavailableError(
+                f"{name} 无法加入 Market Watch：{conn.last_error()}"
+            )
+
+
 def _to_spec(row) -> SymbolSpec:
     return SymbolSpec(
         name=row.name,
@@ -25,6 +36,7 @@ def _to_spec(row) -> SymbolSpec:
         volume_max=row.volume_max,
         volume_step=row.volume_step,
         filling_mode=row.filling_mode,
+        trade_stops_level=getattr(row, "trade_stops_level", 0),
         raw=row,
     )
 
@@ -41,6 +53,7 @@ class SymbolCatalog:
         return [_to_spec(r) for r in rows]
 
     def get(self, name: str) -> SymbolSpec:
+        ensure_symbol_visible(self._conn, self._mt5, name)
         row = self._conn.call(self._mt5.symbol_info, name)
         if row is None:
             raise DataUnavailableError(

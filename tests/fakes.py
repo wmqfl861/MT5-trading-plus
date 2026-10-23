@@ -40,7 +40,7 @@ class FakeMT5:
     TIMEFRAME_MN1 = 49153
 
     # ticks
-    COPY_TICKS_ALL = 2
+    COPY_TICKS_ALL = -1  # 真包值
 
     # order types / filling / actions
     ORDER_TYPE_BUY = 0

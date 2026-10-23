@@ -1,14 +1,19 @@
 """K 线下载器：分块回填全量历史 + 增量刷新，只落库已收盘 bar。
 
-数据保护铁律（C3/I6 修复后）：
+数据保护铁律：
 - 回填中途出错必须上抛，绝不把残缺数据写盘；
-- 与既有文件合并，结果若比现存历史更短/更晚起步则拒绝写入（force=True 除外）；
-- 一根都没取到就是失败；
-- 刷新若与旧数据接不上（空洞）必须报错，绝不静默留洞。
+- 与既有文件一律取并集（force 也只是放弃"收缩即拒"的检查，不丢行）；
+- 彻底替换需显式 --replace，且替换前自动备份旧文件；
+- 刷新用"重叠证明"验证接续：翻页结果必须包含旧末根那一根——
+  接续点之后的缺口属于终端/市场自身的序列（休市），不做算术推断；
+- 一根都没取到、或翻页取尽仍无法与旧数据接续，都是失败。
 """
 from __future__ import annotations
 
 import logging
+import os
+import shutil
+import time
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -16,8 +21,7 @@ import pandas as pd
 from mt5gw.errors import DataUnavailableError
 from mt5gw.market import MarketData
 from mt5data.store import (
-    TIMEFRAME_SECONDS, drop_unclosed, load_bars, merge_bars, read_watermark,
-    save_bars,
+    TIMEFRAME_SECONDS, drop_unclosed, load_bars, merge_bars, save_bars,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,11 +38,11 @@ def _utcnow() -> datetime:
 
 
 def server_now(market: MarketData, symbol: str) -> datetime:
-    """估算服务器"现在"= 墙钟 UTC + 券商时差。
+    """估算服务器"现在" = 墙钟 UTC + 券商时差（由最新 tick 自校准，限幅 ±6h）。
 
-    时差由 (最新 tick 时间 - 墙钟) 自校准，限幅 ±6 小时；周末行情冻结时
-    tick 滞后数日，超出限幅 → 回退 offset=0（墙钟即服务器时钟的近似），
-    保证已收盘的周五 bar 不被误删、未收盘 bar 不会因宽容混入库。
+    注意：超限回退 offset=0 是"墙钟近似"，并非与 tick 完全解耦——周末冻结时
+    tick 滞后数日、offset 回退 0，方向保守（晚判收盘），不会把未收盘 bar 提前
+    放行；GMT 负偏移的券商在极端情况下可能高估 now，见 README 时区约定。
     """
     wall = _utcnow()
     tick_time = market.quote(symbol).time
@@ -52,20 +56,6 @@ def server_now(market: MarketData, symbol: str) -> datetime:
     return wall + offset
 
 
-def _is_weekend_gap(start, end) -> bool:
-    """缺口 [start, end) 是否全部落在服务器时间的周六/周日（休市，非数据洞）。
-
-    小时粒度扫描；注意周日傍晚开市后的真实缺口也会被放行——由下一次
-    全量回填兜底（节假日整日休市同理，需手动重跑回填治愈）。
-    """
-    cur = start
-    while cur < end:
-        if cur.weekday() not in (5, 6):
-            return False
-        cur += timedelta(hours=1)
-    return True
-
-
 def _to_df(bars) -> pd.DataFrame:
     return pd.DataFrame([{
         "time": b.time, "open": b.open, "high": b.high, "low": b.low,
@@ -75,76 +65,86 @@ def _to_df(bars) -> pd.DataFrame:
 
 
 def _fetch_pages(market: MarketData, symbol: str, timeframe: str, chunk: int,
-                 max_chunks: int, stop_before: datetime | None):
-    """从最新往回分块翻页；返回 (合并后的 DataFrame, chunks)。错误一律上抛。
+                 max_chunks: int, stop_before):
+    """从最新往回分页；返回 (合并后的 DataFrame, chunks)。错误一律上抛。
 
-    翻到与 stop_before（旧文件末根时间）重叠即停——既省流量，又验证接续。
+    每页请求 chunk+1 根：整除边界时下一页必然拿不满，杜绝"恰好整数倍
+    导致越界请求"的歧义。翻到与 stop_before 重叠即停。
     """
-    merged: pd.DataFrame | None = None
+    merged = None
     pos = 0
     chunks = 0
+    want = chunk + 1
     while chunks < max_chunks:
-        batch = market.bars(symbol, timeframe, chunk, end_pos=pos)  # 错误上抛
+        batch = market.bars(symbol, timeframe, want, end_pos=pos)  # 错误上抛
         chunks += 1
         if not batch:
             break  # 取尽（服务器无更多历史）
         merged = merge_bars(merged, _to_df(batch))
         pos += len(batch)
-        oldest = merged["time"].iloc[0]
-        if stop_before is not None and oldest <= pd.Timestamp(stop_before):
+        if stop_before is not None and merged["time"].iloc[0] <= pd.Timestamp(stop_before):
             break  # 已与旧数据重叠
-        if len(batch) < chunk:
-            break  # 短块 = 取尽
+        if len(batch) < want:
+            break  # 不满页 = 取尽
+    else:
+        raise DataUnavailableError(
+            f"{symbol} {timeframe} 翻页达 max_chunks={max_chunks} 上限仍未取尽，"
+            "结果不完整，拒绝写入（调大 chunk/max_chunks 后重试）。"
+        )
     return merged, chunks
 
 
-def _shrink_guard(new_df: pd.DataFrame, old: pd.DataFrame | None, symbol, tf, force: bool):
-    """结果不得比现存历史更短或更晚起步（防截断覆盖，C3）。"""
-    if old is None or len(old) == 0 or force:
-        return new_df
-    if len(new_df) < len(old):
+def _lineage_guard(old_meta, meta_info, symbol, tf):
+    """数据血缘：新旧 server/login 不一致说明换了券商/账号，拒绝混写。"""
+    if not meta_info or not old_meta:
+        return
+    old_key = (old_meta.get("server"), old_meta.get("login"))
+    new_key = (meta_info.get("server"), meta_info.get("login"))
+    if old_key != (None, None) and new_key != (None, None) and old_key != new_key:
         raise DataUnavailableError(
-            f"{symbol} {tf}：新取 {len(new_df):,} 根 < 现存 {len(old):,} 根，"
-            "疑似截断（终端同步失败？），拒绝写入；确要覆盖请用 force=True 重跑。"
+            f"{symbol} {tf} 数据来源变更：库内 {old_key} vs 当前 {new_key}，"
+            "拒绝把不同券商/账号的数据混入同一序列（如确要更换，用 --replace）。"
         )
-    if new_df["time"].iloc[0] > old["time"].iloc[0]:
-        raise DataUnavailableError(
-            f"{symbol} {tf}：新数据起点 {new_df['time'].iloc[0]} 晚于现存 "
-            f"{old['time'].iloc[0]}，历史被截断，拒绝写入。"
-        )
-    return merge_bars(old, new_df)
 
 
 def backfill_series(root, market: MarketData, symbol: str, timeframe: str,
                     chunk: int = 500_000, max_chunks: int = 2000, *,
-                    force: bool = False, meta_info: dict | None = None) -> dict:
-    """全量回填：取尽历史 → 剔除未收盘 → 收缩保护 → 原子落库。"""
+                    force: bool = False, replace: bool = False,
+                    meta_info: dict | None = None) -> dict:
+    """全量回填：取尽历史 → 剔除未收盘 → 并集合并（收缩需 force）→ 原子落库。"""
     now = server_now(market, symbol)
     old = load_bars(root, symbol, timeframe)
+    _lineage_guard(_read_meta(root, symbol, timeframe), meta_info, symbol, timeframe)
     merged, chunks = _fetch_pages(market, symbol, timeframe, chunk, max_chunks,
                                   stop_before=None)
     if merged is None or len(merged) == 0:
-        raise DataUnavailableError(  # C3：一根都没取到就是失败
+        raise DataUnavailableError(
             f"{symbol} {timeframe} 未取到任何数据（终端未同步该品种/周期？）"
         )
     closed = drop_unclosed(merged, timeframe, now)
     if closed is None or len(closed) == 0:
         raise DataUnavailableError(f"{symbol} {timeframe} 取到的全是未收盘 bar，异常")
-    guarded = _shrink_guard(closed, old, symbol, timeframe, force)
-    save_bars(root, symbol, timeframe, guarded, **(meta_info or {}))
+    if replace and old is not None and len(old):
+        _backup(root, symbol, timeframe)
+        target = closed  # 显式替换：旧文件已备份
+    else:
+        target = _union_guard(closed, old, symbol, timeframe, force)
+    save_bars(root, symbol, timeframe, target, **(meta_info or {}))
     return {
         "symbol": symbol, "timeframe": timeframe,
-        "rows": int(len(guarded)), "chunks_fetched": chunks,
-        "first_time": guarded["time"].iloc[0].isoformat(),
-        "last_time": guarded["time"].iloc[-1].isoformat(),
+        "rows": int(len(target)), "chunks_fetched": chunks,
+        "first_time": target["time"].iloc[0].isoformat(),
+        "last_time": target["time"].iloc[-1].isoformat(),
     }
 
 
 def refresh_series(root, market: MarketData, symbol: str, timeframe: str,
                    lookback: int = 5000, *, meta_info: dict | None = None) -> dict:
-    """增量刷新：翻页回取至与旧数据重叠；接不上（空洞）必须报错。
+    """增量刷新：翻页回取至与旧末根**重叠**（重叠即接续证明）。
 
-    旧文件不存在时直接转全量回填（绝不静默只存一小段）。
+    接续点之后的缺口（周末/假日休市、日内休市）属于源数据自身的序列，
+    不做算术推断、不会误报；翻页取尽仍够不到旧末根才是失败。
+    旧文件不存在时直接转全量回填。
     """
     old = load_bars(root, symbol, timeframe)
     if old is None or len(old) == 0:
@@ -155,36 +155,24 @@ def refresh_series(root, market: MarketData, symbol: str, timeframe: str,
     now = server_now(market, symbol)
     tf_seconds = TIMEFRAME_SECONDS[timeframe.upper()]
     old_last = old["time"].iloc[-1]
-    # 旧水位之后应有的根数 + 缓冲，再兜底下限，避免长停后刷新留洞
-    gap = (now - old_last).total_seconds() / tf_seconds
-    need = max(lookback, int(gap * 1.2) + 100)
+    gap_bars = (now - old_last).total_seconds() / tf_seconds
+    need = max(lookback, int(gap_bars * 1.2) + 100)
 
     merged, chunks = _fetch_pages(market, symbol, timeframe, need,
                                   max_chunks=2000, stop_before=old_last)
     if merged is None or len(merged) == 0:
         raise DataUnavailableError(f"{symbol} {timeframe} 刷新未取到任何数据")
-
-    new_part = merged[merged["time"] > old_last]
-    if len(new_part) > 0:
-        oldest_new = new_part["time"].iloc[0]
-        expected_next = old_last + pd.to_timedelta(tf_seconds, unit="s")
-        if oldest_new > expected_next:  # I6：空洞检测（周末休市放行）
-            if _is_weekend_gap(expected_next, oldest_new):
-                logger.info(
-                    "%s %s 缺口 %s → %s 全部落在周末（休市），按正常处理",
-                    symbol, timeframe, expected_next, oldest_new,
-                )
-            else:
-                raise DataUnavailableError(
-                    f"{symbol} {timeframe} 刷新存在空洞：旧末根 {old_last} 之后直接跳到 "
-                    f"{oldest_new}（缺约 {int((oldest_new - expected_next).total_seconds() / tf_seconds)} 根）。"
-                    "请重跑全量回填（backfill）。"
-                )
+    if not (merged["time"] == old_last).any():
+        raise DataUnavailableError(
+            f"{symbol} {timeframe} 翻页取尽仍未覆盖旧末根 {old_last}，无法证明与"
+            "旧数据接续（停更过久或服务端缺段）——请重跑全量回填（backfill）。"
+        )
     combined = merge_bars(old, merged)
     closed = drop_unclosed(combined, timeframe, now)
-    # 只动新数据：已入库的旧 bar 未经重新裁决，不因本次刷新被删
     if len(closed) < len(old):
-        closed = combined  # 理论不发生；防御性保留旧数据
+        # 时钟异常的防御分支：绝不因刷新删旧数据
+        logger.warning("%s %s 收盘裁剪反而变短（时钟异常？），保留并集", symbol, timeframe)
+        closed = combined
     save_bars(root, symbol, timeframe, closed, **(meta_info or {}))
     return {
         "symbol": symbol, "timeframe": timeframe,
@@ -193,3 +181,33 @@ def refresh_series(root, market: MarketData, symbol: str, timeframe: str,
         "first_time": closed["time"].iloc[0].isoformat(),
         "last_time": closed["time"].iloc[-1].isoformat(),
     }
+
+
+def _union_guard(new_df: pd.DataFrame, old, symbol, tf, force: bool):
+    """结果与旧文件取并集；比旧历史更短/更晚起步时，force 之外一律拒绝。"""
+    if old is None or len(old) == 0:
+        return new_df
+    shrunk = len(new_df) < len(old) or new_df["time"].iloc[0] > old["time"].iloc[0]
+    if shrunk and not force:
+        raise DataUnavailableError(
+            f"{symbol} {tf}：新取数据比现存更短或更晚起步"
+            f"（新 {len(new_df):,} 根起 {new_df['time'].iloc[0]}，"
+            f"旧 {len(old):,} 根起 {old['time'].iloc[0]}），疑似截断——常见原因是"
+            "终端'图表最大柱数'被重置为默认 10 万（重装/换机后），先检查该设置。"
+            "确要以新数据为准请用 --replace（旧文件自动备份）。"
+        )
+    return merge_bars(old, new_df)  # 并集：force 也不丢行
+
+
+def _read_meta(root, symbol, tf):
+    from mt5data.store import read_watermark
+    return read_watermark(root, symbol, tf)
+
+
+def _backup(root, symbol, tf) -> str:
+    import json
+    d = os.path.join(root, "bars", symbol.upper(), tf.upper())
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    bak = os.path.join(d, f"data.parquet.bak-{stamp}")
+    shutil.copy2(os.path.join(d, "data.parquet"), bak)
+    return bak

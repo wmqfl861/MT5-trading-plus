@@ -19,14 +19,15 @@ PosRow = namedtuple(
     "ticket symbol type volume price_open price_current sl tp swap profit time comment magic",
 )
 OrdRow = namedtuple(
-    "OrdRow", "ticket symbol type volume price_open price_current sl tp time_setup comment"
+    "OrdRow", "ticket symbol type volume_current price_open price_current sl tp "
+             "time_setup comment magic type_time price_stoplimit time_expiration"
 )
 DealRow = namedtuple(
     "DealRow",
     "ticket order position_id symbol type entry volume price profit commission swap fee time comment magic",
 )
 HistRow = namedtuple(
-    "HistRow", "ticket symbol type volume price_open state time_setup time_done comment"
+    "HistRow", "ticket symbol type volume_initial price_open state time_setup time_done comment"
 )
 
 DEMO_ACC = AccRow(
@@ -44,7 +45,8 @@ SHORT = PosRow(
     price_current=1945.0, sl=1970.0, tp=1900.0, swap=0.0, profit=-3.0,
     time=1698000060, comment="", magic=0,
 )
-PEND = OrdRow(8001, "EURUSD", 2, 0.5, 1.0900, 1.1000, 1.0800, 1.1200, 1698000000, "bot")
+PEND = OrdRow(8001, "EURUSD", 2, 0.5, 1.0900, 1.1000, 1.0800, 1.1200,
+              1698000000, "bot", 20261022, 0, 0.0, 0)
 
 
 def make():
@@ -70,7 +72,7 @@ def test_state_maps_all_fields_with_trade_mode():
 def test_state_none_raises_with_last_error():
     acct, fake = make()
     fake.last_error_value = (-6, "terminal not connected")
-    with pytest.raises(Exception, match="terminal not connected"):
+    with pytest.raises(DataUnavailableError, match="terminal not connected"):
         acct.state()
 
 
@@ -133,7 +135,8 @@ def test_position_by_ticket_not_found_raises():
 def test_pending_orders_map_kind():
     acct, fake = make()
     lim = PEND
-    stp = OrdRow(8002, "XAUUSD", 5, 0.1, 1980.0, 1950.0, 0.0, 0.0, 1698000060, "")
+    stp = OrdRow(8002, "XAUUSD", 5, 0.1, 1980.0, 1950.0, 0.0, 0.0, 1698000060, "",
+                 20261022, 0, 0.0, 0)
     fake.set_behavior("orders_get", value=lambda symbol=None, ticket=None: (lim, stp))
     orders = acct.pending_orders()
     assert [o.kind for o in orders] == ["buy_limit", "sell_stop"]

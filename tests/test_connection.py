@@ -103,6 +103,17 @@ def test_last_error_is_serialized():
     assert fake.max_concurrent == 1  # last_error 与 call 互斥进入 mt5 侧
 
 
+def test_reconnect_ok_but_still_disconnected_raises():  # I10：重连≠服务器在线
+    conn, fake = make_conn()
+    fake.terminal_info_value = TerminalInfo(connected=False, trade_allowed=False)
+    fake.initialize_result = True
+    fake.initialize_restores_connection = False  # initialize 成功但服务器仍掉线
+    fake.set_behavior("symbol_info_tick", value=1.1)
+    with pytest.raises(NotConnectedError, match="未连接"):
+        conn.call(fake.symbol_info_tick, "EURUSD")
+    assert fake.calls("symbol_info_tick") == 0  # 陈旧数据路径拒绝执行
+
+
 def test_lazy_connect_on_first_call():
     conn, fake = make_conn()
     fake.set_behavior("symbol_info_tick", value=2.0)

@@ -72,13 +72,33 @@ def test_describe_series_gives_gap_stats(tmp_path):
     assert out["expected_step_minutes"] == 1
 
 
-def test_symbol_traversal_rejected(tmp_path):  # I12：路径穿越/UNC 注入一律拒绝
+def test_symbol_traversal_rejected(tmp_path):  # I12：路径穿越/UNC/点号/换行一律拒绝
     root = make_db(tmp_path)
-    for evil in ("..\..\windows", "\\attacker\share", "EUR/USD", "XAUUSD;moo", "x" * 40):
+    evils = [".." + chr(92) + "x", chr(92) * 2 + "attacker" + chr(92) + "share",
+             "EUR/USD", "XAUUSD;moo", "x" * 40, ".", "..",
+             "EURUSD" + chr(10)]
+    for evil in evils:
         with pytest.raises(ValueError):
             get_bars(root, evil, "M1", limit=5)
         with pytest.raises(ValueError):
             compute_indicator(root, evil, "M1", "rsi", {}, limit=5)
+
+
+def test_indicator_period_capped(tmp_path):  # m4：超大 period 不得让读取失去上界
+    root = make_db(tmp_path)
+    with pytest.raises(ValueError, match="500"):
+        compute_indicator(root, "EURUSD", "M1", "rsi", {"period": 10 ** 9}, limit=5)
+    with pytest.raises(ValueError, match="500"):
+        compute_indicator(root, "EURUSD", "M1", "macd", {"slow": 10 ** 6}, limit=5)
+
+
+def test_indicator_window_invariance(tmp_path):  # m3：limit 变化不得改变同时间戳的值
+    root = make_db(tmp_path, n=300)
+    small = compute_indicator(root, "EURUSD", "M1", "rsi", {"period": 30}, limit=5)
+    large = compute_indicator(root, "EURUSD", "M1", "rsi", {"period": 30}, limit=50)
+    by_time = {v["time"]: v["value"] for v in large["values"]}
+    for v in small["values"]:
+        assert v["value"] == by_time[v["time"]]
 
 
 def test_list_series_raises_when_data_dir_missing(tmp_path):  # M12：不再静默空表

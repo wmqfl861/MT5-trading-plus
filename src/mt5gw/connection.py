@@ -64,11 +64,13 @@ class MT5Connection:
             error = self._mt5.last_error()
             return result, error
 
-    def trade_send(self, request: dict, fuse_check) :
+    def trade_send(self, request: dict, fuse_check, login_check=None):
         """交易唯一出口：同一次持锁内完成 重连检查→保险丝→order_send。
 
         fuse_check(trade_mode) 在 order_send 之前执行；账户状态取不到时
         fail-closed（拒单），杜绝"账户切换竞态"与"漏调保险丝"两类绕过。
+        login_check(login) 非空时同时校验账号（解锁实盘时强制钉死）。
+        返回 (result, last_error)：order_send 无返回时的诊断与发送同锁原子。
         """
         with self._lock:
             self._ready_or_raise()
@@ -78,7 +80,10 @@ class MT5Connection:
                     f"下单前无法确认账户状态，拒绝发送：{self._mt5.last_error()}"
                 )
             fuse_check(account.trade_mode)
-            return self._mt5.order_send(request)  # 直接位置调用（C 扩展解包限制）
+            if login_check is not None:
+                login_check(account.login)
+            result = self._mt5.order_send(request)  # 直接位置调用（C 扩展解包限制）
+            return result, self._mt5.last_error()
 
     def last_error(self) -> str:
         # 同样要过锁：C 扩展非线程安全，错误路径也不能与在途调用并发

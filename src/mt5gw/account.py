@@ -57,11 +57,16 @@ def _position(row) -> Position:
 def _pending(row) -> PendingOrder:
     return PendingOrder(
         ticket=row.ticket, symbol=row.symbol, kind=_kind(row.type),
-        # 真包字段为 volume_current（ORDER_VOLUME_CURRENT）；fake 兼容旧名 volume
+        # 真包字段为 volume_current；fake 兼容旧名 volume
         volume=getattr(row, "volume_current", getattr(row, "volume", 0.0)),
         price_open=row.price_open,
         price_current=row.price_current, sl=row.sl, tp=row.tp,
         time_setup=_utc(row.time_setup), comment=row.comment,
+        magic=getattr(row, "magic", 0),
+        type_time=getattr(row, "type_time", 0),
+        stoplimit=getattr(row, "price_stoplimit", 0.0) or 0.0,
+        expiration=(_utc(row.time_expiration)
+                    if getattr(row, "time_expiration", 0) else None),
     )
 
 
@@ -83,7 +88,9 @@ def _history_order(row) -> HistoryOrder:
     done_raw = getattr(row, "time_done", 0)
     return HistoryOrder(
         ticket=row.ticket, symbol=row.symbol, kind=_kind(row.type),
-        volume=row.volume, price_open=row.price_open, state=row.state,
+        # 真包字段为 volume_initial；fake 兼容旧名 volume
+        volume=getattr(row, "volume_initial", getattr(row, "volume", 0.0)),
+        price_open=row.price_open, state=row.state,
         time_setup=_utc(row.time_setup),
         time_done=_utc(done_raw) if done_raw else None,  # 0 = 未成交/未完成，如实给 None
         comment=row.comment,

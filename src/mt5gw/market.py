@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 
 from mt5gw.connection import MT5Connection
 from mt5gw.errors import DataUnavailableError
+from mt5gw.symbols import ensure_symbol_visible
 from mt5gw.models import Bar, Quote, Tick, _epoch_seconds, _utc
 
 _LATEST_TICK_WINDOW = timedelta(minutes=5)
@@ -104,10 +105,4 @@ class MarketData:
         return self._timeframes[key]
 
     def _ensure_visible(self, symbol: str) -> None:
-        row = self._conn.call(self._mt5.symbol_info, symbol)
-        if row is not None and not getattr(row, "visible", False):
-            ok = self._conn.call(self._mt5.symbol_select, symbol, True)
-            if not ok:  # M7：失败如实上抛，别让后续报错指向错误原因
-                raise DataUnavailableError(
-                    f"{symbol} 无法加入 Market Watch：{self._conn.last_error()}"
-                )
+        ensure_symbol_visible(self._conn, self._mt5, symbol)

@@ -42,7 +42,8 @@ def test_context_manager_connects_and_shuts_down():
 
 def test_from_config_file_builds_config(tmp_path):
     p = tmp_path / "config.json"
-    p.write_text(json.dumps({"magic": 7, "allow_live_trading": True}), encoding="utf-8")
+    p.write_text(json.dumps({"magic": 7, "allow_live_trading": True,
+                             "expected_login": 42}), encoding="utf-8")
     gw = MT5Gateway.from_config_file(str(p), mt5_module=FakeMT5())
     assert gw.config.magic == 7
     assert gw.config.allow_live_trading is True

@@ -19,20 +19,25 @@ from mt5data.downloader import ALL_TIMEFRAMES, backfill_series, refresh_series  
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="下载/刷新 MT5 K线到 Parquet")
-    ap.add_argument("--symbols", required=True, help="逗号分隔，如 XAUUSD,BTCUSD")
+    ap.add_argument("--symbols", required=True, help="逗号分隔，如 XAUUSD,XAUUSDm")
+    ap.add_argument("--config", default=None,
+                    help="可选 config.json（读取终端路径等网关配置）")
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--timeframes", default=",".join(ALL_TIMEFRAMES))
     ap.add_argument("--refresh", action="store_true", help="增量刷新已有序列")
     ap.add_argument("--chunk", type=int, default=500_000)
     ap.add_argument("--force", action="store_true",
-                    help="允许回填覆盖更短/更晚起步的既有历史（截断保护的对冲开关）")
+                    help="新数据比现存短时仍取并集写入（不丢行）")
+    ap.add_argument("--replace", action="store_true",
+                    help="彻底用新数据替换旧文件（自动备份到 data.parquet.bak-时间戳）")
     args = ap.parse_args()
 
-    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]  # 保留大小写
     tfs = [t.strip().upper() for t in args.timeframes.split(",") if t.strip()]
     failed = []
 
-    with MT5Gateway() as gw:
+    gw = (MT5Gateway.from_config_file(args.config) if args.config else MT5Gateway())
+    with gw:
         try:
             st = gw.account.state()
             meta_info = {"server": st.server, "login": st.login}
@@ -49,6 +54,7 @@ def main() -> int:
                     else:
                         stats = backfill_series(args.data_dir, gw.market, sym, tf,
                                                 chunk=args.chunk, force=args.force,
+                                                replace=args.replace,
                                                 meta_info=meta_info)
                         extra = f" 块数={stats['chunks_fetched']}"
                 except Exception as e:  # 单序列失败不中断其余下载

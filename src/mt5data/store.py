@@ -27,7 +27,8 @@ _COLUMNS = ["time", "open", "high", "low", "close",
 
 
 def series_dir(root, symbol: str, timeframe: str) -> str:
-    return os.path.join(root, "bars", symbol.upper(), timeframe.upper())
+    # 品种名保留原大小写（XAUUSDm 等带后缀品种大小写敏感）；周期用规范大写
+    return os.path.join(root, "bars", symbol, timeframe.upper())
 
 
 def merge_bars(old: pd.DataFrame | None, new: pd.DataFrame) -> pd.DataFrame:
@@ -64,21 +65,79 @@ def drop_unclosed(df: pd.DataFrame, timeframe: str, now_server: datetime) -> pd.
 
 
 def _atomic_replace(tmp_path: str, final_path: str) -> None:
-    for attempt in range(5):
+    for attempt in range(10):
         try:
             os.replace(tmp_path, final_path)
             return
         except PermissionError:
-            if attempt == 4:
+            if attempt == 9:
                 raise
-            time.sleep(0.2 * (attempt + 1))  # Windows：读者占着句柄时稍候重试
+            time.sleep(0.3)  # Windows：读者占着句柄时稍候重试（总预算约 3 秒）
+
+
+def _fsync_file(path: str) -> None:
+    fd = os.open(path, os.O_RDWR)  # Windows：fsync 需写句柄
+    try:
+        os.fsync(fd)  # 落盘后再替换，掉电不至半截
+    finally:
+        os.close(fd)
+
+
+class _SeriesLock:
+    """同序列的跨进程写锁（定时刷新与手动回填并发时互相保护）。
+
+    锁文件带时间戳，超过 stale_after 视为残锁接管（进程崩溃遗留）。
+    """
+
+    def __init__(self, directory: str, stale_after: float = 600.0):
+        self._path = os.path.join(directory, ".lock")
+        self._stale = stale_after
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self._path), exist_ok=True)
+        for _ in range(50):
+            try:
+                fd = os.open(self._path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(time.time()).encode())
+                os.close(fd)
+                return self
+            except FileExistsError:
+                try:
+                    age = time.time() - os.path.getmtime(self._path)
+                    if age > self._stale:
+                        os.remove(self._path)  # 残锁接管
+                        continue
+                except OSError:
+                    pass
+                time.sleep(0.2)
+        raise TimeoutError(f"等待序列写锁超时：{self._path}（另一进程在写？）")
+
+    def __exit__(self, *exc):
+        try:
+            os.remove(self._path)
+        except OSError:
+            pass
 
 
 def save_bars(root, symbol: str, timeframe: str, df: pd.DataFrame,
               *, server: str | None = None, login: int | None = None) -> None:
-    """原子写入 data.parquet 与 meta.json（先数据后水位，临时文件过渡）。"""
+    """原子写入 data.parquet 与 meta.json（先数据后水位，跨进程序列锁）。"""
     d = series_dir(root, symbol, timeframe)
     os.makedirs(d, exist_ok=True)
+    with _SeriesLock(d):
+        _save_bars_locked(d, symbol, timeframe, df, server=server, login=login)
+
+
+def _save_bars_locked(d, symbol, timeframe, df, *, server=None, login=None):
+    # meta 的 server/login 未提供时继承旧值（别用 null 覆盖掉数据来源）
+    old_meta_path = os.path.join(d, "meta.json")
+    if (server is None or login is None) and os.path.exists(old_meta_path):
+        try:
+            old = json.load(open(old_meta_path, encoding="utf-8"))
+            server = old.get("server") if server is None else server
+            login = old.get("login") if login is None else login
+        except (OSError, ValueError):
+            pass
     out = df.copy()
     out["time"] = pd.to_datetime(out["time"]).astype("datetime64[ns]")
     for c in ("open", "high", "low", "close"):
@@ -89,6 +148,7 @@ def save_bars(root, symbol: str, timeframe: str, df: pd.DataFrame,
 
     parquet_tmp = os.path.join(d, "data.parquet.tmp")
     out.to_parquet(parquet_tmp, index=False)
+    _fsync_file(parquet_tmp)
     _atomic_replace(parquet_tmp, os.path.join(d, "data.parquet"))
 
     wm = {

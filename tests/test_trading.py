@@ -5,7 +5,7 @@ import pytest
 from mt5gw.account import AccountService
 from mt5gw.config import GatewayConfig, LiveTradingBlockedError
 from mt5gw.connection import MT5Connection
-from mt5gw.errors import RETCode, OrderResultUnknownError, TradeRejectedError
+from mt5gw.errors import RETCode, DataUnavailableError, OrderResultUnknownError, TradeRejectedError
 from mt5gw.symbols import SymbolCatalog
 from mt5gw.trading import TradingService, clamp_volume, pick_filling
 
@@ -52,10 +52,11 @@ def sym(filling=1, v_min=0.01, v_max=100.0, step=0.01):
     )
 
 
-def make(trade_mode=0, filling=1, allow_live=False, **sym_kw):
+def make(trade_mode=0, filling=1, allow_live=False, expected_login=None, **sym_kw):
     fake = FakeMT5()
     conn = MT5Connection(mt5_module=fake)
-    config = GatewayConfig(allow_live_trading=allow_live)
+    config = GatewayConfig(allow_live_trading=allow_live,
+                           expected_login=expected_login)
     fake.set_behavior("account_info", value=ACC._replace(trade_mode=trade_mode))
     fake.set_behavior("symbol_info", value=sym(filling=filling, **sym_kw))
     fake.set_behavior("symbol_select", value=True)
@@ -167,11 +168,20 @@ def test_fuse_immune_to_truthy_string_unlock():  # I1：非严格布尔解锁一
         dataclasses.replace(GatewayConfig(), allow_live_trading=1)
 
 
-def test_fuse_allows_real_when_unlocked():
-    tr, fake = make(trade_mode=2, allow_live=True)
+def test_fuse_allows_real_when_unlocked_and_pinned():
+    tr, fake = make(trade_mode=2, allow_live=True, expected_login=ACC.login)
     box = capture_request(fake)
     res = tr.market_order("EURUSD", "buy", 0.01)
     assert res.ok and fake.calls("order_send") == 1
+
+
+def test_pinned_login_mismatch_rejects():  # 解锁后被切到别的实盘账号 → 拒单
+    from mt5gw.config import GatewayConfig as C
+    tr, fake = make(trade_mode=2, allow_live=True, expected_login=999999)
+    capture_request(fake)
+    with pytest.raises(LiveTradingBlockedError, match="expected_login"):
+        tr.market_order("EURUSD", "buy", 0.01)
+    assert fake.calls("order_send") == 0
 
 
 # ---- 市价单 ----
@@ -192,8 +202,9 @@ def test_market_order_sends_correct_request():
     assert req["comment"] == "hello"
     assert req["type_filling"] == FakeMT5.ORDER_FILLING_FOK  # bits=1：仅 FOK 可用
     assert req["price"] == 1.10462  # 买入带当前 ask（Exness 要求显式参考价）
-    assert res.ok and res.confirmed
+    assert res.ok and res.filled and not res.partial
     assert res.deal_ticket == 777 and res.order_ticket == 888 and res.deal_price == 1.1010
+    assert res.requested_volume == 0.02
 
 
 def test_market_order_sell_uses_bid_price():
@@ -251,20 +262,56 @@ def test_rejected_retcode_raises_with_readable_message():
 
 # ---- 成交结果语义（I3）----
 
-def test_done_partial_is_success_and_confirmed():
+def test_done_partial_is_success_and_filled():
     tr, fake = make()
     capture_request(fake, result=ok_send()._replace(retcode=10010, volume=0.006))
     res = tr.market_order("EURUSD", "buy", 0.01)
-    assert res.ok and res.confirmed  # 部分成交：仓位已建立，绝不能当"被拒"
-    assert res.volume == 0.006
+    assert res.ok and res.filled and res.partial  # 部分成交：仓位已建立，绝不能当"被拒"
+    assert res.volume == 0.006 and res.requested_volume == 0.01
 
 
-def test_placed_is_ok_but_unconfirmed():
+def test_placed_is_ok_but_not_filled():
     tr, fake = make()
     capture_request(fake, result=ok_send()._replace(retcode=10008, order=999, deal=0, price=0.0))
     res = tr.pending_order("EURUSD", "buy", "limit", 0.01, 1.0900)
-    assert res.ok and res.confirmed is False
+    assert res.ok and res.filled is False and res.partial is False
     assert res.deal_ticket is None and res.deal_price is None
+
+
+def test_requote_retried_with_fresh_reference_price():
+    # 真机发现：参考价与发送之间行情变动 → 10004 Requote。
+    # 执行层应有界重试（每次重取参考价），这是传输鲁棒性而非策略逻辑。
+    tr, fake = make()
+    prices = [1.10462, 1.10470, 1.10480]  # 行情在走
+    fake.set_behavior(
+        "symbol_info_tick",
+        value=lambda symbol=None: TickInfo(1698000000, prices[0] - 0.0001,
+                                           prices[fake.state.get("i", 0)], 0, 7)
+        if not fake.state.get("i") else TickInfo(1698000000, 0, prices[fake.state["i"]], 0, 7),
+    )
+    fake.state = {"i": 0}
+    calls = {"n": 0}
+
+    def send(req):
+        calls["n"] += 1
+        fake.state["i"] = min(calls["n"], len(prices) - 1)
+        if calls["n"] < 3:
+            return ok_send()._replace(retcode=10004, comment="Requote")
+        return ok_send(price=req.get("price", 1.1))
+
+    fake.set_behavior("order_send", value=send)
+    res = tr.market_order("EURUSD", "buy", 0.01)
+    assert res.ok and calls["n"] == 3  # 两次 Requote 后第三次成功
+
+
+def test_requote_exhausts_retries_and_raises():
+    tr, fake = make()
+    fake.state = {}
+    fake.set_behavior("order_send",
+                      value=ok_send()._replace(retcode=10004, comment="Requote"))
+    with pytest.raises(TradeRejectedError, match="重新报价"):
+        tr.market_order("EURUSD", "buy", 0.01)
+    assert fake.calls("order_send") == 3  # 有界：至多 3 次
 
 
 def test_order_send_none_raises_unknown_result():
@@ -302,7 +349,7 @@ def test_cancel_order_sends_remove_action():
 def test_cancel_unknown_order_raises():
     tr, fake = make()
     capture_request(fake)
-    with pytest.raises(Exception, match="8002"):
+    with pytest.raises(DataUnavailableError, match="8002"):
         tr.cancel_order(8002)
     assert fake.calls("order_send") == 0
 
@@ -339,7 +386,7 @@ def test_modify_position_requires_sl_or_tp():
 def test_modify_position_unknown_ticket_raises():
     tr, fake = make()
     capture_request(fake)
-    with pytest.raises(Exception, match="9002"):
+    with pytest.raises(DataUnavailableError, match="9002"):
         tr.modify_position(9002, sl=1.08)
     assert fake.calls("order_send") == 0
 
@@ -401,6 +448,6 @@ def test_close_unknown_position_raises():
     tr, fake = make()
     fake.set_behavior("positions_get", value=lambda symbol=None, ticket=None: ())
     capture_request(fake)
-    with pytest.raises(Exception, match="9002"):
+    with pytest.raises(DataUnavailableError, match="9002"):
         tr.close_position(9002)
     assert fake.calls("order_send") == 0

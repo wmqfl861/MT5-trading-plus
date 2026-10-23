@@ -1,8 +1,9 @@
 """交易服务：开仓、挂单、改单、改持仓、撤单、平仓。
 
 铁律（见设计文档）：网关不含任何策略逻辑，SL/TP 只透传；
-一切交易请求经 MT5Connection.trade_send 在同一次持锁内通过实盘保险丝；
-失败如实抛错；"只改一侧、另一侧保持现值"——绝不把未传的字段当 0 发出。
+一切交易请求经 MT5Connection.trade_send 在同一次持锁内通过实盘保险丝
+（解锁实盘必须钉死 expected_login）；失败如实抛错；
+"只改一侧、另一侧保持现值"——绝不把未传的字段当 0 发出。
 """
 from __future__ import annotations
 
@@ -12,15 +13,17 @@ from mt5gw.account import AccountService
 from mt5gw.config import GatewayConfig, ensure_trade_allowed
 from mt5gw.connection import MT5Connection
 from mt5gw.errors import (
-    RETCode, DataUnavailableError, OrderResultUnknownError, TradeRejectedError,
+    RETCode, DataUnavailableError, LiveTradingBlockedError,
+    OrderResultUnknownError, TradeRejectedError,
 )
-from mt5gw.models import OrderResult
+from mt5gw.models import OrderResult, _epoch_seconds
 from mt5gw.symbols import SymbolCatalog
 
 _FILL_FOK, _FILL_IOC, _FILL_RETURN = 0, 1, 2  # ORDER_FILLING_*，与包一致
 _TIME_GTC = 0  # ORDER_TIME_GTC
 # DONE=完成；DONE_PARTIAL=部分成交（仓位已建立）；PLACED=已受理（多见于挂单）
 _OK_RETCODES = frozenset({RETCode.DONE, RETCode.DONE_PARTIAL, RETCode.PLACED})
+_REQUOTE_ATTEMPTS = 3  # 10004 Requote 的有界重试（每次重取参考价）
 
 _PENDING_TYPE = {
     ("buy", "limit"): "ORDER_TYPE_BUY_LIMIT",
@@ -82,7 +85,7 @@ class TradingService:
     ) -> OrderResult:
         if side not in ("buy", "sell"):
             raise ValueError(f"非法方向 {side}，仅接受 buy/sell")
-        spec = self._symbols.get(symbol)
+        spec = self._symbols.get(symbol)  # 含可见性保证（不在 Market Watch 会自动加入）
         request = {
             "action": self._mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
@@ -98,10 +101,7 @@ class TradingService:
             request["sl"] = sl
         if tp is not None:
             request["tp"] = tp
-        ref = self._ref_price(symbol, side)  # Exness 等券商要求市价单也带参考价
-        if ref is not None:
-            request["price"] = ref
-        return self._send(request)
+        return self._send_deal_with_requote(request, symbol, side)
 
     def pending_order(
         self,
@@ -143,7 +143,7 @@ class TradingService:
         tp: float | None = None,
         price: float | None = None,
     ) -> OrderResult:
-        """改挂单；未传的字段回填当前值——MT5 语义里缺省即 0（等于删除）。"""
+        """改挂单；未传的字段回填当前值——MT5 语义里缺省即 0（等于删除/重置）。"""
         order = self._account.pending_order(ticket)
         request = {
             "action": self._mt5.TRADE_ACTION_MODIFY,
@@ -152,8 +152,11 @@ class TradingService:
             "price": order.price_open if price is None else price,
             "sl": order.sl if sl is None else sl,
             "tp": order.tp if tp is None else tp,
-            "type_time": _TIME_GTC,
+            "type_time": order.type_time,          # 保持原有效期（GTC/DAY/…）
+            "stoplimit": order.stoplimit,          # STOP_LIMIT 单的触发价，保持现值
         }
+        if order.expiration is not None:
+            request["expiration"] = _epoch_seconds(order.expiration)
         return self._send(request)
 
     def modify_position(
@@ -209,13 +212,35 @@ class TradingService:
             "type_time": _TIME_GTC,
             "type_filling": pick_filling(spec.filling_mode),
         }
-        ref = self._ref_price(pos.symbol, close_side)
+        return self._send_deal_with_requote(request, pos.symbol, close_side)
+
+    # ---- 内部 ----
+
+    def _send_deal_with_requote(self, request: dict, symbol: str, side: str) -> OrderResult:
+        """市价类请求：10004 Requote 时重取参考价有界重试（执行层鲁棒性）。"""
+        ref = self._ref_price(symbol, side)
         if ref is not None:
             request["price"] = ref
-        return self._send(request)
+        for attempt in range(1, _REQUOTE_ATTEMPTS + 1):
+            try:
+                return self._send(request)
+            except TradeRejectedError as exc:
+                if exc.retcode != RETCode.REQUOTE or attempt == _REQUOTE_ATTEMPTS:
+                    raise
+                ref = self._ref_price(symbol, side)  # 行情在走，重取参考价
+                if ref is not None:
+                    request["price"] = ref
+        raise AssertionError("unreachable")
 
     def _fuse_check(self, trade_mode: int) -> None:
         ensure_trade_allowed(trade_mode, self._config.allow_live_trading)
+
+    def _login_check(self, login: int) -> None:
+        expected = self._config.expected_login
+        if expected is not None and login != expected:
+            raise LiveTradingBlockedError(
+                f"当前账号 {login} 与配置钉死的 expected_login={expected} 不符，拒单。"
+            )
 
     def _volume(self, volume: float, spec) -> float:
         try:
@@ -226,24 +251,28 @@ class TradingService:
             raise TradeRejectedError(RETCode.INVALID_VOLUME, str(exc)) from exc
 
     def _send(self, request: dict) -> OrderResult:
-        # 唯一出口：保险丝+order_send 在连接层的同一次持锁内原子执行
-        result = self._conn.trade_send(request, self._fuse_check)
+        # 唯一出口：保险丝+账号钉死+order_send 在连接层同一次持锁内原子执行
+        result, err = self._conn.trade_send(
+            request, self._fuse_check, self._login_check
+        )
         if result is None:
             raise OrderResultUnknownError(
                 f"order_send 无返回（IPC 中断等）：订单实际状态未知，"
-                f"请核对持仓后再决定是否重发。{self._conn.last_error()}"
+                f"请核对持仓后再决定是否重发。last_error={err}"
             )
         if result.retcode not in _OK_RETCODES:
             raise TradeRejectedError(result.retcode, result.comment)
-        confirmed = result.retcode != RETCode.PLACED
+        filled = result.retcode in (RETCode.DONE, RETCode.DONE_PARTIAL)
         return OrderResult(
             ok=True,
-            confirmed=confirmed,
+            filled=filled,  # True=已回报成交（DONE/DONE_PARTIAL）；PLACED 为未成交
+            partial=result.retcode == RETCode.DONE_PARTIAL,
             retcode=result.retcode,
             comment=result.comment,
             order_ticket=result.order,
             deal_ticket=result.deal if result.deal else None,
-            deal_price=result.price if confirmed and result.price else None,
+            deal_price=result.price if filled and result.price else None,
+            requested_volume=request.get("volume"),
             volume=result.volume,
         )
 

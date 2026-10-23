@@ -21,13 +21,39 @@ MAX_BARS_LIMIT = 500
 MAX_INDICATOR_POINTS = 500
 
 # 品种名白名单：MT5 品种只含字母数字与 . _ # + -（如 XAUUSD.m、BTCUSD#)
-_SYMBOL_RE = re.compile(r"^[A-Za-z0-9._#+-]{1,32}$")
+# 用 fullmatch（$ 可被尾随换行绕过）
+_SYMBOL_RE = re.compile(r"[A-Za-z0-9._#+-]{1,32}")
 
-_INDICATOR_WARMUP = 260  # 基础预热；实际按 max(260, 5*period) 缩放（残余 <1e-4）
+MAX_PERIOD = 500  # m4：period 上限，防超大 period 让 LIMIT 覆盖全表
+
+
+def _capped_period(value: int, name: str) -> int:
+    v = int(value)
+    if v < 1 or v > MAX_PERIOD:
+        raise ValueError(f"{name} 必须在 1..{MAX_PERIOD} 之间，收到 {value}")
+    return v
+
+
+def _warmup_for(indicator: str, params: dict) -> int:
+    """预热根数：保证首个返回点的种子残余 <1e-4。
+
+    Wilder 类（rsi/atr）残余按 (1-1/n)^k 衰减，需约 10.5n；
+    EMA 类 5n 即 e^-10 量级；macd 由 slow 与 signal 中较大者决定。
+    """
+    n = int(params.get("period", 0) or 0)
+    if indicator in ("rsi", "atr"):
+        n = n or (14 if indicator == "rsi" else 14)
+        return max(260, int(10.5 * n) + n)
+    if indicator == "macd":
+        slow = int(params.get("slow", 0) or 26)
+        signal = int(params.get("signal", 0) or 9)
+        return max(260, 5 * max(slow, signal) + 50)
+    n = n or 20
+    return max(260, 5 * n + 50)
 
 
 def _validate_symbol(symbol: str) -> str:
-    if not isinstance(symbol, str) or not _SYMBOL_RE.match(symbol):
+    if not isinstance(symbol, str) or not _SYMBOL_RE.fullmatch(symbol):
         raise ValueError(f"非法品种名 {symbol!r}（只接受 MT5 品名字符集）")
     if symbol.strip("._") == "":  # 拒绝 "."、".." 等纯点号路径组件
         raise ValueError(f"非法品种名 {symbol!r}")
@@ -56,7 +82,8 @@ def list_series(root) -> list[dict]:
     """库里有哪些品种×周期，各多少行、时间范围。"""
     bars_dir = Path(root) / "bars"
     if not bars_dir.exists():
-        raise ValueError(f"数据目录不存在：{bars_dir}（用绝对路径或正确的 --data-dir 启动服务）")
+        # 不回显服务器绝对路径
+        raise ValueError("数据目录不存在：请检查服务的 --data-dir 与启动目录")
     out = []
     for wm_file in sorted(bars_dir.glob("*/*/meta.json")):
         wm = read_watermark(root, wm_file.parent.parent.name, wm_file.parent.name)
@@ -160,9 +187,10 @@ def compute_indicator(root, symbol: str, timeframe: str, indicator: str,
     """服务端现算指标，只回最后 limit 个点（只读尾部 limit+预热期，不碰全量）。"""
     limit = max(1, min(int(limit), MAX_INDICATOR_POINTS))
     params = params or {}
-    period = max(int(params.get("period", 0) or 0),
-                 int(params.get("slow", 0) or 0))  # macd 的 slow 决定预热长度
-    warmup = max(_INDICATOR_WARMUP, 5 * period)
+    for key in ("period", "fast", "slow", "signal"):
+        if key in params and params[key]:
+            params[key] = _capped_period(params[key], key)
+    warmup = _warmup_for(indicator, params)
     path = _parquet_path(root, symbol, timeframe)
     con = duckdb.connect()
     try:

@@ -145,7 +145,8 @@ def test_backfill_zero_rows_is_failure(tmp_path, pinned_wall):
         backfill_series(tmp_path, market, "EURUSD", "M1")
 
 
-def test_backfill_shrink_guard_rejects_and_force_overrides(tmp_path, pinned_wall):
+def test_backfill_shrink_guard_rejects_force_unions_replace_backs_up(tmp_path, pinned_wall):
+    import glob
     # 先存 300 根"深历史"
     fake, market, symbols, wall = make_gateway(total_history=300, now_min=299)
     pinned_wall(wall())
@@ -154,11 +155,16 @@ def test_backfill_shrink_guard_rejects_and_force_overrides(tmp_path, pinned_wall
     # 服务器现在只给得出 100 根（同步不完整）→ 拒绝写
     fake2, market2, _, wall2 = make_gateway(total_history=100, now_min=99)
     pinned_wall(wall2())
-    with pytest.raises(DataUnavailableError, match="拒绝写入"):
+    with pytest.raises(DataUnavailableError, match="疑似截断"):
         backfill_series(tmp_path, market2, "EURUSD", "M1", chunk=100)
-    # force=True 才允许覆盖
+    # N4：force 是并集（不丢行），不是覆盖
     stats = backfill_series(tmp_path, market2, "EURUSD", "M1", chunk=100, force=True)
-    assert stats["rows"] == 99
+    assert stats["rows"] == 299  # 旧 300 - 形成中 1 根，并集保留深历史
+    # 彻底替换走 replace，且自动备份
+    stats2 = backfill_series(tmp_path, market2, "EURUSD", "M1", chunk=100, replace=True)
+    assert stats2["rows"] == 99
+    baks = glob.glob(str(tmp_path / "bars" / "EURUSD" / "M1" / "data.parquet.bak-*"))
+    assert len(baks) == 1  # 旧数据已备份，可恢复
 
 
 def test_weekend_frozen_quote_keeps_last_closed_bar(tmp_path, pinned_wall):
@@ -185,18 +191,26 @@ def test_refresh_appends_new_bars(tmp_path, pinned_wall):
     assert stats["new_bars"] == 10
 
 
-def test_refresh_detects_hole_and_raises(tmp_path, pinned_wall):
-    # 周一基线：交易日内的 5 根缺口必须报错
+def test_refresh_requires_overlap_proof(tmp_path, pinned_wall):
+    # 周一基线；旧末根对应 p11。把 p11 从服务端抹掉 → 翻页永远盖不到旧末根 → 报错
     fake, market, symbols, wall = make_gateway(total_history=100, now_min=99, base=MONDAY)
     pinned_wall(wall())
     backfill_series(tmp_path, market, "EURUSD", "M1", chunk=100)
     fake.state["now"] = MONDAY + timedelta(minutes=109, seconds=30)
     fake.state["total"] = 110
-    fake.state["skip"] = set(range(6, 11))
+    fake.state["skip"] = {11}  # 旧末根那一根服务端缺失
     fake.state["counter"]["n"] = 0
     pinned_wall(fake.state["now"])
-    with pytest.raises(DataUnavailableError, match="空洞"):
+    with pytest.raises(DataUnavailableError, match="接续"):
         refresh_series(tmp_path, market, "EURUSD", "M1", lookback=50)
+
+
+def test_refresh_exact_multiple_boundary_no_spurious_error(tmp_path, pinned_wall):
+    # m5：历史根数恰为页大小整数倍（100 根、页 99+1=100）→ 不得因越界报错
+    fake, market, symbols, wall = make_gateway(total_history=200, now_min=199, base=MONDAY)
+    pinned_wall(wall())
+    stats = backfill_series(tmp_path, market, "EURUSD", "M1", chunk=100)
+    assert stats["rows"] == 199  # 200 根去形成中 1 根，边界无异常
 
 
 def test_refresh_weekend_gap_is_allowed(tmp_path, pinned_wall):

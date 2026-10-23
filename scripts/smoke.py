@@ -38,11 +38,16 @@ def main() -> int:
     if "--config" in sys.argv:
         config_path = sys.argv[sys.argv.index("--config") + 1]
 
-    # C2：配置可读则读，读不到用默认；无论来源，保险丝强制灭活
+    # C2：配置可读则读；显式指定的路径不存在直接报错（不静默用默认）
+    if "--config" in sys.argv and not os.path.exists(config_path):
+        print(f"✗ 指定的配置文件不存在：{config_path}")
+        return 1
     if os.path.exists(config_path):
-        cfg = replace(load(config_path), allow_live_trading=False)
+        cfg = replace(load(config_path), allow_live_trading=False,
+                      magic=902424)  # 冒烟专属 magic，绝不误伤策略持仓
     else:
-        cfg = replace(GatewayConfig(), allow_live_trading=False)
+        print("· 未找到 config.json，使用安全默认（仅模拟盘）")
+        cfg = replace(GatewayConfig(), allow_live_trading=False, magic=902424)
 
     with MT5Gateway(cfg) as gw:
         # ① 品种目录
@@ -101,6 +106,7 @@ def main() -> int:
 
         res = None
         pos_ticket = None
+        _pend_ticket = None
         try:
             # ④ 下单（最小手数×2 市价买入，为部分平仓留余量）+ 二次核身
             print("④ 下单（市价买入）")
@@ -111,8 +117,13 @@ def main() -> int:
                          f"{st.login}/{st.trade_mode} → {again.login}/{again.trade_mode}")
                     return 1
                 volume = round(spec.volume_min * 2, 8)
-                res = gw.trading.market_order(symbol, "buy", volume, comment="smoke")
-                if not res.confirmed:
+                # 带非零 SL 开仓：⑤ 只改 TP 后 SL 必须原样保留（C1 的真证明）
+                dist = max(spec.trade_stops_level + 20, 30) * spec.point
+                open_sl = round(quote.ask - dist, spec.digits)
+                open_tp = round(quote.ask + dist, spec.digits)
+                res = gw.trading.market_order(symbol, "buy", volume,
+                                              sl=open_sl, tp=open_tp, comment="smoke")
+                if not res.filled:
                     step(False, f"retcode={res.retcode} 成交未确认", str(res))
                     res = None
                 else:
@@ -134,6 +145,7 @@ def main() -> int:
                 far = round(quote.ask * 0.99, spec.digits)  # 距现价 1%，远超 stops level
                 pend = gw.trading.pending_order(symbol, "buy", "limit",
                                                 spec.volume_min, far, comment="smoke-pend")
+                _pend_ticket = pend.order_ticket if pend.ok else None
                 if not pend.ok:
                     step(False, f"挂单失败 retcode={pend.retcode}", pend.comment)
                 else:
@@ -146,19 +158,19 @@ def main() -> int:
             except GatewayError as e:
                 step(False, "挂单/撤单", str(e))
 
-            # ⑤ 改持仓 SL/TP（只改一侧，另一侧保持现值——真机验证 C1 修复）
-            print("⑤ 改持仓（只设 TP，SL 应保持 0）")
+            # ⑤ 改持仓 SL/TP（只改一侧，另一侧保持现值——C1 的真证明：
+            #    开仓带非零 SL，只改 TP，断言 SL 仍是 open_sl 而非 0）
+            print("⑤ 改持仓（只设 TP，非零 SL 必须原样保留）")
             try:
                 pos = gw.account.position(res.order_ticket)
                 pos_ticket = pos.ticket
-                guard = pos.volume * spec.point * 500  # 宽距离，避免 INVALID_STOPS
-                far_tp = round(res.deal_price + guard, spec.digits)
-                mod = gw.trading.modify_position(pos.ticket, tp=far_tp)
+                new_tp = round(pos.price_current + dist, spec.digits)
+                mod = gw.trading.modify_position(pos.ticket, tp=new_tp)
                 pos2 = gw.account.position(pos.ticket)
-                step(mod.ok and pos2.sl == 0.0 and pos2.tp == far_tp,
-                     f"TP={pos2.tp} SL={pos2.sl}",
-                     "只改 TP：SL 保持 0（未被清成 0 以外的假值），TP 已生效" if pos2.tp == far_tp
-                     else f"期望 TP={far_tp} 实际 {pos2.tp}")
+                ok5 = (mod.ok and pos2.sl == open_sl and pos2.tp == new_tp)
+                step(ok5, f"TP={pos2.tp} SL={pos2.sl}",
+                     f"只改 TP：SL 保持 {open_sl}（未被清 0），TP 已生效" if ok5
+                     else f"期望 SL={open_sl} TP={new_tp}，实际 SL={pos2.sl} TP={pos2.tp}")
             except GatewayError as e:
                 step(False, "改持仓", str(e))
 
@@ -182,18 +194,36 @@ def main() -> int:
             except GatewayError as e:
                 step(False, "平仓", str(e))
         finally:
-            # C2：无论 ④⑤⑥ 成败（含"结果未知"异常），兜底清掉可能残留的仓位/挂单
+            # N3：兜底只清冒烟自己开的票（按 ticket 精确处理），
+            # 任何异常（含 AttributeError 类）都不得逃出 finally
+            own_positions = set()
+            own_orders = set()
+            if res is not None:
+                own_positions.add(res.order_ticket)
+            for t_ in (_pend_ticket and [_pend_ticket] or []):
+                own_orders.add(t_)
             try:
+                for t_ in own_positions:
+                    try:
+                        gw.trading.close_position(t_)
+                        print(f"  · 兜底平仓 {t_}")
+                    except GatewayError as e:
+                        print(f"  · 兜底平仓 {t_} 未成（可能已平）：{e}")
+                for t_ in own_orders:
+                    try:
+                        gw.trading.cancel_order(t_)
+                        print(f"  · 兜底撤单 {t_}")
+                    except GatewayError as e:
+                        print(f"  · 兜底撤单 {t_} 未成（可能已撤）：{e}")
+                # 终扫：同 magic（冒烟专属 902424）的残留如实报告
                 for p_ in gw.account.positions(symbol):
-                    if p_.magic == gw.config.magic:
-                        gw.trading.close_position(p_.ticket)
-                        print(f"  · 兜底平仓 {p_.ticket}")
+                    if p_.magic == 902424:
+                        step(False, f"残留持仓 {p_.ticket} 未清理", str(p_))
                 for o_ in gw.account.pending_orders(symbol):
-                    if o_.magic == gw.config.magic:
-                        gw.trading.cancel_order(o_.ticket)
-                        print(f"  · 兜底撤单 {o_.ticket}")
-            except GatewayError as e:
-                step(False, "兜底清理失败（可能仍有残留！）", str(e))
+                    if o_.magic == 902424:
+                        step(False, f"残留挂单 {o_.ticket} 未清理", str(o_))
+            except Exception as e:  # noqa: BLE001 —— 兜底路径绝不抛出
+                step(False, "兜底清理失败（可能仍有残留！）", f"{type(e).__name__}: {e}")
 
         if res is None:
             return 1
@@ -213,6 +243,12 @@ def main() -> int:
                 step(True, f"{len(mine)} 笔成交（开/平/部分平）",
                      f"手续费合计={round(fee_sum, 4)} "
                      f"entries={[d.entry for d in mine]}")
+            # 委托历史（N2 的真机验证：volume_initial 字段映射不得崩）
+            hist = gw.account.order_history(win_from, win_to)
+            own_orders_hist = [h for h in hist if h.ticket in
+                               ({res.order_ticket} | ({_pend_ticket} if _pend_ticket else set()))]
+            step(len(hist) >= 1, f"委托历史 {len(hist)} 条（本单 {len(own_orders_hist)} 条）",
+                 f"市价/挂单类型={[h.kind for h in own_orders_hist]}")
         except GatewayError as e:
             step(False, "成交回查", str(e))
 

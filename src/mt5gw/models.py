@@ -40,6 +40,7 @@ class SymbolSpec:
     volume_max: float
     volume_step: float
     filling_mode: int
+    trade_stops_level: int  # 最小止损距离（点），改单/挂单参考
     raw: Any
 
 
@@ -118,6 +119,10 @@ class PendingOrder:
     tp: float
     time_setup: datetime
     comment: str
+    magic: int
+    type_time: int  # 有效期类型（0=GTC，1=DAY…）
+    stoplimit: float  # STOP_LIMIT 单的触发价（普通挂单为 0）
+    expiration: datetime | None  # 0（无到期）如实为 None
 
 
 @dataclass(frozen=True)
@@ -155,10 +160,12 @@ class HistoryOrder:
 @dataclass(frozen=True)
 class OrderResult:
     ok: bool  # retcode ∈ {DONE, DONE_PARTIAL, PLACED}
-    confirmed: bool  # PLACED（已受理未确认成交）为 False，调用方需自行核对
+    filled: bool  # True=已回报成交（DONE/DONE_PARTIAL）；PLACED（多见于挂单受理）为 False
+    partial: bool  # True=DONE_PARTIAL 部分成交
     retcode: int
     comment: str
     order_ticket: int | None
-    deal_ticket: int | None
+    deal_ticket: int | None  # PLACED/未成交时为 None
     deal_price: float | None
+    requested_volume: float | None
     volume: float | None  # 服务器回报的实际成交量（部分成交时 < 请求量）

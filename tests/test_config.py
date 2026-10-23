@@ -22,7 +22,9 @@ def test_defaults_are_safe():
 
 def test_defaults_cover_every_field():
     cfg = GatewayConfig()
-    assert all(getattr(cfg, f.name) is not None for f in fields(cfg))
+    # expected_login 默认 None 是合法值（不钉死），其余字段必须非空
+    assert all(getattr(cfg, f.name) is not None
+               for f in fields(cfg) if f.name != "expected_login")
 
 
 def test_load_missing_file_raises(tmp_path):  # M1：路径写错当场暴露，不静默用默认
@@ -32,11 +34,20 @@ def test_load_missing_file_raises(tmp_path):  # M1：路径写错当场暴露，
 
 def test_load_json_overrides(tmp_path):
     p = tmp_path / "config.json"
-    p.write_text(json.dumps({"allow_live_trading": True, "magic": 42}), encoding="utf-8")
+    p.write_text(json.dumps({"allow_live_trading": True, "magic": 42,
+                             "expected_login": 278008680}), encoding="utf-8")
     cfg = load(str(p))
     assert cfg.allow_live_trading is True
-    assert cfg.magic == 42
+    assert cfg.magic == 42 and cfg.expected_login == 278008680
     assert cfg.terminal_path == GatewayConfig().terminal_path
+
+
+def test_live_unlock_requires_login_pinning():  # m12：解锁实盘必须钉死账号
+    with pytest.raises(LiveTradingBlockedError, match="expected_login"):
+        GatewayConfig(allow_live_trading=True)  # 构造当场拒绝
+    GatewayConfig(allow_live_trading=True, expected_login=123)  # 钉死后合法
+    from mt5gw.config import require_login_pinned
+    require_login_pinned(False, None)  # 未解锁时无需钉死
 
 
 def test_load_ignores_unknown_keys_but_warns(tmp_path, caplog):

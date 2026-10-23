@@ -46,9 +46,14 @@ with MT5Gateway() as gw:                # 终端路径可用 config 定制
 
 **默认一切真实下单只允许发生在模拟盘。** 保险丝是白名单语义：只有模拟盘
 （trade_mode=DEMO）免检放行；竞赛盘、实盘、任何未知值一律拒绝，除非显式解锁。
-校验在连接层的同一次持锁内执行（取账户状态 → 保险丝 → order_send 原子完成），
-账户读不到时 fail-closed 拒单。解锁值必须是严格的 JSON 布尔（字符串 "false"
-会被当场拒绝，代码构造同样校验）。
+校验在连接层的同一次持锁内执行（取账户状态 → 保险丝 → 账号钉死 → order_send
+原子完成），账户读不到时 fail-closed 拒单。解锁值必须是严格的 JSON 布尔
+（字符串 "false" 会被当场拒绝，代码构造同样校验）。**解锁实盘必须同时配置
+`expected_login` 钉死目标账号**——防止解锁后被切到别的实盘账户。
+
+⚠️ MetaTrader5 官方包自带 `mt5.Buy()/Sell()/Close()` 之类快捷函数会**绕过本
+网关**（无保险丝、无锁）——策略代码只允许 `import mt5gw`，不得直接 import
+MetaTrader5。
 
 解锁步骤（自担风险）：
 
@@ -75,10 +80,11 @@ with MT5Gateway() as gw:                # 终端路径可用 config 定制
   低于最小量或超过最大量一律**拒绝**（retcode 10014，绝不静默压量）。
 - 市价单请求会附上下单瞬间的参考价（买 ask / 卖 bid）并尊重 `deviation`；
   部分券商（如 Exness）要求显式参考价。
-- 成功码集合：`10009 DONE`、`10010 DONE_PARTIAL`（部分成交，仓位已建立）、
-  `10008 PLACED`（已受理，`OrderResult.confirmed=False`，成交价/成交号为空，
-  调用方需自行核对）。`order_send` 无返回时抛 `OrderResultUnknownError`——
+- 成功码集合：`10009 DONE`、`10010 DONE_PARTIAL`（`partial=True`，仓位已建立）、
+  `10008 PLACED`（`filled=False`：尚无成交回报，多见于挂单受理；成交价/成交号
+  为空，调用方需自行核对）。`order_send` 无返回时抛 `OrderResultUnknownError`——
   订单状态未知，先核对持仓再决定是否重发，绝不当"被拒"处理。
+  `OrderResult` 另带 `requested_volume` 与服务器回报 `volume`，部分成交时两者不等。
 - `modify()` 改挂单、`modify_position()` 改持仓 SL/TP、`cancel_order()` 撤挂单：
   三者的未传字段一律**回填当前值**——MT5 语义里缺省即 0（等于删除止损），
   本网关绝不把"没传"当 0 发出。
@@ -91,15 +97,22 @@ with MT5Gateway() as gw:                # 终端路径可用 config 定制
 存储为 Parquet 文件，布局 `data/bars/{品种}/{周期}/data.parquet`（另带 `meta.json`
 水位：行数、首末时间、更新时间）。列：`time, open, high, low, close,
 tick_volume, spread, real_volume`；只存**已收盘**的 bar（末根 bar 收盘当且仅当
-其收盘时刻 ≤ 服务器当前时间；服务器当前时间用"墙钟 UTC + 券商时差"自校准
-估算，与 tick 时钟解耦，周末行情冻结也不误删/误留；无任何宽容秒数）。时间戳为服务器时间贴 UTC 标签的 naive datetime。
+其收盘时刻 ≤ 服务器当前时间；服务器当前时间 = 墙钟 UTC + 由最新 tick 自校准
+的券商时差，限幅 ±6h、超限回退 offset=0——注意这是**墙钟近似而非完全解耦**：
+对 GMT 正偏移券商方向保守，极少数负偏移券商的极端情形可能晚一天收录 D1）。时间戳为服务器时间贴 UTC 标签的 naive datetime。
 
 下载/刷新（终端须在线）：
 
 ```bash
 .venv/Scripts/python.exe scripts/download_bars.py --symbols XAUUSD,BTCUSD,USTEC,EURUSD          # 全量回填
-.venv/Scripts/python.exe scripts/download_bars.py --symbols XAUUSD,BTCUSD,USTEC,EURUSD --refresh  # 增量刷新
+.venv/Scripts/python.exe scripts/download_bars.py --symbols XAUUSD,BTCUSD,USTEC,EURUSD --refresh  # 增量刷新（重叠证明接续）
 ```
+
+数据保护：回填与既有文件**一律取并集**（不丢行）；新数据比现存短/晚起步时
+拒绝写入并提示常见原因（终端"图表最大柱数"被重置）；`--force` 只放弃收缩
+检查（仍并集）；彻底替换用 `--replace`（旧文件自动备份为
+`data.parquet.bak-时间戳`）。跨进程写有按序列的文件锁；写入原子（临时文件 +
+fsync + os.replace）。品种名保留大小写（`XAUUSDm` 等后缀品种可用）。
 
 本机建模直接读文件（不要走 MCP）：
 
