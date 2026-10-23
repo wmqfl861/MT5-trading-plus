@@ -51,9 +51,9 @@ def drop_unclosed(df: pd.DataFrame, timeframe: str, now_server: datetime) -> pd.
     """剔除未收盘的 K 线。
 
     规则：非末行的 bar 必已收盘（其后已有新 bar）；末行收盘当且仅当
-    time+周期 <= now_server。now_server 用"墙钟 UTC + 券商时差"估算
-    （由 downloader._server_now 自校准），与 tick 时钟解耦——周末行情
-    冻结时墙钟仍在走，最后一根已收盘 bar 不会被误删，也不需要宽容秒数。
+    time+周期 <= now_server。now_server = 墙钟 UTC + 自校准券商时差
+    （downloader.server_now，超限回退 offset=0 属墙钟近似而非完全解耦，
+    方向见 README 时区约定）；无任何宽容秒数。
     """
     if df is None or len(df) == 0:
         return df

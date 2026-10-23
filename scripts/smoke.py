@@ -36,7 +36,11 @@ def utcnow_naive():
 def main() -> int:
     config_path = "config.json"
     if "--config" in sys.argv:
-        config_path = sys.argv[sys.argv.index("--config") + 1]
+        idx = sys.argv.index("--config")
+        if idx + 1 >= len(sys.argv):
+            print("✗ --config 需要一个文件路径参数")
+            return 1
+        config_path = sys.argv[idx + 1]
 
     # C2：配置可读则读；显式指定的路径不存在直接报错（不静默用默认）
     if "--config" in sys.argv and not os.path.exists(config_path):

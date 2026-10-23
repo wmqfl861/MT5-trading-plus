@@ -402,6 +402,7 @@ def test_modify_pending_fills_current_values():
     assert req["price"] == 1.0900  # 未传 price 用现挂单价
     assert req["sl"] == 1.0800     # 未传 sl 保持现值
     assert req["tp"] == 1.1500
+    assert req["type_time"] == 0 and req["stoplimit"] == 0.0  # 有效期/触发价也回填
     assert res.ok
 
 

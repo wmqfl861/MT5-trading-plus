@@ -152,6 +152,7 @@ def refresh_series(root, market: MarketData, symbol: str, timeframe: str,
         return backfill_series(root, market, symbol, timeframe,
                                meta_info=meta_info)
 
+    _lineage_guard(_read_meta(root, symbol, timeframe), meta_info, symbol, timeframe)
     now = server_now(market, symbol)
     tf_seconds = TIMEFRAME_SECONDS[timeframe.upper()]
     old_last = old["time"].iloc[-1]
@@ -205,8 +206,8 @@ def _read_meta(root, symbol, tf):
 
 
 def _backup(root, symbol, tf) -> str:
-    import json
-    d = os.path.join(root, "bars", symbol.upper(), tf.upper())
+    from mt5data.store import series_dir
+    d = series_dir(root, symbol, tf)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     bak = os.path.join(d, f"data.parquet.bak-{stamp}")
     shutil.copy2(os.path.join(d, "data.parquet"), bak)

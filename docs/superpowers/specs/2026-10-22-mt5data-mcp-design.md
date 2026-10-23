@@ -9,10 +9,12 @@ claude_review.md 与对应 git 提交（2026-10-22 修复轮）。
 - 布局：data/bars/{SYMBOL}/{TF}/data.parquet + meta.json（行数、首末时间、
   updated_at_utc、server/login 数据来源）。
 - 铁律：只存已收盘 bar（末根收盘当且仅当收盘时刻 ≤ 服务器当前时间；
-  服务器当前时间 = 墙钟 UTC + 券商时差自校准，限幅 ±6h，超限回退 offset=0）；
-  写入原子（tmp + os.replace 重试）；回填错误必须上抛、与旧文件合并、
-  收缩（更短/更晚起步）拒绝写入（--force 对冲）；刷新必须与旧数据接续，
-  空洞报错；一根未取到即失败。
+  服务器当前时间 = 墙钟 UTC + 券商时差自校准，限幅 ±6h，超限回退 offset=0
+  属墙钟近似）；写入原子（tmp + fsync + os.replace，跨进程按序列文件锁）；
+  回填错误必须上抛、与旧文件一律取并集；收缩（更短/更晚起步）拒绝写入
+  （--force 仍并集、--replace 备份后替换）；刷新以"重叠证明"验证接续
+  （翻页结果必须包含旧末根），接续点后的缺口属源序列；数据血缘
+  （server/login）不一致拒绝混写；一根未取到即失败。
 - 非目标：tick 库、实时订阅、跨机存储（Parquet+DuckDB 够用；出现多用户
   直连 SQL 需求时再评估 PostgreSQL，迁移路径 = COPY）。
 
