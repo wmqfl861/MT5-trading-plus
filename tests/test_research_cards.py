@@ -230,8 +230,12 @@ def test_committed_at_real_git_tracked_file():
 
 
 def test_committed_at_real_git_ignored_file_returns_none():
-    """仓库内但从未提交的文件（data/ 被 gitignore）→ None（如实=未提交）。"""
+    """仓库内但从未提交的文件（data/ 被 gitignore）→ None（如实=未提交）。
+
+    CI 的干净克隆里没有 data/ 目录——先建目录再落探针（目录本身也被忽略）。
+    """
     probe = os.path.join(_repo_root(), "data", "_card_commit_probe.toml")
+    os.makedirs(os.path.dirname(probe), exist_ok=True)
     with open(probe, "w", encoding="utf-8") as f:
         f.write('id = "H999"\n')
     try:
