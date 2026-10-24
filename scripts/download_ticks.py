@@ -1,5 +1,10 @@
 """Tick 历史下载 CLI（退出码语义与 download_bars.py 一致：0 全成，1 有失败）。
 
+存储为按月分区（T4/R3）：{data-dir}/ticks/{SYMBOL}/{YYYY}/{MM}.parquet +
+meta.json（rows/first_msc/last_msc/months）。回补/刷新只读写涉及月份的
+分区文件。库还是旧单文件布局（data.parquet）时先跑
+scripts/migrate_ticks_layout.py --symbols <品种>，否则下载会拒绝并提示。
+
 小窗口首跑回补（先试浅水）：
     .venv/Scripts/python.exe scripts/download_ticks.py --symbols XAUUSD --mode backfill --start 2026-08-01
 深回补（后台长跑）：
@@ -28,6 +33,26 @@ def _parse_naive(text: str) -> datetime:
     return dt
 
 
+def _precheck_clock(gw):
+    """R5：开跑前用最新 tick 实测服务器时钟偏移并与配置比对；行情冻结则跳过并打印。"""
+    from datetime import datetime, timezone
+
+    from mt5data.clock import check_server_offset
+
+    try:
+        q = gw.market.quote("XAUUSD")
+    except Exception as e:  # 行情取不到不阻塞刷新本身，但如实记录
+        print(f"⚠ 时钟预检取行情失败（{e}），跳过")
+        return
+    lag = (datetime.now(timezone.utc).replace(tzinfo=None) - q.time).total_seconds()
+    if lag > 120:
+        print(f"⚠ 行情静默（末笔 tick 距今 {lag / 3600:.1f} 小时，休市？），时钟预检跳过")
+        return
+    check_server_offset(-lag, gw.config.server_utc_offset_hours)
+    print(f"✓ 时钟预检：实测偏移 {-lag:+.0f}s 与配置 "
+          f"{gw.config.server_utc_offset_hours:g}h 一致")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="下载/刷新 MT5 tick 到 Parquet")
     ap.add_argument("--symbols", required=True, help="逗号分隔，如 XAUUSD,BTCUSD（保留大小写）")
@@ -49,6 +74,7 @@ def main() -> int:
 
     gw = (MT5Gateway.from_config_file(args.config) if args.config else MT5Gateway())
     with gw:
+        _precheck_clock(gw)
         try:
             st = gw.account.state()
             meta_info = {"server": st.server, "login": st.login}

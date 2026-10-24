@@ -1,23 +1,30 @@
-"""Task 2（P1 tick 采集/存储）测试：假件贴真包基线 + 回补/刷新/存储语义。
+"""Task 2（P1 tick 采集/存储）+ T4（tick 按月分区 R3）测试。
 
-覆盖计划用例 a–g 及假件契约、None 上抛、静默窗口、空表守卫等。
+假件贴真包基线 + 回补/刷新/存储语义；覆盖计划用例 a–g、假件契约、
+None 上抛、静默窗口、空表守卫，以及按月分区的跨月写入、刷新只动末月、
+区间读取只开必要月份、旧布局迁移提示与守恒。
 """
+import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
 import pytest
 
+import mt5data.ticks as ticks_mod
 from mt5gw.connection import MT5Connection
 from mt5gw.errors import DataUnavailableError
 from mt5data import store
 from mt5data.ticks import (
     TICK_COLUMNS,
     DataIntegrityError,
+    TicksLayoutError,
     backfill_ticks,
     load_ticks,
     merge_ticks,
+    migrate_old_layout,
     read_ticks_watermark,
     refresh_ticks,
     save_ticks,
@@ -199,7 +206,8 @@ def test_backfill_disordered_page_raises_and_keeps_old_file(tmp_path):
     backfill_ticks(make_conn(fake), fake, str(tmp_path), "XAUUSD",
                    start=start, end=end)
     d = tmp_path / "ticks" / "XAUUSD"
-    before = (d / "data.parquet").read_bytes()
+    month_file = d / "2026" / "08.parquet"
+    before = month_file.read_bytes()
 
     rows = rows_from(start, 5)
     bad = FakeTicksMT5()
@@ -207,7 +215,7 @@ def test_backfill_disordered_page_raises_and_keeps_old_file(tmp_path):
     with pytest.raises(DataIntegrityError, match="倒退"):
         backfill_ticks(make_conn(bad), bad, str(tmp_path), "XAUUSD",
                        start=start, end=end)
-    assert (d / "data.parquet").read_bytes() == before  # 旧文件一字节不动
+    assert month_file.read_bytes() == before  # 旧文件一字节不动
 
 
 def test_backfill_no_data_at_all_raises(tmp_path):
@@ -268,11 +276,12 @@ def test_refresh_without_boundary_tick_raises_and_keeps_file(tmp_path):
     add_page(fake, datetime(2026, 8, 1), datetime(2026, 8, 1, 23),
              rows_from(datetime(2026, 8, 1, 4, 30), 3))  # 缺 04:00 边界
     d = tmp_path / "ticks" / "XAUUSD"
-    before = (d / "data.parquet").read_bytes()
+    month_file = d / "2026" / "08.parquet"
+    before = month_file.read_bytes()
     with pytest.raises(DataIntegrityError, match="无法证明接续"):
         refresh_ticks(make_conn(fake), fake, str(tmp_path), "XAUUSD",
                       now_server=datetime(2026, 8, 1, 6))
-    assert (d / "data.parquet").read_bytes() == before
+    assert month_file.read_bytes() == before
 
 
 def test_refresh_empty_page_within_week_returns_zero(tmp_path):
@@ -281,11 +290,12 @@ def test_refresh_empty_page_within_week_returns_zero(tmp_path):
     save_ticks(str(tmp_path), "XAUUSD",
                ticks_df(rows_from(datetime(2026, 8, 1), 5)))
     d = tmp_path / "ticks" / "XAUUSD"
-    before = (d / "data.parquet").read_bytes()
+    month_file = d / "2026" / "08.parquet"
+    before = month_file.read_bytes()
     added = refresh_ticks(make_conn(fake), fake, str(tmp_path), "XAUUSD",
                           now_server=datetime(2026, 8, 3))  # 静默 2 天
     assert added == 0
-    assert (d / "data.parquet").read_bytes() == before
+    assert month_file.read_bytes() == before
 
 
 def test_refresh_empty_page_beyond_week_raises(tmp_path):
@@ -321,10 +331,10 @@ def test_save_load_roundtrip_preserves_dtypes_and_column_order(tmp_path):
     wm = read_ticks_watermark(str(tmp_path), "XAUUSDm")
     assert wm["rows"] == 3
     assert wm["first_msc"] == rows[0][0] and wm["last_msc"] == rows[-1][0]
+    assert wm["months"] == ["2026-08"]
     assert "updated_at_utc" in wm
-    # 原子写不留临时文件
-    leftovers = [p.name for p in (tmp_path / "ticks" / "XAUUSDm").iterdir()
-                 if p.name.endswith(".tmp")]
+    # 原子写不留临时文件（按月分区后 tmp 在年份子目录里，递归查）
+    leftovers = [str(p) for p in (tmp_path / "ticks" / "XAUUSDm").rglob("*.tmp")]
     assert leftovers == []
     # 列序打乱入参 → 落盘仍按 TICK_COLUMNS
     scrambled = ticks_df(rows)[list(reversed(TICK_COLUMNS))]
@@ -362,3 +372,205 @@ def test_store_exposes_public_aliases():
     assert store.series_lock is store._SeriesLock
     assert store.atomic_replace is store._atomic_replace
     assert store.fsync_file is store._fsync_file
+
+
+# ---- T4：tick 按月分区（R3） ----
+
+
+def _midx_of(msc) -> int:
+    return ticks_mod._month_index_from_msc(int(msc))
+
+
+def _spy_read_month(monkeypatch, reads: list):
+    """记录 _read_month 打开的月份（只读月份数据文件的探针）。"""
+    orig = ticks_mod._read_month
+
+    def spy(d, m):
+        reads.append(m)
+        return orig(d, m)
+
+    monkeypatch.setattr(ticks_mod, "_read_month", spy)
+
+
+def test_backfill_spans_months_into_separate_files(tmp_path):
+    """跨月回补：数据按服务器时间月份写进各自分区文件，meta.months 齐全。"""
+    fake = FakeTicksMT5()
+    start, end = datetime(2026, 8, 30, 12), datetime(2026, 9, 2, 12)
+    rows = rows_from(start, 49, step_s=3600)  # 8/30 12:00 → 9/1 12:00（每小时）
+    add_page(fake, start, end, rows)
+    added = backfill_ticks(make_conn(fake), fake, str(tmp_path), "XAUUSD",
+                           start=start, end=end)
+    assert added == 49
+    d = tmp_path / "ticks" / "XAUUSD"
+    aug = pd.read_parquet(d / "2026" / "08.parquet")
+    sep = pd.read_parquet(d / "2026" / "09.parquet")
+    assert len(aug) + len(sep) == 49  # 行数守恒，一条不少
+    m_aug = _midx_of(_ms(datetime(2026, 8, 15)))
+    m_sep = _midx_of(_ms(datetime(2026, 9, 15)))
+    assert {_midx_of(x) for x in aug["time_msc"]} == {m_aug}
+    assert {_midx_of(x) for x in sep["time_msc"]} == {m_sep}
+    wm = read_ticks_watermark(str(tmp_path), "XAUUSD")
+    assert wm["months"] == ["2026-08", "2026-09"]
+    assert wm["rows"] == 49
+    assert wm["first_msc"] == _ms(start)
+    assert wm["last_msc"] == _ms(datetime(2026, 9, 1, 12))
+    df = load_ticks(str(tmp_path), "XAUUSD")
+    assert len(df) == 49 and df["time_msc"].is_monotonic_increasing
+
+
+def test_refresh_touches_only_tail_month_file(tmp_path, monkeypatch):
+    """刷新只改写末月分区：更早月份文件 mtime 与内容一字节不动，也绝不被读。"""
+    root = str(tmp_path)
+    seed = rows_from(datetime(2026, 7, 1), 62 * 24, step_s=3600)  # 7/1 → 8/31 23:00
+    save_ticks(root, "XAUUSD", ticks_df(seed), server="Exness-Trial", login=1)
+    d = tmp_path / "ticks" / "XAUUSD"
+    jul = d / "2026" / "07.parquet"
+    old_stamp = time.time() - 86400
+    os.utime(jul, (old_stamp, old_stamp))
+    jul_bytes = jul.read_bytes()
+
+    reads: list = []
+    _spy_read_month(monkeypatch, reads)
+
+    fake = FakeTicksMT5()
+    last = seed[-1]
+    page_rows = [last,
+                 (_ms(datetime(2026, 8, 31, 23, 20)), 2100.0, 2100.5, 0, 0, 2),
+                 (_ms(datetime(2026, 8, 31, 23, 40)), 2101.0, 2101.5, 0, 0, 2),
+                 (_ms(datetime(2026, 9, 1, 0, 10)), 2102.0, 2102.5, 0, 0, 2)]
+    add_page(fake, datetime(2026, 8, 31, 23), datetime(2026, 9, 1, 1), page_rows)
+    added = refresh_ticks(make_conn(fake), fake, root, "XAUUSD",
+                          now_server=datetime(2026, 9, 1, 0, 30))
+    assert added == 3
+    # 7 月分区一字节不动、mtime 不变
+    assert jul.read_bytes() == jul_bytes
+    assert os.path.getmtime(jul) == pytest.approx(old_stamp, abs=1e-3)
+    # 只读了末月（2026-08）及新月分区，绝不读更早月份
+    m_aug = _midx_of(_ms(datetime(2026, 8, 15)))
+    assert reads and all(m >= m_aug for m in reads)
+    # 跨入 9 月的新 tick 落在新月分区；总量守恒
+    assert len(pd.read_parquet(d / "2026" / "09.parquet")) == 1
+    assert len(load_ticks(root, "XAUUSD")) == len(seed) + 3
+    wm = read_ticks_watermark(root, "XAUUSD")
+    assert wm["months"] == ["2026-07", "2026-08", "2026-09"]
+    assert wm["last_msc"] == _ms(datetime(2026, 9, 1, 0, 10))
+
+
+def test_load_ticks_range_opens_only_needed_months(tmp_path, monkeypatch):
+    """区间读取只打开涉及的月份文件，行级过滤 [start_msc, end_msc] 含两端。"""
+    root = str(tmp_path)
+    save_ticks(root, "XAUUSD", ticks_df(rows_from(datetime(2026, 7, 1), 62 * 24,
+                                                  step_s=3600)))
+    reads: list = []
+    _spy_read_month(monkeypatch, reads)
+    lo = _ms(datetime(2026, 8, 10, 6))
+    hi = _ms(datetime(2026, 8, 20, 18))
+    df = load_ticks(root, "XAUUSD", start_msc=lo, end_msc=hi)
+    assert reads == [_midx_of(lo)]  # 只开了 2026-08 一个文件
+    t = df["time_msc"].to_numpy()
+    assert len(t) == 253  # 8/10 06:00 → 8/20 18:00 逐小时含两端
+    assert t.min() == lo and t.max() == hi
+    assert (t >= lo).all() and (t <= hi).all()
+    assert list(df.columns) == TICK_COLUMNS
+
+
+def test_load_ticks_range_edges(tmp_path):
+    """库不存在 → None；区间不涉及任何月份 → 空 DataFrame（列齐）；start>end → 抛。"""
+    root = str(tmp_path)
+    assert load_ticks(root, "NOEXIST") is None
+    save_ticks(root, "XAUUSD", ticks_df(rows_from(datetime(2026, 8, 1), 48,
+                                                  step_s=3600)))
+    empty = load_ticks(root, "XAUUSD", start_msc=_ms(datetime(2027, 1, 1)),
+                       end_msc=_ms(datetime(2027, 2, 1)))
+    assert empty is not None and len(empty) == 0
+    assert list(empty.columns) == TICK_COLUMNS
+    with pytest.raises(ValueError, match="不得晚于"):
+        load_ticks(root, "XAUUSD", start_msc=200, end_msc=100)
+
+
+def _seed_old_layout(tmp_path, rows, symbol="XAUUSD"):
+    """手造旧单文件布局：{SYMBOL}/data.parquet + 旧格式 meta.json。"""
+    d = tmp_path / "ticks" / symbol
+    d.mkdir(parents=True)
+    df = ticks_df(rows)
+    df.to_parquet(d / "data.parquet", index=False)
+    meta = {"symbol": symbol, "rows": len(df),
+            "first_msc": int(df["time_msc"].iloc[0]),
+            "last_msc": int(df["time_msc"].iloc[-1]),
+            "updated_at_utc": "2026-10-01T00:00:00+00:00",
+            "server": "Exness-Trial", "login": 42}
+    (d / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    return d
+
+
+def test_old_layout_raises_with_migration_hint(tmp_path):
+    """旧单文件布局：读取/写入/回补/刷新都拒绝并提示先跑迁移脚本。"""
+    _seed_old_layout(tmp_path, rows_from(datetime(2026, 8, 1), 5))
+    root, fake = str(tmp_path), FakeTicksMT5()
+    with pytest.raises(TicksLayoutError, match="migrate_ticks_layout"):
+        load_ticks(root, "XAUUSD")
+    with pytest.raises(TicksLayoutError, match="migrate_ticks_layout"):
+        save_ticks(root, "XAUUSD", ticks_df(rows_from(datetime(2026, 8, 1), 2)))
+    with pytest.raises(TicksLayoutError, match="migrate_ticks_layout"):
+        backfill_ticks(make_conn(fake), fake, root, "XAUUSD",
+                       start=datetime(2026, 8, 1), end=datetime(2026, 8, 2))
+    with pytest.raises(TicksLayoutError, match="migrate_ticks_layout"):
+        refresh_ticks(make_conn(fake), fake, root, "XAUUSD",
+                      now_server=datetime(2026, 8, 2))
+
+
+def test_migrate_old_layout_conserves_rows_and_bounds(tmp_path):
+    """迁移：总行数与首末 time_msc 守恒；旧文件改名保留；meta 换月列表。"""
+    rows = rows_from(datetime(2026, 7, 20, 12), 20 * 24, step_s=3600)  # 7/20→8/8
+    d = _seed_old_layout(tmp_path, rows)
+    root = str(tmp_path)
+    summary = migrate_old_layout(root, "XAUUSD")
+    assert summary["rows"] == len(rows)
+    assert summary["first_msc"] == rows[0][0] and summary["last_msc"] == rows[-1][0]
+    assert summary["months"] == ["2026-07", "2026-08"]
+    assert summary["server"] == "Exness-Trial" and summary["login"] == 42
+    # 旧 data.parquet 已改名保留（不删数据）
+    assert not (d / "data.parquet").exists()
+    backups = [p.name for p in d.iterdir()
+               if p.name.startswith("data.parquet.migrated-")]
+    assert len(backups) == 1 and backups[0] == summary["backup"]
+    # 分区内容 = 旧文件逐行一致
+    df = load_ticks(root, "XAUUSD")
+    assert list(df["time_msc"]) == [r[0] for r in rows]
+    wm = read_ticks_watermark(root, "XAUUSD")
+    assert wm["rows"] == len(rows) and wm["months"] == ["2026-07", "2026-08"]
+    assert wm["server"] == "Exness-Trial" and wm["login"] == 42
+    # 再跑一次：无旧布局可迁 → None（幂等跳过）
+    assert migrate_old_layout(root, "XAUUSD") is None
+
+
+def test_fetch_window_direct_structured_array_conversion():
+    """_fetch_window 对结构化数组直转 DataFrame（不再 tolist），多余字段裁掉。"""
+    fields = [(c, ticks_mod._TICK_DTYPES[c]) for c in TICK_COLUMNS] \
+        + [("volume_real", "f8")]  # 贴真包防御：dtype 可能多出 volume_real
+    arr = np.array([(_ms(datetime(2026, 8, 1)), 1.0, 1.1, 0.0, 0.0, 2, 0.0)],
+                   dtype=np.dtype(fields))
+
+    class _Mod:  # 贴真包最小面：结构化数组直出
+        COPY_TICKS_ALL = -1
+
+        @staticmethod
+        def copy_ticks_range(symbol, from_s, to_s, flags):
+            return arr
+
+    class _Conn:
+        @staticmethod
+        def call(fn, *a, **k):
+            return fn(*a, **k)
+
+        @staticmethod
+        def last_error():
+            return (1, "Success")
+
+    df = ticks_mod._fetch_window(_Conn, _Mod, "XAUUSD",
+                                 _sec(datetime(2026, 8, 1)),
+                                 _sec(datetime(2026, 8, 2)))
+    assert list(df.columns) == TICK_COLUMNS  # volume_real 被列序化裁掉
+    assert str(df["time_msc"].dtype) == "int64"
+    assert str(df["flags"].dtype) == "int64"
+    assert list(df["time_msc"]) == [_ms(datetime(2026, 8, 1))]
