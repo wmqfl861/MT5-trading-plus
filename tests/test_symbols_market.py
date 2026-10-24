@@ -193,3 +193,45 @@ def test_symbol_select_failure_raises():
     fake.last_error_value = (-2, "select failed")
     with pytest.raises(DataUnavailableError, match="Market Watch"):
         mkt.bars("EURUSD", "M1", 10)
+
+
+# ---- SymbolSpec 新增合约参数字段（P0）----
+
+FullSymRow = namedtuple(
+    "FullSymRow",
+    "name description digits point spread trade_mode currency_profit currency_margin "
+    "trade_contract_size volume_min volume_max volume_step filling_mode visible "
+    "trade_stops_level swap_long swap_short trade_freeze_level "
+    "trade_tick_size trade_tick_value trade_calc_mode margin_initial margin_maintenance",
+)
+
+
+def test_full_row_maps_new_spec_fields():
+    conn, cat, _, fake = make()
+    fake.set_behavior("symbol_info", value=FullSymRow(
+        name="XAUUSD", description="Gold", digits=2, point=0.01, spread=20,
+        trade_mode=4, currency_profit="USD", currency_margin="USD",
+        trade_contract_size=100.0, volume_min=0.01, volume_max=100.0,
+        volume_step=0.01, filling_mode=1, visible=True,
+        trade_stops_level=30, swap_long=-18.4, swap_short=9.2,
+        trade_freeze_level=15, trade_tick_size=0.01, trade_tick_value=1.0,
+        trade_calc_mode=1, margin_initial=0.005, margin_maintenance=0.0025,
+    ))
+    spec = cat.get("XAUUSD")
+    assert spec.swap_long == -18.4 and spec.swap_short == 9.2
+    assert spec.trade_freeze_level == 15
+    assert spec.tick_size == 0.01 and spec.tick_value == 1.0  # 包内名 trade_tick_*
+    assert spec.trade_calc_mode == 1
+    assert spec.margin_initial == 0.005 and spec.margin_maintenance == 0.0025
+
+
+def test_old_style_row_falls_back_to_default_new_fields():
+    # 旧式 row（fakes 时代 / 真包低版本）没有新字段 → getattr 兜底为默认值，不崩
+    conn, cat, _, fake = make()
+    fake.set_behavior("symbol_info", value=EUR)
+    spec = cat.get("EURUSD")
+    assert spec.swap_long == 0.0 and spec.swap_short == 0.0
+    assert spec.trade_freeze_level == 0
+    assert spec.tick_size == 0.0 and spec.tick_value == 0.0
+    assert spec.trade_calc_mode == 0
+    assert spec.margin_initial == 0.0 and spec.margin_maintenance == 0.0

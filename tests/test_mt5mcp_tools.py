@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import pytest
 
+from mt5data.lockbox import write_config
 from mt5data.store import save_bars
 from mt5mcp.tools import (
     MAX_BARS_LIMIT,
@@ -144,3 +145,78 @@ def test_compute_indicator_list_names_in_error(tmp_path):
         compute_indicator(make_db(tmp_path), "EURUSD", "M1", "unicorn", {}, limit=5)
     with pytest.raises(ValueError, match="macd"):
         compute_indicator(make_db(tmp_path), "EURUSD", "M1", "unicorn", {}, limit=5)
+
+
+# ---- T4 锁箱：get_bars 的研究边界（Review Focus #4——远程与本地同一约束）----
+
+LOCK_CUTOFF = datetime(2023, 10, 22, 14, 0)  # EURUSD M1 前 120 根开放（12:00–13:59）
+
+
+def lock_root(tmp_path, n=300):
+    root = make_db(tmp_path, n)
+    write_config(root, {"EURUSD/M1": LOCK_CUTOFF.isoformat()})
+    return root
+
+
+def test_get_bars_lockbox_until_beyond_cutoff_raises(tmp_path):
+    with pytest.raises(ValueError, match="锁箱"):
+        get_bars(lock_root(tmp_path), "EURUSD", "M1", limit=10,
+                 until=datetime(2023, 10, 22, 15, 0))
+
+
+def test_get_bars_lockbox_since_beyond_cutoff_raises(tmp_path):
+    with pytest.raises(ValueError, match="锁箱"):
+        get_bars(lock_root(tmp_path), "EURUSD", "M1", limit=10,
+                 since=datetime(2023, 10, 22, 14, 30))
+
+
+def test_get_bars_lockbox_until_equals_cutoff_is_clamped(tmp_path):
+    # until 恰等 cutoff 不算越过，但边界 bar（cutoff 时刻）仍不外发
+    out = get_bars(lock_root(tmp_path), "EURUSD", "M1", limit=500,
+                   until=LOCK_CUTOFF)
+    times = [datetime.fromisoformat(b["time"]) for b in out["bars"]]
+    assert times and max(times) < LOCK_CUTOFF
+
+
+def test_get_bars_lockbox_clamps_open_ended_request(tmp_path):
+    out = get_bars(lock_root(tmp_path), "EURUSD", "M1", limit=500)
+    times = [datetime.fromisoformat(b["time"]) for b in out["bars"]]
+    assert len(times) == 120  # 12:00–13:59 恰 120 根
+    assert max(times) < LOCK_CUTOFF
+    assert out["rows_total_before_limit"] == 120 and out["truncated"] is False
+    assert out["lockbox_cutoff"] == LOCK_CUTOFF.isoformat()
+
+
+def test_get_bars_lockbox_clamps_since_only_request(tmp_path):
+    out = get_bars(lock_root(tmp_path), "EURUSD", "M1", limit=500,
+                   since=datetime(2023, 10, 22, 13, 0))
+    times = [datetime.fromisoformat(b["time"]) for b in out["bars"]]
+    assert len(times) == 60  # 13:00–13:59
+    assert out["lockbox_cutoff"] == LOCK_CUTOFF.isoformat()
+
+
+def test_get_bars_lockbox_legal_window_behaves_as_before(tmp_path):
+    out = get_bars(lock_root(tmp_path), "EURUSD", "M1", limit=500,
+                   since=datetime(2023, 10, 22, 12, 30),
+                   until=datetime(2023, 10, 22, 13, 10))
+    assert out["rows_returned"] == 41  # 两端含，与旧窗口语义一致
+    assert "lockbox_cutoff" not in out
+
+
+def test_get_bars_lockbox_only_affects_configured_series(tmp_path):
+    # 只锁 EURUSD/M1；XAUUSD/H1 无 cutoff → 行为与旧完全一致
+    out = get_bars(lock_root(tmp_path), "XAUUSD", "H1", limit=500)
+    assert out["rows_returned"] == 300
+    assert "lockbox_cutoff" not in out
+
+
+def test_get_bars_without_lockbox_config_matches_legacy(tmp_path):
+    # 回归：无 lockbox.json → 返回 JSON 键集与引入锁箱前完全一致
+    root = make_db(tmp_path)
+    out = get_bars(root, "EURUSD", "M1", limit=3)
+    assert set(out) == {"symbol", "timeframe", "rows_total_before_limit",
+                        "truncated", "rows_returned", "bars"}
+    since = datetime(2023, 10, 22, 13, 0)
+    until = datetime(2023, 10, 22, 13, 10)
+    win = get_bars(root, "EURUSD", "M1", since=since, until=until, limit=500)
+    assert win["rows_returned"] == 11  # 同 test_get_bars_time_window_filter 口径

@@ -131,6 +131,66 @@ UTF-16 编码，改前需先关终端再改再启动）。当前各序列已取�
 注：新品种首次深挖 M1 时，第一笔大请求可能因终端向服务器同步历史而超时
 返回"无数据"，等一两分钟重跑同序列即可（缓存已暖，秒级完成）。
 
+## tick 数据库（mt5data.ticks）
+
+布局 `data/ticks/{品种}/data.parquet`（`meta.json` 水位：行数、首末
+`time_msc`、更新时间、数据来源）。列：`time_msc`（int64 毫秒）、`bid/ask/last/volume`
+（float64）、`flags`（int64）。回补从目标时刻**往回**分块取（连续 3 个空窗
+视为历史尽头正常收尾）；增量刷新从旧水位含边界取到当前，**抓回页必须包含
+旧末根 tick（接续证明）**，否则报错拒写。原子写与跨进程锁与 K 线库同一套。
+
+```bash
+.venv/Scripts/python.exe scripts/download_ticks.py --symbols XAUUSD --mode backfill --start 2026-10-10
+.venv/Scripts/python.exe scripts/download_ticks.py --symbols XAUUSD --mode refresh
+```
+
+## 数据质检与重采样（mt5data.quality / resample / sessions）
+
+- `scripts/quality_report.py --symbols ... --timeframes M1,H1`：逐序列完整性
+  报告（`data/reports/quality/`）——覆盖率、缺口分类（周末/每日休市/节假日/
+  未预期，夏令时用 zoneinfo 按交易所本地时间判定）、重复、乱序、尖刺、
+  点差异常。
+- `resample_bars(df_m1, "H1")`：label=closed=left 约定，spread 取 bar 内最小
+  （MQL5 语义）；`compare_with_broker(res, broker)` 与经纪商原生周期逐根比对
+  （价格差异判失败、成交量差异只记录）。
+
+## 锁箱（mt5data.lockbox）
+
+研究侧只能读到 `time < cutoff` 的数据（当前全部序列按"历史>5 年→锁最近
+12 个月"规则锁定，见 `data/lockbox.json`）：`research_bars()` 显式请求越过
+cutoff 直接报错（绝不静默截断）；MCP `get_bars` 同一约束（越界报错、缺省
+时间钳到 cutoff 并在响应中带 `lockbox_cutoff` 字段）。实盘/信号侧不受限
+（直读 `store.load_bars`）。`scripts/export_lockbox.py` 把锁定段导出为独立
+目录的物理副本（供 G5 锁箱测试与实盘侧读取；文件权限隔离属后续阶段）。
+
+## 研究层（mt5quant：成本模型 / 策略 / A 层回测）
+
+- **成本（P2）**：`mt5quant.costs`——tick 实测点差（按 UTC 小时的中位/p90/p99）、
+  滑点（比例×p90 点差＋固定，事件小时加倍）、佣金（每手来回）、隔夜费
+  （多空分开、三倍日、恒为成本方向）；`scripts/cost_audit.py` 出热力图与
+  纳入/排除清单（`data/reports/costs/`）。
+- **策略（P3 接口）**：`mt5quant.strategies`——统一接口 `params_schema /
+  required_data / generate_signals / exit_rules`；参数 ≤4 个、网格 ≤100 组
+  在类定义时强制；只做内存计算，不做 I/O；回测与实盘共用同一份代码。
+- **A 层回测（P3）**：`mt5quant.backtest`——信号 bar 收盘、下一根开盘成交；
+  bid 基准（多头 Ask 入场）；同 bar 双触止损优先；成本按小时模型叠加；
+  `check_no_lookahead` 截断测试查前视偏差；报告带 manifest（git 提交号、
+  数据快照哈希、参数、成本模型版本）。
+
+```bash
+.venv/Scripts/python.exe scripts/run_backtest.py --strategy mt5quant.strategies.library.buy_hold:BuyHold \
+    --symbol XAUUSD --timeframe H1 --params '{}' --end 2025-09-01
+```
+
+## 每日调度
+
+`scripts/setup_scheduled_tasks.ps1`（安装：右键"使用 PowerShell 运行"或
+`powershell -File`；删除命令在其头注释）：每日 00:05 品种参数快照比对、
+00:10 K 线增量刷新（`scripts/refresh_all.py`，日志在 `data/logs/`）、
+00:15 tick 增量刷新（有 tick 库才装）。`scripts/measure_server_clock.py`
+可随时补测服务器时钟偏移（证据存 `data/server_clock.json`，供夏令时
+切换前后对比）。
+
 ## MCP 数据服务（mt5mcp，给远程 agent 用）
 
 本机建模**直读 Parquet/DuckDB，不要走 MCP**；MCP 是给远程服务器上的 agent
@@ -150,4 +210,5 @@ RSI/ATR 为 Wilder 平滑（种子=前 period 根均值，种子期 NaN）；Bol
 **跨公网必须加 TLS**（反向代理或 SSH/WireGuard 隧道）——令牌明文走 HTTP 会被
 链路窃听重放；`host` 改 `"0.0.0.0"` + 防火墙放行端口；令牌 ≥32 字符且要轮换
 （曾明文传输过就换）。端点为 `http://<主机>:<端口>/mcp`。数据不会自动更新——
-远程 agent 看到的是库的最近一次 `download_bars.py --refresh`。
+远程 agent 看到的是库的最近一次 `refresh_all.py` / `download_bars.py --refresh`。
+锁箱对 MCP 同样生效：远程（研究侧）只能读到 `lockbox.json` 的 cutoff 之前。

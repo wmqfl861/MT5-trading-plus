@@ -42,6 +42,16 @@ class SymbolSpec:
     filling_mode: int
     trade_stops_level: int  # 最小止损距离（点），改单/挂单参考
     raw: Any
+    # 以下为 P0 追加的合约参数（快照/成本模型用）：真包 5.0.6231 提供，
+    # 旧式 row / 假件可能缺——映射侧 getattr 兜底，这里带默认值保证直接构造不崩
+    swap_long: float = 0.0        # 多头隔夜库存费（点/手/日，负=付费）
+    swap_short: float = 0.0       # 空头隔夜库存费
+    trade_freeze_level: int = 0   # 冻结级别（点）：距现价过近的改单/挂单会被拒
+    tick_size: float = 0.0        # 最小价格变动（包内名 trade_tick_size）
+    tick_value: float = 0.0       # 单个 tick 的计价值（包内名 trade_tick_value）
+    trade_calc_mode: int = 0      # 盈利计算模式
+    margin_initial: float = 0.0   # 初始保证金率
+    margin_maintenance: float = 0.0  # 维持保证金率
 
 
 @dataclass(frozen=True)

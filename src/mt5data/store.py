@@ -180,3 +180,8 @@ def read_watermark(root, symbol: str, timeframe: str) -> dict | None:
         return None
     with open(p, encoding="utf-8") as f:
         return json.load(f)
+
+
+series_lock = _SeriesLock
+atomic_replace = _atomic_replace
+fsync_file = _fsync_file

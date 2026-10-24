@@ -15,6 +15,7 @@ import duckdb
 import pandas as pd
 
 from mt5mcp import indicators
+from mt5data import lockbox
 from mt5data.store import TIMEFRAME_SECONDS, read_watermark, series_dir
 
 MAX_BARS_LIMIT = 500
@@ -98,17 +99,50 @@ def list_series(root) -> list[dict]:
     return out
 
 
+def _lockbox_cutoff(root, symbol: str, tf: str) -> datetime | None:
+    """该序列的锁箱 cutoff（data/lockbox.json，键 SYMBOL/TF）；无配置 → None。"""
+    lb = lockbox.load_config(root)
+    return lb.get(lockbox.series_key(symbol, tf)) if lb else None
+
+
 def get_bars(root, symbol: str, timeframe: str, *, limit: int = 100,
              since: datetime | None = None, until: datetime | None = None) -> dict:
-    """取 K 线（最多 MAX_BARS_LIMIT 根，最新一段；since/until 圈窗口）。"""
+    """取 K 线（最多 MAX_BARS_LIMIT 根，最新一段；since/until 圈窗口）。
+
+    锁箱约束（远程研究 agent 与本地 research_bars 同一约束）：
+    该序列配置了 cutoff 时——since/until 越过 cutoff → 报错（绝不静默截断）；
+    未传 until → 钳到 cutoff（time < cutoff），响应带 lockbox_cutoff 字段。
+    无配置 → 行为与引入锁箱前完全一致。
+    """
     limit = max(1, min(int(limit), MAX_BARS_LIMIT))
     path = _parquet_path(root, symbol, timeframe)
+    tf = timeframe.upper()
+    cutoff = _lockbox_cutoff(root, symbol, tf)
     con = duckdb.connect()
     try:
         cond = []
+        clamped = False
+        if cutoff is not None:
+            if since is not None and since >= cutoff:
+                raise ValueError(
+                    f"锁箱：{symbol.upper()} {tf} 研究数据截止（cutoff）为 "
+                    f"{cutoff.isoformat()}，since={since.isoformat()} "
+                    "已越过锁箱边界，锁箱段不外发——请收窄时间窗"
+                )
+            if until is not None and until > cutoff:
+                raise ValueError(
+                    f"锁箱：{symbol.upper()} {tf} 研究数据截止（cutoff）为 "
+                    f"{cutoff.isoformat()}，until={until.isoformat()} "
+                    "已越过锁箱边界，锁箱段不外发——请收窄时间窗"
+                )
+            if until is None or until == cutoff:
+                # 未显式传 until（或恰等于 cutoff）→ 钳到 cutoff，
+                # 左闭右开：cutoff 时刻的 bar 属锁箱段，不外发
+                cond.append(f"time < TIMESTAMP '{cutoff.isoformat()}'")
+                clamped = True
         if since is not None:
             cond.append(f"time >= TIMESTAMP '{since.isoformat()}'")
-        if until is not None:
+        if until is not None and until != cutoff:
             cond.append(f"time <= TIMESTAMP '{until.isoformat()}'")
         where = ("WHERE " + " AND ".join(cond)) if cond else ""
         table = f"read_parquet('{_sql_literal(str(path))}')"
@@ -119,7 +153,7 @@ def get_bars(root, symbol: str, timeframe: str, *, limit: int = 100,
     finally:
         con.close()
     df = df.sort_values("time").reset_index(drop=True)
-    return {
+    out = {
         "symbol": symbol.upper(), "timeframe": timeframe.upper(),
         "rows_total_before_limit": int(total),
         "truncated": bool(total > limit),
@@ -133,6 +167,9 @@ def get_bars(root, symbol: str, timeframe: str, *, limit: int = 100,
             for b in df.to_dict("records")
         ],
     }
+    if clamped:
+        out["lockbox_cutoff"] = cutoff.isoformat()
+    return out
 
 
 def describe_series(root, symbol: str, timeframe: str) -> dict:

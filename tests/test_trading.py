@@ -452,3 +452,29 @@ def test_close_unknown_position_raises():
     with pytest.raises(DataUnavailableError, match="9002"):
         tr.close_position(9002)
     assert fake.calls("order_send") == 0
+
+
+# ---- 每策略 magic（P0）----
+
+def test_magic_defaults_to_config_everywhere():
+    # 缺省不传：市价 / 挂单 / 平仓三处一律用 config.magic
+    tr, fake = make()
+    box = capture_request(fake)
+    tr.market_order("EURUSD", "buy", 0.01)
+    assert box["req"]["magic"] == 20261022  # GatewayConfig.magic 缺省值
+    tr.pending_order("EURUSD", "buy", "limit", 0.01, 1.0900)
+    assert box["req"]["magic"] == 20261022
+    tr.close_position(9001)
+    assert box["req"]["magic"] == 20261022
+
+
+def test_explicit_magic_overrides_config_everywhere():
+    # 逐单覆盖：同一网关下多策略各自标识互不串号
+    tr, fake = make()
+    box = capture_request(fake)
+    tr.market_order("EURUSD", "buy", 0.01, magic=777)
+    assert box["req"]["magic"] == 777
+    tr.pending_order("EURUSD", "buy", "limit", 0.01, 1.0900, magic=777)
+    assert box["req"]["magic"] == 777
+    tr.close_position(9001, magic=777)
+    assert box["req"]["magic"] == 777

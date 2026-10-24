@@ -38,6 +38,15 @@ def _to_spec(row) -> SymbolSpec:
         filling_mode=row.filling_mode,
         trade_stops_level=getattr(row, "trade_stops_level", 0),
         raw=row,
+        # P0 新增合约参数：getattr 兜底，旧式 row（假件/低版本包）缺字段不崩
+        swap_long=getattr(row, "swap_long", 0.0),
+        swap_short=getattr(row, "swap_short", 0.0),
+        trade_freeze_level=getattr(row, "trade_freeze_level", 0),
+        tick_size=getattr(row, "trade_tick_size", 0.0),
+        tick_value=getattr(row, "trade_tick_value", 0.0),
+        trade_calc_mode=getattr(row, "trade_calc_mode", 0),
+        margin_initial=getattr(row, "margin_initial", 0.0),
+        margin_maintenance=getattr(row, "margin_maintenance", 0.0),
     )
 
 

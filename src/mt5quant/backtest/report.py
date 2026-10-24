@@ -1,0 +1,266 @@
+"""标准回测报告：指标汇总、Markdown 渲染与可复现 Manifest。
+
+口径说明：
+- Sharpe / Sortino 按 bar 收益率（equity.pct_change()）年化，年化因子 =
+  sqrt(365.25 天对应的 bar 数)，即 bars_per_year = 365.25×86400/周期秒数
+  （H1 → 8766.0 根/年；D1 → 365.25）。零方差或样本不足时记 None。
+- PF（盈利因子）= 盈利交易净利之和 / |亏损交易净利之和|；无亏损交易时记
+  None（避免无穷大进 JSON）。胜率按 net>0 计。
+- 最大回撤按 equity 相对历史峰值的回撤（负数比例）。
+- 成本占毛利比 = 总成本 / 中价毛利；总成本 = 佣金 + 滑点 + 价差 + |隔夜费|
+  （均为 Trade 的拆分字段）；中价毛利 = Σ(gross + slippage_cost +
+  spread_cost)，即把成交价里隐含的滑点/价差还原后的毛利。
+- 期望值：期望净利（资金）、expectancy_r（平均 R 倍数）、
+  expectancy_cost_multiple（期望净利 / 单笔平均来回成本）。
+- data_sha256 算法：对 bars 的 time+open+high+low+close 五列做
+  pandas.util.hash_pandas_object(..., index=False)（逐行 uint64，不看行
+  索引），全部求和得整数 s，再对 str(s) 的 UTF-8 字节做 hashlib.sha256，
+  取 hexdigest。同数据（同列内容）必得同值。
+- git_commit：读不到（无 git、非仓库、超时、非零返回码）一律写
+  "unknown"，绝不因取不到而中断报告。
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import subprocess
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from mt5data.store import TIMEFRAME_SECONDS
+
+
+def bars_per_year(timeframe: str) -> float:
+    """年化因子用的一年 bar 数：365.25 天 / 周期秒数（M1→525960，H1→8766，
+    D1→365.25）。Sharpe 年化 = mean(bar 收益)/std × sqrt(bars_per_year)。"""
+    try:
+        tf = TIMEFRAME_SECONDS[timeframe.upper()]
+    except KeyError:
+        raise ValueError(f"未知 timeframe：{timeframe!r}（须为 TIMEFRAME_SECONDS 之一）")
+    return 365.25 * 86400.0 / tf
+
+
+def summarize(result, *, cost_version: str = "v0") -> dict:
+    """把 BacktestResult 汇总为指标 dict（render/write_report 的唯一数据源）。"""
+    trades = result.trades
+    equity = result.equity.astype("float64")
+
+    net = trades["net"] if len(trades) else pd.Series(dtype="float64")
+    n = len(trades)
+    wins = float(net[net > 0].sum()) if n else 0.0
+    losses = float(net[net < 0].sum()) if n else 0.0
+    gross_mid = float(
+        (trades["gross"] + trades["slippage_cost"] + trades["spread_cost"]).sum()
+    ) if n else 0.0
+    total_cost = float(
+        trades["commission"].sum() + trades["slippage_cost"].sum()
+        + trades["spread_cost"].sum() - trades["swap"].sum()
+    ) if n else 0.0
+
+    returns = equity.pct_change().dropna() if len(equity) > 1 else pd.Series(dtype="float64")
+    sharpe = sortino = None
+    bpy = None
+    try:
+        bpy = math.sqrt(bars_per_year(result.timeframe)) if result.timeframe else None
+    except ValueError:
+        bpy = None
+    if len(returns) >= 2 and bpy is not None:
+        std = float(returns.std(ddof=1))
+        if std > 0:
+            sharpe = float(returns.mean()) / std * bpy
+        downside = returns[returns < 0]
+        if len(downside) > 0:
+            dd = math.sqrt(float((downside ** 2).mean()))
+            sortino = float(returns.mean()) / dd * bpy
+
+    if len(equity):
+        peak = equity.cummax()
+        mdd = float((equity / peak - 1.0).min())
+    else:
+        mdd = 0.0
+
+    r_mult = trades["r_multiple"].dropna() if n else pd.Series(dtype="float64")
+    avg_win = float(net[net > 0].mean()) if (net > 0).any() else None
+    avg_loss = float(abs(net[net < 0].mean())) if (net < 0).any() else None
+
+    by_year, by_hour, by_side = {}, {}, {}
+    if n:
+        years = pd.to_datetime(trades["exit_time"]).dt.year
+        for y, g in trades.groupby(years):
+            by_year[str(y)] = float(g["net"].sum())
+        hours = pd.to_datetime(trades["entry_time"]).dt.hour
+        for h, g in trades.groupby(hours):
+            by_hour[str(h)] = float(g["net"].sum())
+        for side, g in trades.groupby("side"):
+            by_side[side] = {
+                "count": int(len(g)),
+                "net": float(g["net"].sum()),
+                "win_rate": float((g["net"] > 0).mean()),
+            }
+
+    denom = len(result.bars) - 1
+    return {
+        "symbol": result.symbol,
+        "timeframe": result.timeframe,
+        "params": dict(result.params),
+        "cost_model_version": cost_version,
+        "net_profit": float(net.sum()) if n else 0.0,
+        "return_pct": float(equity.iloc[-1] / equity.iloc[0] - 1.0) if len(equity) else 0.0,
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "max_drawdown": mdd,
+        "profit_factor": (wins / abs(losses)) if losses < 0 else None,
+        "win_rate": float((net > 0).mean()) if n else 0.0,
+        "trade_count": int(n),
+        "long_count": int((trades["side"] == "long").sum()) if n else 0,
+        "short_count": int((trades["side"] == "short").sum()) if n else 0,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "payoff_ratio": (avg_win / avg_loss) if (avg_win is not None and avg_loss) else None,
+        "expectancy": float(net.mean()) if n else None,
+        "expectancy_r": float(r_mult.mean()) if len(r_mult) else None,
+        "expectancy_cost_multiple": (
+            float(net.mean()) / (total_cost / n)) if (n and total_cost > 0) else None,
+        "time_in_market": (
+            float(trades["bars_held"].sum()) / denom) if denom > 0 else 0.0,
+        "cost_to_gross": (total_cost / gross_mid) if gross_mid > 0 else None,
+        "total_commission": float(trades["commission"].sum()) if n else 0.0,
+        "total_slippage": float(trades["slippage_cost"].sum()) if n else 0.0,
+        "total_spread": float(trades["spread_cost"].sum()) if n else 0.0,
+        "total_swap": float(trades["swap"].sum()) if n else 0.0,
+        "by_year": by_year,
+        "by_hour": by_hour,
+        "by_side": by_side,
+    }
+
+
+def _fmt(v, spec=".4f"):
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "—"
+    return format(v, spec)
+
+
+def render_markdown(summary: dict, result) -> str:
+    """中文 Markdown 报告（write_report 落盘的 report.md 内容）。"""
+    lines = [
+        f"# 回测报告：{summary['symbol']} {summary['timeframe']}",
+        "",
+        f"- 参数：`{summary['params']}`　成本模型：{summary['cost_model_version']}",
+        f"- 交易数：{summary['trade_count']}"
+        f"（多 {summary['long_count']} / 空 {summary['short_count']}）",
+        "",
+        "## 核心指标",
+        "",
+        "| 指标 | 值 |",
+        "| --- | --- |",
+        f"| 净利 | {_fmt(summary['net_profit'], '.1f')} |",
+        f"| 收益率 | {_fmt(summary['return_pct'], '.2%')} |",
+        f"| Sharpe（年化，365.25d/tf） | {_fmt(summary['sharpe'])} |",
+        f"| Sortino | {_fmt(summary['sortino'])} |",
+        f"| 最大回撤 | {_fmt(summary['max_drawdown'], '.2%')} |",
+        f"| PF | {_fmt(summary['profit_factor'], '.2f')} |",
+        f"| 胜率 | {_fmt(summary['win_rate'], '.2%')} |",
+        f"| 盈亏比 | {_fmt(summary['payoff_ratio'], '.2f')} |",
+        f"| 期望值（净利/R/成本倍数） | {_fmt(summary['expectancy'], '.1f')}"
+        f" / {_fmt(summary['expectancy_r'])} / {_fmt(summary['expectancy_cost_multiple'])} |",
+        f"| 持仓时间占比 | {_fmt(summary['time_in_market'], '.2%')} |",
+        f"| 成本占毛利比 | {_fmt(summary['cost_to_gross'], '.2%')} |",
+        "",
+        "## 成本拆分",
+        "",
+        f"- 佣金 {_fmt(summary['total_commission'], '.1f')}"
+        f"　滑点 {_fmt(summary['total_slippage'], '.1f')}"
+        f"　价差 {_fmt(summary['total_spread'], '.1f')}"
+        f"　隔夜费 {_fmt(summary['total_swap'], '.1f')}",
+    ]
+    if summary["by_year"]:
+        lines += ["", "## 按年", ""] + [
+            f"- {y}: 净利 {_fmt(v, '.1f')}" for y, v in summary["by_year"].items()]
+    if summary["by_hour"]:
+        lines += ["", "## 按入场小时（UTC）", ""] + [
+            f"- {h:->2}: 净利 {_fmt(v, '.1f')}" for h, v in summary["by_hour"].items()]
+    if summary["by_side"]:
+        lines += ["", "## 多空拆分", ""]
+        for side, s in summary["by_side"].items():
+            name = "多头" if side == "long" else "空头"
+            lines.append(
+                f"- {name}: {s['count']} 笔　净利 {_fmt(s['net'], '.1f')}"
+                f"　胜率 {_fmt(s['win_rate'], '.2%')}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+@dataclass
+class Manifest:
+    """可复现性清单：同代码（git 提交）+ 同数据（快照哈希）+ 同参数/成本版本。"""
+
+    git_commit: str
+    data_sha256: str
+    params: dict
+    cost_model_version: str
+    created_utc: str
+
+
+def current_git_commit() -> str:
+    """当前 git 提交号；取不到（无 git/非仓库/超时/非零返回码）返回 "unknown"。"""
+    try:
+        repo_root = Path(__file__).resolve().parents[3]
+        out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo_root),
+                             capture_output=True, text=True, timeout=5)
+        if out.returncode != 0:
+            return "unknown"
+        commit = out.stdout.strip()
+        return commit or "unknown"
+    except Exception:  # 任何失败都不阻塞报告产出
+        return "unknown"
+
+
+def data_sha256(bars: pd.DataFrame) -> str:
+    """数据快照哈希（算法见模块 docstring；只看 time+OHLC 内容，不看行索引）。"""
+    cols = ["time", "open", "high", "low", "close"]
+    row_hashes = pd.util.hash_pandas_object(bars[cols], index=False)
+    total = int(row_hashes.sum())
+    return hashlib.sha256(str(total).encode("utf-8")).hexdigest()
+
+
+def _jsonable(obj):
+    """递归把 NaN/inf 换成 None，保证落盘 JSON 严格合法。"""
+    if isinstance(obj, dict):
+        return {k: _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating, float)):
+        f = float(obj)
+        return f if math.isfinite(f) else None
+    return obj
+
+
+def write_report(out_dir: str, result, *, cost_version: str = "v0") -> str:
+    """写 summary.json + manifest.json + report.md，返回 report.md 路径。"""
+    summary = summarize(result, cost_version=cost_version)
+    manifest = Manifest(
+        git_commit=current_git_commit(),
+        data_sha256=data_sha256(result.bars),
+        params=dict(result.params),
+        cost_model_version=cost_version,
+        created_utc=datetime.now(timezone.utc).isoformat(),
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(_jsonable(summary), f, ensure_ascii=False, indent=2,
+                  allow_nan=False)
+    with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(_jsonable(asdict(manifest)), f, ensure_ascii=False, indent=2,
+                  allow_nan=False)
+    md_path = os.path.join(out_dir, "report.md")
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(render_markdown(summary, result))
+    return md_path

@@ -82,6 +82,7 @@ class TradingService:
         tp: float | None = None,
         deviation: int = 20,
         comment: str = "",
+        magic: int | None = None,
     ) -> OrderResult:
         if side not in ("buy", "sell"):
             raise ValueError(f"非法方向 {side}，仅接受 buy/sell")
@@ -92,7 +93,7 @@ class TradingService:
             "type": self._mt5.ORDER_TYPE_BUY if side == "buy" else self._mt5.ORDER_TYPE_SELL,
             "volume": self._volume(volume, spec),
             "deviation": deviation,
-            "magic": self._config.magic,
+            "magic": self._config.magic if magic is None else magic,  # 每策略可逐单覆盖
             "comment": comment,
             "type_time": _TIME_GTC,
             "type_filling": pick_filling(spec.filling_mode),
@@ -114,6 +115,7 @@ class TradingService:
         sl: float | None = None,
         tp: float | None = None,
         comment: str = "",
+        magic: int | None = None,
     ) -> OrderResult:
         if side not in ("buy", "sell") or kind not in ("limit", "stop"):
             raise ValueError(f"非法挂单参数 side={side} kind={kind}")
@@ -124,7 +126,7 @@ class TradingService:
             "type": getattr(self._mt5, _PENDING_TYPE[(side, kind)]),
             "price": price,
             "volume": self._volume(volume, spec),
-            "magic": self._config.magic,
+            "magic": self._config.magic if magic is None else magic,  # 每策略可逐单覆盖
             "comment": comment,
             "type_time": _TIME_GTC,
             "type_filling": pick_filling(spec.filling_mode),
@@ -186,7 +188,8 @@ class TradingService:
         return self._send(request)
 
     def close_position(
-        self, ticket: int, volume: float | None = None, *, deviation: int = 20
+        self, ticket: int, volume: float | None = None, *, deviation: int = 20,
+        magic: int | None = None,
     ) -> OrderResult:
         pos = self._account.position(ticket)
         spec = self._symbols.get(pos.symbol)
@@ -207,7 +210,7 @@ class TradingService:
             "position": ticket,
             "volume": vol,
             "deviation": deviation,
-            "magic": self._config.magic,
+            "magic": self._config.magic if magic is None else magic,  # 每策略可逐单覆盖
             "comment": f"close #{ticket}",
             "type_time": _TIME_GTC,
             "type_filling": pick_filling(spec.filling_mode),

@@ -8,3 +8,4 @@ mcp.json
 mcp-remote-prompt.txt
 mcp_server.log
 mcp_server.err
+scripts/task_*.cmd
