@@ -58,7 +58,7 @@ def _validate_symbol(symbol: str) -> str:
         raise ValueError(f"非法品种名 {symbol!r}（只接受 MT5 品名字符集）")
     if symbol.strip("._") == "":  # 拒绝 "."、".." 等纯点号路径组件
         raise ValueError(f"非法品种名 {symbol!r}")
-    return symbol.upper()
+    return symbol  # 保留原始大小写（R13）：目录名是事实来源，Windows 不分大小写能读、Linux 会按原名找
 
 
 def _parquet_path(root, symbol: str, timeframe: str) -> Path:
@@ -67,7 +67,7 @@ def _parquet_path(root, symbol: str, timeframe: str) -> Path:
         raise ValueError(f"未知周期 {timeframe}，可用：{sorted(TIMEFRAME_SECONDS)}")
     p = Path(series_dir(root, _validate_symbol(symbol), tf)) / "data.parquet"
     if not p.exists():
-        raise ValueError(f"库中没有 {symbol.upper()} {tf}（先运行 download_bars.py）")
+        raise ValueError(f"库中没有 {symbol} {tf}（先运行 download_bars.py）")
     return p
 
 
@@ -147,13 +147,13 @@ def get_bars(root, symbol: str, timeframe: str, *, limit: int = 100,
         if cutoff is not None:
             if since is not None and since >= cutoff:
                 raise ValueError(
-                    f"锁箱：{symbol.upper()} {tf} 研究数据截止（cutoff）为 "
+                    f"锁箱：{symbol} {tf} 研究数据截止（cutoff）为 "
                     f"{cutoff.isoformat()}，since={since.isoformat()} "
                     "已越过锁箱边界，锁箱段不外发——请收窄时间窗"
                 )
             if until is not None and until > cutoff:
                 raise ValueError(
-                    f"锁箱：{symbol.upper()} {tf} 研究数据截止（cutoff）为 "
+                    f"锁箱：{symbol} {tf} 研究数据截止（cutoff）为 "
                     f"{cutoff.isoformat()}，until={until.isoformat()} "
                     "已越过锁箱边界，锁箱段不外发——请收窄时间窗"
                 )
@@ -176,7 +176,7 @@ def get_bars(root, symbol: str, timeframe: str, *, limit: int = 100,
         con.close()
     df = df.sort_values("time").reset_index(drop=True)
     out = {
-        "symbol": symbol.upper(), "timeframe": timeframe.upper(),
+        "symbol": _validate_symbol(symbol), "timeframe": timeframe.upper(),
         "rows_total_before_limit": int(total),
         "truncated": bool(total > limit),
         "rows_returned": int(len(df)),
@@ -216,7 +216,7 @@ def describe_series(root, symbol: str, timeframe: str) -> dict:
         con.close()
     n, first, last, max_gap = row
     out = {
-        "symbol": symbol.upper(), "timeframe": tf,
+        "symbol": _validate_symbol(symbol), "timeframe": tf,
         "rows": int(n),
         "first_time": _iso(first),
         "last_time": _iso(last),
@@ -285,7 +285,7 @@ def compute_indicator(root, symbol: str, timeframe: str, indicator: str,
         for _, r in tail.iterrows()
     ]
     out = {
-        "symbol": symbol.upper(), "timeframe": timeframe.upper(),
+        "symbol": _validate_symbol(symbol), "timeframe": timeframe.upper(),
         "indicator": indicator, "params": params,
         "values": values,
     }
