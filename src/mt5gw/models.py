@@ -52,6 +52,13 @@ class SymbolSpec:
     trade_calc_mode: int = 0      # 盈利计算模式
     margin_initial: float = 0.0   # 初始保证金率
     margin_maintenance: float = 0.0  # 维持保证金率
+    # T5（R4）追加的隔夜费计费口径：真包 symbol_info 提供 swap_mode /
+    # swap_rollover3days；旧式 row 缺——getattr 兜底（见 symbols._to_spec）。
+    # swap_mode 取值（本机 MetaTrader5 包打印核对 2026-10-24，与
+    # mt5.SYMBOL_SWAP_MODE_* 一致）：0=禁用 1=点数 2=品种货币 3=保证金货币
+    # 4=存款货币 5=年利率(现价) 6=年利率(开仓价) 7=重开仓(现价) 8=重开仓(Bid)
+    swap_mode: int = 0
+    swap_rollover3days: int = 3   # 三倍隔夜费星期（MT5 枚举周日=0…周六=6；3=周三）
 
 
 @dataclass(frozen=True)

@@ -47,6 +47,9 @@ def _to_spec(row) -> SymbolSpec:
         trade_calc_mode=getattr(row, "trade_calc_mode", 0),
         margin_initial=getattr(row, "margin_initial", 0.0),
         margin_maintenance=getattr(row, "margin_maintenance", 0.0),
+        # T5（R4）：隔夜费计费口径与三倍日；旧式 row 缺 → 兜底 0(禁用)/3(MT5 周三)
+        swap_mode=getattr(row, "swap_mode", 0),
+        swap_rollover3days=getattr(row, "swap_rollover3days", 3),
     )
 
 

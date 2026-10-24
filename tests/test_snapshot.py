@@ -21,7 +21,8 @@ FullRow = namedtuple(
     "name description digits point spread trade_mode currency_profit currency_margin "
     "trade_contract_size volume_min volume_max volume_step filling_mode visible "
     "trade_stops_level swap_long swap_short trade_freeze_level "
-    "trade_tick_size trade_tick_value trade_calc_mode margin_initial margin_maintenance",
+    "trade_tick_size trade_tick_value trade_calc_mode margin_initial margin_maintenance "
+    "swap_mode swap_rollover3days",
 )
 # 旧式 row：无新字段（与 fakes.py 时代的 SymRow 同构，证明 getattr 兜底）
 OldRow = namedtuple(
@@ -40,6 +41,7 @@ def full(sym="XAUUSD"):
         trade_stops_level=30, swap_long=-18.4, swap_short=9.2,
         trade_freeze_level=15, trade_tick_size=0.01, trade_tick_value=1.0,
         trade_calc_mode=1, margin_initial=0.005, margin_maintenance=0.0025,
+        swap_mode=1, swap_rollover3days=3,
     )
 
 
@@ -70,6 +72,7 @@ ALL_PARAM_FIELDS = [
     "swap_long", "swap_short",
     "tick_size", "tick_value", "trade_calc_mode",
     "margin_initial", "margin_maintenance",
+    "swap_mode", "swap_rollover3days",
 ]
 
 
@@ -86,6 +89,8 @@ def test_snapshot_contains_all_contract_param_fields():
     assert entry["tick_size"] == 0.01 and entry["tick_value"] == 1.0
     assert entry["trade_calc_mode"] == 1
     assert entry["margin_initial"] == 0.005 and entry["margin_maintenance"] == 0.0025
+    assert entry["swap_mode"] == 1          # T5：计费口径（1=点数）
+    assert entry["swap_rollover3days"] == 3  # T5：三倍日（MT5 星期枚举，周三=3）
     assert entry["captured_at_utc"]  # 抓取时刻必填
     assert "raw" not in entry  # 原始对象不进 JSON
 
@@ -104,6 +109,8 @@ def test_snapshot_old_row_missing_new_fields_falls_back_to_defaults():
     assert e["tick_size"] == 0.0 and e["tick_value"] == 0.0
     assert e["trade_calc_mode"] == 0
     assert e["margin_initial"] == 0.0 and e["margin_maintenance"] == 0.0
+    # T5：旧式 row 缺 swap 字段 → getattr 兜底（0=禁用 / 3=MT5 周三）
+    assert e["swap_mode"] == 0 and e["swap_rollover3days"] == 3
     assert e["contract_size"] == 100000.0  # 旧字段照常映射
 
 
@@ -156,8 +163,25 @@ def test_spec_to_json_excludes_raw_only_whitelist_scalars():
         "trade_stops_level", "swap_long", "swap_short", "trade_freeze_level",
         "tick_size", "tick_value", "trade_calc_mode",
         "margin_initial", "margin_maintenance", "captured_at_utc",
+        "swap_mode", "swap_rollover3days",
     }
     json.dumps(entry)  # 全部可 JSON 化（raw 对象进 JSON 会当场炸）
+
+
+def test_diff_reports_swap_mode_change():
+    # T5：swap_mode/swap_rollover3days 变更必须被 diff 抓到（券商改口径第一时间可见）
+    old_snap = take_snapshot(FakeCatalog([full()]), ["XAUUSD"])
+    new_snap = take_snapshot(
+        FakeCatalog([full()._replace(swap_mode=4)]), ["XAUUSD"])
+    assert diff_snapshots(old_snap, new_snap) == [
+        SpecChange("swap_mode", "XAUUSD", 1, 4)
+    ]
+    old_snap = take_snapshot(FakeCatalog([full()]), ["XAUUSD"])
+    new_snap = take_snapshot(
+        FakeCatalog([full()._replace(swap_rollover3days=5)]), ["XAUUSD"])
+    assert diff_snapshots(old_snap, new_snap) == [
+        SpecChange("swap_rollover3days", "XAUUSD", 3, 5)
+    ]
 
 
 # ---- 脚本辅助函数 ----

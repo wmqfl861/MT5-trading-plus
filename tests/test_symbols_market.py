@@ -195,14 +195,15 @@ def test_symbol_select_failure_raises():
         mkt.bars("EURUSD", "M1", 10)
 
 
-# ---- SymbolSpec 新增合约参数字段（P0）----
+# ---- SymbolSpec 新增合约参数字段（P0）+ swap 计费口径字段（T5/R4）----
 
 FullSymRow = namedtuple(
     "FullSymRow",
     "name description digits point spread trade_mode currency_profit currency_margin "
     "trade_contract_size volume_min volume_max volume_step filling_mode visible "
     "trade_stops_level swap_long swap_short trade_freeze_level "
-    "trade_tick_size trade_tick_value trade_calc_mode margin_initial margin_maintenance",
+    "trade_tick_size trade_tick_value trade_calc_mode margin_initial margin_maintenance "
+    "swap_mode swap_rollover3days",
 )
 
 
@@ -216,6 +217,7 @@ def test_full_row_maps_new_spec_fields():
         trade_stops_level=30, swap_long=-18.4, swap_short=9.2,
         trade_freeze_level=15, trade_tick_size=0.01, trade_tick_value=1.0,
         trade_calc_mode=1, margin_initial=0.005, margin_maintenance=0.0025,
+        swap_mode=4, swap_rollover3days=3,
     ))
     spec = cat.get("XAUUSD")
     assert spec.swap_long == -18.4 and spec.swap_short == 9.2
@@ -223,6 +225,9 @@ def test_full_row_maps_new_spec_fields():
     assert spec.tick_size == 0.01 and spec.tick_value == 1.0  # 包内名 trade_tick_*
     assert spec.trade_calc_mode == 1
     assert spec.margin_initial == 0.005 and spec.margin_maintenance == 0.0025
+    # T5：swap 计费口径与三倍日（MT5 星期枚举：周日=0…周六=6）
+    assert spec.swap_mode == 4           # 按存款货币计
+    assert spec.swap_rollover3days == 3  # MT5 周三
 
 
 def test_old_style_row_falls_back_to_default_new_fields():
@@ -235,3 +240,5 @@ def test_old_style_row_falls_back_to_default_new_fields():
     assert spec.tick_size == 0.0 and spec.tick_value == 0.0
     assert spec.trade_calc_mode == 0
     assert spec.margin_initial == 0.0 and spec.margin_maintenance == 0.0
+    # T5：缺 swap_mode → 0（禁用）、缺 rollover → 3（MT5 周三，FX 惯例）
+    assert spec.swap_mode == 0 and spec.swap_rollover3days == 3

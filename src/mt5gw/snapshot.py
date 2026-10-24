@@ -30,6 +30,8 @@ _SPEC_JSON_FIELDS = (
     "swap_long", "swap_short", "trade_freeze_level",
     "tick_size", "tick_value", "trade_calc_mode",
     "margin_initial", "margin_maintenance",
+    # T5（R4）：隔夜费计费口径与三倍日（券商改口径要被 diff 第一时间抓到）
+    "swap_mode", "swap_rollover3days",
 )
 # 参与比对的字段：白名单去掉 name（即键名）与 captured_at_utc（抓取时间戳）
 _DIFF_FIELDS = tuple(f for f in _SPEC_JSON_FIELDS if f != "name")
