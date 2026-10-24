@@ -75,7 +75,7 @@ def main() -> int:
     ap.add_argument("--samples", type=int, default=12, help="采样次数")
     ap.add_argument("--interval", type=float, default=5.0, help="采样间隔（秒）")
     ap.add_argument("--symbol", default="XAUUSD")
-    ap.add_argument("--config", default="gateway.json",
+    ap.add_argument("--config", default="config.json",
                     help="网关配置 JSON（不存在则用默认配置）")
     ap.add_argument("--data-dir", default="data")
     args = ap.parse_args()

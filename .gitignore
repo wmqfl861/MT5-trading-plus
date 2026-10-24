@@ -9,3 +9,8 @@ mcp-remote-prompt.txt
 mcp_server.log
 mcp_server.err
 scripts/task_*.cmd
+
+# 本地网关配置（含账号钉死 expected_login / 实盘开关）：绝不进公开仓库
+config.json
+gateway.json
+*.local.json

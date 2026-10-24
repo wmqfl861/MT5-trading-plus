@@ -9,9 +9,14 @@
 约定：
 - --end 经 mt5data.lockbox.research_bars（锁箱语义：显式越过 cutoff 的请求
   直接报错，绝不静默截断）；无 lockbox.json 时返回全量，行为与直读一致。
+- 金额口径：contract_size 取 --contract-size，否则读
+  {data-root}/specs/latest.json（scripts/snapshot_specs.py 产出）；两者都没有
+  → 报错退出（绝不静默按 1 折算——那会让盈亏差几百到十万倍）。
 - 成本：--costs auto（默认）用 {data-root}/ticks 的实测点差+滑点
-  （mt5quant.costs.Costs，佣金/隔夜费未配置时如实为 0 并打印说明）；
+  （mt5quant.costs.Costs）；--commission 为每手来回佣金（账户货币）；
+  隔夜费暂按 0（待 swap_mode 进快照后接入，见开发计划 R4）；
   --costs zero 用零成本占位。
+- 每次运行写入独占目录 {out}/{SYMBOL}_{TF}_{UTC戳}_{随机}，不覆盖历史运行。
 """
 import argparse
 import glob
@@ -26,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from mt5data.lockbox import research_bars  # noqa: E402
 from mt5data.store import TIMEFRAME_SECONDS  # noqa: E402
 from mt5quant.backtest.engine_a import run_backtest  # noqa: E402
-from mt5quant.backtest.report import summarize, write_report  # noqa: E402
+from mt5quant.backtest.report import make_run_dir, summarize, write_report  # noqa: E402
 
 
 class ZeroCosts:
@@ -45,8 +50,29 @@ class ZeroCosts:
         return 0.0
 
 
-def build_costs(data_root: str, symbol: str, spread_fraction: float):
-    """从本地 tick 实测构建成本（佣金/隔夜未配置 → 0，如实打印说明）。"""
+def resolve_contract_size(data_root: str, symbol: str, override: float | None) -> float:
+    """合约大小：CLI 覆盖 > {data_root}/specs/latest.json；都没有 → ValueError。"""
+    if override is not None:
+        if not override > 0:
+            raise ValueError(f"--contract-size 必须为正，收到 {override}")
+        return float(override)
+    snap_path = os.path.join(data_root, "specs", "latest.json")
+    if os.path.exists(snap_path):
+        with open(snap_path, encoding="utf-8") as f:
+            snap = json.load(f)
+        spec = snap.get(symbol) if isinstance(snap, dict) else None
+        cs = spec.get("contract_size") if isinstance(spec, dict) else None
+        if isinstance(cs, (int, float)) and cs > 0:
+            return float(cs)
+    raise ValueError(
+        f"{symbol} 合约大小未知：先跑 scripts/snapshot_specs.py 生成 "
+        f"{snap_path}，或显式传 --contract-size（XAUUSD 常见 100、EURUSD 100000）"
+    )
+
+
+def build_costs(data_root: str, symbol: str, spread_fraction: float,
+                commission_per_lot: float = 0.0):
+    """从本地 tick 实测构建成本（佣金按 CLI；隔夜费暂按 0，如实打印说明）。"""
     import pandas as pd
 
     from mt5quant.costs import (
@@ -65,14 +91,15 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float):
     slip = SlippageModel(spread, spread_fraction=spread_fraction)
     costs = Costs(
         spread=spread, slippage_model=slip,
-        commission=CommissionModel(default_per_lot=0.0),
-        # 未取到账户 swap 规则前如实按 0 计（零费率规则，仍走真实模型路径）
+        commission=CommissionModel(default_per_lot=commission_per_lot),
+        # 未取到账户 swap 规则（含 swap_mode）前如实按 0 计（零费率规则，仍走真实模型路径）
         swap=SwapModel(per_symbol={
             symbol: SwapRule(long_per_day=0.0, short_per_day=0.0)}),
     )
     print(f"✓ 成本：tick {len(ticks):,} 条实测点差（p90 口径）；"
-          f"佣金/隔夜费未配置按 0 计（账户佣金与 swap 规则待 P5 配置）")
-    return costs, f"tick-spread-p90+slip{spread_fraction}-comm0-swap0"
+          f"佣金 {commission_per_lot}/手来回；隔夜费暂按 0（待 R4 接入 swap 规则）")
+    return costs, (f"tick-spread-p90+slip{spread_fraction}"
+                   f"-comm{commission_per_lot:g}-swap0")
 
 
 def load_strategy(path: str):
@@ -123,6 +150,10 @@ def main() -> int:
                     help="auto=本地 tick 实测点差+滑点（佣金/隔夜未配置按 0 并说明）；zero=零成本")
     ap.add_argument("--spread-fraction", type=float, default=0.1,
                     help="--costs auto 时的滑点比例（×p90 点差）")
+    ap.add_argument("--commission", type=float, default=0.0,
+                    help="每手来回佣金（账户货币），--costs auto 时生效")
+    ap.add_argument("--contract-size", type=float, default=None,
+                    help="合约大小覆盖；缺省读 {data-root}/specs/latest.json")
     ap.add_argument("--cost-version", default=None,
                     help="成本模型版本（写进 manifest；缺省按 --costs 自动生成）")
     args = ap.parse_args()
@@ -137,30 +168,38 @@ def main() -> int:
         return 1
     try:
         strategy_cls = load_strategy(args.strategy)
+        contract_size = resolve_contract_size(args.data_root, args.symbol,
+                                              args.contract_size)
         bars = load_series(args.data_root, args.symbol, args.timeframe.upper(),
                            args.end)
         if args.costs == "auto":
             costs, cost_version = build_costs(args.data_root, args.symbol,
-                                              args.spread_fraction)
+                                              args.spread_fraction, args.commission)
         else:
             costs, cost_version = ZeroCosts(), "zero-v0"
         if args.cost_version:
             cost_version = args.cost_version
         result = run_backtest(
             strategy_cls(), bars, costs, symbol=args.symbol,
-            params=params, volume_lots=args.volume_lots,
+            params=params, contract_size=contract_size,
+            volume_lots=args.volume_lots,
             initial_capital=args.initial_capital,
             timeframe=args.timeframe.upper(),
         )
         summary = summarize(result, cost_version=cost_version)
-        report_path = write_report(args.out, result, cost_version=cost_version)
+        run_dir = make_run_dir(args.out, args.symbol, args.timeframe.upper())
+        report_path = write_report(
+            run_dir, result, cost_version=cost_version, strategy=args.strategy,
+            extra={"end": args.end, "costs": args.costs,
+                   "spread_fraction": args.spread_fraction,
+                   "commission_per_lot": args.commission})
     except Exception as e:  # fail-fast：任何错误如实报出
         print(f"✗ {type(e).__name__}: {e}")
         return 1
 
     print(f"✓ {args.symbol} {args.timeframe.upper()} "
           f"bars={len(result.bars)} trades={summary['trade_count']} "
-          f"净利={summary['net_profit']:.2f} "
+          f"合约大小={contract_size:g} 净利={summary['net_profit']:.2f} "
           f"回撤={summary['max_drawdown']:.2%}")
     print(f"报告：{report_path}")
     return 0

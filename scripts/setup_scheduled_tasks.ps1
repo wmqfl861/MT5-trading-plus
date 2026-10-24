@@ -46,9 +46,12 @@ function New-DailyTask($name, $time, $wrapper) {
     Write-Host "已创建 MT5Quant\$name（每日 $time）→ $wrapper"
 }
 
-$cfgPath = Join-Path $repoRoot "gateway.json"
+# 配置文件统一为 config.json（README 约定）；兼容旧名 gateway.json
 $cfgArg  = ""
-if (Test-Path $cfgPath) { $cfgArg = " --config `"$cfgPath`"" }
+foreach ($name in @("config.json", "gateway.json")) {
+    $cfgPath = Join-Path $repoRoot $name
+    if (Test-Path $cfgPath) { $cfgArg = " --config `"$cfgPath`""; break }
+}
 
 New-DailyTask "snapshot_specs" "00:05" `
     (New-TaskWrapper "snapshot_specs" "snapshot_specs.py" $cfgArg)

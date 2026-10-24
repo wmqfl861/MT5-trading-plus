@@ -6,7 +6,7 @@
     .venv/Scripts/python.exe scripts/download_ticks.py --symbols XAUUSD,BTCUSD --mode backfill --start 2020-01-01
 增量刷新（定时任务用）：
     .venv/Scripts/python.exe scripts/download_ticks.py --symbols XAUUSD --mode refresh
-可选：--end --chunk-days 7 --data-dir data --config gateway.json
+可选：--end --chunk-days 7 --data-dir data --config config.json
 """
 import argparse
 import sys

@@ -89,8 +89,6 @@ MetaTrader5。
   三者的未传字段一律**回填当前值**——MT5 语义里缺省即 0（等于删除止损），
   本网关绝不把"没传"当 0 发出。
 - 历史委托/挂单里出现未知订单类型时如实标注为 `typeN`，不崩溃。
-- `positions()/pending_orders()` 的 None 歧义按 `last_error` 裁决：成功码视为
-  空集，否则抛错——查询失败绝不伪装成"空仓"。
 
 ## K 线数据库（mt5data）
 
@@ -175,12 +173,23 @@ cutoff 直接报错（绝不静默截断）；MCP `get_bars` 同一约束（越�
 - **A 层回测（P3）**：`mt5quant.backtest`——信号 bar 收盘、下一根开盘成交；
   bid 基准（多头 Ask 入场）；同 bar 双触止损优先；成本按小时模型叠加；
   `check_no_lookahead` 截断测试查前视偏差；报告带 manifest（git 提交号、
-  数据快照哈希、参数、成本模型版本）。
+  数据快照哈希、参数、成本模型版本、引擎版本、数据区间、合约大小）。
+- **金额口径（引擎 A-1.1，2026-10-25）**：`run_backtest(..., contract_size=)`
+  为必填参数——盈亏 = 价格差 × 手数 × 合约大小（账户货币），佣金/隔夜费按
+  手数计；SL 被跳空穿过按开盘价成交（`stop_gap`）；空头 SL/TP 按 Ask 触发
+  （与 MT5 一致）。CLI 的合约大小取 `--contract-size`，否则读
+  `data/specs/latest.json`（先跑 `scripts/snapshot_specs.py`），都没有就报错。
+- 每次 CLI 运行写入独占目录 `data/reports/backtests/{品种}_{周期}_{UTC戳}_{随机}/`，
+  历史运行不会被覆盖（P4 试验台账的前提）。
 
 ```bash
+.venv/Scripts/python.exe scripts/snapshot_specs.py      # 首次：写 data/specs/latest.json（含合约大小）
 .venv/Scripts/python.exe scripts/run_backtest.py --strategy mt5quant.strategies.library.buy_hold:BuyHold \
-    --symbol XAUUSD --timeframe H1 --params '{}' --end 2025-09-01
+    --symbol XAUUSD --timeframe H1 --params '{}' --end 2025-09-01 --commission 0
 ```
+
+审核报告与后续计划：`docs/reviews/`（各轮审核）、`docs/blueprint.md`（蓝图与现状）、
+`docs/superpowers/plans/2026-10-25-review-fixes-p3b-p4.md`（下一轮施工计划）。
 
 ## 每日调度
 

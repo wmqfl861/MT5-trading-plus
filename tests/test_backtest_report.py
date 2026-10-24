@@ -1,5 +1,6 @@
 """报告测试：两笔合成交易的手算指标、Manifest 哈希可重复、write_report。"""
 import json
+import os
 from dataclasses import asdict
 from datetime import datetime, timedelta
 
@@ -203,3 +204,75 @@ def test_current_git_commit_marks_dirty(monkeypatch):
         return R(0)
     monkeypatch.setattr(report.subprocess, "run", fake_run_clean)
     assert report.current_git_commit() == "abc123"
+
+
+# ---------------------------------------------------------- 2026-10-25 修复轮回归
+
+def _flat_result(times, equity_values):
+    bars = pd.DataFrame({
+        "time": pd.to_datetime(times),
+        "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0,
+        "tick_volume": 1, "spread": 1, "real_volume": 0,
+    })[_COLUMNS]
+    empty = pd.DataFrame(columns=list(asdict(trade()).keys()))
+    return BacktestResult(trades=empty, equity=pd.Series(equity_values, dtype="float64"),
+                          bars=bars, params={}, symbol="XAUUSD", timeframe="H1")
+
+
+def test_annualization_uses_observed_bar_frequency_for_5_day_markets():
+    """外汇/黄金/指数一周只交易 5 天：按日历 8766 根/年会把 Sharpe 高估约 18%。"""
+    from mt5quant.backtest.report import observed_bars_per_year
+    times = [t for t in pd.date_range("2026-01-05", "2026-03-06 23:00", freq="h")
+             if t.weekday() < 5]
+    span_days = (times[-1] - times[0]).total_seconds() / 86400.0
+    expected = (len(times) - 1) / (span_days / 365.25)
+    assert observed_bars_per_year(times) == pytest.approx(expected)
+    vals = [10_000.0 + (i % 7) for i in range(len(times))]
+    s = summarize(_flat_result(times, vals))
+    assert s["annualization_basis"] == "observed"
+    assert s["annualization_bars_per_year"] == pytest.approx(expected)
+    assert s["annualization_bars_per_year"] < 0.8 * bars_per_year("H1")
+
+
+def test_annualization_falls_back_to_calendar_for_short_spans():
+    s = summarize(two_trade_result())          # 5 根 H1，跨度 4 小时
+    assert s["annualization_basis"] == "calendar"
+    assert s["annualization_bars_per_year"] == pytest.approx(bars_per_year("H1"))
+
+
+def test_sortino_uses_full_sample_downside_deviation():
+    import math
+    times = [pd.Timestamp("2026-01-05 00:00") + timedelta(hours=i) for i in range(4)]
+    res = _flat_result(times, [100.0, 110.0, 104.5, 109.725])   # 收益 +10% −5% +5%
+    s = summarize(res)
+    r = [0.10, -0.05, 0.05]
+    mean = sum(r) / 3
+    dd = math.sqrt((0.0 + 0.05 ** 2 + 0.0) / 3)   # 分母 = 全部 3 个观测
+    assert s["sortino"] == pytest.approx(mean / dd * math.sqrt(bars_per_year("H1")))
+
+
+def test_make_run_dir_is_unique_and_never_reused(tmp_path):
+    from mt5quant.backtest.report import make_run_dir
+    a = make_run_dir(str(tmp_path), "XAUUSD", "h1")
+    b = make_run_dir(str(tmp_path), "XAUUSD", "h1")
+    assert a != b
+    for d in (a, b):
+        assert os.path.isdir(d)
+        assert os.path.basename(d).startswith("XAUUSD_H1_")
+
+
+def test_manifest_carries_engine_strategy_data_range_and_money_basis(tmp_path, monkeypatch):
+    import mt5quant.backtest.report as report_mod
+    from mt5quant.backtest.engine_a import ENGINE_VERSION
+    monkeypatch.setattr(report_mod, "current_git_commit", lambda: "deadbeef")
+    res = two_trade_result()
+    res.contract_size, res.volume_lots, res.initial_capital = 100.0, 1.0, 10_000.0
+    write_report(str(tmp_path), res, strategy="pkg.mod:Strat", extra={"end": "2025-09-01"})
+    m = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert m["engine_version"] == ENGINE_VERSION
+    assert m["strategy"] == "pkg.mod:Strat"
+    assert m["symbol"] == "XAUUSD" and m["timeframe"] == "H1" and m["n_bars"] == 5
+    assert m["data_first_time"] == "2026-01-05T00:00:00"
+    assert m["data_last_time"] == "2026-01-05T04:00:00"
+    assert m["contract_size"] == 100.0 and m["initial_capital"] == 10_000.0
+    assert m["extra"] == {"end": "2025-09-01"}

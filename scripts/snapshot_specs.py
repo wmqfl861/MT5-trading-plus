@@ -5,7 +5,7 @@ latest 比对打印中文变更报告——券商悄悄改合约大小/库存费
 
 用法：
     .venv/Scripts/python.exe scripts/snapshot_specs.py
-    .venv/Scripts/python.exe scripts/snapshot_specs.py --symbols XAUUSD,BTCUSD,EURUSD,USTEC --config gateway.json
+    .venv/Scripts/python.exe scripts/snapshot_specs.py --symbols XAUUSD,BTCUSD,EURUSD,USTEC --config config.json
 """
 import argparse
 import os
@@ -40,7 +40,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="抓取品种合约参数快照并与上一份比对")
     ap.add_argument("--symbols", default="XAUUSD,BTCUSD,EURUSD,USTEC",
                     help="逗号分隔品种列表（保留大小写）")
-    ap.add_argument("--config", default="gateway.json",
+    ap.add_argument("--config", default="config.json",
                     help="网关配置 JSON（不存在则用默认配置）")
     ap.add_argument("--data-dir", default="data")
     args = ap.parse_args()

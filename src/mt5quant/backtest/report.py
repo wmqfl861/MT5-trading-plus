@@ -1,9 +1,15 @@
 """标准回测报告：指标汇总、Markdown 渲染与可复现 Manifest。
 
 口径说明：
+- 金额字段（净利、成本、期望值）均为账户货币（引擎 C1 修复后的口径）。
 - Sharpe / Sortino 按 bar 收益率（equity.pct_change()）年化，年化因子 =
-  sqrt(365.25 天对应的 bar 数)，即 bars_per_year = 365.25×86400/周期秒数
-  （H1 → 8766.0 根/年；D1 → 365.25）。零方差或样本不足时记 None。
+  sqrt(每年 bar 数)。每年 bar 数优先取**数据实测**（bars 跨度 ≥ 30 天时：
+  bar 根数 ÷ 跨越年数）——外汇/黄金/指数每周只交易约 5 天，按日历
+  365.25×86400/周期秒数 会把 Sharpe 高估约 sqrt(7/5)≈18%；跨度不足时退回
+  日历口径 bars_per_year(tf)。实际采用的值与依据写进 summary
+  （annualization_bars_per_year / annualization_basis）。零方差或样本不足时记 None。
+- Sortino 的下行偏差 = sqrt(mean(min(r,0)²))，分母为全部 bar（标准定义）；
+  无任何负收益时记 None。
 - PF（盈利因子）= 盈利交易净利之和 / |亏损交易净利之和|；无亏损交易时记
   None（避免无穷大进 JSON）。胜率按 net>0 计。
 - 最大回撤按 equity 相对历史峰值的回撤（负数比例）。
@@ -25,8 +31,9 @@ import hashlib
 import json
 import math
 import os
+import secrets
 import subprocess
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,6 +41,7 @@ import numpy as np
 import pandas as pd
 
 from mt5data.store import TIMEFRAME_SECONDS
+from mt5quant.backtest.engine_a import ENGINE_VERSION
 
 
 def bars_per_year(timeframe: str) -> float:
@@ -44,6 +52,35 @@ def bars_per_year(timeframe: str) -> float:
     except KeyError:
         raise ValueError(f"未知 timeframe：{timeframe!r}（须为 TIMEFRAME_SECONDS 之一）")
     return 365.25 * 86400.0 / tf
+
+
+_MIN_OBSERVED_SPAN_DAYS = 30.0
+
+
+def observed_bars_per_year(times) -> float | None:
+    """数据实测的每年 bar 数（跨度 < 30 天或少于 2 根 → None，调用方退回日历口径）。"""
+    t = pd.to_datetime(pd.Series(times))
+    if len(t) < 2:
+        return None
+    span_days = (t.iloc[-1] - t.iloc[0]).total_seconds() / 86400.0
+    if span_days < _MIN_OBSERVED_SPAN_DAYS:
+        return None
+    return (len(t) - 1) / (span_days / 365.25)
+
+
+def annualization_factor(result) -> tuple[float | None, str]:
+    """(每年 bar 数, 依据)；依据 ∈ {"observed", "calendar", "unknown"}。"""
+    bars = getattr(result, "bars", None)
+    if bars is not None and "time" in getattr(bars, "columns", ()):
+        obs = observed_bars_per_year(bars["time"])
+        if obs is not None:
+            return obs, "observed"
+    try:
+        if result.timeframe:
+            return bars_per_year(result.timeframe), "calendar"
+    except ValueError:
+        pass
+    return None, "unknown"
 
 
 def summarize(result, *, cost_version: str = "v0") -> dict:
@@ -65,18 +102,15 @@ def summarize(result, *, cost_version: str = "v0") -> dict:
 
     returns = equity.pct_change().dropna() if len(equity) > 1 else pd.Series(dtype="float64")
     sharpe = sortino = None
-    bpy = None
-    try:
-        bpy = math.sqrt(bars_per_year(result.timeframe)) if result.timeframe else None
-    except ValueError:
-        bpy = None
+    per_year, basis = annualization_factor(result)
+    bpy = math.sqrt(per_year) if per_year else None
     if len(returns) >= 2 and bpy is not None:
         std = float(returns.std(ddof=1))
         if std > 0:
             sharpe = float(returns.mean()) / std * bpy
-        downside = returns[returns < 0]
-        if len(downside) > 0:
-            dd = math.sqrt(float((downside ** 2).mean()))
+        if (returns < 0).any():
+            # 标准下行偏差：分母为全部观测（正收益按 0 计入）
+            dd = math.sqrt(float((returns.clip(upper=0.0) ** 2).mean()))
             sortino = float(returns.mean()) / dd * bpy
 
     if len(equity):
@@ -114,6 +148,8 @@ def summarize(result, *, cost_version: str = "v0") -> dict:
         "return_pct": float(equity.iloc[-1] / equity.iloc[0] - 1.0) if len(equity) else 0.0,
         "sharpe": sharpe,
         "sortino": sortino,
+        "annualization_bars_per_year": per_year,
+        "annualization_basis": basis,
         "max_drawdown": mdd,
         "profit_factor": (wins / abs(losses)) if losses < 0 else None,
         "win_rate": float((net > 0).mean()) if n else 0.0,
@@ -161,7 +197,8 @@ def render_markdown(summary: dict, result) -> str:
         "| --- | --- |",
         f"| 净利 | {_fmt(summary['net_profit'], '.1f')} |",
         f"| 收益率 | {_fmt(summary['return_pct'], '.2%')} |",
-        f"| Sharpe（年化，365.25d/tf） | {_fmt(summary['sharpe'])} |",
+        f"| Sharpe（年化，{_fmt(summary.get('annualization_bars_per_year'), '.0f')} 根/年，"
+        f"{summary.get('annualization_basis', '—')}） | {_fmt(summary['sharpe'])} |",
         f"| Sortino | {_fmt(summary['sortino'])} |",
         f"| 最大回撤 | {_fmt(summary['max_drawdown'], '.2%')} |",
         f"| PF | {_fmt(summary['profit_factor'], '.2f')} |",
@@ -198,13 +235,28 @@ def render_markdown(summary: dict, result) -> str:
 
 @dataclass
 class Manifest:
-    """可复现性清单：同代码（git 提交）+ 同数据（快照哈希）+ 同参数/成本版本。"""
+    """可复现性清单：同代码（git 提交）+ 同数据（快照哈希）+ 同参数/成本版本。
+
+    2026-10-25 起追加引擎版本、策略、品种周期、数据区间与金额口径——试验台账
+    （P4）按这些字段去重与追溯，缺一项就无法判断两次运行是否"同一次试验"。
+    """
 
     git_commit: str
     data_sha256: str
     params: dict
     cost_model_version: str
     created_utc: str
+    engine_version: str = ""
+    strategy: str = ""
+    symbol: str = ""
+    timeframe: str = ""
+    n_bars: int = 0
+    data_first_time: str | None = None
+    data_last_time: str | None = None
+    contract_size: float | None = None
+    volume_lots: float | None = None
+    initial_capital: float | None = None
+    extra: dict = field(default_factory=dict)
 
 
 def current_git_commit() -> str:
@@ -258,16 +310,50 @@ def _jsonable(obj):
     return obj
 
 
-def write_report(out_dir: str, result, *, cost_version: str = "v0") -> str:
-    """写 summary.json + manifest.json + report.md，返回 report.md 路径。"""
-    summary = summarize(result, cost_version=cost_version)
-    manifest = Manifest(
+def make_run_dir(base_out: str, symbol: str, timeframe: str, *, now=None) -> str:
+    """为一次运行生成独占输出目录：{base}/{SYMBOL}_{TF}_{UTC戳}_{6位随机}（并创建）。"""
+    now = now or datetime.now(timezone.utc)
+    stamp = now.strftime("%Y%m%dT%H%M%SZ")
+    path = os.path.join(base_out, f"{symbol}_{timeframe.upper()}_{stamp}_{secrets.token_hex(3)}")
+    os.makedirs(path, exist_ok=False)   # 撞名即抛：绝不覆盖既有运行
+    return path
+
+
+def build_manifest(result, *, cost_version: str = "v0", strategy: str = "",
+                   extra: dict | None = None) -> Manifest:
+    """从 BacktestResult 组装 Manifest（write_report 与试验台账共用）。"""
+    bars = result.bars
+    times = pd.to_datetime(bars["time"]) if len(bars) else None
+    return Manifest(
         git_commit=current_git_commit(),
-        data_sha256=data_sha256(result.bars),
+        data_sha256=data_sha256(bars),
         params=dict(result.params),
         cost_model_version=cost_version,
         created_utc=datetime.now(timezone.utc).isoformat(),
+        engine_version=ENGINE_VERSION,
+        strategy=strategy,
+        symbol=result.symbol,
+        timeframe=result.timeframe or "",
+        n_bars=int(len(bars)),
+        data_first_time=times.iloc[0].isoformat() if times is not None else None,
+        data_last_time=times.iloc[-1].isoformat() if times is not None else None,
+        contract_size=getattr(result, "contract_size", None),
+        volume_lots=getattr(result, "volume_lots", None),
+        initial_capital=getattr(result, "initial_capital", None),
+        extra=dict(extra or {}),
     )
+
+
+def write_report(out_dir: str, result, *, cost_version: str = "v0",
+                 strategy: str = "", extra: dict | None = None) -> str:
+    """写 summary.json + manifest.json + report.md，返回 report.md 路径。
+
+    out_dir 应为**本次运行独占**的目录（CLI 用 make_run_dir 生成）；
+    多次运行写同一目录会互相覆盖，试验台账就丢了记录。
+    """
+    summary = summarize(result, cost_version=cost_version)
+    manifest = build_manifest(result, cost_version=cost_version,
+                              strategy=strategy, extra=extra)
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(_jsonable(summary), f, ensure_ascii=False, indent=2,
