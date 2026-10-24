@@ -93,8 +93,14 @@ _SCHEMA: dict[str, dict[str, type]] = {
 
 
 def gates_sha256(path) -> str:
-    """门槛文件的 sha256（写进每次运行的 gates_hash 字段）。"""
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    """门槛文件的 sha256（写进每次运行的 gates_hash 字段）。
+
+    哈希前统一换行为 LF：git 在 Windows 检出为 CRLF、Linux 为 LF，
+    裸字节哈希会让同一提交在不同平台"被篡改"（本机实测踩过）。
+    """
+    CRLF = bytes([13, 10])
+    raw = Path(path).read_bytes().replace(CRLF, bytes([10]))
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _parse(data: dict, source: str) -> GatesConfig:
