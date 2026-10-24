@@ -77,7 +77,7 @@ Start-Service sshd; Set-Service -Name sshd -StartupType Automatic
 ## 本机加固清单（S1，由用户手动执行，代理不得代办）
 
 1. `mcp.json` 的 `host` 改回 `127.0.0.1`，并按上面步骤轮换令牌。
-2. 删除 Windows 防火墙里 MCP 端口（如 47621）的入站放行规则
+2. 删除 Windows 防火墙里 MCP 端口（即本机 mcp.json 里的 port 值）的入站放行规则
    （管理员 PowerShell：`Get-NetFirewallRule | Where-Object ...` 找到后
    `Remove-NetFirewallRule`，或防火墙 GUI 删除）。
 3. 确认 RDP（3389）未暴露公网；必须远程则限制来源 IP、开启 NLA、强密码。
