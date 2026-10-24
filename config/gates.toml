@@ -1,0 +1,36 @@
+# 关卡门槛（P4/T12）——数值逐条取自 docs/blueprint.md 附录 B。
+# 冻结机制：本文件的 sha256 记录在 src/mt5quant/validation/gates.py 的
+# FROZEN_GATES_SHA256；load_gates 每次加载先核对，不符 → 拒绝运行
+# （防偷偷放松门槛）。P5 用基线策略校准后重新冻结（T13）。
+version = 1
+
+[g1]                                   # 样本内资格线
+trade_count_min_intraday = 300         # 附录 B：M5–M15 ≥300（M1/M30 未列，从严同档）
+trade_count_min_hourly = 150           # 附录 B：H1 ≥150（H4/D1 及以上同档）
+gross_cost_multiple_min = 3.0          # 平均每笔毛利 ≥ 3 倍来回成本
+profit_factor_min = 1.2                # 净盈亏比 ≥ 1.2
+
+[g2]                                   # 稳健性
+cost_scale_pass = 1.5                  # 成本 ×1.5 仍为正期望
+cost_scale_record = 2.0                # 成本 ×2 只记录备查（不计入通过）
+plateau_min_fraction = 0.70            # 参数邻域（±1 档）≥70% 净盈利
+yearly_min_fraction = 0.70             # ≥70% 年份盈利
+yearly_max_concentration = 0.50        # 单一年份贡献 ≤ 总利润 50%
+random_entry_percentile = 95.0         # 夏普须高于随机入场蒙特卡洛 95 分位
+random_entry_sims = 200                # 随机入场蒙特卡洛次数
+drop_best_fraction = 0.05              # 去掉最好的 5% 交易后仍盈利
+cross_symbol_min = 2                   # 通用逻辑 ≥2 个品种为正
+
+[g3]                                   # walk-forward
+walkforward_train_bars = 2000          # 滚动训练窗（bar 数）
+walkforward_test_bars = 500            # 滚动测试窗（bar 数）
+walkforward_min_oos_ratio = 0.50       # 样本外夏普 ≥ 样本内 × 0.5 且为正
+
+[g4]                                   # 统计显著性
+dsr_min_probability = 0.95             # Deflated Sharpe Ratio 概率 ≥ 0.95
+mc_drawdown_sims = 1000                # 蒙特卡洛回撤分布重采样次数
+mc_drawdown_percentile_max = 99.0      # 实际回撤不得差于 99% 的重采样路径
+
+[g5]                                   # 锁箱一次性
+lockbox_interval_lo_percentile = 5.0   # 指标落在样本外蒙特卡洛 [p5, p95] 内
+lockbox_interval_hi_percentile = 95.0
