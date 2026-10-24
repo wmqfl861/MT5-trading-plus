@@ -18,6 +18,9 @@ import pandas as pd
 MAX_PARAMS = 4
 MAX_GRID_POINTS = 100
 
+# ExitRules.reentry 的合法取值（R7，引擎 A-1.3 消费）
+REENTRY_MODES = ("immediate", "after_signal_change")
+
 
 @dataclass(frozen=True)
 class ParamSpec:
@@ -39,12 +42,29 @@ class RequiredData:
 
 @dataclass(frozen=True)
 class ExitRules:
-    """出场规则（引擎消费）：SL/TP 为入场 ATR 的倍数，time_stop 按 bar 数。"""
+    """出场规则（引擎消费）：SL/TP 为入场 ATR 的倍数，time_stop 按 bar 数。
+
+    reentry（R7，引擎 A-1.3）——保护性出场（stop / stop_gap / take_profit /
+    take_profit_gap / time_stop / week_close；signal 出场不算）之后的同向再入场：
+    - "immediate"（默认）：目标仓位语义，信号仍指向该方向时下一根开盘重入；
+    - "after_signal_change"：信号离开该方向（变 0 或反向）之前禁止同向再入场。
+    非法值在构造时抛 ValueError——策略类体里的 `exit_rules = ExitRules(...)`
+    赋值发生在类定义求值时，即"策略定义时抛"。
+    week_close_exit 只允许 ≤ H1 的周期：按 bar 收盘时刻判定周五收盘，D1/H4
+    会提前一整根平仓（D1 在周四收盘就强平），更高周期由引擎在运行前拒绝（R8）。
+    """
 
     stop_loss_atr: float | None = None
     take_profit_atr: float | None = None
     time_stop_bars: int | None = None
     week_close_exit: bool = False
+    reentry: str = "immediate"
+
+    def __post_init__(self):
+        if self.reentry not in REENTRY_MODES:
+            raise ValueError(
+                f"reentry 必须是 {REENTRY_MODES} 之一，收到 {self.reentry!r}"
+            )
 
 
 _TYPE_CHECKS = {

@@ -173,6 +173,7 @@ def test_long_round_trip_hand_computed():
     assert t["exit_price"] == pytest.approx(103 - SLIP)
     assert t["entry_time"] == df["time"].iloc[1]
     assert t["exit_time"] == df["time"].iloc[3]
+    assert t["exit_fill_time"] == df["time"].iloc[3] + pd.Timedelta(hours=1)  # 收盘价出场=bar 收盘
     assert t["gross"] == pytest.approx((103 - SLIP) - (100 + HALF + SLIP))
     assert t["commission"] == pytest.approx(COMM)
     assert t["slippage_cost"] == pytest.approx(2 * SLIP)
@@ -280,6 +281,7 @@ def test_stop_loss_single_touch():
                                timeframe="H1"))
     assert t["exit_reason"] == "stop"
     assert t["exit_price"] == pytest.approx(100.6 - 2.0 - SLIP)
+    assert t["exit_fill_time"] == t["exit_time"]   # 盘中出场：成交时刻=bar 时间
 
 
 # ------------------------------------------------- time_stop / week_close
@@ -381,6 +383,7 @@ def test_reversal_closes_then_opens_at_same_bar_open():
     assert t2["side"] == "short"
     assert t2["entry_price"] == pytest.approx(100 - SLIP)  # 同一根开盘开空
     assert t2["entry_time"] == t1["exit_time"] == df["time"].iloc[2]
+    assert t1["exit_fill_time"] == t1["exit_time"]  # signal 出场：成交时刻=bar 时间
 
 
 # ------------------------------------------------- equity 曲线
@@ -400,6 +403,7 @@ def test_equity_mark_to_market_per_bar():
         10_000.0 + 1.3,          # bar3 已实现净利
     ])
     assert eq.iloc[-1] == pytest.approx(10_000.0 + one_trade(res)["net"])
+    assert res.ruined is False and res.ruined_at is None   # 权益未穿透 0：无爆仓标记
 
 
 def test_result_carries_context():
@@ -603,8 +607,9 @@ def test_equity_marks_short_at_ask():
 
 # ------------------------------------------------- 成本接口 v2（R1 / 计划 T3）
 
-def test_engine_version_bumped_for_cost_interface_v2():
-    assert ENGINE_VERSION == "A-1.2"
+def test_engine_version_bumped_for_t7_exit_and_ruin_rules():
+    # A-1.2 → A-1.3：R7 reentry / R8 week_close 限 ≤H1 / R9 exit_fill_time / R16 爆仓标记
+    assert ENGINE_VERSION == "A-1.3"
 
 
 def test_engine_passes_price_to_cost_models_long_fills():
@@ -709,3 +714,113 @@ def test_engine_relative_costs_double_price_doubles_spread_cost():
     assert t2["spread_cost"] == pytest.approx(rel * 200.0 * 100.0)   # 入场基准 200
     assert t2["slippage_cost"] == pytest.approx(
         (0.1 * rel * 200.0 + 0.1 * rel * 206.0) * 100.0)             # 出场基准 206
+
+
+# ------------------------------------------------- T7：R7 / R8 / R9 / R16
+
+def reentry_bars():
+    """sl_tp_bars 基础上把 bar16 的 low 打到 98.0（≤ 多头 SL 98.6）。"""
+    df = sl_tp_bars()
+    df.loc[16, "low"] = 98.0
+    return df
+
+
+def test_reentry_immediate_reenters_next_bar_after_stop():
+    """R7 默认（immediate）：止损后信号仍为 1 → 下一根开盘立即重入（目标仓位语义）。"""
+    rules = ExitRules(stop_loss_atr=2.0)          # reentry 默认 "immediate"
+    res = run_backtest(ScriptStrategy([0] * 14 + [1] * 5, fill=1, exit_rules=rules),
+                       reentry_bars(), FlatCosts(), symbol="XAUUSD",
+                       contract_size=1.0, params={}, timeframe="H1")
+    assert len(res.trades) == 2
+    t1, t2 = res.trades.iloc[0], res.trades.iloc[1]
+    assert t1["exit_reason"] == "stop" and t1["exit_time"] == res.bars["time"].iloc[16]
+    assert t2["entry_time"] == res.bars["time"].iloc[17]   # bar16 止损 → bar17 开盘重入
+    assert t2["exit_reason"] == "end_of_data"
+
+
+def test_reentry_after_signal_change_blocks_until_signal_leaves_direction():
+    """R7：after_signal_change——止损后信号仍 1 不重入；归 0（bar17）再回 1（bar18）
+    后，bar19 开盘才重新入场。"""
+    rules = ExitRules(stop_loss_atr=2.0, reentry="after_signal_change")
+    df = reentry_bars()
+    res = run_backtest(ScriptStrategy([0] * 14 + [1, 1, 1, 0, 1], fill=0,
+                                      exit_rules=rules),
+                       df, FlatCosts(), symbol="XAUUSD", contract_size=1.0,
+                       params={}, timeframe="H1")
+    assert len(res.trades) == 2
+    t1, t2 = res.trades.iloc[0], res.trades.iloc[1]
+    assert t1["exit_reason"] == "stop"
+    assert t2["entry_time"] == df["time"].iloc[19]
+    assert t2["exit_reason"] == "end_of_data"
+
+
+def test_reentry_after_signal_change_no_reentry_while_signal_holds():
+    """R7：信号始终为 1 时 after_signal_change 止损后不再重入（对照 immediate 用例）。"""
+    rules = ExitRules(stop_loss_atr=2.0, reentry="after_signal_change")
+    res = run_backtest(ScriptStrategy([0] * 14 + [1] * 5, fill=1, exit_rules=rules),
+                       reentry_bars(), FlatCosts(), symbol="XAUUSD",
+                       contract_size=1.0, params={}, timeframe="H1")
+    assert len(res.trades) == 1
+    assert res.trades.iloc[0]["exit_reason"] == "stop"
+
+
+def test_engine_rejects_invalid_reentry_value():
+    """引擎侧防御：绕过 ExitRules 构造校验的鸭子类型规则也在运行前被拒。"""
+    from types import SimpleNamespace
+    rules = SimpleNamespace(stop_loss_atr=None, take_profit_atr=None,
+                            time_stop_bars=None, week_close_exit=False,
+                            reentry="sometimes")
+    with pytest.raises(ValueError, match="reentry"):
+        run_backtest(ScriptStrategy([1], fill=1, exit_rules=rules), base4(),
+                     FlatCosts(), symbol="XAUUSD", contract_size=1.0,
+                     params={}, timeframe="H1")
+
+
+def test_week_close_exit_rejects_timeframes_above_h1():
+    """R8：week_close_exit 按 bar 收盘时刻判定，D1/H4 会提前一整根平仓 → 只许 ≤H1。"""
+    rules = ExitRules(week_close_exit=True)
+    for tf in ("H4", "D1"):
+        df = flat_bars(pd.Timestamp("2026-01-05 10:00"), 6, tf=tf)
+        with pytest.raises(ValueError, match="week_close"):
+            run_backtest(ScriptStrategy([1], fill=1, exit_rules=rules), df,
+                         FlatCosts(), symbol="XAUUSD", contract_size=1.0,
+                         params={}, timeframe=tf)
+    m30 = flat_bars(pd.Timestamp("2026-01-09 17:00"), 8, tf="M30")
+    run_backtest(ScriptStrategy([1], fill=1, exit_rules=rules), m30,
+                 FlatCosts(), symbol="XAUUSD", contract_size=1.0,
+                 params={}, timeframe="M30")   # ≤H1 的周期不受影响
+
+
+def test_time_stop_exit_fill_time_is_bar_close_and_swap_counts_extra_night():
+    """R9：按收盘价出场的成交时刻 = bar 收盘（bar 时间 + 周期），隔夜费按
+    (entry_time, exit_fill_time] 计——到期 bar 20:30（收盘 21:00）恰跨 21:00
+    计费时刻，比按 bar 开盘时刻（旧口径）多计 1 夜。"""
+    df = flat_bars(pd.Timestamp("2026-01-05 00:30"), 41, tf="M30")  # bar40 = 20:30
+    rules = ExitRules(time_stop_bars=2)
+    t = one_trade(run_backtest(ScriptStrategy([0] * 37 + [1, 1, 1], fill=0,
+                                              exit_rules=rules),
+                               df, ChargeHourCosts(), symbol="XAUUSD",
+                               contract_size=1.0, params={}, timeframe="M30"))
+    assert t["entry_time"] == pd.Timestamp("2026-01-05 19:30")
+    assert t["exit_reason"] == "time_stop"
+    assert t["exit_time"] == pd.Timestamp("2026-01-05 20:30")        # bar 时间（原义）
+    assert t["exit_fill_time"] == pd.Timestamp("2026-01-05 21:00")   # bar 收盘时刻
+    assert t["swap"] == pytest.approx(-3.0)  # (19:30, 21:00] 含 21:00 计费时刻
+
+
+def test_ruin_stops_new_entries_and_marks_result():
+    """R16：权益 ≤ 0 后不再开新仓；BacktestResult.ruined / ruined_at 记首次时刻，
+    标记粘滞（time_stop 出场后权益回升也不清除）。"""
+    df = flat_bars(pd.Timestamp("2026-01-05 10:00"), 10)
+    df.loc[1, "close"] = 95.0    # bar1 收盘浮亏 (95−100.6)×1000 = −5600 < −本金 1000
+    rules = ExitRules(time_stop_bars=2)
+    res = run_backtest(ScriptStrategy([1], fill=1, exit_rules=rules), df, FlatCosts(),
+                       symbol="XAUUSD", contract_size=1000.0, params={},
+                       initial_capital=1000.0, timeframe="H1")
+    assert len(res.trades) == 1                    # bar3 time_stop 出场后信号仍 1，但已爆仓
+    t = res.trades.iloc[0]
+    assert t["exit_reason"] == "time_stop"
+    assert res.ruined is True
+    assert res.ruined_at == df["time"].iloc[1]     # 首次权益 ≤ 0 的 bar
+    # 出场净利 −701：bar3 起权益 = 1000 − 701 = 299（回升，但 ruined 已粘滞）
+    assert res.equity.iloc[-1] == pytest.approx(299.0)

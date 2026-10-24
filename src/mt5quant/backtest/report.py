@@ -100,6 +100,9 @@ def summarize(result, *, cost_version: str = "v0") -> dict:
         + trades["spread_cost"].sum() - trades["swap"].sum()
     ) if n else 0.0
 
+    ruined = bool(getattr(result, "ruined", False))
+    ruined_at = getattr(result, "ruined_at", None)
+
     returns = equity.pct_change().dropna() if len(equity) > 1 else pd.Series(dtype="float64")
     sharpe = sortino = None
     per_year, basis = annualization_factor(result)
@@ -173,6 +176,8 @@ def summarize(result, *, cost_version: str = "v0") -> dict:
         "by_year": by_year,
         "by_hour": by_hour,
         "by_side": by_side,
+        "ruined": ruined,
+        "ruined_at": ruined_at.isoformat() if ruined_at else None,
     }
 
 
@@ -190,6 +195,13 @@ def render_markdown(summary: dict, result) -> str:
         f"- 参数：`{summary['params']}`　成本模型：{summary['cost_model_version']}",
         f"- 交易数：{summary['trade_count']}"
         f"（多 {summary['long_count']} / 空 {summary['short_count']}）",
+    ]
+    if summary.get("ruined"):
+        lines.append("")
+        lines.append("> ⚠ 权益已 ≤0（爆仓，首次 "
+                     + str(summary.get("ruined_at"))
+                     + "）：已停止开新仓；收益率/回撤等指标失真，仅供诊断。")
+    lines += [
         "",
         "## 核心指标",
         "",

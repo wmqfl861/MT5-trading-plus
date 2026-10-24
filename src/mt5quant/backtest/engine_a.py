@@ -42,11 +42,24 @@
 - bar 内处理顺序：开盘调仓（同 bar 反向先平后开）→ 开盘跳空检查 → SL → TP →
   time_stop（到期 bar 收盘价出）→ week_close（周五收盘价出）；
   入场当根 bar 同样适用 SL/TP 盘中检查（入场即开盘价，不存在跳空）。
-- 保护性出场（SL/TP/time_stop/week_close）之后若信号仍指向同一方向，
-  下一根 bar 开盘会重新入场——这是"目标仓位"语义；需要冷却的策略自行在
-  信号里归 0（P5 计划提供 ExitRules 选项）。
-- 隔夜费：整段 (entry_time, exit_time] 交给 overnight_fee 按计费时刻数夜
+- 保护性出场后的再入场（R7，ExitRules.reentry，A-1.3）：保护性出场指
+  stop / stop_gap / take_profit / take_profit_gap / time_stop / week_close
+  （signal 出场不算）。reentry="immediate"（默认）＝目标仓位语义——信号仍
+  指向该方向时下一根开盘重入；reentry="after_signal_change"＝信号离开该
+  方向（变 0 或反向）之前禁止同向再入场。
+- Trade 时间口径（R9，A-1.3）：exit_time = 出场 bar 的开盘时刻（原义不变，
+  供对齐/分组）；exit_fill_time = 出场成交时刻——按收盘价出场
+  （time_stop / week_close / end_of_data）为该 bar 收盘时刻（bar 时间+周期），
+  其余出场 = bar 时间。隔夜费按 (entry_time, exit_fill_time] 计。
+- week_close_exit 只允许 ≤ H1 的周期（R8，A-1.3）：按 bar 收盘时刻判定周五
+  收盘，D1/H4 会提前一整根平仓（D1 在周四收盘强平），更高周期运行前抛
+  ValueError。
+- 隔夜费：整段 (entry_time, exit_fill_time] 交给 overnight_fee 按计费时刻数夜
   （三倍日由成本模型内部计算），结果 × 手数。
+- 爆仓标记（R16，A-1.3）：不模拟逐笔保证金。逐 bar 收盘权益 ≤ 0 时引擎停止
+  开新仓（已有持仓的各类出场照常执行），BacktestResult.ruined=True 且
+  ruined_at 记首次发生 bar 的时间（标记粘滞，权益回升不清除）。equity 序列
+  如实记录负值；收益率等指标的解释由报告层结合 ruined 标记判断。
 - equity = 逐 bar 收盘市值：初始资金 + 已实现净利 + 持仓浮盈；多头按收盘
   Bid 估值，空头按收盘 Ask（close + spr，spr 基准价=当根 close）估值，
   与各自的平仓口径一致；
@@ -67,11 +80,18 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from mt5data.store import TIMEFRAME_SECONDS
-from mt5quant.strategies.base import ExitRules
+from mt5quant.strategies.base import REENTRY_MODES, ExitRules
 
 NY_TZ = "America/New_York"   # 周五当地收盘（17:00）换算用的时区
 _WEEK_CLOSE_LOCAL = dtime(17, 0)
-ENGINE_VERSION = "A-1.2"     # 2026-10-25：成本接口 v2（price 参数，相对点差 R1）
+ENGINE_VERSION = "A-1.3"     # 2026-10-25 T7：R7 reentry / R8 week_close 限 ≤H1 /
+                             # R9 exit_fill_time / R16 爆仓标记
+
+# 按收盘价出场的 reason：成交时刻 = bar 收盘（bar 时间 + 周期）（R9）
+CLOSE_PRICE_REASONS = ("time_stop", "week_close", "end_of_data")
+# 保护性出场（R7）：这些 reason 触发 after_signal_change 的同向禁入
+PROTECTIVE_REASONS = ("stop", "stop_gap", "take_profit", "take_profit_gap",
+                      "time_stop", "week_close")
 
 
 class Costs(Protocol):
@@ -124,6 +144,10 @@ class Trade:
     bars_held: int
     exit_reason: str     # signal|stop|stop_gap|take_profit|take_profit_gap|
                          # time_stop|week_close|end_of_data
+    exit_fill_time: pd.Timestamp | None = None   # 出场成交时刻（R9）：
+                         # 按收盘价出场（CLOSE_PRICE_REASONS）= bar 时间+周期，
+                         # 其余 = bar 时间（与 exit_time 相同）。引擎恒写入；
+                         # None 仅出现在引擎之外手工构造的合成交易里。
 
 
 @dataclass
@@ -137,6 +161,8 @@ class BacktestResult:
     contract_size: float | None = None   # 金额换算口径（写进 manifest）
     volume_lots: float | None = None
     initial_capital: float | None = None
+    ruined: bool = False                 # 权益 ≤ 0 过（R16）：此后不再开新仓
+    ruined_at: pd.Timestamp | None = None  # 首次权益 ≤ 0 的 bar 时间；未发生为 None
 
 
 def _wilder(values: pd.Series, period: int) -> pd.Series:
@@ -204,6 +230,10 @@ def _validate_rules(rules: ExitRules) -> None:
         raise ValueError(f"take_profit_atr 必须为正：{rules.take_profit_atr!r}")
     if rules.time_stop_bars is not None and rules.time_stop_bars < 1:
         raise ValueError(f"time_stop_bars 必须 ≥1：{rules.time_stop_bars!r}")
+    # ExitRules 构造时已校验；这里兜住绕过 dataclass 的鸭子类型规则对象
+    if rules.reentry not in REENTRY_MODES:
+        raise ValueError(
+            f"reentry 必须是 {REENTRY_MODES} 之一，收到 {rules.reentry!r}")
 
 
 def _week_close_bars(times: list, tf_seconds: int) -> frozenset:
@@ -245,8 +275,9 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
     contract_size 必填（无默认值，防止静默按 1 折算）：每手每 1.0 价格变动的
     账户货币盈亏；报价货币 = 账户货币时即品种合约大小
     （data/specs/latest.json 的 contract_size）。
-    timeframe 未显式给出时取 strategy.required_data.timeframe；仅
-    week_close_exit=True 时必须能对应 TIMEFRAME_SECONDS 的周期。
+    timeframe 未显式给出时取 strategy.required_data.timeframe；必须能对应
+    TIMEFRAME_SECONDS 的周期（Trade.exit_fill_time 需要 bar 周期算收盘时刻）。
+    week_close_exit=True 另要求周期 ≤ H1（R8）。
     """
     cs = _validate_contract_size(contract_size)
     if not (isinstance(volume_lots, (int, float)) and not isinstance(volume_lots, bool)
@@ -257,6 +288,13 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
         raise ValueError(f"initial_capital 必须是有限正数，收到 {initial_capital!r}")
     if timeframe is None:
         timeframe = strategy.required_data.timeframe
+    tf_norm = timeframe.upper() if timeframe else ""
+    tf_seconds = TIMEFRAME_SECONDS.get(tf_norm)
+    if tf_seconds is None:
+        raise ValueError(
+            f"timeframe 必须是 TIMEFRAME_SECONDS 之一（exit_fill_time 需要 bar "
+            f"周期计算收盘时刻），得到 {timeframe!r}")
+    tf_delta = pd.Timedelta(seconds=tf_seconds)
     params = strategy.validate_params(dict(params))
     _validate_bars(bars)
     rules: ExitRules = strategy.exit_rules or ExitRules()
@@ -274,22 +312,27 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
 
     week_close_idx: frozenset = frozenset()
     if rules.week_close_exit:
-        tf = timeframe.upper() if timeframe else ""
-        if tf not in TIMEFRAME_SECONDS:
+        if tf_seconds > TIMEFRAME_SECONDS["H1"]:
             raise ValueError(
-                f"week_close_exit 需要有效 timeframe（TIMEFRAME_SECONDS），"
-                f"得到 {timeframe!r}"
-            )
-        week_close_idx = _week_close_bars(times, TIMEFRAME_SECONDS[tf])
+                f"week_close_exit 只允许 ≤ H1 的周期：按 bar 收盘时刻判定周五"
+                f"收盘，D1/H4 会提前一整根平仓（D1 在周四收盘强平），得到 "
+                f"{timeframe!r}")
+        week_close_idx = _week_close_bars(times, tf_seconds)
 
     trades: list[Trade] = []
     state: dict | None = None   # 持仓状态；None = 空仓
     realized = 0.0
     equity_vals = [0.0] * n
+    # R7：after_signal_change 模式下保护性出场后的禁入方向（±1；0=无禁入）。
+    # immediate 模式不设禁入（保持目标仓位语义）。
+    blocked_dir = 0
+    # R16：权益 ≤ 0 后不再开新仓；ruined 粘滞，ruined_at 记首次发生 bar。
+    ruined = False
+    ruined_at: pd.Timestamp | None = None
 
     def _close(j: int, base_price: float, reason: str) -> None:
         """平仓。base_price 为 bid 口径基准价（空头出场另加 spr 变成 Ask）。"""
-        nonlocal state, realized
+        nonlocal state, realized, blocked_dir
         assert state is not None
         spr = costs.spread_p90(symbol, times[j].hour, price=base_price)
         slip = costs.slippage(symbol, times[j].hour, price=base_price)
@@ -300,11 +343,13 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
         lots = state["lots"]
         gross = (exit_price - state["entry_price"]) * state["dir"] * lots * cs
         commission = costs.commission_per_lot(symbol) * lots
-        # 整段 (entry, exit] 交给模型按计费时刻数夜：同日跨 charge_hour 也计，
-        # 不再用"跨 UTC 日界"作代理（那会漏掉日内跨计费时刻的持仓）；
-        # overnight_fee 是"每手"口径，必须 × 手数
+        # 成交时刻（R9）：按收盘价出场 = bar 收盘（bar 时间+周期），其余 = bar
+        # 时间。隔夜费按 (entry_time, exit_fill_time] 计——恰跨计费时刻的那根
+        # bar 的收盘也计入；overnight_fee 是"每手"口径，必须 × 手数
+        exit_fill = (times[j] + tf_delta if reason in CLOSE_PRICE_REASONS
+                     else times[j])
         swap = costs.overnight_fee(
-            symbol, state["side"], state["entry_time"], times[j]) * lots
+            symbol, state["side"], state["entry_time"], exit_fill) * lots
         net = gross - commission + swap
         spread_charged = state["spread_charged"]
         if spread_charged is None:        # 空头：价差计在出场腿
@@ -317,8 +362,11 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
             slippage_cost=(state["entry_slip"] + slip) * lots * cs,
             spread_cost=spread_charged * lots * cs, swap=swap, net=net,
             r_multiple=_r_multiple(net, state), bars_held=j - state["entry_bar"],
-            exit_reason=reason))
+            exit_reason=reason, exit_fill_time=exit_fill))
         realized += net
+        if (rules.reentry == "after_signal_change"
+                and reason in PROTECTIVE_REASONS):   # R7：保护性出场 → 禁同向再入场
+            blocked_dir = state["dir"]
         state = None
 
     def _open(j: int, desired: int) -> None:
@@ -396,12 +444,15 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
 
     for j in range(n):
         # 1) 开盘调仓：信号来自 bar j-1 的收盘
-        if j > 0 and int(sig_arr[j - 1]) != (state["dir"] if state else 0):
-            desired = int(sig_arr[j - 1])
-            if state is not None:
-                _close(j, opens[j], "signal")
-            if desired != 0:
-                _open(j, desired)
+        if j > 0:
+            if blocked_dir and int(sig_arr[j - 1]) != blocked_dir:
+                blocked_dir = 0   # R7：信号已离开禁入方向（变 0 或反向）→ 解禁
+            if int(sig_arr[j - 1]) != (state["dir"] if state else 0):
+                desired = int(sig_arr[j - 1])
+                if state is not None:
+                    _close(j, opens[j], "signal")
+                if desired != 0 and not ruined and desired != blocked_dir:
+                    _open(j, desired)   # 爆仓（R16）或同向禁入（R7）时不开新仓
         # 2) 持仓检查（入场当根同样适用盘中 SL/TP）
         if state is not None:
             _protective_exit(j)
@@ -420,10 +471,16 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
                                                     price=closes[j])
             unreal = (mark - state["entry_price"]) * state["dir"] * state["lots"] * cs
         equity_vals[j] = initial_capital + realized + unreal
+        if not ruined and equity_vals[j] <= 0:   # R16：爆仓（粘滞标记）
+            ruined = True
+            ruined_at = times[j]
 
     if state is not None:  # 数据末尾强平
         _close(n - 1, closes[n - 1], "end_of_data")
         equity_vals[n - 1] = initial_capital + realized
+        if not ruined and equity_vals[n - 1] <= 0:
+            ruined = True
+            ruined_at = times[n - 1]
 
     trades_df = pd.DataFrame(
         [asdict(t) for t in trades],
@@ -433,4 +490,5 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
     return BacktestResult(trades=trades_df, equity=equity, bars=bars,
                           params=params, symbol=symbol, timeframe=timeframe,
                           contract_size=cs, volume_lots=float(volume_lots),
-                          initial_capital=float(initial_capital))
+                          initial_capital=float(initial_capital),
+                          ruined=ruined, ruined_at=ruined_at)

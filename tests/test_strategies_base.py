@@ -133,3 +133,24 @@ def test_buy_hold_signals_all_one():
     assert set(sig.unique()) == {1}
     assert list(sig.index) == list(bars(5).index)
     BuyHold().validate_params({})  # 无参数策略接受空参
+
+
+# ------------------------------------------------- R7：ExitRules.reentry
+
+def test_exit_rules_default_reentry_is_immediate():
+    assert ExitRules().reentry == "immediate"
+    assert ExitRules(reentry="after_signal_change").reentry == "after_signal_change"
+
+
+def test_exit_rules_rejects_invalid_reentry_at_construction():
+    with pytest.raises(ValueError, match="reentry"):
+        ExitRules(reentry="cooldown")
+
+
+def test_exit_rules_rejects_invalid_reentry_at_strategy_definition():
+    with pytest.raises(ValueError, match="reentry"):
+        class BadReentry(BaseStrategy):
+            exit_rules = ExitRules(reentry="one_bar")   # 类体求值即"策略定义时"
+
+            def generate_signals(self, bars, params):
+                return pd.Series(0, index=bars.index, dtype="int64")
