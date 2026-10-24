@@ -29,7 +29,15 @@ ACCOUNT_TRADE_MODE_CONTEST = 1
 ACCOUNT_TRADE_MODE_REAL = 2
 
 _EXPECTED_TYPES = {"terminal_path": str, "allow_live_trading": bool, "magic": int,
-                   "expected_login": int}
+                   "expected_login": int, "server_utc_offset_hours": float}
+
+# 类型不符时的补充说明（按字段类型给最贴切的提示）
+_TYPE_HINTS = {
+    bool: "（例如 allow_live_trading 必须写 true/false，不能是字符串——"
+          "字符串 \"false\" 为真值，会静默解锁实盘。）",
+    float: "（例如 server_utc_offset_hours 必须写带小数点的数字，如 0.0 / 2.0 / 3.0；"
+           "整数与字符串一律拒绝——R5：时差声明错了，时段与按小时成本会全部错位。）",
+}
 
 
 @dataclass(frozen=True)
@@ -38,6 +46,10 @@ class GatewayConfig:
     allow_live_trading: bool = False
     magic: int = 20261022
     expected_login: int | None = None  # 钉死账号；解锁实盘时必填
+    # 服务器时间 − UTC 的声明时差（小时，R5）：库内时间实为服务器时间，
+    # Exness 为 GMT+0 故默认 0.0；换 GMT+2/+3 券商必须显式声明并经
+    # mt5data.clock.check_server_offset 用实测时钟校验
+    server_utc_offset_hours: float = 0.0
 
     def __post_init__(self):
         # 代码构造（GatewayConfig(...)、dataclasses.replace）与 JSON 装载同一条
@@ -69,8 +81,7 @@ def _validate_types(data: dict) -> None:
             raise ValueError(
                 f"配置项 {key} 类型应为 {expected.__name__}，"
                 f"实际为 {type(value).__name__}：{value!r}。"
-                "（例如 allow_live_trading 必须写 true/false，不能是字符串——"
-                "字符串 \"false\" 为真值，会静默解锁实盘。）"
+                f"{_TYPE_HINTS.get(expected, '')}"
             )
 
 

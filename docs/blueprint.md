@@ -60,8 +60,9 @@ MT5 终端 ⇄ mt5gw（唯一入口：行情/账户/交易，保险丝）
 ## 4. 铁律（v2）
 
 1. **时间**：库内时间是"贴 UTC 标签的 naive datetime"，实为经纪商服务器时间。Exness 服务器
-   为 GMT+0，所以目前等于 UTC。R5 落地后，配置必须声明 `server_utc_offset_hours`，
-   刷新与回测启动时用实测时钟校验，不符即拒绝运行。交易时段一律用 zoneinfo 按交易所本地时间换算。
+   为 GMT+0，所以目前等于 UTC。R5 已落地：配置声明 `server_utc_offset_hours`（默认 0.0），
+   刷新与回测启动时用实测时钟校验（`mt5data.clock`），不符即拒绝运行；行情静默时跳过并记录。
+   交易时段一律用 zoneinfo 按交易所本地时间换算。
 2. **金额**：价格单位与账户货币严格区分。`run_backtest` 的 `contract_size` 必填；
    成本模型每个方法都在 docstring 写明单位（价格单位 / 每手金额）。
 3. **只用已收盘 bar**：信号在 bar i 收盘产生，bar i+1 开盘成交。

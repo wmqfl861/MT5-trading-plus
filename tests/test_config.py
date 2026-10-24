@@ -76,6 +76,41 @@ def test_fuse_blocks_real_account():
         ensure_trade_allowed(2, False)
 
 
+# ---- server_utc_offset_hours：时区显式化（R5 / 计划 T6）----
+
+def test_server_utc_offset_hours_defaults_to_zero():
+    cfg = GatewayConfig()
+    assert cfg.server_utc_offset_hours == 0.0
+    assert isinstance(cfg.server_utc_offset_hours, float)
+
+
+def test_load_accepts_float_offset(tmp_path):
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps({"server_utc_offset_hours": 3.0}), encoding="utf-8")
+    assert load(str(p)).server_utc_offset_hours == 3.0
+
+
+def test_offset_rejects_string(tmp_path):
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps({"server_utc_offset_hours": "0"}), encoding="utf-8")
+    with pytest.raises(ValueError, match="server_utc_offset_hours"):
+        load(str(p))  # 字符串时差会静默按 0 换算——必须当场拒绝
+    with pytest.raises(ValueError):
+        GatewayConfig(server_utc_offset_hours="+2")  # 代码构造同一条底线
+
+
+def test_offset_rejects_bool_and_int(tmp_path):
+    # 严格 float：True 会被当成 1.0、int 2 与 2.0 混用会掩盖单位粗心
+    with pytest.raises(ValueError):
+        GatewayConfig(server_utc_offset_hours=True)
+    with pytest.raises(ValueError):
+        GatewayConfig(server_utc_offset_hours=2)
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps({"server_utc_offset_hours": 2}), encoding="utf-8")
+    with pytest.raises(ValueError, match="server_utc_offset_hours"):
+        load(str(p))  # JSON 整数同样拒绝：必须写 2.0
+
+
 def test_fuse_blocks_contest_and_unknown_modes():  # 白名单：只有模拟盘免检放行
     with pytest.raises(LiveTradingBlockedError):
         ensure_trade_allowed(1, False)  # 竞赛盘
