@@ -200,9 +200,9 @@ def slippage(self, symbol: str, hour_utc: int, *, price: float | None = None) ->
 
 - [x] `.github/workflows/tests.yml`（windows-latest、Python 3.12、全量 pytest）已由审核方建立，
       首次运行 389 passed；之后每次推送看 Actions 是否为绿，红了先修再继续。
-- [ ] `cost_audit.py`：合约大小缺失时报错（与 `run_backtest.py` 一致），保留 `--contract-size` 覆盖。
-- [ ] `mt5mcp.tools._validate_symbol`：不再转大写，按原样校验后使用（Windows 行为不变）。
-- [ ] 修复轮收尾：跑 `cost_audit.py --timeframes M1,M5,M15,H1`（相对点差 + 校准佣金），
+- [x] `cost_audit.py`：合约大小缺失时报错（与 `run_backtest.py` 一致），保留 `--contract-size` 覆盖。
+- [x] `mt5mcp.tools._validate_symbol`：不再转大写，按原样校验后使用（Windows 行为不变）。
+- [x] 修复轮收尾：跑 `cost_audit.py --timeframes M1,M5,M15,H1`（相对点差 + 校准佣金），
       写 `docs/research/scope-<日期>.md`：哪些品种 × 周期 × 时段进入研究、哪些时段禁止交易、理由。
 
 ---
@@ -240,12 +240,12 @@ def run_backtest_ticks(strategy, bars, ticks_loader, costs, *, symbol, params, c
 **Files:** 新建 `scripts/reconcile_ab.py`、`mql5/Experts/BuyHoldRef.mq5`、`mql5/Experts/MACrossRef.mq5`、
 `scripts/reconcile_mt5_tester.py`、`docs/reports/reconciliation-<日期>.md`。
 
-- [ ] `reconcile_ab.py`：同一策略、同一 tick 覆盖期分别跑 A、B，逐笔对齐输出差异表
+- [x] `reconcile_ab.py`：同一策略、同一 tick 覆盖期分别跑 A、B，逐笔对齐输出差异表
       （入场/出场时间、价格、净利），汇总每笔净利差的分布。
-- [ ] 两个参考 EA：信号逻辑与 Python 版逐行对应（BuyHold；收盘价 SMA 快慢线交叉，参数写死），
+- [x] 两个参考 EA：信号逻辑与 Python 版逐行对应（BuyHold；收盘价 SMA 快慢线交叉，参数写死），
       `OnTester` 把成交写成 CSV（`MQL5\Files`）。
-- [ ] 在 MT5 策略测试器用"基于真实 tick"模式跑同一时段，`reconcile_mt5_tester.py` 与 B 层逐笔比对。
-- [ ] 把实测差异与约定容差写进报告和本计划（例如：信号类交易的时间必须完全一致；
+- [x] 在 MT5 策略测试器用"基于真实 tick"模式跑同一时段，`reconcile_mt5_tester.py` 与 B 层逐笔比对。
+- [x] 把实测差异与约定容差写进报告和本计划（例如：信号类交易的时间必须完全一致；
       每笔净利差 ≤ 1 个点差）。容差确定后写进 `tests/` 的回归用例。
 
 ---
@@ -294,10 +294,10 @@ def run_backtest_ticks(strategy, bars, ticks_loader, costs, *, symbol, params, c
 - G5：锁箱一次性——必须 `--approve` 且写入 `lockbox_uses`；第二次请求直接拒绝。
 - `config/gates.toml` 的 sha256 写进每次运行；与冻结值不符 → 拒绝运行。
 
-- [ ] 失败测试先行：用 EMA 全史计算、`lookback` 不够的策略被窗口不变性抓出；
+- [x] 失败测试先行：用 EMA 全史计算、`lookback` 不够的策略被窗口不变性抓出；
       故意过拟合的策略（在噪声上挑最优参数）过不了 G2/G4；随机信号策略过不了随机入场基准；
       G5 第二次被拒；改动 `gates.toml` 后拒绝运行。
-- [ ] 实现；用 BuyHold 示例卡端到端跑 G0–G4，产出标准关卡报告。
+- [x] 实现；用 BuyHold 示例卡端到端跑 G0–G4，产出标准关卡报告。
 
 ---
 
