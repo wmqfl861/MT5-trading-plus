@@ -1,0 +1,25 @@
+# H001：买入持有基准（XAUUSD H1）。
+# 用途：一切候选策略的对照线（G2 的"对比买入持有"关卡）；本身不追求 alpha。
+# 先卡后测：本卡在第一次回测前已提交到 git，提交时间即预测登记时间。
+id = "H001"
+version = 1
+symbols = ["XAUUSD"]
+timeframe = "H1"
+session = "全时段（基准，不限定交易时段）"
+phenomenon = "黄金长期名义价格上行（2020 年代央行购金与法币贬值背景下的长期趋势）"
+mechanism = "持有者承担波动与隔夜风险，赚取风险溢价与长期通胀重定价；无对手方持续送钱，故只作基准不作alpha"
+should_fail_when = "实际利率持续走高或长期通缩环境（金价长期下行段），持有净值为负"
+falsified_if = "样本内净利为负，或夏普低于同期任何候选策略的随机入场蒙特卡洛 95 分位"
+graveyard_checked = []
+
+[rules]
+entry = "第一根可交易 bar 开盘买入（信号恒 1，无择时）"
+exit = "持有到数据末尾强平（end_of_data）"
+stop = "无（基准不设止损；引擎不模拟保证金，用小手数控制名义敞口）"
+
+[params]                     # 无参数：网格恰 1 组（BuyHold）
+
+[expected]
+trades_per_year = "≈0.17（单笔持有全部样本，年化不足一笔）"
+win_rate = "与样本期金价涨跌同号；长期样本预期 >50%"
+payoff_ratio = "不适用（单笔交易）"
