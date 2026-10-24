@@ -11,7 +11,7 @@ P4（试验台账、假设卡、关卡 G0–G5），为 P5 基线策略打底。
 1. `docs/reviews/2026-10-25-review-round3.md`——问题清单（S1、R1–R16）与本轮已修项（F1–F10）
 2. `docs/blueprint.md`——蓝图 v2：架构、铁律、路线图、决策记录
 
-**基线：** 提交 `045bffe`（引擎 A-1.1）。本地全量应为 **388** 个测试全部通过。
+**基线：** 提交 `045bffe`（引擎 A-1.1）。全量 **389** 个测试全部通过（GitHub Actions 实测）。
 
 **Tech Stack:** Python 3.12（`.venv`）、pandas / numpy / pyarrow / duckdb；标准库 `sqlite3`、
 `tomllib`、`zoneinfo`。**不新增第三方依赖**（确需新增先问用户）。
@@ -45,7 +45,7 @@ P4（试验台账、假设卡、关卡 G0–G5），为 P5 基线策略打底。
 
 ### T0：基线核对（0.5 天）
 
-- [ ] `git status` 干净后 `git pull`；全量 pytest，记录通过数（预期 388）。有失败先修，不得带病推进。
+- [ ] `git status` 干净后 `git pull`；全量 pytest，记录通过数（预期 389）。有失败先修，不得带病推进。
 - [ ] 跑 `scripts/snapshot_specs.py`，确认 `data/specs/latest.json` 里四个品种的 `contract_size`。
 - [ ] 跑 `scripts/run_backtest.py --strategy mt5quant.strategies.library.buy_hold:BuyHold
       --symbol XAUUSD --timeframe H1 --params '{}' --end <锁箱 cutoff> --volume-lots 0.01`；
@@ -198,8 +198,8 @@ def slippage(self, symbol: str, hour_utc: int, *, price: float | None = None) ->
 
 ### T8：CI 与小项 R12 / R13 / R15（0.5 天）
 
-- [ ] 确认 `.github/workflows/tests.yml`（windows-latest、Python 3.12、全量 pytest）在 GitHub 上是绿的；
-      若本仓库还没有该文件则新建。
+- [x] `.github/workflows/tests.yml`（windows-latest、Python 3.12、全量 pytest）已由审核方建立，
+      首次运行 389 passed；之后每次推送看 Actions 是否为绿，红了先修再继续。
 - [ ] `cost_audit.py`：合约大小缺失时报错（与 `run_backtest.py` 一致），保留 `--contract-size` 覆盖。
 - [ ] `mt5mcp.tools._validate_symbol`：不再转大写，按原样校验后使用（Windows 行为不变）。
 - [ ] 修复轮收尾：跑 `cost_audit.py --timeframes M1,M5,M15,H1`（相对点差 + 校准佣金），

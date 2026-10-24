@@ -20,15 +20,14 @@
 
 ## 验证方式
 
-在 Linux 沙箱里运行了测试。沙箱无法安装 pyarrow / duckdb，因此：
-
-- 运行了 363 个测试（原 342 个可导入的 + 本轮新增 21 个），323 个通过；
-  其余 40 个失败**全部**是"缺 parquet 引擎"，与代码无关；
-- `test_mt5mcp_server.py`、`test_mt5mcp_tools.py` 因缺 duckdb 未能导入（25 个测试未跑）。
+- **全量测试已在 GitHub Actions 跑通**：windows-latest、Python 3.12、`requirements-dev.txt`
+  全部依赖，结果 **389 passed**（本轮新增 21 个；工作流见 `.github/workflows/tests.yml`，
+  汇总行写在提交的检查注解里）。
+- 审核用的 Linux 沙箱装不上 pyarrow / duckdb，只能跑其中不读写 parquet 的 323 个，
+  用于开发过程中的快速回归。
 - 引擎的三个缺陷另用探针脚本在修复前后各跑一次，结果见下表。
 
-**本地必须跑一次全量**：`.venv/Scripts/python.exe -m pytest -q`，预期 388 个
-（367 + 21）全部通过。
+本地仍建议跑一次：`.venv/Scripts/python.exe -m pytest -q`，应为 389 个全部通过。
 
 ## 已直接修复（提交 045bffe，引擎版本 A-1.1）
 
