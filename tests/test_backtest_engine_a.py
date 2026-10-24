@@ -19,13 +19,13 @@ HALF, SLIP, COMM, ONIGHT = 0.5, 0.1, 1.0, -2.0
 
 
 class FlatCosts:
-    """手算假成本：常数 half/slip/佣金、隔夜费每次调用恒 −2.0。"""
+    """手算假成本：常数 half/slip/佣金；隔夜费按 (from,to] 跨过的 UTC 午夜数计。"""
 
     def __init__(self, half=HALF, slip=SLIP, commission=COMM, overnight=ONIGHT):
         self.half, self.slip = half, slip
         self.commission, self.overnight = commission, overnight
 
-    def half_spread(self, symbol, hour_utc):
+    def spread_p90(self, symbol, hour_utc):
         return self.half
 
     def slippage(self, symbol, hour_utc):
@@ -35,7 +35,26 @@ class FlatCosts:
         return self.commission
 
     def overnight_fee(self, symbol, side, from_ts, to_ts):
-        return self.overnight
+        f, t = pd.Timestamp(from_ts), pd.Timestamp(to_ts)
+        if t <= f:
+            return 0.0
+        days = (t.normalize() - f.normalize()).days  # (f,t] 内午夜数（t 恰为午夜也计）
+        return self.overnight * days
+
+
+class ChargeHourCosts(FlatCosts):
+    """按 21:00 计费时刻数夜（I2 回归）：每夜 −3.0。"""
+
+    def overnight_fee(self, symbol, side, from_ts, to_ts):
+        f, t = pd.Timestamp(from_ts), pd.Timestamp(to_ts)
+        nights = 0
+        day = f.normalize()
+        while day <= t:
+            mark = day + pd.Timedelta(hours=21)
+            if f < mark <= t:
+                nights += 1
+            day += pd.Timedelta(days=1)
+        return -3.0 * nights
 
 
 class HourlySlipCosts(FlatCosts):
@@ -309,7 +328,7 @@ def test_without_week_close_holds_over_weekend():
                                symbol="XAUUSD", params={}, timeframe="H1"))
     assert t["exit_reason"] == "end_of_data"
     assert t["exit_time"] == df["time"].iloc[4]  # 次周一 00:00 那根
-    assert t["swap"] == pytest.approx(ONIGHT)    # 周五 19:00 → 周一 00:00 跨日
+    assert t["swap"] == pytest.approx(4 * ONIGHT)  # 周五19:00→(次日)周二00:00：跨 4 个午夜（模型整段计夜）
 
 
 # ------------------------------------------------- 隔夜费
@@ -403,3 +422,19 @@ def test_rejects_invalid_exit_rules():
         run_backtest(ScriptStrategy([1], fill=1,
                                     exit_rules=ExitRules(stop_loss_atr=-1.0)),
                      df, FlatCosts(), symbol="XAUUSD", params={}, timeframe="H1")
+
+
+def test_overnight_fee_counts_intraday_charge_hour_crossing():
+    """I2 回归：00:30 起持仓到当日 22:00——不跨 UTC 日界但跨 21:00 计费时刻，
+    必须记 1 夜（旧实现只在跨日界时才调用模型，恒漏计日内跨计费时刻）。"""
+    df = flat_bars(pd.Timestamp("2026-01-05 00:30"), 44, tf="M30")  # 00:30…22:00
+    t = one_trade(run_backtest(ScriptStrategy([1], fill=1), df, ChargeHourCosts(),
+                               symbol="XAUUSD", params={}, timeframe="M30"))
+    assert t["entry_time"] == pd.Timestamp("2026-01-05 01:00")
+    assert t["exit_time"] == pd.Timestamp("2026-01-05 22:00")  # 末根强平
+    assert t["swap"] == pytest.approx(-3.0)                    # 恰跨 21:00 一次
+
+    ctrl = flat_bars(pd.Timestamp("2026-01-05 00:30"), 24, tf="M30")  # 00:30…12:00 不跨
+    t2 = one_trade(run_backtest(ScriptStrategy([1], fill=1), ctrl, ChargeHourCosts(),
+                                symbol="XAUUSD", params={}, timeframe="M30"))
+    assert t2["swap"] == pytest.approx(0.0)

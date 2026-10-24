@@ -56,9 +56,10 @@ def test_fixed_only_model_positive():
     assert m.slippage("EURUSD", 10) == pytest.approx(0.00005)
 
 
-def test_zero_or_negative_config_rejected():
-    with pytest.raises(ValueError):
-        SlippageModel(_spread_model(), spread_fraction=0.0, fixed_price=0.0)
+def test_zero_config_allowed_negative_rejected():
+    # 显式零滑点合法（零点差品种/有意忽略）；负值拒绝
+    m = SlippageModel(_spread_model(), spread_fraction=0.0, fixed_price=0.0)
+    assert m.slippage("EURUSD", 10) == 0.0
     with pytest.raises(ValueError):
         SlippageModel(_spread_model(), spread_fraction=-0.1)
     with pytest.raises(ValueError):

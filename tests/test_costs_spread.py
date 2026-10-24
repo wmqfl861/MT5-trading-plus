@@ -56,15 +56,15 @@ def test_hour_bucket_is_utc_from_epoch_msc():
     assert m.stat(0).n == 1 and m.stat(0).median == pytest.approx(0.0004)
 
 
-def test_half_spread_returns_p90_and_validates():
+def test_spread_p90_returns_p90_and_validates():
     ticks = make_ticks([(f"2026-06-01 10:{i:02d}:00", 0.0001 * (i + 1)) for i in range(5)])
     m = SpreadModel.from_ticks("EURUSD", ticks)
     # 口径：返回该小时 p90（保守），不是 p90 的一半
-    assert m.half_spread("EURUSD", 10) == pytest.approx(0.00046)
+    assert m.spread_p90("EURUSD", 10) == pytest.approx(0.00046)
     with pytest.raises(ValueError):  # 品种不在模型
-        m.half_spread("XAUUSD", 10)
+        m.spread_p90("XAUUSD", 10)
     with pytest.raises(ValueError):  # 小时无统计
-        m.half_spread("EURUSD", 3)
+        m.spread_p90("EURUSD", 3)
 
 
 def test_rollover_hours_flag_p99_spike():
@@ -88,7 +88,7 @@ def test_save_load_roundtrip(tmp_path):
     assert not os.path.exists(p + ".tmp")  # 原子写不留残片
     m2 = SpreadModel.load(p)
     assert m2.stat(10) == m.stat(10)
-    assert m2.half_spread("EURUSD", 10) == pytest.approx(0.00046)
+    assert m2.spread_p90("EURUSD", 10) == pytest.approx(0.00046)
     assert m2.rollover_hours() == m.rollover_hours()
 
 
@@ -112,8 +112,8 @@ def test_merge_and_multi_symbol_lookup():
     b = SpreadModel.from_ticks("XAUUSD", make_ticks([("2026-06-01 10:00:00", 0.30)]))
     m = a.merge(b)
     assert m.symbols == ("EURUSD", "XAUUSD")
-    assert m.half_spread("EURUSD", 10) == pytest.approx(0.0002)
-    assert m.half_spread("XAUUSD", 10) == pytest.approx(0.30)
+    assert m.spread_p90("EURUSD", 10) == pytest.approx(0.0002)
+    assert m.spread_p90("XAUUSD", 10) == pytest.approx(0.30)
     with pytest.raises(ValueError):  # 多品种时无 symbol 的查询必须显式
         m.stat(10)
     with pytest.raises(ValueError):

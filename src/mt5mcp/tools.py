@@ -173,21 +173,27 @@ def get_bars(root, symbol: str, timeframe: str, *, limit: int = 100,
 
 
 def describe_series(root, symbol: str, timeframe: str) -> dict:
-    """序列概况：行数、范围、步长、最大相邻间隔（周末休市导致的大间隔属正常）。"""
+    """序列概况：行数、范围、步长、最大相邻间隔（周末休市导致的大间隔属正常）。
+
+    锁箱约束：该序列配置了 cutoff 时只统计开放段（time < cutoff），
+    last_time 绝不越过 cutoff——否则等于泄露锁箱段的末时刻。
+    """
     path = _parquet_path(root, symbol, timeframe)
+    tf = timeframe.upper()
+    cutoff = _lockbox_cutoff(root, symbol, tf)
+    cond = f"WHERE time < TIMESTAMP '{cutoff.isoformat()}' " if cutoff else ""
     con = duckdb.connect()
     try:
         table = f"read_parquet('{_sql_literal(str(path))}')"
         row = con.execute(f"""
             SELECT count(*) AS n, min(time) AS f, max(time) AS l, max(gap) AS max_gap
             FROM (SELECT time, datediff('second', lag(time) OVER (ORDER BY time), time) AS gap
-                  FROM {table})
+                  FROM {table} {cond})
         """).fetchone()
     finally:
         con.close()
     n, first, last, max_gap = row
-    tf = timeframe.upper()
-    return {
+    out = {
         "symbol": symbol.upper(), "timeframe": tf,
         "rows": int(n),
         "first_time": _iso(first),
@@ -196,6 +202,9 @@ def describe_series(root, symbol: str, timeframe: str) -> dict:
         "max_gap_seconds": int(max_gap) if max_gap is not None else 0,
         "note": "max_gap 大多为周末/假日休市；远超两倍步长且不是周末时段才值得排查",
     }
+    if cutoff:
+        out["lockbox_cutoff"] = cutoff.isoformat()
+    return out
 
 
 def _indicator_columns(name: str, df: pd.DataFrame, params: dict) -> dict[str, pd.Series]:
@@ -221,7 +230,12 @@ def _indicator_columns(name: str, df: pd.DataFrame, params: dict) -> dict[str, p
 
 def compute_indicator(root, symbol: str, timeframe: str, indicator: str,
                       params: dict | None = None, limit: int = 50) -> dict:
-    """服务端现算指标，只回最后 limit 个点（只读尾部 limit+预热期，不碰全量）。"""
+    """服务端现算指标，只回最后 limit 个点（只读尾部 limit+预热期，不碰全量）。
+
+    锁箱约束：配置了 cutoff 时只读开放段（time < cutoff）的尾部——指标
+    全部由开放段数据计算，锁箱段一根都不进（period=1 的 sma 即收盘价原值，
+    不钳制等于整段外发锁箱收盘价）。
+    """
     limit = max(1, min(int(limit), MAX_INDICATOR_POINTS))
     params = params or {}
     for key in ("period", "fast", "slow", "signal"):
@@ -229,10 +243,12 @@ def compute_indicator(root, symbol: str, timeframe: str, indicator: str,
             params[key] = _capped_period(params[key], key)
     warmup = _warmup_for(indicator, params)
     path = _parquet_path(root, symbol, timeframe)
+    cutoff = _lockbox_cutoff(root, symbol, timeframe.upper())
+    cond = f"WHERE time < TIMESTAMP '{cutoff.isoformat()}' " if cutoff else ""
     con = duckdb.connect()
     try:
         df = con.execute(
-            f"SELECT * FROM read_parquet('{_sql_literal(str(path))}') "
+            f"SELECT * FROM read_parquet('{_sql_literal(str(path))}') {cond}"
             f"ORDER BY time DESC LIMIT {limit + warmup}"
         ).fetchdf()
     finally:
@@ -246,8 +262,11 @@ def compute_indicator(root, symbol: str, timeframe: str, indicator: str,
          **{k: round(float(r[k]), 8) for k in cols}}
         for _, r in tail.iterrows()
     ]
-    return {
+    out = {
         "symbol": symbol.upper(), "timeframe": timeframe.upper(),
         "indicator": indicator, "params": params,
         "values": values,
     }
+    if cutoff:
+        out["lockbox_cutoff"] = cutoff.isoformat()
+    return out

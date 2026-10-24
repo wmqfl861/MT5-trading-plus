@@ -152,10 +152,10 @@ def test_heatmap_hand_computed_both_symbols():
                       _vol_fixture(), ["XAUUSD", "EURUSD"], ["H1"])
     assert list(hm.index) == [("XAUUSD", "H1"), ("EURUSD", "H1")]
     assert list(hm.columns) == [14]
-    # XAUUSD：(2×0.46 + 2×0.046 + 6/100) / 8 = 1.072/8 = 0.134（佣金只折一次）
-    assert hm.loc[("XAUUSD", "H1"), 14] == pytest.approx(0.134)
-    # EURUSD：(2×0.00046 + 2×0.000046 + 3/100000) / 0.008 = 0.001042/0.008 = 0.13025
-    assert hm.loc[("EURUSD", "H1"), 14] == pytest.approx(0.13025)
+    # XAUUSD：(0.46 + 2×0.046 + 6/100) / 8 = 0.612/8 = 0.0765（点差每来回一次，佣金只折一次）
+    assert hm.loc[("XAUUSD", "H1"), 14] == pytest.approx(0.0765)
+    # EURUSD：(0.00046 + 2×0.000046 + 3/100000) / 0.008 = 0.000582/0.008 = 0.07275
+    assert hm.loc[("EURUSD", "H1"), 14] == pytest.approx(0.07275)
 
 
 def test_heatmap_missing_spread_hour_is_nan():
@@ -169,7 +169,7 @@ def test_heatmap_missing_spread_hour_is_nan():
                       vol, ["XAUUSD", "EURUSD"], ["H1"])
     assert list(hm.columns) == [14, 15]  # 列=vol 小时并集
     assert math.isnan(hm.loc[("XAUUSD", "H1"), 15])  # 点差缺 15 点 → NaN
-    assert hm.loc[("XAUUSD", "H1"), 14] == pytest.approx(0.134)
+    assert hm.loc[("XAUUSD", "H1"), 14] == pytest.approx(0.0765)
 
 
 def test_heatmap_fail_fast_on_bad_inputs():
@@ -230,7 +230,7 @@ def test_costs_bundle_delegates_four_methods():
     spread, slip, comm = _models()
     swap = SwapModel(per_symbol={"XAUUSD": SwapRule(long_per_day=-7.0, short_per_day=-2.0)})
     costs = Costs(spread=spread, slippage_model=slip, commission=comm, swap=swap)
-    assert costs.half_spread("XAUUSD", 14) == pytest.approx(0.46)
+    assert costs.spread_p90("XAUUSD", 14) == pytest.approx(0.46)
     assert costs.slippage("XAUUSD", 14) == pytest.approx(0.046)
     assert costs.commission_per_lot("XAUUSD") == pytest.approx(6.0)
     assert costs.overnight_fee("XAUUSD", "long",
@@ -294,8 +294,8 @@ def test_cost_audit_script_smoke(tmp_path, monkeypatch):
     assert mod.main() == 0
 
     hm = pd.read_csv(out / "heatmap.csv", index_col=[0, 1])
-    # XAUUSD：(2×0.3 + 2×0.03 + 6/100) / 16 = 0.72/16 = 0.045
-    assert hm.loc[("XAUUSD", "H1"), "9"] == pytest.approx(0.045)
+    # XAUUSD：(0.3 + 2×0.03 + 6/100) / 16 = 0.42/16 = 0.02625（点差每来回一次）
+    assert hm.loc[("XAUUSD", "H1"), "9"] == pytest.approx(0.02625)
     assert math.isnan(hm.loc[("EURUSD", "H1"), "9"])  # EURUSD 无 tick → 全 NaN
     scope = (out / "scope.md").read_text(encoding="utf-8")
     assert "无tick，跳过点差实测" in scope   # EURUSD/BTCUSD

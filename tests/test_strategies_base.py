@@ -1,6 +1,7 @@
 """策略接口测试：参数个数/网格组合上限、validate_params、BuyHold。"""
 import pandas as pd
 import pytest
+from dataclasses import FrozenInstanceError
 
 from mt5quant.strategies import (
     BaseStrategy,
@@ -43,13 +44,13 @@ def bars(n=3):
 
 def test_param_specs_are_frozen():
     spec = ParamSpec(name="k", type="int", grid=(1, 2))
-    with pytest.raises(Exception):
+    with pytest.raises(FrozenInstanceError):
         spec.name = "x"  # type: ignore[misc]
     rules = ExitRules()
-    with pytest.raises(Exception):
+    with pytest.raises(FrozenInstanceError):
         rules.stop_loss_atr = 1.0  # type: ignore[misc]
     req = RequiredData(symbols=("XAUUSD",), timeframe="H1", lookback_bars=10)
-    with pytest.raises(Exception):
+    with pytest.raises(FrozenInstanceError):
         req.timeframe = "M1"  # type: ignore[misc]
 
 

@@ -133,7 +133,8 @@ def _save_bars_locked(d, symbol, timeframe, df, *, server=None, login=None):
     old_meta_path = os.path.join(d, "meta.json")
     if (server is None or login is None) and os.path.exists(old_meta_path):
         try:
-            old = json.load(open(old_meta_path, encoding="utf-8"))
+            with open(old_meta_path, encoding="utf-8") as _f:
+                old = json.load(_f)
             server = old.get("server") if server is None else server
             login = old.get("login") if login is None else login
         except (OSError, ValueError):

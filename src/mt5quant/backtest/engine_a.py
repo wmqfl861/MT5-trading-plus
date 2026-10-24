@@ -1,12 +1,12 @@
 """A 层向量化回测引擎：信号 bar 收盘 → 下一根 bar 开盘调仓，bid 基准成本模型。
 
 成交与成本模型（全部钉死，测试逐项手算对账）：
-- bar 价格即 bid；ask 建模为 bid + 2×half_spread，本引擎每个来回只按
-  half_spread 计一次价差成本（挂在"非 bid 一侧"的那条腿上）。
+- bar 价格即 bid；ask = bid + 点差。costs.spread_p90 即点差全幅（p90），
+  每个来回恰计一次，挂在"非 bid 一侧"的那条腿上（多头入场/空头出场）。
 - 执行价（p 为成交基准价，h 为执行 bar 开盘时刻的 UTC 小时，
-  half=costs.half_spread(symbol,h)、slip=costs.slippage(symbol,h)）：
-      多头 entry = p + half + slip    多头 exit = p − slip
-      空头 entry = p − slip           空头 exit = p + half + slip
+  spr=costs.spread_p90(symbol,h)、slip=costs.slippage(symbol,h)）：
+      多头 entry = p + spr + slip    多头 exit = p − slip
+      空头 entry = p − slip           空头 exit = p + spr + slip
   → 价差与滑点已含在成交价内；Trade.slippage_cost/spread_cost 仅作报告
     拆分，计算 net 时不再重复扣减。
 - 成交基准价 p：信号调仓 = 下一根 bar 的 open；SL/TP = 止损/止盈价；
@@ -46,7 +46,7 @@ _WEEK_CLOSE_LOCAL = dtime(17, 0)
 class Costs(Protocol):
     """成本模型结构化接口——四个方法名与 mt5quant.costs 的产出逐字一致。"""
 
-    def half_spread(self, symbol: str, hour_utc: int) -> float:
+    def spread_p90(self, symbol: str, hour_utc: int) -> float:
         """该 UTC 小时的半点差（价格单位）。"""
         ...
 
@@ -70,12 +70,12 @@ class Trade:
     exit_time: pd.Timestamp
     side: str            # "long" | "short"
     volume_lots: float
-    entry_price: float   # 实际成交价（已含 half/slip）
+    entry_price: float   # 实际成交价（已含点差/滑点）
     exit_price: float
     gross: float         # (exit−entry)×方向×手数——已含价差与滑点损耗
     commission: float    # 来回佣金
     slippage_cost: float  # 双边滑点（拆分用，已含在 gross 内）
-    spread_cost: float   # 单边 half 价差（拆分用，已含在 gross 内）
+    spread_cost: float   # 该来回的价差成本全幅（拆分用，已含在 gross 内）
     swap: float          # 隔夜费（成本模型口径，≤0）
     net: float           # gross − commission + swap
     r_multiple: float    # net / 初始风险（SL 距离；无 SL 时按 1×ATR）
@@ -226,30 +226,30 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
     def _close(j: int, base_price: float, reason: str) -> None:
         nonlocal state, realized
         assert state is not None
-        half = costs.half_spread(symbol, times[j].hour)
+        spr = costs.spread_p90(symbol, times[j].hour)
         slip = costs.slippage(symbol, times[j].hour)
         if state["dir"] == 1:
             exit_price = base_price - slip
         else:
-            exit_price = base_price + half + slip
+            exit_price = base_price + spr + slip
         lots = state["lots"]
         gross = (exit_price - state["entry_price"]) * state["dir"] * lots
         commission = costs.commission_per_lot(symbol) * lots
-        swap = 0.0
-        if times[j].date() > state["entry_time"].date():
-            swap = costs.overnight_fee(
-                symbol, state["side"], state["entry_time"], times[j])
+        # 整段 (entry, exit] 交给模型按计费时刻数夜：同日跨 charge_hour 也计，
+        # 不再用"跨 UTC 日界"作代理（那会漏掉日内跨计费时刻的持仓）
+        swap = costs.overnight_fee(
+            symbol, state["side"], state["entry_time"], times[j])
         net = gross - commission + swap
-        half_charged = state["half_charged"]
-        if half_charged is None:          # 空头：价差计在出场腿
-            half_charged = half
+        spread_charged = state["spread_charged"]
+        if spread_charged is None:        # 空头：价差计在出场腿
+            spread_charged = spr
         trades.append(Trade(
             entry_time=state["entry_time"], exit_time=times[j],
             side=state["side"], volume_lots=lots,
             entry_price=state["entry_price"], exit_price=exit_price,
             gross=gross, commission=commission,
             slippage_cost=(state["entry_slip"] + slip) * lots,
-            spread_cost=half_charged * lots, swap=swap, net=net,
+            spread_cost=spread_charged * lots, swap=swap, net=net,
             r_multiple=_r_multiple(net, state), bars_held=j - state["entry_bar"],
             exit_reason=reason))
         realized += net
@@ -257,15 +257,15 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
 
     def _open(j: int, desired: int) -> None:
         nonlocal state
-        half = costs.half_spread(symbol, times[j].hour)
+        spr = costs.spread_p90(symbol, times[j].hour)
         slip = costs.slippage(symbol, times[j].hour)
         base = opens[j]
         if desired == 1:
-            entry_price = base + half + slip
-            half_charged: float | None = half   # 多头：价差计在入场腿
+            entry_price = base + spr + slip
+            spread_charged: float | None = spr  # 多头：价差计在入场腿
         else:
             entry_price = base - slip
-            half_charged = None
+            spread_charged = None
         sig_bar = j - 1                       # SL/TP 用信号 bar 的 ATR（已收盘）
         entry_atr = float(atr_arr[sig_bar])
         if math.isnan(entry_atr):
@@ -281,7 +281,7 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
         state = {
             "dir": desired, "side": "long" if desired == 1 else "short",
             "lots": volume_lots, "entry_price": entry_price, "entry_time": times[j],
-            "entry_bar": j, "entry_slip": slip, "half_charged": half_charged,
+            "entry_bar": j, "entry_slip": slip, "spread_charged": spread_charged,
             "entry_atr": entry_atr, "sl_k": rules.stop_loss_atr, "sl": sl, "tp": tp,
         }
 

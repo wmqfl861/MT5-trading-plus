@@ -32,7 +32,7 @@ from mt5quant.backtest.report import summarize, write_report  # noqa: E402
 class ZeroCosts:
     """零成本占位：实现 engine_a.Costs Protocol。"""
 
-    def half_spread(self, symbol, hour_utc):
+    def spread_p90(self, symbol, hour_utc):
         return 0.0
 
     def slippage(self, symbol, hour_utc):
@@ -88,7 +88,9 @@ def load_strategy(path: str):
 def load_series(data_root, symbol, timeframe, end):
     """读序列：经锁箱加载器（end 越过 cutoff 直接报错，绝不静默截断）。
 
-    end 语义与 research_bars 一致：保留 time <= end 的行（含端点）。
+    end 语义与 research_bars 一致：保留 time <= end 的行（含端点）——
+    注意 end 时刻"开盘"的那根 bar 会整根纳入（含其整段 OHLC）；
+    做切分严谨的样本外研究时请传 bar 的收盘时刻。
     """
     import pandas as pd
 

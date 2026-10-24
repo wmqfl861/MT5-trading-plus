@@ -27,8 +27,8 @@ class Costs:
     commission: CommissionModel
     swap: SwapModel
 
-    def half_spread(self, symbol: str, hour_utc: int) -> float:
-        return self.spread.half_spread(symbol, hour_utc)
+    def spread_p90(self, symbol: str, hour_utc: int) -> float:
+        return self.spread.spread_p90(symbol, hour_utc)
 
     def slippage(self, symbol: str, hour_utc: int) -> float:
         return self.slippage_model.slippage(symbol, hour_utc)

@@ -36,7 +36,7 @@ def main(argv=None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     lines = ["# K 线质检汇总", "",
-             "| 品种 | 周期 | 覆盖率% | unexpected 缺口 | spike | 点差异常 | 说明 |",
+             "| 品种 | 周期 | 覆盖率% | unexpected | micro_gap | spike | 点差异常 | 说明 |",
              "|---|---|---|---|---|---|---|"]
     for sym in symbols:
         for tf in tfs:
@@ -50,11 +50,12 @@ def main(argv=None) -> int:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(rep.to_dict(), f, ensure_ascii=False, indent=2)
             n_unexpected = sum(1 for g in rep.gaps if g.kind == "unexpected")
+            n_micro = sum(1 for g in rep.gaps if g.kind == "micro_gap")
             lines.append(
-                f"| {sym} | {tf} | {rep.coverage_pct:.2f} | {n_unexpected} "
+                f"| {sym} | {tf} | {rep.coverage_pct:.2f} | {n_unexpected} | {n_micro} "
                 f"| {len(rep.spikes)} | {len(rep.spread_anomalies)} | |")
             print(f"✓ {sym:8s} {tf:4s} rows={rep.rows:,} "
-                  f"覆盖率={rep.coverage_pct:.2f}% unexpected={n_unexpected} "
+                  f"覆盖率={rep.coverage_pct:.2f}% unexpected={n_unexpected} micro={n_micro} "
                   f"spikes={len(rep.spikes)} 点差异常={len(rep.spread_anomalies)}",
                   flush=True)
 

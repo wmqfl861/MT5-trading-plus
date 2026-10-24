@@ -6,6 +6,9 @@
 data/server_clock.json，末尾打印 offset 的 min/max/median 与稳定性
 判读（判据随输出写明），供切换前后对比。
 
+休市/静默期防护：tick 距墙钟超过 STALE_TICK_S 视为陈旧（度量的是
+"距末笔的时间"而非时钟差），样本标 stale=True 且不参与统计。
+
 用法：
     .venv/Scripts/python.exe scripts/measure_server_clock.py --samples 12 --interval 5
 """
@@ -24,6 +27,7 @@ from mt5gw import GatewayConfig, MT5Gateway, load  # noqa: E402
 from mt5gw.snapshot import write_json_atomic  # noqa: E402
 
 STABLE_SPREAD_S = 1.0  # tick 时间粒度为秒：极差 ≤1s 视为稳定
+STALE_TICK_S = 120.0   # tick 距墙钟超过该秒数视为陈旧（休市静默期），样本无效
 
 
 def append_samples(path: str, records: list[dict]) -> int:
@@ -37,6 +41,15 @@ def append_samples(path: str, records: list[dict]) -> int:
     data.extend(records)
     write_json_atomic(path, data)
     return len(data)
+
+
+def is_stale(record: dict) -> bool:
+    """tick 陈旧判定：server_time 距 wall_utc 超过 STALE_TICK_S（休市/静默期，
+    取到的是末笔旧 tick，其差值度量的是"距末笔的时间"而非时钟差——无效）。"""
+    wall = datetime.fromisoformat(record["wall_utc"])
+    server = datetime.fromisoformat(record["server_time"])
+    lag = (wall.replace(tzinfo=None) - server).total_seconds()
+    return lag > STALE_TICK_S
 
 
 def summarize_offsets(offsets: list[float]) -> dict:
@@ -68,25 +81,43 @@ def main() -> int:
     args = ap.parse_args()
 
     records = []
+    stale_count = 0
     with MT5Gateway(_load_config(args.config)) as gw:
         for i in range(args.samples):
             wall = datetime.now(timezone.utc)
             q = gw.market.quote(args.symbol)  # 内含 symbol_info_tick，time 即服务器时间
             offset_s = (q.time - wall.replace(tzinfo=None)).total_seconds()
-            records.append({
+            rec = {
                 "wall_utc": wall.isoformat(),
                 "server_time": q.time.isoformat(),
                 "offset_s": offset_s,
-            })
-            print(f"[{i + 1}/{args.samples}] wall={wall.isoformat()} "
-                  f"server={q.time.isoformat()} offset={offset_s:+.1f}s", flush=True)
+            }
+            if is_stale(rec):
+                # 休市静默期：末笔 tick 距今太远，offset 度量的是静默时长而非时钟差
+                rec["stale"] = True
+                stale_count += 1
+                records.append(rec)
+                print(f"[{i + 1}/{args.samples}] wall={wall.isoformat()} "
+                      f"server={q.time.isoformat()} 陈旧 tick（休市？），样本无效",
+                      flush=True)
+            else:
+                records.append(rec)
+                print(f"[{i + 1}/{args.samples}] wall={wall.isoformat()} "
+                      f"server={q.time.isoformat()} offset={offset_s:+.1f}s",
+                      flush=True)
             if i + 1 < args.samples:
                 time.sleep(args.interval)
 
     out = os.path.join(args.data_dir, "server_clock.json")
     total = append_samples(out, records)
-    s = summarize_offsets([r["offset_s"] for r in records])
-    print(f"\n已追加 {len(records)} 条到 {out}（累计 {total} 条）")
+    fresh = [r["offset_s"] for r in records if not r.get("stale")]
+    print(f"\n已追加 {len(records)} 条到 {out}（累计 {total} 条；"
+          f"其中陈旧 {stale_count} 条已标 stale，不参与统计）")
+    if not fresh:
+        print("全部样本陈旧（休市静默期）——本次无有效测量，"
+              "请在开市时段重跑。")
+        return 1
+    s = summarize_offsets(fresh)
     print(f"offset_s: min={s['min_s']:+.1f} max={s['max_s']:+.1f} "
           f"median={s['median_s']:+.1f} 极差={s['spread_s']:.1f}s")
     verdict = "稳定" if s["stable"] else "存在漂移"

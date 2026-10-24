@@ -208,15 +208,30 @@ class Manifest:
 
 
 def current_git_commit() -> str:
-    """当前 git 提交号；取不到（无 git/非仓库/超时/非零返回码）返回 "unknown"。"""
+    """当前 git 提交号；工作树/索引脏时附 "+dirty"（可复现性声称的前提）。
+
+    取不到（无 git/非仓库/超时/非零返回码）返回 "unknown"。
+    """
     try:
         repo_root = Path(__file__).resolve().parents[3]
-        out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo_root),
-                             capture_output=True, text=True, timeout=5)
+
+        def _run(args):
+            return subprocess.run(args, cwd=str(repo_root), capture_output=True,
+                                  text=True, timeout=5)
+
+        out = _run(["git", "rev-parse", "HEAD"])
         if out.returncode != 0:
             return "unknown"
         commit = out.stdout.strip()
-        return commit or "unknown"
+        if not commit:
+            return "unknown"
+        dirty = False
+        for probe in (["git", "diff", "--quiet"],               # 工作树 vs 索引
+                      ["git", "diff", "--cached", "--quiet"]):  # 索引 vs HEAD
+            if _run(probe).returncode != 0:
+                dirty = True
+                break
+        return commit + ("+dirty" if dirty else "")
     except Exception:  # 任何失败都不阻塞报告产出
         return "unknown"
 

@@ -87,7 +87,7 @@ def merge_ticks(old: pd.DataFrame | None, new: pd.DataFrame) -> pd.DataFrame:
     排序按 time_msc 稳定排序（同毫秒内保持到达顺序），列序化返回。
     """
     if new is None or len(new) == 0:
-        return old if old is not None else new
+        return old if old is not None else _normalize(new)
     if old is None or len(old) == 0:
         merged = new
     else:
@@ -241,7 +241,8 @@ def _save_ticks_locked(d, symbol, df, *, server=None, login=None):
     old_meta_path = os.path.join(d, "meta.json")
     if (server is None or login is None) and os.path.exists(old_meta_path):
         try:
-            old = json.load(open(old_meta_path, encoding="utf-8"))
+            with open(old_meta_path, encoding="utf-8") as _f:
+                old = json.load(_f)
             server = old.get("server") if server is None else server
             login = old.get("login") if login is None else login
         except (OSError, ValueError):

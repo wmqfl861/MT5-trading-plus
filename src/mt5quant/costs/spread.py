@@ -5,7 +5,8 @@
 - epoch 毫秒直读为 UTC，先落到 weekday×hour，再按小时聚合全周
   （最终统计键=hour_utc 0..23）；
 - 分位用线性插值（numpy 默认），与 pandas quantile 一致；
-- half_spread 取该小时 p90（保守估计）：引擎在开、平两侧各扣一次（共 2×）。
+- spread_p90 取该小时 p90（保守估计）＝一次来回的完整点差成本（价格单位）：
+  bar 按 bid 计，多头按 ask(=bid+点差) 入场、空头按 ask 出场，每个来回恰收一次。
 """
 from __future__ import annotations
 
@@ -105,8 +106,8 @@ class SpreadModel:
             raise ValueError(f"{sym} 小时 {h} 无点差统计（tick 覆盖缺失？）")
         return table[h]
 
-    def half_spread(self, symbol: str, hour_utc: int) -> float:
-        """结构化接口：价格单位，取该小时 p90（保守；引擎每侧各扣一次）。"""
+    def spread_p90(self, symbol: str, hour_utc: int) -> float:
+        """结构化接口：价格单位，该小时 p90＝来回点差成本全幅（每来回恰收一次）。"""
         return float(self.stat(hour_utc, symbol=symbol).p90)
 
     def rollover_hours(self, symbol: str | None = None) -> tuple[int, ...]:

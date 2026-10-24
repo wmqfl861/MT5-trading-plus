@@ -260,7 +260,7 @@ def test_render_markdown_contains_key_lines():
                 if t != datetime(2026, 10, 27, 2, 30)]
     md2 = quality_report(make_bars(mon_full + tue_hole), "M1",
                          symbol="XAUUSD").render_markdown()
-    assert "unexpected 缺口" in md2
+    assert "micro_gap=1" in md2  # 单分钟缺失归 micro_gap
 
 
 # ---- CLI 脚本 ----
@@ -291,3 +291,56 @@ def test_quality_report_script_writes_json_and_summary(tmp_path):
     summary = (tmp_path / "reports" / "summary.md").read_text(encoding="utf-8")
     assert "XAUUSD" in summary and "100.00" in summary
     assert "NOSUCH" in summary and "跳过" in summary  # 缺文件在汇总注明
+
+
+# ---- I3 回归：同一物理休市不被夏令时拆裂 ----
+
+def test_daily_break_same_local_hour_across_dst_not_split():
+    """同一物理维护窗（NY 17:00）夏令时落在标签 21 点、冬令时落在 22 点——
+    按本地小时聚合后两周合计 8/8 有效交易日 → 周一至周四的 8 处全为
+    daily_break、unexpected=0。（按 UTC 标签小时分桶则各 4/8=50% <60%，
+    会全部误报 unexpected。周五的维护窗与收市窗口相交，归 weekend 属合理。）"""
+    week_a = [date(2026, 10, 19) + timedelta(days=i) for i in range(5)]  # EDT 周
+    week_b = [date(2026, 11, 2) + timedelta(days=i) for i in range(5)]   # EST 周
+    times = []
+    for d in week_a:
+        times += day_minutes(d, hours=range(24), skip_hours={21})  # EDT: 21:00 UTC=NY17
+    for d in week_b:
+        times += day_minutes(d, hours=range(24), skip_hours={22})  # EST: 22:00 UTC=NY17
+    rep = quality_report(make_bars(times), "M1")
+    kinds = [g.kind for g in rep.gaps]
+    assert kinds.count("daily_break") == 8   # 周一至周四 × 2 周
+    assert kinds.count("unexpected") == 0     # 关键：不被 DST 拆成 unexpected
+    assert kinds.count("weekend") == 3        # 两周五的收市窗 + 两周之间的大缺口
+
+
+# ---- I4 回归：异常列表限量与 p99=0 防退化 ----
+
+def test_spread_anomaly_capped_with_count_and_histogram():
+    """150 根 spread=0：p99=0 → 退化只按 <=0 计；明细限量 100 条但计数/直方图全量。"""
+    start = datetime(2026, 10, 5, 0, 0)
+    times = [start + timedelta(minutes=i) for i in range(150)]
+    rep = quality_report(make_bars(times, spread=[0] * 150), "M1")
+    assert rep.spread_anomaly_count == 150
+    assert len(rep.spread_anomalies) == 100  # 明细限量
+    assert rep.spread_anomaly_by_hour == {0: 60, 1: 60, 2: 30}
+    assert any("仅按 spread<=0 计数" in n for n in rep.notes)
+    assert any("明细仅列前 100 条" in n for n in rep.notes)
+    d = rep.to_dict()
+    assert d["spread_anomaly_count"] == 150 and d["spread_anomaly_by_hour"][0] == 60
+
+
+def test_daily_break_starting_mid_history_uses_window_denominator():
+    """真实案例回归：Exness 的 NY17:00 维护窗 2017 年才开始、且只在周一至周四
+    （周五那次并入 weekend）——全局分母下频率只有约 48% 而全部误报 unexpected；
+    窗口分母（首末出现日内的交易日）必须把它判成 daily_break。"""
+    import itertools
+    days = [date(2026, 3, 2) + timedelta(days=i) for i in range(40)]  # 含周末
+    times = []
+    for i, d in enumerate(days):
+        skip = {21} if (i >= 20 and d.weekday() < 4) else frozenset()
+        times += day_minutes(d, hours=range(24), skip_hours=skip)
+    rep = quality_report(make_bars(times), "M1")
+    kinds = [g.kind for g in rep.gaps]
+    assert kinds.count("daily_break") >= 12      # 后半段周一至周四的维护窗全中
+    assert kinds.count("unexpected") == 0        # 关键：不再误报

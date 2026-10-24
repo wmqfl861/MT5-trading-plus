@@ -220,3 +220,23 @@ def test_get_bars_without_lockbox_config_matches_legacy(tmp_path):
     until = datetime(2023, 10, 22, 13, 10)
     win = get_bars(root, "EURUSD", "M1", since=since, until=until, limit=500)
     assert win["rows_returned"] == 11  # 同 test_get_bars_time_window_filter 口径
+
+
+def test_compute_indicator_lockbox_never_leaks_closed_prices(tmp_path):
+    """C1 回归：sma(period=1) 即收盘价原值——锁箱段一根都不许出现在返回里。"""
+    out = compute_indicator(lock_root(tmp_path), "EURUSD", "M1", "sma",
+                            {"period": 1}, limit=3)
+    times = [datetime.fromisoformat(v["time"]) for v in out["values"]]
+    assert len(times) == 3
+    assert all(t < LOCK_CUTOFF for t in times)
+    assert times[-1] == datetime(2023, 10, 22, 13, 59)  # 开放段末根
+    assert out["lockbox_cutoff"] == LOCK_CUTOFF.isoformat()
+
+
+def test_describe_series_lockbox_clamps_last_time(tmp_path):
+    """C1 回归：概况的 last_time 只报开放段末时刻，不泄露锁箱段。"""
+    out = describe_series(lock_root(tmp_path), "EURUSD", "M1")
+    assert datetime.fromisoformat(out["last_time"]) < LOCK_CUTOFF
+    assert datetime.fromisoformat(out["last_time"]) == datetime(2023, 10, 22, 13, 59)
+    assert out["rows"] == 120  # 只数开放段
+    assert out["lockbox_cutoff"] == LOCK_CUTOFF.isoformat()

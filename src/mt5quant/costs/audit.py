@@ -1,6 +1,7 @@
 """可交易性审计：来回成本 / 小时平均波幅热力图与纳入决策。
 
-来回成本价（价格单位）= 2×half_spread + 2×slippage + commission_per_lot/contract_size；
+来回成本价（价格单位）= spread_p90 + 2×slippage + commission_per_lot/contract_size
+（点差每个来回恰一次：bar 按 bid、ask 腿收全幅；滑点开平各一次）；
 格值 = 来回成本价 ÷ 该小时 mean_range（平均振幅）。
 """
 from __future__ import annotations
@@ -58,12 +59,12 @@ def cost_heatmap(spread, slip, commission, contract_sizes: dict[str, float],
             if not mr > 0:  # NaN 或非正 → 无有效波幅
                 continue
             try:
-                hs = spread.half_spread(s, h)
+                sp = spread.spread_p90(s, h)
                 sl = slip.slippage(s, h)
             except ValueError:  # 该小时/该品种无点差统计（如缺 tick）→ 留 NaN
                 continue
             comm_price = commission.commission_per_lot(s) / contract_sizes[s]
-            arr[i, j] = (2.0 * hs + 2.0 * sl + comm_price) / mr
+            arr[i, j] = (sp + 2.0 * sl + comm_price) / mr
     hm = pd.DataFrame(arr, index=idx, columns=hours)
     hm.columns.name = "hour_utc"
     return hm

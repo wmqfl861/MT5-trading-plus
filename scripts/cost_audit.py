@@ -80,7 +80,7 @@ def _render_scope_md(decisions, rollover, notes, *, threshold, assumptions) -> s
         "# 成本与可交易性审计",
         "",
         f"- 生成时间（UTC）：{datetime.now(timezone.utc).isoformat(timespec='seconds')}",
-        "- 来回成本价 = 2×half_spread + 2×slippage + 佣金/合约大小（价格单位）",
+        "- 来回成本价 = spread_p90(点差全幅,每来回一次) + 2×slippage + 佣金/合约大小（价格单位）",
         f"- 判定：来回成本价 ÷ 该小时平均振幅 ≤ {threshold} → 纳入；无数据 → 排除",
     ]
     lines += [f"- {a}" for a in assumptions]

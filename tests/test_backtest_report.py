@@ -176,3 +176,30 @@ def test_write_report_manifest_repeatable(tmp_path, monkeypatch):
     assert s1["net_profit"] == pytest.approx(200.0)
     # NaN 不得混进 JSON（allow_nan=False 已强制）
     assert "NaN" not in (out1 / "summary.json").read_text(encoding="utf-8")
+
+
+def test_current_git_commit_marks_dirty(monkeypatch):
+    """I6 回归：工作树脏时提交号必须带 +dirty（可复现性声称的前提）。"""
+    import subprocess as sp
+    from mt5quant.backtest import report
+
+    class R:
+        def __init__(self, rc):
+            self.returncode = rc
+            self.stdout = "abc123"
+
+    calls = []
+    def fake_run(args, **kw):
+        calls.append(args[1])
+        if args[1] == "rev-parse":
+            return R(0)
+        return R(1)  # diff --quiet 非零 = 工作树脏
+    monkeypatch.setattr(report.subprocess, "run", fake_run)
+    assert report.current_git_commit() == "abc123+dirty"
+
+    def fake_run_clean(args, **kw):
+        if args[1] == "rev-parse":
+            return R(0)
+        return R(0)
+    monkeypatch.setattr(report.subprocess, "run", fake_run_clean)
+    assert report.current_git_commit() == "abc123"

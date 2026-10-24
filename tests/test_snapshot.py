@@ -188,3 +188,18 @@ def test_script_append_samples_and_summarize(tmp_path):
     assert s["median_s"] == 7200.5 and s["spread_s"] == 1.0
     assert s["stable"] is True   # 极差 1.0s ≤ 判据（tick 粒度 1s）
     assert mod.summarize_offsets([0.0, 5.0])["stable"] is False
+
+
+def test_measure_server_clock_stale_detection():
+    """I5 回归：休市静默期的陈旧 tick（server_time 远落后 wall）必须被判 stale。"""
+    mod = _load_script("measure_server_clock.py")
+    from datetime import datetime, timedelta
+    wall = datetime(2026, 10, 24, 14, 0, tzinfo=datetime.utcoffset(None) or None)         if False else datetime.fromisoformat("2026-10-24T14:00:00+00:00")
+    stale = {"wall_utc": wall.isoformat(),
+             "server_time": "2026-10-23T20:57:59",  # 周五收盘后 17 小时
+             "offset_s": -61741.0}
+    fresh = {"wall_utc": wall.isoformat(),
+             "server_time": "2026-10-24T13:59:58",
+             "offset_s": -2.0}
+    assert mod.is_stale(stale) is True
+    assert mod.is_stale(fresh) is False
