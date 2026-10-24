@@ -43,18 +43,24 @@ def _parse_kv(pairs: str) -> dict[str, float]:
 
 
 def _load_ticks(data_root: str, symbol: str) -> pd.DataFrame | None:
-    """读 {data_root}/ticks/{SYMBOL}/ 下全部 parquet（只按列名取 time_msc/bid/ask）。"""
-    d = os.path.join(data_root, "ticks", symbol)
-    if not os.path.isdir(d):
-        return None
-    files = sorted(glob.glob(os.path.join(d, "*.parquet")))
-    if not files:
-        return None
-    return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+    """读该品种全部 tick（按月分区布局，经 mt5data.ticks.load_ticks）。
+
+    返回 None 表示尚无 tick 库；旧单文件布局会抛 TicksLayoutError 并提示
+    先跑 scripts/migrate_ticks_layout.py。
+    """
+    from mt5data.ticks import load_ticks
+    df = load_ticks(data_root, symbol)
+    return df if df is not None and len(df) else None
 
 
 def _contract_sizes(data_root: str, symbols, overrides: dict[str, float],
-                    notes: list[str]) -> dict[str, float]:
+                    require_for: set[str]) -> dict[str, float]:
+    """合约大小：CLI 覆盖 > {data_root}/specs/latest.json；都缺 → 报错（R12）。
+
+    只对 require_for（实际进入热力图、需要把佣金折成价格单位的品种）强制；
+    无 tick 的品种整列跳过，不因缺合约大小挡住整个审计。
+    静默按 1.0 会让热力图差几个数量级——禁止。
+    """
     sizes: dict[str, float] = {}
     snap_path = os.path.join(data_root, "specs", "latest.json")
     snap: dict = {}
@@ -63,15 +69,20 @@ def _contract_sizes(data_root: str, symbols, overrides: dict[str, float],
             with open(snap_path, encoding="utf-8") as f:
                 snap = json.load(f)
         except (OSError, ValueError) as e:
-            print(f"⚠ 读 {snap_path} 失败（{e}），合约大小退回 CLI/默认值")
+            print(f"⚠ 读 {snap_path} 失败（{e}），无 CLI 覆盖的品种将报错")
+    missing = []
     for s in symbols:
         if s in overrides:
             sizes[s] = overrides[s]
         elif isinstance(snap.get(s), dict) and snap[s].get("contract_size"):
             sizes[s] = float(snap[s]["contract_size"])
-        else:
-            sizes[s] = 1.0
-            notes.append(f"{s}：合约大小未知（无 specs/CLI 覆盖），按 1.0 折算佣金")
+        elif s in require_for:
+            missing.append(s)
+    if missing:
+        raise SystemExit(
+            f"✗ 合约大小未知：{', '.join(missing)}（无 specs 快照且无 CLI 覆盖）。"
+            f"先跑 scripts/snapshot_specs.py，或传 --contract-size SYM=数值"
+        )
     return sizes
 
 
@@ -122,7 +133,7 @@ def main() -> int:
     ap.add_argument("--commission", default="",
                     help="SYM=每手来回佣金（计价货币），逗号分隔，如 XAUUSD=6.0")
     ap.add_argument("--contract-size", default="",
-                    help="SYM=合约大小覆盖，逗号分隔；缺省读 {data-root}/specs/latest.json，再缺省 1.0")
+                    help="SYM=合约大小覆盖，逗号分隔；缺省读 {data-root}/specs/latest.json，缺则报错")
     ap.add_argument("--spread-fraction", type=float, default=0.1,
                     help="滑点=该比例×p90 点差")
     ap.add_argument("--fixed-slippage", type=float, default=0.0)
@@ -135,6 +146,7 @@ def main() -> int:
     # 1) 点差实测（有 tick 的品种）
     spread = SpreadModel()
     have_any_tick = False
+    have_tick: set[str] = set()
     for s in symbols:
         ticks = _load_ticks(args.data_root, s)
         if ticks is None or len(ticks) == 0:
@@ -143,6 +155,7 @@ def main() -> int:
         try:
             spread = spread.merge(SpreadModel.from_ticks(s, ticks))
             have_any_tick = True
+            have_tick.add(s)
             print(f"✓ {s}：tick {len(ticks):,} 条已测点差")
         except ValueError as e:
             notes.append(f"{s}：点差实测失败（{e}），跳过")
@@ -169,7 +182,7 @@ def main() -> int:
     grid_tfs = [tf for tf in timeframes if all((s, tf) in vol for s in grid_syms)]
 
     sizes = _contract_sizes(args.data_root, symbols,
-                            _parse_kv(args.contract_size), notes)
+                            _parse_kv(args.contract_size), have_tick)
     commissions = _parse_kv(args.commission)
     commission = CommissionModel(default_per_lot=0.0,
                                  per_symbol=commissions or None)

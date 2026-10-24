@@ -12,14 +12,15 @@
 - 金额口径：contract_size 取 --contract-size，否则读
   {data-root}/specs/latest.json（scripts/snapshot_specs.py 产出）；两者都没有
   → 报错退出（绝不静默按 1 折算——那会让盈亏差几百到十万倍）。
-- 成本：--costs auto（默认）用 {data-root}/ticks 的实测点差+滑点
-  （mt5quant.costs.Costs）；--commission 为每手来回佣金（账户货币）；
-  隔夜费暂按 0（待 swap_mode 进快照后接入，见开发计划 R4）；
-  --costs zero 用零成本占位。
+- 成本：--costs auto（默认）＝tick 实测点差+滑点；佣金与隔夜费优先
+  {data-root}/costs/calibrated.json（scripts/calibrate_costs.py 实测），其次
+  品种快照推算（SwapModel.from_snapshot）；两者都没有 → 报错，除非显式
+  --allow-zero-swap（零隔夜费会写进 manifest）。--costs zero 用零成本占位。
+- 时钟校验（R5）：读 {data-root}/server_clock.json 最新有效样本，与配置的
+  server_utc_offset_hours 比对，超限拒绝运行；无有效样本仅警告。
 - 每次运行写入独占目录 {out}/{SYMBOL}_{TF}_{UTC戳}_{随机}，不覆盖历史运行。
 """
 import argparse
-import glob
 import importlib
 import json
 import os
@@ -28,8 +29,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from mt5data.clock import (  # noqa: E402
+    ClockMismatchError, check_server_offset, latest_valid_sample,
+)
 from mt5data.lockbox import research_bars  # noqa: E402
 from mt5data.store import TIMEFRAME_SECONDS  # noqa: E402
+from mt5data.ticks import load_ticks  # noqa: E402
 from mt5quant.backtest.engine_a import run_backtest  # noqa: E402
 from mt5quant.backtest.report import make_run_dir, summarize, write_report  # noqa: E402
 
@@ -37,10 +42,10 @@ from mt5quant.backtest.report import make_run_dir, summarize, write_report  # no
 class ZeroCosts:
     """零成本占位：实现 engine_a.Costs Protocol。"""
 
-    def spread_p90(self, symbol, hour_utc):
+    def spread_p90(self, symbol, hour_utc, *, price=None):
         return 0.0
 
-    def slippage(self, symbol, hour_utc):
+    def slippage(self, symbol, hour_utc, *, price=None):
         return 0.0
 
     def commission_per_lot(self, symbol):
@@ -70,36 +75,117 @@ def resolve_contract_size(data_root: str, symbol: str, override: float | None) -
     )
 
 
-def build_costs(data_root: str, symbol: str, spread_fraction: float,
-                commission_per_lot: float = 0.0):
-    """从本地 tick 实测构建成本（佣金按 CLI；隔夜费暂按 0，如实打印说明）。"""
-    import pandas as pd
+def check_clock(data_root: str, *, tol_s: float = 120.0) -> None:
+    """R5：最新有效时钟样本 vs 配置的 server_utc_offset_hours；无样本仅警告。"""
+    sample = latest_valid_sample(os.path.join(data_root, "server_clock.json"))
+    expected = 0.0
+    for cfg_name in ("config.json", "gateway.json"):
+        p = os.path.join(os.getcwd(), cfg_name)
+        if os.path.exists(p):
+            from mt5gw import load
+            expected = load(p).server_utc_offset_hours
+            break
+    if sample is None:
+        print(f"⚠ {data_root}/server_clock.json 无有效时钟样本（休市或未测），"
+              f"跳过时区校验；开市后跑 scripts/measure_server_clock.py")
+        return
+    check_server_offset(sample["offset_s"], expected, tol_s=tol_s)
+    print(f"✓ 时钟校验：实测偏移 {sample['offset_s']:+.0f}s 与配置 "
+          f"{expected:g}h 一致（样本 {sample['wall_utc']}）")
 
+
+def _load_calibrated(data_root: str) -> dict | None:
+    p = os.path.join(data_root, "costs", "calibrated.json")
+    if not os.path.exists(p):
+        return None
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def build_costs(data_root: str, symbol: str, spread_fraction: float,
+                commission_per_lot: float = 0.0, *,
+                allow_zero_swap: bool = False) -> tuple:
+    """tick 实测点差 + 佣金/隔夜费（calibrated.json > 品种快照 > 报错）。
+
+    返回 (costs, cost_version)。佣金优先 calibrated 实测，其次 CLI 显式值；
+    隔夜费优先 calibrated 实测费率（free_of_swap=true 属合法实测零费），其次
+    快照推算；两者都没有且未 --allow-zero-swap → ValueError（禁止静默按 0）。
+    """
     from mt5quant.costs import (
         CommissionModel, Costs, SlippageModel, SpreadModel, SwapModel,
         SwapRule,
     )
 
-    d = os.path.join(data_root, "ticks", symbol)
-    files = sorted(glob.glob(os.path.join(d, "*.parquet"))) if os.path.isdir(d) else []
-    if not files:
-        print(f"⚠ {symbol} 无 tick 数据（{d}），退回零成本；"
+    ticks = load_ticks(data_root, symbol)
+    if ticks is None or len(ticks) == 0:
+        print(f"⚠ {symbol} 无 tick 数据，退回零成本；"
               f"先跑 scripts/download_ticks.py 可启用实测点差/滑点")
         return ZeroCosts(), "zero-v0(no-ticks)"
-    ticks = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
     spread = SpreadModel.from_ticks(symbol, ticks)
     slip = SlippageModel(spread, spread_fraction=spread_fraction)
-    costs = Costs(
-        spread=spread, slippage_model=slip,
-        commission=CommissionModel(default_per_lot=commission_per_lot),
-        # 未取到账户 swap 规则（含 swap_mode）前如实按 0 计（零费率规则，仍走真实模型路径）
-        swap=SwapModel(per_symbol={
-            symbol: SwapRule(long_per_day=0.0, short_per_day=0.0)}),
-    )
-    print(f"✓ 成本：tick {len(ticks):,} 条实测点差（p90 口径）；"
-          f"佣金 {commission_per_lot}/手来回；隔夜费暂按 0（待 R4 接入 swap 规则）")
-    return costs, (f"tick-spread-p90+slip{spread_fraction}"
-                   f"-comm{commission_per_lot:g}-swap0")
+
+    calibrated = _load_calibrated(data_root)
+    cal_sym = None
+    if calibrated and symbol in calibrated.get("symbols", {}):
+        cal_sym = calibrated["symbols"][symbol]
+
+    # ---- 佣金：calibrated 实测 > CLI 显式值（默认 0，标准账户点差内含属合法） ----
+    if cal_sym and cal_sym.get("commission", {}).get("round_trip_per_lot") is not None:
+        rt = float(cal_sym["commission"]["round_trip_per_lot"])
+        commission = CommissionModel(default_per_lot=rt)
+        comm_tag = f"comm{rt:g}-calibrated"
+    else:
+        commission = CommissionModel(default_per_lot=commission_per_lot)
+        comm_tag = f"comm{commission_per_lot:g}-cli"
+
+    # ---- 隔夜费：calibrated 实测费率 > 快照推算 > 报错/显式零 ----
+    swap = None
+    swap_tag = "swap?"
+    cal_sw = cal_sym.get("swap") if cal_sym else None
+    cal_rate = None
+    if cal_sw:
+        lng_r = cal_sw.get("long", {}).get("per_lot_per_night")
+        sht_r = cal_sw.get("short", {}).get("per_lot_per_night")
+        if lng_r is not None or sht_r is not None:
+            cal_rate = (lng_r if lng_r is not None else 0.0,
+                        sht_r if sht_r is not None else 0.0)
+    if cal_rate is not None:
+        cands = cal_sw.get("charge_hour_candidates_utc") or [21]
+        ch = int(cands[0])
+        # 实测均值费率已含三倍日摊薄，按无三倍日规则使用（口径见 cost_version 标注）
+        swap = SwapModel(per_symbol={symbol: SwapRule(
+            long_per_day=cal_rate[0], short_per_day=cal_rate[1],
+            triple_weekdays=frozenset(), charge_hour_utc=ch)})
+        ambig = "（时刻有歧义取首个）" if cal_sw.get("charge_hour_ambiguous") else ""
+        swap_tag = f"swap-cal(ch{ch}){ambig}"
+    elif cal_sw and cal_sw.get("free_of_swap") is True:
+        swap = SwapModel(per_symbol={symbol: SwapRule(
+            long_per_day=0.0, short_per_day=0.0)})
+        swap_tag = "swap0-calibrated(free)"
+    else:
+        snap_path = os.path.join(data_root, "specs", "latest.json")
+        try:
+            with open(snap_path, encoding="utf-8") as f:
+                snap = json.load(f)
+            swap = SwapModel.from_snapshot(snap, [symbol], charge_hour_utc=21)
+            swap_tag = "swap-snapshot"
+        except (OSError, KeyError, NotImplementedError, ValueError) as e:
+            if allow_zero_swap:
+                swap = SwapModel(per_symbol={symbol: SwapRule(
+                    long_per_day=0.0, short_per_day=0.0)})
+                swap_tag = "swap0-explicit-allow"
+                print(f"⚠ 隔夜费无法推算（{e}），--allow-zero-swap 显式按 0 计"
+                      "（已写进 manifest）")
+            else:
+                raise ValueError(
+                    f"{symbol} 隔夜费未知（calibrated.json 无实测、快照推算失败：{e}）。"
+                    "先跑 scripts/calibrate_costs.py / scripts/snapshot_specs.py，"
+                    "或显式 --allow-zero-swap（会记录在 manifest）") from e
+
+    costs = Costs(spread=spread, slippage_model=slip, commission=commission,
+                  swap=swap)
+    print(f"✓ 成本：tick {len(ticks):,} 条实测点差（p90）；{comm_tag}；{swap_tag}")
+    return costs, f"tick-spread-p90+slip{spread_fraction}-{comm_tag}-{swap_tag}"
 
 
 def load_strategy(path: str):
@@ -151,7 +237,9 @@ def main() -> int:
     ap.add_argument("--spread-fraction", type=float, default=0.1,
                     help="--costs auto 时的滑点比例（×p90 点差）")
     ap.add_argument("--commission", type=float, default=0.0,
-                    help="每手来回佣金（账户货币），--costs auto 时生效")
+                    help="每手来回佣金（账户货币），--costs auto 时无 calibrated 实测则用此值")
+    ap.add_argument("--allow-zero-swap", action="store_true",
+                    help="隔夜费推算不出时显式按 0 计（记入 manifest；默认报错）")
     ap.add_argument("--contract-size", type=float, default=None,
                     help="合约大小覆盖；缺省读 {data-root}/specs/latest.json")
     ap.add_argument("--cost-version", default=None,
@@ -170,11 +258,13 @@ def main() -> int:
         strategy_cls = load_strategy(args.strategy)
         contract_size = resolve_contract_size(args.data_root, args.symbol,
                                               args.contract_size)
+        check_clock(args.data_root)
         bars = load_series(args.data_root, args.symbol, args.timeframe.upper(),
                            args.end)
         if args.costs == "auto":
-            costs, cost_version = build_costs(args.data_root, args.symbol,
-                                              args.spread_fraction, args.commission)
+            costs, cost_version = build_costs(
+                args.data_root, args.symbol, args.spread_fraction,
+                args.commission, allow_zero_swap=args.allow_zero_swap)
         else:
             costs, cost_version = ZeroCosts(), "zero-v0"
         if args.cost_version:
@@ -192,7 +282,8 @@ def main() -> int:
             run_dir, result, cost_version=cost_version, strategy=args.strategy,
             extra={"end": args.end, "costs": args.costs,
                    "spread_fraction": args.spread_fraction,
-                   "commission_per_lot": args.commission})
+                   "commission_per_lot": args.commission,
+                   "allow_zero_swap": args.allow_zero_swap})
     except Exception as e:  # fail-fast：任何错误如实报出
         print(f"✗ {type(e).__name__}: {e}")
         return 1

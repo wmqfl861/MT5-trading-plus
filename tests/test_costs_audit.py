@@ -265,6 +265,7 @@ def test_cost_audit_script_smoke(tmp_path, monkeypatch):
                   pd.concat([bars_frame("2026-10-19"), bars_frame("2026-10-20")],
                             ignore_index=True))
 
+    from mt5data.ticks import save_ticks
     ticks = pd.DataFrame(
         {
             "time_msc": np.asarray(
@@ -273,11 +274,12 @@ def test_cost_audit_script_smoke(tmp_path, monkeypatch):
                 dtype="int64"),
             "bid": [2400.0] * 20,
             "ask": [2400.3] * 20,  # 点差恒 0.3 → p90=0.3
+            "last": [2400.15] * 20,
+            "volume": [0.0] * 20,
+            "flags": [2] * 20,
         }
     )
-    tdir = root / "ticks" / "XAUUSD"
-    tdir.mkdir(parents=True)
-    ticks.to_parquet(tdir / "data.parquet")
+    save_ticks(str(root), "XAUUSD", ticks)  # 按月分区布局
 
     specs = root / "specs"
     specs.mkdir(parents=True)
