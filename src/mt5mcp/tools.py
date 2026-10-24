@@ -80,7 +80,13 @@ def _iso(ts) -> str:
 
 
 def list_series(root) -> list[dict]:
-    """库里有哪些品种×周期，各多少行、时间范围。"""
+    """库里有哪些品种×周期，各多少行、时间范围。
+
+    锁箱约束（R10）：序列配置了 cutoff（v1 序列键或 v2 全局）时，
+    rows 与 last_time 只统计开放段（time < cutoff）——锁箱段的行数与
+    末时刻本身就是元数据泄露面；first_time 属开放段前缀，不受影响。
+    无 cutoff 的序列行为与引入钳制前完全一致。
+    """
     bars_dir = Path(root) / "bars"
     if not bars_dir.exists():
         # 不回显服务器绝对路径
@@ -88,14 +94,30 @@ def list_series(root) -> list[dict]:
     out = []
     for wm_file in sorted(bars_dir.glob("*/*/meta.json")):
         wm = read_watermark(root, wm_file.parent.parent.name, wm_file.parent.name)
-        if wm:
-            out.append({
-                "symbol": wm["symbol"], "timeframe": wm["timeframe"],
-                "rows": wm["rows"],
-                "first_time": wm["first_time"], "last_time": wm["last_closed_time"],
-                "updated_at_utc": wm.get("updated_at_utc"),
-                "server": wm.get("server"), "login": wm.get("login"),
-            })
+        if not wm:
+            continue
+        entry = {
+            "symbol": wm["symbol"], "timeframe": wm["timeframe"],
+            "rows": wm["rows"],
+            "first_time": wm["first_time"], "last_time": wm["last_closed_time"],
+            "updated_at_utc": wm.get("updated_at_utc"),
+            "server": wm.get("server"), "login": wm.get("login"),
+        }
+        cutoff = _lockbox_cutoff(root, wm["symbol"], wm["timeframe"])
+        parquet = wm_file.parent / "data.parquet"
+        if cutoff is not None and parquet.exists():
+            con = duckdb.connect()
+            try:
+                table = f"read_parquet('{_sql_literal(str(parquet))}')"
+                n, last = con.execute(
+                    f"SELECT count(*), max(time) FROM {table} "
+                    f"WHERE time < TIMESTAMP '{cutoff.isoformat()}'").fetchone()
+            finally:
+                con.close()
+            entry["rows"] = int(n)
+            entry["last_time"] = _iso(last) if last is not None else None
+            entry["lockbox_cutoff"] = cutoff.isoformat()
+        out.append(entry)
     return out
 
 

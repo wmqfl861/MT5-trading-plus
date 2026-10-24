@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import pytest
 
-from mt5data.lockbox import write_config
+from mt5data.lockbox import write_config, write_global_cutoff
 from mt5data.store import save_bars
 from mt5mcp.tools import (
     MAX_BARS_LIMIT,
@@ -239,4 +239,83 @@ def test_describe_series_lockbox_clamps_last_time(tmp_path):
     assert datetime.fromisoformat(out["last_time"]) < LOCK_CUTOFF
     assert datetime.fromisoformat(out["last_time"]) == datetime(2023, 10, 22, 13, 59)
     assert out["rows"] == 120  # 只数开放段
+    assert out["lockbox_cutoff"] == LOCK_CUTOFF.isoformat()
+
+
+# ---- T2（R2/R10）：list_series 按锁箱钳制 rows/last_time；v2 全局 cutoff ----
+
+_LEGACY_KEYS = {"symbol", "timeframe", "rows", "first_time", "last_time",
+                "updated_at_utc", "server", "login"}
+
+
+def test_list_series_lockbox_clamps_rows_and_last_time(tmp_path):
+    """R10：清单的 rows/last_time 只统计开放段——锁箱段行数与末时刻不外发。"""
+    rows = list_series(lock_root(tmp_path))
+    eur = next(r for r in rows if r["symbol"] == "EURUSD")
+    assert eur["rows"] == 120  # 12:00–13:59
+    assert eur["last_time"].startswith("2023-10-22T13:59")
+    assert eur["lockbox_cutoff"] == LOCK_CUTOFF.isoformat()
+    # 未配置的序列（XAUUSD/H1）行为与旧完全一致：键集、行数都不变
+    xau = next(r for r in rows if r["symbol"] == "XAUUSD")
+    assert set(xau) == _LEGACY_KEYS
+    assert xau["rows"] == 300
+    assert xau["last_time"].startswith("2023-10-22T16:59")
+
+
+def test_list_series_global_lockbox_clamps_every_series(tmp_path):
+    """R2/v2：全局 cutoff 对清单里每个序列生效，无一例外。"""
+    root = make_db(tmp_path)
+    write_global_cutoff(root, LOCK_CUTOFF, note="全局")
+    rows = list_series(root)
+    assert len(rows) == 2
+    for r in rows:
+        assert r["rows"] == 120
+        assert r["last_time"].startswith("2023-10-22T13:59")
+        assert r["lockbox_cutoff"] == LOCK_CUTOFF.isoformat()
+
+
+def test_list_series_without_lockbox_keeps_legacy_shape(tmp_path):
+    """回归：无 lockbox.json → 清单键集与引入 R10 修复前完全一致。"""
+    rows = list_series(make_db(tmp_path))
+    assert all(set(r) == _LEGACY_KEYS for r in rows)
+    eur = next(r for r in rows if r["symbol"] == "EURUSD")
+    assert eur["rows"] == 300
+    assert eur["last_time"].startswith("2023-10-22T16:59")
+
+
+def global_lock_root(tmp_path, n=300):
+    root = make_db(tmp_path, n)
+    write_global_cutoff(root, LOCK_CUTOFF, note="test")
+    return root
+
+
+def test_get_bars_global_lockbox_clamps_all_series(tmp_path):
+    out = get_bars(global_lock_root(tmp_path), "XAUUSD", "H1", limit=500)
+    times = [datetime.fromisoformat(b["time"]) for b in out["bars"]]
+    assert len(times) == 120  # 未单独配置的序列同样被全局 cutoff 钳制
+    assert max(times) < LOCK_CUTOFF
+    assert out["rows_total_before_limit"] == 120
+    assert out["lockbox_cutoff"] == LOCK_CUTOFF.isoformat()
+
+
+def test_get_bars_global_lockbox_until_beyond_raises(tmp_path):
+    with pytest.raises(ValueError, match="锁箱"):
+        get_bars(global_lock_root(tmp_path), "XAUUSD", "H1", limit=10,
+                 until=LOCK_CUTOFF + timedelta(hours=1))
+
+
+def test_describe_series_global_lockbox_clamps(tmp_path):
+    out = describe_series(global_lock_root(tmp_path), "XAUUSD", "H1")
+    assert out["rows"] == 120
+    assert datetime.fromisoformat(out["last_time"]) == datetime(2023, 10, 22, 13, 59)
+    assert out["lockbox_cutoff"] == LOCK_CUTOFF.isoformat()
+
+
+def test_compute_indicator_global_lockbox_no_leak(tmp_path):
+    out = compute_indicator(global_lock_root(tmp_path), "XAUUSD", "H1", "sma",
+                            {"period": 1}, limit=3)
+    times = [datetime.fromisoformat(v["time"]) for v in out["values"]]
+    assert len(times) == 3
+    assert all(t < LOCK_CUTOFF for t in times)
+    assert times[-1] == datetime(2023, 10, 22, 13, 59)
     assert out["lockbox_cutoff"] == LOCK_CUTOFF.isoformat()
