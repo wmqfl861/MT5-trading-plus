@@ -1,8 +1,11 @@
 """MCP 数据服务 CLI。
 
-    .venv/Scripts/python.exe scripts/run_mcp_server.py --init      # 生成 mcp.json（随机令牌）
-    .venv/Scripts/python.exe scripts/run_mcp_server.py             # HTTP 模式（远程 agent 用）
+    .venv/Scripts/python.exe scripts/run_mcp_server.py --init      # 生成 mcp.json（随机令牌，只写 127.0.0.1）
+    .venv/Scripts/python.exe scripts/run_mcp_server.py             # HTTP 模式（远程 agent 经隧道用）
     .venv/Scripts/python.exe scripts/run_mcp_server.py --stdio     # 本机 agent 用
+
+安全口径（S1）：明文 HTTP 只监听回环地址；远程访问一律经隧道
+（SSH 本地端口转发 / Tailscale / WireGuard），见 docs/ops/mcp-remote-access.md。
 """
 import argparse
 import sys
@@ -26,6 +29,7 @@ def main() -> int:
         cfg = create_default(args.config)
         print(f"已生成 {args.config}：host={cfg.host} port={cfg.port}")
         print(f"访问令牌（保管好）：{cfg.token}")
+        print("服务只监听回环地址；远程 agent 请走隧道访问，见 docs/ops/mcp-remote-access.md")
         return 0
 
     if args.stdio:

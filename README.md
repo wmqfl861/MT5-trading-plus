@@ -216,8 +216,10 @@ RSI/ATR 为 Wilder 平滑（种子=前 period 根均值，种子期 NaN）；Bol
 .venv/Scripts/python.exe scripts/run_mcp_server.py --stdio    # 本机 agent 用 stdio
 ```
 
-**跨公网必须加 TLS**（反向代理或 SSH/WireGuard 隧道）——令牌明文走 HTTP 会被
-链路窃听重放；`host` 改 `"0.0.0.0"` + 防火墙放行端口；令牌 ≥32 字符且要轮换
-（曾明文传输过就换）。端点为 `http://<主机>:<端口>/mcp`。数据不会自动更新——
+**远程访问只经隧道，见 `docs/ops/mcp-remote-access.md`**（SSH 本地端口转发 /
+Tailscale / WireGuard；远程 agent 连 `http://127.0.0.1:<端口>/mcp`）——令牌明文走
+HTTP 会被链路窃听重放。配置已 fail-closed：`host` 非回环地址且未显式写
+`"allow_plaintext_public": true` 时启动直接报错。令牌 ≥32 字符且要轮换
+（曾明文传输过就换）。数据不会自动更新——
 远程 agent 看到的是库的最近一次 `refresh_all.py` / `download_bars.py --refresh`。
 锁箱对 MCP 同样生效：远程（研究侧）只能读到 `lockbox.json` 的 cutoff 之前。
