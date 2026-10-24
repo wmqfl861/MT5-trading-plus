@@ -111,7 +111,7 @@ def slippage(self, symbol: str, hour_utc: int, *, price: float | None = None) ->
 - 可选子任务（时间允许再做）：`BarSpreadCalibrator`——用 K 线 `spread` 字段（bar 内最小点差，
   全历史都有）× 按小时倍数（tick p90 ÷ 同期 bar 最小点差）重建历史点差。
 
-- [ ] 失败测试先行：价格翻倍 → 相对模型点差翻倍；absolute 模式行为与旧版逐位一致；
+- [x] 失败测试先行：价格翻倍 → 相对模型点差翻倍；absolute 模式行为与旧版逐位一致；
       引擎把 price 传给成本模型（用记录调用参数的假成本断言）；`contract_size=100` 的手算交易；
       cost_audit 比率在整体价格 ×2 时不变。测试里所有假成本类加 `price=None` 参数。
 - [ ] 实现；`run_backtest.py --costs auto` 默认 relative，`cost_model_version` 写明 `rel`。
