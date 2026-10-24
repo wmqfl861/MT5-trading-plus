@@ -72,7 +72,7 @@ def test_drop_unclosed_no_slack_at_all():  # I7：宽容秒数已废除
 
 def test_save_load_roundtrip_watermark_and_atomic(tmp_path):
     df = bars_df([0, 1, 2], [1.0, 2.0, 3.0])
-    save_bars(tmp_path, "EURUSD", "M1", df, server="Exness-Trial", login=278008680)
+    save_bars(tmp_path, "EURUSD", "M1", df, server="Exness-Trial", login=123456789)
     loaded = load_bars(tmp_path, "EURUSD", "M1")
     assert list(loaded["close"]) == [1.0, 2.0, 3.0]
     assert str(loaded["time"].dtype).startswith("datetime64")
@@ -83,7 +83,7 @@ def test_save_load_roundtrip_watermark_and_atomic(tmp_path):
     assert wm["first_time"] == "2023-10-22T00:00:00"
     assert wm["last_closed_time"] == "2023-10-22T00:02:00"
     assert "updated_at_utc" in wm  # M2：明确标注为 UTC 墙钟
-    assert wm["server"] == "Exness-Trial" and wm["login"] == 278008680  # M11：数据来源可追溯
+    assert wm["server"] == "Exness-Trial" and wm["login"] == 123456789  # M11：数据来源可追溯
     # 原子写不留临时文件（I8）
     leftovers = [p.name for p in (tmp_path / "bars" / "EURUSD" / "M1").iterdir()
                  if p.name.endswith(".tmp")]

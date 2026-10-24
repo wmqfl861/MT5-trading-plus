@@ -337,17 +337,17 @@ def test_meta_server_login_inherited_when_omitted(tmp_path):
     root = str(tmp_path)
     rows = rows_from(datetime(2026, 8, 1), 2)
     save_ticks(root, "XAUUSD", ticks_df(rows), server="Exness-Trial",
-               login=278008680)
+               login=123456789)
     wm = read_ticks_watermark(root, "XAUUSD")
-    assert wm["server"] == "Exness-Trial" and wm["login"] == 278008680
+    assert wm["server"] == "Exness-Trial" and wm["login"] == 123456789
     # 不带来源再写：继承
     save_ticks(root, "XAUUSD", ticks_df(rows_from(datetime(2026, 8, 1), 3)))
     wm = read_ticks_watermark(root, "XAUUSD")
-    assert wm["server"] == "Exness-Trial" and wm["login"] == 278008680
+    assert wm["server"] == "Exness-Trial" and wm["login"] == 123456789
     # 只给 server：login 仍继承
     save_ticks(root, "XAUUSD", ticks_df(rows), server="Other")
     wm = read_ticks_watermark(root, "XAUUSD")
-    assert wm["server"] == "Other" and wm["login"] == 278008680
+    assert wm["server"] == "Other" and wm["login"] == 123456789
 
 
 def test_save_ticks_rejects_empty_frame(tmp_path):

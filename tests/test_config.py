@@ -35,10 +35,10 @@ def test_load_missing_file_raises(tmp_path):  # M1：路径写错当场暴露，
 def test_load_json_overrides(tmp_path):
     p = tmp_path / "config.json"
     p.write_text(json.dumps({"allow_live_trading": True, "magic": 42,
-                             "expected_login": 278008680}), encoding="utf-8")
+                             "expected_login": 123456789}), encoding="utf-8")
     cfg = load(str(p))
     assert cfg.allow_live_trading is True
-    assert cfg.magic == 42 and cfg.expected_login == 278008680
+    assert cfg.magic == 42 and cfg.expected_login == 123456789
     assert cfg.terminal_path == GatewayConfig().terminal_path
 
 

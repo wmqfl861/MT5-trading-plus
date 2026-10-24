@@ -33,10 +33,10 @@ def test_config_load_roundtrip(tmp_path):
 
 def test_config_dns_rebinding_settings_roundtrip(tmp_path):
     p = tmp_path / "mcp.json"
-    p.write_text('{"host": "0.0.0.0", "port": 9000, "token": "%s", "dns_rebinding_protection": true, "allowed_hosts": ["103.236.80.135:*"]}' % ("t" * 40), encoding="utf-8")
+    p.write_text('{"host": "0.0.0.0", "port": 9000, "token": "%s", "dns_rebinding_protection": true, "allowed_hosts": ["<SERVER_IP>:*"]}' % ("t" * 40), encoding="utf-8")
     cfg = load_mcp_config(p)
     assert cfg.dns_rebinding_protection is True
-    assert cfg.allowed_hosts == ("103.236.80.135:*",)
+    assert cfg.allowed_hosts == ("<SERVER_IP>:*",)
 
 
 def test_config_default_disables_dns_rebinding_protection(tmp_path):

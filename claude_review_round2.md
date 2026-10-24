@@ -37,7 +37,7 @@
 - **I12 已修复**：白名单正则加拒绝纯点号（`tools.py:24,29-34`）。残留见 m7；服务仍以 Administrator 身份运行。
 - **I13 未修复**
   - `mcp.json` 仍是 host=0.0.0.0、port=47621。
-  - `mcp-remote-prompt.txt:9/14/22/28` 里仍是 `http://103.236.80.135:47621/mcp`，并且写着与 `mcp.json` 一致的现行令牌（本报告不复述令牌）。
+  - `mcp-remote-prompt.txt:9/14/22/28` 里仍是 `http://<SERVER_IP>:47621/mcp`，并且写着与 `mcp.json` 一致的现行令牌（本报告不复述令牌）。
 - **I14 部分修复**：DuckDB 用 Top-N 读取，加上 `Semaphore(2)`（`tools.py:167-172`、`server.py:18`）。SDK 用 `to_thread` 执行同步工具（`mcp/server/mcpserver/utilities/func_metadata.py:164`），所以信号量是有效的。但 period 没有上限，见 m4。
 - **I15 数学已修复，但预热不足**：`_wilder` 先把种子（前 n 个有效值的均值）写进去，再用 `ewm(alpha=1/n, adjust=False, ignore_na=True)` 递推。这与 Wilder 的 `avg=(avg·(n−1)+x)/n` 严格等价（`indicators.py:24-39`）。预热长度的问题见 m3。
 - **I16 部分修复**
