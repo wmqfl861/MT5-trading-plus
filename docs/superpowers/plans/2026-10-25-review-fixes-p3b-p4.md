@@ -45,22 +45,22 @@ P4（试验台账、假设卡、关卡 G0–G5），为 P5 基线策略打底。
 
 ### T0：基线核对（0.5 天）
 
-- [ ] `git status` 干净后 `git pull`；全量 pytest，记录通过数（预期 389）。有失败先修，不得带病推进。
-- [ ] 跑 `scripts/snapshot_specs.py`，确认 `data/specs/latest.json` 里四个品种的 `contract_size`。
-- [ ] 跑 `scripts/run_backtest.py --strategy mt5quant.strategies.library.buy_hold:BuyHold
+- [x] `git status` 干净后 `git pull`；全量 pytest，记录通过数（预期 389）。有失败先修，不得带病推进。
+- [x] 跑 `scripts/snapshot_specs.py`，确认 `data/specs/latest.json` 里四个品种的 `contract_size`。
+- [x] 跑 `scripts/run_backtest.py --strategy mt5quant.strategies.library.buy_hold:BuyHold
       --symbol XAUUSD --timeframe H1 --params '{}' --end <锁箱 cutoff> --volume-lots 0.01`；
       人工核对：净利 ≈ (末根收盘 − 首次入场价) × contract_size × 0.01 − 成本；收益率与金价涨幅量级一致。
       （注意：引擎不模拟保证金与爆仓，1 手黄金配 1 万本金会让权益变负、收益率指标失真，见 T7。）
-- [ ] 在提交说明或 `docs/reviews/` 追加一段"T0 核对结果"（测试数、四品种合约大小、BuyHold 净利）。
+- [x] 在提交说明或 `docs/reviews/` 追加一段"T0 核对结果"（测试数、四品种合约大小、BuyHold 净利）。
 
 ### T1：安全加固 S1（代码 0.5 天 + 用户操作）
 
 **Files:** `src/mt5mcp/config.py`、`scripts/run_mcp_server.py`、`tests/test_mt5mcp_*.py`、
 新建 `docs/ops/mcp-remote-access.md`、README 的 MCP 段。
 
-- [ ] 失败测试先行：`host` 不是回环地址（127.0.0.1 / ::1 / localhost）且配置里没有
+- [x] 失败测试先行：`host` 不是回环地址（127.0.0.1 / ::1 / localhost）且配置里没有
       `"allow_plaintext_public": true` → `load_config` 抛错，文案指向隧道文档。
-- [ ] 实现上述 fail-closed 校验；`--init` 生成的 `mcp.json` 只写回环地址。
+- [x] 实现上述 fail-closed 校验；`--init` 生成的 `mcp.json` 只写回环地址。
 - [ ] 写 `docs/ops/mcp-remote-access.md`：两种接法（SSH 本地端口转发；Tailscale/WireGuard），
       远程 agent 侧连接 `http://127.0.0.1:<端口>/mcp`；令牌轮换步骤（`--init` 重新生成，远程端同步）。
 - [ ] **列清单交给用户执行并等待确认**（不要自己做）：
@@ -85,9 +85,9 @@ P4（试验台账、假设卡、关卡 G0–G5），为 P5 基线策略打底。
 - `scripts/lockbox_init.py`：`--cutoff YYYY-MM-DD` 或 `--auto`；打印每个序列开放/锁定行数。
 - `list_series`：配置了 cutoff 时 `rows`、`last_time` 只统计开放段（R10）。
 
-- [ ] 失败测试先行：v2 对所有品种/周期生效；cutoff 前移（变晚）被拒；变早允许；v1 兼容；
+- [x] 失败测试先行：v2 对所有品种/周期生效；cutoff 前移（变晚）被拒；变早允许；v1 兼容；
       `research_bars`、MCP 三个读取路径与 `list_series` 都按全局 cutoff 钳制。
-- [ ] 实现；本机执行 `lockbox_init.py --auto` 生成 v2 并重跑 `export_lockbox.py`。
+- [x] 实现；本机执行 `lockbox_init.py --auto` 生成 v2 并重跑 `export_lockbox.py`。
 - 说明：tick 库只用于成本统计，不受锁箱约束（在 docstring 写明豁免理由）。
 
 ### T3：相对点差 R1（1.5 天）
@@ -132,9 +132,9 @@ def slippage(self, symbol: str, hour_utc: int, *, price: float | None = None) ->
 - 迁移脚本：读旧 `data.parquet` → 按月写 → 校验总行数与首末 `time_msc` 相等 → 旧文件改名
   `data.parquet.migrated-<UTC戳>`；检测到旧布局时 `load_ticks` 抛错并提示先迁移。
 
-- [ ] 失败测试先行：跨月回补分到两个文件；刷新只改写当月文件（其他月份 mtime 不变）；
+- [x] 失败测试先行：跨月回补分到两个文件；刷新只改写当月文件（其他月份 mtime 不变）；
       迁移前后行数与首末时间守恒；按区间读取只打开必要月份；旧布局给出迁移提示。
-- [ ] 实现；本机执行迁移脚本，之后才允许做深度 tick 回补。
+- [x] 实现；本机执行迁移脚本，之后才允许做深度 tick 回补。
 
 ### T5：真实佣金与隔夜费 R4（1.5 天）
 
@@ -158,7 +158,7 @@ def slippage(self, symbol: str, hour_utc: int, *, price: float | None = None) ->
 - `run_backtest.py --costs auto`：佣金与隔夜费优先 `calibrated.json`，其次快照；都没有 → 报错，
   除非显式 `--allow-zero-swap`（写进 manifest）。
 
-- [ ] 失败测试先行：三种 swap_mode 的手算换算；三倍日枚举换算；利率类抛错；
+- [x] 失败测试先行：三种 swap_mode 的手算换算；三倍日枚举换算；利率类抛错；
       校准脚本对假 deals 的汇总数字；`--allow-zero-swap` 缺失时报错。
 - [ ] 实现；本机在模拟盘开平几笔（含过夜）后跑校准脚本。
 
@@ -174,8 +174,8 @@ def slippage(self, symbol: str, hour_utc: int, *, price: float | None = None) ->
 - `refresh_all.py`、`download_ticks.py`：开始前用 `server_now()` 的实测偏移校验（行情冻结时跳过并记日志）。
 - `run_backtest.py`：读取 `data/server_clock.json` 最新有效样本校验；没有样本 → 警告但不阻断。
 
-- [ ] 失败测试先行：偏移 0 通过；+7200 秒在期望 0 时抛错；陈旧样本跳过。
-- [ ] 实现；在 `docs/blueprint.md` §4 第 1 条把"待 R5"改为"已落地"。
+- [x] 失败测试先行：偏移 0 通过；+7200 秒在期望 0 时抛错；陈旧样本跳过。
+- [x] 实现；在 `docs/blueprint.md` §4 第 1 条把"待 R5"改为"已落地"。
 
 ### T7：引擎小修 R7 / R8 / R9 / R16（1 天）
 
@@ -273,9 +273,9 @@ def run_backtest_ticks(strategy, bars, ticks_loader, costs, *, symbol, params, c
 - `bt.py`：`bt card check <path>`、`bt screen --card H012`（在卡的网格上跑 A 层，逐组合记入台账）、
   `bt ledger stats --card H012`（试验次数，供 DSR 用）。
 
-- [ ] 失败测试先行：卡模式校验（参数超 4 个 / 网格超 100 / 缺字段）；未提交的卡拒绝；
+- [x] 失败测试先行：卡模式校验（参数超 4 个 / 网格超 100 / 缺字段）；未提交的卡拒绝；
       每次运行（含抛异常的）都有一行 runs；lockbox_uses 第二次插入失败。
-- [ ] 实现；写一张示例卡（BuyHold 基准）跑通 `bt screen`。
+- [x] 实现；写一张示例卡（BuyHold 基准）跑通 `bt screen`。
 
 ### T12：关卡 G0–G5（4 天）
 
