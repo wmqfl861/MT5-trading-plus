@@ -1,0 +1,30 @@
+name: tests
+
+# 每次推送到 main 与每个 PR 都在 Windows 上跑全量 pytest。
+# 测试不连 MT5 终端（MetaTrader5 为延迟导入，纯逻辑用 FakeMT5），只需装依赖。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run tests
+        run: python -m pytest -q -p no:cacheprovider
