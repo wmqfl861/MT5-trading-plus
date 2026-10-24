@@ -38,6 +38,7 @@ from mt5data.lockbox import research_bars  # noqa: E402
 from mt5data.store import TIMEFRAME_SECONDS  # noqa: E402
 from mt5data.ticks import load_ticks  # noqa: E402
 from mt5quant.backtest.engine_a import run_backtest  # noqa: E402
+from mt5quant.backtest.engine_b import run_backtest_ticks  # noqa: E402
 from mt5quant.backtest.report import make_run_dir, summarize, write_report  # noqa: E402
 
 
@@ -251,6 +252,12 @@ def main() -> int:
                          "缩放（R1 默认）；absolute=旧口径（价格单位，忽略 price）")
     ap.add_argument("--commission", type=float, default=0.0,
                     help="每手来回佣金（账户货币），--costs auto 时无 calibrated 实测则用此值")
+    ap.add_argument("--engine", choices=("a", "b"), default="a",
+                    help="a=向量化；b=tick 级事件驱动（需 tick 库覆盖回测区间）")
+    ap.add_argument("--latency-ms", type=int, default=0,
+                    help="--engine b：信号 bar 收盘后的执行延迟（毫秒）")
+    ap.add_argument("--slippage-price", type=float, default=0.0,
+                    help="--engine b：成交价叠加的额外不利滑点（价格单位）")
     ap.add_argument("--allow-zero-swap", action="store_true",
                     help="隔夜费推算不出时显式按 0 计（记入 manifest；默认报错）")
     ap.add_argument("--contract-size", type=float, default=None,
@@ -283,13 +290,28 @@ def main() -> int:
             costs, cost_version = ZeroCosts(), "zero-v0"
         if args.cost_version:
             cost_version = args.cost_version
-        result = run_backtest(
-            strategy_cls(), bars, costs, symbol=args.symbol,
-            params=params, contract_size=contract_size,
-            volume_lots=args.volume_lots,
-            initial_capital=args.initial_capital,
-            timeframe=args.timeframe.upper(),
-        )
+        if args.engine == "b":
+            result = run_backtest_ticks(
+                strategy_cls(), bars,
+                lambda start_msc, end_msc: load_ticks(
+                    args.data_root, args.symbol,
+                    start_msc=start_msc, end_msc=end_msc),
+                costs, symbol=args.symbol, params=params,
+                contract_size=contract_size,
+                volume_lots=args.volume_lots,
+                initial_capital=args.initial_capital,
+                timeframe=args.timeframe.upper(),
+                latency_ms=args.latency_ms,
+                slippage_price=args.slippage_price,
+            )
+        else:
+            result = run_backtest(
+                strategy_cls(), bars, costs, symbol=args.symbol,
+                params=params, contract_size=contract_size,
+                volume_lots=args.volume_lots,
+                initial_capital=args.initial_capital,
+                timeframe=args.timeframe.upper(),
+            )
         summary = summarize(result, cost_version=cost_version)
         run_dir = make_run_dir(args.out, args.symbol, args.timeframe.upper())
         report_path = write_report(
@@ -298,7 +320,9 @@ def main() -> int:
                    "spread_fraction": args.spread_fraction,
                    "spread_mode": args.spread_mode,
                    "commission_per_lot": args.commission,
-                   "allow_zero_swap": args.allow_zero_swap})
+                   "allow_zero_swap": args.allow_zero_swap,
+                   "engine": args.engine, "latency_ms": args.latency_ms,
+                   "slippage_price": args.slippage_price})
     except Exception as e:  # fail-fast：任何错误如实报出
         print(f"✗ {type(e).__name__}: {e}")
         return 1
