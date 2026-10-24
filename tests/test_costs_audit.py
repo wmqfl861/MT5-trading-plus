@@ -1,5 +1,6 @@
 """audit 测试：ATR/hourly_stats（volatility，计划未列独立测试文件，归本文件）、
-热力图手算、阈值边界翻转、Costs 聚合体、cost_audit.py 脚本冒烟。"""
+热力图手算（绝对口径 + 相对口径 R1/T3）、阈值边界翻转、Costs 聚合体、
+cost_audit.py / run_backtest.build_costs 脚本冒烟。"""
 import importlib.util
 import json
 import math
@@ -20,7 +21,12 @@ from mt5quant.costs import (
     SwapModel,
     SwapRule,
 )
-from mt5quant.costs.audit import ScopeDecision, cost_heatmap, decide_scope
+from mt5quant.costs.audit import (
+    ScopeDecision,
+    cost_heatmap,
+    decide_scope,
+    relative_hourly_stats,
+)
 from mt5quant.costs.volatility import atr_series, hourly_stats
 
 
@@ -125,10 +131,13 @@ def test_hourly_stats_invalid_timeframe_and_columns():
 # ---------- audit.cost_heatmap ----------
 
 def _models():
+    """绝对口径（旧口径逐位一致，回归钉死）。"""
     xau = SpreadModel.from_ticks("XAUUSD", make_ticks(
-        [(f"2026-06-01 14:00:{i:02d}", 0.1 * (i + 1)) for i in range(5)], base=2400.0))
+        [(f"2026-06-01 14:00:{i:02d}", 0.1 * (i + 1)) for i in range(5)], base=2400.0),
+        mode="absolute")
     eur = SpreadModel.from_ticks("EURUSD", make_ticks(
-        [(f"2026-06-01 14:00:{i:02d}", 0.0001 * (i + 1)) for i in range(5)], base=1.10))
+        [(f"2026-06-01 14:00:{i:02d}", 0.0001 * (i + 1)) for i in range(5)], base=1.10),
+        mode="absolute")
     spread = xau.merge(eur)                       # p90：XAU 0.46 / EUR 0.00046
     slip = SlippageModel(spread, spread_fraction=0.1)  # 0.046 / 0.000046
     comm = CommissionModel(default_per_lot=0.0,
@@ -224,6 +233,84 @@ def test_decide_scope_iteration_order():
         ("B", "H1", 7), ("B", "H1", 8)]
 
 
+# ---------- 相对口径热力图（R1 / 计划 T3） ----------
+
+def test_relative_hourly_stats_hand_computed():
+    bars = make_bars(
+        ["2026-10-19 14:00:00", "2026-10-20 14:00:00"],
+        [1008.0, 504.0], [1000.0, 500.0], [1004.0, 502.0])
+    st = relative_hourly_stats(bars)
+    assert st.index.name == "hour_utc"
+    assert list(st.columns) == ["mean_rel_range", "mean_close"]
+    assert st.loc[14, "mean_rel_range"] == pytest.approx((8 / 1004 + 4 / 502) / 2)
+    assert st.loc[14, "mean_close"] == pytest.approx((1004.0 + 502.0) / 2)
+
+
+def test_relative_hourly_stats_rejects_missing_columns():
+    with pytest.raises(ValueError):
+        relative_hourly_stats(make_bars(["2026-10-19 14:00:00"],
+                                        [11.0], [10.0], [10.5]).drop(columns=["close"]))
+
+
+def _rel_fixture(level: float):
+    """同一相对形态、整体价格水平 ×level 的 ticks+bars（佣金 0）。
+
+    tick：bid=100×level、ask=100.2×level → rel 恒 0.2/100.1（与 level 无关）；
+    bar：high/low/close = 1008/1000/1004 ×level → 相对振幅恒 8/1004。
+    """
+    ticks = make_ticks([(f"2026-06-01 14:00:{i:02d}", 0.2 * level) for i in range(5)],
+                       base=100.0 * level)
+    spread = SpreadModel.from_ticks("XAUUSD", ticks)          # 默认 relative
+    slip = SlippageModel(spread, spread_fraction=0.1)
+    comm = CommissionModel(default_per_lot=0.0)
+    hi, lo, cl = 1008.0 * level, 1000.0 * level, 1004.0 * level
+    bars = make_bars(["2026-10-19 14:00:00", "2026-10-20 14:00:00"],
+                     [hi, hi], [lo, lo], [cl, cl])
+    vol = {("XAUUSD", "H1"): hourly_stats(bars, "H1").join(relative_hourly_stats(bars))}
+    return spread, slip, comm, vol
+
+
+def test_heatmap_relative_hand_computed():
+    spread, slip, comm, vol = _rel_fixture(1.0)
+    hm = cost_heatmap(spread, slip, comm, {"XAUUSD": 100.0}, vol, ["XAUUSD"], ["H1"])
+    rel = 0.2 / 100.1
+    expected = (rel + 2 * 0.1 * rel) / (8 / 1004)
+    assert hm.loc[("XAUUSD", "H1"), 14] == pytest.approx(expected)
+
+
+def test_heatmap_relative_ratio_invariant_to_price_level():
+    # R1 核心：整体价格 ×2（tick 与 K 线同乘）→ 比率不变
+    spread1, slip1, comm1, vol1 = _rel_fixture(1.0)
+    spread2, slip2, comm2, vol2 = _rel_fixture(2.0)
+    hm1 = cost_heatmap(spread1, slip1, comm1, {"XAUUSD": 100.0}, vol1,
+                       ["XAUUSD"], ["H1"])
+    hm2 = cost_heatmap(spread2, slip2, comm2, {"XAUUSD": 100.0}, vol2,
+                       ["XAUUSD"], ["H1"])
+    assert hm2.loc[("XAUUSD", "H1"), 14] == pytest.approx(hm1.loc[("XAUUSD", "H1"), 14])
+
+
+def test_heatmap_relative_with_commission_uses_hour_mean_close():
+    spread, slip, comm, vol = _rel_fixture(1.0)
+    comm = CommissionModel(default_per_lot=0.0, per_symbol={"XAUUSD": 6.0})
+    hm = cost_heatmap(spread, slip, comm, {"XAUUSD": 100.0}, vol, ["XAUUSD"], ["H1"])
+    rel = 0.2 / 100.1
+    # 佣金 6 美元/手 ÷（合约 100 × 小时均价 1004）折成相对价
+    expected = (rel + 2 * 0.1 * rel + 6.0 / (100.0 * 1004.0)) / (8 / 1004)
+    assert hm.loc[("XAUUSD", "H1"), 14] == pytest.approx(expected)
+
+
+def test_heatmap_relative_rejects_fixed_slippage_and_missing_columns():
+    spread, slip, comm, vol = _rel_fixture(1.0)
+    bad_slip = SlippageModel(spread, spread_fraction=0.1, fixed_price=0.01)
+    with pytest.raises(ValueError, match="固定滑点"):
+        cost_heatmap(spread, bad_slip, comm, {"XAUUSD": 100.0}, vol,
+                     ["XAUUSD"], ["H1"])
+    stripped = {("XAUUSD", "H1"): vol[("XAUUSD", "H1")].drop(columns=["mean_rel_range"])}
+    with pytest.raises(ValueError, match="mean_rel_range"):
+        cost_heatmap(spread, slip, comm, {"XAUUSD": 100.0}, stripped,
+                     ["XAUUSD"], ["H1"])
+
+
 # ---------- Costs 聚合体（四方法签名与 T6 Protocol 同名） ----------
 
 def test_costs_bundle_delegates_four_methods():
@@ -250,11 +337,25 @@ def _load_script():
     return mod
 
 
-def test_cost_audit_script_smoke(tmp_path, monkeypatch):
-    from mt5data.store import save_bars
+def _xau_ticks_frame():
+    return pd.DataFrame(
+        {
+            "time_msc": np.asarray(
+                [pd.Timestamp(f"2026-10-19 {h:02d}:{m:02d}:00").value // 10**6
+                 for h in (9, 10, 11, 12) for m in (0, 10, 20, 30, 40)],
+                dtype="int64"),
+            "bid": [2400.0] * 20,
+            "ask": [2400.3] * 20,  # 点差恒 0.3 → 绝对 p90=0.3；相对 p90=0.3/2400.15
+            "last": [2400.15] * 20,
+            "volume": [0.0] * 20,
+            "flags": [2] * 20,
+        }
+    )
 
-    root = tmp_path / "data"
-    out = tmp_path / "reports" / "costs"
+
+def _setup_audit_data(root) -> None:
+    from mt5data.store import save_bars
+    from mt5data.ticks import save_ticks
 
     def bars_frame(day):
         times = [f"{day} {h:02d}:00:00" for h in (9, 10, 11, 12)]
@@ -264,22 +365,7 @@ def test_cost_audit_script_smoke(tmp_path, monkeypatch):
         save_bars(str(root), sym, "H1",
                   pd.concat([bars_frame("2026-10-19"), bars_frame("2026-10-20")],
                             ignore_index=True))
-
-    from mt5data.ticks import save_ticks
-    ticks = pd.DataFrame(
-        {
-            "time_msc": np.asarray(
-                [pd.Timestamp(f"2026-10-19 {h:02d}:{m:02d}:00").value // 10**6
-                 for h in (9, 10, 11, 12) for m in (0, 10, 20, 30, 40)],
-                dtype="int64"),
-            "bid": [2400.0] * 20,
-            "ask": [2400.3] * 20,  # 点差恒 0.3 → p90=0.3
-            "last": [2400.15] * 20,
-            "volume": [0.0] * 20,
-            "flags": [2] * 20,
-        }
-    )
-    save_ticks(str(root), "XAUUSD", ticks)  # 按月分区布局
+    save_ticks(str(root), "XAUUSD", _xau_ticks_frame())  # 按月分区布局
 
     specs = root / "specs"
     specs.mkdir(parents=True)
@@ -287,6 +373,12 @@ def test_cost_audit_script_smoke(tmp_path, monkeypatch):
         json.dumps({"XAUUSD": {"contract_size": 100.0},
                     "EURUSD": {"contract_size": 100000.0}}),
         encoding="utf-8")
+
+
+def test_cost_audit_script_smoke_relative_default(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    out = tmp_path / "reports" / "costs"
+    _setup_audit_data(root)
 
     mod = _load_script()
     monkeypatch.setattr(
@@ -296,13 +388,34 @@ def test_cost_audit_script_smoke(tmp_path, monkeypatch):
     assert mod.main() == 0
 
     hm = pd.read_csv(out / "heatmap.csv", index_col=[0, 1])
-    # XAUUSD：(0.3 + 2×0.03 + 6/100) / 16 = 0.42/16 = 0.02625（点差每来回一次）
-    assert hm.loc[("XAUUSD", "H1"), "9"] == pytest.approx(0.02625)
+    # 相对口径（默认）：rel=0.3/2400.15；相对振幅=16/2000；佣金 6/(100×2000)
+    rel = 0.3 / 2400.15
+    expected = (rel + 2 * 0.1 * rel + 6.0 / 100.0 / 2000.0) / (16.0 / 2000.0)
+    assert hm.loc[("XAUUSD", "H1"), "9"] == pytest.approx(expected)
     assert math.isnan(hm.loc[("EURUSD", "H1"), "9"])  # EURUSD 无 tick → 全 NaN
     scope = (out / "scope.md").read_text(encoding="utf-8")
     assert "无tick，跳过点差实测" in scope   # EURUSD/BTCUSD
     assert "无K线" in scope                  # BTCUSD
     assert "XAUUSD" in scope
+    assert "相对" in scope                   # 口径写进假设说明
+
+
+def test_cost_audit_script_absolute_flag_matches_legacy_ratio(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    out = tmp_path / "reports" / "costs"
+    _setup_audit_data(root)
+
+    mod = _load_script()
+    monkeypatch.setattr(
+        sys, "argv",
+        ["cost_audit.py", "--symbols", "XAUUSD,EURUSD", "--timeframes", "H1",
+         "--data-root", str(root), "--out", str(out),
+         "--commission", "XAUUSD=6.0", "--spread-mode", "absolute"])
+    assert mod.main() == 0
+
+    hm = pd.read_csv(out / "heatmap.csv", index_col=[0, 1])
+    # 绝对口径与旧版逐位一致：(0.3 + 2×0.03 + 6/100) / 16 = 0.42/16 = 0.02625
+    assert hm.loc[("XAUUSD", "H1"), "9"] == pytest.approx(0.02625)
 
 
 def test_cost_audit_script_graceful_when_no_data(tmp_path, monkeypatch, capsys):
@@ -313,3 +426,37 @@ def test_cost_audit_script_graceful_when_no_data(tmp_path, monkeypatch, capsys):
          "--data-root", str(tmp_path / "empty"), "--out", str(tmp_path / "out")])
     assert mod.main() == 1  # 无任何 tick：优雅说明而非栈崩
     assert "tick" in capsys.readouterr().out
+
+
+# ---------- scripts/run_backtest.py::build_costs（相对点差装配，R1/T3） ----------
+
+RUN_BT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "run_backtest.py"
+
+
+def _load_run_backtest():
+    spec = importlib.util.spec_from_file_location("run_backtest_script_t3", RUN_BT_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_build_costs_defaults_to_relative_and_version_says_rel(tmp_path):
+    from mt5data.ticks import save_ticks
+
+    root = tmp_path / "data"
+    save_ticks(str(root), "XAUUSD", _xau_ticks_frame())
+
+    mod = _load_run_backtest()
+    costs, ver = mod.build_costs(str(root), "XAUUSD", 0.1, allow_zero_swap=True)
+    assert "rel" in ver                                   # cost_model_version 写明 rel
+    rel = 0.3 / 2400.15
+    assert costs.spread_p90("XAUUSD", 9, price=2000.0) == pytest.approx(rel * 2000.0)
+    assert costs.slippage("XAUUSD", 9, price=2000.0) == pytest.approx(0.1 * rel * 2000.0)
+    with pytest.raises(ValueError):                       # 相对口径缺 price
+        costs.spread_p90("XAUUSD", 9)
+
+    costs_abs, ver_abs = mod.build_costs(str(root), "XAUUSD", 0.1,
+                                         allow_zero_swap=True, spread_mode="absolute")
+    assert "abs" in ver_abs
+    assert costs_abs.spread_p90("XAUUSD", 9) == pytest.approx(0.3)   # 旧口径逐位一致
+    assert costs_abs.slippage("XAUUSD", 9) == pytest.approx(0.03)

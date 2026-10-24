@@ -12,7 +12,9 @@
 - 金额口径：contract_size 取 --contract-size，否则读
   {data-root}/specs/latest.json（scripts/snapshot_specs.py 产出）；两者都没有
   → 报错退出（绝不静默按 1 折算——那会让盈亏差几百到十万倍）。
-- 成本：--costs auto（默认）＝tick 实测点差+滑点；佣金与隔夜费优先
+- 成本：--costs auto（默认）＝tick 实测点差+滑点，点差默认**相对口径**
+  （--spread-mode relative，R1：p90 of (ask−bid)/mid 按小时，回测时按成交
+  基准价缩放；--spread-mode absolute 为旧口径）；佣金与隔夜费优先
   {data-root}/costs/calibrated.json（scripts/calibrate_costs.py 实测），其次
   品种快照推算（SwapModel.from_snapshot）；两者都没有 → 报错，除非显式
   --allow-zero-swap（零隔夜费会写进 manifest）。--costs zero 用零成本占位。
@@ -104,8 +106,13 @@ def _load_calibrated(data_root: str) -> dict | None:
 
 def build_costs(data_root: str, symbol: str, spread_fraction: float,
                 commission_per_lot: float = 0.0, *,
-                allow_zero_swap: bool = False) -> tuple:
+                allow_zero_swap: bool = False,
+                spread_mode: str = "relative") -> tuple:
     """tick 实测点差 + 佣金/隔夜费（calibrated.json > 品种快照 > 报错）。
+
+    spread_mode（R1/T3）：relative（默认）＝(ask−bid)/mid 按小时分位，
+    引擎按成交基准价缩放——近期点差结构可外推到价格水平不同的历史；
+    absolute＝旧口径（价格单位，忽略 price）。cost_version 里写明 rel/abs。
 
     返回 (costs, cost_version)。佣金优先 calibrated 实测，其次 CLI 显式值；
     隔夜费优先 calibrated 实测费率（free_of_swap=true 属合法实测零费），其次
@@ -121,8 +128,9 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
         print(f"⚠ {symbol} 无 tick 数据，退回零成本；"
               f"先跑 scripts/download_ticks.py 可启用实测点差/滑点")
         return ZeroCosts(), "zero-v0(no-ticks)"
-    spread = SpreadModel.from_ticks(symbol, ticks)
+    spread = SpreadModel.from_ticks(symbol, ticks, mode=spread_mode)
     slip = SlippageModel(spread, spread_fraction=spread_fraction)
+    mode_tag = "rel" if spread_mode == "relative" else "abs"
 
     calibrated = _load_calibrated(data_root)
     cal_sym = None
@@ -184,8 +192,9 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
 
     costs = Costs(spread=spread, slippage_model=slip, commission=commission,
                   swap=swap)
-    print(f"✓ 成本：tick {len(ticks):,} 条实测点差（p90）；{comm_tag}；{swap_tag}")
-    return costs, f"tick-spread-p90+slip{spread_fraction}-{comm_tag}-{swap_tag}"
+    print(f"✓ 成本：tick {len(ticks):,} 条实测点差（{mode_tag} p90"
+          f"{'×成交价' if mode_tag == 'rel' else ''}）；{comm_tag}；{swap_tag}")
+    return costs, f"tick-spread-p90[{mode_tag}]+slip{spread_fraction}-{comm_tag}-{swap_tag}"
 
 
 def load_strategy(path: str):
@@ -236,6 +245,10 @@ def main() -> int:
                     help="auto=本地 tick 实测点差+滑点（佣金/隔夜未配置按 0 并说明）；zero=零成本")
     ap.add_argument("--spread-fraction", type=float, default=0.1,
                     help="--costs auto 时的滑点比例（×p90 点差）")
+    ap.add_argument("--spread-mode", choices=("relative", "absolute"),
+                    default="relative",
+                    help="点差口径：relative=(ask−bid)/mid 按小时 p90，回测按成交基准价"
+                         "缩放（R1 默认）；absolute=旧口径（价格单位，忽略 price）")
     ap.add_argument("--commission", type=float, default=0.0,
                     help="每手来回佣金（账户货币），--costs auto 时无 calibrated 实测则用此值")
     ap.add_argument("--allow-zero-swap", action="store_true",
@@ -264,7 +277,8 @@ def main() -> int:
         if args.costs == "auto":
             costs, cost_version = build_costs(
                 args.data_root, args.symbol, args.spread_fraction,
-                args.commission, allow_zero_swap=args.allow_zero_swap)
+                args.commission, allow_zero_swap=args.allow_zero_swap,
+                spread_mode=args.spread_mode)
         else:
             costs, cost_version = ZeroCosts(), "zero-v0"
         if args.cost_version:
@@ -282,6 +296,7 @@ def main() -> int:
             run_dir, result, cost_version=cost_version, strategy=args.strategy,
             extra={"end": args.end, "costs": args.costs,
                    "spread_fraction": args.spread_fraction,
+                   "spread_mode": args.spread_mode,
                    "commission_per_lot": args.commission,
                    "allow_zero_swap": args.allow_zero_swap})
     except Exception as e:  # fail-fast：任何错误如实报出

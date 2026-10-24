@@ -5,6 +5,11 @@
 与 {out}/scope.md（纳入/排除清单及理由、禁止时段=rollover 小时、
 无 tick/无 K 线备注）。ticks 缺失的品种注明"无tick，跳过点差实测"，
 对应格为空=不可判，全部按排除处理。
+
+点差口径（R1 / 计划 T3）：默认 --spread-mode relative——格值 = 相对成本 ÷
+相对振幅（(high−low)/close 的小时均值），各分量折成"占价格的比率"，
+比率不随整体价格水平变化（近期 tick 的点差结构可外推到价格水平不同的
+历史）；absolute 为旧口径（价格单位 ÷ 平均振幅）。
 """
 from __future__ import annotations
 
@@ -28,6 +33,7 @@ from mt5quant.costs import (  # noqa: E402
     SpreadModel,
     cost_heatmap,
     decide_scope,
+    relative_hourly_stats,
 )
 from mt5quant.costs.volatility import hourly_stats  # noqa: E402
 
@@ -86,13 +92,22 @@ def _contract_sizes(data_root: str, symbols, overrides: dict[str, float],
     return sizes
 
 
-def _render_scope_md(decisions, rollover, notes, *, threshold, assumptions) -> str:
+def _render_scope_md(decisions, rollover, notes, *, threshold, assumptions,
+                     relative: bool) -> str:
+    cost_line = (
+        "- 来回成本（相对价）= rel_p90 + 2×rel_slip + 佣金/(合约大小×该小时均价)；"
+        "格值 = 相对成本 ÷ 该小时平均相对振幅 ((high−low)/close)"
+        if relative else
+        "- 来回成本价 = spread_p90(点差全幅,每来回一次) + 2×slippage + 佣金/合约大小"
+        "（价格单位）"
+    )
     lines = [
         "# 成本与可交易性审计",
         "",
         f"- 生成时间（UTC）：{datetime.now(timezone.utc).isoformat(timespec='seconds')}",
-        "- 来回成本价 = spread_p90(点差全幅,每来回一次) + 2×slippage + 佣金/合约大小（价格单位）",
-        f"- 判定：来回成本价 ÷ 该小时平均振幅 ≤ {threshold} → 纳入；无数据 → 排除",
+        cost_line,
+        f"- 判定：成本 ÷ 该小时{'平均相对振幅' if relative else '平均振幅'}"
+        f" ≤ {threshold} → 纳入；无数据 → 排除",
     ]
     lines += [f"- {a}" for a in assumptions]
     lines += ["", "## 品种备注"]
@@ -137,6 +152,10 @@ def main() -> int:
     ap.add_argument("--spread-fraction", type=float, default=0.1,
                     help="滑点=该比例×p90 点差")
     ap.add_argument("--fixed-slippage", type=float, default=0.0)
+    ap.add_argument("--spread-mode", choices=("relative", "absolute"),
+                    default="relative",
+                    help="点差口径（R1）：relative=相对价 p90，格值=相对成本÷相对振幅，"
+                         "不随价格水平漂移（默认）；absolute=旧口径（价格单位）")
     args = ap.parse_args()
 
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
@@ -153,10 +172,12 @@ def main() -> int:
             notes.append(f"{s}：无tick，跳过点差实测")
             continue
         try:
-            spread = spread.merge(SpreadModel.from_ticks(s, ticks))
+            spread = spread.merge(SpreadModel.from_ticks(s, ticks,
+                                                         mode=args.spread_mode))
             have_any_tick = True
             have_tick.add(s)
-            print(f"✓ {s}：tick {len(ticks):,} 条已测点差")
+            print(f"✓ {s}：tick {len(ticks):,} 条已测点差"
+                  f"（{args.spread_mode}）")
         except ValueError as e:
             notes.append(f"{s}：点差实测失败（{e}），跳过")
     if not have_any_tick:
@@ -164,7 +185,7 @@ def main() -> int:
               f"请先运行 scripts/download_ticks.py 回补后再重跑本脚本。")
         return 1
 
-    # 2) 波幅统计（有 K 线的品种×周期）
+    # 2) 波幅统计（有 K 线的品种×周期；relative 另需相对振幅/均价列）
     vol: dict[tuple[str, str], pd.DataFrame] = {}
     for s in symbols:
         for tf in timeframes:
@@ -172,7 +193,10 @@ def main() -> int:
             if bars is None or len(bars) == 0:
                 notes.append(f"{s} {tf}：无K线，跳过")
                 continue
-            vol[(s, tf)] = hourly_stats(bars, tf)
+            stats = hourly_stats(bars, tf)
+            if args.spread_mode == "relative":
+                stats = stats.join(relative_hourly_stats(bars))
+            vol[(s, tf)] = stats
     if not vol:
         print(f"{args.data_root}/bars/ 下没有可用 K 线（{symbols} × {timeframes}）：无可审计序列。")
         return 1
@@ -202,12 +226,16 @@ def main() -> int:
     os.makedirs(args.out, exist_ok=True)
     hm.to_csv(os.path.join(args.out, "heatmap.csv"))
     assumptions = [
-        f"佣金（计价货币/手，来回）：默认 0；按品种 {commissions if commissions else '无'}",
-        f"合约大小来源：CLI 覆盖 > {args.data_root}/specs/latest.json > 默认 1.0",
+        f"点差口径：{args.spread_mode}"
+        f"（{'p90 of (ask−bid)/mid 按小时，随价格水平缩放' if args.spread_mode == 'relative' else '价格单位，旧口径'}）",
+        f"佣金（计价货币/手，来回）：默认 0；按品种 {commissions if commissions else '无'}"
+        + ("；relative 口径按该小时均价折成相对价" if args.spread_mode == "relative" else ""),
+        f"合约大小来源：CLI 覆盖 > {args.data_root}/specs/latest.json > 报错",
         f"滑点模型：{args.spread_fraction}×p90 点差 + 固定 {args.fixed_slippage}（事件小时未配置）",
     ]
     md = _render_scope_md(decisions, rollover, notes,
-                          threshold=args.threshold, assumptions=assumptions)
+                          threshold=args.threshold, assumptions=assumptions,
+                          relative=args.spread_mode == "relative")
     with open(os.path.join(args.out, "scope.md"), "w", encoding="utf-8") as f:
         f.write(md)
 

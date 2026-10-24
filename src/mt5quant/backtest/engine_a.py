@@ -11,19 +11,29 @@
 成交与成本模型（全部钉死，测试逐项手算对账）：
 - bar 价格即 bid；ask = bid + 点差。costs.spread_p90 即点差全幅（p90），
   每个来回恰计一次，挂在"非 bid 一侧"的那条腿上（多头入场/空头出场）。
+- 成本接口 v2（R1，A-1.2）：spread_p90/slippage 均带 keyword-only price
+  （该笔成交的 bid 基准价）。相对点差模型（(ask−bid)/mid 按小时分位）按
+  price 缩放——缺 price 抛 ValueError；绝对模型忽略 price（行为与旧版逐位
+  一致）。价格基准：开/平仓 = 该笔成交的 bid 基准价（开盘调仓=下一根 open；
+  time_stop/week_close/end_of_data=该根 close）；空头 SL/TP 的 Ask 触发
+  判断 = 当根 high（SL）/low（TP），开盘跳空检查 = 开盘价；逐 bar 估值 =
+  当根 close。
 - 执行价（p 为 bid 口径的成交基准价，h 为执行 bar 开盘时刻的小时，
-  spr=costs.spread_p90(symbol,h)、slip=costs.slippage(symbol,h)）：
+  spr=costs.spread_p90(symbol,h,price=p)、slip=costs.slippage(symbol,h,price=p)）：
       多头 entry = p + spr + slip    多头 exit = p − slip
       空头 entry = p − slip           空头 exit = p + spr + slip
   → 价差与滑点已含在成交价内；Trade.slippage_cost/spread_cost 仅作报告
-    拆分，计算 net 时不再重复扣减。
+    拆分，计算 net 时不再重复扣减。（相对模型下空头保护性出场的触发基准价
+    与成交基准价不同，exit 与「价位+slip」之间存在二阶小量残差；绝对模型
+    两者严格一致。）
 - 成交基准价 p：信号调仓 = 下一根 bar 的 open；time_stop / week_close /
   end_of_data = 该 bar 的 close；SL/TP 见下。
 - SL/TP 价位 = 入场成交价 ± 系数 × ATR14。ATR 取**信号 bar**（决策时点
   已收盘）的值；入场 bar 自身的 ATR 未收盘不可知。ATR 为 NaN（回看不足）
   → 不设 SL/TP，r_multiple 记 NaN。
 - SL/TP 触发口径与 MT5 一致（H2 修复）：多头按 Bid 触发（bar 的 low/high），
-  空头按 Ask 触发（bar 的 high/low + spr）。成交：多头 exit = 价位 − slip；
+  空头按 Ask 触发（bar 的 high/low + spr，spr 的价格基准见成本接口 v2 条）。
+  成交：多头 exit = 价位 − slip；
   空头 exit = 价位 + slip（价位本身就是 Ask 口径，不再另加点差）。
 - 跳空穿价（H1 修复）：入场之后的 bar 若**开盘**已越过 SL（多头 open ≤ SL；
   空头 open+spr ≥ SL），按开盘价成交（exit_reason="stop_gap"，比止损价更差）；
@@ -38,7 +48,8 @@
 - 隔夜费：整段 (entry_time, exit_time] 交给 overnight_fee 按计费时刻数夜
   （三倍日由成本模型内部计算），结果 × 手数。
 - equity = 逐 bar 收盘市值：初始资金 + 已实现净利 + 持仓浮盈；多头按收盘
-  Bid 估值，空头按收盘 Ask（close + spr）估值，与各自的平仓口径一致；
+  Bid 估值，空头按收盘 Ask（close + spr，spr 基准价=当根 close）估值，
+  与各自的平仓口径一致；
   未实现隔夜费不计，出场时一次入账。
 - 数据末尾仍持仓 → 按末根 bar 收盘价强平，exit_reason="end_of_data"。
 - 时间口径：bar.time 是经纪商服务器时间（库内约定贴 UTC 标签）；
@@ -60,18 +71,27 @@ from mt5quant.strategies.base import ExitRules
 
 NY_TZ = "America/New_York"   # 周五当地收盘（17:00）换算用的时区
 _WEEK_CLOSE_LOCAL = dtime(17, 0)
-ENGINE_VERSION = "A-1.1"     # 2026-10-25：货币口径/跳空止损/空头 Ask 触发
+ENGINE_VERSION = "A-1.2"     # 2026-10-25：成本接口 v2（price 参数，相对点差 R1）
 
 
 class Costs(Protocol):
-    """成本模型结构化接口——四个方法名与 mt5quant.costs 的产出逐字一致。"""
+    """成本模型结构化接口（v2，R1）——四个方法名与 mt5quant.costs 的产出逐字一致。
 
-    def spread_p90(self, symbol: str, hour_utc: int) -> float:
-        """该小时的点差全幅 p90（价格单位，每个来回恰计一次）。"""
+    spread_p90/slippage 的 keyword-only price = 该笔成交的 bid 基准价：
+    相对点差模型必须拿到 price（缺失抛 ValueError）；绝对模型忽略。
+    """
+
+    def spread_p90(self, symbol: str, hour_utc: int,
+                   *, price: float | None = None) -> float:
+        """该小时的点差全幅 p90（价格单位，每个来回恰计一次）。
+
+        相对模型返回 rel_p90×price（缺 price 抛 ValueError）；绝对模型忽略 price。
+        """
         ...
 
-    def slippage(self, symbol: str, hour_utc: int) -> float:
-        """该 UTC 小时的滑点幅值（价格单位，恒为正、不利方向）。"""
+    def slippage(self, symbol: str, hour_utc: int,
+                 *, price: float | None = None) -> float:
+        """该 UTC 小时的滑点幅值（价格单位，恒为正、不利方向）；price 同上。"""
         ...
 
     def commission_per_lot(self, symbol: str) -> float:
@@ -271,8 +291,8 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
         """平仓。base_price 为 bid 口径基准价（空头出场另加 spr 变成 Ask）。"""
         nonlocal state, realized
         assert state is not None
-        spr = costs.spread_p90(symbol, times[j].hour)
-        slip = costs.slippage(symbol, times[j].hour)
+        spr = costs.spread_p90(symbol, times[j].hour, price=base_price)
+        slip = costs.slippage(symbol, times[j].hour, price=base_price)
         if state["dir"] == 1:
             exit_price = base_price - slip
         else:
@@ -303,8 +323,8 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
 
     def _open(j: int, desired: int) -> None:
         nonlocal state
-        spr = costs.spread_p90(symbol, times[j].hour)
-        slip = costs.slippage(symbol, times[j].hour)
+        spr = costs.spread_p90(symbol, times[j].hour, price=opens[j])
+        slip = costs.slippage(symbol, times[j].hour, price=opens[j])
         base = opens[j]
         if desired == 1:
             entry_price = base + spr + slip
@@ -339,7 +359,12 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
         return net / (k * atr_v * st["lots"] * cs)   # 初始风险金额（账户货币）
 
     def _protective_exit(j: int) -> None:
-        """开盘跳空 → 盘中 SL → 盘中 TP。多头按 Bid、空头按 Ask 触发（MT5 口径）。"""
+        """开盘跳空 → 盘中 SL → 盘中 TP。多头按 Bid、空头按 Ask 触发（MT5 口径）。
+
+        空头 Ask = Bid + spr；触发判断的 spr 价格基准＝当根 high（SL）/
+        low（TP），开盘跳空检查＝开盘价（成本接口 v2，相对模型下随基准价
+        缩放；绝对模型与旧版逐位一致）。
+        """
         sl, tp = state["sl"], state["tp"]
         if sl is None and tp is None:
             return
@@ -354,15 +379,20 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
             elif tp is not None and highs[j] >= tp:
                 _close(j, tp, "take_profit")
             return
-        spr = costs.spread_p90(symbol, times[j].hour)   # 空头按 Ask = Bid + spr 触发
-        if gap_check and sl is not None and opens[j] + spr >= sl:
-            _close(j, opens[j], "stop_gap")              # exit = open + spr + slip
-        elif gap_check and tp is not None and opens[j] + spr <= tp:
-            _close(j, tp - spr, "take_profit_gap")       # exit = tp + slip
-        elif sl is not None and highs[j] + spr >= sl:
-            _close(j, sl - spr, "stop")                  # exit = sl + slip
-        elif tp is not None and lows[j] + spr <= tp:
-            _close(j, tp - spr, "take_profit")           # exit = tp + slip
+        if gap_check and (sl is not None or tp is not None):
+            spr_open = costs.spread_p90(symbol, times[j].hour, price=opens[j])
+            if sl is not None and opens[j] + spr_open >= sl:
+                _close(j, opens[j], "stop_gap")          # exit = open + spr + slip
+            elif tp is not None and opens[j] + spr_open <= tp:
+                _close(j, tp - spr_open, "take_profit_gap")  # exit = tp + slip
+        if state is not None and sl is not None:
+            spr_high = costs.spread_p90(symbol, times[j].hour, price=highs[j])
+            if highs[j] + spr_high >= sl:
+                _close(j, sl - spr_high, "stop")         # exit = sl + slip
+        if state is not None and tp is not None:
+            spr_low = costs.spread_p90(symbol, times[j].hour, price=lows[j])
+            if lows[j] + spr_low <= tp:
+                _close(j, tp - spr_low, "take_profit")   # exit = tp + slip
 
     for j in range(n):
         # 1) 开盘调仓：信号来自 bar j-1 的收盘
@@ -386,7 +416,8 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
         if state is not None:
             mark = closes[j]
             if state["dir"] == -1:
-                mark = closes[j] + costs.spread_p90(symbol, times[j].hour)
+                mark = closes[j] + costs.spread_p90(symbol, times[j].hour,
+                                                    price=closes[j])
             unreal = (mark - state["entry_price"]) * state["dir"] * state["lots"] * cs
         equity_vals[j] = initial_capital + realized + unreal
 

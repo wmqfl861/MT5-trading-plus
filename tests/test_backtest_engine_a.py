@@ -1,4 +1,5 @@
-"""A 层引擎测试：成交模型逐项手算对账（half=0.5、slip=0.1、佣金 1.0/手）。"""
+"""A 层引擎测试：成交模型逐项手算对账（half=0.5、slip=0.1、佣金 1.0/手）；
+成本接口 v2（R1/T3）：price 传参断言 + 相对点差模型手算。"""
 from datetime import timedelta
 
 import numpy as np
@@ -11,6 +12,7 @@ from mt5quant.strategies import BaseStrategy, BuyHold, ExitRules
 from mt5quant.backtest.engine_a import (
     BacktestResult,
     Costs,
+    ENGINE_VERSION,
     atr_series,
     run_backtest,
 )
@@ -19,16 +21,19 @@ HALF, SLIP, COMM, ONIGHT = 0.5, 0.1, 1.0, -2.0
 
 
 class FlatCosts:
-    """手算假成本：常数 half/slip/佣金；隔夜费按 (from,to] 跨过的 UTC 午夜数计。"""
+    """手算假成本：常数 half/slip/佣金；隔夜费按 (from,to] 跨过的 UTC 午夜数计。
+
+    绝对口径（成本接口 v2 的 price 参数被忽略），与旧版行为逐位一致。
+    """
 
     def __init__(self, half=HALF, slip=SLIP, commission=COMM, overnight=ONIGHT):
         self.half, self.slip = half, slip
         self.commission, self.overnight = commission, overnight
 
-    def spread_p90(self, symbol, hour_utc):
+    def spread_p90(self, symbol, hour_utc, *, price=None):
         return self.half
 
-    def slippage(self, symbol, hour_utc):
+    def slippage(self, symbol, hour_utc, *, price=None):
         return self.slip
 
     def commission_per_lot(self, symbol):
@@ -60,8 +65,27 @@ class ChargeHourCosts(FlatCosts):
 class HourlySlipCosts(FlatCosts):
     """滑点随 UTC 小时变化，验证引擎用的是执行 bar 的小时。"""
 
-    def slippage(self, symbol, hour_utc):
+    def slippage(self, symbol, hour_utc, *, price=None):
         return SLIP + 0.01 * hour_utc
+
+
+class RecordingCosts(FlatCosts):
+    """记录每次 spread_p90/slippage 调用参数的假成本（price 传参断言用）。"""
+
+    def __init__(self):
+        super().__init__()
+        self.calls: list[tuple[str, int, float | None]] = []
+
+    def spread_p90(self, symbol, hour_utc, *, price=None):
+        self.calls.append(("spread", int(hour_utc), price))
+        return self.half
+
+    def slippage(self, symbol, hour_utc, *, price=None):
+        self.calls.append(("slip", int(hour_utc), price))
+        return self.slip
+
+    def prices(self, kind: str) -> list[float | None]:
+        return [p for k, _, p in self.calls if k == kind]
 
 
 class ScriptStrategy(BaseStrategy):
@@ -575,3 +599,113 @@ def test_equity_marks_short_at_ask():
                        initial_capital=10_000.0, timeframe="H1")
     # 入场 99.9；bar1/2 收盘 Ask=100.5 → 浮亏 0.6；末根平仓 103.6 → 净 −3.7−1.0
     assert list(res.equity) == pytest.approx([10_000.0, 9_999.4, 9_999.4, 9_995.3])
+
+
+# ------------------------------------------------- 成本接口 v2（R1 / 计划 T3）
+
+def test_engine_version_bumped_for_cost_interface_v2():
+    assert ENGINE_VERSION == "A-1.2"
+
+
+def test_engine_passes_price_to_cost_models_long_fills():
+    """多头：入场 spr/slip 的 price=执行 bar 开盘；平仓 price=该根收盘。"""
+    df = base4()  # bar1 11:00 开盘入场（open=100），末根 13:00 收盘 103 强平
+    rec = RecordingCosts()
+    run_backtest(ScriptStrategy([1], fill=1), df, rec,
+                 symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1")
+    # 多头估值按 Bid（close），不调点差模型 → 调用序列完全确定
+    assert rec.calls == [("spread", 11, 100.0), ("slip", 11, 100.0),
+                         ("spread", 13, 103.0), ("slip", 13, 103.0)]
+
+
+def test_engine_passes_bar_prices_for_short_ask_trigger_and_marking():
+    """空头：Ask 触发判断 price=当根 high/low（跳空用 open）；逐 bar 估值 price=close。"""
+    df = gap_bars(100.0, 101.6, 99.5, 100.0)
+    df.loc[19, "close"] = 100.4      # 与 open=100 区分，验证估值基准是 close
+    rules = ExitRules(stop_loss_atr=2.0)
+    rec = RecordingCosts()
+    t = one_trade(run_backtest(ScriptStrategy([0] * 18 + [-1], fill=-1, exit_rules=rules),
+                               df, rec, symbol="XAUUSD", contract_size=1.0,
+                               params={}, timeframe="H1"))
+    spread_prices = rec.prices("spread")
+    assert all(p is not None for p in spread_prices)
+    assert 100.4 in spread_prices    # bar19 收盘估值 spr 的 price=close
+    assert 101.6 in spread_prices    # bar20 SL 触发判断 spr 的 price=当根 high
+    assert 100.0 in spread_prices    # 入场 open / bar20 开盘跳空判断
+    # 绝对假成本下成交口径不变：exit = SL 价位 + slip
+    assert t["exit_reason"] == "stop"
+    assert t["exit_price"] == pytest.approx(101.9 + SLIP)
+
+
+def _relative_costs():
+    """真实相对口径成本束：rel 恒 0.2/100.1（bid 100/ask 100.2），滑点=0.1×rel×price。"""
+    from mt5quant.costs import (
+        CommissionModel, Costs as Bundle, SlippageModel, SpreadModel, SwapModel,
+        SwapRule,
+    )
+
+    rows = [(f"2026-01-05 {h:02d}:30:00", 0.2) for h in (10, 11, 12, 13)]
+    df = pd.DataFrame(
+        {"time_msc": [pd.Timestamp(t).value // 10**6 for t, _ in rows],
+         "bid": [100.0] * 4, "ask": [100.2] * 4}
+    )
+    spread = SpreadModel.from_ticks("XAUUSD", df)          # 默认 relative
+    slip = SlippageModel(spread, spread_fraction=0.1)
+    swap = SwapModel(per_symbol={"XAUUSD": SwapRule(long_per_day=0.0,
+                                                    short_per_day=0.0)})
+    return Bundle(spread=spread, slippage_model=slip,
+                  commission=CommissionModel(default_per_lot=0.0), swap=swap)
+
+
+def test_engine_relative_costs_hand_computed_contract_size_100():
+    """相对点差 × contract_size=100 的手算往返：点差随成交基准价缩放。"""
+    rel = 0.2 / 100.1
+    df = base4()  # bar1 开盘 100 入场，末根收盘 103 强平
+    res = run_backtest(ScriptStrategy([1], fill=1), df, _relative_costs(),
+                       symbol="XAUUSD", contract_size=100.0, params={}, timeframe="H1")
+    t = one_trade(res)
+    e_spr, e_slip = rel * 100.0, 0.1 * rel * 100.0        # 入场基准价=开盘 100
+    x_slip = 0.1 * rel * 103.0                            # 出场基准价=收盘 103
+    assert t["entry_price"] == pytest.approx(100.0 + e_spr + e_slip)
+    assert t["exit_price"] == pytest.approx(103.0 - x_slip)
+    assert t["gross"] == pytest.approx((103.0 - x_slip - 100.0 - e_spr - e_slip) * 100.0)
+    assert t["spread_cost"] == pytest.approx(e_spr * 100.0)
+    assert t["slippage_cost"] == pytest.approx((e_slip + x_slip) * 100.0)
+    assert t["commission"] == 0.0 and t["swap"] == 0.0
+    assert t["net"] == pytest.approx(t["gross"])
+    # 手数只放大金额字段，价格字段仍是价格单位
+    res2 = run_backtest(ScriptStrategy([1], fill=1), df, _relative_costs(),
+                        symbol="XAUUSD", contract_size=100.0, params={},
+                        volume_lots=2.0, timeframe="H1")
+    t2x = one_trade(res2)
+    assert t2x["entry_price"] == pytest.approx(t["entry_price"])
+    assert t2x["spread_cost"] == pytest.approx(2 * t["spread_cost"])
+
+
+def test_engine_relative_costs_double_price_doubles_spread_cost():
+    """价格整体 ×2 → 相对模型的点差/滑点成本（价格单位）恰 ×2（R1 核心性质）。"""
+    rel = 0.2 / 100.1
+    df2 = base4()
+    for col in ("open", "high", "low", "close"):
+        df2[col] = df2[col] * 2.0
+    rows = [(f"2026-01-05 {h:02d}:30:00", 0.4) for h in (10, 11, 12, 13)]
+    from mt5quant.costs import (
+        CommissionModel, Costs as Bundle, SlippageModel, SpreadModel, SwapModel,
+        SwapRule,
+    )
+    ticks2 = pd.DataFrame(
+        {"time_msc": [pd.Timestamp(t).value // 10**6 for t, _ in rows],
+         "bid": [200.0] * 4, "ask": [200.4] * 4}          # rel 仍 = 0.2/100.1
+    )
+    spread2 = SpreadModel.from_ticks("XAUUSD", ticks2)
+    costs2 = Bundle(spread=spread2,
+                    slippage_model=SlippageModel(spread2, spread_fraction=0.1),
+                    commission=CommissionModel(default_per_lot=0.0),
+                    swap=SwapModel(per_symbol={"XAUUSD": SwapRule(
+                        long_per_day=0.0, short_per_day=0.0)}))
+    res = run_backtest(ScriptStrategy([1], fill=1), df2, costs2,
+                       symbol="XAUUSD", contract_size=100.0, params={}, timeframe="H1")
+    t2 = one_trade(res)
+    assert t2["spread_cost"] == pytest.approx(rel * 200.0 * 100.0)   # 入场基准 200
+    assert t2["slippage_cost"] == pytest.approx(
+        (0.1 * rel * 200.0 + 0.1 * rel * 206.0) * 100.0)             # 出场基准 206

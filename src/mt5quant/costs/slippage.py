@@ -2,6 +2,9 @@
 
 口径：返回**不利方向幅值**（恒 > 0）——多单视为买贵、空单视为卖便宜；
 引擎在开、平两侧各扣一次（来回共 2×）。
+单位：spread_fraction 部分随注入的 SpreadModel 口径（relative 模型随 price
+缩放、缺 price 抛 ValueError；absolute 模型为固定价格单位）；fixed_price 恒为
+绝对价格单位。
 """
 from __future__ import annotations
 
@@ -9,9 +12,9 @@ from .spread import SpreadModel
 
 
 class SlippageModel:
-    """slippage = (spread_fraction×p90(hour) + fixed_price) × (事件小时乘数)。
+    """slippage = (spread_fraction×p90(hour,price) + fixed_price) × (事件小时乘数)。
 
-    p90(hour) 来自注入的 SpreadModel（与 spread_p90 同源，口径一致）。
+    p90(hour,price) 来自注入的 SpreadModel（与 spread_p90 同源，口径一致）。
     """
 
     def __init__(self, spread: SpreadModel | None = None, *,
@@ -34,11 +37,16 @@ class SlippageModel:
         self.event_hours = frozenset(int(h) for h in event_hours)
         self.event_multiplier = float(event_multiplier)
 
-    def slippage(self, symbol: str, hour_utc: int) -> float:
-        """结构化接口：价格单位，恒为正（不利方向幅值）。"""
+    def slippage(self, symbol: str, hour_utc: int,
+                 *, price: float | None = None) -> float:
+        """结构化接口：价格单位，恒为正（不利方向幅值）。
+
+        price（该笔成交的 bid 基准价）透传给 SpreadModel.spread_p90——
+        relative 点差模型必须提供，缺失由其如实抛 ValueError。
+        """
         if self.spread is None:
             raise ValueError("未注入 SpreadModel，无法按点差比例估计滑点")
-        p90 = self.spread.spread_p90(symbol, hour_utc)
+        p90 = self.spread.spread_p90(symbol, hour_utc, price=price)
         v = self.spread_fraction * p90 + self.fixed_price
         if int(hour_utc) in self.event_hours:
             v *= self.event_multiplier
@@ -47,3 +55,4 @@ class SlippageModel:
                 f"{symbol} 小时 {hour_utc} 滑点计算为负（p90={p90}），拒绝有利方向成本")
         # v==0 合法：零点差品种 + 零固定滑点的如实配置（恒正约束改为非负）
         return float(v)
+

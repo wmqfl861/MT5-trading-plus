@@ -1,4 +1,5 @@
-"""SlippageModel 手算测试：fraction×p90+fixed、事件小时乘数、恒正、fail-fast。"""
+"""SlippageModel 手算测试：fraction×p90+fixed、事件小时乘数、恒正、fail-fast；
+相对口径（R1/T3）：price 透传给点差模型、随价格缩放。"""
 import pandas as pd
 import pytest
 
@@ -7,6 +8,7 @@ from mt5quant.costs.spread import SpreadModel
 
 
 def _spread_model():
+    """绝对口径（旧口径逐位一致）。"""
     rows = [(f"2026-06-01 10:00:{i:02d}", 0.001) for i in range(5)]      # p90=0.001
     rows += [(f"2026-06-01 11:00:{i:02d}", 0.003) for i in range(5)]     # p90=0.003
     df = pd.DataFrame(
@@ -14,6 +16,20 @@ def _spread_model():
             "time_msc": [pd.Timestamp(t).value // 10**6 for t, _ in rows],
             "bid": [1.0] * len(rows),
             "ask": [1.0 + s for _, s in rows],
+        }
+    )
+    return SpreadModel.from_ticks("EURUSD", df, mode="absolute")
+
+
+def _rel_spread_model():
+    """相对口径：bid 99.9 / ask 100.1 → rel=0.002 恒定（10/11 点各 5 笔）。"""
+    rows = [(f"2026-06-01 10:00:{i:02d}", 0.2) for i in range(5)]
+    rows += [(f"2026-06-01 11:00:{i:02d}", 0.2) for i in range(5)]
+    df = pd.DataFrame(
+        {
+            "time_msc": [pd.Timestamp(t).value // 10**6 for t, _ in rows],
+            "bid": [99.9] * len(rows),
+            "ask": [100.1] * len(rows),
         }
     )
     return SpreadModel.from_ticks("EURUSD", df)
@@ -76,3 +92,23 @@ def test_missing_hour_propagates_from_spread_model():
     m = SlippageModel(_spread_model(), spread_fraction=0.1)
     with pytest.raises(ValueError):
         m.slippage("EURUSD", 3)  # 点差模型缺 3 点统计
+
+
+# ------------------------------------------------- 相对口径（R1 / 计划 T3）
+
+def test_relative_slippage_scales_with_price_and_requires_it():
+    m = SlippageModel(_rel_spread_model(), spread_fraction=0.1)
+    assert m.slippage("EURUSD", 10, price=100.0) == pytest.approx(0.1 * 0.002 * 100.0)
+    # 价格翻倍 → 滑点（价格单位）恰翻倍
+    assert m.slippage("EURUSD", 10, price=200.0) == pytest.approx(0.1 * 0.002 * 200.0)
+    assert m.slippage("EURUSD", 10, price=200.0) == pytest.approx(
+        2 * m.slippage("EURUSD", 10, price=100.0))
+    with pytest.raises(ValueError):  # 相对口径缺 price：由点差模型如实抛出
+        m.slippage("EURUSD", 10)
+
+
+def test_relative_slippage_event_hour_multiplies():
+    m = SlippageModel(_rel_spread_model(), spread_fraction=0.1,
+                      event_hours=frozenset({10}), event_multiplier=3.0)
+    assert m.slippage("EURUSD", 10, price=100.0) == pytest.approx(3 * 0.1 * 0.002 * 100.0)
+    assert m.slippage("EURUSD", 11, price=100.0) == pytest.approx(0.1 * 0.002 * 100.0)
