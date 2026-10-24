@@ -191,10 +191,10 @@ def slippage(self, symbol: str, hour_utc: int, *, price: float | None = None) ->
   （不模拟逐笔保证金，但绝不让负权益进入收益率计算）。
 - `ENGINE_VERSION` 递增；docstring 同步。
 
-- [ ] 失败测试先行：止损后信号仍为 1 时，`immediate` 下一根重入、`after_signal_change` 不重入
+- [x] 失败测试先行：止损后信号仍为 1 时，`immediate` 下一根重入、`after_signal_change` 不重入
       直到信号归 0 再回 1；H4 + week_close 抛错；time_stop 的 `exit_fill_time` = bar 收盘时刻、
       恰跨计费时刻时隔夜费多计一夜。
-- [ ] 实现。
+- [x] 实现。
 
 ### T8：CI 与小项 R12 / R13 / R15（0.5 天）
 
@@ -229,11 +229,11 @@ def run_backtest_ticks(strategy, bars, ticks_loader, costs, *, symbol, params, c
 - 佣金、隔夜费口径与 A 层一致（每手 × 手数）。
 - tick 覆盖不到的区间直接报错并给出覆盖范围（不静默跳过）；按月流式读取（依赖 T4）。
 
-- [ ] 失败测试先行（全部手造 tick 序列）：入场成交在信号 bar 收盘后的第一笔 tick 的 ask；
+- [x] 失败测试先行（全部手造 tick 序列）：入场成交在信号 bar 收盘后的第一笔 tick 的 ask；
       空头止损由 ask 触发；tick 级跳空按触发 tick 成交；latency_ms 把成交推迟到下一笔；
       tick 覆盖不足报错；用"tick 恰好复现 bar OHLC"的合成数据时 A/B 两层交易列表时间一致、
       价格差只来自点差建模差异。
-- [ ] 实现。
+- [x] 实现。
 
 ### T10：A/B 对账 + MT5 策略测试器对账（3 天）
 
