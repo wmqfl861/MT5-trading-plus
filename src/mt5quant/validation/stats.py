@@ -1,4 +1,4 @@
-"""G4 统计：Deflated Sharpe Ratio 与蒙特卡洛回撤分布（P4/T12）。
+"""G4 统计：Deflated Sharpe Ratio 与蒙特卡洛回撤分布（P4/T12；T21a/T21c 修订）。
 
 Deflated Sharpe Ratio——Bailey & López de Prado（2014）*The Deflated Sharpe
 Ratio: Correcting for Selection Bias, Backtest Overfitting and Non-Normality*，
@@ -15,10 +15,16 @@ Journal of Portfolio Management 40(5)：
 - V[SR_trials] 取各次试验 Sharpe 的样本方差（同一 bar 频率口径）；
   trial_sharpes 缺省或不足 2 个 → V=0 → SR₀=0（如实：没有可用选择效应估计）。
 
-蒙特卡洛回撤分布：对 bar 收益做 iid 自助重采样（bootstrap），逐条路径算
-最大回撤（相对历史峰值，负比例），得到 [p1, p5, p50, p95, p99] 分布；
-策略实际回撤落在分布的百分位过高（差于几乎所有重采样路径）→ 路径风险
-与收益分布不一致，报警。
+蒙特卡洛回撤分布（T21c/H6 修订）：**块**自助重采样（block_len = 一个交易日
+的 bar 数，保留日级波动聚集；缺省 1 = 旧 iid 自助，且随机流与旧实现逐位
+一致）+ **分批**模拟（每批 ≤ _MC_SIMS_PER_BATCH 条路径；37 万根的 M5 序列
+每个批矩阵约 60 MB，一次性物化 sims×n 会到数 GB）。逐条路径算最大回撤
+（相对历史峰值，负比例），得到 [p1, p5, p50, p95, p99] 分布；策略实际回撤
+落在分布的百分位过高（差于几乎所有重采样路径）→ 报警。
+
+块自助夏普分布（T21a/C3）：block_bootstrap_sharpes 对收益序列整块重采样
+出指定长度窗口，逐窗算**年化** Sharpe（口径与 report.summarize 一致）——
+G5 用它把策略自身样本外收益变成"锁箱长度"下的参照分布。
 
 种子约定（可复现，写进关卡报告）：所有蒙特卡洛用 numpy default_rng，
 种子 = sha256(card_id) 前 8 字节大端整数（rng_seed）。
@@ -34,6 +40,11 @@ import numpy as np
 import pandas as pd
 
 EULER_GAMMA = 0.5772156649015329
+
+# H6/探针 P4：M5 全史（约 37 万根）单矩阵约 3 GB——分批后每批 ≤20 条路径
+_MC_SIMS_PER_BATCH = 20
+# 块自助夏普的分块规模（窗口 × 2000 sims 在长窗时会到数百 MB）
+_BOOTSTRAP_CHUNK = 256
 
 
 def rng_seed(card_id: str) -> int:
@@ -126,6 +137,7 @@ class DrawdownDistribution:
     seed: int
     drawdowns: tuple[float, ...]
     percentiles: dict = field(default_factory=dict)
+    block_len: int = 1
 
     @property
     def p1(self) -> float:
@@ -156,6 +168,7 @@ class DrawdownDistribution:
     def summary(self) -> dict:
         """JSON 可写的摘要（drawdowns 不落盘，凭 seed 可复现）。"""
         return {"sims": self.sims, "seed": self.seed,
+                "block_len": int(self.block_len),
                 **{k: float(v) for k, v in self.percentiles.items()}}
 
 
@@ -168,23 +181,115 @@ def max_drawdown_of_returns(returns) -> float:
     return float(dd.min())
 
 
-def mc_drawdown_distribution(returns, *, sims: int, seed: int) -> DrawdownDistribution:
-    """自助重采样 bar 收益 → 最大回撤分布（同 seed 逐位可复现）。"""
+def _sample_block_starts(rng, n: int, block_len: int, size: tuple) -> np.ndarray:
+    """块起点（有放回，均匀）：与旧 iid 实现共用同一次 rng 调用
+    （block_len=1、size=(sims, n) 时随机流逐位一致）。"""
+    return rng.integers(0, n - block_len + 1, size=size)
+
+
+def _gather_blocks(arr: np.ndarray, starts: np.ndarray,
+                   block_len: int) -> np.ndarray:
+    """starts[..., None] + 块内偏移 → 展平为 (行数, 块数×块长) 的重采样矩阵。"""
+    idx = starts[:, :, None] + np.arange(block_len)[None, None, :]
+    return arr[idx].reshape(starts.shape[0], -1)
+
+
+def block_bootstrap_sharpes(returns, *, window_len: int, block_len: int,
+                            sims: int, seed: int,
+                            bars_per_year: float | None = None) -> np.ndarray:
+    """块自助重采样 → 各重采样窗的**年化** Sharpe 分布（T21a/C3，G5 参照分布）。
+
+    - 从 returns 整块抽取长度 block_len 的连续片段（块起点均匀、有放回），
+      拼接出 window_len 根 bar 的窗口，算一个年化 Sharpe；重复 sims 次。
+      块长 = 一个交易日的 bar 数（保留日内到日级的相关结构）；
+    - 年化口径与 report.summarize 一致：mean/std(ddof=1) × sqrt(bars_per_year)。
+      bars_per_year 缺省时按 returns 的 DatetimeIndex 实测
+      （observed_bars_per_year，与 report 同一函数）；跨度 < 30 天无法实测
+      → ValueError：调用方必须显式传入，绝不静默换日历口径；
+    - 无方差窗的夏普无定义 → 该窗丢弃；全部无方差 → ValueError。
+    """
+    from mt5quant.backtest.report import observed_bars_per_year
+    arr = _as_float_array(returns)
+    if window_len < 2:
+        raise ValueError(f"window_len 必须 ≥2（夏普无定义），收到 {window_len}")
+    if block_len < 1:
+        raise ValueError(f"block_len 必须 ≥1，收到 {block_len}")
+    if sims < 2:
+        raise ValueError(f"sims 必须 ≥2，收到 {sims}")
+    if len(arr) < block_len:
+        raise ValueError(
+            f"returns 长度 {len(arr)} 不足一个块（block_len={block_len}）")
+    if bars_per_year is None:
+        idx = getattr(returns, "index", None)
+        if not isinstance(idx, pd.DatetimeIndex):
+            raise ValueError(
+                "returns 无 DatetimeIndex 且未传 bars_per_year——年化口径"
+                "无法确定（与 report 一致的实测口径需要时间索引）")
+        bars_per_year = observed_bars_per_year(idx)
+        if bars_per_year is None:
+            raise ValueError(
+                "returns 时间跨度 < 30 天，bars_per_year 无法实测——请显式传入"
+                "（锁箱段的 annualization_bars_per_year）")
+    if not float(bars_per_year) > 0:
+        raise ValueError(f"bars_per_year 必须为正，收到 {bars_per_year!r}")
+
+    n_blocks = -(-int(window_len) // int(block_len))     # ceil
+    rng = np.random.default_rng(seed)
+    factor = math.sqrt(float(bars_per_year))
+    sharpes: list[float] = []
+    done = 0
+    while done < sims:
+        b = min(_BOOTSTRAP_CHUNK, sims - done)
+        starts = _sample_block_starts(rng, len(arr), block_len, (b, n_blocks))
+        sampled = _gather_blocks(arr, starts, block_len)[:, :window_len]
+        mean = sampled.mean(axis=1)
+        std = sampled.std(axis=1, ddof=1)
+        ok = std > 0.0
+        sharpes.extend(
+            float(x) for x in mean[ok] / std[ok] * factor)
+        done += b
+    if not sharpes:
+        raise ValueError("全部重采样窗都无方差——夏普分布无定义")
+    return np.asarray(sharpes, dtype="float64")
+
+
+def mc_drawdown_distribution(returns, *, sims: int, seed: int,
+                             block_len: int = 1) -> DrawdownDistribution:
+    """块自助重采样 bar 收益 → 最大回撤分布（同 seed 逐位可复现）。
+
+    T21c/H6：分批物化路径（每批 ≤ _MC_SIMS_PER_BATCH 条，就地运算控峰值
+    内存），重采样改按块（block_len = 一个交易日的 bar 数；缺省 1 = 旧 iid
+    自助，随机流与旧实现完全一致——块起点一次抽完，block_len=1 时形状与
+    旧 idx 相同）。
+    """
     arr = _as_float_array(returns)
     if sims < 2:
         raise ValueError(f"sims 必须 ≥2，收到 {sims}")
+    if block_len < 1:
+        raise ValueError(f"block_len 必须 ≥1，收到 {block_len}")
     if len(arr) < 2:
         raise ValueError("收益观测不足，无法重采样")
+    if len(arr) < block_len:
+        raise ValueError(
+            f"收益长度 {len(arr)} 不足一个块（block_len={block_len}）")
+    n = len(arr)
+    n_blocks = -(-n // int(block_len))
     rng = np.random.default_rng(seed)
-    idx = rng.integers(0, len(arr), size=(sims, len(arr)))
-    sampled = arr[idx]
-    equity = np.concatenate(
-        [np.ones((sims, 1)), np.cumprod(1.0 + sampled, axis=1)], axis=1)
-    peaks = np.maximum.accumulate(equity, axis=1)
-    dd = equity / peaks - 1.0
-    mdds = dd.min(axis=1)
+    starts = _sample_block_starts(rng, n, block_len, (int(sims), n_blocks))
+    mdds = np.empty(int(sims), dtype="float64")
+    for b0 in range(0, int(sims), _MC_SIMS_PER_BATCH):
+        b1 = min(b0 + _MC_SIMS_PER_BATCH, int(sims))
+        sampled = _gather_blocks(arr, starts[b0:b1], block_len)[:, :n]
+        # 就地算回撤：sampled ← 权益 ← 回撤（峰值内存 ≈ 2×批矩阵）
+        np.add(sampled, 1.0, out=sampled)
+        np.cumprod(sampled, axis=1, out=sampled)
+        peaks = np.maximum.accumulate(sampled, axis=1)
+        np.maximum(peaks, 1.0, out=peaks)    # 峰值不低于初始权益 1
+        np.divide(sampled, peaks, out=sampled)
+        sampled -= 1.0
+        mdds[b0:b1] = sampled.min(axis=1)
     pcts = {f"p{q}": float(np.percentile(mdds, q))
             for q in (1, 5, 50, 95, 99)}
     return DrawdownDistribution(sims=int(sims), seed=int(seed),
                                 drawdowns=tuple(float(x) for x in mdds),
-                                percentiles=pcts)
+                                percentiles=pcts, block_len=int(block_len))

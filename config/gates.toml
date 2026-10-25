@@ -1,8 +1,12 @@
 # 关卡门槛（P4/T12）——数值逐条取自 docs/blueprint.md 附录 B。
 # 冻结机制：本文件的 sha256 记录在 src/mt5quant/validation/gates.py 的
 # FROZEN_GATES_SHA256；load_gates 每次加载先核对，不符 → 拒绝运行
-# （防偷偷放松门槛）。P5 用基线策略校准后重新冻结（T13）。
-version = 1
+# （防偷偷放松门槛）。
+# 冻结历史：
+# - 2026-10-24（T12 初值）；2026-10-25 P5 校准后维持；
+# - 2026-10-26（T21 第二次冻结）：[g3] 窗口改日历月（H5，旧按 bar 数的
+#   3 个键删除）；[g5] 改单侧判定（C3，旧双侧区间键删除）。
+version = 2
 
 [g1]                                   # 样本内资格线
 trade_count_min_intraday = 300         # 附录 B：M5–M15 ≥300（M1/M30 未列，从严同档）
@@ -21,16 +25,20 @@ random_entry_sims = 200                # 随机入场蒙特卡洛次数
 drop_best_fraction = 0.05              # 去掉最好的 5% 交易后仍盈利
 cross_symbol_min = 2                   # 通用逻辑 ≥2 个品种为正
 
-[g3]                                   # walk-forward
-walkforward_train_bars = 2000          # 滚动训练窗（bar 数）
-walkforward_test_bars = 500            # 滚动测试窗（bar 数）
-walkforward_min_oos_ratio = 0.50       # 样本外夏普 ≥ 样本内 × 0.5 且为正
+[g3]                                   # walk-forward（T21b/H5：日历月窗口）
+train_months_hourly = 24               # H1 及以上：训练窗 24 个日历月
+test_months_hourly = 6                 # H1 及以上：测试窗 6 个日历月
+train_months_intraday = 12             # 日内（< 1 小时）：训练窗 12 个月
+test_months_intraday = 3               # 日内：测试窗 3 个月
+min_oos_ratio = 0.50                   # 样本外夏普 ≥ 样本内 × 0.5 且为正
 
 [g4]                                   # 统计显著性
 dsr_min_probability = 0.95             # Deflated Sharpe Ratio 概率 ≥ 0.95
-mc_drawdown_sims = 1000                # 蒙特卡洛回撤分布重采样次数
+mc_drawdown_sims = 1000                # 蒙特卡洛回撤分布重采样次数（块自助，T21c）
 mc_drawdown_percentile_max = 99.0      # 实际回撤不得差于 99% 的重采样路径
 
-[g5]                                   # 锁箱一次性
-lockbox_interval_lo_percentile = 5.0   # 指标落在样本外蒙特卡洛 [p5, p95] 内
-lockbox_interval_hi_percentile = 95.0
+[g5]                                   # 锁箱一次性（T21a/C3：单侧判定）
+lockbox_sharpe_min_percentile = 5.0    # 锁箱夏普 ≥ 参照分布 p5（单侧）
+lockbox_warn_percentile = 95.0         # 高于 p95 只告警，不判失败
+lockbox_min_trades_ratio = 0.50        # 交易数 ≥ 预期的 50%
+lockbox_bootstrap_sims = 2000

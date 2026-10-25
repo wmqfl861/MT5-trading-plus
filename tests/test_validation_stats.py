@@ -122,6 +122,81 @@ def test_deflated_sharpe_rejects_degenerate_inputs():
         vstats.deflated_sharpe_probability(pd.Series([0.01] * 10), n_trials=1)
 
 
+# ------------------------------------------------------- 块自助夏普（T21a/C3）
+
+def test_block_bootstrap_sharpes_shape_and_determinism():
+    idx = pd.date_range("2024-01-01", periods=500, freq="h")
+    rng = np.random.default_rng(3)
+    r = pd.Series(rng.normal(0.0005, 0.004, 500), index=idx)
+    a = vstats.block_bootstrap_sharpes(r, window_len=200, block_len=24,
+                                       sims=50, seed=11,
+                                       bars_per_year=6000.0)
+    b = vstats.block_bootstrap_sharpes(r, window_len=200, block_len=24,
+                                       sims=50, seed=11,
+                                       bars_per_year=6000.0)
+    assert a.shape == (50,)
+    assert np.array_equal(a, b)
+
+
+def test_block_bootstrap_sharpes_drift_sign():
+    """正漂移收益的自助夏普分布 p5 也显著为正；零漂移分布的中位数在 0 附近。"""
+    idx = pd.date_range("2024-01-01", periods=1200, freq="h")
+    rng = np.random.default_rng(7)
+    drift = pd.Series(0.0015 + rng.normal(0.0, 0.003, 1200), index=idx)
+    noise = pd.Series(rng.normal(0.0, 0.003, 1200), index=idx)
+    d = vstats.block_bootstrap_sharpes(drift, window_len=300, block_len=24,
+                                       sims=100, seed=5, bars_per_year=6000.0)
+    n = vstats.block_bootstrap_sharpes(noise, window_len=300, block_len=24,
+                                       sims=100, seed=5, bars_per_year=6000.0)
+    assert float(np.percentile(d, 5)) > 5.0
+    assert abs(float(np.median(n))) < 5.0
+
+
+def test_block_bootstrap_sharpes_annualization_scales_with_bpy():
+    """年化口径与 report 一致：bars_per_year ×4 → 夏普 ×2（sqrt 年化）。"""
+    idx = pd.date_range("2024-01-01", periods=400, freq="h")
+    r = pd.Series(np.random.default_rng(9).normal(0.0004, 0.003, 400),
+                  index=idx)
+    s1 = vstats.block_bootstrap_sharpes(r, window_len=200, block_len=24,
+                                        sims=20, seed=2, bars_per_year=1000.0)
+    s4 = vstats.block_bootstrap_sharpes(r, window_len=200, block_len=24,
+                                        sims=20, seed=2, bars_per_year=4000.0)
+    assert np.allclose(s4, s1 * 2.0)
+
+
+def test_block_bootstrap_sharpes_derives_bpy_from_datetime_index():
+    """未传 bars_per_year 时按 DatetimeIndex 实测（与 observed_bars_per_year
+    同口径）；跨度 ≥30 天才能实测。"""
+    from mt5quant.backtest.report import observed_bars_per_year
+    idx = pd.date_range("2024-01-01", periods=24 * 60, freq="h")   # 60 天
+    r = pd.Series(np.random.default_rng(2).normal(0.0005, 0.003, len(idx)),
+                  index=idx)
+    a = vstats.block_bootstrap_sharpes(r, window_len=500, block_len=24,
+                                       sims=10, seed=4)
+    b = vstats.block_bootstrap_sharpes(
+        r, window_len=500, block_len=24, sims=10, seed=4,
+        bars_per_year=observed_bars_per_year(r.index))
+    assert np.array_equal(a, b)
+
+
+def test_block_bootstrap_sharpes_rejects_bad_args():
+    idx = pd.date_range("2024-01-01", periods=100, freq="h")
+    r = pd.Series(0.001, index=idx)
+    with pytest.raises(ValueError):   # 窗口太短：夏普无定义
+        vstats.block_bootstrap_sharpes(r, window_len=1, block_len=24,
+                                       sims=5, seed=1)
+    with pytest.raises(ValueError):   # 块长超过样本
+        vstats.block_bootstrap_sharpes(r, window_len=50, block_len=101,
+                                       sims=5, seed=1)
+    with pytest.raises(ValueError):   # 非时间索引且未给 bars_per_year
+        vstats.block_bootstrap_sharpes(pd.Series(np.linspace(1.0, 2.0, 300)),
+                                       window_len=100, block_len=24,
+                                       sims=5, seed=1)
+    with pytest.raises(ValueError):   # 时间索引但跨度 < 30 天，无法实测
+        vstats.block_bootstrap_sharpes(r, window_len=50, block_len=24,
+                                       sims=5, seed=1)
+
+
 # ---------------------------------------------------------------- 蒙特卡洛回撤
 
 def test_mc_drawdown_reproducible_with_same_seed():
@@ -147,3 +222,53 @@ def test_mc_drawdown_summary_is_jsonable():
     dist = vstats.mc_drawdown_distribution(r, sims=100, seed=1)
     payload = json.dumps(dist.summary())
     assert "p95" in payload
+
+
+# ------------------------------------------- T21c/H6：分批 + 块自助重采样
+
+def test_mc_drawdown_block_len_one_matches_legacy_iid_stream():
+    """block_len=1（缺省）与旧一次性 iid 实现同 seed 逐位一致（回归保护）。"""
+    r = trending_returns(n=300, seed=8)
+    seed = vstats.rng_seed("H001")
+    dist = vstats.mc_drawdown_distribution(r, sims=200, seed=seed)
+    # 手工按旧实现复算（一次性矩阵、iid 抽样、含前置 1 的权益）
+    arr = np.asarray(r, dtype="float64")
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(arr), size=(200, len(arr)))
+    sampled = arr[idx]
+    equity = np.concatenate(
+        [np.ones((200, 1)), np.cumprod(1.0 + sampled, axis=1)], axis=1)
+    peaks = np.maximum.accumulate(equity, axis=1)
+    dd = equity / peaks - 1.0
+    assert list(dist.drawdowns) == [float(x) for x in dd.min(axis=1)]
+
+
+def test_mc_drawdown_block_bootstrap_reproducible_and_sane():
+    r = trending_returns(n=2000, seed=4)
+    a = vstats.mc_drawdown_distribution(r, sims=100, seed=9, block_len=24)
+    b = vstats.mc_drawdown_distribution(r, sims=100, seed=9, block_len=24)
+    assert a.p50 == b.p50 and a.p95 == b.p95
+    assert all(d <= 0.0 for d in a.drawdowns)
+    assert a.summary()["block_len"] == 24
+
+
+def test_mc_drawdown_batched_memory_under_500mb():
+    """H6/探针 P4：37 万根 × 1000 次重采样的峰值内存 < 500 MB（tracemalloc）。
+
+    旧实现一次性物化 sims×n 矩阵（约 3 GB×多个）；分批（每批 ≤20）+
+    就地运算后应远低于 500 MB。下限断言确认 tracemalloc 确实看到了
+    批矩阵（防止 numpy 分配不被追踪导致空断言）。
+    """
+    import tracemalloc
+    rng = np.random.default_rng(1)
+    r = pd.Series(rng.normal(0.0002, 0.004, 370_000))
+    tracemalloc.start()
+    try:
+        dist = vstats.mc_drawdown_distribution(r, sims=1000, seed=3,
+                                               block_len=288)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert len(dist.drawdowns) == 1000
+    assert peak > 50_000_000        # ≈ 每批 2×60 MB 的矩阵确实被追踪
+    assert peak < 500_000_000       # H6 验收线

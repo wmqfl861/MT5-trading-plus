@@ -163,6 +163,123 @@ def test_filename_must_match_id(tmp_path):
         cards.load_card(p)
 
 
+# ------------------------------------------------------- 谱系字段（T21d/H4）
+
+V2 = """\
+id = "H012-v2"
+family = "H012"
+version = 2
+parent = "H012-v1"
+strategy = "mt5quant.strategies.library.b1_donchian_breakout:DonchianBreakout"
+selection_rule = "max_net_profit"
+symbols = ["XAUUSD"]
+timeframe = "H1"
+session = "全时段"
+phenomenon = "趋势延续"
+mechanism = "时间序列动量"
+should_fail_when = "长期震荡"
+falsified_if = "样本外夏普为负"
+graveyard_checked = []
+
+[rules]
+entry = "突破 N 日高点"
+exit = "跌破短通道"
+stop = "ATR 止损"
+
+[params]
+entry_days = [10, 20]
+
+[expected]
+trades_per_year = "10-40"
+win_rate = "35-50%"
+payoff_ratio = "1.5-3.0"
+"""
+
+
+def v2_card(tmp_path):
+    return write_card(tmp_path, V2, name="H012-v2.toml")
+
+
+def test_v2_card_loads_lineage_fields(tmp_path):
+    card = cards.load_card(v2_card(tmp_path))
+    assert card.family == "H012"
+    assert card.parent == "H012-v1"
+    assert (card.strategy
+            == "mt5quant.strategies.library.b1_donchian_breakout:DonchianBreakout")
+    assert card.selection_rule == "max_net_profit"
+    assert card.version == 2
+    assert card.is_legacy is False
+    assert card.migration_hint == ""
+
+
+def test_legacy_card_defaults_family_to_id(tmp_path):
+    """旧卡缺字段：family=id、strategy=None（须由 --strategy 给出）+ 迁移提示。"""
+    card = cards.load_card(valid_card(tmp_path))
+    assert card.family == "H097"           # 无 -v 后缀 → family = id
+    assert card.parent == ""
+    assert card.strategy is None
+    assert card.selection_rule == "max_net_profit"
+    assert card.is_legacy is True
+    assert "--strategy" in card.migration_hint
+
+
+def test_missing_family_on_versioned_id_derives_family(tmp_path):
+    body = V2.replace('family = "H012"\n', "")
+    card = cards.load_card(write_card(tmp_path, body, name="H012-v2.toml"))
+    assert card.family == "H012"
+
+
+def test_family_mismatched_with_id_rejected(tmp_path):
+    body = V2.replace('family = "H012"', 'family = "H13"')
+    with pytest.raises(cards.CardError, match="family"):
+        cards.load_card(write_card(tmp_path, body, name="H012-v2.toml"))
+
+
+def test_parent_required_for_v2(tmp_path):
+    body = V2.replace('parent = "H012-v1"\n', "")
+    with pytest.raises(cards.CardError, match="parent"):
+        cards.load_card(write_card(tmp_path, body, name="H012-v2.toml"))
+
+
+def test_parent_must_be_empty_for_v1(tmp_path):
+    body = VALID.replace("version = 1",
+                         'version = 1\nparent = "H096"')
+    with pytest.raises(cards.CardError, match="parent"):
+        cards.load_card(write_card(tmp_path, body))
+
+
+def test_id_version_suffix_must_match(tmp_path):
+    body = V2.replace("version = 2", "version = 3")
+    with pytest.raises(cards.CardError, match="-v2"):
+        cards.load_card(write_card(tmp_path, body, name="H012-v2.toml"))
+
+
+def test_strategy_bad_format_rejected(tmp_path):
+    for bad in ("no_colon_here", " :Cls", "mod:"):
+        body = V2.replace(
+            'strategy = "mt5quant.strategies.library.b1_donchian_breakout:DonchianBreakout"',
+            f'strategy = "{bad}"')
+        with pytest.raises(cards.CardError, match="strategy"):
+            cards.load_card(write_card(tmp_path, body, name="H012-v2.toml"))
+
+
+def test_selection_rule_blank_allowed_default(tmp_path):
+    """selection_rule 缺省 → max_net_profit（T21e 的 --params auto 规则）。"""
+    body = V2.replace('selection_rule = "max_net_profit"\n', "")
+    card = cards.load_card(write_card(tmp_path, body, name="H012-v2.toml"))
+    assert card.selection_rule == "max_net_profit"
+
+
+def test_repo_legacy_cards_load_with_defaults():
+    """research/cards/ 旧卡 H001-H007 不改（迁移由主会话决定）——仍可装载。"""
+    repo = os.path.join(_repo_root(), "research", "cards")
+    for name in ("H001", "H004", "H007"):
+        card = cards.load_card(os.path.join(repo, f"{name}.toml"))
+        assert card.family == name
+        assert card.strategy is None
+        assert card.is_legacy is True
+
+
 # ---------------------------------------------------------------- param_grid
 
 def test_param_grid_cartesian(tmp_path):
@@ -274,3 +391,85 @@ def test_ensure_mixed_awareness_is_valueerror():
         cards.ensure_card_precedes_run(
             "H097", datetime(2026, 10, 20, tzinfo=timezone.utc),
             datetime(2026, 10, 21))
+
+
+# --------------------------------------------- 工作区干净（T21d/P6）与策略绑定
+
+def test_worktree_clean_runner_injection(tmp_path):
+    p = valid_card(tmp_path)
+    assert cards.worktree_clean(
+        p, runner=lambda args, cwd: _Proc(0, "")) is True
+    assert cards.worktree_clean(
+        p, runner=lambda args, cwd: _Proc(0, " M H097.toml\n")) is False
+    assert cards.worktree_clean(
+        p, runner=lambda args, cwd: _Proc(1, "")) is False   # fail-closed
+
+
+def test_worktree_clean_calls_git_status_with_path(tmp_path):
+    seen = {}
+
+    def runner(args, cwd):
+        seen["args"] = args
+        return _Proc(0, "")
+
+    p = valid_card(tmp_path)
+    cards.worktree_clean(p, runner=runner)
+    assert seen["args"][:4] == ["git", "status", "--porcelain", "--"]
+    assert str(p) in seen["args"]
+
+
+def test_worktree_clean_real_git_lifecycle(tmp_path):
+    """真实 git：提交后干净 → 改动即脏 → 再提交又干净（P6 场景）。"""
+    import subprocess
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    p = write_card(repo, VALID)
+
+    def git(*args):
+        subprocess.run(["git", *args], cwd=str(repo), capture_output=True,
+                       check=True)
+
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    git("add", "H097.toml")
+    git("commit", "-qm", "card")
+    assert cards.worktree_clean(p) is True
+    p.write_text(VALID + "# local edit\n", encoding="utf-8")
+    assert cards.worktree_clean(p) is False
+    git("add", "H097.toml")
+    git("commit", "-qm", "card edit")
+    assert cards.worktree_clean(p) is True
+
+
+def test_p6_dirty_worktree_rejected():
+    """探针 P6：卡文件改了没提交 → 先卡后测必须拒绝。"""
+    committed = datetime(2026, 10, 20, tzinfo=timezone.utc)
+    with pytest.raises(cards.CardDirtyWorktreeError, match="未提交改动"):
+        cards.ensure_card_precedes_run(
+            "H097", committed, None, worktree_clean=False)
+    # 已跑过的卡同理
+    with pytest.raises(cards.CardDirtyWorktreeError):
+        cards.ensure_card_precedes_run(
+            "H097", committed,
+            datetime(2026, 10, 21, tzinfo=timezone.utc),
+            worktree_clean=False)
+
+
+def test_clean_worktree_passes():
+    committed = datetime(2026, 10, 20, tzinfo=timezone.utc)
+    first_run = datetime(2026, 10, 21, tzinfo=timezone.utc)
+    cards.ensure_card_precedes_run("H097", committed, first_run,
+                                   worktree_clean=True)
+    # None = 未检查（向后兼容的旧调用）
+    cards.ensure_card_precedes_run("H097", committed, first_run)
+
+
+def test_ensure_strategy_matches(tmp_path):
+    card = cards.load_card(v2_card(tmp_path))
+    ref = "mt5quant.strategies.library.b1_donchian_breakout:DonchianBreakout"
+    cards.ensure_strategy_matches(card, ref)          # 一致 → 放行
+    with pytest.raises(cards.CardStrategyMismatchError, match="不一致"):
+        cards.ensure_strategy_matches(card, "mt5quant.strategies.library.buy_hold:BuyHold")
+    legacy = cards.load_card(valid_card(tmp_path))
+    cards.ensure_strategy_matches(legacy, "any:Thing")  # 旧卡不限制
