@@ -54,6 +54,13 @@
   K 线 + 成本缓存文件，无 tick；研究库无锁箱段，锁箱语义自然满足）。
   台账缺省**不**跟随切换，仍落 data/research/ledger.sqlite——permissions.md
   的 ACL 里研究库对研究账户只读，可写的台账目录是 data\\research。
+- 代码指纹（T37/H3/M6，D23/D27）：screen/gate 运行前过
+  cards.ensure_strategy_clean（策略类所在模块 + 其 import 的
+  strategies/library 内模块必须已提交且工作区干净），指纹
+  （strategy_sha）随每次运行落 runs 表并参与去重 N 的七元组键；
+  同一卡版本首跑登记指纹，之后代码指纹不同 → 拒绝运行（提示新建
+  下一版本卡）；`bt ledger verify` 校验 runs/gates/lockbox_uses 三条
+  哈希链，链头由 scripts/ledger_anchor.py 每日锚定进 git。
 """
 import argparse
 import json
@@ -88,6 +95,10 @@ from run_backtest import (  # noqa: E402
 from mt5quant.sizing import load_volume_limits  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# T37/D23：策略代码指纹/干净检查的 git 根。从 mt5quant 包位置推导而非
+# REPO_ROOT——测试会 monkeypatch bt.REPO_ROOT 重定向 gates 配置（P7 的
+# CRLF 用例），而策略文件永远住在真正的仓库里，git 交互必须指向它。
+STRATEGY_FP_ROOT = Path(cards.__file__).resolve().parents[3]
 
 
 def _ledger_default(args) -> Path:
@@ -181,8 +192,10 @@ def _select_params_auto(ledger, card, *, symbol: str, data_sha256: str,
 def _dedup_trial_sharpes(ledger, card_id: str,
                          bars_per_year: float) -> tuple[int, list[float]]:
     """T21c/M4：谱系（cards.family_of）内试验夏普按 (strategy, params,
-    symbol, timeframe, data_sha256, cost_model_version) 去重——同一组参数
-    先 screen 后 gate 只计 1 次，v1/v2 新卡累计进同一谱系；失败运行不计。
+    symbol, timeframe, data_sha256, cost_model_version, strategy_sha)
+    去重——同一组参数先 screen 后 gate 只计 1 次，v1/v2 新卡累计进同一
+    谱系；T37：策略代码指纹进键（改代码重跑 = 新试验）；失败运行与
+    迁移行（actor=migration）不计。
 
     返回 (去重后 N, 每根 bar 口径的试验夏普列表)；成功但无夏普的运行计入
     N、不进夏普列表（与 ledger.stats 的 n_dedup 同键口径）。
@@ -190,10 +203,11 @@ def _dedup_trial_sharpes(ledger, card_id: str,
     family = cards.family_of(card_id)
     rows = ledger.conn.execute(
         "SELECT card_id, strategy, params_json, symbol, timeframe,"
-        " data_sha256, cost_model_version, metrics_json FROM runs").fetchall()
+        " data_sha256, strategy_sha, cost_model_version, actor, metrics_json"
+        " FROM runs").fetchall()
     by_key: dict[tuple, float | None] = {}
     for r in rows:
-        if cards.family_of(r["card_id"]) != family:
+        if r["actor"] == "migration" or cards.family_of(r["card_id"]) != family:
             continue
         payload = json.loads(r["metrics_json"])
         if not payload.get("ok"):
@@ -202,7 +216,7 @@ def _dedup_trial_sharpes(ledger, card_id: str,
                json.dumps(json.loads(r["params_json"]), sort_keys=True,
                           ensure_ascii=False),
                r["symbol"], r["timeframe"], r["data_sha256"],
-               r["cost_model_version"])
+               r["cost_model_version"], r["strategy_sha"])
         if key in by_key:
             continue
         s = (payload.get("metrics") or {}).get("sharpe")
@@ -213,6 +227,34 @@ def _dedup_trial_sharpes(ledger, card_id: str,
 def _bars_per_day(timeframe: str) -> int:
     """一个交易日的 bar 数（G4 块自助块长 / G5 参照块长，T21c/T21a）。"""
     return max(1, round(86400.0 / TIMEFRAME_SECONDS[timeframe.upper()]))
+
+
+def _bind_strategy_sha(ledger, card, strategy_ref: str) -> str | None:
+    """T37/D23：策略代码必须已提交且干净，并登记/校验卡版本的指纹绑定。
+
+    - ensure_strategy_clean 不过 → 打印原因，返回 None（调用方退出 1，
+      不产生任何 runs）；
+    - 该卡版本已绑定其他指纹（首跑登记后代码改动）→ 拒绝，提示新建
+      下一版本卡；legacy 行（迁移前的运行，无指纹）不构成绑定；
+    - 返回当前代码指纹（record_run 落 runs.strategy_sha）。
+    """
+    try:
+        cards.ensure_strategy_clean(strategy_ref, STRATEGY_FP_ROOT)
+    except cards.StrategyDirtyError as e:
+        print(f"✗ {e}")
+        return None
+    sha = cards.strategy_fingerprint(strategy_ref, STRATEGY_FP_ROOT)
+    registered = ledger.card_strategy_sha(card.id, card.version)
+    if registered is not None and registered != sha:
+        print(
+            f"✗ 卡 {card.id} v{card.version} 首跑已登记策略指纹 "
+            f"{registered[:12]}…，与当前代码指纹 {sha[:12]}… 不符——"
+            "策略代码在试验开始后改动过（同卡版本下改代码重跑会静默低估"
+            " N，H3）；请新建下一版本卡（research/cards/ 下新建 "
+            f"{cards.family_of(card.id)}-v{card.version + 1}.toml）再运行")
+        return None
+    print(f"— 策略指纹 {sha[:12]}…（T37/D23：strategy_sha 随运行落台账）")
+    return sha
 
 
 def _g3_reference_returns(ledger, card, spec, bars, costs, *,
@@ -400,6 +442,10 @@ def cmd_screen(args) -> int:
                 cards.CardDirtyWorktreeError) as e:
             print(f"✗ {e}")
             return 1
+        # T37/D23：策略代码已提交且干净 + 卡版本的指纹绑定校验
+        strategy_sha = _bind_strategy_sha(ledger, card, args.strategy)
+        if strategy_sha is None:
+            return 1
         ledger.register_card(card.id, card.version, str(path),
                              current_git_commit(), committed)
 
@@ -487,7 +533,8 @@ def cmd_screen(args) -> int:
                         data_last=data_last, data_sha256=dsha,
                         engine_version=ENGINE_VERSION,
                         cost_model_version=cost_version, gates_hash=gates_hash,
-                        metrics=summary, actor=args.actor)
+                        metrics=summary, actor=args.actor,
+                        strategy_sha=strategy_sha)
                     skipped = summary.get("skipped_zero_lots") or 0
                     print(f"✓ run#{rid} {label} -> "
                           f"净利 {summary['net_profit']:.2f} "
@@ -503,7 +550,8 @@ def cmd_screen(args) -> int:
                         engine_version=ENGINE_VERSION,
                         cost_model_version=cost_version,
                         gates_hash=gates_hash, metrics=None,
-                        error=f"{type(e).__name__}: {e}", actor=args.actor)
+                        error=f"{type(e).__name__}: {e}", actor=args.actor,
+                        strategy_sha=strategy_sha)
                     print(f"✗ run#{rid} {label} -> {type(e).__name__}: {e}")
 
         st = ledger.stats(card.id)
@@ -566,6 +614,10 @@ def cmd_gate(args) -> int:
         except (cards.CardNotCommittedError, cards.CardLateCommitError,
                 cards.CardDirtyWorktreeError) as e:
             print(f"✗ {e}")
+            return 1
+        # T37/D23：策略代码已提交且干净 + 卡版本的指纹绑定校验
+        strategy_sha = _bind_strategy_sha(ledger, card, args.strategy)
+        if strategy_sha is None:
             return 1
         ledger.register_card(card.id, card.version, str(path),
                              current_git_commit(), committed)
@@ -669,7 +721,7 @@ def cmd_gate(args) -> int:
             timeframe=card.timeframe, data_first=data_first,
             data_last=data_last, data_sha256=dsha,
             engine_version=ENGINE_VERSION, cost_model_version=cost_version,
-            gates_hash=gsha, actor=args.actor)
+            gates_hash=gsha, actor=args.actor, strategy_sha=strategy_sha)
         try:
             base_kwargs = dict(symbol=symbol, params=dict(params),
                                contract_size=sizes[symbol],
@@ -810,6 +862,29 @@ def cmd_ledger_stats(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- ledger verify
+
+def cmd_ledger_verify(args) -> int:
+    """T37/M6/D27：校验 runs/gates/lockbox_uses 三条哈希链（断链/篡改）。"""
+    ledger_path = Path(args.ledger) if args.ledger else \
+        Path(args.data_root) / "research" / "ledger.sqlite"
+    try:
+        with Ledger(ledger_path, create=False) as ledger:
+            problems = ledger.verify_chain()
+    except FileNotFoundError as e:
+        print(f"✗ {e}")
+        return 1
+    if problems:
+        print(f"✗ 台账哈希链校验失败（{len(problems)} 处）：")
+        for p in problems:
+            print(f"  - {p}")
+        print("— 与 docs/research/ledger-anchors.md 的锚定记录比对，可定位"
+              "改写发生的时间（D27）")
+        return 1
+    print("✓ 台账哈希链完好（runs/gates/lockbox_uses 三链逐行校验通过）")
+    return 0
+
+
 # ---------------------------------------------------------------- 入口
 
 def build_parser() -> argparse.ArgumentParser:
@@ -900,6 +975,11 @@ def build_parser() -> argparse.ArgumentParser:
     pstat.add_argument("--data-root", default="data")
     pstat.add_argument("--ledger", default=None)
     pstat.set_defaults(func=cmd_ledger_stats)
+    pverify = ledger_sub.add_parser(
+        "verify", help="校验台账哈希链（T37/M6/D27：断链/篡改逐行报出）")
+    pverify.add_argument("--data-root", default="data")
+    pverify.add_argument("--ledger", default=None)
+    pverify.set_defaults(func=cmd_ledger_verify)
     return ap
 
 

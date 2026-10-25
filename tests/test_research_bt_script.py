@@ -546,3 +546,195 @@ def test_screen_default_data_root_unchanged(tmp_path, monkeypatch, capsys):
          "--ledger", str(tmp_path / "l.sqlite")])
     assert rc == 1
     assert "装配失败" in capsys.readouterr().out
+
+
+# ------------------------------------------------- T37（H3/M6/D23/D27）
+
+def patch_strategy_fp(monkeypatch, mod, sha):
+    """注入策略指纹与干净检查（git 交互按用例控制）。"""
+    monkeypatch.setattr(mod.cards, "ensure_strategy_clean",
+                        lambda ref, root, **kw: None)
+    monkeypatch.setattr(mod.cards, "strategy_fingerprint",
+                        lambda ref, root, **kw: sha)
+
+
+def run_screen(mod, cards_dir, root, ledger_path, monkeypatch, sha,
+               card="H099"):
+    patch_strategy_fp(monkeypatch, mod, sha)
+    return mod.main(
+        ["screen", "--card", card, "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--volume-lots", "0.01"])
+
+
+def test_screen_records_strategy_sha(tmp_path, monkeypatch):
+    mod = load_bt()
+    root = make_data_root(tmp_path)
+    cards_dir = write_card(tmp_path)
+    ledger_path = tmp_path / "ledger.sqlite"
+    patch_card_git(monkeypatch, mod)
+    assert run_screen(mod, cards_dir, root, ledger_path, monkeypatch,
+                      "a" * 64) == 0
+    with Ledger(ledger_path) as led:
+        r = led.conn.execute("SELECT strategy_sha FROM runs").fetchone()
+    assert r["strategy_sha"] == "a" * 64
+
+
+def test_screen_refuses_changed_sha_same_card_version(tmp_path, monkeypatch,
+                                                      capsys):
+    """计划用例 2：首跑登记指纹后代码改动（指纹不同）→ 同卡版本拒绝运行，
+    提示新建版本；同指纹重跑不拒绝。"""
+    mod = load_bt()
+    root = make_data_root(tmp_path)
+    cards_dir = write_card(tmp_path)
+    ledger_path = tmp_path / "ledger.sqlite"
+    patch_card_git(monkeypatch, mod)
+    assert run_screen(mod, cards_dir, root, ledger_path, monkeypatch,
+                      "a" * 64) == 0
+    rc = run_screen(mod, cards_dir, root, ledger_path, monkeypatch, "b" * 64)
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "指纹" in out and "版本" in out
+    with Ledger(ledger_path) as led:
+        assert led.stats("H099")["total_runs"] == 1   # 拒绝时不产生 runs
+    assert run_screen(mod, cards_dir, root, ledger_path, monkeypatch,
+                      "a" * 64) == 0                   # 原指纹照常可跑
+    with Ledger(ledger_path) as led:
+        assert led.stats("H099")["total_runs"] == 2
+
+
+def test_screen_rejects_uncommitted_strategy(tmp_path, monkeypatch, capsys):
+    """计划用例 3：策略文件未提交 → 拒绝运行（不产生 runs）。"""
+    mod = load_bt()
+    root = make_data_root(tmp_path)
+    cards_dir = write_card(tmp_path)
+    ledger_path = tmp_path / "ledger.sqlite"
+    patch_card_git(monkeypatch, mod)
+
+    def boom(ref, root_, **kw):
+        raise mod.cards.StrategyDirtyError(
+            "策略文件 src/mt5quant/strategies/library/buy_hold.py 未提交到"
+            " git（D23：策略文件须已提交且干净）")
+    monkeypatch.setattr(mod.cards, "ensure_strategy_clean", boom)
+    rc = mod.main(
+        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--volume-lots", "0.01"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "未提交" in out and "策略文件" in out
+    with Ledger(ledger_path) as led:
+        assert led.stats("H099")["total_runs"] == 0
+
+
+def test_new_card_version_after_code_change_counts_n_plus_one(tmp_path,
+                                                              monkeypatch):
+    """计划用例 1（端到端）：改代码后同参数重跑 → 须新建卡版本 H099-v2，
+    谱系去重 N 由 1 变 2（指纹进七元组去重键）。"""
+    mod = load_bt()
+    root = make_data_root(tmp_path)
+    cards_dir = write_card(tmp_path)
+    v2 = CARD_BODY.replace('id = "H099"', 'id = "H099-v2"').replace(
+        "version = 1", 'version = 2\nparent = "H099"')
+    (cards_dir / "H099-v2.toml").write_text(v2, encoding="utf-8")
+    ledger_path = tmp_path / "ledger.sqlite"
+    patch_card_git(monkeypatch, mod)
+    assert run_screen(mod, cards_dir, root, ledger_path, monkeypatch,
+                      "1" * 64, card="H099") == 0
+    assert run_screen(mod, cards_dir, root, ledger_path, monkeypatch,
+                      "2" * 64, card="H099-v2") == 0
+    with Ledger(ledger_path) as led:
+        st = led.stats("H099")
+        assert st["family"] == "H099"
+        assert st["family_n_dedup"] == 2          # N 加 1（代码版本不同）
+        assert st["n_dedup"] == 2
+
+
+def test_bt_ledger_verify_subcommand(tmp_path, capsys):
+    mod = load_bt()
+    ledger_path = tmp_path / "ledger.sqlite"
+    with Ledger(ledger_path) as led:
+        for i in (1, 2):
+            led.record_run(
+                card_id="H099", card_version=1, strategy="s:BuyHold",
+                params={"i": i}, symbol="XAUUSD", timeframe="H1",
+                data_first="2024-01-01", data_last="2026-01-01",
+                data_sha256="x" * 64, engine_version="A-1.1",
+                cost_model_version="zero-v0", gates_hash="",
+                metrics={"net": 1.0}, actor="test")
+        assert led.verify_chain() == []
+    rc = mod.main(["ledger", "verify", "--ledger", str(ledger_path)])
+    assert rc == 0
+    assert "完好" in capsys.readouterr().out
+    with Ledger(ledger_path) as led:              # 手工改一行 → verify 报出
+        with led.conn:
+            led.conn.execute(
+                "UPDATE runs SET metrics_json='{\"ok\":true}'"
+                " WHERE run_id=1")
+    rc = mod.main(["ledger", "verify", "--ledger", str(ledger_path)])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "run#1" in out and "篡改" in out
+
+
+def test_bt_ledger_verify_missing_ledger(tmp_path, capsys):
+    mod = load_bt()
+    rc = mod.main(["ledger", "verify",
+                   "--ledger", str(tmp_path / "missing.sqlite")])
+    assert rc == 1
+    assert "✗" in capsys.readouterr().out
+
+
+# ------------------------------------------------- T37：run_backtest 接线
+
+def load_rb():
+    spec = importlib.util.spec_from_file_location(
+        "rb_script_t37", REPO_ROOT / "scripts" / "run_backtest.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _rb_argv(root, out):
+    return ["run_backtest.py", "--strategy",
+            "mt5quant.strategies.library.buy_hold:BuyHold",
+            "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
+            "--data-root", str(root), "--out", str(out),
+            "--costs", "zero", "--contract-size", "100",
+            "--volume-lots", "0.01", "--allow-zero-swap"]
+
+
+def test_run_backtest_refuses_dirty_strategy(tmp_path, monkeypatch, capsys):
+    """run_backtest 同样先过 ensure_strategy_clean（D23）。"""
+    mod = load_rb()
+    root = make_data_root(tmp_path)
+    monkeypatch.chdir(tmp_path)               # 时钟校验读 cwd 的 config.json
+
+    def boom(ref, root_, **kw):
+        raise mod.cards.StrategyDirtyError(
+            "策略文件 src/mt5quant/strategies/library/buy_hold.py 未提交到"
+            " git（D23）")
+    monkeypatch.setattr(mod.cards, "ensure_strategy_clean", boom)
+    monkeypatch.setattr("sys.argv", _rb_argv(root, tmp_path / "out"))
+    assert mod.main() == 1
+    assert "未提交" in capsys.readouterr().out
+    assert not (tmp_path / "out").exists() or not list(
+        (tmp_path / "out").iterdir())
+
+
+def test_run_backtest_manifest_carries_strategy_sha(tmp_path, monkeypatch):
+    mod = load_rb()
+    root = make_data_root(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(mod.cards, "ensure_strategy_clean",
+                        lambda ref, root_, **kw: None)
+    monkeypatch.setattr(mod.cards, "strategy_fingerprint",
+                        lambda ref, root_, **kw: "c" * 64)
+    monkeypatch.setattr("sys.argv", _rb_argv(root, tmp_path / "out"))
+    assert mod.main() == 0
+    run_dir = sorted((tmp_path / "out").iterdir())[-1]
+    manifest = json.loads((run_dir / "manifest.json").read_text(
+        encoding="utf-8"))
+    assert manifest["strategy_sha"] == "c" * 64

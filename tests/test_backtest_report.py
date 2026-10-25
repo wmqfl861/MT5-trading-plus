@@ -276,3 +276,22 @@ def test_manifest_carries_engine_strategy_data_range_and_money_basis(tmp_path, m
     assert m["data_last_time"] == "2026-01-05T04:00:00"
     assert m["contract_size"] == 100.0 and m["initial_capital"] == 10_000.0
     assert m["extra"] == {"end": "2025-09-01"}
+
+
+# ------------------------------------------------- T37（D23）：策略指纹进 manifest
+
+def test_manifest_carries_strategy_sha(tmp_path, monkeypatch):
+    """策略代码指纹（cards.strategy_fingerprint）随 manifest 落盘——
+    报告可追溯到产生它的确切策略代码。"""
+    import mt5quant.backtest.report as report_mod
+    monkeypatch.setattr(report_mod, "current_git_commit", lambda: "deadbeef")
+    write_report(str(tmp_path), two_trade_result(),
+                 strategy="pkg.mod:Strat", strategy_sha="ab" * 32)
+    m = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert m["strategy_sha"] == "ab" * 32
+    # 未给指纹（旧调用方）→ 空串字段仍在（schema 稳定）
+    write_report(str(tmp_path / "r2"), two_trade_result(),
+                 strategy="pkg.mod:Strat")
+    m2 = json.loads((tmp_path / "r2" / "manifest.json").read_text(
+        encoding="utf-8"))
+    assert m2["strategy_sha"] == ""

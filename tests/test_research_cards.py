@@ -473,3 +473,131 @@ def test_ensure_strategy_matches(tmp_path):
         cards.ensure_strategy_matches(card, "mt5quant.strategies.library.buy_hold:BuyHold")
     legacy = cards.load_card(valid_card(tmp_path))
     cards.ensure_strategy_matches(legacy, "any:Thing")  # 旧卡不限制
+
+
+# ------------------------------------------------- T37（H3/D23）：代码指纹
+
+import hashlib as _hashlib  # noqa: E402
+
+_LIB = "mt5quant.strategies.library"
+
+
+def test_strategy_fingerprint_deterministic_and_strategy_specific():
+    """真仓只读探测：同策略两次指纹一致（sha256 hex）；不同策略指纹不同。"""
+    fp1 = cards.strategy_fingerprint(f"{_LIB}.buy_hold:BuyHold", _repo_root())
+    fp2 = cards.strategy_fingerprint(f"{_LIB}.buy_hold:BuyHold", _repo_root())
+    assert fp1 == fp2
+    assert len(fp1) == 64 and int(fp1, 16) >= 0          # sha256 hexdigest
+    other = cards.strategy_fingerprint(
+        f"{_LIB}.b1_donchian_breakout:DonchianBreakout", _repo_root())
+    assert other != fp1
+
+
+def test_strategy_fingerprint_canonical_combination(tmp_path):
+    """注入 files+runner：逐文件 git hash-object，按路径排序拼
+    "relpath:hash\\n"，整体 sha256（手算对照）。"""
+    (tmp_path / "a.py").write_text("x=1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("y=2\n", encoding="utf-8")
+
+    def runner(args, cwd):
+        assert args[:2] == ["git", "hash-object"]        # 逐文件 hash-object
+        return _Proc(0, "HA1\nHB2\n")                    # 与文件同序输出
+
+    fp = cards.strategy_fingerprint(
+        "mod:Cls", tmp_path, runner=runner,
+        files=[tmp_path / "b.py", tmp_path / "a.py"])    # 乱序给入 → 排序
+    expect = _hashlib.sha256("a.py:HA1\nb.py:HB2\n".encode()).hexdigest()
+    assert fp == expect
+
+
+def test_strategy_files_exclude_outside_library():
+    """指纹覆盖范围：策略类所在模块必进；strategies/library **外**的依赖
+    （如 strategies.base）不进指纹。"""
+    main = cards._module_file(f"{_LIB}.buy_hold")
+    files = cards.strategy_files(f"{_LIB}.buy_hold:BuyHold")
+    assert [f.resolve() for f in files] == [main.resolve()]
+
+
+def test_strategy_files_include_intra_library_imports(tmp_path):
+    """import 的 strategies/library 内模块进指纹（绝对 import 与
+    from-import 两种形式都认）。"""
+    main = cards._module_file(f"{_LIB}.buy_hold")
+    probe = tmp_path / "zz_probe.py"
+    probe.write_text(
+        "from mt5quant.strategies.library import buy_hold\n"
+        f"import {_LIB}.b1_donchian_breakout\n",
+        encoding="utf-8")
+    deps = cards._imports_within(probe, main.parent)
+    assert {f.name for f in deps} == {"buy_hold.py",
+                                      "b1_donchian_breakout.py"}
+
+
+def test_strategy_files_transitive_within_library(tmp_path, monkeypatch):
+    """传递闭包：alpha imports beta（库内）→ 两个文件都进指纹；
+    库外的 numpy 不进。"""
+    libdir = tmp_path / "library"
+    libdir.mkdir()
+    (libdir / "__init__.py").write_text("", encoding="utf-8")
+    alpha = libdir / "alpha.py"
+    beta = libdir / "beta.py"
+    alpha.write_text(f"import {_LIB}.beta\n", encoding="utf-8")
+    beta.write_text("import numpy\n", encoding="utf-8")
+    fake = {f"{_LIB}": libdir / "__init__.py",
+            f"{_LIB}.alpha": alpha, f"{_LIB}.beta": beta}
+    monkeypatch.setattr(cards, "_module_file", lambda name: fake.get(name))
+    files = cards.strategy_files(f"{_LIB}.alpha:Alpha")
+    assert {f.name for f in files} == {"alpha.py", "beta.py"}
+
+
+def test_strategy_fingerprint_bad_ref_rejected():
+    for bad in ("no_colon", ":Cls", "mod:"):
+        with pytest.raises(ValueError, match="module:Class"):
+            cards.strategy_files(bad)
+
+
+def _git_repo_with_strategy(tmp_path):
+    import subprocess
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    f = repo / "strat.py"
+    f.write_text("class S: pass\n", encoding="utf-8")
+
+    def git(*args):
+        subprocess.run(["git", *args], cwd=str(repo),
+                       capture_output=True, check=True)
+
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    return repo, f, git
+
+
+def test_ensure_strategy_clean_uncommitted_rejected(tmp_path):
+    """计划用例 3（函数级）：策略文件未提交 → StrategyDirtyError。"""
+    repo, f, _ = _git_repo_with_strategy(tmp_path)      # 未 commit
+    with pytest.raises(cards.StrategyDirtyError, match="未提交"):
+        cards.ensure_strategy_clean("m:S", repo, files=[f])
+
+
+def test_ensure_strategy_clean_dirty_rejected(tmp_path):
+    repo, f, git = _git_repo_with_strategy(tmp_path)
+    git("add", "strat.py")
+    git("commit", "-qm", "s")
+    cards.ensure_strategy_clean("m:S", repo, files=[f])  # 已提交且干净 → 通过
+    f.write_text("class S: pass  # local edit\n", encoding="utf-8")
+    with pytest.raises(cards.StrategyDirtyError, match="工作区|未提交改动"):
+        cards.ensure_strategy_clean("m:S", repo, files=[f])
+
+
+def test_ensure_strategy_clean_fail_closed_on_git_error(tmp_path):
+    """git 返回非零（无法证明干净）→ 从严拒绝（与 worktree_clean 同口径）。"""
+    repo, f, _ = _git_repo_with_strategy(tmp_path)
+    with pytest.raises(cards.StrategyDirtyError):
+        cards.ensure_strategy_clean(
+            "m:S", repo, files=[f],
+            runner=lambda a, cwd=None, **kw: _Proc(128, ""))
+
+
+def test_ensure_strategy_clean_real_repo_library_strategy():
+    """只读探测：本仓策略库文件已提交且干净 → 通过（bt/回测运行的前提）。"""
+    cards.ensure_strategy_clean(f"{_LIB}.buy_hold:BuyHold", _repo_root())

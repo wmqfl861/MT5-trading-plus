@@ -255,6 +255,9 @@ class Manifest:
 
     2026-10-25 起追加引擎版本、策略、品种周期、数据区间与金额口径——试验台账
     （P4）按这些字段去重与追溯，缺一项就无法判断两次运行是否"同一次试验"。
+    strategy_sha（T37/D23，2026-10-26）：策略代码指纹
+    （mt5quant.research.cards.strategy_fingerprint）——报告可追溯到产生
+    它的确切策略代码；缺省空串（未计算的旧调用方，如实为空）。
     """
 
     git_commit: str
@@ -264,6 +267,7 @@ class Manifest:
     created_utc: str
     engine_version: str = ""
     strategy: str = ""
+    strategy_sha: str = ""
     symbol: str = ""
     timeframe: str = ""
     n_bars: int = 0
@@ -336,8 +340,13 @@ def make_run_dir(base_out: str, symbol: str, timeframe: str, *, now=None) -> str
 
 
 def build_manifest(result, *, cost_version: str = "v0", strategy: str = "",
+                   strategy_sha: str = "",
                    extra: dict | None = None) -> Manifest:
-    """从 BacktestResult 组装 Manifest（write_report 与试验台账共用）。"""
+    """从 BacktestResult 组装 Manifest（write_report 与试验台账共用）。
+
+    strategy_sha（T37/D23）：策略代码指纹，由调用方（run_backtest）计算
+    传入；缺省空串（不阻塞无指纹的旧调用方，如实为空）。
+    """
     bars = result.bars
     times = pd.to_datetime(bars["time"]) if len(bars) else None
     return Manifest(
@@ -348,6 +357,7 @@ def build_manifest(result, *, cost_version: str = "v0", strategy: str = "",
         created_utc=datetime.now(timezone.utc).isoformat(),
         engine_version=ENGINE_VERSION,
         strategy=strategy,
+        strategy_sha=strategy_sha,
         symbol=result.symbol,
         timeframe=result.timeframe or "",
         n_bars=int(len(bars)),
@@ -361,7 +371,8 @@ def build_manifest(result, *, cost_version: str = "v0", strategy: str = "",
 
 
 def write_report(out_dir: str, result, *, cost_version: str = "v0",
-                 strategy: str = "", extra: dict | None = None) -> str:
+                 strategy: str = "", strategy_sha: str = "",
+                 extra: dict | None = None) -> str:
     """写 summary.json + manifest.json + report.md，返回 report.md 路径。
 
     out_dir 应为**本次运行独占**的目录（CLI 用 make_run_dir 生成）；
@@ -369,7 +380,8 @@ def write_report(out_dir: str, result, *, cost_version: str = "v0",
     """
     summary = summarize(result, cost_version=cost_version)
     manifest = build_manifest(result, cost_version=cost_version,
-                              strategy=strategy, extra=extra)
+                              strategy=strategy, strategy_sha=strategy_sha,
+                              extra=extra)
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(_jsonable(summary), f, ensure_ascii=False, indent=2,

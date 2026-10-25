@@ -53,6 +53,10 @@
   （mt5quant.sizing.load_volume_limits，缺数据报错指路 snapshot_specs），
   定手数方式写进 manifest（extra.sizing）与 summary（skipped_zero_lots
   为跳过的零手数入场计数）。
+- 代码指纹（T37/D23）：运行前先过 cards.ensure_strategy_clean（策略类
+  所在模块 + 其 import 的 strategies/library 内模块必须已提交且工作区
+  干净），指纹（strategy_sha）写进 manifest——报告可追溯到产生它的
+  确切策略代码；改策略代码请先提交（配合研究卡的新版本，见 bt.py）。
 - 每次运行写入独占目录 {out}/{SYMBOL}_{TF}_{UTC戳}_{随机}，不覆盖历史运行。
 """
 import argparse
@@ -77,6 +81,7 @@ from mt5data.ticks import load_ticks, tick_watermark  # noqa: E402
 from mt5quant.backtest.engine_a import run_backtest  # noqa: E402
 from mt5quant.backtest.engine_b import run_backtest_ticks  # noqa: E402
 from mt5quant.backtest.report import make_run_dir, summarize, write_report  # noqa: E402
+from mt5quant.research import cards  # noqa: E402
 from mt5quant.sizing import RiskSizing, load_volume_limits  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -645,6 +650,10 @@ def main() -> int:
             return 1
     try:
         strategy_cls = load_strategy(args.strategy)
+        # T37/D23：策略代码必须已提交且干净；指纹（strategy_sha）随
+        # manifest 落盘——报告可追溯到产生它的确切策略代码
+        cards.ensure_strategy_clean(args.strategy, REPO_ROOT)
+        strategy_sha = cards.strategy_fingerprint(args.strategy, REPO_ROOT)
         contract_size = resolve_contract_size(data_root, args.symbol,
                                               args.contract_size)
         # T23：定手数口径（默认风险定手数 0.005；见 resolve_lots_mode 语义）
@@ -726,6 +735,7 @@ def main() -> int:
         run_dir = make_run_dir(args.out, args.symbol, args.timeframe.upper())
         report_path = write_report(
             run_dir, result, cost_version=cost_version, strategy=args.strategy,
+            strategy_sha=strategy_sha,
             extra={"end": args.end, "costs": args.costs,
                    "spread_fraction": args.spread_fraction,
                    "spread_mode": args.spread_mode,

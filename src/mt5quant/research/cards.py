@@ -32,6 +32,7 @@ committed_at 语义（钉死）：
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import subprocess
@@ -461,3 +462,194 @@ def ensure_strategy_matches(card: Card, strategy_ref: str) -> None:
             f"卡 {card.id} 绑定策略 {card.strategy}，与传入 --strategy "
             f"{strategy_ref!r} 不一致——拒绝运行（卡谱系只统计绑定策略的"
             "试验；旧卡请在迁移到 v2 时补 strategy 字段）")
+
+
+# ------------------------------------------------------- 代码指纹（T37/H3/D23）
+
+_LIBRARY_PKG = "mt5quant.strategies.library"
+
+
+class StrategyDirtyError(RuntimeError):
+    """策略代码未提交或工作区不干净（D23：试验身份含代码指纹，
+    策略文件须已提交且干净）——拒绝运行。"""
+
+
+def _module_file(name: str) -> Path | None:
+    """按模块名定位 .py 文件（不执行模块；找不到/非源文件 → None）。"""
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec(name)
+    except (ImportError, AttributeError, ValueError):
+        return None
+    if spec is None or not spec.origin or not spec.origin.endswith(".py"):
+        return None
+    return Path(spec.origin).resolve()
+
+
+def _imports_within(path: Path, library_dir: Path) -> list[Path]:
+    """path 源码里 import 的、且落在 strategies/library 内的模块文件。
+
+    认两类形式：绝对 import（`import mt5quant.strategies.library[.x]`、
+    `from mt5quant.strategies.library[.x] import y`）与 library 包内文件的
+    相对 import（level 1 → library 包、level 2 → strategies 包）；解析后
+    只保留 library_dir 之内的文件。`from mt5quant.strategies.library
+    import x` 的 x 存在同名子模块文件才算（属性导出不展开 __init__——
+    否则任何库策略的指纹都会经 __init__ 蔓延到整个策略库）。
+    """
+    import ast
+
+    lib = _LIBRARY_PKG
+    lib_parts = tuple(lib.split("."))
+    parent_parts = lib_parts[:-1]
+    targets: set[str] = set()
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                n = alias.name
+                if n == lib or n.startswith(lib + "."):
+                    targets.add(n)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0:
+                base = node.module or ""
+            else:
+                # 相对导入只对 library 包内文件有意义（level=1 → library
+                # 包自身；level=2 → strategies 包），否则无从解析
+                anchor = lib_parts if node.level == 1 else (
+                    parent_parts if node.level == 2 else ())
+                base = ".".join(anchor + tuple((node.module or "").split(".")))
+            if base == lib:
+                for alias in node.names:
+                    cand = f"{lib}.{alias.name}"
+                    if _module_file(cand) is not None:
+                        targets.add(cand)
+            elif base.startswith(lib + "."):
+                targets.add(base)
+    out: list[Path] = []
+    for t in sorted(targets):
+        f = _module_file(t)
+        if f is not None and library_dir in f.parents:
+            out.append(f)
+    return out
+
+
+def strategy_files(strategy_ref: str) -> list[Path]:
+    """指纹覆盖的文件集：策略类所在模块文件 + 它（传递）import 的
+    strategies/library 内模块文件（T37/H3/D23——台账 runs.strategy_sha
+    的哈希对象；library 外的依赖（pandas、strategies.base 等）不进指纹，
+    它们由 git_commit + engine_version 另行覆盖）。
+
+    策略模块通过 importlib 定位（不执行）；找不到模块 → ValueError
+    （fail-fast：试验身份必须可计算，不能静默退化为不含代码的指纹）。
+    """
+    mod_name, sep, cls = strategy_ref.partition(":")
+    if not sep or not mod_name or not cls:
+        raise ValueError(
+            f"strategy_ref 必须形如 module:Class，收到 {strategy_ref!r}")
+    main = _module_file(mod_name)
+    if main is None:
+        raise ValueError(
+            f"找不到策略模块 {mod_name!r}（strategy_ref={strategy_ref!r}）"
+            "——代码指纹（D23）无从计算，拒绝运行")
+    lib_init = _module_file(_LIBRARY_PKG)
+    library_dir = lib_init.parent if lib_init is not None else None
+    seen: set[Path] = set()
+    files: list[Path] = []
+    queue = [main]
+    while queue:
+        f = queue.pop(0)
+        rf = f.resolve()
+        if rf in seen:
+            continue
+        seen.add(rf)
+        files.append(rf)
+        if library_dir is None:
+            continue
+        for dep in _imports_within(rf, library_dir):
+            if dep.resolve() not in seen:
+                queue.append(dep)
+    return files
+
+
+def _rel_to(repo: Path, f: Path) -> str:
+    try:
+        return f.resolve().relative_to(repo.resolve()).as_posix()
+    except ValueError:
+        return f.as_posix()          # 仓库外：绝对路径如实入指纹
+
+
+def strategy_fingerprint(strategy_ref: str, repo_root=None, *,
+                         runner=None, files=None) -> str:
+    """策略代码指纹（D23）：覆盖文件逐个 `git hash-object`，按路径排序拼
+    "relpath:blob_hash\\n"，整体 sha256。
+
+    - 排序保证与发现次序无关；relpath 保证改名/挪位置即变指纹；
+    - runner 为注入点（测试）；files 为注入文件集（测试/复算——正常调用
+      由 strategy_files 解析）；
+    - git 返回非零 → RuntimeError（指纹算不出就不允许运行，fail-fast）。
+    """
+    repo = Path(repo_root) if repo_root is not None else Path.cwd()
+    fl = sorted((Path(f) for f in files) if files is not None
+                else strategy_files(strategy_ref),
+                key=lambda f: f.as_posix())
+    if not fl:
+        raise ValueError("指纹文件集为空——strategy_files 未解析出任何文件")
+
+    def _default_runner(args, cwd):
+        return subprocess.run(args, cwd=cwd, capture_output=True,
+                              text=True, timeout=10)
+
+    run = runner or _default_runner
+    args = ["git", "hash-object"] + [str(f) for f in fl]
+    proc = run(args, cwd=str(repo))
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git hash-object 失败（rc={proc.returncode}）："
+            f"{(proc.stderr or '').strip() or (proc.stdout or '').strip()}"
+            "——代码指纹（D23）算不出，拒绝运行")
+    hashes = (proc.stdout or "").strip().splitlines()
+    if len(hashes) != len(fl):
+        raise RuntimeError(
+            f"git hash-object 输出 {len(hashes)} 个哈希，与文件数 "
+            f"{len(fl)} 不符——代码指纹（D23）无从计算")
+    canonical = "".join(f"{_rel_to(repo, f)}:{h}\n"
+                        for f, h in zip(fl, hashes))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def ensure_strategy_clean(strategy_ref: str, repo_root=None, *,
+                          runner=None, files=None) -> None:
+    """指纹覆盖的每个文件都已提交且工作区干净，否则 StrategyDirtyError
+    （D23；先卡后测此前只查卡文件，H3 指出策略代码可以改了重跑不涨 N）。
+
+    与 committed_at/worktree_clean 同口径：git 返回非零（不在仓库/仓库
+    损坏/超时后按 fail-closed）→ 拒绝；只有 git 可执行缺失如实抛
+    FileNotFoundError。runner/files 为注入点（测试）。
+    """
+    repo = Path(repo_root) if repo_root is not None else Path.cwd()
+    fl = [Path(f) for f in files] if files is not None \
+        else strategy_files(strategy_ref)
+    if not fl:
+        raise ValueError("指纹文件集为空——无从检查干净与否")
+
+    def _default_runner(args, cwd):
+        return subprocess.run(args, cwd=cwd, capture_output=True,
+                              text=True, timeout=10)
+
+    run = runner or _default_runner
+    for f in fl:
+        rel = _rel_to(repo, f)
+        proc = run(["git", "log", "-1", "--format=%cI", "--", str(f)],
+                   cwd=str(repo))
+        if proc.returncode != 0 or not (proc.stdout or "").strip():
+            raise StrategyDirtyError(
+                f"策略文件 {rel} 未提交到 git（D23：策略文件须已提交且"
+                "干净——试验身份含代码指纹）——先 commit 再运行")
+        proc = run(["git", "status", "--porcelain", "--", str(f)],
+                   cwd=str(repo))
+        if proc.returncode != 0 or (proc.stdout or "").strip():
+            raise StrategyDirtyError(
+                f"策略文件 {rel} 在工作区有未提交改动（D23）——先提交"
+                "（或还原）后再运行；改策略代码请配合新建卡版本"
+                " H###-v<n>.toml，旧卡版本不改代码")
