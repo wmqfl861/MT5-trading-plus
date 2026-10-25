@@ -298,6 +298,93 @@ def test_default_heartbeat_path_under_data_root():
     assert default_heartbeat_path(cfg) == "x/hb.json"
 
 
+# ---- T33/M1：心跳写入失败不退出（PermissionError 不再杀进程）----
+
+def test_write_heartbeat_survives_transient_permission_error(tmp_path,
+                                                             monkeypatch):
+    """M1 根因：风控进程正读着心跳文件 → os.replace 抛 PermissionError。
+    原子写的重试预算内自愈，心跳写入成功（monkeypatch 前两次抛错）。"""
+    import os as _os
+
+    real = _os.replace
+    state = {"n": 0}
+
+    def flaky(src, dst):
+        if state["n"] < 2:
+            state["n"] += 1
+            raise PermissionError(32, "另一个进程正在使用此文件")
+        return real(src, dst)
+
+    monkeypatch.setattr(_os, "replace", flaky)
+    hb = tmp_path / "heartbeat-777.json"
+    write_heartbeat(str(hb), config=mk_config(), dry_run=True, pid=1)
+    payload = json.loads(hb.read_text(encoding="utf-8"))
+    assert payload["runner_alive"] is True and payload["pid"] == 1
+
+
+def test_heartbeat_writer_failure_does_not_kill_and_alerts_after_3(tmp_path,
+                                                                  monkeypatch):
+    """写心跳持续失败：不抛（运行器不退出）、记日志；连续 3 次 → 告警一次；
+    成功一次即复位（新的连续失败段才再告警）。"""
+    from mt5live import runner as runner_mod
+    from mt5live.runner import HeartbeatWriter
+
+    live = tmp_path / "live"
+    live.mkdir()
+    writer = HeartbeatWriter(str(live / "hb.json"), config=mk_config(),
+                             alert_dir=str(live))
+    alerts = live / "alerts.log"
+
+    def _boom(*a, **kw):
+        raise PermissionError(5, "拒绝访问")
+
+    monkeypatch.setattr(runner_mod, "write_heartbeat", _boom)
+    for _ in range(2):                            # 前 2 次：只记日志，不告警
+        assert writer.write(dry_run=True) is False
+    assert not alerts.exists()
+
+    assert writer.write(dry_run=True) is False    # 第 3 次：告警一次
+    text = alerts.read_text(encoding="utf-8")
+    assert "HEARTBEAT_WRITE_ERROR" in text and "3" in text
+    n_alerts = text.count("HEARTBEAT_WRITE_ERROR")
+    writer.write(dry_run=True)                    # 持续失败不重复刷告警
+    assert alerts.read_text(encoding="utf-8").count(
+        "HEARTBEAT_WRITE_ERROR") == n_alerts
+
+    monkeypatch.setattr(runner_mod, "write_heartbeat", lambda *a, **kw: None)
+    assert writer.write(dry_run=True) is True     # 恢复：计数复位
+    assert writer.consecutive_failures == 0
+
+    monkeypatch.setattr(runner_mod, "write_heartbeat", _boom)
+    for _ in range(2):
+        writer.write(dry_run=True)
+    assert alerts.read_text(encoding="utf-8").count(
+        "HEARTBEAT_WRITE_ERROR") == n_alerts      # 新段前 2 次不告警
+    writer.write(dry_run=True)                    # 新段第 3 次 → 再告警
+    assert alerts.read_text(encoding="utf-8").count(
+        "HEARTBEAT_WRITE_ERROR") == n_alerts + 1
+
+
+def test_heartbeat_writer_alert_channel_failure_is_swallowed(tmp_path,
+                                                             monkeypatch):
+    """告警通道（alerts.log）同样写不进去时也不许把运行器打崩（日志已记）。"""
+    from mt5live import runner as runner_mod
+    from mt5live.runner import HeartbeatWriter
+
+    live = tmp_path / "live"
+    live.mkdir()
+    writer = HeartbeatWriter(str(live / "hb.json"), config=mk_config(),
+                             alert_dir=str(live))
+
+    def _boom(*a, **kw):
+        raise PermissionError(5, "拒绝访问")
+
+    monkeypatch.setattr(runner_mod, "write_heartbeat", _boom)
+    monkeypatch.setattr(runner_mod, "append_alert", _boom)
+    for _ in range(3):
+        assert writer.write(dry_run=True) is False    # 不抛 = 不退出
+
+
 class _ConstSignal(BaseStrategy):
     """恒定信号（含非法值 2 的注入用）。"""
 

@@ -27,7 +27,11 @@
   （实盘未实现，dry-run 同样校验）。
 - 心跳：每策略一个 {data_root}/live/heartbeat-<magic>.json，每轮更新
   （含无决策轮次），风控进程按 ts 判活；决策异常记 last_error 后继续轮询，
-  执行异常原样上抛并停机退出（等人工/风控处置）。
+  执行异常原样上抛并停机退出（等人工/风控处置）；**心跳写入失败不退出**
+  （T33/M1：记日志下一轮重试，连续 3 次写告警——跨进程文件写入一律经
+  mt5live.fileio 的原子写/追加）。
+- 点差闸门（T33/L3）：实盘（非 dry-run）找不到 --spread-model 文件 →
+  拒绝启动（不再静默关闸）；确要关闭须显式 --no-spread-gate（启动日志标红）。
 """
 from __future__ import annotations
 
@@ -48,13 +52,13 @@ from mt5live.executor import ExecutionAdapter, LiveExecutor, \
 from mt5live.gate import LiveSizer, RiskGate  # noqa: E402
 from mt5live.riskproc import RiskConfigError, RiskProcess, load_risk_config  # noqa: E402
 from mt5live.runner import (  # noqa: E402
+    HeartbeatWriter,
     MarketClosedError,
     SignalRunner,
     TerminalBarsSource,
     default_compute_window_bars,
     default_heartbeat_path,
     terminal_bars_loader,
-    write_heartbeat,
 )
 from mt5quant.sizing import RiskSizing  # noqa: E402
 
@@ -71,6 +75,11 @@ def load_strategy(path: str):
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def print_red(message: str) -> None:
+    """启动日志标红（ANSI；不支持颜色的终端只是看不到红色，内容不变）。"""
+    print(f"\033[31m{message}\033[0m", flush=True)
 
 
 def find_gateway_config(override: str | None) -> str:
@@ -103,7 +112,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sessions-config", default=None,
                    help="config/sessions.toml 路径（缺省用仓库默认）")
     p.add_argument("--spread-model", default="data/costs/spread_model.json",
-                   help="点差模型文件（点差闸门；不存在则该闸门关闭）")
+                   help="点差模型文件（点差闸门；实盘缺文件拒绝启动，"
+                        "除非 --no-spread-gate）")
+    p.add_argument("--no-spread-gate", action="store_true",
+                   help="显式关闭点差闸门（T33/L3：实盘默认缺点差模型必须"
+                        "拒启动；开启本开关会打红色警告）")
     p.add_argument("--stale-quote-s", type=float, default=120.0,
                    help="报价陈旧阈值秒（超过=休市静默跳过，默认 120）")
     p.add_argument("--max-wait-s", type=float, default=10.0,
@@ -119,6 +132,23 @@ def main(argv=None) -> int:
     cfg: LiveConfig = load_config(args.config)
     strategy = load_strategy(cfg.strategy)()
     validate_live_strategy(strategy)          # M1：未实现的出场规则拒启动
+
+    # T33/L3：实盘（非 dry-run）缺点差模型文件 → 拒绝启动——点差闸门不再
+    # 静默关闭；确要关闭必须显式 --no-spread-gate（启动日志标红）。检查放在
+    # 连接网关之前（fail-fast，不占终端）。
+    if not args.dry_run:
+        if args.no_spread_gate:
+            print_red(f"⚠ 点差闸门已用 --no-spread-gate 显式关闭"
+                      f"（--spread-model={args.spread_model!r} 不加载）——"
+                      "点差失控时不会拒单，风险自负")
+        elif not args.spread_model or not os.path.exists(args.spread_model):
+            print_red(
+                f"× 实盘找不到点差模型文件：{args.spread_model!r}——点差闸门"
+                "不能静默关闭（T33/L3）。重建 data/costs/spread_model.json"
+                "（scripts/build_cost_model.py）或用 --spread-model 指向有效"
+                "文件；确要关闭须显式 --no-spread-gate")
+            return 2
+
     heartbeat = default_heartbeat_path(cfg)
     live_dir = os.path.join(cfg.data_root, "live")
     specs_path = os.path.join(cfg.data_root, "specs", "latest.json")
@@ -161,7 +191,8 @@ def main(argv=None) -> int:
             from mt5quant.costs.spread import SpreadModel
             session_policy = load_default_session_policy(args.sessions_config)
             spread_model = None
-            if args.spread_model and os.path.exists(args.spread_model):
+            if (not args.no_spread_gate and args.spread_model
+                    and os.path.exists(args.spread_model)):
                 spread_model = SpreadModel.load(args.spread_model)
             process = RiskProcess(risk_cfg, live_dir=live_dir,
                                   session_policy=session_policy)
@@ -186,6 +217,9 @@ def main(argv=None) -> int:
     print(f"mt5live 启动：{cfg.symbol} {cfg.timeframe} magic={cfg.magic} "
           f"strategy={cfg.strategy} lookback={cfg.lookback_bars} "
           f"手数={sizing_desc} {mode_desc}")
+    # T33/M1：心跳写入失败不退出（记日志下一轮重试，连续 3 次写告警）——
+    # PermissionError 不再杀进程、随后心跳超时全局停机
+    hb_writer = HeartbeatWriter(heartbeat, config=cfg, alert_dir=live_dir)
     try:
         skips_logged = runner.market_closed_skips
         while True:
@@ -216,8 +250,9 @@ def main(argv=None) -> int:
                 try:
                     rr = executor.poll(decision, now)
                 except Exception as exc:
-                    # 执行侧异常：原样上抛前先把状态写进心跳（风控要能看到）
-                    write_heartbeat(heartbeat, config=cfg, decision=decision,
+                    # 执行侧异常：原样上抛前先把状态写进心跳（风控要能看到）；
+                    # 心跳本身写失败也不再掩盖原始异常（T33/M1）
+                    hb_writer.write(decision=decision,
                                     error=f"执行异常 {type(exc).__name__}: "
                                           f"{exc}",
                                     dry_run=args.dry_run)
@@ -234,8 +269,8 @@ def main(argv=None) -> int:
                     error = rr.error
             elif decision is not None:
                 print("    [dry-run] 不下单", flush=True)
-            write_heartbeat(heartbeat, config=cfg, decision=decision,
-                            error=error, dry_run=args.dry_run)
+            hb_writer.write(decision=decision, error=error,
+                            dry_run=args.dry_run)
             if args.once:
                 return 0
             time.sleep(max(args.poll_interval, 0.1))

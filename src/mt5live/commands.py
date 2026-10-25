@@ -26,7 +26,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
-from mt5gw.snapshot import write_json_atomic
+from mt5live.fileio import atomic_replace, write_json_atomic
 from mt5live.monitor import iso_utc, naive_utc, parse_iso
 
 COMMANDS_SUBDIR = "commands"
@@ -160,8 +160,10 @@ def archive_if_all_acked(live_dir: str, magics: set[int],
     archive_dir = os.path.join(_commands_dir(live_dir), FLATTEN_ARCHIVE_SUBDIR)
     os.makedirs(archive_dir, exist_ok=True)
     stamp = iso_utc(now).replace(":", "").replace("+", "_")
-    os.replace(flatten_path(live_dir),
-               os.path.join(archive_dir, f"flatten-{cmd.id[:8]}-{stamp}.json"))
+    # T33：归档挪档同样可能撞上执行器正读着指令文件（Windows 句柄）——
+    # 经 fileio.atomic_replace 带重试
+    atomic_replace(flatten_path(live_dir),
+                   os.path.join(archive_dir, f"flatten-{cmd.id[:8]}-{stamp}.json"))
     for magic in sorted(magics):
         try:
             os.remove(ack_path(live_dir, magic))

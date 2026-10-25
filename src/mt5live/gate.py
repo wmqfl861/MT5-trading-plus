@@ -5,7 +5,9 @@ RiskGate.check_open 组装 RiskState（计划 T24 逐字）：
 - 快照合约大小（data/specs/latest.json，scripts/snapshot_specs.py 产出）；
 - 实时报价（market.quote 的中间价，供美元暴露换算；取不到 → missing_data
   拒单，绝不静默放行）；
-- 本地下单日志频率（live/orders.jsonl，LiveExecutor 每笔市价单追加；
+- 本地下单日志频率（live/orders-<magic>.jsonl，每策略一个、LiveExecutor
+  经 fileio.append_jsonl 追加（T33/M8）；闸门读全部 orders-*.jsonl（兼容
+  旧 orders.jsonl），坏行按"此刻一笔下单"保守计入并告警、不阻断裁决；
   60 秒滑窗由 RiskProcess.check 的规则 7 裁决）；
 - 当日盈亏（UTC 日内 deals 的已实现 + 持仓浮动，daily_pnl 同源）；
 - 停机标志（killSwitch / halt.json 由 RiskProcess.check_order 文件级
@@ -26,6 +28,7 @@ LiveSizer（T24/M2 实盘侧）：手数 = mt5quant.sizing.lots_for_risk(
 """
 from __future__ import annotations
 
+import glob
 import json
 import math
 import os
@@ -44,7 +47,13 @@ from mt5live.riskproc import OrderRequest, RiskDecision, RiskProcess, RiskState,
 from mt5quant.costs.spread import BUCKET_TZ, SpreadModel
 from mt5quant.sizing import RiskSizing, lots_for_risk
 
-ORDER_LOG_FILE = "orders.jsonl"       # 本地下单日志（频率滑窗的数据源）
+ORDER_LOG_FILE = "orders.jsonl"            # 旧版共用下单日志（只兼容读，M8）
+ORDER_LOG_MAGIC_FMT = "orders-{magic}.jsonl"   # T33/M8：每策略各写各的
+ORDER_LOG_MAGIC_GLOB = "orders-*.jsonl"    # 闸门读全部（频率保护整个账户）
+
+# 告警类别（T33；monitor 未定义的新类别，常量放本层——同 executor 先例）
+ALERT_PAUSE_UNREADABLE = "PAUSE_UNREADABLE"      # 暂停文件读不出：按暂停处理
+ALERT_ORDER_LOG_BAD_LINE = "ORDER_LOG_BAD_LINE"  # 下单日志坏行：保守计入频率
 
 
 # ---- 快照读取（合约大小 / vol 三元组；单一来源 data/specs/latest.json） ----
@@ -139,14 +148,18 @@ PAUSE_MAGIC_FMT = "pause-{magic}.json"   # T30/D20：对账进程按策略写
 class _Paused:
     paused: bool
     reason: str | None
+    unreadable: bool = False   # T33/M2：文件存在但读不出（fail-closed 按暂停）
 
 
 def read_pause(live_dir: str, magic: int | None = None) -> _Paused:
     """读暂停指令（T30/D20：只读；写路径在对账进程/人工）。
 
     magic 给定 → ``pause-<magic>.json``（对账进程按策略写的暂停）；
-    magic=None → 全局 ``pause.json``（只留给人工）。缺失/不合法 = 未暂停
-    （T33 改为 fail-closed：读不出按暂停处理）。
+    magic=None → 全局 ``pause.json``（只留给人工）。缺失 = 未暂停；
+    **存在但读不出（损坏/权限/缺 paused 字段）= 暂停**（T33/M2 反转旧
+    语义——停机类信号读不出必须按停机处理，绝不默认未暂停）。此时
+    paused=True、reason 以 ``pause_unreadable`` 开头、unreadable=True，
+    由调用方（RiskGate.check_open）写告警。
     """
     name = (PAUSE_FILE if magic is None
             else PAUSE_MAGIC_FMT.format(magic=magic))
@@ -156,35 +169,67 @@ def read_pause(live_dir: str, magic: int | None = None) -> _Paused:
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-        return _Paused(bool(data.get("paused")), data.get("reason"))
-    except (OSError, ValueError):
-        return _Paused(False, None)
+        if not isinstance(data, dict) or "paused" not in data:
+            raise ValueError(f"顶层须为带 paused 字段的对象，收到 {data!r}")
+    except (OSError, ValueError) as e:
+        return _Paused(
+            True, f"pause_unreadable: {name} 读不出（{e}）——fail-closed "
+            "按暂停处理，人工核对后修复或删除", unreadable=True)
+    return _Paused(bool(data.get("paused")), data.get("reason"))
+
+
+def order_log_paths(live_dir: str) -> list[str]:
+    """全部下单日志路径：orders-<magic>.jsonl（每策略一个，T33/M8）+ 兼容
+    旧版共用 orders.jsonl（存在才列入）。"""
+    paths = sorted(glob.glob(os.path.join(live_dir, ORDER_LOG_MAGIC_GLOB)))
+    legacy = os.path.join(live_dir, ORDER_LOG_FILE)
+    if os.path.exists(legacy):
+        paths.append(legacy)
+    return paths
 
 
 def read_recent_order_times(live_dir: str, now: datetime,
                             window_s: float = 3600.0) -> tuple:
-    """本地下单日志 → 近 window_s 秒内的下单时刻（频率规则的数据源）。
+    """全部下单日志 → 近 window_s 秒内的下单时刻（频率规则的数据源）。
 
-    行格式（LiveExecutor 追加）：{"ts": iso, "magic", "symbol", "kind",
-    "side", "lots", "decision_id"}。文件损坏 → ValueError（自己的日志坏了
-    必须当场暴露，不能默默放行频率检查）。
+    行格式（LiveExecutor 经 fileio.append_jsonl 追加）：{"ts": iso, "magic",
+    "symbol", "kind", "side", "lots", "decision_id"}。T33/M8 语义：
+
+    - 读**全部** orders-*.jsonl（+旧 orders.jsonl）——频率保护整个账户；
+    - 坏行（并发追加交错/半行）不再抛错阻断所有策略：保守按**此刻一笔
+      下单**计入频率（时间 = now，必在滑窗内），并写告警
+      （ALERT_ORDER_LOG_BAD_LINE）；闸门照常给出裁决。
     """
-    path = os.path.join(live_dir, ORDER_LOG_FILE)
-    if not os.path.exists(path):
-        return ()
-    out = []
-    with open(path, encoding="utf-8") as f:
-        for ln in f:
-            ln = ln.strip()
-            if not ln:
-                continue
-            try:
-                rec = json.loads(ln)
-                t = parse_iso(rec["ts"])
-            except (ValueError, KeyError, TypeError) as e:
-                raise ValueError(f"{path} 行格式异常：{ln!r}（{e}）") from e
-            if (now - t).total_seconds() < window_s:
-                out.append(t)
+    n = naive_utc(now)
+    out: list[datetime] = []
+    bad: list[str] = []
+    for path in order_log_paths(live_dir):
+        try:
+            with open(path, encoding="utf-8") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        rec = json.loads(ln)
+                        t = parse_iso(rec["ts"])
+                    except (ValueError, KeyError, TypeError):
+                        bad.append(os.path.basename(path))
+                        out.append(n)     # 保守：坏行按此刻一笔下单计入
+                        continue
+                    if (n - t).total_seconds() < window_s:
+                        out.append(t)
+        except OSError:
+            bad.append(os.path.basename(path))
+            out.append(n)                 # 整个文件读不出：同样保守计 1 笔
+    if bad:
+        try:
+            append_alert(
+                live_dir, ALERT_ORDER_LOG_BAD_LINE,
+                f"下单日志 {len(bad)} 行读不出（{sorted(set(bad))}）——按"
+                "此刻一笔下单保守计入频率（M8），人工核对 orders-*.jsonl", n)
+        except OSError:
+            pass                          # 告警通道不可用：不让告警打崩闸门
     return tuple(out)
 
 
@@ -225,14 +270,21 @@ class RiskGate:
         n = naive_utc(now if now is not None else self._clock())
 
         # 0) 对账暂停（T30/D20）：本策略 pause-<magic>.json（对账进程写）与
-        #    全局 pause.json（人工）任一暂停即拒开仓
+        #    全局 pause.json（人工）任一暂停即拒开仓；读不出按暂停处理并
+        #    告警（T33/M2 fail-closed——停机类信号读不出必须按停机处理）
         paused = read_pause(self._live_dir, magic)
         if paused.paused:
+            if paused.unreadable:
+                append_alert(self._live_dir, ALERT_PAUSE_UNREADABLE,
+                             f"magic {magic}：{paused.reason}", n)
             return RiskDecision(
                 False, f"reconcile_paused: 持仓对账不一致（magic {magic}，"
                 f"{paused.reason or f'详见 pause-{magic}.json'}），暂停开仓")
         manual = read_pause(self._live_dir)
         if manual.paused:
+            if manual.unreadable:
+                append_alert(self._live_dir, ALERT_PAUSE_UNREADABLE,
+                             f"全局人工暂停文件：{manual.reason}", n)
             return RiskDecision(
                 False, f"reconcile_paused: 全局人工暂停（pause.json，"
                 f"{manual.reason or '原因见文件'}），暂停开仓")
@@ -323,12 +375,14 @@ def alert_reject(live_dir: str, magic: int, decision_id: str | None,
 
 __all__ = [
     "ORDER_LOG_FILE",
+    "ORDER_LOG_MAGIC_FMT",
     "LiveSizer",
     "RiskGate",
     "alert_reject",
     "decision_symbol",
     "load_contract_sizes",
     "load_sizing_inputs",
+    "order_log_paths",
     "read_pause",
     "read_recent_order_times",
 ]

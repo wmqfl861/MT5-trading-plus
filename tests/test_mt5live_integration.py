@@ -1329,3 +1329,99 @@ data_root = "{(tmp_path / 'data').as_posix()}"
             mod.main(["--config", cfg_path, "--once", "--dry-run", "--offline"])
     finally:
         mod.load_strategy = orig_load
+
+
+# ================================================================ T33：跨进程文件契约
+
+def _runner_cfg(tmp_path) -> str:
+    return write_text(tmp_path / "live.toml", f"""
+symbol = "{SYMBOL}"
+timeframe = "M15"
+strategy = "mt5quant.strategies.library.buy_hold:BuyHold"
+magic = {MAGIC}
+lookback_bars = 30
+risk_fraction = 0.005
+data_root = "{(tmp_path / 'data').as_posix()}"
+trigger_delay_s = 5.0
+""")
+
+
+def test_live_runner_refuses_start_without_spread_model(tmp_path, monkeypatch,
+                                                        capsys):
+    """L3：实盘（非 dry-run）无点差模型且未给 --no-spread-gate → 启动失败
+    （rc 2，连网关都不碰）——点差闸门不再静默关闭。"""
+    mod = load_script("live_runner")
+
+    def _never(p):
+        raise AssertionError("拒绝启动时不得触碰网关")
+
+    monkeypatch.setattr("mt5gw.MT5Gateway.from_config_file",
+                        staticmethod(_never))
+    rc = mod.main(["--config", _runner_cfg(tmp_path), "--once", "--spread-model",
+                   str(tmp_path / "missing" / "spread_model.json")])
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "点差模型" in out
+    assert "--no-spread-gate" in out
+
+
+def test_live_runner_no_spread_gate_flag_warns_red_and_proceeds(tmp_path,
+                                                                monkeypatch,
+                                                                capsys):
+    """--no-spread-gate：启动检查放行（走到网关装配）、启动日志标红警示。"""
+    mod = load_script("live_runner")
+
+    class _Sentinel(Exception):
+        pass
+
+    class _FakeGW:
+        def connect(self):
+            raise _Sentinel("已通过点差模型检查，到达网关连接")
+
+    monkeypatch.setattr("mt5gw.MT5Gateway.from_config_file",
+                        staticmethod(lambda p: _FakeGW()))
+    with pytest.raises(_Sentinel):
+        mod.main(["--config", _runner_cfg(tmp_path), "--once", "--no-spread-gate",
+                  "--spread-model", str(tmp_path / "missing.json")])
+    out = capsys.readouterr().out
+    assert "\033[31m" in out                    # 标红
+    assert "点差闸门" in out
+
+
+def test_dry_run_exempt_from_spread_model_refusal(tmp_path, capsys):
+    """dry-run 不下单（闸门/执行器本就未接线）：缺模型不拒启动，行为不变。"""
+    mod = load_script("live_runner")
+    cfg_path = _runner_cfg(tmp_path)
+    epoch = int(datetime.now(timezone.utc).timestamp())
+    boundary = epoch - epoch % TF_S
+    if boundary + 8 > epoch:
+        _time.sleep(boundary + 8 - epoch)
+    save_bars(str(tmp_path / "data"), SYMBOL, "M15",
+              grid_bars(pd.Timestamp(boundary - TF_S, unit="s"), last="up"))
+    rc = mod.main(["--config", cfg_path, "--once", "--dry-run", "--offline",
+                   "--spread-model", str(tmp_path / "missing.json")])
+    assert rc == 0
+
+
+def test_runner_once_survives_persistent_heartbeat_write_failure(tmp_path,
+                                                                 monkeypatch):
+    """M1：写心跳持续 PermissionError——运行器不退出（--once 正常返回 0），
+    失败记日志、下一轮重试；不再让权限错杀进程、随后心跳超时全局停机。"""
+    mod = load_script("live_runner")
+
+    def _boom(*a, **kw):
+        raise PermissionError(5, "拒绝访问")
+
+    monkeypatch.setattr("mt5live.runner.write_heartbeat", _boom)
+    epoch = int(datetime.now(timezone.utc).timestamp())
+    boundary = epoch - epoch % TF_S
+    if boundary + 8 > epoch:
+        _time.sleep(boundary + 8 - epoch)
+    save_bars(str(tmp_path / "data"), SYMBOL, "M15",
+              grid_bars(pd.Timestamp(boundary - TF_S, unit="s"), last="up"))
+    rc = mod.main(["--config", _runner_cfg(tmp_path), "--once", "--dry-run",
+                   "--offline"])
+    assert rc == 0
+    # 心跳写失败不等于假装写过：文件不存在（风控会按超时停机——那是另一层
+    # fail-closed，运行器进程本身活着才是本条修的语义）
+    assert not (tmp_path / "data" / "live" / f"heartbeat-{MAGIC}.json").exists()

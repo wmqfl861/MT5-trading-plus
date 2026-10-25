@@ -17,20 +17,21 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 
 from mt5data.store import atomic_replace, fsync_file
-from mt5gw.snapshot import write_json_atomic
+from mt5live.fileio import append_line, write_json_atomic
 from mt5quant.costs.spread import SpreadModel
 
 HEARTBEAT_FILE = "heartbeat.json"
 ALERTS_FILE = "alerts.log"
 DAILY_REPORT_SUBDIR = "live"  # data/reports/live/
 
-# 即时告警类别（任务约定的三类 + 账户轮询失败 + 开仓被拒）
+# 即时告警类别（任务约定的三类 + 账户轮询失败 + 开仓被拒 + 心跳写失败）
 ALERT_HEARTBEAT_TIMEOUT = "HEARTBEAT_TIMEOUT"    # 断线：心跳超时/缺失
 ALERT_RECONCILE_MISMATCH = "RECONCILE_MISMATCH"  # 持仓对账不一致
 ALERT_RISK_HALT = "RISK_HALT"                    # 风控触发停机
 ALERT_RISK_FLATTEN = "RISK_FLATTEN"              # 风控触发全平
 ALERT_ACCOUNT_POLL_ERROR = "ACCOUNT_POLL_ERROR"  # 账户轮询失败
 ALERT_RISK_REJECT = "RISK_REJECT"                # 开仓被风控/闸门拒绝（T24）
+ALERT_HEARTBEAT_WRITE_ERROR = "HEARTBEAT_WRITE_ERROR"  # 心跳写入连续失败（T33/M1）
 
 DEFAULT_HEARTBEAT_TIMEOUT_S = 120.0
 
@@ -169,11 +170,10 @@ class Alert:
 
 def append_alert(live_dir: str, kind: str, message: str,
                  now: datetime | None = None) -> None:
-    """追加一行告警（追加写；多进程并发追加由 OS 行原子性兜底）。"""
+    """追加一行告警（O_APPEND 单次 write + 共享冲突重试，T33 经 fileio）。"""
     ts = now if now is not None else datetime.now(timezone.utc)
-    os.makedirs(live_dir, exist_ok=True)
-    with open(os.path.join(live_dir, ALERTS_FILE), "a", encoding="utf-8") as f:
-        f.write(f"{iso_utc(ts)}\t{kind}\t{message}\n")
+    append_line(os.path.join(live_dir, ALERTS_FILE),
+                f"{iso_utc(ts)}\t{kind}\t{message}\n")
 
 
 def read_alerts(live_dir: str) -> tuple[Alert, ...]:

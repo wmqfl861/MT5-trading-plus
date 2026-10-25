@@ -33,7 +33,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from mt5gw.snapshot import write_json_atomic
+from mt5live.fileio import write_json_atomic
 from mt5live.monitor import iso_utc, naive_utc, parse_iso
 
 EXPECTED_FILE = "expected.json"          # 旧版单文件（只兼容读）

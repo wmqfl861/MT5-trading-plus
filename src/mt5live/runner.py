@@ -29,7 +29,6 @@
 """
 from __future__ import annotations
 
-import json
 import math
 import os
 import time as _time
@@ -39,6 +38,8 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from mt5data.store import TIMEFRAME_SECONDS, drop_unclosed, load_bars
+from mt5live.fileio import write_json_atomic
+from mt5live.monitor import ALERT_HEARTBEAT_WRITE_ERROR, append_alert
 from mt5quant.backtest.engine_a import atr_series
 from mt5quant.strategies.base import ExitRules
 
@@ -390,7 +391,7 @@ def write_heartbeat(path: str, *, config, decision: Decision | None = None,
                     error: str | None = None, dry_run: bool = False,
                     pid: int | None = None,
                     now: datetime | None = None) -> None:
-    """原子写心跳 JSON（tmp + os.replace）。
+    """原子写心跳 JSON（tmp + fsync + os.replace 带重试，T33 经 fileio）。
 
     契约（风控/监控进程 T14b 消费，落点 {data_root}/live/heartbeat-<magic>.json，
     T24/M9 起每策略一个文件）：
@@ -408,7 +409,7 @@ def write_heartbeat(path: str, *, config, decision: Decision | None = None,
     ts_dt = (now if now is not None
              else datetime.now(timezone.utc)).replace(tzinfo=timezone.utc)
     ts = ts_dt.isoformat(timespec="milliseconds")
-    payload = {
+    write_json_atomic(path, {
         "runner_alive": True,        # T14b monitor.read_heartbeat_path 的必需字段
         "ts": ts,                    # 同上；风控进程超时会整文件改写
         "pid": pid if pid is not None else os.getpid(),
@@ -421,11 +422,76 @@ def write_heartbeat(path: str, *, config, decision: Decision | None = None,
         "dry_run": dry_run,
         "last_decision": decision.to_dict() if decision is not None else None,
         "last_error": str(error) if error else None,
-    }
-    directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    })
+
+
+# 心跳写入失败连续多少次后写告警（T33/M1）
+HEARTBEAT_FAILURE_ALERT_THRESHOLD = 3
+
+
+def _default_log(message: str) -> None:
+    print(message, flush=True)
+
+
+class HeartbeatWriter:
+    """心跳写入的容错包装（T33/M1）：写失败不退出，下一轮重试。
+
+    旧实现的写心跳在主循环里裸调用——Windows 下目标文件被风控进程占着
+    句柄时 os.replace 抛 PermissionError 直接把运行器打崩，随后心跳超时、
+    全局停机。语义改为：
+
+    - 瞬时冲突由 fileio.write_json_atomic 内部重试自愈（调用方无感）；
+    - 重试预算仍失败（OSError）：记日志、返回 False，**不抛**——下一轮
+      再写；连续 ``max_consecutive_failures``（缺省 3）次失败写一条告警
+      （HEARTBEAT_WRITE_ERROR，每段连续失败只告警一次，成功即复位）；
+    - 告警通道本身写不进去时同样吞掉 OSError（日志已记，别让告警打崩）。
+    """
+
+    def __init__(self, path: str, *, config, alert_dir: str | None = None,
+                 max_consecutive_failures: int = HEARTBEAT_FAILURE_ALERT_THRESHOLD,
+                 log=_default_log):
+        self._path = path
+        self._config = config
+        self._alert_dir = alert_dir
+        self._max = int(max_consecutive_failures)
+        self._log = log
+        self._consecutive = 0
+        self._alerted = False
+
+    @property
+    def consecutive_failures(self) -> int:
+        """当前连续失败计数（成功即归零）。"""
+        return self._consecutive
+
+    def write(self, *, decision: Decision | None = None,
+              error: str | None = None, dry_run: bool = False,
+              now: datetime | None = None, pid: int | None = None) -> bool:
+        """写一次心跳：成功 True；失败记日志 False（绝不抛 OSError）。"""
+        try:
+            write_heartbeat(self._path, config=self._config, decision=decision,
+                            error=error, dry_run=dry_run, pid=pid, now=now)
+        except OSError as e:
+            self._consecutive += 1
+            self._log(
+                f"心跳写入失败（连续 {self._consecutive} 次）："
+                f"{type(e).__name__}: {e}——记日志下一轮重试，不退出"
+                f"（{self._path}）")
+            if self._consecutive >= self._max:
+                self._alert_streak()
+            return False
+        self._consecutive = 0
+        self._alerted = False
+        return True
+
+    def _alert_streak(self) -> None:
+        """连续失败达到阈值：告警一次（本段内不重复；成功后复位）。"""
+        if self._alerted or not self._alert_dir:
+            return
+        self._alerted = True
+        try:
+            append_alert(
+                self._alert_dir, ALERT_HEARTBEAT_WRITE_ERROR,
+                f"心跳写入连续失败 {self._consecutive} 次（{self._path}）——"
+                "运行器仍在轮询重试；人工检查 live 目录权限/磁盘", None)
+        except OSError as e:      # 告警通道同样不可用：日志已记，不打崩
+            self._log(f"告警写入同样失败：{type(e).__name__}: {e}")

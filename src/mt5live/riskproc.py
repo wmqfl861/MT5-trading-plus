@@ -48,7 +48,6 @@ from datetime import datetime, timezone
 from typing import Mapping
 
 from mt5data.sessions import DEFAULT_SESSIONS_PATH, SessionPolicy, load_session_policy
-from mt5gw.snapshot import write_json_atomic
 from mt5live.commands import (
     ALERT_COMMAND_UNREADABLE,
     COMMANDS_SUBDIR,
@@ -57,6 +56,7 @@ from mt5live.commands import (
     archive_if_all_acked,
     write_flatten,
 )
+from mt5live.fileio import write_json_atomic
 from mt5live.monitor import (
     ALERT_HEARTBEAT_TIMEOUT,
     ALERT_RISK_FLATTEN,

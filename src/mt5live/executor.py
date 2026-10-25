@@ -34,7 +34,8 @@ from mt5live.commands import (
     read_flatten,
     write_ack,
 )
-from mt5live.gate import ORDER_LOG_FILE, LiveSizer, RiskGate, alert_reject
+from mt5live.fileio import append_jsonl, write_json_atomic
+from mt5live.gate import ORDER_LOG_MAGIC_FMT, LiveSizer, RiskGate, alert_reject
 from mt5live.monitor import append_alert, iso_utc, naive_utc
 from mt5live.reconcile import (
     INTENT_FILE_FMT,
@@ -330,8 +331,9 @@ class ExecutionAdapter:
 #   写告警（ALERT_UNEXPECTED_RESIZE），须人工核对；
 # - 启动校验（M1）：time_stop_bars / week_close_exit 未实现，策略用到即
 #   拒绝启动（validate_live_strategy，dry-run 同样校验）。
-# - 本地下单日志 data/live/orders.jsonl（每笔市价单一行，RiskGate 的频率
-#   滑窗数据源）。
+# - 本地下单日志 data/live/orders-<magic>.jsonl（每笔市价单一行；T33/M8
+#   起每策略各写各的、经 fileio.append_jsonl 追加——RiskGate 读全部
+#   orders-*.jsonl 作为频率滑窗数据源，兼容旧 orders.jsonl）。
 
 STATE_FILE_FMT = "state-{magic}.json"
 # 全平指令/确认文件（flatten.json、flatten.ack-<magic>）的读写一律经
@@ -405,7 +407,8 @@ class LiveExecutor:
             live_dir, STATE_FILE_FMT.format(magic=magic))
         self._intent_path = os.path.join(
             live_dir, INTENT_FILE_FMT.format(magic=magic))
-        self._order_log_path = os.path.join(live_dir, ORDER_LOG_FILE)
+        self._order_log_path = os.path.join(
+            live_dir, ORDER_LOG_MAGIC_FMT.format(magic=magic))
         self._state = self._load_state()
 
     # ---- 主入口 ----
@@ -680,10 +683,7 @@ class LiveExecutor:
                 str(k): v for k, v in self._state["known_positions"].items()},
             "last_decision_id": self._state.get("last_decision_id"),
         }
-        tmp = self._state_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self._state_path)
+        write_json_atomic(self._state_path, payload)   # T33：经 fileio（重试）
 
     def _current_positions(self) -> dict[int, int]:
         return {p.ticket: (1 if p.side == "buy" else -1)
@@ -765,12 +765,13 @@ class LiveExecutor:
         self._log_orders(orders, decision_id, n)
 
     def _log_orders(self, orders, decision_id, n: datetime) -> None:
-        """本地下单日志（orders.jsonl）：每笔市价开/平一行（频率滑窗数据源）。"""
-        entries = []
+        """本地下单日志（orders-<magic>.jsonl，T33/M8 每策略各写各的）：
+        每笔市价开/平一行（频率滑窗数据源），经 fileio.append_jsonl
+        （O_APPEND 单次 write，多运行器并发不交错）。"""
         for o in orders:
             if o.kind not in ("open", "close"):
                 continue
-            entries.append({
+            append_jsonl(self._order_log_path, {
                 "ts": iso_utc(n), "magic": self._magic,
                 "symbol": self._symbol, "kind": o.kind,
                 "side": o.side or "", "lots": (o.filled_volume
@@ -778,9 +779,3 @@ class LiveExecutor:
                                                else o.requested_volume),
                 "decision_id": decision_id or "-",
             })
-        if not entries:
-            return
-        os.makedirs(self._live_dir, exist_ok=True)
-        with open(self._order_log_path, "a", encoding="utf-8") as f:
-            for e in entries:
-                f.write(json.dumps(e, ensure_ascii=False) + "\n")
