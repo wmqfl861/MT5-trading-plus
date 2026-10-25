@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .superpowers/
 data/
+data_research/
 mcp.json
 mcp-remote-prompt.txt
 mcp_server.log

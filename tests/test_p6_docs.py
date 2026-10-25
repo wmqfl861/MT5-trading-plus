@@ -121,6 +121,44 @@ def test_permissions_doc_acl_and_hook_and_mcp():
     assert "拒读" in text and "只读" in text
 
 
+# ------------------------------------------------- T27（H3）：研究库隔离
+
+
+def test_permissions_doc_research_store_isolation():
+    """T27/H3：研究、审查账户对主库 data\\bars、data\\ticks 拒读（含锁箱段
+    的物理隔离），对 data_research 只读；icacls 命令清单齐全；钩子章节
+    同步 T29 白名单新签名（check_staged / violation_reason）。"""
+    assert PERMISSIONS.is_file()
+    text = PERMISSIONS.read_text(encoding="utf-8")
+    # 主库 bars/ticks 拒读（deny 行 + 路径同时出现）
+    for path in ('data\\bars', 'data\\ticks'):
+        assert path in text, f"权限方案缺主库路径 {path} 的隔离说明"
+    assert text.count('/deny "MT5Research:') >= 4, \
+        "拒读 icacls 样例不足（bars/ticks 至少各一条 deny）"
+    # 研究库只读（grant R + deny 写删；export_research_store 产出口径）
+    assert 'data_research' in text, "权限方案缺研究库 data_research 条目"
+    assert "MT5Research:R" in text, "研究库只读授权（:R）样例缺失"
+    assert "export_research_store" in text, "缺研究库导出工具指引"
+    assert "tick" in text and "spread_model.json" in text, \
+        "缺说明：tick 不进研究库，成本经缓存文件提供"
+    # 钩子章节同步 T29 新签名（白名单 + 可导入函数新名）
+    for kw in ("check_staged", "violation_reason", "白名单", "MT5QUANT_COMMIT_ROLE"):
+        assert kw in text, f"权限方案钩子章节缺（T29 新签名）：{kw}"
+
+
+def test_readme_research_store_not_main_store():
+    """T27/H3/L3：README 不再推荐直读主库 data/bars；研究侧用法改为研究库
+    （--research-store / data_research），并注明主库仅限管理员与实盘侧。"""
+    text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert 'read_parquet("data/bars' not in text, \
+        "README 仍有直读主库 data/bars 的示例（L3/H3）"
+    assert "data_research" in text, "README 缺研究库用法（data_research）"
+    assert "--research-store" in text, "README 缺 --research-store 用法"
+    assert "管理员与实盘" in text or "仅限管理员" in text, \
+        "README 缺主库访问范围说明（仅管理员与实盘侧）"
+    assert "export_research_store" in text, "README 缺研究库导出工具指引"
+
+
 # ---------------------------------------------------------------- pre-commit 钩子（T29 白名单 + 缺省拒绝）
 
 

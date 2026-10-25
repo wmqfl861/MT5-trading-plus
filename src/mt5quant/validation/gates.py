@@ -46,6 +46,27 @@ class LockboxPrerequisiteError(RuntimeError):
     """未过 G3 的卡不允许跑 G5（参照分布 = G3 拼接的样本外收益）。"""
 
 
+class LockboxBudgetExhaustedError(RuntimeError):
+    """该锁箱（cutoff）的项目级使用预算已用尽（T27/M11/D16）——拒绝，
+    且不消耗当前卡的一次性机会。"""
+
+
+def _budget_check(ledger, cid: str, cutoff) -> str:
+    """预算检查 + cutoff 键规范化：用尽 → LockboxBudgetExhaustedError。
+    返回规范化后的 cutoff ISO 串（写进 lockbox_uses 供计数）。"""
+    from mt5quant.research.ledger import _cutoff_iso
+
+    key = _cutoff_iso(cutoff)
+    b = ledger.lockbox_budget(key)
+    if b["exhausted"]:
+        raise LockboxBudgetExhaustedError(
+            f"卡 {cid} 的 G5 被拒：锁箱 cutoff={key} 的使用预算已用尽"
+            f"（{b['used']}/{b['max_uses']}，T27/M11——多张卡各看一次锁箱"
+            "等于在锁箱上做选择）。预算与退役规则见蓝图决策 D16；调整"
+            "预算是管理员动作（改台账库），不是代码缺省")
+    return key
+
+
 @dataclass(frozen=True)
 class GatesConfig:
     """门槛集合（字段与 config/gates.toml 一一对应）。"""
@@ -285,18 +306,22 @@ def _card_id_of(card) -> str:
     return cid
 
 
-def begin_lockbox(ledger, card, *, approved_by: str) -> None:
+def begin_lockbox(ledger, card, *, approved_by: str,
+                  cutoff=None) -> None:
     """G5 编排第一步：**读锁箱数据之前**调用（T21a/C3）。
 
     - 未批准 → GateApprovalError（不消耗一次性机会）；
     - 未过 G3 → LockboxPrerequisiteError（不消耗一次性机会）；
     - 已有任何记录（含上次崩溃残留的 started）→ LockboxAlreadyUsedError；
+    - cutoff 给出且该锁箱预算用尽 → LockboxBudgetExhaustedError
+      （T27/M11：不消耗一次性机会，预算计数见 ledger.lockbox_budget）；
     - 否则写 status='started' 行——此后该卡锁箱视为已用，中途崩溃也
       不允许重跑（防多次窥视锁箱段）。
 
     编排协议（bt.py，T21e 接线）：
     begin_lockbox → 读锁箱段（load_lockbox_window，带预热）→ 回测 →
-    run_g5（评估并把 started 行写成 done）。
+    run_g5（评估并把 started 行写成 done）。cutoff 由调用方从
+    data/lockbox.json 读出传入（load_lockbox_window 用同一来源）。
     """
     cid = _card_id_of(card)
     if not approved_by:
@@ -312,12 +337,14 @@ def begin_lockbox(ledger, card, *, approved_by: str) -> None:
             f"卡 {cid} 的锁箱已用过（lockbox_uses 有记录，含进行中的 "
             "started）——第二次请求直接拒绝；一次性机会已消耗，结论以"
             "第一次为准")
-    ledger.record_lockbox_start(cid, approved_by=approved_by)
+    key = _budget_check(ledger, cid, cutoff) if cutoff is not None else None
+    ledger.record_lockbox_start(cid, approved_by=approved_by, cutoff=key)
 
 
 def run_g5(ledger, card, *, lockbox_result: dict, reference_returns,
            expected_trades: float, approved_by: str, cfg: GatesConfig,
-           bars_per_day: int | None = None) -> dict:
+           bars_per_day: int | None = None,
+           cutoff=None) -> dict:
     """锁箱一次性（T21a/C3 重写）：**单侧**判定，参照策略自身的样本外分布。
 
     参照分布：reference_returns（策略 G3 拼接的样本外收益）按锁箱长度
@@ -342,7 +369,10 @@ def run_g5(ledger, card, *, lockbox_result: dict, reference_returns,
 
     前置拒绝（不消耗一次性）：approved_by 为空 → GateApprovalError；
     已有 done 记录 → LockboxAlreadyUsedError；未过 G3 →
-    LockboxPrerequisiteError。评估完成（无论过没过）写终态：started 行
+    LockboxPrerequisiteError。cutoff 给出且预算用尽 →
+    LockboxBudgetExhaustedError（T27/M11；直调路径没有 started 行时才查——
+    begin_lockbox 已消耗预算槽的卡在这里复查会把自己拒掉）。
+    评估完成（无论过没过）写终态：started 行
     → done；无 started 行（直接调用路径）→ 插入 done 行。看过一眼即消耗。
     """
     cid = _card_id_of(card)
@@ -358,6 +388,10 @@ def run_g5(ledger, card, *, lockbox_result: dict, reference_returns,
         raise LockboxPrerequisiteError(
             f"卡 {cid} 未通过 G3——G5 的参照分布取自 G3 拼接的样本外收益，"
             "没有可信参照不允许跑 G5")
+    # 预算检查（T27/M11）：只查直调路径（该卡无任何行）；begin_lockbox
+    # 已写 started 的卡预算槽已占，不复查
+    if cutoff is not None and ledger.lockbox_status(cid) is None:
+        _budget_check(ledger, cid, cutoff)
     timeframe = getattr(card, "timeframe", None)
     if bars_per_day is None:
         if not timeframe or str(timeframe).upper() not in TIMEFRAME_SECONDS:
@@ -421,7 +455,10 @@ def run_g5(ledger, card, *, lockbox_result: dict, reference_returns,
     if sharpe is not None and sharpe > p95:
         result["warning"] = (f"锁箱夏普 {sharpe:.2f} 高于参照分布 "
                              f"p95（{p95:.2f}）——异常好，复核数据与前视")
-    ledger.finish_lockbox_use(cid, result=result, approved_by=approved_by)
+    from mt5quant.research.ledger import _cutoff_iso
+    ledger.finish_lockbox_use(cid, result=result, approved_by=approved_by,
+                              cutoff=_cutoff_iso(cutoff)
+                              if cutoff is not None else None)
     return result
 
 

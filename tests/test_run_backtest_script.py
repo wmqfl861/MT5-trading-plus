@@ -489,3 +489,130 @@ def test_cli_risk_mode_requires_volume_bounds_in_specs(tmp_path, monkeypatch,
     assert rc == 1
     out = capsys.readouterr().out
     assert "volume_min" in out or "snapshot_specs" in out
+
+
+# ------------------------------------------------- T27（H3）：研究库切换
+
+
+def test_resolve_data_root_semantics():
+    """--research-store 语义：显式 --data-root 优先；否则 flag → data_research，
+    无 flag → data（主库缺省不变）。"""
+    mod = _load_script()
+    assert mod.resolve_data_root("some/root", False) == "some/root"
+    assert mod.resolve_data_root("some/root", True) == "some/root"
+    assert mod.resolve_data_root(None, False) == "data"
+    assert mod.resolve_data_root(None, True) == "data_research"
+
+
+def _research_store(tmp_path):
+    """可直接回测的研究库：bars + specs + 成本缓存（无 tick——研究账户拒读）。
+    缓存在旁边的 build/ 目录用真 tick 构建，再只复制缓存文件过来。"""
+    import shutil
+
+    import pandas as pd
+    from mt5data.store import _COLUMNS, save_bars
+
+    build = tmp_path / "build"
+    _full_hour_ticks(build)                      # 建 tick → 建缓存
+    rb = _load_script()
+    from mt5quant.costs import SpreadModel
+    from mt5data.ticks import load_ticks, tick_watermark
+    ticks = load_ticks(str(build), "XAUUSD",
+                       columns=["time_msc", "bid", "ask"])
+    model = SpreadModel.from_ticks("XAUUSD", ticks, mode="relative")
+    rb.save_spread_model_cache(
+        rb.spread_model_cache_path(str(build)), model,
+        {"XAUUSD": tick_watermark(str(build), "XAUUSD")})
+
+    root = tmp_path / "data_research"
+    times = pd.date_range("2026-01-05 10:00", periods=20, freq="h")
+    save_bars(str(root), "XAUUSD", "H1", pd.DataFrame({
+        "time": times, "open": 100.0, "high": 100.5, "low": 99.5,
+        "close": 100.0, "tick_volume": 10, "spread": 5, "real_volume": 0,
+    })[_COLUMNS])
+    specs = root / "specs"
+    specs.mkdir(parents=True)
+    (specs / "latest.json").write_text(json.dumps(
+        {"XAUUSD": {"contract_size": 100.0, "volume_min": 0.01,
+                    "volume_step": 0.01, "volume_max": 200.0}}),
+        encoding="utf-8")
+    costs = root / "costs"
+    costs.mkdir()
+    shutil.copyfile(rb.spread_model_cache_path(str(build)),
+                    str(costs / "spread_model.json"))
+    assert not (root / "ticks").exists()         # 研究库无 tick，有意为之
+    return root
+
+
+def test_cli_research_store_switch_uses_data_research(tmp_path, monkeypatch,
+                                                      capsys):
+    """--research-store：--data-root 缺省切换为 data_research（cwd 相对），
+    成本经缓存文件装配（无 tick），manifest 记录 research_store 与 data_root。
+    cwd 下只有 data_research 没有 data——成功即证明读的是研究库。"""
+    mod = _load_script()
+    root = _research_store(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sys.argv", [
+        "run_backtest.py", "--strategy",
+        "mt5quant.strategies.library.buy_hold:BuyHold",
+        "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
+        "--research-store", "--out", str(tmp_path / "out"),
+        "--volume-lots", "0.01", "--allow-zero-swap"])
+    assert mod.main() == 0
+    out = capsys.readouterr().out
+    assert "研究库" in out and "缓存" in out
+    run_dir = sorted((tmp_path / "out").iterdir())[-1]
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["extra"]["research_store"] is True
+    assert "data_research" in manifest["extra"]["data_root"].replace("\\", "/")
+
+
+def test_cli_default_data_root_still_main_store(tmp_path, monkeypatch):
+    """对照：不给 --research-store 时 --data-root 缺省仍是 data（cwd 下
+    无 data/ → 报无数据，而不是去读 data_research）。"""
+    mod = _load_script()
+    _research_store(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sys.argv", [
+        "run_backtest.py", "--strategy",
+        "mt5quant.strategies.library.buy_hold:BuyHold",
+        "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
+        "--costs", "zero", "--volume-lots", "0.01", "--allow-zero-swap",
+        "--out", str(tmp_path / "out")])
+    assert mod.main() == 1
+
+
+def test_cli_research_store_missing_cache_points_to_export(tmp_path,
+                                                           monkeypatch,
+                                                           capsys):
+    mod = _load_script()
+    root = _research_store(tmp_path)
+    (root / "costs" / "spread_model.json").unlink()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sys.argv", [
+        "run_backtest.py", "--strategy",
+        "mt5quant.strategies.library.buy_hold:BuyHold",
+        "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
+        "--research-store", "--out", str(tmp_path / "out"),
+        "--volume-lots", "0.01", "--allow-zero-swap"])
+    assert mod.main() == 1
+    out = capsys.readouterr().out
+    assert "export_research_store" in out
+
+
+def test_cli_build_cost_model_refused_under_research_store(tmp_path,
+                                                           monkeypatch,
+                                                           capsys):
+    """研究库无 tick 可建模型：--build-cost-model + --research-store 拒绝。"""
+    mod = _load_script()
+    _research_store(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sys.argv", [
+        "run_backtest.py", "--strategy",
+        "mt5quant.strategies.library.buy_hold:BuyHold",
+        "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
+        "--research-store", "--build-cost-model",
+        "--out", str(tmp_path / "out"),
+        "--volume-lots", "0.01", "--allow-zero-swap"])
+    assert mod.main() == 1
+    assert "研究库" in capsys.readouterr().out

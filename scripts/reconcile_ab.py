@@ -4,13 +4,17 @@
 点差模型）与 B 层（engine_b，逐 tick 真实报价），逐笔对齐输出差异表
 （入场/出场时间、价格、净利），并汇总每笔净利差的分布。
 
-锁箱豁免声明（与 research_bars 的差异）：
-- 研究路径（scripts/run_backtest.py / bt.py）必须经 mt5data.lockbox.research_bars，
-  只能看到锁箱 cutoff 之前的 K 线；本脚本**直接 store.load_bars 读全量**。
+锁箱豁免声明（T27/H3 收口：显式 --ops-ack）：
+- 研究路径（scripts/run_backtest.py / bt.py）必须经研究库或
+  mt5data.lockbox.research_bars，看不到锁箱段；本脚本直读 store.load_bars
+  全量（对账需要两个引擎吃同一份 bars，其中含锁箱期行）。
 - 豁免理由：本脚本是运维对账工具，不产生任何研究结论——它只校验两个执行
   引擎在同一数据上的口径一致性，输出的是差异表与容差判定，不会进入试验
   台账或假设卡。A/B 两层喂的是同一份 bars，锁箱段数据不会单侧泄漏成
   "可研究的 alpha"。
+- 收口（T27）：对账窗触到锁箱期时必须显式 --ops-ack（运维确认上述豁免
+  理由），否则在读 bars 之前拒绝退出；给了 --ops-ack 的运行会在台账
+  （{data-root}/research/ledger.sqlite）记一行 actor=ops 供事后审计。
 
 用法（Git Bash）：
     .venv/Scripts/python.exe scripts/reconcile_ab.py \
@@ -50,7 +54,8 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # 复用 run_backtest 的装配
 
-from mt5data.store import TIMEFRAME_SECONDS, load_bars  # noqa: E402  锁箱豁免：直读全量
+from mt5data.lockbox import cutoff_for, load_config  # noqa: E402
+from mt5data.store import TIMEFRAME_SECONDS, load_bars  # noqa: E402
 from mt5data.ticks import load_ticks, read_ticks_watermark  # noqa: E402
 from mt5quant.backtest.engine_a import (  # noqa: E402
     ENGINE_VERSION, run_backtest,
@@ -58,7 +63,9 @@ from mt5quant.backtest.engine_a import (  # noqa: E402
 from mt5quant.backtest.engine_b import (  # noqa: E402
     ENGINE_VERSION_B, run_backtest_ticks,
 )
-from mt5quant.backtest.report import make_run_dir  # noqa: E402
+from mt5quant.backtest.report import (  # noqa: E402
+    data_sha256, make_run_dir,
+)
 from mt5data.store import atomic_replace  # noqa: E402
 from run_backtest import (  # noqa: E402
     ZeroCosts, build_costs, check_clock, load_strategy,
@@ -395,6 +402,38 @@ def _print_report(report: ReconcileReport, paths: dict | None) -> None:
         print(f"汇总：{paths['summary']}")
 
 
+# ------------------------------------------------ 锁箱闸门（T27/H3）
+
+OPS_CARD_ID = "OPS-RECONCILE-AB"      # 台账登记用的"卡位"（非研究卡）
+
+
+def window_touches_lockbox(to_ms: int, cutoff_ms: int, tf_seconds: int) -> bool:
+    """对账窗是否可能包含锁箱行（row time ≥ cutoff）。
+
+    保留的 bar 以收盘时刻落窗判定（bars_in_tick_window）：窗末端允许的
+    最晚收盘 = to_ms + 1ms，其开盘 = to_ms + 1 − 周期。开盘 ≥ cutoff 的
+    行属锁箱段——保守判定"可能包含"（真实 tick 库只覆盖最近数周，整段
+    深锁箱期，此判定实际总是 True）。"""
+    return to_ms + 1 >= cutoff_ms + tf_seconds * 1000
+
+
+def _record_ops_run(ledger_path, *, args, symbol, tf, bars, cost_version,
+                    summary) -> None:
+    """--ops-ack 的审计登记：runs 表一行 actor=ops（T27/H3 收口）。"""
+    from mt5quant.research.ledger import Ledger
+
+    with Ledger(ledger_path) as led:
+        led.record_run(
+            card_id=OPS_CARD_ID, card_version=0, strategy=args.strategy,
+            params=json.loads(args.params), symbol=symbol, timeframe=tf,
+            data_first=pd.Timestamp(bars["time"].iloc[0]).isoformat(),
+            data_last=pd.Timestamp(bars["time"].iloc[-1]).isoformat(),
+            data_sha256=data_sha256(bars),
+            engine_version=f"{ENGINE_VERSION}/{ENGINE_VERSION_B}",
+            cost_model_version=cost_version, gates_hash="",
+            metrics=summary, actor="ops")
+
+
 # ------------------------------------------------ CLI
 
 def main(argv=None) -> int:
@@ -424,6 +463,11 @@ def main(argv=None) -> int:
     ap.add_argument("--tol-exit-signal-ms", type=int,
                     default=TOL_EXIT_TIME_SIGNAL_MS)
     ap.add_argument("--net-tol-spreads", type=float, default=NET_TOL_SPREADS)
+    ap.add_argument("--ops-ack", action="store_true",
+                    help="运维确认锁箱豁免（对账窗触到锁箱期时必须显式给出，"
+                         "否则拒绝运行；给出后本次运行在台账记一行 actor=ops）")
+    ap.add_argument("--ledger", default=None,
+                    help="台账路径；缺省 {data-root}/research/ledger.sqlite")
     args = ap.parse_args(argv)
 
     tf = args.timeframe.upper()
@@ -440,11 +484,6 @@ def main(argv=None) -> int:
         contract_size = resolve_contract_size(args.data_root, args.symbol,
                                               args.contract_size)
         check_clock(args.data_root)
-        # 锁箱豁免：直读全量 bars（理由见模块 docstring）
-        bars_all = load_bars(args.data_root, args.symbol, tf)
-        if bars_all is None or len(bars_all) == 0:
-            raise ValueError(
-                f"无 K 线数据：{args.symbol} {tf}（先跑 scripts/download_bars.py）")
         meta = read_ticks_watermark(args.data_root, args.symbol)
         first_msc = (meta or {}).get("first_msc")
         last_msc = (meta or {}).get("last_msc")
@@ -457,9 +496,33 @@ def main(argv=None) -> int:
         for label, ts in (("--start", start), ("--end", end)):
             if ts is not None and ts.tzinfo is not None:
                 raise ValueError(f"{label} 只接受不带时区的 UTC 时间")
+        # T27/H3：对账窗触到锁箱期 → 读 bars 之前先过 --ops-ack 闸门
+        from_ms = int(first_msc) if start is None \
+            else max(int(first_msc), _ms(start))
+        to_ms = int(last_msc) if end is None else min(int(last_msc), _ms(end))
+        tf_seconds = TIMEFRAME_SECONDS[tf]
+        cutoff = cutoff_for(load_config(args.data_root), args.symbol, tf)
+        ops_ack_recorded = False
+        if cutoff is not None and window_touches_lockbox(
+                to_ms, _ms(pd.Timestamp(cutoff)), tf_seconds):
+            if not args.ops_ack:
+                print(
+                    f"✗ 对账窗 [{pd.Timestamp(from_ms, unit='ms')} … "
+                    f"{pd.Timestamp(to_ms, unit='ms')}] 触到锁箱段"
+                    f"（cutoff {pd.Timestamp(cutoff)}）——本脚本直读主库全量"
+                    " bars（含锁箱期行），读锁箱期数据必须显式 --ops-ack："
+                    "运维确认本次只做执行口径核对、不产生研究结论；"
+                    "加 --ops-ack 会在台账记一行 actor=ops 供审计（T27/H3）")
+                return 1
+            ops_ack_recorded = True
+        # 锁箱豁免（已 ack）：直读全量 bars（理由见模块 docstring）
+        bars_all = load_bars(args.data_root, args.symbol, tf)
+        if bars_all is None or len(bars_all) == 0:
+            raise ValueError(
+                f"无 K 线数据：{args.symbol} {tf}（先跑 scripts/download_bars.py）")
         bars = bars_in_tick_window(bars_all, first_msc=first_msc,
                                    last_msc=last_msc,
-                                   tf_seconds=TIMEFRAME_SECONDS[tf],
+                                   tf_seconds=tf_seconds,
                                    start=start, end=end)
         if args.costs == "auto":
             costs, cost_version = build_costs(
@@ -489,7 +552,17 @@ def main(argv=None) -> int:
             "slippage_price": args.slippage_price,
             "cost_version": cost_version,
             "tick_first_msc": first_msc, "tick_last_msc": last_msc,
+            "ops_ack": ops_ack_recorded,       # T27：本次是否走了运维豁免
+            "lockbox_cutoff": (pd.Timestamp(cutoff).isoformat()
+                               if cutoff is not None else None),
         })
+        if ops_ack_recorded:
+            ledger_path = args.ledger if args.ledger else os.path.join(
+                args.data_root, "research", "ledger.sqlite")
+            _record_ops_run(ledger_path, args=args, symbol=args.symbol,
+                            tf=tf, bars=bars, cost_version=cost_version,
+                            summary=report.summary)
+            print(f"— 运维豁免已登记（actor=ops）：{ledger_path}")
     except Exception as e:  # fail-fast：任何错误如实报出
         print(f"✗ {type(e).__name__}: {e}")
         return 1

@@ -49,6 +49,11 @@
   与 load_gates 同口径——探针 P7：裸字节哈希在 CRLF 检出下两侧不一致），
   否则空串（T12 起强制核对）。
 - 台账缺省 {data-root}/research/ledger.sqlite（data/ 不入库，本地持久）。
+- 研究库（T27/H3）：--research-store 时 --data-root 缺省切到 data_research
+  （scripts/export_research_store.py 导出的隔离副本：只含 time < cutoff 的
+  K 线 + 成本缓存文件，无 tick；研究库无锁箱段，锁箱语义自然满足）。
+  台账缺省**不**跟随切换，仍落 data/research/ledger.sqlite——permissions.md
+  的 ACL 里研究库对研究账户只读，可写的台账目录是 data\\research。
 """
 import argparse
 import json
@@ -77,11 +82,24 @@ from mt5quant.validation import walkforward as vwf  # noqa: E402
 from mt5quant.validation.robustness import BacktestSpec  # noqa: E402
 from run_backtest import (  # noqa: E402
     SESSIONS_PATH, ZeroCosts, build_costs, entry_policy_for, load_series,
-    load_strategy, resolve_contract_size, resolve_lots_mode, sessions_sha256,
+    load_strategy, resolve_contract_size, resolve_data_root,
+    resolve_lots_mode, sessions_sha256,
 )
 from mt5quant.sizing import load_volume_limits  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _ledger_default(args) -> Path:
+    """台账缺省路径：--research-store 时固定 data/research/ledger.sqlite
+    （研究库对研究账户只读，可写台账目录是 data\\research——permissions.md）；
+    否则 {data-root}/research/ledger.sqlite。显式 --ledger 永远优先。"""
+    if args.ledger is not None:
+        return Path(args.ledger)
+    if getattr(args, "research_store", False):
+        return Path("data") / "research" / "ledger.sqlite"
+    return Path(resolve_data_root(args.data_root, False)) / "research" \
+        / "ledger.sqlite"
 
 # 参数选择规则枚举（附录 A v2；卡定义时 bt card check 校验，非法值拒绝）
 _SELECTION_METRICS = {
@@ -249,8 +267,10 @@ def _g5_orchestrate(ledger, card, *, strategy, spec, params, base_summary,
 
     1. 参照重建（_g3_reference_returns，只读研究段；失败不消耗一次性）；
     2. begin_lockbox：读锁箱数据**之前**写 started（未批准/未过 G3/已用过
-       → 如实抛 GateApprovalError / LockboxPrerequisiteError /
-       LockboxAlreadyUsedError，不消耗或已消耗由语义决定）；
+       /预算用尽（T27：cutoff 级 max_uses，默认 5）→ 如实抛
+       GateApprovalError / LockboxPrerequisiteError /
+       LockboxAlreadyUsedError / LockboxBudgetExhaustedError，
+       不消耗或已消耗由语义决定）；
     3. load_lockbox_window：cutoff 前卡策略声明的 lookback_bars 根起步
        （无预热段时信号与全史不一致，C3）；
     4. 回测（引擎 A，与基准同一装配含禁入窗）；交易与权益收益**只计
@@ -264,8 +284,13 @@ def _g5_orchestrate(ledger, card, *, strategy, spec, params, base_summary,
     # 1) 参照分布（G3 样本外收益；任何失败都发生在 begin_lockbox 之前）
     reference = _g3_reference_returns(
         ledger, card, spec, bars, costs, data_sha=data_sha256(bars))
-    # 2) 读锁箱数据之前写 started（中途崩溃也不允许重跑）
-    vgate.begin_lockbox(ledger, card, approved_by=approved_by)
+    # 2) 读锁箱数据之前写 started（中途崩溃也不允许重跑）；cutoff 与
+    #    load_lockbox_window 同一来源（lockbox.json），作为预算计数口径
+    from mt5data.lockbox import cutoff_for, load_config
+    lb_cutoff = cutoff_for(load_config(data_root), spec.symbol,
+                           card.timeframe)
+    vgate.begin_lockbox(ledger, card, approved_by=approved_by,
+                        cutoff=lb_cutoff)
     # 3) 锁箱运行窗（带预热段）
     lookback = max(int(getattr(strategy.required_data, "lookback_bars", 0)
                        or 0), 0)
@@ -308,7 +333,7 @@ def _g5_orchestrate(ledger, card, *, strategy, spec, params, base_summary,
     return vgate.run_g5(ledger, card, lockbox_result=lockbox_result,
                         reference_returns=reference,
                         expected_trades=expected_trades,
-                        approved_by=approved_by, cfg=cfg)
+                        approved_by=approved_by, cfg=cfg, cutoff=lb_cutoff)
 
 
 # ---------------------------------------------------------------- card check
@@ -356,8 +381,12 @@ def cmd_screen(args) -> int:
     if card.migration_hint:
         print(f"⚠ 迁移提示：{card.migration_hint}")
 
-    ledger_path = Path(args.ledger) if args.ledger else \
-        Path(args.data_root) / "research" / "ledger.sqlite"
+    ledger_path = _ledger_default(args)
+    data_root = resolve_data_root(args.data_root,
+                                  getattr(args, "research_store", False))
+    if getattr(args, "research_store", False):
+        print(f"— 研究库模式（T27/H3）：--data-root 缺省 {data_root}"
+              f"（无 tick，成本经缓存文件；台账 {ledger_path}）")
     with Ledger(ledger_path) as ledger:
         # 先卡后测：未提交 / 工作区脏（P6）/ 提交晚于该卡文件首次运行 →
         # 拒绝（不产生任何 runs）
@@ -377,17 +406,17 @@ def cmd_screen(args) -> int:
         # 装配（setup 失败 = 尚无任何组合开跑，fail-fast 不记 runs）
         try:
             strategy_cls = load_strategy(args.strategy)
-            sizes = {sym: resolve_contract_size(args.data_root, sym, None)
+            sizes = {sym: resolve_contract_size(data_root, sym, None)
                      for sym in card.symbols}
             # T23：定手数口径（默认风险定手数；risk 模式逐品种读快照 vol 三元组）
             lots, sizing, sizing_info = resolve_lots_mode(args.risk_per_trade,
                                                           args.volume_lots)
             if sizing is not None:
-                vols_by_sym = {sym: load_volume_limits(args.data_root, sym)
+                vols_by_sym = {sym: load_volume_limits(data_root, sym)
                                for sym in card.symbols}
             else:
                 vols_by_sym = None
-            bars_by_sym = {sym: load_series(args.data_root, sym,
+            bars_by_sym = {sym: load_series(data_root, sym,
                                             card.timeframe, args.end)
                            for sym in card.symbols}
             # T20：禁入窗唯一来源 config/sessions.toml（sha 进 cost_model_version）
@@ -400,8 +429,10 @@ def cmd_screen(args) -> int:
                 policy_by_sym = {}
                 for sym in card.symbols:
                     costs_by_sym[sym], cost_version = build_costs(
-                        args.data_root, sym, args.spread_fraction,
-                        args.commission, sessions_sha=sess_sha)
+                        data_root, sym, args.spread_fraction,
+                        args.commission, sessions_sha=sess_sha,
+                        research_store=getattr(args, "research_store",
+                                                False))
                     policy_by_sym[sym] = entry_policy_for(
                         costs_by_sym[sym], sym, sess_policy)
             else:
@@ -517,8 +548,14 @@ def cmd_gate(args) -> int:
         print(f"✗ 未知关卡 {unknown}；合法：{list(vgate.GATE_ORDER)}")
         return 1
 
-    ledger_path = Path(args.ledger) if args.ledger else \
-        Path(args.data_root) / "research" / "ledger.sqlite"
+    ledger_path = _ledger_default(args)
+    data_root = resolve_data_root(args.data_root,
+                                  getattr(args, "research_store", False))
+    if getattr(args, "research_store", False):
+        print(f"— 研究库模式（T27/H3）：--data-root 缺省 {data_root}"
+              f"（无 tick，成本经缓存文件；台账 {ledger_path}）。G5 需读"
+              "锁箱段，只能由管理员在主库侧跑（--research-store 下无"
+              "lockbox.json）")
     with Ledger(ledger_path) as ledger:
         committed = cards.committed_at(path)
         try:
@@ -541,21 +578,34 @@ def cmd_gate(args) -> int:
             print(f"✗ 卡 {card.id} 的锁箱已用过一次（lockbox_uses 有记录）——"
                   "第二次请求直接拒绝")
             return 1
+        # T27/M11：锁箱预算预检（cutoff 级 max_uses，默认 5，D16 未决）——
+        # 用尽直接拒绝，不烧该卡一次性、也不跑基准运行
+        if "G5" in wanted:
+            from mt5data.lockbox import cutoff_for, load_config
+            lb_cut = cutoff_for(load_config(data_root), card.symbols[0],
+                                card.timeframe)
+            if lb_cut is not None:
+                budget = ledger.lockbox_budget(lb_cut)
+                if budget["exhausted"]:
+                    print(f"✗ 锁箱 cutoff={budget['cutoff']} 的使用预算已用尽"
+                          f"（{budget['used']}/{budget['max_uses']}，T27/M11"
+                          "）——G5 拒绝运行；预算与退役规则见蓝图 D16")
+                    return 1
 
         # 装配（失败 = 未开跑，fail-fast 不记 runs）
         try:
             strategy = load_strategy(args.strategy)()
-            sizes = {sym: resolve_contract_size(args.data_root, sym, None)
+            sizes = {sym: resolve_contract_size(data_root, sym, None)
                      for sym in card.symbols}
             # T23：定手数口径（默认风险定手数；risk 模式逐品种读快照 vol 三元组）
             lots, sizing, sizing_info = resolve_lots_mode(args.risk_per_trade,
                                                           args.volume_lots)
             if sizing is not None:
-                vols_by_sym = {sym: load_volume_limits(args.data_root, sym)
+                vols_by_sym = {sym: load_volume_limits(data_root, sym)
                                for sym in card.symbols}
             else:
                 vols_by_sym = None
-            bars_by_sym = {sym: load_series(args.data_root, sym,
+            bars_by_sym = {sym: load_series(data_root, sym,
                                             card.timeframe, args.end)
                            for sym in card.symbols}
             # T20：禁入窗唯一来源 config/sessions.toml（sha 进 cost_model_version）
@@ -567,8 +617,10 @@ def cmd_gate(args) -> int:
                 policy_by_sym = {}
                 for sym in card.symbols:
                     costs_by_sym[sym], cost_version = build_costs(
-                        args.data_root, sym, args.spread_fraction,
-                        args.commission, sessions_sha=sess_sha)
+                        data_root, sym, args.spread_fraction,
+                        args.commission, sessions_sha=sess_sha,
+                        research_store=getattr(args, "research_store",
+                                                False))
                     policy_by_sym[sym] = entry_policy_for(
                         costs_by_sym[sym], sym, sess_policy)
             else:
@@ -713,7 +765,7 @@ def cmd_gate(args) -> int:
                 ledger, card, strategy=strategy, spec=spec, params=params,
                 base_summary=summary, bars=bars, costs=costs,
                 session_policy=policy_by_sym[symbol],
-                data_root=args.data_root,
+                data_root=data_root,
                 approved_by=args.approved_by or args.actor, cfg=cfg))
 
         for gate in vgate.GATE_ORDER:
@@ -778,9 +830,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_screen.add_argument("--strategy", required=True,
                           help="module:Class，如 mt5quant.strategies.library.buy_hold:BuyHold")
     p_screen.add_argument("--cards-dir", default=str(REPO_ROOT / "research" / "cards"))
-    p_screen.add_argument("--data-root", default="data")
+    p_screen.add_argument("--data-root", default=None,
+                          help="数据根；缺省 data，--research-store 时缺省"
+                               " data_research（显式给出者优先）")
+    p_screen.add_argument("--research-store", action="store_true",
+                          help="读导出的研究库 data_research（T27/H3；台账"
+                               "缺省仍落 data/research/ledger.sqlite）")
     p_screen.add_argument("--ledger", default=None,
-                          help="台账路径；缺省 {data-root}/research/ledger.sqlite")
+                          help="台账路径；缺省 {data-root}/research/ledger.sqlite"
+                               "（--research-store 时固定 data/research/ledger.sqlite）")
     p_screen.add_argument("--costs", choices=("auto", "zero"), default="auto",
                           help="与 run_backtest 同义；测试/冒烟用 zero")
     p_screen.add_argument("--end", default=None,
@@ -812,7 +870,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_gate.add_argument("--approved-by", default=None,
                         help="G5 批准人（缺省记 --actor）")
     p_gate.add_argument("--cards-dir", default=str(REPO_ROOT / "research" / "cards"))
-    p_gate.add_argument("--data-root", default="data")
+    p_gate.add_argument("--data-root", default=None,
+                        help="数据根；缺省 data，--research-store 时缺省"
+                             " data_research（显式给出者优先）")
+    p_gate.add_argument("--research-store", action="store_true",
+                        help="读导出的研究库 data_research（T27/H3；G5 需锁箱段"
+                             "，只能管理员在主库侧跑）")
     p_gate.add_argument("--ledger", default=None)
     p_gate.add_argument("--costs", choices=("auto", "zero"), default="auto",
                         help="与 run_backtest 同义；测试/冒烟用 zero")

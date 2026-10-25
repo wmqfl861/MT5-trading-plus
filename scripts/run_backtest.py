@@ -4,9 +4,18 @@
     .venv/Scripts/python.exe scripts/run_backtest.py \
         --strategy mt5quant.strategies.library.buy_hold:BuyHold \
         --symbol XAUUSD --timeframe H1 --params '{}' \
-        --data-root data --end 2026-09-01 --out data/reports/backtests
+        --research-store --end 2026-09-01 --out data/reports/backtests
 
 约定：
+- 数据根（T27/H3）：--research-store 显式切换缺省数据根为 data_research
+  （管理员用 scripts/export_research_store.py 导出的研究库：只含
+  time < cutoff 的 K 线 + 成本缓存文件，无 tick，锁箱语义自然满足——
+  研究库里没有锁箱段）；显式 --data-root 永远优先；缺省仍是 data。
+  为什么用 CLI flag 而不是环境变量：命令行里可见、可审计、可复制，
+  不依赖会话全局状态；真正的边界是 ACL（docs/p6/permissions.md），
+  flag 只是把研究工作流自然指向隔离副本。研究库模式下 --costs auto
+  必须命中 data_research/costs/spread_model.json（无 tick 可自建，
+  缺失报错指路 export_research_store）。
 - --end 经 mt5data.lockbox.research_bars（锁箱语义：显式越过 cutoff 的请求
   直接报错，绝不静默截断）；无 lockbox.json 时返回全量，行为与直读一致。
 - 金额口径：contract_size 取 --contract-size，否则读
@@ -72,6 +81,20 @@ from mt5quant.sizing import RiskSizing, load_volume_limits  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SESSIONS_PATH = REPO_ROOT / "config" / "sessions.toml"
+
+# T27（H3）：--research-store 的语义——显式 CLI flag 切换缺省数据根（不用
+# 环境变量：研究账户拿不到能写环境变量的 shell 也不该依赖隐式全局状态，
+# 命令行里可见的 flag 更可审计；真正的边界是 ACL（permissions.md），flag
+# 只是把研究工作流自然指向隔离副本）。显式 --data-root 永远优先。
+DEFAULT_DATA_ROOT = "data"
+RESEARCH_STORE_ROOT = "data_research"
+
+
+def resolve_data_root(explicit: str | None, research_store: bool) -> str:
+    """--data-root 显式值 > --research-store 缺省（data_research）> data。"""
+    if explicit is not None:
+        return explicit
+    return RESEARCH_STORE_ROOT if research_store else DEFAULT_DATA_ROOT
 
 
 def sessions_sha256(path: str) -> str:
@@ -247,12 +270,18 @@ def save_spread_model_cache(path: str, model, watermarks: dict) -> dict:
 
 def load_spread_model_cache(path: str, symbol: str, *,
                             spread_mode: str,
-                            watermark: dict | None):
+                            watermark: dict | None,
+                            require_watermark: bool = True):
     """读缓存并做四重校验，任何一处不过 → ValueError（提示重建，绝不静默）。
 
     1) 文件可读、结构完整；2) model_sha256 与模型负载一致（防手改/半截写）；
     3) 口径（mode）与请求一致；4) 品种在模型中且 tick 水位（rows/first/last）
     与当前库逐项一致。watermark=None（tick 库没了）而缓存还在属环境异常，同报错。
+
+    require_watermark=False（T27 研究库）：研究库 data_research **有意**不含
+    tick（tick 对研究账户拒读），水位核验无从做起——缓存必须自带水位
+    （第 4 检的前半仍执行），与主库 tick 的一致性由导出方
+    scripts/export_research_store.py 在导出时把关。
     """
     from mt5quant.costs import SpreadModel
     from mt5quant.costs.spread import BUCKET_TZ, SpreadStat
@@ -293,6 +322,8 @@ def load_spread_model_cache(path: str, symbol: str, *,
     wm_cached = wms.get(symbol)
     if wm_cached is None:
         raise ValueError(f"{symbol} 的 tick 水位不在点差缓存中——{REBUILD_HINT}")
+    if not require_watermark:
+        return model                       # 研究库：导出方已核水位
     if watermark is None:
         raise ValueError(
             f"{symbol} 当前无 tick 库却存在点差缓存（库被移动/删除？）——"
@@ -311,7 +342,8 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
                 allow_zero_swap: bool = False,
                 spread_mode: str = "relative",
                 sessions_sha: str | None = None,
-                cache: bool = True) -> tuple:
+                cache: bool = True,
+                research_store: bool = False) -> tuple:
     """tick 实测点差 + 佣金/隔夜费（calibrated.json > 品种快照 > 报错）。
 
     T28/M8：优先加载点差模型缓存 {data-root}/costs/spread_model.json（按
@@ -319,6 +351,12 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
     tick**（XAUUSD 全库全列约 3.7 GB）。CLI 主路径缺缓存先报错（见 main 的
     --build-cost-model）；本函数保留"无缓存→直建"回退是给 bt.py / 对账
     脚本 / 测试的兼容路径（cache=False 可强制直建）。
+
+    research_store=True（T27/H3）：data_root 是导出的研究库 data_research
+    ——它**有意**不含 tick（tick 对研究账户拒读，成本经缓存文件提供），
+    此时缓存文件必须存在（缺 → 报错指路 scripts/export_research_store.py，
+    研究侧无 tick 可自建），加载不做水位对照（新鲜度由导出方把关），也不
+    走"无 tick → 直建/零成本"回退。
 
     spread_mode（R1/T3）：relative（默认）＝(ask−bid)/mid 按**纽约本地小时**
     分位（T20：换日尖峰不被 DST 摊薄），引擎按成交基准价缩放——近期点差
@@ -347,7 +385,19 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
     cache_path = spread_model_cache_path(data_root)
     wm = tick_watermark(data_root, symbol)   # 只读 parquet 元数据，不载数据行
     used_cache = False
-    if cache and wm is not None and os.path.exists(cache_path):
+    if research_store:
+        # T27：研究库无 tick（拒读），缓存必须存在；不做水位对照（导出方已核）
+        if not os.path.exists(cache_path):
+            raise ValueError(
+                f"研究库缺成本缓存 {cache_path}——研究侧无 tick 库不能自建；"
+                "请管理员在主库侧重跑 scripts/export_research_store.py"
+                "（它会同时核验缓存与主库 tick 水位的一致性）")
+        spread = load_spread_model_cache(cache_path, symbol,
+                                         spread_mode=spread_mode,
+                                         watermark=None,
+                                         require_watermark=False)
+        used_cache = True
+    elif cache and wm is not None and os.path.exists(cache_path):
         spread = load_spread_model_cache(cache_path, symbol,
                                          spread_mode=spread_mode,
                                          watermark=wm)
@@ -356,7 +406,8 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
         if cache and wm is None and os.path.exists(cache_path):
             raise ValueError(
                 f"{symbol} 无 tick 库却存在点差缓存 {cache_path}——环境异常，"
-                f"请检查数据目录；确认后可{REBUILD_HINT}")
+                f"请检查数据目录；确认后可{REBUILD_HINT}"
+                "（研究库请用 --research-store）")
         ticks = load_ticks(data_root, symbol,
                            columns=["time_msc", "bid", "ask"])
         if ticks is None or len(ticks) == 0:
@@ -439,8 +490,12 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
 
     costs = Costs(spread=spread, slippage_model=slip, commission=commission,
                   swap=swap)
-    src = (f"缓存命中，tick 水位一致（{wm['rows']:,} 条实测）" if used_cache
-           else f"tick {len(ticks):,} 条实测点差")
+    if research_store:
+        src = "研究库缓存命中（导出时已对照主库 tick 水位）"
+    elif used_cache:
+        src = f"缓存命中，tick 水位一致（{wm['rows']:,} 条实测）"
+    else:
+        src = f"tick {len(ticks):,} 条实测点差"
     print(f"✓ 成本：{src}（{mode_tag}@NY p90"
           f"{'×成交价' if mode_tag == 'rel' else ''}）；{comm_tag}；{swap_tag}"
           + (f"；缺统计 {len(missing)} 个纽约小时（forbid 禁入）" if missing else ""))
@@ -522,7 +577,14 @@ def main() -> int:
     ap.add_argument("--timeframe", required=True,
                     help="M1/H1/D1 等（TIMEFRAME_SECONDS 之一）")
     ap.add_argument("--params", default="{}", help='JSON 字符串，如 \'{"k":1}\'')
-    ap.add_argument("--data-root", default="data")
+    ap.add_argument("--data-root", default=None,
+                    help="数据根目录；缺省 data，--research-store 时缺省"
+                         " data_research（显式给出者永远优先）")
+    ap.add_argument("--research-store", action="store_true",
+                    help="读导出的研究库 data_research（T27/H3：只含"
+                         " time < cutoff 的 K 线与成本缓存文件；无 tick，"
+                         "锁箱语义自然满足）。研究/审查账户用这个，主库"
+                         "仅管理员与实盘侧可读")
     ap.add_argument("--end", default=None,
                     help="只用该 UTC 时刻及之前的数据（naive UTC；越过锁箱 cutoff 会报错）")
     ap.add_argument("--out", default="data/reports/backtests")
@@ -571,23 +633,33 @@ def main() -> int:
     except ValueError as e:
         print(f"✗ --params 不是合法 JSON：{e}")
         return 1
+    data_root = resolve_data_root(args.data_root, args.research_store)
+    if args.research_store:
+        print(f"— 研究库模式（T27/H3）：--data-root 缺省 {data_root}"
+              "（无 tick，成本经 costs/spread_model.json 缓存；锁箱语义"
+              "自然满足——库里没有锁箱段）")
+        if args.build_cost_model:
+            print("✗ 研究库没有 tick（对研究账户拒读），--build-cost-model"
+                  " 无从建模型——请管理员在主库侧重跑 build_cost_model.py"
+                  " 与 export_research_store.py")
+            return 1
     try:
         strategy_cls = load_strategy(args.strategy)
-        contract_size = resolve_contract_size(args.data_root, args.symbol,
+        contract_size = resolve_contract_size(data_root, args.symbol,
                                               args.contract_size)
         # T23：定手数口径（默认风险定手数 0.005；见 resolve_lots_mode 语义）
         lots, sizing, sizing_info = resolve_lots_mode(args.risk_per_trade,
                                                       args.volume_lots)
         if sizing is not None:
-            vol_lo, vol_st, vol_hi = load_volume_limits(args.data_root,
+            vol_lo, vol_st, vol_hi = load_volume_limits(data_root,
                                                         args.symbol)
             sizing_info.update(vol_min=vol_lo, vol_step=vol_st, vol_max=vol_hi)
             print(f"✓ 定手数：按风险 {sizing.risk_fraction:.4%}"
                   f"（basis={sizing.basis}，vol {vol_lo}/{vol_st}/{vol_hi}）")
         else:
             print(f"✓ 定手数：固定 {lots} 手")
-        check_clock(args.data_root)
-        bars = load_series(args.data_root, args.symbol, args.timeframe.upper(),
+        check_clock(data_root)
+        bars = load_series(data_root, args.symbol, args.timeframe.upper(),
                            args.end)
         # T20：禁入窗唯一来源 config/sessions.toml（与实盘风控共用）
         sess_policy = load_session_policy(str(SESSIONS_PATH))
@@ -595,21 +667,25 @@ def main() -> int:
         if args.costs == "auto":
             # T28/M8：CLI 主路径缺缓存先报错（不静默重读全部 tick——那正是
             # M8 要消除的 4 GB 隐性加载）；--build-cost-model 为显式直建通道。
-            cache_path = spread_model_cache_path(args.data_root)
-            if args.build_cost_model:
-                from build_cost_model import build_cost_models  # scripts 目录
-                build_cost_models(args.data_root, [args.symbol],
-                                  spread_mode=args.spread_mode)
-            elif not os.path.exists(cache_path):
-                raise ValueError(
-                    f"缺 点差模型缓存 {cache_path}：先跑 "
-                    f"scripts/build_cost_model.py --data-root {args.data_root} "
-                    f"--symbols {args.symbol}"
-                    f"（或本次运行加 --build-cost-model 从 tick 现建）")
+            # T27：研究库模式下缺缓存/新鲜度由 build_costs(research_store=True)
+            # 给出更准确的指路（export_research_store）。
+            cache_path = spread_model_cache_path(data_root)
+            if not args.research_store:
+                if args.build_cost_model:
+                    from build_cost_model import build_cost_models  # scripts 目录
+                    build_cost_models(data_root, [args.symbol],
+                                      spread_mode=args.spread_mode)
+                elif not os.path.exists(cache_path):
+                    raise ValueError(
+                        f"缺 点差模型缓存 {cache_path}：先跑 "
+                        f"scripts/build_cost_model.py --data-root {data_root} "
+                        f"--symbols {args.symbol}"
+                        f"（或本次运行加 --build-cost-model 从 tick 现建）")
             costs, cost_version = build_costs(
-                args.data_root, args.symbol, args.spread_fraction,
+                data_root, args.symbol, args.spread_fraction,
                 args.commission, allow_zero_swap=args.allow_zero_swap,
-                spread_mode=args.spread_mode, sessions_sha=sess_sha)
+                spread_mode=args.spread_mode, sessions_sha=sess_sha,
+                research_store=args.research_store)
         else:
             costs, cost_version = ZeroCosts(), "zero-v0"
         entry_policy = entry_policy_for(costs, args.symbol, sess_policy)
@@ -619,7 +695,7 @@ def main() -> int:
             result = run_backtest_ticks(
                 strategy_cls(), bars,
                 lambda start_msc, end_msc: load_ticks(
-                    args.data_root, args.symbol,
+                    data_root, args.symbol,
                     start_msc=start_msc, end_msc=end_msc),
                 costs, symbol=args.symbol, params=params,
                 contract_size=contract_size,
@@ -659,7 +735,9 @@ def main() -> int:
                    "slippage_price": args.slippage_price,
                    "sizing": sizing_info,      # T23：定手数方式进 manifest
                    "sessions_path": str(SESSIONS_PATH),
-                   "sessions_sha256": sess_sha})
+                   "sessions_sha256": sess_sha,
+                   "research_store": bool(args.research_store),   # T27
+                   "data_root": str(data_root)})
     except Exception as e:  # fail-fast：任何错误如实报出
         print(f"✗ {type(e).__name__}: {e}")
         return 1

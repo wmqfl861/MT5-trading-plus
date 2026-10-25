@@ -9,11 +9,19 @@
   **失败的运行也记一行**（metrics_json 里 ok=false + error 摘要）；
 - gates(run_id, gate, passed, details_json)——关卡结果（T12 消费）；
 - lockbox_uses(card_id UNIQUE, used_at_utc, approved_by, result_json,
-  status)——锁箱一次性：status ∈ {"started", "done"}（T21a/C3）——
+  status, cutoff)——锁箱一次性：status ∈ {"started", "done"}（T21a/C3）——
   G5 读锁箱数据**之前**先写 started（record_lockbox_start），评估结束写
   结果（finish_lockbox_use → done）；已有 started 行（上次崩溃残留）同样
   视为已用（lockbox_used），第二次插入直接 sqlite3.IntegrityError。
   旧库无 status 列 → 打开时自动补列（旧行按终态 done 处理）。
+  cutoff 列（T27/M11）：该次使用消耗的是哪个锁箱（ISO naive UTC）；
+  旧库迁移补列，旧行 NULL = 预算制度前的既往锁箱，不计入当前 cutoff
+  的预算计数。
+- lockbox_budget(cutoff PRIMARY KEY, max_uses, created_utc)——项目级
+  锁箱使用预算（T27/M11/D16：几十张卡各看一次锁箱 = 在锁箱上做选择）。
+  lockbox_budget() 登记并返回状态；max_uses 首登记生效，缺省
+  DEFAULT_LOCKBOX_MAX_USES=5（D16 待用户决定，未决定前硬编码默认 +
+  参数可覆盖；调整预算是管理员改库动作，不改代码）。
 
 metrics_json 结构：{"ok": bool, "error": str|None, "metrics": dict|None}。
 时间一律 aware-UTC ISO（created_utc 校验强制带时区——它要和卡的提交时间比）。
@@ -76,9 +84,21 @@ CREATE TABLE IF NOT EXISTS lockbox_uses(
   used_at_utc TEXT NOT NULL,
   approved_by TEXT NOT NULL,
   result_json TEXT NOT NULL,
-  status      TEXT NOT NULL DEFAULT 'done'
+  status      TEXT NOT NULL DEFAULT 'done',
+  cutoff      TEXT
+);
+CREATE TABLE IF NOT EXISTS lockbox_budget(
+  cutoff      TEXT NOT NULL PRIMARY KEY,
+  max_uses    INTEGER NOT NULL,
+  created_utc TEXT NOT NULL
 );
 """
+
+# T27/M11（D16 未决）：每个锁箱（cutoff）最多允许多少次 G5——
+# 多张卡各看一次锁箱等于在锁箱上做选择，需要项目级预算。
+# 蓝图 §8 的建议值是 5；用户对 D16 拍板前以此为硬编码默认，
+# lockbox_budget(cutoff, max_uses=N) 首次登记时可覆盖。
+DEFAULT_LOCKBOX_MAX_USES = 5
 
 
 def _san(obj):
@@ -105,6 +125,18 @@ def _iso(dt) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
 
+def _cutoff_iso(cutoff) -> str | None:
+    """锁箱 cutoff 的统一键形态：str 直通，datetime/pd.Timestamp 取
+    isoformat（naive UTC 语义，与 lockbox.json 的存法一致）。None → None。"""
+    if cutoff is None or isinstance(cutoff, str):
+        return cutoff
+    import pandas as pd
+
+    if isinstance(cutoff, pd.Timestamp):
+        return cutoff.isoformat()
+    return cutoff.isoformat()
+
+
 class Ledger:
     """试验台账句柄；用完 close（或 with）。所有写入即时提交。"""
 
@@ -128,6 +160,12 @@ class Ledger:
                 self.conn.execute(
                     "ALTER TABLE lockbox_uses ADD COLUMN status TEXT"
                     " NOT NULL DEFAULT 'done'")
+        # T27 迁移：老库的 lockbox_uses 无 cutoff 列（预算制度前）——补列，
+        # 旧行 NULL = 既往锁箱，不计入任何 cutoff 的预算计数
+        if "cutoff" not in cols:
+            with self.conn:
+                self.conn.execute(
+                    "ALTER TABLE lockbox_uses ADD COLUMN cutoff TEXT")
 
     def close(self) -> None:
         self.conn.close()
@@ -195,38 +233,45 @@ class Ledger:
                  json.dumps(_san(details), ensure_ascii=False)))
 
     def record_lockbox_use(self, card_id: str, *, approved_by: str,
-                           result: dict) -> None:
+                           result: dict, cutoff: str | None = None) -> None:
         """锁箱使用登记（直接写终态）：同一 card_id 第二次插入 →
         sqlite3.IntegrityError。不捕获、不绕过——"只能用一次"由 UNIQUE
         约束钉死。G5 的常规路径用 record_lockbox_start + finish_lockbox_use
         （T21a：读锁箱数据前先写 started，防中途崩溃后重跑）。
+        cutoff（T27）：该次使用消耗的锁箱（ISO naive UTC），供预算计数。
         """
         with self.conn:
             self.conn.execute(
                 "INSERT INTO lockbox_uses(card_id, used_at_utc, approved_by,"
-                " result_json, status) VALUES (?,?,?,?,'done')",
+                " result_json, status, cutoff) VALUES (?,?,?,?, 'done', ?)",
                 (card_id, datetime.now(timezone.utc).isoformat(), approved_by,
-                 json.dumps(_san(result), ensure_ascii=False)))
+                 json.dumps(_san(result), ensure_ascii=False),
+                 _cutoff_iso(cutoff)))
 
-    def record_lockbox_start(self, card_id: str, *, approved_by: str) -> None:
+    def record_lockbox_start(self, card_id: str, *, approved_by: str,
+                             cutoff: str | None = None) -> None:
         """写 status='started' 行（T21a/C3：G5 读锁箱数据**之前**调用）。
 
         同一 card_id 已有任何行（含上次崩溃残留的 started）→
         sqlite3.IntegrityError（UNIQUE 约束）；started 行同样算已用。
+        cutoff（T27）：预算计数口径，见 lockbox_budget。
         """
         with self.conn:
             self.conn.execute(
                 "INSERT INTO lockbox_uses(card_id, used_at_utc, approved_by,"
-                " result_json, status) VALUES (?,?,?,?,'started')",
+                " result_json, status, cutoff)"
+                " VALUES (?,?,?,?,'started',?)",
                 (card_id, datetime.now(timezone.utc).isoformat(), approved_by,
-                 "{}"))
+                 "{}", _cutoff_iso(cutoff)))
 
     def finish_lockbox_use(self, card_id: str, *, result: dict,
-                           approved_by: str = "bt") -> None:
+                           approved_by: str = "bt",
+                           cutoff: str | None = None) -> None:
         """评估结束写终态：started → done（保留 started 行的批准人与时刻）。
 
         无 started 行（run_g5 被直接调用的路径）→ 插入完整 done 行；
         已有 done 行 → sqlite3.IntegrityError（一次性机会已消耗）。
+        cutoff 只在无 started 行需要插入时使用（started 行已带口径）。
         """
         payload = json.dumps(_san(result), ensure_ascii=False)
         with self.conn:
@@ -244,9 +289,9 @@ class Ledger:
                     "（UNIQUE 约束）——锁箱一次性已消耗")
             self.conn.execute(
                 "INSERT INTO lockbox_uses(card_id, used_at_utc, approved_by,"
-                " result_json, status) VALUES (?,?,?,?,'done')",
+                " result_json, status, cutoff) VALUES (?,?,?,?, 'done', ?)",
                 (card_id, datetime.now(timezone.utc).isoformat(), approved_by,
-                 payload))
+                 payload, _cutoff_iso(cutoff)))
 
     # ---------------------------------------------------------------- 读
 
@@ -263,6 +308,50 @@ class Ledger:
             "SELECT status FROM lockbox_uses WHERE card_id=?",
             (card_id,)).fetchone()
         return None if row is None else str(row["status"])
+
+    # ------------------------------------------------ 锁箱预算（T27/M11/D16）
+
+    def lockbox_budget(self, cutoff, max_uses: int | None = None) -> dict:
+        """登记（幂等）并返回该 cutoff 的锁箱使用预算状态（T27/M11）。
+
+        - 首次见到该 cutoff → 写入 max_uses（缺省
+          DEFAULT_LOCKBOX_MAX_USES=5，可参数覆盖；非正数 → ValueError）；
+        - 已有行 → 表内值权威，参数不再覆盖（调预算 = 管理员改库动作，
+          改代码缺省不动已登记的锁箱）；
+        - used = lockbox_uses 中 cutoff 匹配的行数（**含 started**——读了
+          就算看过；旧库 NULL 行属预算制度前的既往锁箱，不计入）；
+        - exhausted = used >= max_uses：G5 的 begin_lockbox / run_g5 直调
+          路径据此拒绝（见 mt5quant.validation.gates）。
+
+        返回 {"cutoff", "max_uses", "used", "remaining", "exhausted"}。
+        """
+        key = _cutoff_iso(cutoff)
+        if key is None:
+            raise ValueError("lockbox_budget 需要 cutoff（锁箱标识）")
+        row = self.conn.execute(
+            "SELECT max_uses FROM lockbox_budget WHERE cutoff=?",
+            (key,)).fetchone()
+        if row is None:
+            limit = DEFAULT_LOCKBOX_MAX_USES if max_uses is None \
+                else int(max_uses)
+            if limit <= 0:
+                raise ValueError(
+                    f"max_uses 必须为正整数，收到 {max_uses!r}——预算为零或"
+                    "负数应直接不登记 G5，而不是写进表里")
+            with self.conn:
+                self.conn.execute(
+                    "INSERT INTO lockbox_budget(cutoff, max_uses,"
+                    " created_utc) VALUES (?,?,?)",
+                    (key, limit,
+                     datetime.now(timezone.utc).isoformat()))
+        else:
+            limit = int(row["max_uses"])
+        used = int(self.conn.execute(
+            "SELECT COUNT(*) n FROM lockbox_uses WHERE cutoff=?",
+            (key,)).fetchone()["n"])
+        return {"cutoff": key, "max_uses": limit, "used": used,
+                "remaining": max(0, limit - used),
+                "exhausted": used >= limit}
 
     def gate_passed(self, card_id: str, gate: str) -> bool:
         """该卡是否有某道关卡的**通过**记录（G5 前置：未过 G3 拒跑）。

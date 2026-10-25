@@ -112,13 +112,18 @@ tick_volume, spread, real_volume`；只存**已收盘**的 bar（末根 bar 收�
 `data.parquet.bak-时间戳`）。跨进程写有按序列的文件锁；写入原子（临时文件 +
 fsync + os.replace）。品种名保留大小写（`XAUUSDm` 等后缀品种可用）。
 
-本机建模直接读文件（不要走 MCP）：
+数据读取（T27/H3 物理隔离）：**主库 `data/bars`、`data/ticks` 仅限管理员
+与实盘侧**（含完整锁箱段，研究/审查账户拒读，ACL 见 `docs/p6/permissions.md`）。
+研究侧读**研究库** `data_research/`——管理员跑 `scripts/export_research_store.py`
+导出的隔离副本（只含 `time < cutoff` 的 K 线 + 成本模型缓存文件；tick 不进
+研究库，成本经 `data_research/costs/spread_model.json` 提供），CLI 加
+`--research-store` 即可（`--data-root` 缺省切到 `data_research`）：
 
 ```python
 import duckdb, pandas as pd
-df = pd.read_parquet("data/bars/XAUUSD/H1/data.parquet")            # 全速 pandas
+df = pd.read_parquet("data_research/bars/XAUUSD/H1/data.parquet")      # 研究侧
 con = duckdb.connect()
-df = con.execute("SELECT * FROM read_parquet('data/bars/*/*/data.parquet', filename=true) WHERE ...").fetchdf()
+df = con.execute("SELECT * FROM read_parquet('data_research/bars/*/*/data.parquet', filename=true) WHERE ...").fetchdf()
 ```
 
 历史深度：终端"图表最大柱数"已从默认 10 万调大到 1 亿
@@ -159,7 +164,10 @@ UTF-16 编码，改前需先关终端再改再启动）。当前各序列已取�
 cutoff 直接报错（绝不静默截断）；MCP `get_bars` 同一约束（越界报错、缺省
 时间钳到 cutoff 并在响应中带 `lockbox_cutoff` 字段）。实盘/信号侧不受限
 （直读 `store.load_bars`）。`scripts/export_lockbox.py` 把锁定段导出为独立
-目录的物理副本（供 G5 锁箱测试与实盘侧读取；文件权限隔离属后续阶段）。
+目录的物理副本（供 G5 锁箱测试与实盘侧读取）；`scripts/export_research_store.py`
+（T27）反向导出**研究库** `data_research/`（开放段 + 成本缓存，导出后自检
+任何序列 `last_time < cutoff`），研究/审查账户只能读研究库。每个锁箱另有
+**使用预算**（D16 待定，缺省 5 次 G5；用尽即拒，台账 `lockbox_budget` 表）。
 
 ## 研究层（mt5quant：成本模型 / 策略 / A 层回测）
 
@@ -185,8 +193,11 @@ cutoff 直接报错（绝不静默截断）；MCP `get_bars` 同一约束（越�
 ```bash
 .venv/Scripts/python.exe scripts/snapshot_specs.py      # 首次：写 data/specs/latest.json（含合约大小）
 .venv/Scripts/python.exe scripts/run_backtest.py --strategy mt5quant.strategies.library.buy_hold:BuyHold \
-    --symbol XAUUSD --timeframe H1 --params '{}' --end 2025-09-01 --commission 0
+    --symbol XAUUSD --timeframe H1 --params '{}' --end 2025-09-01 --commission 0 --research-store
 ```
+
+研究侧一律加 `--research-store`（读 `data_research`；主库 `data/bars`
+仅管理员与实盘侧可读）。
 
 审核报告与后续计划：`docs/reviews/`（各轮审核）、`docs/blueprint.md`（蓝图与现状）、
 `docs/superpowers/plans/2026-10-26-round4-optimization.md`（当前施工计划；上一轮为 `2026-10-25-review-fixes-p3b-p4.md`）。
@@ -204,7 +215,8 @@ cutoff 直接报错（绝不静默截断）；MCP `get_bars` 同一约束（越�
 
 ## MCP 数据服务（mt5mcp，给远程 agent 用）
 
-本机建模**直读 Parquet/DuckDB，不要走 MCP**；MCP 是给远程服务器上的 agent
+本机建模**直读研究库 Parquet/DuckDB（`data_research`，不要走 MCP）**——
+主库 `data/bars`、`data/ticks` 仅管理员与实盘侧可读；MCP 是给远程服务器上的 agent
 开的一扇有界的门：四个工具 `list_series` / `get_bars`（≤500 根，DuckDB 下推
 过滤，不整文件载入）/ `describe_series`（含最大相邻间隔）/ `compute_indicator`
 （服务端现算 sma/ema/rsi/atr/macd/bbands，只读尾部 limit+预热期，并发受信号量

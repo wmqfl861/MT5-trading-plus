@@ -416,3 +416,68 @@ def test_buyhold_reference_is_untouched():
     bars = base4()
     sig = BuyHold().generate_signals(bars, {})
     assert set(sig) == {1}
+
+
+# --------------------------------------------- T27（H3）：--ops-ack 闸门
+
+def _add_lockbox(root, cutoff="2026-01-05T06:00:00"):
+    from mt5data.lockbox import write_global_cutoff
+    write_global_cutoff(str(root), pd.Timestamp(cutoff), note="测试")
+
+
+def test_cli_requires_ops_ack_when_window_hits_lockbox(tmp_path, data_root,
+                                                       capsys):
+    """计划失败测试（T27）：对账窗触到锁箱期而无 --ops-ack → 拒绝并说明，
+    不读 bars、不写报告。"""
+    _add_lockbox(data_root)                    # cutoff 落在 tick 窗中段
+    mod = _load_script()
+    code = mod.main([
+        "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+        "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
+        "--data-root", str(data_root), "--volume-lots", "0.01",
+        "--slippage-price", "0.05", "--allow-zero-swap",
+        "--out", str(tmp_path / "reports")])
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "--ops-ack" in out and "锁箱" in out
+    assert not list((tmp_path / "reports").iterdir()) \
+        if (tmp_path / "reports").exists() else True
+
+
+def test_cli_ops_ack_records_ledger_row_actor_ops(tmp_path, data_root):
+    """--ops-ack：照常对账，并在台账记一行 actor=ops（供审计）。"""
+    from mt5quant.research.ledger import Ledger
+
+    _add_lockbox(data_root)
+    mod = _load_script()
+    code = mod.main([
+        "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+        "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
+        "--data-root", str(data_root), "--volume-lots", "0.01",
+        "--slippage-price", "0.05", "--allow-zero-swap",
+        "--ops-ack",
+        "--out", str(tmp_path / "reports")])
+    assert code == 0
+    ledger_path = data_root / "research" / "ledger.sqlite"
+    assert ledger_path.is_file()
+    with Ledger(ledger_path, create=False) as led:
+        row = led.conn.execute(
+            "SELECT card_id, actor, metrics_json FROM runs").fetchone()
+    assert row["actor"] == "ops"
+    assert row["card_id"].startswith("OPS-")
+    assert json.loads(row["metrics_json"])["ok"] is True
+
+
+def test_cli_window_before_cutoff_needs_no_ack(tmp_path, data_root):
+    """对账窗整体早于 cutoff（历史窗对账）→ 不需要 --ops-ack。"""
+    _add_lockbox(data_root, cutoff="2030-01-01T00:00:00")
+    mod = _load_script()
+    code = mod.main([
+        "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+        "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
+        "--data-root", str(data_root), "--volume-lots", "0.01",
+        "--slippage-price", "0.05", "--allow-zero-swap",
+        "--out", str(tmp_path / "reports")])
+    assert code == 0
+    # 无 ops 行（没读锁箱期数据，不需要豁免登记）
+    assert not (data_root / "research" / "ledger.sqlite").exists()

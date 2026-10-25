@@ -900,9 +900,9 @@ def test_g5_orchestrate_protocol_order(tmp_path, monkeypatch):
                           "params": {}}]})
     real_begin = mod.vgate.begin_lockbox
 
-    def _begin(led_, card, *, approved_by):
+    def _begin(led_, card, *, approved_by, cutoff=None):
         calls.append("begin")
-        real_begin(led_, card, approved_by=approved_by)
+        real_begin(led_, card, approved_by=approved_by, cutoff=cutoff)
 
     window = ramp_bars(8)
     cutoff = window["time"].iloc[4]

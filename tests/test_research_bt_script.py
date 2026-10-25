@@ -490,3 +490,59 @@ def test_gate_risk_sizing_passes_spec_through_g2(tmp_path, monkeypatch,
     assert "error" not in det                   # G2 全部子检查跑完（无接线错误）
     assert set(det["checks"]) >= {"cost_scaling", "param_plateau",
                                   "random_entry_benchmark", "delay_1_bar"}
+
+
+# ------------------------------------------------- T27（H3）：研究库切换
+
+
+def make_research_root(tmp_path, n=6):
+    """cwd 相对的研究库：bars + specs（研究侧不读主库 data/）。"""
+    root = tmp_path / "data_research"
+    sdir = root / "bars" / "XAUUSD" / "H1"
+    sdir.mkdir(parents=True)
+    h1_bars(n).to_parquet(sdir / "data.parquet")
+    specs = root / "specs"
+    specs.mkdir(parents=True)
+    (specs / "latest.json").write_text(
+        json.dumps({"XAUUSD": {"contract_size": 100.0, "volume_min": 0.01,
+                               "volume_step": 0.01, "volume_max": 200.0}}),
+        encoding="utf-8")
+    return root
+
+
+def test_screen_research_store_switch(tmp_path, monkeypatch, capsys):
+    """--research-store：--data-root 缺省切到 cwd 的 data_research；台账
+    缺省仍落 data/research/ledger.sqlite（permissions.md：研究库对研究
+    账户只读，可写的台账目录是 data\research）。"""
+    mod = load_bt()
+    make_research_root(tmp_path)
+    cards_dir = write_card(tmp_path)
+    patch_card_git(monkeypatch, mod)
+    monkeypatch.chdir(tmp_path)            # cwd 下只有 data_research，无 data/
+    rc = mod.main(
+        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--research-store",
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--volume-lots", "0.01"])
+    assert rc == 0, capsys.readouterr().out
+    ledger_default = tmp_path / "data" / "research" / "ledger.sqlite"
+    assert ledger_default.is_file()        # 台账不在只读的研究库里
+    assert not (tmp_path / "data_research" / "research").exists()
+    with Ledger(ledger_default) as led:
+        assert led.stats("H099")["total_runs"] == 1
+
+
+def test_screen_default_data_root_unchanged(tmp_path, monkeypatch, capsys):
+    """对照：不给 --research-store 时缺省 data/——cwd 无 data → 装配失败。"""
+    mod = load_bt()
+    make_research_root(tmp_path)
+    cards_dir = write_card(tmp_path)
+    patch_card_git(monkeypatch, mod)
+    monkeypatch.chdir(tmp_path)
+    rc = mod.main(
+        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--volume-lots", "0.01",
+         "--ledger", str(tmp_path / "l.sqlite")])
+    assert rc == 1
+    assert "装配失败" in capsys.readouterr().out
