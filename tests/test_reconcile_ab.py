@@ -132,10 +132,13 @@ def trades_frame(rows):
 # --------------------------------------------- 默认容差常量（计划的回归锚点）
 
 def test_default_tolerances_match_plan():
+    """容差锚点（T26 1,101 笔实测修订：换日窗空窗 max 111s；保护性越幅/风险 p95 0.188）。"""
     mod = _load_script()
-    assert mod.TOL_ENTRY_TIME_MS == 2_000     # 信号类时间容差 2s（真机实测 1ms 到达抖动）
-    assert mod.TOL_EXIT_TIME_SIGNAL_MS == 2_000
-    assert mod.NET_TOL_SPREADS == 1.0          # 每笔净利差 ≤ 1 个点差
+    assert mod.TOL_ENTRY_TIME_MS == 120_000    # 信号类时间容差 120s（换日窗 tick 空窗）
+    assert mod.TOL_EXIT_TIME_SIGNAL_MS == 120_000
+    assert mod.NET_TOL_SPREADS == 1.0          # signal/end_of_data 净利差 ≤ 1 点差
+    assert mod.NET_TOL_RISK_MULTIPLE == 1.0    # 保护性另容 max(1 点差, 1×初始风险)
+    assert mod.EXIT_TIME_PROTECTIVE_BARS == 6.0  # 保护性出场时间容差 6 根 bar
 
 
 def test_module_doc_states_lockbox_exemption_and_direct_load():

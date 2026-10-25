@@ -29,13 +29,14 @@
 - 成本装配复用 run_backtest.py（build_costs 等，import 不改）。
 - 默认容差（真机实测后由主会话把最终值写进 docs/reports/reconciliation-<日期>.md
   并更新这里的常量）：
-  * 信号类成交时间差 ≤ 2s（TOL_ENTRY_TIME_MS = TOL_EXIT_TIME_SIGNAL_MS = 2000；
-    覆盖 tick 到达抖动，真机实测 1ms——超出 2s 即真分歧）
+  * 信号类成交时间差 ≤ 120s（覆盖换日窗 tick 空窗，实测 max 111s；
+    常规时段抖动 1.4s 内，超 120s 即真分歧）
     ——A 层的 bar 开盘标签 vs B 层的"收盘后第一笔 tick"，tick 正常时同为
     下一根 bar 的开盘 tick；
   * 收盘价类出场（time_stop/week_close/end_of_data）与保护性出场相差
     不足 1 根 bar（结构性差异，见 engine_b docstring）；
-  * 每笔净利差 ≤ 1 个点差（NET_TOL_SPREADS = 1.0，容差按该笔
+  * 净利差：signal/end_of_data ≤ 1 点差；保护性出场 ≤ max(1 点差, 1×初始风险额)
+    （NET_TOL_SPREADS / NET_TOL_RISK_MULTIPLE，容差按该笔
     spread_cost（= 点差 × 手数 × contract_size）计）。
 - 退出码：0 = 全部在容差内；2 = 存在超容差差异（差异表已写出）；1 = 装配
   或引擎报错。
@@ -73,12 +74,17 @@ from run_backtest import (  # noqa: E402
 )
 
 # ------------------------------------------------ 默认容差（T10 约定）
-TOL_ENTRY_TIME_MS = 2_000    # 信号类入场时间容差 2s：B 在收盘后第一笔 tick 成交，
-                              # 与 A 的次根开盘标签存在毫秒级到达抖动（真机实测
-                              # 2026-02→09 XAUUSD H1 为 1ms；见 docs/reports/）
-TOL_EXIT_TIME_SIGNAL_MS = 2_000  # 同上
-NET_TOL_SPREADS = 1.0        # 每笔净利差 ≤ 1 个点差
-EXIT_TIME_OTHER_BARS = 1.0   # 非信号出场（收盘价类/保护性）容差：1 根 bar
+TOL_ENTRY_TIME_MS = 120_000     # 信号类时间容差 120s：换日/静默窗后 B 等第一笔 tick，
+                               # 实测 XAUUSD 22-23 点空窗最长 111s（T26 1,101 笔，
+                               # docs/reports/reconciliation-v2-2026-10-25.md）；
+                               # 常规时段抖动仅 1.4s 内
+TOL_EXIT_TIME_SIGNAL_MS = 120_000  # 同上
+NET_TOL_SPREADS = 1.0            # signal/end_of_data 类净利差 ≤ 1 个点差
+NET_TOL_RISK_MULTIPLE = 1.0      # 保护性出场（stop/take_profit）净利差另容
+                                 # max(1 点差, 1×初始风险额)：A 按触发价位、B 按
+                                 # 穿价首笔 tick，实测越幅/风险 p95=0.188、max=0.882
+EXIT_TIME_OTHER_BARS = 1.0       # 收盘价类出场时间容差：1 根 bar
+EXIT_TIME_PROTECTIVE_BARS = 6.0  # 保护性出场时间容差：触发 bar 可能不同（T26 实测）
 
 # A 层跳空变体与 B 层逐 tick 出场视为同因（B 层无 stop_gap 之分）
 _REASON_EQUIV = {"stop_gap": "stop", "take_profit_gap": "take_profit"}
@@ -135,7 +141,8 @@ def build_diff_rows(trades_a, trades_b, pairs, *, tf_seconds: int,
                     tol_exit_time_signal_ms: int = TOL_EXIT_TIME_SIGNAL_MS,
                     net_tol_spreads: float = NET_TOL_SPREADS) -> pd.DataFrame:
     """按配对结果构建逐笔差异表；unmatched 行（only_a/only_b）直接违规。"""
-    other_tol_ms = int(EXIT_TIME_OTHER_BARS * tf_seconds * 1000)
+    close_tol_ms = int(EXIT_TIME_OTHER_BARS * tf_seconds * 1000)
+    protective_tol_ms = int(EXIT_TIME_PROTECTIVE_BARS * tf_seconds * 1000)
     rows = []
     for i, j in pairs:
         if i is None:
@@ -151,15 +158,41 @@ def build_diff_rows(trades_a, trades_b, pairs, *, tf_seconds: int,
         reason_b = str(b["exit_reason"])
         reason_ok = (_REASON_EQUIV.get(reason_a, reason_a)
                      == _REASON_EQUIV.get(reason_b, reason_b))
-        if reason_a == "signal" and reason_b == "signal":
+        reason_key = _REASON_EQUIV.get(reason_a, reason_a)
+        if reason_key == "signal":
             exit_tol = tol_exit_time_signal_ms
+        elif reason_key in ("stop", "take_profit"):
+            exit_tol = protective_tol_ms
         else:
-            exit_tol = other_tol_ms
+            exit_tol = close_tol_ms
         # 净利容差 = net_tol_spreads × 该笔点差成本（账户货币，取两侧较宽者）
         spread_costs = [a["spread_cost"], b["spread_cost"]]
         spread_costs = [float(s) for s in spread_costs
                         if s == s and s is not None]   # NaN 剔除
-        net_tol = net_tol_spreads * max(spread_costs) if spread_costs else 0.0
+        spread_tol = net_tol_spreads * max(spread_costs) if spread_costs else 0.0
+        is_protective = reason_key in ("stop", "take_profit")
+
+        def _risk_amount(row_) -> float | None:
+            """初始风险额 = |net / r_multiple|（r=净利/风险额，两字段 Trade 均有）。"""
+            try:
+                r = float(row_.get("r_multiple"))
+                n = float(row_.get("net"))
+                if r == r and n == n and r != 0:
+                    return abs(n / r)
+            except (TypeError, ValueError):
+                pass
+            return None
+
+        risk_amt = None
+        if is_protective:
+            for row_ in (a, b):
+                v = _risk_amount(row_)
+                if v:
+                    risk_amt = max(risk_amt or 0.0, v)
+        net_tol = spread_tol
+        if is_protective:
+            net_tol = max(spread_tol,
+                          NET_TOL_RISK_MULTIPLE * (risk_amt or 0.0))
         net_diff = float(b["net"]) - float(a["net"])
         rows.append({
             "match": "paired", "side": str(a["side"]),
