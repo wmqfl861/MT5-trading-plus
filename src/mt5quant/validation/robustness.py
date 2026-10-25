@@ -7,7 +7,9 @@
 - cross_symbol：通用逻辑 ≥2 个品种净利为正（可用品种不足 2 → 不适用）；
 - random_entry_benchmark：随机入场蒙特卡洛（同交易数、同持仓时长分布、
   同出场规则——随机信号喂给**同一个引擎**，保护性出场照常触发），
-  策略夏普须高于其 95 分位；
+  策略夏普须高于其 95 分位；T21e/M7 起入场时刻按策略实际入场的
+  **纽约本地小时分布**抽样、多空比例与策略一致（旧实现全场随机 +
+  五五开，基准被高成本小时压低，策略更容易胜出）；
 - buy_hold_benchmark：纯多头策略夏普须高于同期买入持有（否则不适用）；
 - drop_best_5pct：去掉净利最好的 5% 交易后仍盈利；
 - delay_1_bar：全部信号延迟一根 bar 执行（更保守的成交时刻）仍盈利。
@@ -19,6 +21,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -27,6 +30,8 @@ from mt5quant.backtest.engine_a import run_backtest
 from mt5quant.backtest.report import bars_per_year, observed_bars_per_year
 from mt5quant.strategies import BaseStrategy, BuyHold
 from mt5quant.strategies.base import ExitRules
+
+NY_TZ = ZoneInfo("America/New_York")   # 与点差分桶/换日窗同一时区（T20）
 
 
 @dataclass(frozen=True)
@@ -251,30 +256,65 @@ def cross_symbol_check(strategy, bars_by_symbol, costs_by_symbol,
             "net_by_symbol": nets}
 
 
+def ny_local_hours(times) -> np.ndarray:
+    """时间序列（naive UTC 或 aware）→ 纽约本地小时数组（M7 抽样口径，
+    与 T20 点差分桶同时区）。"""
+    s = pd.to_datetime(pd.Series(times))
+    if s.dt.tz is None:
+        s = s.dt.tz_localize("UTC")
+    return s.dt.tz_convert(NY_TZ).dt.hour.to_numpy(dtype="int64")
+
+
 def _random_signal_series(n: int, n_trades: int, durations: np.ndarray,
-                          rng) -> np.ndarray:
-    """随机 ±1 入场、持仓时长从经验分布抽取、互不重叠（中间隔至少 1 根 0）。"""
+                          rng, *, positions_by_hour: dict[int, np.ndarray],
+                          hour_probs: np.ndarray, long_prob: float):
+    """随机 ±1 入场（T21e/M7 口径）：
+
+    - 入场 bar 先按策略实际入场的纽约本地小时分布（hour_probs）抽小时，
+      再在该小时的候选 bar（positions_by_hour）里均匀抽一根；
+    - 方向按 long_prob（策略的多头占比）抽，不再五五开；
+    - 持仓时长仍从策略的经验分布抽取；互不重叠（中间隔至少 1 根 0）；
+    - 某小时候选耗尽/重叠放不下 → 放弃该次尝试重抽（保持小时口径，
+      不回退到全场随机）；重试上限内放不满则如实少放（placed < n_trades）。
+
+    返回 (sig, 入场小时列表, 方向列表)——诊断统计用。
+    """
     sig = np.zeros(n, dtype=np.int64)
-    starts = rng.permutation(np.arange(1, n))
     placed = 0
-    for start in starts:
-        if placed >= n_trades:
-            break
+    hours_out: list[int] = []
+    sides_out: list[int] = []
+    max_attempts = 60 * n_trades + 200
+    attempts = 0
+    while placed < n_trades and attempts < max_attempts:
+        attempts += 1
         d = max(1, int(durations[int(rng.integers(0, len(durations)))]))
+        h = int(rng.choice(len(hour_probs), p=hour_probs))
+        pool = positions_by_hour.get(h)
+        if pool is None or len(pool) == 0:
+            continue
+        start = int(pool[int(rng.integers(0, len(pool)))])
         end = start + d
         if end + 1 > n:
             continue
         if sig[max(0, start - 1):end + 1].any():
             continue
-        sig[start:end] = 1 if rng.integers(0, 2) else -1
+        side = 1 if rng.random() < long_prob else -1
+        sig[start:end] = side
         placed += 1
-    return sig
+        hours_out.append(h)
+        sides_out.append(side)
+    return sig, hours_out, sides_out
 
 
 def random_entry_check(spec, bars, costs, base_trades, base_sharpe, *,
                        sims: int, percentile: float, seed: int) -> dict:
     """随机入场蒙特卡洛：同交易数、同持仓时长分布、同出场规则（随机信号
-    喂给同一个 A 层引擎，保护性出场照常触发）；策略夏普须高于分位阈值。"""
+    喂给同一个 A 层引擎，保护性出场照常触发）；策略夏普须高于分位阈值。
+
+    T21e/M7：随机入场不再是"任意时刻 + 五五开"——入场时刻按策略实际
+    入场的纽约本地小时分布抽样、多空比例与策略一致，基准与策略在同一
+    时段结构与方向结构上比较（不被高成本小时或方向错配压低）。
+    """
     if not len(base_trades) or base_sharpe is None:
         return {"passed": False, "valid_sims": 0, "p95": None,
                 "reason": "无交易或夏普无定义，无法对比随机入场基准"}
@@ -282,9 +322,30 @@ def random_entry_check(spec, bars, costs, base_trades, base_sharpe, *,
     n_trades = len(base_trades)
     exit_rules = spec.strategy.exit_rules
     rng = np.random.default_rng(seed)
+
+    # 策略实际入场的纽约本地小时分布 + 多空比例（M7 抽样口径）
+    base_hours = ny_local_hours(base_trades["entry_time"])
+    hour_counts = np.bincount(base_hours, minlength=24).astype("float64")
+    hour_probs = hour_counts / hour_counts.sum()
+    bar_hours = ny_local_hours(bars["time"])
+    positions_by_hour: dict[int, np.ndarray] = {}
+    for h in np.flatnonzero(hour_counts > 0):
+        positions_by_hour[int(h)] = np.flatnonzero(bar_hours == h)
+    long_prob = float((base_trades["side"] == "long").mean())
+
     sharpes: list[float] = []
+    sampled_hour_counts = np.zeros(24, dtype="int64")
+    sampled_longs = 0
+    sampled_total = 0
     for _ in range(int(sims)):
-        sig = _random_signal_series(len(bars), n_trades, durations, rng)
+        sig, hours_out, sides_out = _random_signal_series(
+            len(bars), n_trades, durations, rng,
+            positions_by_hour=positions_by_hour, hour_probs=hour_probs,
+            long_prob=long_prob)
+        for h, s in zip(hours_out, sides_out):
+            sampled_hour_counts[h] += 1
+            sampled_longs += 1 if s == 1 else 0
+        sampled_total += len(sides_out)
         fixed = FixedSignals(sig, exit_rules=exit_rules)
         r = run_engine(spec, bars, costs, {}, strategy=fixed)
         s = equity_sharpe(r.equity, bars["time"], spec.timeframe)
@@ -307,6 +368,14 @@ def random_entry_check(spec, bars, costs, base_trades, base_sharpe, *,
         "sims": int(sims),
         "target_trades": int(n_trades),
         "seed": int(seed),
+        # M7 口径：抽样分布与策略实际入场的对账证据（写进关卡 details）
+        "base_entry_hours_ny": [int(h) for h in np.flatnonzero(hour_counts)],
+        "base_long_fraction": long_prob,
+        "sampled_hours_ny": {str(h): int(sampled_hour_counts[h])
+                             for h in np.flatnonzero(sampled_hour_counts)},
+        "sampled_long_fraction": (float(sampled_longs / sampled_total)
+                                  if sampled_total else None),
+        "sampled_trades": int(sampled_total),
         # 原始分布（G5 的区间检查用）；写入台账前应 pop 掉（凭 seed 可复现）
         "sharpes": [float(x) for x in sharpes],
     }

@@ -447,3 +447,66 @@ def test_run_g2_overfit_on_noise_fails(cfg):
                 "cross_symbol", "random_entry_benchmark", "buy_hold_benchmark",
                 "drop_best_5pct", "delay_1_bar"):
         assert key in out["checks"]
+
+
+# ------------------------------------------- 随机入场口径（T21e/M7 计划失败测试）
+
+def ny_hours_of(times):
+    """测试助手：naive-UTC 时间序列 → 纽约本地小时数组（与引擎分桶同口径）。"""
+    return (pd.to_datetime(pd.Series(times)).dt.tz_localize("UTC")
+            .dt.tz_convert("America/New_York").dt.hour.to_numpy())
+
+
+def hour_entry_bars(n_days=10, signal_hours=(9,), step=0.3):
+    """上行 H1 bars；信号只打在纽约本地 hour ∈ signal_hours 的 bar 上。
+
+    引擎在信号 bar 的**下一根开盘**入场（信号 bar hour=9 → 入场 10:00），
+    故 signal_hours=(9,) 得到"只在 10:00–11:00 入场"的策略。
+    """
+    bars = make_bars([100.0 + step * i for i in range(n_days * 24)])
+    h = ny_hours_of(bars["time"])
+    sig = np.zeros(len(bars), dtype=int)
+    sig[np.isin(h, signal_hours)] = 1
+    return bars, sig
+
+
+def random_entry_of(sig, bars, *, side=1, sims=12, seed=2026):
+    """跑一次随机入场基准（FixedSignals×side），返回其结果 dict。"""
+    strategy = rob.FixedSignals(np.asarray(sig, dtype=int) * side)
+    costs = ConstCosts(spread=0.05)
+    result = run_backtest(strategy, bars, costs, symbol="TST", params={},
+                          contract_size=1.0, timeframe="H1")
+    assert len(result.trades) >= 3            # 夹具自检：确有交易
+    base_sharpe = rob.equity_sharpe(result.equity, bars["time"], "H1")
+    return rob.random_entry_check(
+        spec_of(strategy), bars, costs, result.trades, base_sharpe,
+        sims=sims, percentile=95.0, seed=seed)
+
+
+def test_random_entry_samples_only_strategy_entry_hours_ny():
+    """M7 计划失败测试：只在 10:00–11:00（纽约）入场的策略，随机基准的
+    入场也全部落在该时段（旧实现全场随机，含高成本小时）。"""
+    bars, sig = hour_entry_bars(signal_hours=(9,))
+    out = random_entry_of(sig, bars)
+    assert out["base_entry_hours_ny"] == [10]
+    assert {int(h) for h in out["sampled_hours_ny"]} == {10}
+
+
+def test_random_entry_hour_mixture_limited_to_strategy_support():
+    """M7：入场分布在小时段集合 {10, 14} 上 → 随机基准只在支撑集内抽样。"""
+    bars, sig = hour_entry_bars(signal_hours=(9, 13))
+    out = random_entry_of(sig, bars)
+    assert out["base_entry_hours_ny"] == [10, 14]
+    assert {int(h) for h in out["sampled_hours_ny"]} <= {10, 14}
+    assert {int(h) for h in out["sampled_hours_ny"]} == {10, 14}
+
+
+def test_random_entry_side_ratio_matches_strategy():
+    """M7：策略全空（全多）→ 随机基准方向也全空（全多），不再五五开。"""
+    bars, sig = hour_entry_bars(signal_hours=(9,))
+    out_short = random_entry_of(sig, bars, side=-1)
+    assert out_short["base_long_fraction"] == 0.0
+    assert out_short["sampled_long_fraction"] == 0.0
+    out_long = random_entry_of(sig, bars, side=1)
+    assert out_long["base_long_fraction"] == 1.0
+    assert out_long["sampled_long_fraction"] == 1.0

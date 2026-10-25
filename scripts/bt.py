@@ -9,36 +9,57 @@
         --strategy mt5quant.strategies.library.buy_hold:BuyHold --gates G0,G1,G2,G3,G4
 
 约定：
-- 先卡后测：卡文件必须已提交到 git，且最后提交时间早于该卡在台账中的
-  首次运行（cards.ensure_card_precedes_run）；未提交/事后改动 → 拒绝运行。
+- 先卡后测：卡文件必须已提交到 git、工作区干净（git status --porcelain 为空，
+  探针 P6），且最后提交时间早于该卡（id+version，按卡文件判定）在台账中的
+  首次运行（cards.ensure_card_precedes_run）；未提交/脏文件/事后改动 →
+  拒绝运行。卡上绑定了 strategy 时与 --strategy 不一致 → 拒绝
+  （cards.ensure_strategy_matches，T21d）；旧卡（无 strategy 字段）沿用
+  --strategy 并打印一次迁移提示。
 - screen 在卡的参数网格 × 卡的 symbols 上跑 A 层（engine_a.run_backtest），
   逐组合写入台账；抛异常的组合也记一行（ok=false + 错误摘要），有失败则
   退出码 1。数据经 mt5data.lockbox.research_bars（锁箱语义）。
-- gate：在卡的主品种上按 --params（缺省取卡网格第一个组合）跑一次基准
-  运行记入 runs，然后逐关卡评估并把结果写 gates 表；任一关卡未过 →
-  退出码 1。门槛文件 config/gates.toml 的 sha256 与冻结值不符 → 拒绝运行
-  （不产生任何 runs）。G5（锁箱一次性）必须显式 --approve。
+- gate：在卡的主品种上跑一次基准运行记入 runs，然后逐关卡评估并把结果写
+  gates 表；任一关卡未过 → 退出码 1。门槛文件 config/gates.toml 的 sha256
+  与冻结值不符 → 拒绝运行（不产生任何 runs）。G5（锁箱一次性）必须显式
+  --approve。
+- 参数选择（T21e/M5）：--params 缺省或 "auto" 时按卡 selection_rule（附录 A
+  枚举：max_net_profit / max_sharpe）从同 data_sha256 + cost_model_version
+  的 screen 运行里自动选参，候选数与选中 run_id 写进关卡报告与 gates 表
+  details（params_selection）；显式 --params 记 selection="manual"。
+- G5 编排（T21a 协议）：_g5_orchestrate = 参照重建（G3 拼接的样本外收益，
+  只读研究段）→ begin_lockbox（读锁箱数据**之前**写 started）→
+  load_lockbox_window（cutoff 前卡策略声明的 lookback_bars 根起步）→
+  回测（交易与收益只计 cutoff 后）→ run_g5（单侧判定，写终态 done）。
+- G4（T21c 接线）：n_trials 与试验夏普按 (strategy, params, symbol,
+  timeframe, data_sha256, cost_model_version) 在谱系内去重
+  （_dedup_trial_sharpes，同参 screen+gate 只计 1）；蒙特卡洛回撤块长 =
+  一个交易日的 bar 数（block_len）。
 - contract_size 只认 {data-root}/specs/latest.json（与 run_backtest 同规：
   缺则报错，绝不静默按 1 折算）。
 - 禁入窗（T20）：screen/gate 默认加载 config/sessions.toml（与 run_backtest、
   实盘风控共用），基准运行与锁箱运行按禁入窗推迟开仓；其 sha256 随
   cost_model_version 写进台账。
-- gates_hash：config/gates.toml 存在时取其 sha256，否则空串（T12 起强制核对）。
+- gates_hash：config/gates.toml 存在时取 vgate.gates_sha256（LF 归一，
+  与 load_gates 同口径——探针 P7：裸字节哈希在 CRLF 检出下两侧不一致），
+  否则空串（T12 起强制核对）。
 - 台账缺省 {data-root}/research/ledger.sqlite（data/ 不入库，本地持久）。
 """
 import argparse
-import hashlib
 import json
 import math
 import sys
 from pathlib import Path
 
+import pandas as pd
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # 复用 run_backtest 的装配
 
+from mt5data.store import TIMEFRAME_SECONDS  # noqa: E402
 from mt5quant.backtest.engine_a import ENGINE_VERSION, run_backtest  # noqa: E402
 from mt5quant.backtest.report import (  # noqa: E402
-    bars_per_year, current_git_commit, data_sha256, summarize,
+    bars_per_year, current_git_commit, data_sha256, observed_bars_per_year,
+    summarize,
 )
 from mt5quant.research import cards  # noqa: E402
 from mt5quant.research.ledger import Ledger  # noqa: E402
@@ -55,13 +76,23 @@ from run_backtest import (  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# 参数选择规则枚举（附录 A v2；卡定义时 bt card check 校验，非法值拒绝）
+_SELECTION_METRICS = {
+    "max_net_profit": "net_profit",
+    "max_sharpe": "sharpe",
+}
 
-def _gates_hash() -> str:
-    """config/gates.toml 的 sha256（T12 冻结后与运行前核对）；缺文件 → 空串。"""
-    p = REPO_ROOT / "config" / "gates.toml"
+
+def _gates_hash(path=None) -> str:
+    """config/gates.toml 的 sha256（T12 冻结后与运行前核对）；缺文件 → 空串。
+
+    T21e/P7：经 vgate.gates_sha256（LF 归一）——与 bt gate（load_gates）同
+    一口径；裸字节哈希在 CRLF 检出下会得到另一个值。
+    """
+    p = Path(path) if path is not None else REPO_ROOT / "config" / "gates.toml"
     if not p.is_file():
         return ""
-    return hashlib.sha256(p.read_bytes()).hexdigest()
+    return vgate.gates_sha256(p)
 
 
 def _card_path(value: str, cards_dir: Path) -> Path:
@@ -69,6 +100,202 @@ def _card_path(value: str, cards_dir: Path) -> Path:
     if value.lower().endswith(".toml"):
         return Path(value)
     return cards_dir / f"{value}.toml"
+
+
+def _check_card_lineage(card, source: str) -> str | None:
+    """selection_rule 枚举校验（M5：非法值定义时拒）；返回错误信息或 None。"""
+    if card.selection_rule not in _SELECTION_METRICS:
+        return (f"{source}：selection_rule {card.selection_rule!r} 不在支持"
+                f"枚举 {sorted(_SELECTION_METRICS)} 内（附录 A v2；"
+                "bt gate --params auto 按该规则自动选参）")
+    return None
+
+
+def _select_params_auto(ledger, card, *, symbol: str, data_sha256: str,
+                        cost_model_version: str) -> dict:
+    """M5：按卡 selection_rule 从同 data_sha256 + cost_model_version 的
+    screen 运行里选参（返回选择信息，含选中的 params 与 run_id）。
+
+    候选 = 该卡在该 symbol/timeframe/数据哈希/成本版本下 metrics ok 且
+    规则指标有值的运行；并列取 run_id 最小（稳定）。非法规则 / 无候选 →
+    ValueError（调用方在基准运行之前拒绝，不产生任何 runs）。
+    """
+    rule = card.selection_rule
+    if rule not in _SELECTION_METRICS:
+        raise ValueError(_check_card_lineage(card, f"卡 {card.id}"))
+    metric = _SELECTION_METRICS[rule]
+    rows = ledger.conn.execute(
+        "SELECT run_id, params_json, metrics_json FROM runs"
+        " WHERE card_id=? AND symbol=? AND timeframe=? AND data_sha256=?"
+        " AND cost_model_version=? ORDER BY run_id",
+        (card.id, symbol, card.timeframe, data_sha256,
+         cost_model_version)).fetchall()
+    best = None          # (指标值, run_id, params)
+    n_candidates = 0
+    for r in rows:
+        payload = json.loads(r["metrics_json"])
+        if not payload.get("ok"):
+            continue
+        value = (payload.get("metrics") or {}).get(metric)
+        if value is None:
+            continue
+        n_candidates += 1
+        if best is None or float(value) > best[0]:
+            best = (float(value), int(r["run_id"]),
+                    json.loads(r["params_json"]))
+    if best is None:
+        raise ValueError(
+            f"自动选参（--params auto）找不到候选：卡 {card.id} 在 {symbol} "
+            f"{card.timeframe}、data_sha256={data_sha256[:12]}…、成本版本 "
+            f"{cost_model_version} 下没有可用的 screen 运行——先跑 bt screen")
+    return {"selection": "auto", "rule": rule, "metric": metric,
+            "candidates": n_candidates, "selected_run_id": best[1],
+            "selected_value": best[0], "params": best[2]}
+
+
+def _dedup_trial_sharpes(ledger, card_id: str,
+                         bars_per_year: float) -> tuple[int, list[float]]:
+    """T21c/M4：谱系（cards.family_of）内试验夏普按 (strategy, params,
+    symbol, timeframe, data_sha256, cost_model_version) 去重——同一组参数
+    先 screen 后 gate 只计 1 次，v1/v2 新卡累计进同一谱系；失败运行不计。
+
+    返回 (去重后 N, 每根 bar 口径的试验夏普列表)；成功但无夏普的运行计入
+    N、不进夏普列表（与 ledger.stats 的 n_dedup 同键口径）。
+    """
+    family = cards.family_of(card_id)
+    rows = ledger.conn.execute(
+        "SELECT card_id, strategy, params_json, symbol, timeframe,"
+        " data_sha256, cost_model_version, metrics_json FROM runs").fetchall()
+    by_key: dict[tuple, float | None] = {}
+    for r in rows:
+        if cards.family_of(r["card_id"]) != family:
+            continue
+        payload = json.loads(r["metrics_json"])
+        if not payload.get("ok"):
+            continue
+        key = (r["strategy"],
+               json.dumps(json.loads(r["params_json"]), sort_keys=True,
+                          ensure_ascii=False),
+               r["symbol"], r["timeframe"], r["data_sha256"],
+               r["cost_model_version"])
+        if key in by_key:
+            continue
+        s = (payload.get("metrics") or {}).get("sharpe")
+        by_key[key] = None if s is None else float(s) / math.sqrt(bars_per_year)
+    return len(by_key), [v for v in by_key.values() if v is not None]
+
+
+def _bars_per_day(timeframe: str) -> int:
+    """一个交易日的 bar 数（G4 块自助块长 / G5 参照块长，T21c/T21a）。"""
+    return max(1, round(86400.0 / TIMEFRAME_SECONDS[timeframe.upper()]))
+
+
+def _g3_reference_returns(ledger, card, spec, bars, costs, *,
+                          data_sha: str) -> pd.Series:
+    """重建 G3 拼接的样本外收益（run_g5 的参照分布，T21a）。
+
+    读台账里该卡最近一次 G3 通过记录的 segments（test_range + 段内选中
+    params），按 walkforward.run_g3 的同一切片/拼接口径重放各测试窗
+    （research 段数据，不碰锁箱）。G3 记录的数据哈希与当前不符 / 无可用
+    segments → ValueError（发生在 begin_lockbox 之前，不消耗锁箱一次性）。
+    """
+    row = ledger.conn.execute(
+        "SELECT r.data_sha256 AS dsha, g.details_json AS dj"
+        " FROM gates g JOIN runs r ON r.run_id = g.run_id"
+        " WHERE r.card_id=? AND g.gate='G3' AND g.passed=1"
+        " ORDER BY r.run_id DESC LIMIT 1", (card.id,)).fetchone()
+    if row is None:
+        raise ValueError(
+            f"卡 {card.id} 无通过的 G3 关卡记录——G5 的参照分布取自 G3 拼接"
+            "的样本外收益，没有可信参照不允许跑 G5")
+    if row["dsha"] != data_sha:
+        raise ValueError(
+            f"卡 {card.id} 的 G3 记录基于 data_sha256={row['dsha'][:12]}…，"
+            f"与当前数据 {data_sha[:12]}… 不符——参照分布已过期，先在新数据"
+            "上重跑 G3")
+    segments = (json.loads(row["dj"]) or {}).get("segments") or []
+    lookback = max(int(getattr(spec.strategy.required_data,
+                               "lookback_bars", 0) or 0), 0)
+    rets = []
+    for seg in segments:
+        t1, t2 = (seg.get("test_range") or [0, 0])[:2]
+        t1, t2 = int(t1), int(t2)
+        if t2 <= t1:
+            continue
+        test = bars.iloc[max(0, t1 - lookback): t2]
+        if not len(test):
+            continue
+        oos = vrob.run_engine(spec, test, costs, seg.get("params") or {})
+        # 与 run_g3 同口径：测试窗权益收益（含测试窗首根，去预热段）
+        rets.append(oos.equity.astype("float64")
+                    .iloc[-(t2 - t1 + 1):].pct_change().dropna())
+    if not rets:
+        raise ValueError(
+            f"卡 {card.id} 的 G3 记录没有可用的 segments——参照分布无从重建")
+    return pd.concat(rets, ignore_index=True)
+
+
+def _g5_orchestrate(ledger, card, *, strategy, spec, params, base_summary,
+                    bars, costs, session_policy, data_root, approved_by,
+                    cfg) -> dict:
+    """G5 编排（T21a 协议，T21e 接线）：
+
+    1. 参照重建（_g3_reference_returns，只读研究段；失败不消耗一次性）；
+    2. begin_lockbox：读锁箱数据**之前**写 started（未批准/未过 G3/已用过
+       → 如实抛 GateApprovalError / LockboxPrerequisiteError /
+       LockboxAlreadyUsedError，不消耗或已消耗由语义决定）；
+    3. load_lockbox_window：cutoff 前卡策略声明的 lookback_bars 根起步
+       （无预热段时信号与全史不一致，C3）；
+    4. 回测（引擎 A，与基准同一装配含禁入窗）；交易与权益收益**只计
+       cutoff 之后**（bar_count 同）；
+    5. run_g5：期望 > 0、交易数 ≥ 预期 × 比例、锁箱夏普 ≥ 参照 p5
+       （单侧），评估完把 started 写成终态 done。
+
+    expected_trades = 样本内交易频率（基准运行 trade_count / 研究段 bar 数）
+    × 锁箱评估窗 bar 数。
+    """
+    # 1) 参照分布（G3 样本外收益；任何失败都发生在 begin_lockbox 之前）
+    reference = _g3_reference_returns(
+        ledger, card, spec, bars, costs, data_sha=data_sha256(bars))
+    # 2) 读锁箱数据之前写 started（中途崩溃也不允许重跑）
+    vgate.begin_lockbox(ledger, card, approved_by=approved_by)
+    # 3) 锁箱运行窗（带预热段）
+    lookback = max(int(getattr(strategy.required_data, "lookback_bars", 0)
+                       or 0), 0)
+    lb_bars, cutoff = vgate.load_lockbox_window(
+        data_root, spec.symbol, card.timeframe, lookback_bars=lookback)
+    # 4) 回测；交易与收益只计 cutoff 之后
+    lb = run_backtest(strategy, lb_bars, costs, symbol=spec.symbol,
+                      params=dict(params), contract_size=spec.contract_size,
+                      volume_lots=spec.volume_lots,
+                      initial_capital=spec.initial_capital,
+                      timeframe=card.timeframe,
+                      session_policy=session_policy)
+    entries = pd.to_datetime(lb.trades["entry_time"])
+    lb_trades = lb.trades[entries >= cutoff]
+    k = int(lb_bars["time"].searchsorted(pd.Timestamp(cutoff), side="left"))
+    times_post = lb_bars["time"].iloc[k:]
+    sharpe = vrob.equity_sharpe(lb.equity.astype("float64").iloc[k:],
+                                times_post, card.timeframe)
+    bpy = observed_bars_per_year(times_post) or bars_per_year(card.timeframe)
+    lockbox_result = {
+        "net_profit": (float(lb_trades["net"].sum()) if len(lb_trades)
+                       else 0.0),
+        "expectancy": (float(lb_trades["net"].mean()) if len(lb_trades)
+                       else None),
+        "sharpe": sharpe,
+        "trade_count": int(len(lb_trades)),
+        "bar_count": int(len(lb_bars) - k),
+        "annualization_bars_per_year": float(bpy),
+        "cutoff": pd.Timestamp(cutoff).isoformat(),
+    }
+    # 5) 预期交易数：样本内频率 × 锁箱评估窗长度；run_g5 写终态
+    in_sample_trades = float(base_summary.get("trade_count") or 0)
+    expected_trades = in_sample_trades / len(bars) * lockbox_result["bar_count"]
+    return vgate.run_g5(ledger, card, lockbox_result=lockbox_result,
+                        reference_returns=reference,
+                        expected_trades=expected_trades,
+                        approved_by=approved_by, cfg=cfg)
 
 
 # ---------------------------------------------------------------- card check
@@ -79,12 +306,21 @@ def cmd_card_check(args) -> int:
     except cards.CardError as e:
         print(f"✗ {e}")
         return 1
+    lineage_err = _check_card_lineage(card, str(args.path))
+    if lineage_err is not None:
+        print(f"✗ {lineage_err}")
+        return 1
     committed = cards.committed_at(args.path)
     committed_s = (f"已提交 {committed.isoformat()}" if committed is not None
                    else "⚠ 尚未提交到 git（先卡后测：运行前必须 git commit）")
+    if committed is not None and not cards.worktree_clean(args.path):
+        committed_s += "；⚠ 工作区有未提交改动（P6：先卡后测会拒绝运行）"
     print(f"✓ {args.path}")
-    print(f"  id={card.id} version={card.version} symbols={list(card.symbols)} "
+    print(f"  id={card.id} version={card.version} "
+          f"family={card.family} symbols={list(card.symbols)} "
           f"timeframe={card.timeframe}")
+    print(f"  strategy={card.strategy or '（旧卡，未绑定：运行须 --strategy）'} "
+          f"selection_rule={card.selection_rule}")
     print(f"  参数 {len(card.params)} 个，网格 {len(card.param_grid())} 组；{committed_s}")
     return 0
 
@@ -98,16 +334,28 @@ def cmd_screen(args) -> int:
     except cards.CardError as e:
         print(f"✗ {e}")
         return 1
+    # T21d：卡绑定的策略与 --strategy 一致才放行（旧卡不绑定，沿 --strategy）
+    try:
+        cards.ensure_strategy_matches(card, args.strategy)
+    except cards.CardStrategyMismatchError as e:
+        print(f"✗ {e}")
+        return 1
+    if card.migration_hint:
+        print(f"⚠ 迁移提示：{card.migration_hint}")
 
     ledger_path = Path(args.ledger) if args.ledger else \
         Path(args.data_root) / "research" / "ledger.sqlite"
     with Ledger(ledger_path) as ledger:
-        # 先卡后测：未提交 / 提交晚于首次运行 → 拒绝（不产生任何 runs）
+        # 先卡后测：未提交 / 工作区脏（P6）/ 提交晚于该卡文件首次运行 →
+        # 拒绝（不产生任何 runs）
         committed = cards.committed_at(path)
         try:
             cards.ensure_card_precedes_run(
-                card.id, committed, ledger.first_run_at(card.id))
-        except (cards.CardNotCommittedError, cards.CardLateCommitError) as e:
+                card.id, committed,
+                ledger.first_run_at(card.id, version=card.version),
+                worktree_clean=cards.worktree_clean(path))
+        except (cards.CardNotCommittedError, cards.CardLateCommitError,
+                cards.CardDirtyWorktreeError) as e:
             print(f"✗ {e}")
             return 1
         ledger.register_card(card.id, card.version, str(path),
@@ -209,6 +457,14 @@ def cmd_gate(args) -> int:
     except cards.CardError as e:
         print(f"✗ {e}")
         return 1
+    # T21d：卡绑定的策略与 --strategy 一致才放行（旧卡不绑定，沿 --strategy）
+    try:
+        cards.ensure_strategy_matches(card, args.strategy)
+    except cards.CardStrategyMismatchError as e:
+        print(f"✗ {e}")
+        return 1
+    if card.migration_hint:
+        print(f"⚠ 迁移提示：{card.migration_hint}")
     # 门槛冻结核对：sha256 与冻结值不符 → 拒绝运行（不产生任何 runs）
     try:
         cfg, gsha = vgate.load_gates()
@@ -227,8 +483,11 @@ def cmd_gate(args) -> int:
         committed = cards.committed_at(path)
         try:
             cards.ensure_card_precedes_run(
-                card.id, committed, ledger.first_run_at(card.id))
-        except (cards.CardNotCommittedError, cards.CardLateCommitError) as e:
+                card.id, committed,
+                ledger.first_run_at(card.id, version=card.version),
+                worktree_clean=cards.worktree_clean(path))
+        except (cards.CardNotCommittedError, cards.CardLateCommitError,
+                cards.CardDirtyWorktreeError) as e:
             print(f"✗ {e}")
             return 1
         ledger.register_card(card.id, card.version, str(path),
@@ -275,15 +534,34 @@ def cmd_gate(args) -> int:
         symbol = card.symbols[0]
         bars = bars_by_sym[symbol]
         costs = costs_by_sym[symbol]
-        combos = card.param_grid()
-        try:
-            params = json.loads(args.params) if args.params else dict(combos[0])
-        except ValueError as e:
-            print(f"✗ --params 不是合法 JSON：{e}")
-            return 1
+        combos = card.param_grid()      # G3 的网格内重选用
+
+        # 参数选择（T21e/M5）：缺省与 "auto" 均按卡 selection_rule 从
+        # 同数据哈希/成本版本的 screen 运行自动选参；显式 JSON 记 manual。
+        dsha = data_sha256(bars)
+        if args.params is None or args.params == "auto":
+            try:
+                selection = _select_params_auto(
+                    ledger, card, symbol=symbol, data_sha256=dsha,
+                    cost_model_version=cost_version)
+            except ValueError as e:
+                print(f"✗ {e}")
+                return 1
+            params = selection["params"]
+            print(f"— 参数选择（auto）：规则 {selection['rule']}"
+                  f"（{selection['metric']}），候选 {selection['candidates']}"
+                  f" 个 screen 运行，选中 run#{selection['selected_run_id']}"
+                  f" -> {params}")
+        else:
+            try:
+                params = json.loads(args.params)
+            except ValueError as e:
+                print(f"✗ --params 不是合法 JSON：{e}")
+                return 1
+            selection = {"selection": "manual", "params": params}
+            print(f"— 参数选择（manual）：显式 --params -> {params}")
 
         # 基准运行（引擎 A）：先入台账（失败的也记），关卡结果挂在它名下
-        dsha = data_sha256(bars)
         data_first, data_last = pd_iso(bars["time"].iloc[0]), pd_iso(bars["time"].iloc[-1])
         common = dict(
             card_id=card.id, card_version=card.version,
@@ -344,55 +622,46 @@ def cmd_gate(args) -> int:
         if "G4" in wanted:
             def _g4():
                 returns = base.equity.astype("float64").pct_change().dropna()
-                rows = ledger.conn.execute(
-                    "SELECT metrics_json FROM runs WHERE card_id=?"
-                    " ORDER BY run_id", (card.id,)).fetchall()
                 bpy = summary.get("annualization_bars_per_year") \
                     or bars_per_year(card.timeframe)
-                trial_sharpes = []
-                for r in rows:
-                    payload = json.loads(r["metrics_json"])
-                    s = (payload.get("metrics") or {}).get("sharpe")
-                    if payload.get("ok") and s is not None:
-                        trial_sharpes.append(float(s) / math.sqrt(bpy))
-                n_trials = ledger.stats(card.id)["total_runs"]
-                return vgate.run_g4(
-                    returns, n_trials=n_trials, trial_sharpes=trial_sharpes,
+                # T21c/M4：N 与试验夏普按谱系内去重（同参 screen+gate 只计 1）
+                n_dedup, trial_sharpes = _dedup_trial_sharpes(
+                    ledger, card.id, float(bpy))
+                out = vgate.run_g4(
+                    returns, n_trials=n_dedup, trial_sharpes=trial_sharpes,
                     actual_max_drawdown=summary.get("max_drawdown", 0.0),
-                    cfg=cfg, seed=seed)
+                    cfg=cfg, seed=seed,
+                    block_len=_bars_per_day(card.timeframe))
+                out["project_n_trials"] = ledger.stats(card.id)[
+                    "project_n_dedup"]
+                return out
             _run("G4", _g4)
         if "G5" in wanted:
-            def _g5():
-                lb_bars = vgate.load_lockbox_segment(args.data_root, symbol,
-                                                     card.timeframe)
-                lb = run_backtest(strategy, lb_bars, costs, symbol=symbol,
-                                  params=dict(params),
-                                  contract_size=sizes[symbol],
-                                  volume_lots=args.volume_lots,
-                                  initial_capital=args.initial_capital,
-                                  timeframe=card.timeframe,
-                                  session_policy=policy_by_sym[symbol])
-                lb_summary = summarize(lb, cost_version=cost_version)
-                mc = vrob.random_entry_check(
-                    spec, bars, costs, base.trades, summary.get("sharpe"),
-                    sims=cfg.random_entry_sims,
-                    percentile=cfg.random_entry_percentile, seed=seed)
-                mc_sharpes = mc.get("sharpes") or []
-                metrics = {"net_profit": lb_summary["net_profit"],
-                           "expectancy": lb_summary.get("expectancy"),
-                           "sharpe": lb_summary.get("sharpe"),
-                           "trade_count": lb_summary["trade_count"]}
-                return vgate.run_g5(ledger, card.id,
-                                    approved_by=args.approved_by or args.actor,
-                                    metrics=metrics, mc_sharpes=mc_sharpes,
-                                    cfg=cfg)
-            _run("G5", _g5)
+            _run("G5", lambda: _g5_orchestrate(
+                ledger, card, strategy=strategy, spec=spec, params=params,
+                base_summary=summary, bars=bars, costs=costs,
+                session_policy=policy_by_sym[symbol],
+                data_root=args.data_root,
+                approved_by=args.approved_by or args.actor, cfg=cfg))
 
         for gate in vgate.GATE_ORDER:
             if gate in results:
+                details = dict(results[gate])
+                # M5：参数选择过程（候选数、选中 run_id）随每个关卡落台账
+                details["params_selection"] = selection
                 ledger.record_gate(run_id, gate, bool(results[gate]["passed"]),
-                                   results[gate])
+                                   details)
         report = vgate.render_gate_report(card.id, params, results)
+        if selection["selection"] == "auto":
+            report += (
+                f"\n## 参数选择（auto）\n\n"
+                f"- 规则：`{selection['rule']}`（按 {selection['metric']}）\n"
+                f"- 候选：{selection['candidates']} 个同数据哈希/成本版本的"
+                f" screen 运行\n"
+                f"- 选中：run#{selection['selected_run_id']} -> `{params}`"
+                f"（{selection['metric']}={selection['selected_value']:.2f}）\n")
+        else:
+            report += "\n## 参数选择（manual）\n\n- 显式 --params 指定\n"
         print(report)
         if args.out:
             out = Path(args.out)
@@ -459,7 +728,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_gate.add_argument("--gates", default="G0,G1,G2,G3,G4",
                         help="逗号分隔的关卡子集；G5（锁箱一次性）须显式列出且加 --approve")
     p_gate.add_argument("--params", default=None,
-                        help="JSON 参数；缺省取卡网格第一个组合")
+                        help="JSON 参数；缺省与 \"auto\" 均按卡 selection_rule "
+                             "从同数据哈希/成本版本的 screen 运行自动选参"
+                             "（T21e/M5），选择过程写进关卡报告与 gates 表")
     p_gate.add_argument("--approve", action="store_true",
                         help="批准 G5 锁箱一次性测试（看过一眼即消耗）")
     p_gate.add_argument("--approved-by", default=None,
