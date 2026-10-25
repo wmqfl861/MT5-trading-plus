@@ -5,8 +5,18 @@
   去最好 5%/延迟一根 bar）；
 - walkforward：G3 滚动训练/测试窗；
 - stats：G4 Deflated Sharpe Ratio 与蒙特卡洛回撤分布（种子 = card_id 哈希）；
-- gates：门槛配置（config/gates.toml，sha256 冻结核对）与 G1/G4/G5。
+- gates：门槛配置（config/gates.toml，sha256 冻结核对）与 G1/G4/G5；
+- synthetic：T22 正负对照（块置换负对照、植入优势正对照、
+  PlantedEdgeStrategy / RandomEntries 工具策略）。
 """
-from mt5quant.validation import gates, lookahead, robustness, stats, walkforward
+from mt5quant.validation import (
+    gates,
+    lookahead,
+    robustness,
+    stats,
+    synthetic,
+    walkforward,
+)
 
-__all__ = ["gates", "lookahead", "robustness", "stats", "walkforward"]
+__all__ = ["gates", "lookahead", "robustness", "stats", "synthetic",
+           "walkforward"]
