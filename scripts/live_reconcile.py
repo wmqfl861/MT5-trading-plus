@@ -27,11 +27,10 @@ from mt5gw import GatewayConfig, MT5Gateway  # noqa: E402
 from mt5gw.errors import DataUnavailableError  # noqa: E402
 from mt5live.monitor import ALERT_RECONCILE_MISMATCH, append_alert  # noqa: E402
 from mt5live.reconcile import (  # noqa: E402
-    EXPECTED_FILE,
     ExpectedStateError,
     ReconcileResult,
     diff_positions,
-    load_expected,
+    load_expected_dir,
     write_pause,
 )
 
@@ -55,7 +54,7 @@ def run_once(live_dir: str, gw: MT5Gateway, *,
     """
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     try:
-        exp = load_expected(os.path.join(live_dir, EXPECTED_FILE))
+        exp = load_expected_dir(live_dir)   # T24：读全部 expected-<magic>.json
     except ExpectedStateError as e:
         print(f"× {e}")
         return 2, None
