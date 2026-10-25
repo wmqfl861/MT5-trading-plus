@@ -341,7 +341,7 @@ def test_gates_hash_lf_normalized_under_crlf(tmp_path):
     mod = load_bt()
     raw = (REPO_ROOT / "config" / "gates.toml").read_bytes()
     p = tmp_path / "gates.toml"
-    p.write_bytes(raw.replace(b"\n", b"\r\n"))
+    p.write_bytes(raw.replace(b'\r\n', b'\n').replace(b'\n', b'\r\n'))
     assert b"\r\n" in p.read_bytes()          # 夹具自检：确为 CRLF
     assert mod._gates_hash(p) == mod.vgate.gates_sha256(p)
     assert mod._gates_hash(p) == mod.vgate.load_gates()[1]   # 与 gate 侧一致

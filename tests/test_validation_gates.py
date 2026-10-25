@@ -692,7 +692,8 @@ def test_screen_and_gate_record_same_gates_hash_crlf(tmp_path, monkeypatch):
     cfg_root = tmp_path / "cfgroot"
     (cfg_root / "config").mkdir(parents=True)
     crlf = cfg_root / "config" / "gates.toml"
-    crlf.write_bytes(vg.DEFAULT_GATES_TOML.read_bytes().replace(b"\n", b"\r\n"))
+    crlf.write_bytes(vg.DEFAULT_GATES_TOML.read_bytes()
+                     .replace(b'\r\n', b'\n').replace(b'\n', b'\r\n'))
     assert b"\r\n" in crlf.read_bytes()           # 夹具自检：确为 CRLF
     monkeypatch.setattr(mod, "REPO_ROOT", cfg_root)
     monkeypatch.setattr(vg, "DEFAULT_GATES_TOML", crlf)
