@@ -94,7 +94,7 @@ def load_session_policy(path="config/sessions.toml") -> SessionPolicy
 不再出现 `triple_weekdays=frozenset()`。Exness 官方表：外汇、金属周三，指数周五，加密货币交叉盘周三、其余周五；
 rollover 报告里列出四个品种的快照值并与官方表核对，不一致时停下报告用户。
 
-- [ ] 失败测试先行：
+- [x] 失败测试先行（证据：test_costs_swap.py::test_friday_to_monday_is_one_night / test_full_week_is_seven_nights_with_wednesday_split / test_charge_moment_dst_summer_21_utc / _winter_22_utc；test_calibrate_costs.py::test_rate_includes_triple_day_round_trip；test_mt5data_sessions.py T20 节；test_backtest_engine_{a,b}.py 禁入推迟节；test_mt5live_riskproc.py SessionPolicy 节；test_run_backtest_script.py::test_missing_hour_forbid_defers_engine_entry_end_to_end）：
   - 周五 20:00 → 周一 20:00 = 1 夜；整周 = 7 夜（含周三 ×3）；冬令时日期的计费时刻是 22:00 UTC、
     夏令时是 21:00 UTC（用 2026-07-15 与 2026-12-15 钉死）；
   - 校准：周二 → 周四持仓，实际隔夜费 −40，校准费率 −10，回测按同一规则（含三倍日）复算回 −40；
@@ -105,7 +105,7 @@ rollover 报告里列出四个品种的快照值并与官方表核对，不一�
     `[[forbidden]]` 迁到 `config/sessions.toml`，禁入规则只保留一处）；
   - 点差模型按纽约本地小时分桶；某小时缺统计时按 `config/sessions.toml` 的 `missing_hour_policy`
     （`"forbid"` = 该小时禁入，出场取全天最大 p90），不再让整次运行抛错。
-- [ ] 实现；`run_backtest.py`、`bt.py` 默认加载 `config/sessions.toml` 并把它的 sha256 写进 manifest 与
+- [x] 实现（A-1.4/B-0.2；证据：全量 1112 passed， deaf6ef）；`run_backtest.py`、`bt.py` 默认加载 `config/sessions.toml` 并把它的 sha256 写进 manifest 与
       `cost_model_version`。
 - [ ] 实测报告 `docs/research/rollover-dst-<日期>.md`：tick 按冬、夏季拆开，统计四个品种在 UTC 20–23 点的
       点差 p50/p99；用 10-26 至 10-30 这一周确认 Exness 冬令时跟随欧洲还是美国；据此定稿 `config/sessions.toml`。
