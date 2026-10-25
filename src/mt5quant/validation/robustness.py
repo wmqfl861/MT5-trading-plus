@@ -2,6 +2,9 @@
 
 子检查（门槛数值全部来自 config/gates.toml，即蓝图附录 B）：
 - cost_scaling：成本 ×1.5 仍正期望（×2 只记录备查，不计入通过）；
+  T36（H2/M7）附两块只报告不改判定的敏感性：止损越幅 0.5×/1×/p90 三档
+  净利（stop_overshoot_sensitivity）、"2020 年以前点差 ×1.5"情形
+  （early_years_spread_x1_5，相对点差外推早年成本偏乐观的对照）；
 - param_plateau：参数邻域（每个参数 ±1 档，其余不动）≥70% 净盈利；
 - yearly_segments：≥70% 年份盈利，且单一年份贡献 ≤ 总利润 50%；
 - cross_symbol：通用逻辑 ≥2 个品种净利为正（可用品种不足 2 → 不适用）；
@@ -92,7 +95,11 @@ def run_engine(spec: BacktestSpec, bars: pd.DataFrame, costs, params: dict, *,
 
 
 class ScaledCosts:
-    """成本模型等比缩放包装：四个成本分量一律 ×factor（G2 成本放大）。"""
+    """成本模型等比缩放包装：四个成本分量一律 ×factor（G2 成本放大）。
+
+    T36：base 带 stop_overshoot（可选第五方法）时同样 ×factor；base 未
+    提供该方法 → 返回 0（与 base 行为一致，不凭空造出越幅）。
+    """
 
     def __init__(self, base, factor: float):
         if not factor > 0:
@@ -110,6 +117,59 @@ class ScaledCosts:
 
     def overnight_fee(self, symbol, side, from_ts, to_ts):
         return self._base.overnight_fee(symbol, side, from_ts, to_ts) * self._factor
+
+    def stop_overshoot(self, symbol, hour_utc, *, price=None, level="p50"):
+        fn = getattr(self._base, "stop_overshoot", None)
+        if fn is None:
+            return 0.0
+        return fn(symbol, hour_utc, price=price, level=level) * self._factor
+
+
+class OvershootVariantCosts:
+    """T36：只替换 stop_overshoot 分量的包装（0.5×p50 / p90 档敏感性报告用）。
+
+    factor 给出时返回 base 的 p50×factor；use_p90=True 时返回 p90 档；
+    两者互斥。其余成本（含其余可选方法）经 __getattr__ 原样透传 base。
+    """
+
+    def __init__(self, base, *, factor: float | None = None,
+                 use_p90: bool = False):
+        if (factor is not None) == bool(use_p90):
+            raise ValueError("factor 与 use_p90 恰给其一")
+        if not use_p90 and not factor > 0:
+            raise ValueError(f"factor 必须为正，收到 {factor!r}")
+        if not hasattr(base, "stop_overshoot"):
+            raise ValueError("base 成本模型未提供 stop_overshoot，无从做越幅敏感性")
+        self._base, self._factor, self._use_p90 = base, factor, bool(use_p90)
+
+    def stop_overshoot(self, symbol, hour_utc, *, price=None, level="p50"):
+        if self._use_p90:
+            return self._base.stop_overshoot(symbol, hour_utc, price=price,
+                                             level="p90")
+        return self._base.stop_overshoot(symbol, hour_utc, price=price,
+                                         level="p50") * self._factor
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+
+
+class SpreadOnlyScaledCosts:
+    """T36/M7：只放大 spread_p90 的包装（"2020 年以前点差 ×1.5"报告情形）。
+
+    其余成本分量（滑点/佣金/隔夜费/越幅）原样——早年敏感性针对的是点差
+    外推（relative 口径把近期点差结构套到 2014 年以来的全部历史，M7）。
+    """
+
+    def __init__(self, base, factor: float):
+        if not factor > 0:
+            raise ValueError(f"factor 必须为正，收到 {factor!r}")
+        self._base, self._factor = base, float(factor)
+
+    def spread_p90(self, symbol, hour_utc, *, price=None):
+        return self._base.spread_p90(symbol, hour_utc, price=price) * self._factor
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
 
 
 class FixedSignals(BaseStrategy):
@@ -153,11 +213,79 @@ def _expectancy(result) -> float | None:
 
 # ---------------------------------------------------------------- 子检查
 
+# T36/M7：早年成本敏感性的报告口径——2020 年以前出场的交易、只放大点差 ×1.5
+# （relative 点差模型把近期（2026 年）点差结构外推到全部历史，早年真实点差
+# 更宽；此情形只报告，不参与通过判定）
+EARLY_YEARS_CUTOFF = pd.Timestamp("2020-01-01")
+EARLY_YEARS_SPREAD_FACTOR = 1.5
+
+
+def _pre_cutoff_trades(r, cutoff: pd.Timestamp = EARLY_YEARS_CUTOFF):
+    """result.trades 里 exit_time < cutoff 的（净利合计, 笔数）。"""
+    t = r.trades
+    if not len(t):
+        return 0.0, 0
+    m = pd.to_datetime(t["exit_time"]) < cutoff
+    return float(t.loc[m, "net"].sum()), int(m.sum())
+
+
+def _overshoot_sensitivity(spec, bars, costs, params, r_base) -> dict:
+    """T36/H2：止损越幅 0.5×/1×/p90 三档净利——只报告，不改门槛。
+
+    base 成本模型未提供 stop_overshoot（旧口径/测试替身）→ applicable=False，
+    不跑变体。三档共用同一次基准复算 r_base（1× 档）。
+    """
+    if not hasattr(costs, "stop_overshoot"):
+        return {"applicable": False, "record_only": True}
+    r05 = run_engine(spec, bars,
+                     OvershootVariantCosts(costs, factor=0.5), params)
+    r90 = run_engine(spec, bars, OvershootVariantCosts(costs, use_p90=True),
+                     params)
+    return {
+        "applicable": True,
+        "record_only": True,                      # 不计入通过判定
+        "net_overshoot_0_5x": _net_sum(r05),
+        "net_overshoot_1x": _net_sum(r_base),
+        "net_overshoot_p90": _net_sum(r90),
+    }
+
+
+def _early_years_spread_report(spec, bars, costs, params, r_base) -> dict:
+    """T36/M7：2020 年以前点差 ×1.5 情形——只报告，不改门槛。
+
+    变体跑全期（引擎前向因果：早年成交不受之后成本影响），只读 cutoff 前
+    出场交易；基准净利取自 r_base 的同子集。
+    """
+    net_base, n_pre = _pre_cutoff_trades(r_base)
+    if n_pre == 0:
+        return {"applicable": False, "record_only": True,
+                "cutoff": str(EARLY_YEARS_CUTOFF.date())}
+    r_scaled = run_engine(spec, bars,
+                          SpreadOnlyScaledCosts(costs, EARLY_YEARS_SPREAD_FACTOR),
+                          params)
+    net_scaled, _ = _pre_cutoff_trades(r_scaled)
+    return {
+        "applicable": True,
+        "record_only": True,                      # 不计入通过判定
+        "cutoff": str(EARLY_YEARS_CUTOFF.date()),
+        "factor": float(EARLY_YEARS_SPREAD_FACTOR),
+        "trades_pre_cutoff": n_pre,
+        "net_pre_cutoff_base": net_base,
+        "net_pre_cutoff_spread_scaled": net_scaled,
+    }
+
+
 def cost_scaling_check(spec, bars, costs, params, cfg) -> dict:
-    """成本 ×1.5（门槛倍数）须仍为正期望；×2（备查倍数）只记录。"""
+    """成本 ×1.5（门槛倍数）须仍为正期望；×2（备查倍数）只记录。
+
+    T36 附带两块只报告不改判定的敏感性（H2/M7）：
+    - stop_overshoot_sensitivity：止损越幅 0.5×/1×/p90 三档净利；
+    - early_years_spread_x1_5：2020 年以前点差 ×1.5 的净利对比。
+    """
     r15 = run_engine(spec, bars, ScaledCosts(costs, cfg.cost_scale_pass), params)
     r2 = run_engine(spec, bars, ScaledCosts(costs, cfg.cost_scale_record), params)
     e15 = _expectancy(r15)
+    r_base = run_engine(spec, bars, costs, params)   # 两块报告共用的基准复算
     return {
         "passed": bool(e15 is not None and e15 > 0),
         "scale_pass": float(cfg.cost_scale_pass),
@@ -165,6 +293,10 @@ def cost_scaling_check(spec, bars, costs, params, cfg) -> dict:
         "scale_record": float(cfg.cost_scale_record),
         "net_2x": _net_sum(r2),
         "record_only": True,                      # ×2 不计入通过判定
+        "stop_overshoot_sensitivity": _overshoot_sensitivity(
+            spec, bars, costs, params, r_base),
+        "early_years_spread_x1_5": _early_years_spread_report(
+            spec, bars, costs, params, r_base),
     }
 
 

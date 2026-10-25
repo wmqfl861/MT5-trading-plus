@@ -597,6 +597,96 @@ def test_short_stop_gap_fills_at_open_ask():
     assert t["exit_price"] == pytest.approx(103.0 + HALF + SLIP)
 
 
+# ------------------------------------------------- T36（H2）：止损越幅 A-1.6
+
+class OvershootCosts(FlatCosts):
+    """带 stop_overshoot 的假成本：恒定越幅 OV（p50 档）/ OV_P90（p90 档）。"""
+
+    def __init__(self, ov=0.3, ov_p90=0.8, **kw):
+        super().__init__(**kw)
+        self.ov, self.ov_p90 = ov, ov_p90
+
+    def stop_overshoot(self, symbol, hour_utc, *, price=None, level="p50"):
+        return self.ov_p90 if level == "p90" else self.ov
+
+
+def test_stop_overshoot_added_to_long_stop_exit_only():
+    """失败测试清单第 3 条：越幅只加在 stop——多头 stop = SL − slip − ov。"""
+    rules = ExitRules(stop_loss_atr=2.0, take_profit_atr=2.0)
+    df = sl_tp_bars()
+    df.loc[19, "high"] = 103.0     # 触及 TP=102.6
+    df.loc[19, "low"] = 98.0       # 同根触及 SL=98.6（双触 → 止损优先）
+    t = one_trade(run_backtest(ScriptStrategy([0] * 18 + [1], exit_rules=rules),
+                               df, OvershootCosts(ov=0.3), symbol="XAUUSD",
+                               contract_size=1.0, params={}, timeframe="H1",
+                               volume_lots=1.0))
+    assert t["exit_reason"] == "stop"
+    assert t["exit_price"] == pytest.approx(98.6 - SLIP - 0.3)   # 越幅恶化成交价
+
+
+def test_stop_overshoot_not_added_to_take_profit_or_gap_or_signal():
+    rules = ExitRules(stop_loss_atr=2.0, take_profit_atr=2.0)
+    # take_profit：不加越幅（102.6 − slip）
+    df = sl_tp_bars()
+    df.loc[19, "high"] = 103.0
+    df.loc[19, "low"] = 99.5
+    t = one_trade(run_backtest(ScriptStrategy([0] * 18 + [1], exit_rules=rules),
+                               df, OvershootCosts(ov=0.3), symbol="XAUUSD",
+                               contract_size=1.0, params={}, timeframe="H1",
+                               volume_lots=1.0))
+    assert t["exit_reason"] == "take_profit"
+    assert t["exit_price"] == pytest.approx(102.6 - SLIP)
+    # stop_gap：按开盘价成交（跳空已含真实越幅），不重复加
+    dg = gap_bars(95.0, 95.5, 94.5, 95.0)
+    t2 = one_trade(run_backtest(
+        ScriptStrategy([0] * 18 + [1], fill=1, exit_rules=ExitRules(stop_loss_atr=2.0)),
+        dg, OvershootCosts(ov=0.3), symbol="XAUUSD", contract_size=1.0,
+        params={}, timeframe="H1", volume_lots=1.0))
+    assert t2["exit_reason"] == "stop_gap"
+    assert t2["exit_price"] == pytest.approx(95.0 - SLIP)
+    # signal 出场：不加越幅（bar2 开盘 100 平仓）
+    t3 = one_trade(run_backtest(ScriptStrategy([1, 0], fill=0), base4(),
+                                OvershootCosts(ov=0.3), symbol="XAUUSD",
+                                contract_size=1.0, params={}, timeframe="H1",
+                                volume_lots=1.0))
+    assert t3["exit_reason"] == "signal"
+    assert t3["exit_price"] == pytest.approx(100.0 - SLIP)
+
+
+def test_stop_overshoot_added_to_short_stop_and_rejects_negative():
+    # 空头 stop：exit = SL + slip + ov（Ask 口径价位本身已含点差）
+    df = gap_bars(100.0, 101.6, 99.5, 100.0)
+    rules = ExitRules(stop_loss_atr=2.0)
+    t = one_trade(run_backtest(ScriptStrategy([0] * 18 + [-1], fill=-1, exit_rules=rules),
+                               df, OvershootCosts(ov=0.25), symbol="XAUUSD",
+                               contract_size=1.0, params={}, timeframe="H1",
+                               volume_lots=1.0))
+    assert t["exit_reason"] == "stop"
+    assert t["exit_price"] == pytest.approx(101.9 + SLIP + 0.25)
+    # 负越幅 = 有利方向成本，拒绝（fail-fast，不静默取 0）
+    with pytest.raises(ValueError, match="越幅"):
+        run_backtest(ScriptStrategy([0] * 14 + [1] * 5, fill=1, exit_rules=rules),
+                     reentry_bars(), NegativeOvershootCosts(), symbol="XAUUSD",
+                     contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0)
+
+
+class NegativeOvershootCosts(OvershootCosts):
+    def stop_overshoot(self, symbol, hour_utc, *, price=None, level="p50"):
+        return -0.1
+
+
+def test_costs_without_stop_overshoot_keep_a15_behavior():
+    """成本模型未提供 stop_overshoot（旧口径/测试替身）→ 不加越幅（A-1.5 行为）。"""
+    rules = ExitRules(stop_loss_atr=2.0)
+    df = sl_tp_bars()
+    df.loc[19, "low"] = 98.0
+    t = one_trade(run_backtest(ScriptStrategy([0] * 18 + [1], exit_rules=rules),
+                               df, FlatCosts(), symbol="XAUUSD", contract_size=1.0,
+                               params={}, timeframe="H1", volume_lots=1.0))
+    assert t["exit_reason"] == "stop"
+    assert t["exit_price"] == pytest.approx(98.6 - SLIP)
+
+
 def test_equity_marks_short_at_ask():
     res = run_backtest(ScriptStrategy([-1], fill=-1), base4(), FlatCosts(),
                        symbol="XAUUSD", contract_size=1.0, params={},
@@ -607,10 +697,11 @@ def test_equity_marks_short_at_ask():
 
 # ------------------------------------------------- 成本接口 v2（R1 / 计划 T3）
 
-def test_engine_version_bumped_for_t23_risk_sizing():
-    # A-1.4 → A-1.5（T23）：RiskSizing 按风险定手数（M2；sizing 与
-    # volume_lots 二选一，零手数跳过计数）；A-1.4 = T20 禁入窗推迟开仓
-    assert ENGINE_VERSION == "A-1.5"
+def test_engine_version_bumped_for_t36_stop_overshoot():
+    # A-1.5 → A-1.6（T36/H2）：stop 出场成交价加该小时止损越幅 p50
+    # （stop_gap 按开盘价成交已含真实越幅，不重复加）；A-1.5 = T23
+    # RiskSizing 按风险定手数；A-1.4 = T20 禁入窗推迟开仓
+    assert ENGINE_VERSION == "A-1.6"
 
 
 def test_engine_passes_price_to_cost_models_long_fills():

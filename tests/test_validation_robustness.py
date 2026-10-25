@@ -14,6 +14,7 @@ import pytest
 from mt5quant.backtest.engine_a import run_backtest
 from mt5quant.backtest.report import summarize
 from mt5quant.strategies import BaseStrategy, ParamSpec, RequiredData
+from mt5quant.strategies.base import ExitRules
 from mt5quant.validation import robustness as rob
 from mt5quant.validation.gates import load_gates
 
@@ -510,3 +511,81 @@ def test_random_entry_side_ratio_matches_strategy():
     out_long = random_entry_of(sig, bars, side=1)
     assert out_long["base_long_fraction"] == 1.0
     assert out_long["sampled_long_fraction"] == 1.0
+
+
+# ------------------------------------------------- T36（H2/M7）：成本敏感性报告
+
+class OvershootConstCosts(ConstCosts):
+    """带 stop_overshoot 的替身：p50/p90 两档恒定越幅（价格单位）。"""
+
+    def __init__(self, *a, ov=0.1, ov_p90=0.5, **kw):
+        super().__init__(*a, **kw)
+        self._ov, self._ov90 = ov, ov_p90
+
+    def stop_overshoot(self, symbol, hour_utc, *, price=None, level="p50"):
+        return self._ov90 if level == "p90" else self._ov
+
+
+class EnterAndStop(BaseStrategy):
+    """bar15 起做多 + 崩盘 bar：ATR≈0.4（TR 恒 0.4）→ SL=入场−1.6 触发。
+
+    SL 距离取 4×ATR（1.6）：远大于常态 bar 的 low 缓冲（−0.2），点差放大
+    （敏感性变体）不会把 SL 抬进常态 low 而变成连续即时空损。
+    """
+
+    def __init__(self):
+        self.exit_rules = ExitRules(stop_loss_atr=4.0)
+
+    def generate_signals(self, bars: pd.DataFrame, params: dict) -> pd.Series:
+        s = pd.Series(0, index=bars.index, dtype="int64")
+        s.iloc[15:] = 1
+        return s
+
+
+def crash_bars(n=40, crash_at=20, start="2024-01-01"):
+    closes = [100.0] * n
+    closes[crash_at] = 97.0                        # low = 96.8 <= SL 99.2
+    return make_bars(closes, start=start)
+
+
+def test_cost_scaling_reports_stop_overshoot_sensitivity(cfg):
+    """T36：0.5x/1x/p90 三档净利只报告不改门槛（净利随越幅成本单调递减）。"""
+    costs = OvershootConstCosts(ov=0.1, ov_p90=0.5)
+    out = rob.cost_scaling_check(spec_of(EnterAndStop()), crash_bars(),
+                                 costs, {}, cfg)
+    sens = out["stop_overshoot_sensitivity"]
+    assert sens["applicable"] is True and sens["record_only"] is True
+    assert sens["net_overshoot_1x"] > sens["net_overshoot_p90"]
+    assert sens["net_overshoot_0_5x"] > sens["net_overshoot_1x"]
+    # 门槛判定不受影响：仍只看 x1.5 的期望
+    assert out["passed"] is True
+
+
+def test_cost_scaling_overshoot_sensitivity_na_without_model(cfg):
+    out = rob.cost_scaling_check(spec_of(LongMid()), uptrend(),
+                                 ConstCosts(spread=0.02), {}, cfg)
+    assert out["stop_overshoot_sensitivity"]["applicable"] is False
+
+
+def test_cost_scaling_reports_early_years_spread_x1_5(cfg):
+    """T36/M7：2020 年以前点差 x1.5 情形——只报告，不改判定。
+
+    2019 年的 bars（全部交易都在 cutoff 前出场）：点差 0.5 -> x1.5 后
+    早年净利下降；passed 仍由全期 x1.5 的期望决定。
+    """
+    costs = ConstCosts(spread=0.5)
+    bars = crash_bars(n=40, crash_at=20, start="2019-06-01")
+    out = rob.cost_scaling_check(spec_of(EnterAndStop()), bars, costs, {}, cfg)
+    rep = out["early_years_spread_x1_5"]
+    assert rep["applicable"] is True and rep["record_only"] is True
+    assert rep["cutoff"] == "2020-01-01" and rep["factor"] == 1.5
+    assert rep["trades_pre_cutoff"] >= 1
+    assert rep["net_pre_cutoff_spread_scaled"] < rep["net_pre_cutoff_base"]
+    assert out["passed"] is True
+
+
+def test_cost_scaling_early_years_na_without_pre2020_trades(cfg):
+    # 2024 年的 bars：无 2020 年以前交易 -> 不适用（字段仍存在）
+    out = rob.cost_scaling_check(spec_of(LongMid()), uptrend(),
+                                 ConstCosts(spread=0.02), {}, cfg)
+    assert out["early_years_spread_x1_5"]["applicable"] is False

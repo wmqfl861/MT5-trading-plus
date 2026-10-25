@@ -12,17 +12,26 @@ scripts/migrate_ticks_layout.py --symbols <品种>，否则下载会拒绝并提
 增量刷新（定时任务用）：
     .venv/Scripts/python.exe scripts/download_ticks.py --symbols XAUUSD --mode refresh
 可选：--end --chunk-days 7 --data-dir data --config config.json
+
+T36（H2/锁箱铁律）——--ops-ack：tick 库整段落在锁箱期内、只用于运维成本
+测量（换日时刻、点差/越幅、执行口径），读锁箱期 tick 必须显式确认：
+- backfill 窗口 [start, end] 触及锁箱 cutoff（{data-dir}/lockbox.json 的
+  global_cutoff）之后的数据而未带 --ops-ack → 拒绝（退出码 1，不联网）；
+- 带 --ops-ack 时启动即打印 actor=ops（本次读取仅运维测量，不产生研究
+  结论）。台账不涉及（脚本级确认）；refresh 为既有增量维护路径，不设此门槛
+  （收紧与否由主会话统一决定，避免静默破坏已装计划任务）。
 """
 import argparse
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mt5gw import MT5Gateway  # noqa: E402
 from mt5data.downloader import server_now  # noqa: E402
+from mt5data.lockbox import load_config as load_lockbox  # noqa: E402
 from mt5data.ticks import backfill_ticks, read_ticks_watermark, refresh_ticks  # noqa: E402
 
 
@@ -53,6 +62,28 @@ def _precheck_clock(gw):
           f"{gw.config.server_utc_offset_hours:g}h 一致")
 
 
+def _ops_ack_gate(data_dir: str, start: datetime, end: datetime,
+                  acked: bool) -> str | None:
+    """T36：backfill 窗口触及锁箱 cutoff 之后的数据而未 --ops-ack → 拒绝。
+
+    返回拒绝信息（None=放行）。锁箱段 = time >= global_cutoff；窗口与之
+    相交 ⟺ end >= cutoff（窗口连续、end 为上界）。
+    """
+    try:
+        lb = load_lockbox(data_dir)
+    except Exception as e:  # 锁箱配置读不出来：如实报错，不静默放行
+        return f"读取锁箱配置失败（{type(e).__name__}: {e}），拒绝本次回补"
+    cutoff = getattr(lb, "global_cutoff", None) if lb is not None else None
+    if cutoff is None or end < cutoff:
+        return None
+    if acked:
+        return None
+    return (f"backfill 窗口 [{start} → {end}] 触及锁箱 cutoff {cutoff} 之后的"
+            "数据：读锁箱期 tick 仅限运维成本测量（换日时刻、点差/越幅、执行"
+            "口径），必须显式加 --ops-ack（本次读取记 actor=ops，不产生研究"
+            "结论）后重跑")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="下载/刷新 MT5 tick 到 Parquet")
     ap.add_argument("--symbols", required=True, help="逗号分隔，如 XAUUSD,BTCUSD（保留大小写）")
@@ -64,10 +95,27 @@ def main() -> int:
                     help="backfill 起点：YYYY-MM-DD 或 ISO 时刻（naive UTC）")
     ap.add_argument("--end", default=None, help="backfill 终点（缺省=现在）")
     ap.add_argument("--chunk-days", type=float, default=7.0)
+    ap.add_argument("--ops-ack", action="store_true",
+                    help="T36：确认本次读取锁箱期 tick 仅用于运维成本测量"
+                         "（actor=ops，不产生研究结论）；backfill 窗口触及锁箱"
+                         " cutoff 之后的数据时必须显式给出")
     args = ap.parse_args()
 
     if args.mode == "backfill" and not args.start:
         ap.error("--mode backfill 需要 --start（如 --start 2026-08-01）")
+
+    if args.ops_ack:
+        print("✓ --ops-ack：本次读取锁箱期 tick 仅用于运维成本测量"
+              "（actor=ops），不产生研究结论", flush=True)
+
+    if args.mode == "backfill":
+        start = _parse_naive(args.start)
+        end = (_parse_naive(args.end) if args.end
+               else datetime.now(timezone.utc).replace(tzinfo=None))
+        refuse = _ops_ack_gate(args.data_dir, start, end, args.ops_ack)
+        if refuse is not None:
+            print(f"✗ {refuse}", flush=True)
+            return 1
 
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     failed = []

@@ -142,3 +142,122 @@ def test_cli_main_writes_cache(tmp_path, capsys, monkeypatch):
     assert mod.main() == 0
     assert (root / "costs" / "spread_model.json").exists()
     assert "spread_model.json" in capsys.readouterr().out
+
+
+# ------------------------------------------------- T36（H2）：流式 + 越幅表
+
+def _seed_multimonth_ticks(root, symbol):
+    """跨 3 个月、每分钟多笔、跨数小时的 tick（采样/蓄水池非平凡数据）。"""
+    import numpy as np
+    import pandas as pd
+    from mt5data.ticks import save_ticks
+
+    rows = []
+    for y, mth, days in ((2026, 8, 5), (2026, 9, 4), (2026, 10, 3)):
+        for d in range(1, days + 1):
+            for hour_utc in (13, 14, 15):           # 纽约 9/10/11（EDT/EST 混合）
+                for minute in (0, 17, 41):
+                    for k, sec in enumerate((0, 23, 51)):
+                        spread = 0.0001 * (k + 1) * (hour_utc - 12) * d
+                        rows.append((pd.Timestamp(y, mth, d, hour_utc, minute, sec),
+                                     2400.0, 2400.0 + spread))
+    save_ticks(str(root), symbol, pd.DataFrame({
+        "time_msc": np.asarray([t.value // 10**6 for t, _, _ in rows],
+                               dtype="int64"),
+        "bid": [b for _, b, _ in rows],
+        "ask": [a for _, _, a in rows],
+        "last": [(b + a) / 2 for _, b, a in rows],
+        "volume": [0.0] * len(rows),
+        "flags": [2] * len(rows),
+    }))
+
+
+def test_build_streams_monthly_and_matches_one_shot(tmp_path):
+    """失败测试清单第 4 条（脚本侧）：逐月流式构建 == 全量一次性构建。
+
+    两种采样口径都核对（bar_open_m1 缺省、tick 对比）。
+    """
+    from mt5data.ticks import load_ticks
+    from mt5quant.costs import SpreadModel
+
+    mod = _load("build_cost_model_t36", SCRIPT_PATH)
+    rb = _load("run_backtest_t36", RUN_BT_PATH)
+    root = tmp_path / "data"
+    _seed_multimonth_ticks(root, "XAUUSD")
+    from mt5data.ticks import tick_watermark
+    for sampling in ("bar_open_m1", "tick"):
+        doc = mod.build_cost_models(str(root), ["XAUUSD"], sampling=sampling)
+        assert doc["sampling"] == sampling
+        assert doc["version"] == 2
+        direct = SpreadModel.from_ticks(
+            "XAUUSD", load_ticks(str(root), "XAUUSD",
+                                 columns=["time_msc", "bid", "ask"]),
+            sampling=sampling)
+        model = rb.load_spread_model_cache(
+            str(root / "costs" / "spread_model.json"), "XAUUSD",
+            spread_mode="relative", watermark=tick_watermark(str(root), "XAUUSD"))
+        for h, st in direct._per_symbol["XAUUSD"].items():  # noqa: SLF001
+            assert model.stat(h) == st, f"sampling={sampling} 小时 {h}"
+
+
+def test_build_overshoot_table_written_with_version_and_sha(tmp_path):
+    """--overshoot：缓存文件加越幅表 + 版本 2 + 独立 sha；负载可无损重建。"""
+    import numpy as np
+    import pandas as pd
+    from mt5data.ticks import save_ticks
+    from mt5quant.costs.overshoot import StopOvershootModel
+
+    mod = _load("build_cost_model_t36b", SCRIPT_PATH)
+    rb = _load("run_backtest_t36b", RUN_BT_PATH)
+    root = tmp_path / "data"
+    # 价格跳动 tick（制造穿价事件）：每小时首笔正常价，第二笔下跳（时间升序）
+    rng = np.random.default_rng(3)
+    rows = []
+    for h in range(24):
+        rows.append((pd.Timestamp(2026, 10, 19, h, 0, 0), 2400.0, 2400.3))
+        rows.append((pd.Timestamp(2026, 10, 19, h, 0, 1),
+                     2400.0 - abs(rng.normal(0, 0.5)),
+                     2400.3 - abs(rng.normal(0, 0.5))))
+    save_ticks(str(root), "XAUUSD", pd.DataFrame({
+        "time_msc": np.asarray([t.value // 10**6 for t, _, _ in rows],
+                               dtype="int64"),
+        "bid": [b for _, b, _ in rows], "ask": [a for _, _, a in rows],
+        "last": [2400.15] * len(rows), "volume": [0.0] * len(rows),
+        "flags": [2] * len(rows),
+    }))
+    mod.build_cost_models(str(root), ["XAUUSD"], overshoot=True)
+    doc = json.loads((root / "costs" / "spread_model.json")
+                     .read_text(encoding="utf-8"))
+    assert doc["version"] == 2
+    assert doc["sampling"] == "bar_open_m1"
+    assert "overshoot" in doc and "overshoot_sha256" in doc
+    assert (rb.canonical_json_sha256(doc["overshoot"])
+            == doc["overshoot_sha256"])
+    loaded = StopOvershootModel.from_dict(doc["overshoot"])
+    direct = StopOvershootModel.from_ticks(
+        "XAUUSD", rb.load_ticks(str(root), "XAUUSD",
+                                columns=["time_msc", "bid", "ask"]))
+    assert loaded.symbols == ("XAUUSD",)
+    for h, st in direct._per_symbol["XAUUSD"].items():    # noqa: SLF001
+        assert loaded.stat(h) == st
+
+
+def test_build_overshoot_disabled_leaves_no_table(tmp_path):
+    mod = _load("build_cost_model_t36c", SCRIPT_PATH)
+    root = tmp_path / "data"
+    _seed_ticks(root, "XAUUSD", range(24))
+    doc = mod.build_cost_models(str(root), ["XAUUSD"])    # 缺省不建越幅表
+    assert "overshoot" not in doc and "overshoot_sha256" not in doc
+
+
+def test_cli_overshoot_flag(tmp_path, monkeypatch):
+    mod = _load("build_cost_model_t36d", SCRIPT_PATH)
+    root = tmp_path / "data"
+    _seed_ticks(root, "XAUUSD", range(24))
+    monkeypatch.setattr("sys.argv", [
+        "build_cost_model.py", "--data-root", str(root),
+        "--symbols", "XAUUSD", "--overshoot"])
+    assert mod.main() == 0
+    doc = json.loads((root / "costs" / "spread_model.json")
+                     .read_text(encoding="utf-8"))
+    assert doc["version"] == 2 and "overshoot" in doc

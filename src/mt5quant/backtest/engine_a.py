@@ -53,6 +53,10 @@
   空头按 Ask 触发（bar 的 high/low + spr，spr 的价格基准见成本接口 v2 条）。
   成交：多头 exit = 价位 − slip；
   空头 exit = 价位 + slip（价位本身就是 Ask 口径，不再另加点差）。
+- 止损越幅（T36 / A-1.6，H2）：reason="stop" 的成交价再加该纽约小时越幅
+  p50（costs.stop_overshoot(symbol, h, price=价位 bid 基准)，多头减、空头加；
+  成本模型未提供该方法 → 不加，行为同 A-1.5）。stop_gap 按开盘价成交已含
+  真实越幅，不重复加；take_profit / 开盘 / 收盘出场一律不加。
 - 跳空穿价（H1 修复）：入场之后的 bar 若**开盘**已越过 SL（多头 open ≤ SL；
   空头 open+spr ≥ SL），按开盘价成交（exit_reason="stop_gap"，比止损价更差）；
   开盘已越过 TP 时按 TP 价成交（exit_reason="take_profit_gap"，保守不计跳空收益）。
@@ -103,8 +107,11 @@ from mt5quant.strategies.base import REENTRY_MODES, ExitRules
 
 NY_TZ = "America/New_York"   # 周五当地收盘（17:00）换算与点差分桶共用的时区
 _WEEK_CLOSE_LOCAL = dtime(17, 0)
-ENGINE_VERSION = "A-1.5"     # 2026-10-26 T23：RiskSizing 按风险定手数（M2；
-                             # sizing 与 volume_lots 二选一，零手数跳过计数）。
+ENGINE_VERSION = "A-1.6"     # 2026-10-26 T36：stop 出场成交价加止损越幅 p50
+                             # （H2；stop_gap 按开盘价成交已含真实越幅，不重复加；
+                             # 越幅模型缺失＝不加，行为同 A-1.5）。
+                             # A-1.5 = T23 RiskSizing 按风险定手数（M2；
+                             # sizing 与 volume_lots 二选一，零手数跳过计数）
                              # A-1.4 = T20 禁入窗推迟开仓/成本小时纽约本地口径
 
 # 按收盘价出场的 reason：成交时刻 = bar 收盘（bar 时间 + 周期）（R9）
@@ -143,6 +150,18 @@ class Costs(Protocol):
     def overnight_fee(self, symbol: str, side: str,
                       from_ts: datetime, to_ts: datetime) -> float:
         """持仓 [from_ts, to_ts] 的隔夜费（计价货币/手，恒 ≤0）。"""
+        ...
+
+    def stop_overshoot(self, symbol: str, hour_ny: int, *,
+                       price: float | None = None,
+                       level: str = "p50") -> float:
+        """（可选，T36/A-1.6）该纽约小时止损越幅（价格单位，不利方向）。
+
+        只作用于 reason="stop" 的出场成交价（stop_gap 按开盘价成交已含
+        真实越幅，不重复加；take_profit/开盘/收盘出场不加）。price = 该笔
+        出场的 bid 基准价（多头=SL 价位、空头=SL−spr）。**未实现该方法的
+        成本模型按 0 处理**（越幅统计缺失＝不加，行为同 A-1.5）。
+        """
         ...
 
 
@@ -394,7 +413,12 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
     ruined_at: pd.Timestamp | None = None
 
     def _close(j: int, base_price: float, reason: str) -> None:
-        """平仓。base_price 为 bid 口径基准价（空头出场另加 spr 变成 Ask）。"""
+        """平仓。base_price 为 bid 口径基准价（空头出场另加 spr 变成 Ask）。
+
+        T36/A-1.6：reason="stop" 的成交价再加该纽约小时止损越幅 p50
+        （costs.stop_overshoot，价格单位；模型未提供该方法 → 不加）。
+        stop_gap 按开盘价成交已含真实越幅，不重复加；其余出场不加。
+        """
         nonlocal state, realized, blocked_dir
         assert state is not None
         spr = costs.spread_p90(symbol, int(ny_hours[j]), price=base_price)
@@ -403,6 +427,16 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
             exit_price = base_price - slip
         else:
             exit_price = base_price + spr + slip
+        if reason == "stop":
+            ov_fn = getattr(costs, "stop_overshoot", None)
+            if ov_fn is not None:
+                ov = float(ov_fn(symbol, int(ny_hours[j]), price=base_price))
+                if not math.isfinite(ov) or ov < 0:
+                    raise ValueError(
+                        f"{symbol} 小时 {int(ny_hours[j])} 止损越幅为 {ov!r}"
+                        "（须为有限非负——负值即有利方向成本），拒绝")
+                exit_price = (exit_price - ov if state["dir"] == 1
+                              else exit_price + ov)
         lots = state["lots"]
         gross = (exit_price - state["entry_price"]) * state["dir"] * lots * cs
         commission = costs.commission_per_lot(symbol) * lots

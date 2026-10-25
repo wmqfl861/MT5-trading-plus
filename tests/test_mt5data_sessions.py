@@ -180,6 +180,7 @@ end_local = "18:30"
 [costs]
 spread_gate_multiplier = 3.0
 missing_hour_policy = "forbid"
+min_days_per_hour = 20
 """
 
 
@@ -326,6 +327,7 @@ def test_load_session_policy_from_toml(tmp_path):
     assert pol.extended_allow_long == frozenset()
     assert pol.spread_gate_multiplier == 3.0
     assert pol.missing_hour_policy == "forbid"
+    assert pol.min_days_per_hour == 20
     assert not pol.entry_allowed("XAUUSD", datetime(2026, 7, 15, 21, 10))
     assert pol.entry_allowed("XAUUSD", datetime(2026, 12, 15, 21, 10))
 
@@ -361,6 +363,31 @@ def test_repo_sessions_toml_defaults_match_plan():
     assert pol.extended_ends == {}
     assert pol.spread_gate_multiplier == 3.0
     assert pol.missing_hour_policy == "forbid"
+    assert pol.min_days_per_hour == 20
+
+
+def test_costs_min_days_per_hour_loaded_defaulted_validated(tmp_path):
+    """T36：[costs] min_days_per_hour——缺省 20、自定义读取、非法值拒载。"""
+    p = tmp_path / "sessions.toml"
+    # 缺省（键缺省）→ 20
+    p.write_text(SESSIONS_TOML.replace("min_days_per_hour = 20" + chr(10), ""),
+                 encoding="utf-8")
+    assert load_session_policy(str(p)).min_days_per_hour == 20
+    # 直接构造缺省同样 20；自定义值读取
+    assert SessionPolicy().min_days_per_hour == 20
+    p.write_text(SESSIONS_TOML.replace("min_days_per_hour = 20",
+                                       "min_days_per_hour = 30"),
+                 encoding="utf-8")
+    assert load_session_policy(str(p)).min_days_per_hour == 30
+    # 非法：非整数 / 0（正整数才有效）→ SessionConfigError
+    for bad in ('min_days_per_hour = "20"', "min_days_per_hour = 0",
+                "min_days_per_hour = true", "min_days_per_hour = 1.5"):
+        p.write_text(SESSIONS_TOML.replace("min_days_per_hour = 20", bad),
+                     encoding="utf-8")
+        with pytest.raises(SessionConfigError, match="min_days_per_hour"):
+            load_session_policy(str(p))
+    with pytest.raises(ValueError, match="min_days_per_hour"):
+        SessionPolicy(min_days_per_hour=0)
 
 
 def test_repo_policy_p11_reversal_eurusd():

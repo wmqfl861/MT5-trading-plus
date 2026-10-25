@@ -35,3 +35,8 @@ exempt_symbols = ["BTCUSD"]
 spread_gate_multiplier = 3.0
 # 点差模型某纽约本地小时缺统计时的策略：forbid = 该小时禁入、出场成本取全天最大 p90。
 missing_hour_policy = "forbid"
+# T36（H2）：点差模型某纽约本地小时的最少覆盖天数（n_days）——不足即视为缺统计
+# （forbid 语义：禁入该小时、出场成本取足额小时的最大 p90）。bar_open_m1 采样
+# （每 M1 边界后第一笔 tick）下每小时每天至多 60 个样本，覆盖天数才是样本量
+# 的关键维度；20 天 ≈ 一个月工作日的覆盖下限。
+min_days_per_hour = 20

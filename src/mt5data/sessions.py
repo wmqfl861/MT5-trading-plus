@@ -148,7 +148,9 @@ class SessionPolicy:
     （那是数据保护，不是时段规则）。
     forbidden_hours_ny 是**数据驱动**的补充禁入小时（点差模型缺统计的小时，
     由回测接线层注入，不进 sessions.toml）；spread_gate_multiplier /
-    missing_hour_policy 供成本侧与实盘点差闸门（T24）读取。
+    missing_hour_policy 供成本侧与实盘点差闸门（T24）读取；
+    min_days_per_hour（T36）供点差模型消费方（SpreadModel.missing_hours /
+    spread_p90 的 min_days_per_hour 参数）——某小时覆盖天数不足即缺统计。
     """
 
     rollover_local: str = "17:00"
@@ -161,6 +163,7 @@ class SessionPolicy:
     forbidden_hours_ny: Mapping[str, frozenset] = field(default_factory=dict)
     spread_gate_multiplier: float = 3.0
     missing_hour_policy: str = "forbid"
+    min_days_per_hour: int = 20   # T36：点差模型每小时最少覆盖天数（不足=缺统计）
 
     # 扩展窗长度上限（分钟）：换日时刻 → end_local 超过 3 小时须显式放行
     EXTENDED_WINDOW_MAX_MINUTES = 180
@@ -182,6 +185,11 @@ class SessionPolicy:
         if not (self.spread_gate_multiplier > 0):
             raise ValueError(
                 f"spread_gate_multiplier 须为正，收到 {self.spread_gate_multiplier!r}")
+        if (isinstance(self.min_days_per_hour, bool)
+                or not isinstance(self.min_days_per_hour, int)
+                or self.min_days_per_hour < 1):
+            raise ValueError(
+                f"min_days_per_hour 须为正整数，收到 {self.min_days_per_hour!r}")
         rollover_min = _hhmm_to_minutes(self.rollover_local)
         for sym, end in self.extended_ends.items():
             if not sym:
@@ -339,7 +347,8 @@ def _session_policy_from_dict(data: dict, path: str) -> SessionPolicy:
     costs = require("costs")
     if not isinstance(costs, dict):
         raise SessionConfigError("costs 须为表")
-    unknown = sorted(set(costs) - {"spread_gate_multiplier", "missing_hour_policy"})
+    unknown = sorted(set(costs) - {"spread_gate_multiplier", "missing_hour_policy",
+                                   "min_days_per_hour"})
     if unknown:
         raise SessionConfigError(f"costs 未知键：{unknown}")
     mult = costs.get("spread_gate_multiplier", 3.0)
@@ -350,6 +359,11 @@ def _session_policy_from_dict(data: dict, path: str) -> SessionPolicy:
         raise SessionConfigError(
             f"costs.missing_hour_policy 须为 {_MISSING_HOUR_POLICIES} 之一，"
             f"收到 {policy!r}")
+    min_days = costs.get("min_days_per_hour", 20)
+    if (isinstance(min_days, bool) or not isinstance(min_days, int)
+            or min_days < 1):
+        raise SessionConfigError(
+            f"costs.min_days_per_hour 须为正整数，收到 {min_days!r}")
 
     if data:
         raise SessionConfigError(f"会话配置未知键：{sorted(data)}（{path}）")
@@ -361,5 +375,6 @@ def _session_policy_from_dict(data: dict, path: str) -> SessionPolicy:
         extended_allow_long=frozenset(extended_allow),
         spread_gate_multiplier=float(mult),
         missing_hour_policy=policy,
+        min_days_per_hour=int(min_days),
     )
 

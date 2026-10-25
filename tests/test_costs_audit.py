@@ -131,13 +131,17 @@ def test_hourly_stats_invalid_timeframe_and_columns():
 # ---------- audit.cost_heatmap ----------
 
 def _models():
-    """绝对口径（旧口径逐位一致，回归钉死）。"""
+    """绝对口径 + 全 tick 采样（旧口径逐位一致，回归钉死）。
+
+    T36 起 from_ticks 缺省采样为 bar_open_m1（每 M1 首笔），本夹具同一分钟
+    5 笔、分位依赖全部 tick——显式钉死 sampling="tick" 保持手算不变。
+    """
     xau = SpreadModel.from_ticks("XAUUSD", make_ticks(
         [(f"2026-06-01 14:00:{i:02d}", 0.1 * (i + 1)) for i in range(5)], base=2400.0),
-        mode="absolute")
+        mode="absolute", sampling="tick")
     eur = SpreadModel.from_ticks("EURUSD", make_ticks(
         [(f"2026-06-01 14:00:{i:02d}", 0.0001 * (i + 1)) for i in range(5)], base=1.10),
-        mode="absolute")
+        mode="absolute", sampling="tick")
     spread = xau.merge(eur)                       # p90：XAU 0.46 / EUR 0.00046
     slip = SlippageModel(spread, spread_fraction=0.1)  # 0.046 / 0.000046
     comm = CommissionModel(default_per_lot=0.0,
