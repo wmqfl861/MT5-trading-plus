@@ -46,8 +46,15 @@
   契约即 load_ticks 的区间参数），一次只在内存驻留一个月；
   tick 帧需含 time_msc/bid/ask，time_msc 单调不倒退、bid/ask 有限为正
   且 ask ≥ bid，违反抛 ValueError。
-- 本引擎是正确性优先的参考实现（逐 tick Python 循环）；向量化/事件折叠
-  等优化留待 T10 对账通过之后。
+- 性能（T28/M8，B-0.3）：tick 校验按月块向量化（不再逐笔 Python 判定）；
+  不再为每笔 tick 构造 pd.Timestamp——成交时刻在 _open_at/_close_at 按需
+  构造；空仓且无待成交订单的区间用 numpy searchsorted 直接跳到下一个
+  bar 边界后的首笔 tick（被跳过段的末笔按"逐笔消费"语义更新 prev，
+  覆盖检查/收盘估值结果与逐笔循环逐位一致）；逐笔段按 64k 小批把三列
+  转 Python 标量迭代（tolist 批转换，免去逐笔 numpy 标量提取），下一个
+  bar 收盘时刻与持仓方向/SL/TP 提升为循环内局部变量。
+- 本引擎是正确性优先的参考实现（持仓区间仍逐 tick Python 循环）；
+  持仓区间的向量化留待 T10 对账通过之后。
 """
 from __future__ import annotations
 
@@ -56,6 +63,7 @@ from bisect import bisect_right
 from dataclasses import asdict, fields
 from typing import Callable, Protocol
 
+import numpy as np
 import pandas as pd
 
 from mt5data.store import TIMEFRAME_SECONDS
@@ -72,12 +80,17 @@ from mt5quant.backtest.engine_a import (
     _week_close_bars,
 )
 
-ENGINE_VERSION_B = "B-0.2"   # 2026-10-26 T20：SessionPolicy 禁入窗推迟开仓
-                             # （订单保留到第一个允许时刻的 tick；平仓不受限）
+ENGINE_VERSION_B = "B-0.3"   # 2026-10-26 T28/M8：性能改写——月块向量化校验、
+                             # 免逐笔 pd.Timestamp、空仓区间 searchsorted 跳读
+                             # （时间行为与 B-0.2 逐位一致；B-0.2 = T20 禁入窗
+                             # 推迟开仓，B-0.1/B-0.0 见 git 历史）
 
 
 class TickCoverageError(RuntimeError):
     """tick 覆盖不足（需要的 bar 区间无 tick / 订单无法成交）——拒绝静默跳过。"""
+
+
+_TICK_BATCH = 1 << 16   # T28：逐笔段的小批大小（tolist 批转换，约 5 MB 标量）
 
 
 class CostsTick(Protocol):
@@ -117,7 +130,13 @@ def _month_windows(start_ms: int, end_ms: int) -> list[tuple[int, int]]:
 
 
 class _TickStream:
-    """逐月窗口拉取并产出 (msc, bid, ask, Timestamp)；记录已加载覆盖范围。"""
+    """逐月窗口拉取并产出整块经验证的 (msc, bid, ask) numpy 数组；记录覆盖范围。
+
+    T28/M8：校验（time_msc 不倒退、报价有限为正且 ask ≥ bid）按块向量化，
+    与旧版逐笔判定逐位同判（同一谓词、同一首个坏样本上报）；跨月接续点
+    仍逐块比末笔。不再为每笔 tick 构造 pd.Timestamp（成交时刻由引擎按需
+    构造）。
+    """
 
     def __init__(self, symbol: str, loader: Callable, start_ms: int, end_ms: int):
         self.symbol = symbol
@@ -142,24 +161,30 @@ class _TickStream:
             msc_arr = df["time_msc"].to_numpy(dtype="int64")
             bid_arr = df["bid"].to_numpy(dtype="float64")
             ask_arr = df["ask"].to_numpy(dtype="float64")
-            for i in range(len(msc_arr)):
-                m = int(msc_arr[i])
-                b, a = float(bid_arr[i]), float(ask_arr[i])
-                if self._last_msc is not None and m < self._last_msc:
+            if msc_arr.size >= 2:
+                bad = np.flatnonzero(np.diff(msc_arr) < 0)
+                if bad.size:
+                    i = int(bad[0])
                     raise ValueError(
                         f"{self.symbol} tick time_msc 倒退"
-                        f"（{self._last_msc} → {m}），历史损坏，拒绝回测")
-                if not (math.isfinite(b) and math.isfinite(a) and b > 0
-                        and a >= b):
-                    raise ValueError(
-                        f"{self.symbol} tick 报价非法（bid={b!r}, ask={a!r}，"
-                        "要求有限为正且 ask ≥ bid），拒绝回测")
-                self._last_msc = m
-                if self.first_msc is None:
-                    self.first_msc = m
-                self.last_msc = m
-                self.loaded_rows += 1
-                yield (m, b, a, pd.Timestamp(m, unit="ms"))
+                        f"（{msc_arr[i]} → {msc_arr[i + 1]}），历史损坏，拒绝回测")
+            if self._last_msc is not None and int(msc_arr[0]) < self._last_msc:
+                raise ValueError(
+                    f"{self.symbol} tick time_msc 倒退"
+                    f"（{self._last_msc} → {int(msc_arr[0])}），历史损坏，拒绝回测")
+            ok = (np.isfinite(bid_arr) & np.isfinite(ask_arr)
+                  & (bid_arr > 0) & (ask_arr >= bid_arr))
+            if not bool(ok.all()):
+                i = int(np.flatnonzero(~ok)[0])
+                raise ValueError(
+                    f"{self.symbol} tick 报价非法（bid={bid_arr[i]!r}, "
+                    f"ask={ask_arr[i]!r}，要求有限为正且 ask ≥ bid），拒绝回测")
+            self._last_msc = int(msc_arr[-1])
+            if self.first_msc is None:
+                self.first_msc = int(msc_arr[0])
+            self.last_msc = int(msc_arr[-1])
+            self.loaded_rows += int(msc_arr.size)
+            yield msc_arr, bid_arr, ask_arr
 
 
 # ------------------------------------------------ 主入口
@@ -229,12 +254,17 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
     trades: list[Trade] = []
     state: dict | None = None      # 持仓；None = 空仓
     pending: dict | None = None    # {"desired": -1|0|1, "ready_ms": int}
-    prev: tuple | None = None      # 已处理的最后一笔 tick (msc, bid, ask, ts)
+    prev: tuple | None = None      # 已处理的最后一笔 tick (msc, bid, ask)
     last_closed = -1               # 最后已收盘 bar 的下标
     interval_need = False          # 当前 bar 区间内曾有持仓或待成交订单
     realized = 0.0
     equity_vals = [0.0] * n
     trade_field_names = {f.name for f in fields(Trade)}
+    # T28：state 的热字段镜像（逐笔 SL/TP 判定免字典查找；只在
+    # _open_at/_close_at 两个唯一变更点随 state 同步）
+    pos_dir = 0
+    pos_sl: float | None = None
+    pos_tp: float | None = None
 
     def _bar_of(m: int) -> int:
         return bisect_right(t_ms, m) - 1
@@ -246,10 +276,13 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
         k = st["sl_k"] if st["sl_k"] is not None else 1.0
         return net / (k * atr_v * st["lots"] * cs)
 
-    def _open_at(tk: tuple, desired: int) -> None:
-        """按成交 tick 开仓：多头 Ask 买入 / 空头 Bid 卖出，另加不利滑点。"""
-        nonlocal state
-        m, bid, ask, ts_ = tk
+    def _open_at(m: int, bid: float, ask: float, desired: int) -> None:
+        """按成交 tick 开仓：多头 Ask 买入 / 空头 Bid 卖出，另加不利滑点。
+
+        T28：pd.Timestamp 只在成交时构造（不再逐笔构造）。
+        """
+        nonlocal state, pos_dir, pos_sl, pos_tp
+        ts_ = pd.Timestamp(m, unit="ms")
         if desired == 1:
             entry_price = ask + slippage_price
             entry_spread = ask - bid          # 多头：价差拆分挂入场腿
@@ -273,12 +306,13 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
             "entry_spread": entry_spread, "entry_atr": entry_atr,
             "sl_k": rules.stop_loss_atr, "sl": sl, "tp": tp,
         }
+        pos_dir, pos_sl, pos_tp = desired, sl, tp
 
-    def _close_at(tk: tuple, reason: str) -> None:
+    def _close_at(m: int, bid: float, ask: float, reason: str) -> None:
         """按成交 tick 平仓：多头 Bid 卖出 / 空头 Ask 买入，另加不利滑点。"""
-        nonlocal state, realized, pending
+        nonlocal state, realized, pending, pos_dir, pos_sl, pos_tp
         assert state is not None
-        m, bid, ask, ts_ = tk
+        ts_ = pd.Timestamp(m, unit="ms")
         if state["dir"] == 1:
             exit_price = bid - slippage_price
             spread_charged = state["entry_spread"]
@@ -307,26 +341,10 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
         trades.append(Trade(**kwargs))
         realized += net
         state = None
+        pos_dir, pos_sl, pos_tp = 0, None, None
         # 持仓已被保护性出场平掉时，同向的"平仓单"已成空单，立即撤销
         if pending is not None and pending["desired"] == 0:
             pending = None
-
-    def _protective(tk: tuple) -> None:
-        """逐 tick SL/TP：多头按 Bid、空头按 Ask 触发（MT5 口径），止损优先。"""
-        _, bid, ask, _ = tk
-        sl, tp = state["sl"], state["tp"]
-        if sl is None and tp is None:
-            return
-        if state["dir"] == 1:
-            if sl is not None and bid <= sl:
-                _close_at(tk, "stop")
-            elif tp is not None and bid >= tp:
-                _close_at(tk, "take_profit")
-        else:
-            if sl is not None and ask >= sl:
-                _close_at(tk, "stop")
-            elif tp is not None and ask <= tp:
-                _close_at(tk, "take_profit")
 
     def _coverage_desc(stream: _TickStream) -> str:
         if stream.first_msc is None:
@@ -361,7 +379,7 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
             if reason is None and b == n - 1:
                 reason = "end_of_data"
             if reason is not None:
-                _close_at(prev, reason)
+                _close_at(prev[0], prev[1], prev[2], reason)
         # 3) 收盘市值：多头按 Bid、空头按 Ask（该 bar 收盘前最后一笔 tick）
         unreal = 0.0
         if state is not None:
@@ -389,32 +407,74 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
         interval_need = (state is not None) or (pending is not None)
 
     stream = _TickStream(symbol, ticks_loader, close_ms[0], close_ms[n - 1] - 1)
-    for tk in stream:
-        # bar 收盘边界（含两端）：先处理完边界再消费该 tick
-        while last_closed < n - 1 and close_ms[last_closed + 1] <= tk[0]:
-            last_closed += 1
-            _close_bar(last_closed, stream)
-        # 订单成交：就绪时刻含边界。开仓订单遇禁入时段 → 保留待下一笔
-        # 允许时刻的 tick（T20）；平仓单（desired=0）不受限
-        entered = False
-        if pending is not None and tk[0] >= pending["ready_ms"]:
-            desired = pending["desired"]
-            if state is not None and state["dir"] != desired:
-                _close_at(tk, "signal")
-            if desired != 0:
-                if session_policy is None or session_policy.entry_allowed(
-                        symbol, tk[3]):
-                    pending = None
-                    _open_at(tk, desired)
-                    entered = True
-            else:
-                pending = None
-        # SL/TP 逐 tick（入场 tick 自身不触发自己的止损）
-        if state is not None and not entered:
-            _protective(tk)
-        prev = tk
-        if state is not None or pending is not None:
-            interval_need = True
+    # T28/M8：按月块迭代。空仓且无待成交订单（interval_need=False）的区间
+    # 没有任何引擎事件——searchsorted 直接跳到下一个 bar 边界后的首笔 tick，
+    # 被跳过段的末笔照"逐笔消费"语义更新 prev（覆盖检查/收盘估值与逐笔
+    # 循环逐位一致）；持仓/待成交区间逐笔处理——64k 小批 tolist 转 Python
+    # 标量迭代（免去逐笔 numpy 标量提取），下一收盘时刻/方向/SL/TP 为
+    # 循环局部变量（镜像见 pos_* 注释）。
+    close_next = close_ms[0]   # 待处理的下一次 bar 收盘（ms）；None=全部收盘
+    for msc_arr, bid_arr, ask_arr in stream:
+        ntk = msc_arr.size
+        i = 0
+        while i < ntk:
+            if state is None and pending is None and not interval_need:
+                # 空闲：下一个事件只能是下一次 bar 收盘产生的新订单
+                if close_next is None:
+                    break                      # 全部 bar 已收盘：剩余 tick 无关
+                j = int(np.searchsorted(msc_arr, close_next, side="left"))
+                if j >= ntk:
+                    if j > i:                  # 模拟逐笔消费到本块末笔
+                        prev = (int(msc_arr[-1]), bid_arr[-1], ask_arr[-1])
+                    i = ntk
+                    break
+                if j > i:
+                    prev = (int(msc_arr[j - 1]), bid_arr[j - 1], ask_arr[j - 1])
+                i = j
+            end = min(i + _TICK_BATCH, ntk)
+            for m, bid, ask in zip(msc_arr[i:end].tolist(),
+                                   bid_arr[i:end].tolist(),
+                                   ask_arr[i:end].tolist()):
+                # bar 收盘边界（含两端）：先处理完边界再消费该 tick
+                while close_next is not None and close_next <= m:
+                    last_closed += 1
+                    _close_bar(last_closed, stream)
+                    close_next = (close_ms[last_closed + 1]
+                                  if last_closed < n - 1 else None)
+                # 订单成交：就绪时刻含边界。开仓订单遇禁入时段 → 保留待下一笔
+                # 允许时刻的 tick（T20）；平仓单（desired=0）不受限
+                entered = False
+                if pending is not None and m >= pending["ready_ms"]:
+                    desired = pending["desired"]
+                    if state is not None and state["dir"] != desired:
+                        _close_at(m, bid, ask, "signal")
+                    if desired != 0:
+                        if session_policy is None or session_policy.entry_allowed(
+                                symbol, pd.Timestamp(m, unit="ms")):
+                            pending = None
+                            _open_at(m, bid, ask, desired)
+                            entered = True
+                    else:
+                        pending = None
+                # SL/TP 逐 tick（入场 tick 自身不触发自己的止损；内联省一次
+                # 逐笔函数调用与字典查找——T28）：多头按 Bid、空头按 Ask，
+                # 止损优先
+                if state is not None and not entered \
+                        and (pos_sl is not None or pos_tp is not None):
+                    if pos_dir == 1:
+                        if pos_sl is not None and bid <= pos_sl:
+                            _close_at(m, bid, ask, "stop")
+                        elif pos_tp is not None and bid >= pos_tp:
+                            _close_at(m, bid, ask, "take_profit")
+                    else:
+                        if pos_sl is not None and ask >= pos_sl:
+                            _close_at(m, bid, ask, "stop")
+                        elif pos_tp is not None and ask <= pos_tp:
+                            _close_at(m, bid, ask, "take_profit")
+                prev = (m, bid, ask)
+                if state is not None or pending is not None:
+                    interval_need = True
+                i += 1
     # tick 耗尽：剩余 bar 依次收盘（空区间在此触发覆盖检查）
     while last_closed < n - 1:
         last_closed += 1

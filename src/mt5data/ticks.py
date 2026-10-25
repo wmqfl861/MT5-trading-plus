@@ -134,11 +134,14 @@ def _scan_months(d: str) -> list[int]:
     return sorted(out)
 
 
-def _read_month(d: str, m: int) -> pd.DataFrame | None:
+def _read_month(d: str, m: int, columns: list[str] | None = None
+                ) -> pd.DataFrame | None:
     p = _month_file(d, m)
     if not os.path.exists(p):
         return None
-    return pd.read_parquet(p)
+    if columns is None:
+        return pd.read_parquet(p)
+    return pd.read_parquet(p, columns=columns)
 
 
 def _write_month_atomic(d: str, m: int, df: pd.DataFrame) -> None:
@@ -463,13 +466,38 @@ def _save_ticks_locked(d, symbol, df, *, server=None, login=None):
     _recompute_meta_locked(d, symbol, server=server, login=login)
 
 
+def _resolve_columns(columns) -> list[str]:
+    """columns 参数 → 规范序列表（按 TICK_COLUMNS 顺序）；None=全部列。
+
+    T28（M8）：构建点差模型只需 time_msc/bid/ask 三列，免载 last/volume/flags。
+    空列表/非法列名/重复列 → ValueError（调用方笔误立即暴露，不静默忽略）。
+    """
+    if columns is None:
+        return list(TICK_COLUMNS)
+    cols = list(columns)
+    if not cols:
+        raise ValueError("columns 不能为空（None=全部列）")
+    bad = sorted({c for c in cols if c not in TICK_COLUMNS})
+    if bad:
+        raise ValueError(f"columns 含非法列 {bad}（合法列 {TICK_COLUMNS}）")
+    if len(set(cols)) != len(cols):
+        raise ValueError(f"columns 有重复：{cols}")
+    return [c for c in TICK_COLUMNS if c in set(cols)]
+
+
 def load_ticks(root, symbol: str, *, start_msc: int | None = None,
-               end_msc: int | None = None) -> pd.DataFrame | None:
+               end_msc: int | None = None,
+               columns: list[str] | tuple[str, ...] | None = None
+               ) -> pd.DataFrame | None:
     """读取 tick 历史，只打开 [start_msc, end_msc] 涉及的月份分区文件。
 
     - start/end 均缺省 → 全部月份；
     - 行级过滤 time_msc ∈ [start_msc, end_msc]（含两端，毫秒）；
-    - 库不存在 → None；库存在但区间不涉及任何月份 → 空 DataFrame（列齐）；
+    - columns（T28/M8）：只读指定列（parquet 列裁剪，省内存省 IO）；
+      返回列序按 TICK_COLUMNS 规范序、dtype 不变；行级过滤仍按 time_msc
+      （columns 未含 time_msc 时内部照读、过滤后裁掉）。None=全部列；
+    - 库不存在 → None；库存在但区间不涉及任何月份 → 空 DataFrame（列与
+      dtype 按请求给出）；
     - 检测到旧单文件布局 → TicksLayoutError（提示先跑迁移脚本）。
     """
     d = ticks_dir(root, symbol)
@@ -480,6 +508,11 @@ def load_ticks(root, symbol: str, *, start_msc: int | None = None,
     if start_msc is not None and end_msc is not None \
             and int(start_msc) > int(end_msc):
         raise ValueError(f"start_msc {start_msc} 不得晚于 end_msc {end_msc}")
+    wanted = _resolve_columns(columns)
+    subset = columns is not None
+    # 行级过滤需要 time_msc：内部读盘列 = 请求列 ∪ {time_msc}
+    read_cols = (wanted if "time_msc" in wanted else wanted + ["time_msc"]) \
+        if subset else None
     lo = (_month_index_from_msc(int(start_msc))
           if start_msc is not None else months[0])
     hi = (_month_index_from_msc(int(end_msc))
@@ -487,17 +520,35 @@ def load_ticks(root, symbol: str, *, start_msc: int | None = None,
     frames = []
     for m in months:
         if lo <= m <= hi:
-            part = _read_month(d, m)
+            part = _read_month(d, m, columns=read_cols)
             if part is not None and len(part) > 0:
                 frames.append(part)
     if not frames:
-        return pd.DataFrame(columns=TICK_COLUMNS)
+        return pd.DataFrame({c: pd.Series(dtype=_TICK_DTYPES[c]) for c in wanted})
     df = frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
     if start_msc is not None:
         df = df[df["time_msc"] >= int(start_msc)]
     if end_msc is not None:
         df = df[df["time_msc"] <= int(end_msc)]
+    if subset:
+        df = df[wanted]
     return df.reset_index(drop=True)
+
+
+def tick_watermark(root, symbol: str) -> dict | None:
+    """当前 tick 库水位 {rows, first_msc, last_msc}——只读各月分区 parquet 的
+    元数据，不加载任何数据行（T28/M8：成本模型缓存以它为键做失效判定）。
+
+    与 meta.json 无关（防异常中断留下陈旧 meta；与 _recompute_meta_locked
+    同一统计源）。无库（无月份分区）→ None；旧单文件布局照抛 TicksLayoutError。
+    """
+    d = ticks_dir(root, symbol)
+    _raise_if_old_layout(d, symbol)
+    months = _scan_months(d)
+    if not months:
+        return None
+    rows, first, last = _scan_stats(d, months)
+    return {"rows": rows, "first_msc": first, "last_msc": last}
 
 
 def read_ticks_watermark(root, symbol: str) -> dict | None:

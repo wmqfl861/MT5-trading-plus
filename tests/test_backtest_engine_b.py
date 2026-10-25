@@ -574,7 +574,9 @@ def _pol_window(local_hhmm: str, tz: str = "UTC", *, pre: int = 0, post: int = 6
 
 
 def test_engine_b_version_bumped_for_t20():
-    assert ENGINE_VERSION_B == "B-0.2"
+    # T28（M8）改写性能（B-0.3）：月块向量化校验、免逐笔 pd.Timestamp、
+    # 空仓区间 searchsorted 跳读——时间行为与 B-0.2 逐位一致。
+    assert ENGINE_VERSION_B == "B-0.3"
 
 
 def test_session_policy_defers_entry_to_first_allowed_tick():
@@ -627,3 +629,64 @@ def test_session_policy_pending_until_data_end_is_cancelled_not_coverage_error()
     res = run_b(df, ticks, ScriptStrategy([1], fill=1), session_policy=pol)
     assert len(res.trades) == 0
     assert list(res.equity) == pytest.approx([10_000.0] * 3)
+
+
+# --------------------------------------------- T28（M8）：跳读不改语义 + 性能
+
+def test_idle_jump_dense_ticks_keep_results_bit_identical():
+    """空仓区间的稠密 tick（跳读段）不改变任何结果：trades 与 equity
+    与稀疏 tick 版逐位一致（prev 按逐笔消费语义模拟）。
+
+    信号 [0,0,1,1]：[11:00, 13:00)（bar1/bar2 区间）空仓无订单——稠密 idle 段。
+    """
+    df = base4()
+    sparse = [
+        tick("2026-01-05 13:00:00.500", 99.9, 100.4),   # bar2 收盘后的首笔 → 入场
+        tick("2026-01-05 13:30:00", 102.0, 102.4),
+        tick("2026-01-05 13:59:59.999", 103.0, 103.2),
+    ]
+    dense = list(sparse)
+    for m in range(0, 120):                             # 每分钟一笔 idle tick
+        dense.append(tick(pd.Timestamp("2026-01-05 11:00") + timedelta(minutes=m),
+                          98.0 + m * 0.01, 98.2 + m * 0.01))
+    dense.sort(key=lambda t: t[0])
+    res_sparse = run_b(df, sparse, ScriptStrategy([0, 0, 1], fill=1))
+    res_dense = run_b(df, dense, ScriptStrategy([0, 0, 1], fill=1))
+    assert len(res_sparse.trades) == len(res_dense.trades) == 1
+    pd.testing.assert_frame_equal(res_sparse.trades, res_dense.trades)
+    assert list(res_sparse.equity) == pytest.approx(list(res_dense.equity))
+
+
+def test_idle_jump_still_raises_coverage_error_for_empty_interval():
+    """跳读后 prev 的覆盖语义不变：跳过稠密 idle 段之后，下一根 bar 区间
+    仍无 tick → TickCoverageError 照报（缺口区间与已加载范围都在报文里，
+    跳读段的 tick 计入已加载覆盖统计）。"""
+    df = base4()   # bar 10/11/12/13，收盘 11/12/13/14
+    ticks = [tick(pd.Timestamp("2026-01-05 11:00") + timedelta(minutes=m),
+                  99.0, 99.2) for m in range(120)]      # [11:00, 13:00) 稠密 idle
+    # bar3 区间 [13:00, 14:00) 一笔 tick 都没有
+    with pytest.raises(TickCoverageError) as ei:
+        run_b(df, ticks, ScriptStrategy([0, 0, 1], fill=1))   # bar2 收盘（13:00）下单
+    msg = str(ei.value)
+    assert "2026-01-05 13:00" in msg            # bar3 区间无 tick 被查出
+    assert "2026-01-05 12:59" in msg            # 跳读段末笔计入已加载覆盖
+    assert "120 笔" in msg
+
+
+def test_engine_b_perf_smoke_no_regression():
+    """性能冒烟（宽限断言）：200 根 H1 × 每 30 秒一笔 tick（2.4 万笔，
+    BuyHold 全程持仓——最重路径）应在数秒内完成；防 O(bar×tick) 级回退。"""
+    import time
+
+    df = flat_bars(pd.Timestamp("2026-03-02 00:00"), 200)
+    ticks = []
+    for b in range(200):
+        t0 = pd.Timestamp("2026-03-02 00:00") + timedelta(hours=b)
+        for s in range(0, 3600, 30):
+            ticks.append(tick(t0 + timedelta(seconds=s),
+                              100.0 + (s % 60) * 0.01, 100.4 + (s % 60) * 0.01))
+    t_start = time.perf_counter()
+    res = run_b(df, ticks, BuyHold())
+    elapsed = time.perf_counter() - t_start
+    assert len(res.trades) == 1
+    assert elapsed < 10.0, f"engine B 性能冒烟超时：{elapsed:.1f}s（2.4 万 tick）"

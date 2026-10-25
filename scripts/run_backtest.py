@@ -18,6 +18,14 @@
   {data-root}/costs/calibrated.json（scripts/calibrate_costs.py 实测），其次
   品种快照推算（SwapModel.from_snapshot）；两者都没有 → 报错，除非显式
   --allow-zero-swap（零隔夜费会写进 manifest）。--costs zero 用零成本占位。
+- 点差模型缓存（T28/M8）：--costs auto 优先加载 {data-root}/costs/
+  spread_model.json（scripts/build_cost_model.py 产出，按 tick 水位失效），
+  不再每次回测重读全部原始 tick（XAUUSD 7,780 万行全列约 3.7 GB）。缓存
+  缺失 → 明确报错指路（加 --build-cost-model 可本次运行内从 tick 现建——
+  选择"缺缓存报错 + 显式 flag"而非静默直建：批量/计划任务里的隐性 4 GB
+  加载正是 M8 要消除的）；水位变化而模型未重建 → 同样报错，绝不静默用
+  旧模型。函数级 build_costs 保留无缓存直建回退（bt.py / 对账脚本 / 测试
+  的兼容路径，行为与旧版一致）。
 - 时钟校验（R5）：读 {data-root}/server_clock.json 最新有效样本，与配置的
   server_utc_offset_hours 比对，超限拒绝运行；无有效样本仅警告。
 - 禁入窗（T20）：默认加载 config/sessions.toml（SessionPolicy，与实盘风控
@@ -33,6 +41,7 @@ import importlib
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -43,7 +52,7 @@ from mt5data.clock import (  # noqa: E402
 from mt5data.lockbox import research_bars  # noqa: E402
 from mt5data.sessions import SessionPolicy, load_session_policy  # noqa: E402
 from mt5data.store import TIMEFRAME_SECONDS  # noqa: E402
-from mt5data.ticks import load_ticks  # noqa: E402
+from mt5data.ticks import load_ticks, tick_watermark  # noqa: E402
 from mt5quant.backtest.engine_a import run_backtest  # noqa: E402
 from mt5quant.backtest.engine_b import run_backtest_ticks  # noqa: E402
 from mt5quant.backtest.report import make_run_dir, summarize, write_report  # noqa: E402
@@ -121,12 +130,127 @@ def _load_calibrated(data_root: str) -> dict | None:
         return json.load(f)
 
 
+# ------------------------------------------------ T28（M8）：点差模型缓存
+#
+# 缓存文件 {data-root}/costs/spread_model.json 由 scripts/build_cost_model.py
+# 产出（本模块的 save/load 是同一读写的另一入口，供 --build-cost-model 与
+# 测试使用）。IO/校验逻辑放这里而不是 build_cost_model.py，是因为
+# build_costs 在函数级就要消费它，而 bt.py / 测试经 importlib 装载本模块时
+# scripts 目录不在 sys.path 上（不能顶层 import 兄弟脚本）。
+
+REBUILD_HINT = ("重跑 scripts/build_cost_model.py（或回测时加 --build-cost-model"
+                " 本次现建）")
+
+
+def spread_model_cache_path(data_root: str) -> str:
+    return os.path.join(data_root, "costs", "spread_model.json")
+
+
+def canonical_json_sha256(payload: dict) -> str:
+    """模型负载的规范 sha256（sort_keys + 紧致分隔符，任何等价 dict 同哈希）。"""
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                   separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def save_spread_model_cache(path: str, model, watermarks: dict) -> dict:
+    """原子写缓存：{version, mode, watermarks, model, model_sha256, built_at_utc}。
+
+    watermarks：{symbol: {rows, first_msc, last_msc}}（mt5data.ticks.
+    tick_watermark 的产出）——读取方逐项比对当前水位，不一致即要求重建。
+    """
+    payload = model.to_dict()
+    doc = {
+        "version": 1,
+        "mode": model.mode,
+        "watermarks": {s: dict(w) for s, w in watermarks.items()},
+        "model": payload,
+        "model_sha256": canonical_json_sha256(payload),
+        "built_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+    return doc
+
+
+def load_spread_model_cache(path: str, symbol: str, *,
+                            spread_mode: str,
+                            watermark: dict | None):
+    """读缓存并做四重校验，任何一处不过 → ValueError（提示重建，绝不静默）。
+
+    1) 文件可读、结构完整；2) model_sha256 与模型负载一致（防手改/半截写）；
+    3) 口径（mode）与请求一致；4) 品种在模型中且 tick 水位（rows/first/last）
+    与当前库逐项一致。watermark=None（tick 库没了）而缓存还在属环境异常，同报错。
+    """
+    from mt5quant.costs import SpreadModel
+    from mt5quant.costs.spread import BUCKET_TZ, SpreadStat
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+        payload = doc["model"]
+        sha = doc["model_sha256"]
+        wms = doc["watermarks"]
+        cached_mode = doc["mode"]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise ValueError(f"点差缓存 {path} 不可读或结构不完整（{e}）——{REBUILD_HINT}") from e
+    if canonical_json_sha256(payload) != sha:
+        raise ValueError(
+            f"点差缓存 {path} 的 model_sha256 与模型内容不一致"
+            f"（文件被改动或写坏）——{REBUILD_HINT}")
+    if cached_mode != spread_mode:
+        raise ValueError(
+            f"点差缓存口径为 {cached_mode}，本次请求 {spread_mode}——"
+            f"{REBUILD_HINT} 并加 --spread-mode {spread_mode}")
+    # 与 SpreadModel.load 相同的口径防线（此处直接从负载重建，不经文件）
+    if payload.get("bucket_tz") != BUCKET_TZ:
+        raise ValueError(
+            f"点差缓存 bucket_tz={payload.get('bucket_tz')!r}"
+            f"（缺标注=UTC 分桶的旧文件），与纽约本地小时口径不兼容——{REBUILD_HINT}")
+    try:
+        per = {s: {int(h): SpreadStat(**st) for h, st in hours.items()}
+               for s, hours in payload["per_symbol"].items()}
+        overall = {s: float(v) for s, v in payload["overall_median"].items()}
+        model = SpreadModel(per, overall, mode=cached_mode)
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError(f"点差缓存 {path} 模型负载非法（{e}）——{REBUILD_HINT}") from e
+    if symbol not in per:
+        raise ValueError(
+            f"{symbol} 不在点差缓存中（缓存品种：{sorted(per)}）——{REBUILD_HINT}"
+            f" --symbols {symbol}")
+    wm_cached = wms.get(symbol)
+    if wm_cached is None:
+        raise ValueError(f"{symbol} 的 tick 水位不在点差缓存中——{REBUILD_HINT}")
+    if watermark is None:
+        raise ValueError(
+            f"{symbol} 当前无 tick 库却存在点差缓存（库被移动/删除？）——"
+            f"先确认数据目录，再{REBUILD_HINT}")
+    for k in ("rows", "first_msc", "last_msc"):
+        if wm_cached.get(k) != watermark.get(k):
+            raise ValueError(
+                f"{symbol} tick 水位已变化（缓存 {k}={wm_cached.get(k)!r}，"
+                f"当前 {watermark.get(k)!r}）——模型可能过期，{REBUILD_HINT}；"
+                "绝不静默沿用旧模型")
+    return model
+
+
 def build_costs(data_root: str, symbol: str, spread_fraction: float,
                 commission_per_lot: float = 0.0, *,
                 allow_zero_swap: bool = False,
                 spread_mode: str = "relative",
-                sessions_sha: str | None = None) -> tuple:
+                sessions_sha: str | None = None,
+                cache: bool = True) -> tuple:
     """tick 实测点差 + 佣金/隔夜费（calibrated.json > 品种快照 > 报错）。
+
+    T28/M8：优先加载点差模型缓存 {data-root}/costs/spread_model.json（按
+    tick 水位校验，绝不静默沿用过期模型），**不再为每次回测重读全部原始
+    tick**（XAUUSD 全库全列约 3.7 GB）。CLI 主路径缺缓存先报错（见 main 的
+    --build-cost-model）；本函数保留"无缓存→直建"回退是给 bt.py / 对账
+    脚本 / 测试的兼容路径（cache=False 可强制直建）。
 
     spread_mode（R1/T3）：relative（默认）＝(ask−bid)/mid 按**纽约本地小时**
     分位（T20：换日尖峰不被 DST 摊薄），引擎按成交基准价缩放——近期点差
@@ -152,12 +276,26 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
     )
     from mt5quant.costs.swap import mt5_to_py_weekday
 
-    ticks = load_ticks(data_root, symbol)
-    if ticks is None or len(ticks) == 0:
-        print(f"⚠ {symbol} 无 tick 数据，退回零成本；"
-              f"先跑 scripts/download_ticks.py 可启用实测点差/滑点")
-        return ZeroCosts(), "zero-v0(no-ticks)"
-    spread = SpreadModel.from_ticks(symbol, ticks, mode=spread_mode)
+    cache_path = spread_model_cache_path(data_root)
+    wm = tick_watermark(data_root, symbol)   # 只读 parquet 元数据，不载数据行
+    used_cache = False
+    if cache and wm is not None and os.path.exists(cache_path):
+        spread = load_spread_model_cache(cache_path, symbol,
+                                         spread_mode=spread_mode,
+                                         watermark=wm)
+        used_cache = True
+    else:
+        if cache and wm is None and os.path.exists(cache_path):
+            raise ValueError(
+                f"{symbol} 无 tick 库却存在点差缓存 {cache_path}——环境异常，"
+                f"请检查数据目录；确认后可{REBUILD_HINT}")
+        ticks = load_ticks(data_root, symbol,
+                           columns=["time_msc", "bid", "ask"])
+        if ticks is None or len(ticks) == 0:
+            print(f"⚠ {symbol} 无 tick 数据，退回零成本；"
+                  f"先跑 scripts/download_ticks.py 可启用实测点差/滑点")
+            return ZeroCosts(), "zero-v0(no-ticks)"
+        spread = SpreadModel.from_ticks(symbol, ticks, mode=spread_mode)
     slip = SlippageModel(spread, spread_fraction=spread_fraction)
     mode_tag = "rel" if spread_mode == "relative" else "abs"
 
@@ -233,7 +371,9 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
 
     costs = Costs(spread=spread, slippage_model=slip, commission=commission,
                   swap=swap)
-    print(f"✓ 成本：tick {len(ticks):,} 条实测点差（{mode_tag}@NY p90"
+    src = (f"缓存命中，tick 水位一致（{wm['rows']:,} 条实测）" if used_cache
+           else f"tick {len(ticks):,} 条实测点差")
+    print(f"✓ 成本：{src}（{mode_tag}@NY p90"
           f"{'×成交价' if mode_tag == 'rel' else ''}）；{comm_tag}；{swap_tag}"
           + (f"；缺统计 {len(missing)} 个纽约小时（forbid 禁入）" if missing else ""))
     return (costs,
@@ -342,6 +482,11 @@ def main() -> int:
                     help="合约大小覆盖；缺省读 {data-root}/specs/latest.json")
     ap.add_argument("--cost-version", default=None,
                     help="成本模型版本（写进 manifest；缺省按 --costs 自动生成）")
+    ap.add_argument("--build-cost-model", action="store_true",
+                    help="--costs auto 时本次运行内（重）建点差模型缓存 "
+                         "{data-root}/costs/spread_model.json（等价先跑 "
+                         "scripts/build_cost_model.py；XAUUSD 全库约数分钟）。"
+                         "缺省要求缓存已存在——缺缓存直接报错，不静默重读全部 tick")
     args = ap.parse_args()
 
     if args.timeframe.upper() not in TIMEFRAME_SECONDS:
@@ -363,6 +508,19 @@ def main() -> int:
         sess_policy = load_session_policy(str(SESSIONS_PATH))
         sess_sha = sessions_sha256(str(SESSIONS_PATH))
         if args.costs == "auto":
+            # T28/M8：CLI 主路径缺缓存先报错（不静默重读全部 tick——那正是
+            # M8 要消除的 4 GB 隐性加载）；--build-cost-model 为显式直建通道。
+            cache_path = spread_model_cache_path(args.data_root)
+            if args.build_cost_model:
+                from build_cost_model import build_cost_models  # scripts 目录
+                build_cost_models(args.data_root, [args.symbol],
+                                  spread_mode=args.spread_mode)
+            elif not os.path.exists(cache_path):
+                raise ValueError(
+                    f"缺 点差模型缓存 {cache_path}：先跑 "
+                    f"scripts/build_cost_model.py --data-root {args.data_root} "
+                    f"--symbols {args.symbol}"
+                    f"（或本次运行加 --build-cost-model 从 tick 现建）")
             costs, cost_version = build_costs(
                 args.data_root, args.symbol, args.spread_fraction,
                 args.commission, allow_zero_swap=args.allow_zero_swap,

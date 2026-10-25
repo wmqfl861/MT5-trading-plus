@@ -385,9 +385,9 @@ def _spy_read_month(monkeypatch, reads: list):
     """记录 _read_month 打开的月份（只读月份数据文件的探针）。"""
     orig = ticks_mod._read_month
 
-    def spy(d, m):
+    def spy(d, m, columns=None):
         reads.append(m)
-        return orig(d, m)
+        return orig(d, m, columns=columns)
 
     monkeypatch.setattr(ticks_mod, "_read_month", spy)
 
@@ -542,6 +542,94 @@ def test_migrate_old_layout_conserves_rows_and_bounds(tmp_path):
     assert wm["server"] == "Exness-Trial" and wm["login"] == 42
     # 再跑一次：无旧布局可迁 → None（幂等跳过）
     assert migrate_old_layout(root, "XAUUSD") is None
+
+
+# ---- T28（M8）：columns 只读指定列；tick_watermark 只碰元数据 ----
+
+
+def test_load_ticks_columns_reads_only_requested_columns(tmp_path, monkeypatch):
+    """columns=["time_msc","bid","ask"]：parquet 只开三列（构建点差模型不必载
+    last/volume/flags），返回列序按 TICK_COLUMNS 规范序、dtype 与全列读取一致、
+    值与全列读取的子集逐位一致。"""
+    root = str(tmp_path)
+    save_ticks(root, "XAUUSD", ticks_df(rows_from(datetime(2026, 7, 1), 72,
+                                                  step_s=3600)))
+    seen: list = []
+    real_read = pd.read_parquet
+
+    def spy(path, columns=None, **kw):
+        seen.append(columns)
+        return real_read(path, columns=columns, **kw)
+
+    monkeypatch.setattr(ticks_mod.pd, "read_parquet", spy)
+    df3 = load_ticks(root, "XAUUSD", columns=["time_msc", "bid", "ask"])
+    monkeypatch.setattr(ticks_mod.pd, "read_parquet", real_read)
+    # 打开的每个月分区都只读了三列（不是全列）
+    assert seen and all(c is not None and set(c) == {"time_msc", "bid", "ask"}
+                        for c in seen)
+    assert list(df3.columns) == ["time_msc", "bid", "ask"]
+    full = load_ticks(root, "XAUUSD")
+    for c in ("time_msc", "bid", "ask"):
+        assert str(df3[c].dtype) == str(full[c].dtype)
+        assert list(df3[c]) == list(full[c])
+
+
+def test_load_ticks_columns_normalizes_order_and_validates(tmp_path):
+    """乱序传入按规范序返回；columns 不含 time_msc 时行级过滤仍准确；
+    非法列名/重复列 → ValueError。"""
+    root = str(tmp_path)
+    rows = rows_from(datetime(2026, 8, 1), 48, step_s=3600)
+    save_ticks(root, "XAUUSD", ticks_df(rows))
+    lo, hi = _ms(datetime(2026, 8, 1, 5)), _ms(datetime(2026, 8, 1, 9))
+
+    rev = load_ticks(root, "XAUUSD", columns=["ask", "time_msc"])
+    assert list(rev.columns) == ["time_msc", "ask"]   # TICK_COLUMNS 规范序
+
+    bid_only = load_ticks(root, "XAUUSD", start_msc=lo, end_msc=hi,
+                          columns=["bid"])
+    assert list(bid_only.columns) == ["bid"]
+    assert list(bid_only["bid"]) == [r[1] for r in rows[5:10]]  # 过滤仍按 time_msc
+
+    with pytest.raises(ValueError, match="非法列"):
+        load_ticks(root, "XAUUSD", columns=["time_msc", "mid"])
+    with pytest.raises(ValueError, match="重复"):
+        load_ticks(root, "XAUUSD", columns=["bid", "bid"])
+    with pytest.raises(ValueError, match="不能为空"):
+        load_ticks(root, "XAUUSD", columns=[])
+
+
+def test_load_ticks_columns_empty_result_keeps_schema(tmp_path):
+    """区间不涉及任何月份时返回空表：列与 dtype 与请求一致（不再 object 占位）。"""
+    root = str(tmp_path)
+    save_ticks(root, "XAUUSD", ticks_df(rows_from(datetime(2026, 8, 1), 5)))
+    empty = load_ticks(root, "XAUUSD", start_msc=_ms(datetime(2027, 1, 1)),
+                       end_msc=_ms(datetime(2027, 2, 1)),
+                       columns=["ask", "bid", "time_msc"])
+    assert empty is not None and len(empty) == 0
+    assert list(empty.columns) == ["time_msc", "bid", "ask"]
+    assert str(empty["time_msc"].dtype) == "int64"
+    assert str(empty["bid"].dtype) == "float64"
+    assert str(empty["ask"].dtype) == "float64"
+
+
+def test_tick_watermark_reads_metadata_only_and_ignores_stale_meta(tmp_path):
+    """tick_watermark：{rows, first_msc, last_msc} 与磁盘月分区一致；无库 → None；
+    meta.json 被改陈旧也不信（以分区元数据重算，供成本缓存做水位键）。"""
+    from mt5data.ticks import tick_watermark
+
+    root = str(tmp_path)
+    assert tick_watermark(root, "NOEXIST") is None
+    rows = rows_from(datetime(2026, 7, 1), 10, step_s=3600)
+    save_ticks(root, "XAUUSD", ticks_df(rows))
+    wm = tick_watermark(root, "XAUUSD")
+    assert wm == {"rows": 10, "first_msc": rows[0][0], "last_msc": rows[-1][0]}
+    # 手改 meta.json 模拟异常中断留下的陈旧水位 → 仍按磁盘分区重算
+    d = ticks_dir(root, "XAUUSD")
+    stale = dict(read_ticks_watermark(root, "XAUUSD"))
+    stale["rows"] = 999999
+    with open(os.path.join(d, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(stale, f)
+    assert tick_watermark(root, "XAUUSD")["rows"] == 10
 
 
 def test_fetch_window_direct_structured_array_conversion():
