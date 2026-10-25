@@ -1,7 +1,7 @@
-"""T22/H7 合成对照（validation.synthetic）：负对照块置换、正对照植入优势、
-PlantedEdgeStrategy / RandomEntries。
+"""T22/H7 合成对照（validation.synthetic）：负对照块置换/槽位置换、正对照
+植入优势、PlantedEdgeStrategy / RandomEntries。
 
-计划失败测试落点（docs/superpowers/plans/2026-10-26-round4-optimization.md T22）：
+计划失败测试落点（第四轮 T22，docs/superpowers/plans/ 下相应计划）：
 - 植入器 d=0 时数据逐位还原（test_plant_edge_zero_drift_bitwise_identity）；
 - PlantedEdgeStrategy 通过 G0（截断 + 窗口不变性 + 静态扫描）
   （test_planted_edge_strategy_passes_g0）；
@@ -11,7 +11,15 @@ PlantedEdgeStrategy / RandomEntries。
   （test_block_permute_preserves_daily_return_multiset /
   test_block_permute_preserves_intraday_variance /
   test_block_permute_destroys_cross_day_autocorrelation）。
+
+第五轮 T39（M4，2026-10-26-round5-hardening）日内零假设 slot_permute_bars：
+- 槽位收益多重集不变（test_slot_permute_preserves_slot_return_multiset）；
+- 同种子逐位复现（test_slot_permute_seed_reproducible）；
+- 植入"日内第 k 根 bar 漂移"的数据置换后漂移消失
+  （test_slot_permute_destroys_planted_intraday_drift）。
 """
+from zoneinfo import ZoneInfo
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -25,7 +33,10 @@ from mt5quant.validation.synthetic import (
     block_permute_bars,
     event_bars,
     plant_edge,
+    slot_permute_bars,
 )
+
+NY_TZ = ZoneInfo("America/New_York")
 
 
 def daily_bars(day_closes, bars_per_day=4, start="2025-01-01", bar_seconds=3600,
@@ -331,3 +342,165 @@ def test_block_permute_handles_weekend_day_gaps():
     assert len(out) == len(bars)
     np.testing.assert_allclose(np.sort(_daily_returns(bars)),
                                np.sort(_daily_returns(out)), rtol=1e-10)
+
+
+# ------------------------------------------------- 槽位置换（T39/M4 日内零假设）
+
+def _slot_of_day(times) -> np.ndarray:
+    """bar 时间（naive UTC）→ 纽约本地时刻的分钟数（槽位键）。"""
+    idx = pd.DatetimeIndex(pd.Series(times))
+    local = idx.tz_localize("UTC").tz_convert(NY_TZ)
+    return np.asarray(local.hour * 60 + local.minute, dtype="int64")
+
+
+def _slot_returns(bars) -> dict[int, np.ndarray]:
+    """每个 NY 槽位的 bar 收益（close[i]/close[i-1]，i≥1），升序排序。"""
+    close = bars["close"].to_numpy(dtype="float64")
+    rets = close[1:] / close[:-1]
+    slots = _slot_of_day(bars["time"])[1:]
+    return {int(s): np.sort(rets[slots == s]) for s in np.unique(slots)}
+
+
+def intraday_drift_bars(n_days=80, bars_per_day=4, *, drift=0.03, noise=0.002,
+                        drift_slot=1, drift_every=2, seed=101,
+                        start="2024-12-01", bar_seconds=3600):
+    """日内第 k 根 bar（= 第 k 个 NY 槽位）只在隔日的日期上漂移 +d。
+
+    每天 bars_per_day 根 bar、UTC 0..N 点 → 纽约本地时刻逐根不同且逐日
+    对齐；起点 12 月、80 天 → 全程冬令时（EST 固定 UTC−5，不跨 3 月
+    夏令时切换，槽位不漂移）。漂移日的第 drift_slot 根 bar 收益 =
+    噪声+d，其余（含其他槽位、非漂移日）只有噪声。
+    """
+    rng = np.random.default_rng(seed)
+    rows = []
+    t0 = pd.Timestamp(start)
+    price = 100.0
+    for day in range(n_days):
+        for k in range(bars_per_day):
+            r = rng.normal(0.0, noise)
+            if k == drift_slot and day % drift_every == 0:
+                r += drift
+            o = price
+            c = price * (1.0 + r)
+            rows.append({"time": t0 + pd.Timedelta(
+                days=day, seconds=bar_seconds * k),
+                "open": o, "high": max(o, c) * 1.001,
+                "low": min(o, c) * 0.999, "close": c,
+                "tick_volume": 1, "spread": 1, "real_volume": 0})
+            price = c
+    return pd.DataFrame(rows)
+
+
+def test_slot_permute_seed_reproducible():
+    bars = daily_bars(100.0 * np.cumprod(1.0 + ar1_day_returns(25)),
+                      start="2025-01-06", seed=31)
+    a = slot_permute_bars(bars, seed=42)
+    b = slot_permute_bars(bars, seed=42)
+    pd.testing.assert_frame_equal(a, b, check_exact=True)
+    c = slot_permute_bars(bars, seed=43)
+    assert not a["close"].equals(c["close"])
+
+
+def test_slot_permute_keeps_timestamps_length_and_ohlc_relations():
+    bars = daily_bars(100.0 * np.cumprod(1.0 + ar1_day_returns(15)),
+                      start="2025-01-06", seed=3)
+    out = slot_permute_bars(bars, seed=1)
+    assert len(out) == len(bars)
+    assert out["time"].tolist() == bars["time"].tolist()
+    assert (out["high"] >= out[["open", "close"]].max(axis=1) - 1e-12).all()
+    assert (out["low"] <= out[["open", "close"]].min(axis=1) + 1e-12).all()
+    # bar 内形状（high/close、low/close 等比值）逐位保留：每根 bar 整体缩放
+    np.testing.assert_allclose(
+        out["high"].to_numpy() / out["close"].to_numpy(),
+        bars["high"].to_numpy() / bars["close"].to_numpy(), rtol=1e-12)
+
+
+def test_slot_permute_preserves_slot_return_multiset():
+    """T39 失败测试 1：每个 NY 槽位的收益多重集不变（时段波动分布保留）。"""
+    bars = daily_bars(100.0 * np.cumprod(1.0 + ar1_day_returns(30)),
+                      bars_per_day=4, start="2025-01-06", seed=8)
+    out = slot_permute_bars(bars, seed=4)
+    orig = _slot_returns(bars)
+    shuf = _slot_returns(out)
+    assert set(orig) == set(shuf) and len(orig) >= 4   # 每根日内 bar 一个槽位
+    for slot in orig:
+        np.testing.assert_allclose(orig[slot], shuf[slot], rtol=1e-10)
+
+
+def test_slot_permute_preserves_multiset_across_dst_switch():
+    """同一 UTC 时刻在夏令时切换两侧落到不同 NY 槽位：按本地时刻分组仍成立，
+    多重集逐槽位保留（2025-03-09 美国切换夏令时）。"""
+    t0 = pd.Timestamp("2025-03-05 13:00")      # 切换前一周，跨 03-09
+    rng = np.random.default_rng(9)
+    rows = []
+    price = 100.0
+    for i in range(24 * 8):
+        r = rng.normal(0.0, 0.003)
+        o, c = price, price * (1.0 + r)
+        rows.append({"time": t0 + pd.Timedelta(hours=i), "open": o,
+                     "high": max(o, c) * 1.001, "low": min(o, c) * 0.999,
+                     "close": c, "tick_volume": 1, "spread": 1,
+                     "real_volume": 0})
+        price = c
+    bars = pd.DataFrame(rows)
+    out = slot_permute_bars(bars, seed=6)
+    orig, shuf = _slot_returns(bars), _slot_returns(out)
+    assert set(orig) == set(shuf)
+    for slot in orig:
+        np.testing.assert_allclose(orig[slot], shuf[slot], rtol=1e-10)
+
+
+def test_slot_permute_destroys_planted_intraday_drift():
+    """T39 失败测试 3：植入"日内第 k 根 bar 漂移"（只在隔日漂移）后置换，
+    漂移日第 k 槽位的条件均值收益塌回槽位无条件均值（≈d/2）——
+    日期与槽位收益的对齐被打乱，日内条件优势不可再捕获。"""
+    d = 0.03
+    bars = intraday_drift_bars(drift=d, drift_slot=1, drift_every=2)
+    slots = _slot_of_day(bars["time"])
+    k_slot = int(np.unique(slots)[1])          # 第 2 个槽位 = 日内第 2 根 bar
+    n_days = len(bars) // 4
+
+    def cond_mean(df):
+        close = df["close"].to_numpy(dtype="float64")
+        rets = close[1:] / close[:-1] - 1.0
+        sl = _slot_of_day(df["time"])
+        # bar (day, k) 的槽位；漂移日 = UTC 日序号偶数（每日 4 根，i//4）
+        idx = np.arange(1, len(df))
+        sel = (sl[1:] == k_slot) & ((idx // 4) % 2 == 0)
+        return float(np.mean(rets[sel])), int(sel.sum())
+
+    before, n_sel = cond_mean(bars)
+    assert n_sel == n_days // 2
+    assert before > 0.9 * d                    # 植入生效：条件均值 ≈ d
+    after, n_sel2 = cond_mean(slot_permute_bars(bars, seed=13))
+    assert n_sel2 == n_sel
+    # 置换后：漂移日的第 k 槽位收益是槽位多重集的随机抽取（≈一半含漂移）
+    # → 条件均值塌向 d/2；对齐信息消失（阈值留出 3σ 余量）
+    assert after < 0.62 * d
+    # 无条件（时段）分布原样保留：第 k 槽位收益总均值不变
+    total_before = float(np.mean(
+        (bars["close"].to_numpy(dtype="float64")[1:]
+         / bars["close"].to_numpy(dtype="float64")[:-1] - 1.0)[
+            _slot_of_day(bars["time"])[1:] == k_slot]))
+    out = slot_permute_bars(bars, seed=13)
+    total_after = float(np.mean(
+        (out["close"].to_numpy(dtype="float64")[1:]
+         / out["close"].to_numpy(dtype="float64")[:-1] - 1.0)[
+            _slot_of_day(out["time"])[1:] == k_slot]))
+    assert abs(total_after - total_before) < 1e-12
+
+
+def test_slot_permute_rejects_bad_input():
+    bars = daily_bars([100.0, 101.0], bars_per_day=2, start="2025-01-06")
+    with pytest.raises(ValueError):
+        slot_permute_bars(bars.iloc[:0], seed=1)
+    # 单个纽约本地日（不足两个日期可置换）如实拒绝
+    with pytest.raises(ValueError):
+        slot_permute_bars(daily_bars([100.0], bars_per_day=4,
+                                     start="2025-01-06"), seed=1)
+    # 非正价格（乘法重锚的前提）
+    bad = daily_bars([100.0, 101.0, 102.0], bars_per_day=2,
+                     start="2025-01-06")
+    bad.loc[2, "close"] = -1.0
+    with pytest.raises(ValueError):
+        slot_permute_bars(bad, seed=1)

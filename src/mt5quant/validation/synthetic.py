@@ -1,16 +1,25 @@
 """合成对照数据与工具策略（T22/H7：关卡正负对照实验）。
 
-负对照（测误报率）——block_permute_bars：以 UTC 日为块做**日收益置换**。
-每个日历日保留自己的 bar 序列、时间戳与日内形状（日内 bar 间相对路径
-逐位不变，只是整日价格水平按置换后的日收益重锚），只有"日总收益"
-（当日末根收盘 / 前日末根收盘）在日期之间重排：
+负对照（测误报率）有两种零假设，按卡的持仓周期选用（T39/M4）：
 
-- 保留：逐日日内方差等窗口统计量（留在原日历槽，排序不变）、日收益
-  多重集（分布不变）、bar 数与时间戳（时段结构、按小时分桶的成本口径
-  不变）→ 波动聚集的日内结构原样保留；
-- 破坏：跨日自相关（日收益次序随机化，"用昨天预测今天"的可预测性归零）
-  ——六个基线策略打乱后的任何正期望只能来自运气，其过关率即误报率；
-- 种子化：np.random.default_rng(seed)，同一种子逐位可复现。
+- block_permute_bars（多日持仓卡）：以 UTC 日为块做**日收益置换**。
+  每个日历日保留自己的 bar 序列、时间戳与日内形状（日内 bar 间相对路径
+  逐位不变，只是整日价格水平按置换后的日收益重锚），只有"日总收益"
+  （当日末根收盘 / 前日末根收盘）在日期之间重排：
+  - 保留：逐日日内方差等窗口统计量（留在原日历槽，排序不变）、日收益
+    多重集（分布不变）、bar 数与时间戳（时段结构、按小时分桶的成本口径
+    不变）→ 波动聚集的日内结构原样保留；
+  - 破坏：跨日自相关（日收益次序随机化，"用昨天预测今天"的可预测性
+    归零）——策略打乱后的任何正期望只能来自运气，其过关率即误报率。
+
+- slot_permute_bars（日内卡，T39/M4）：同一纽约本地时刻（同一 bar
+  槽位）的 bar 收益在不同日期之间置换：
+  - 保留：每个槽位的收益多重集（各时段波动分布留在原槽位）、bar 数与
+    时间戳（时段结构不变）；
+  - 破坏：日内先后依赖与跨日次序——对当日平仓的策略这才是零假设
+    （日块置换保留每天完整的日内形状，对日内策略测出的"误报率"
+    含义不清，见第五轮审核 M4）；
+  - 两者都种子化：np.random.default_rng(seed)，同一种子逐位可复现。
 
 正对照（测检出率）——plant_edge + PlantedEdgeStrategy：
 - 固定规则产生"事件 bar"：interval_hours 时间块（epoch 锚定，可带
@@ -167,6 +176,77 @@ def block_permute_bars(bars: pd.DataFrame, *, seed: int) -> pd.DataFrame:
     per_bar_alpha = np.repeat(alphas, counts)
     for col in _PRICE_COLS:
         out[col] = out[col].astype("float64") * per_bar_alpha
+    return out
+
+
+# ---------------------------------------------------------------- 槽位置换
+
+# 槽位 = bar 时间的纽约本地时刻（时:分）。会话口径锚定纽约（开盘区间、
+# 尾盘、换日 17:00 都按 NY 本地时刻定义），同一本地时刻的 bar 处在相同
+# 的市场节律位置；夏令时切换由 tz_convert 自然处理（同一 UTC 时刻在
+# 切换两侧落到不同槽位）。
+_NY_TZ = "America/New_York"
+
+
+def _ny_local(times):
+    """bar 时间（naive UTC）→ 纽约本地 DatetimeIndex。"""
+    idx = pd.DatetimeIndex(pd.Series(times))
+    return idx.tz_localize("UTC").tz_convert(_NY_TZ)
+
+
+def slot_permute_bars(bars: pd.DataFrame, *, seed: int) -> pd.DataFrame:
+    """日内零假设打乱（T39/M4）：同一纽约本地时刻（同一 bar 槽位）的
+    bar 收益在不同日期之间置换。
+
+    实现：bar i 的收益 r_i = close_i / close_{i-1}（i≥1；bar 0 锚定起点）。
+    把各槽位（NY 本地时:分）内、跨日期的收益多重集在该槽位的日期位置间
+    随机重排，再以 r' 逐 bar 乘法重锚价格水平（每根 bar 的 OHLC 同乘
+    该 bar 的重锚因子 → bar 内比值逐位保留）。
+
+    - 保留：每个槽位的收益多重集（各时段的波动分布原样留在原槽位）、
+      bar 数与时间戳（时段结构不变）→ 按小时分桶的成本口径不受影响；
+    - 破坏：日内先后依赖（相邻 bar 的收益不再来自同一天的同一段行情）
+      与跨日次序（每个槽位内部日期次序随机化，"用昨天同一时刻预测
+      今天"的可预测性归零）——日内策略打乱后的任何正期望只能来自运气；
+    - 与 block_permute_bars 并存：日内（当日平仓）卡用本函数，多日
+      持仓卡仍用日块置换（按卡的持仓周期选零假设，见 gate_calibration）；
+    - 种子化：np.random.default_rng(seed)，槽位按本地时刻升序逐一置换，
+      同一种子逐位可复现。价格必须为正（乘法重锚的前提），否则如实报错。
+    """
+    if len(bars) == 0:
+        raise ValueError("bars 为空：无槽位收益可置换")
+    local = _ny_local(bars["time"])
+    slot_ids = np.asarray(local.hour * 60 + local.minute, dtype="int64")
+    n = len(bars)
+    if len(np.unique(np.asarray(local.date))) < 2:
+        raise ValueError("bars 覆盖不足两个纽约本地日：无槽位收益可置换")
+    prices = {col: bars[col].to_numpy(dtype="float64") for col in _PRICE_COLS}
+    if not all(np.all(v > 0) for v in prices.values()):
+        raise ValueError("槽位置换要求 OHLC 价格为正（乘法重锚），数据含非正值")
+
+    closes = prices["close"]
+    r_bar = np.ones(n, dtype="float64")
+    r_bar[1:] = closes[1:] / closes[:-1]
+    rng = np.random.default_rng(seed)
+    # 按槽位分组（i≥1），组内收益在日期位置间置换；bar 0 的槽位首元素
+    # 是锚点，不参与（它没有可定义的前一根 bar 收益）
+    slots = slot_ids[1:]
+    order = np.argsort(slots, kind="stable")
+    sorted_slots = slots[order]
+    bounds = np.flatnonzero(np.diff(sorted_slots) != 0)
+    starts = np.concatenate(([0], bounds + 1))
+    ends = np.concatenate((bounds, [len(order) - 1]))
+    for s, e in zip(starts, ends):
+        pos = order[s:e + 1]                # 该槽位各 bar 的全局索引 − 1
+        r_bar[pos + 1] = r_bar[pos + 1][rng.permutation(e + 1 - s)]
+    # 逐 bar 乘法重锚：level_i = close_0 × Π r'（等价于逐 bar 递推）
+    level = np.empty(n, dtype="float64")
+    level[0] = closes[0]
+    level[1:] = closes[0] * np.cumprod(r_bar[1:])
+    factor = level / closes
+    out = bars.copy()
+    for col in _PRICE_COLS:
+        out[col] = prices[col] * factor
     return out
 
 
