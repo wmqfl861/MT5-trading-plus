@@ -8,6 +8,7 @@ IANA tzdata 事实基线（2026 年）：
 - 因此 10-30 周的周末窗口不对称：周五收盘 21:00 UTC、周日开盘 22:00 UTC（49 小时）。
 """
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -152,3 +153,165 @@ def test_gap_crossing_weekend_from_thursday_is_weekend():
     # 巨大缺口跨过周末（周四→下周一）仍应识别出周末成分
     assert gap_is_weekend(datetime(2026, 10, 22, 12, 0),
                           datetime(2026, 10, 26, 12, 0))
+
+
+# ---- T20：SessionPolicy（禁入窗共享定义源，决策 D11 / 铁律 v3 第 11 条） ----
+
+from mt5data.sessions import (  # noqa: E402
+    SessionConfigError, SessionPolicy, load_session_policy,
+)
+
+SESSIONS_TOML = """\
+# 测试用 sessions.toml（与 config/sessions.toml 同构）
+version = 1
+
+[rollover]
+local_time = "17:00"
+tz = "America/New_York"
+
+[forbidden]
+pre_minutes = 5
+post_minutes = 60
+exempt_symbols = ["BTCUSD"]
+
+[forbidden.extended.EURUSD]
+end_local = "23:00"
+
+[costs]
+spread_gate_multiplier = 3.0
+missing_hour_policy = "forbid"
+"""
+
+
+def _policy() -> SessionPolicy:
+    return SessionPolicy(
+        rollover_local="17:00", rollover_tz=NY_TZ,
+        pre_minutes=5, post_minutes=60,
+        exempt_symbols=frozenset({"BTCUSD"}),
+        extended_ends={"EURUSD": "23:00"},
+    )
+
+
+def test_entry_forbidden_summer_2110_utc():
+    # 2026-07-15（EDT）：17:00 NY = 21:00 UTC，禁入 20:55–22:00 → 21:10 禁入
+    assert not _policy().entry_allowed("XAUUSD", datetime(2026, 7, 15, 21, 10))
+
+
+def test_entry_allowed_winter_2110_utc():
+    # 2026-12-15（EST）：17:00 NY = 22:00 UTC，禁入 21:55–23:00 → 21:10 允许
+    assert _policy().entry_allowed("XAUUSD", datetime(2026, 12, 15, 21, 10))
+
+
+def test_entry_forbidden_winter_2210_utc():
+    assert not _policy().entry_allowed("XAUUSD", datetime(2026, 12, 15, 22, 10))
+
+
+def test_entry_window_boundaries():
+    p = _policy()
+    # 夏令时边界：20:55 起（含）禁入、22:00 止（不含）恢复
+    assert p.entry_allowed("XAUUSD", datetime(2026, 7, 15, 20, 54, 59))
+    assert not p.entry_allowed("XAUUSD", datetime(2026, 7, 15, 20, 55))
+    assert not p.entry_allowed("XAUUSD", datetime(2026, 7, 15, 21, 59, 59))
+    assert p.entry_allowed("XAUUSD", datetime(2026, 7, 15, 22, 0))
+
+
+def test_exempt_symbol_allowed_in_rollover_window():
+    p = _policy()
+    assert p.entry_allowed("BTCUSD", datetime(2026, 7, 15, 21, 10))
+    assert p.entry_allowed("BTCUSD", datetime(2026, 12, 15, 22, 10))
+
+
+def test_extended_window_eurusd_until_23_local():
+    p = _policy()
+    # EURUSD 扩展到 23:00 本地：22:30 UTC = 18:30 NY 仍在 [16:55, 23:00) → 禁入
+    assert not p.entry_allowed("EURUSD", datetime(2026, 7, 15, 22, 30))
+    # 23:00 NY（=次日 03:00 UTC）边界不含 → 允许
+    assert p.entry_allowed("EURUSD", datetime(2026, 7, 16, 3, 0))
+    assert not p.entry_allowed("EURUSD", datetime(2026, 7, 16, 2, 59, 59))
+    # 基础品种 18:00 NY（夏令时 22:00 UTC）已恢复，EURUSD 仍禁入（扩展窗差异）
+    assert p.entry_allowed("XAUUSD", datetime(2026, 7, 15, 22, 0))
+    assert not p.entry_allowed("EURUSD", datetime(2026, 7, 15, 22, 0))
+
+
+def test_rollover_window_naive_utc_summer_and_winter():
+    p = _policy()
+    assert p.rollover_window(date(2026, 7, 15)) == (
+        datetime(2026, 7, 15, 20, 55), datetime(2026, 7, 15, 22, 0))
+    assert p.rollover_window(date(2026, 12, 15)) == (
+        datetime(2026, 12, 15, 21, 55), datetime(2026, 12, 15, 23, 0))
+
+
+def test_with_forbidden_hours_extends_policy():
+    p = _policy().with_forbidden_hours({"XAUUSD": (3, 17), "BTCUSD": (3,)})
+    # 数据驱动缺统计小时按品种生效：本地小时 3/17 禁入
+    assert not p.entry_allowed("XAUUSD", datetime(2026, 7, 15, 7, 10))    # 03:10 NY
+    assert not p.entry_allowed("XAUUSD", datetime(2026, 7, 15, 21, 10))   # 17:10 NY：缺统计 + 换日窗
+    assert not p.entry_allowed("BTCUSD", datetime(2026, 7, 15, 7, 10))    # 豁免换日窗但不豁免自己的缺统计小时
+    assert p.entry_allowed("BTCUSD", datetime(2026, 7, 15, 21, 10))       # 豁免品种无缺统计的 17 点照常
+    assert p.entry_allowed("XAUUSD", datetime(2026, 7, 15, 10, 10))       # 06:10 NY 正常
+    assert p.entry_allowed("XAUUSD", datetime(2026, 7, 15, 20, 10))       # 16:10 NY：窗前且小时不在缺统计集
+    # 原策略不变（with_ 返回新对象）
+    assert _policy().entry_allowed("XAUUSD", datetime(2026, 7, 15, 7, 10))
+
+
+def test_policy_validation_rejects_bad_values():
+    with pytest.raises(ValueError):
+        SessionPolicy(pre_minutes=-1)
+    with pytest.raises(ValueError):
+        SessionPolicy(rollover_local="25:00")
+    with pytest.raises(ValueError):
+        SessionPolicy(rollover_tz="Mars/Olympus")
+    with pytest.raises(ValueError):
+        SessionPolicy(missing_hour_policy="ignore")
+    with pytest.raises(ValueError):
+        SessionPolicy(spread_gate_multiplier=0.0)
+    with pytest.raises(ValueError):
+        SessionPolicy(extended_ends={"EURUSD": "09:00"})   # 早于换日时刻的扩展无意义
+    with pytest.raises(ValueError):
+        SessionPolicy().with_forbidden_hours({"XAUUSD": (24,)})
+
+
+def test_load_session_policy_from_toml(tmp_path):
+    p = tmp_path / "sessions.toml"
+    p.write_text(SESSIONS_TOML, encoding="utf-8")
+    pol = load_session_policy(str(p))
+    assert pol.rollover_local == "17:00" and pol.rollover_tz == NY_TZ
+    assert pol.pre_minutes == 5 and pol.post_minutes == 60
+    assert pol.exempt_symbols == frozenset({"BTCUSD"})
+    assert pol.extended_ends == {"EURUSD": "23:00"}
+    assert pol.spread_gate_multiplier == 3.0
+    assert pol.missing_hour_policy == "forbid"
+    assert not pol.entry_allowed("XAUUSD", datetime(2026, 7, 15, 21, 10))
+    assert pol.entry_allowed("XAUUSD", datetime(2026, 12, 15, 21, 10))
+
+
+def test_load_session_policy_strict_validation(tmp_path):
+    p = tmp_path / "sessions.toml"
+    base = SESSIONS_TOML
+    p.write_text(base.replace("version = 1", "version = 2"), encoding="utf-8")
+    with pytest.raises(SessionConfigError, match="version"):
+        load_session_policy(str(p))
+    p.write_text(base + '\nfoo = 1\n', encoding="utf-8")
+    with pytest.raises(SessionConfigError, match="foo"):
+        load_session_policy(str(p))
+    p.write_text(base.replace('pre_minutes = 5', 'pre_minutes = "x"'), encoding="utf-8")
+    with pytest.raises(SessionConfigError):
+        load_session_policy(str(p))
+    p.write_text(base.replace("local_time = \"17:00\"\n", ""), encoding="utf-8")
+    with pytest.raises(SessionConfigError, match="local_time"):
+        load_session_policy(str(p))
+    with pytest.raises(SessionConfigError, match="不存在"):
+        load_session_policy(str(tmp_path / "nope.toml"))
+
+
+def test_repo_sessions_toml_defaults_match_plan():
+    # 仓库实际配置：换日 17:00 NY、前 5 分钟到后 60 分钟、BTCUSD 豁免、
+    # EURUSD 扩展到 23:00、倍数 3.0、missing forbid（初值，待 DST 实测定稿）
+    repo = Path(__file__).resolve().parents[1] / "config" / "sessions.toml"
+    pol = load_session_policy(str(repo))
+    assert pol.rollover_local == "17:00" and pol.rollover_tz == NY_TZ
+    assert pol.pre_minutes == 5 and pol.post_minutes == 60
+    assert pol.exempt_symbols == frozenset({"BTCUSD"})
+    assert pol.extended_ends == {"EURUSD": "23:00"}
+    assert pol.spread_gate_multiplier == 3.0
+    assert pol.missing_hour_policy == "forbid"

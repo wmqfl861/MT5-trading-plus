@@ -12,11 +12,14 @@
 口径：
 - 佣金按成交方向聚合（entry=in 为开、out/out_by/inout 为平），每手金额=Σ佣/Σ量，
   来回=开+平（与 CommissionModel 一次性给出口径一致）；
-- 隔夜费：MT5 把累计 swap 记在平仓成交上，按 position_id 配对出入场得到持仓区间
-  (entry, exit]，计费夜数与 mt5quant.costs.swap.charge_nights 同源（含三倍日）；
-  计费时刻未知 → 对 0..23 逐小时假设，取"每笔隐含费率与中位数偏差最小"且
-  无矛盾（swap≠0 却 0 夜）的时刻，全部并列报告，不武断；
-- 免隔夜费判定：存在过夜持仓且全部 swap=0 → 是；无过夜持仓 → 未知（None）。
+- 隔夜费（T20/H1）：MT5 把累计 swap 记在平仓成交上，按 position_id 配对出入场
+  得到持仓区间 (entry, exit]，计费夜数与 mt5quant.costs.swap.charge_nights
+  同源——规则 = SwapRule 默认（计费时刻 17:00 America/New_York，DST 感知；
+  周末不计），三倍日取快照 swap_rollover3days（经 mt5_to_py_weekday）。
+  实测费率即"每夜"口径，回测按同一规则（含 ×3）复算；
+- 免隔夜费判定（T20）：存在**跨过计费时刻**的持仓且全部 swap=0 → 是；
+  没有任何跨计费时刻的持仓 → 未知（None）。跨日历日但未跨计费时刻
+  （如冬令时 22:00 入场、次日 20:00 出场）不算过夜。
 """
 import argparse
 import json
@@ -31,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mt5gw.snapshot import write_json_atomic  # noqa: E402
 from mt5quant.costs.swap import (  # noqa: E402
-    mt5_to_py_weekday, per_lot_per_night,
+    SwapRule, charge_nights, mt5_to_py_weekday, per_lot_per_night,
 )
 
 _TRADING_SIDES = ("buy", "sell")
@@ -57,11 +60,13 @@ def _is_trading(deal) -> bool:
 
 
 def nights_between(entry_time: datetime, exit_time: datetime,
-                   charge_hour: int, triple_weekday: int | None = None) -> int:
-    """(entry, exit] 内的计费夜数（三倍日 ×3；triple_weekday 为 Python weekday）。"""
-    from mt5quant.costs.swap import charge_nights
-    tw = frozenset({triple_weekday}) if triple_weekday is not None else frozenset()
-    return charge_nights(entry_time, exit_time, charge_hour, triple_weekdays=tw)
+                   rule: SwapRule) -> int:
+    """(entry, exit] 内的计费夜数（与 mt5quant.costs.swap.charge_nights 同源）。
+
+    T20：计费时刻/星期由 rule（17:00 America/New_York、周末不计）决定，
+    三倍日 = rule.triple_weekdays（快照 swap_rollover3days 换算）。
+    """
+    return charge_nights(entry_time, exit_time, rule)
 
 
 def match_closed_positions(deals) -> tuple[list[ClosedPosition], int]:
@@ -116,17 +121,18 @@ def commission_summary(deals) -> dict:
     }
 
 
-def _side_stats(positions, side, charged, best_hour, triple_py):
+def _side_stats(positions, side, charged, rule, feasible, free):
     of_side = [p for p in positions if p.side == side]
     charged_side = [p for p in charged if p.side == side]
-    rate = None
-    if best_hour is not None and charged_side:
+    if not feasible:
+        rate = None            # 实测与固定规则矛盾：费率置空，warnings 已说明
+    elif charged_side:
         rates = [p.swap / p.volume /
-                 nights_between(p.entry_time, p.exit_time, best_hour, triple_py)
+                 nights_between(p.entry_time, p.exit_time, rule)
                  for p in charged_side]
         rate = statistics.median(rates)
-    elif charged_side == [] and of_side:
-        rate = 0.0 if best_hour == "free" else None
+    else:
+        rate = 0.0 if free is True else None   # 免隔夜费=实测 0；无从判断=None
     return {
         "positions": len(of_side),
         "positions_with_swap": len(charged_side),
@@ -135,56 +141,74 @@ def _side_stats(positions, side, charged, best_hour, triple_py):
     }
 
 
+def _crossed_charge_hours(positions, rule) -> list[int]:
+    """全部持仓区间跨过的计费时刻所在的 UTC 小时（信息性，T20 固定规则）。
+
+    实际数夜一律走 charge_nights；本函数只为报告展示计费时刻随 DST 的落点
+    （夏令时 21、冬令时 22 UTC）。
+    """
+    hours: set[int] = set()
+    for p in positions:
+        day = p.entry_time.date() - timedelta(days=1)
+        end = p.exit_time.date() + timedelta(days=1)
+        while day <= end:
+            moment = _charge_moment(day)
+            if moment is not None and p.entry_time < moment <= p.exit_time:
+                hours.add(moment.hour)
+            day += timedelta(days=1)
+    return sorted(hours)
+
+
+def _charge_moment(day):
+    """day（本地日）17:00 America/New_York → naive UTC datetime。"""
+    from mt5data.sessions import local_to_utc_naive
+    try:
+        return local_to_utc_naive(day, "America/New_York", "17:00")
+    except ValueError:
+        return None
+
+
 def calibrate_swap(symbol: str, positions: list[ClosedPosition],
                    snap: dict, warnings: list) -> dict:
-    """单品种隔夜费校准：实测费率 + 计费时刻候选 + 快照推算并列。"""
+    """单品种隔夜费校准：实测费率（按 SwapRule v2 复算）+ 快照推算并列。
+
+    T20：计费时刻固定 17:00 America/New_York（DST 感知、周末不计），三倍日取
+    快照 swap_rollover3days。实测费率 = swap / 手数 / 计费夜数（含 ×3 加权），
+    回测 build_costs 按同一规则复算即与实测对上。
+    """
     entry = snap.get(symbol)
     triple_raw = entry.get("swap_rollover3days") if entry else None
     triple_py = None
     if triple_raw is None:
-        warnings.append(f"{symbol} 快照缺 swap_rollover3days，按无三倍日估算")
+        warnings.append(f"{symbol} 快照缺 swap_rollover3days，按无三倍日估算"
+                        "（费率口径与回测可能不一致，重跑 snapshot_specs.py）")
+        triple = frozenset()
     else:
         triple_py = mt5_to_py_weekday(triple_raw)
+        triple = frozenset({triple_py})
+    rule = SwapRule(long_per_day=0.0, short_per_day=0.0, triple_weekdays=triple)
 
     charged = [p for p in positions if p.swap != 0 and p.volume > 0]
+    # T20：过夜 = 跨过计费时刻（不再是跨日历日）
     overnight = [p for p in positions
-                 if (p.exit_time.date() - p.entry_time.date()).days >= 1]
+                 if nights_between(p.entry_time, p.exit_time, rule) > 0]
     if charged:
         free = False
     elif overnight:
         free = True
     else:
-        free = None  # 无过夜持仓：无从判断，不猜
+        free = None  # 无跨计费时刻的持仓：无从判断，不猜
 
-    best_hour = None
-    candidates: list[int] = []
-    if charged:
-        scores: dict[int, float] = {}
-        for hour in range(24):
-            feasible = all(
-                nights_between(p.entry_time, p.exit_time, hour, triple_py) > 0
-                for p in charged)
-            if not feasible:
-                continue
-            dev = 0.0
-            for side in ("long", "short"):
-                cs = [p for p in charged if p.side == side]
-                if not cs:
-                    continue
-                rates = [p.swap / p.volume /
-                         nights_between(p.entry_time, p.exit_time, hour, triple_py)
-                         for p in cs]
-                med = statistics.median(rates)
-                dev = max(dev, max(abs(r - med) for r in rates))
-            scores[hour] = dev
-        if scores:
-            best = min(scores.values())
-            candidates = sorted(h for h, s in scores.items() if s <= best + 1e-9)
-            best_hour = candidates[0]
-        else:
-            warnings.append(f"{symbol}：找不到与 swap≠0 矛盾自洽的计费时刻，费率未知")
-    elif free is True:
-        best_hour = "free"  # 全 0：任何时刻都成立，无从判定，费率记 0
+    # 可行性：swap≠0 的持仓在固定规则下必须有 ≥1 夜，否则实测与规则矛盾
+    feasible = True
+    infeasible = [p for p in charged
+                  if nights_between(p.entry_time, p.exit_time, rule) == 0]
+    if infeasible:
+        feasible = False
+        warnings.append(
+            f"{symbol}：{len(infeasible)} 笔 swap≠0 的持仓未跨过 17:00 纽约"
+            "计费时刻——实测与固定规则矛盾，费率置空，须人工核对（Exness "
+            "冬令时跟随欧洲还是美国见 docs/research/rollover-dst-2026-10-25.md）")
 
     snap_block = {"available": False}
     if entry is None:
@@ -206,10 +230,12 @@ def calibrate_swap(symbol: str, positions: list[ClosedPosition],
 
     result = {
         "free_of_swap": free,
-        "charge_hour_candidates_utc": candidates,
-        "charge_hour_ambiguous": len(candidates) > 1,
-        "long": _side_stats(positions, "long", charged, best_hour, triple_py),
-        "short": _side_stats(positions, "short", charged, best_hour, triple_py),
+        # T20：计费时刻固定 17:00 纽约——此字段改为信息性输出（跨过的计费时刻
+        # 所在 UTC 小时，随 DST 在 21/22 间移动），回测不再消费
+        "charge_hour_candidates_utc": _crossed_charge_hours(charged, rule),
+        "charge_hour_ambiguous": False,
+        "long": _side_stats(positions, "long", charged, rule, feasible, free),
+        "short": _side_stats(positions, "short", charged, rule, feasible, free),
         "snapshot": snap_block,
     }
     if snap_block["available"]:
@@ -307,8 +333,8 @@ def render_markdown(res: dict) -> str:
         free_txt = {True: "是", False: "否", None: "未知"}[sw["free_of_swap"]]
         snap = sw["snapshot"]
         lines.append(
-            f"- 隔夜费（免隔夜费={free_txt}，计费时刻候选 UTC="
-            f"{_fmt_hours(sw['charge_hour_candidates_utc'])}）")
+            f"- 隔夜费（免隔夜费={free_txt}；计费时刻=17:00 纽约，实测跨过"
+            f" UTC {_fmt_hours(sw['charge_hour_candidates_utc'])}）")
         for side in ("long", "short"):
             s = sw[side]
             label = "多" if side == "long" else "空"

@@ -1,4 +1,4 @@
-"""交易时段工具：DST 感知的本地↔UTC 换算与周末窗口判定。
+"""交易时段工具：DST 感知的本地↔UTC 换算与周末窗口判定 + 换日禁入策略（T20）。
 
 约定（Global Constraints）：库内时间一律"贴 UTC 标签的 naive datetime"。
 涉及本地时段（默认 America/New_York，MT5 常见收盘惯例 17:00）时用
@@ -9,13 +9,30 @@ DST 事实（IANA tzdata，测试已钉死）：
 - 美国东部 2026-11-01 02:00 本地回拨（EDT→EST）；
 - 因此 10-30 周的周末窗口不对称：周五收盘 21:00 UTC、周日开盘 22:00 UTC
   （49 小时）——周末缺口判断绝不能按"恒 48 小时"做算术推断。
+
+SessionPolicy（T20 / 决策 D11 / 铁律 v3 第 11 条）：换日禁入窗的**唯一定义源**
+（config/sessions.toml），回测引擎（engine_a/engine_b 的开仓推迟）与实盘风控
+（mt5live.riskproc 的禁入检查）共同读取——两边对"什么时候禁止开仓"永远一致。
+窗口锚定 rollover_local 于 rollover_tz 的墙上时刻（Exness 换日 17:00 纽约 =
+夏令时 21:00 / 冬令时 22:00 GMT），禁止用固定 UTC 小时表示（铁律第 1 条）。
 """
 from __future__ import annotations
 
+import os
+import tomllib
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
+from typing import Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 NY_TZ = "America/New_York"
+
+DEFAULT_SESSIONS_PATH = "config/sessions.toml"
+_MISSING_HOUR_POLICIES = ("forbid",)
+
+
+class SessionConfigError(RuntimeError):
+    """sessions.toml 缺失 / 键不合法 / 类型错误——拒绝启动。"""
 
 
 def _parse_hhmm(hhmm: str) -> tuple[int, int]:
@@ -106,3 +123,215 @@ def gap_is_weekend(t_prev: datetime, t_next: datetime,
             if w not in windows:
                 windows.append(w)
     return any(t_prev < wo and t_next > wc for wc, wo in windows)
+
+
+# ------------------------------------------------ T20：换日禁入策略（共享定义源）
+
+def _hhmm_to_minutes(hhmm: str) -> int:
+    """解析 "HH:MM" → 当日分钟数；非法即抛 ValueError。"""
+    hh, mm = _parse_hhmm(hhmm)
+    return hh * 60 + mm
+
+
+@dataclass(frozen=True)
+class SessionPolicy:
+    """换日禁入窗与点差闸门参数（config/sessions.toml 的内存形态）。
+
+    禁入窗（非豁免品种）= 换日时刻前 pre_minutes 到后 post_minutes（本地墙上
+    时间，zoneinfo 逐日换算，DST 感知）；extended_ends 把指定品种的禁入窗
+    **结束**时刻延长到该本地时刻（如 EURUSD 到 23:00——初值，待 DST 周实测
+    定稿，见 docs/research/rollover-dst-2026-10-25.md）。
+    exempt_symbols 完全豁免换日窗（BTCUSD 7×24），但不豁免 forbidden_hours_ny
+    （那是数据保护，不是时段规则）。
+    forbidden_hours_ny 是**数据驱动**的补充禁入小时（点差模型缺统计的小时，
+    由回测接线层注入，不进 sessions.toml）；spread_gate_multiplier /
+    missing_hour_policy 供成本侧与实盘点差闸门（T24）读取。
+    """
+
+    rollover_local: str = "17:00"
+    rollover_tz: str = NY_TZ
+    pre_minutes: int = 5
+    post_minutes: int = 60
+    exempt_symbols: frozenset = frozenset()
+    extended_ends: Mapping[str, str] = field(default_factory=dict)
+    forbidden_hours_ny: Mapping[str, frozenset] = field(default_factory=dict)
+    spread_gate_multiplier: float = 3.0
+    missing_hour_policy: str = "forbid"
+
+    def __post_init__(self):
+        _parse_hhmm(self.rollover_local)   # 非法即抛
+        try:
+            ZoneInfo(self.rollover_tz)
+        except Exception as e:
+            raise ValueError(f"未知时区 {self.rollover_tz!r}") from e
+        for name in ("pre_minutes", "post_minutes"):
+            v = getattr(self, name)
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise ValueError(f"{name} 须为非负整数，收到 {v!r}")
+        if self.missing_hour_policy not in _MISSING_HOUR_POLICIES:
+            raise ValueError(
+                f"missing_hour_policy 须为 {_MISSING_HOUR_POLICIES} 之一，"
+                f"收到 {self.missing_hour_policy!r}")
+        if not (self.spread_gate_multiplier > 0):
+            raise ValueError(
+                f"spread_gate_multiplier 须为正，收到 {self.spread_gate_multiplier!r}")
+        rollover_min = _hhmm_to_minutes(self.rollover_local)
+        for sym, end in self.extended_ends.items():
+            if not sym:
+                raise ValueError("extended_ends 品种名不能为空")
+            if _hhmm_to_minutes(end) <= rollover_min:
+                raise ValueError(
+                    f"{sym} 扩展窗结束 {end} 须晚于换日时刻 {self.rollover_local}")
+        for sym, hours in self.forbidden_hours_ny.items():
+            for h in hours:
+                if not 0 <= int(h) <= 23:
+                    raise ValueError(f"{sym} 禁入小时须 0..23，收到 {h}")
+        object.__setattr__(self, "exempt_symbols", frozenset(self.exempt_symbols))
+        object.__setattr__(
+            self, "extended_ends", dict(self.extended_ends))
+        object.__setattr__(
+            self, "forbidden_hours_ny",
+            {s: frozenset(h) for s, h in self.forbidden_hours_ny.items()})
+
+    # -- 查询 --
+
+    def rollover_window(self, day: date) -> tuple[datetime, datetime]:
+        """该本地日的基础禁入窗（naive UTC）：[换日−pre, 换日+post]。
+
+        品种差异（扩展窗）由 entry_allowed 处理；本方法返回通用锚点窗。
+        """
+        start = (local_to_utc_naive(day, self.rollover_tz, self.rollover_local)
+                 - timedelta(minutes=self.pre_minutes))
+        end = (local_to_utc_naive(day, self.rollover_tz, self.rollover_local)
+               + timedelta(minutes=self.post_minutes))
+        return start, end
+
+    def entry_allowed(self, symbol: str, t_utc: datetime) -> bool:
+        """t_utc（naive UTC，或 aware）时刻 symbol 是否允许**开新仓**。
+
+        平仓永远不受限（调用方语义）；本方法只回答开仓。
+        """
+        t = (t_utc if t_utc.tzinfo is not None
+             else t_utc.replace(tzinfo=timezone.utc))
+        tz = ZoneInfo(self.rollover_tz)
+        local = t.astimezone(tz)
+        hours = self.forbidden_hours_ny.get(symbol, frozenset())
+        if local.hour in hours:
+            return False
+        if symbol in self.exempt_symbols:
+            return True
+        t_naive = t.astimezone(timezone.utc).replace(tzinfo=None)
+        for day in (local.date() - timedelta(days=1), local.date()):
+            start = (local_to_utc_naive(day, self.rollover_tz, self.rollover_local)
+                     - timedelta(minutes=self.pre_minutes))
+            end_local = self.extended_ends.get(symbol)
+            end = (local_to_utc_naive(day, self.rollover_tz, end_local)
+                   if end_local is not None else
+                   local_to_utc_naive(day, self.rollover_tz, self.rollover_local)
+                   + timedelta(minutes=self.post_minutes))
+            if start <= t_naive < end:
+                return False
+        return True
+
+    def with_forbidden_hours(
+            self, hours_by_symbol: Mapping[str, Iterable[int]]) -> "SessionPolicy":
+        """合并数据驱动的禁入小时（点差模型缺统计），返回新策略（原对象不变）。"""
+        merged = {s: frozenset(self.forbidden_hours_ny.get(s, frozenset()))
+                  | frozenset(h) for s, h in hours_by_symbol.items()}
+        return replace(self, forbidden_hours_ny=merged)
+
+
+def load_session_policy(path: str = DEFAULT_SESSIONS_PATH) -> SessionPolicy:
+    """加载 sessions.toml（严格校验：缺键/未知键/类型不符 → SessionConfigError）。"""
+    if not os.path.exists(path):
+        raise SessionConfigError(
+            f"会话配置不存在：{path}（T20 起回测与风控共用该文件定义禁入窗）")
+    with open(path, "rb") as f:
+        try:
+            data = tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            raise SessionConfigError(f"{path} 不是合法 TOML：{e}") from e
+    try:
+        return _session_policy_from_dict(data, path)
+    except SessionConfigError:
+        raise
+    except (TypeError, ValueError) as e:
+        raise SessionConfigError(f"{path} 会话配置不合法：{e}") from e
+
+
+def _session_policy_from_dict(data: dict, path: str) -> SessionPolicy:
+    def require(key: str):
+        if key not in data:
+            raise SessionConfigError(f"会话配置缺键：{key}（{path}）")
+        return data.pop(key)
+
+    version = require("version")
+    if version != 1:
+        raise SessionConfigError(f"version 须为 1，收到 {version!r}（{path}）")
+
+    rollover = require("rollover")
+    if not isinstance(rollover, dict):
+        raise SessionConfigError("rollover 须为表")
+    unknown = sorted(set(rollover) - {"local_time", "tz"})
+    if unknown:
+        raise SessionConfigError(f"rollover 未知键：{unknown}")
+    local_time = rollover.get("local_time")
+    tz = rollover.get("tz")
+    if not isinstance(local_time, str) or not isinstance(tz, str):
+        raise SessionConfigError("rollover.local_time/tz 须为字符串（HH:MM / 时区名）")
+
+    forbidden = require("forbidden")
+    if not isinstance(forbidden, dict):
+        raise SessionConfigError("forbidden 须为表")
+    unknown = sorted(set(forbidden) - {"pre_minutes", "post_minutes",
+                                       "exempt_symbols", "extended"})
+    if unknown:
+        raise SessionConfigError(f"forbidden 未知键：{unknown}")
+    pre = forbidden.get("pre_minutes", 5)
+    post = forbidden.get("post_minutes", 60)
+    for name, v in (("pre_minutes", pre), ("post_minutes", post)):
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            raise SessionConfigError(f"forbidden.{name} 须为非负整数，收到 {v!r}")
+    exempt = forbidden.get("exempt_symbols", [])
+    if (not isinstance(exempt, list)
+            or not all(isinstance(s, str) and s for s in exempt)):
+        raise SessionConfigError("forbidden.exempt_symbols 须为字符串数组")
+    extended_raw = forbidden.get("extended", {})
+    if not isinstance(extended_raw, dict):
+        raise SessionConfigError("forbidden.extended 须为表（品种 → {end_local}）")
+    extended: dict[str, str] = {}
+    for sym, sub in extended_raw.items():
+        if not isinstance(sub, dict) or set(sub) - {"end_local"} or "end_local" not in sub:
+            raise SessionConfigError(
+                f"forbidden.extended.{sym} 须只含 end_local（HH:MM 本地时刻）")
+        end = sub["end_local"]
+        if not isinstance(end, str):
+            raise SessionConfigError(f"forbidden.extended.{sym}.end_local 须为字符串")
+        extended[sym] = end
+
+    costs = require("costs")
+    if not isinstance(costs, dict):
+        raise SessionConfigError("costs 须为表")
+    unknown = sorted(set(costs) - {"spread_gate_multiplier", "missing_hour_policy"})
+    if unknown:
+        raise SessionConfigError(f"costs 未知键：{unknown}")
+    mult = costs.get("spread_gate_multiplier", 3.0)
+    if isinstance(mult, bool) or not isinstance(mult, (int, float)) or not mult > 0:
+        raise SessionConfigError(f"costs.spread_gate_multiplier 须为正数，收到 {mult!r}")
+    policy = costs.get("missing_hour_policy", "forbid")
+    if policy not in _MISSING_HOUR_POLICIES:
+        raise SessionConfigError(
+            f"costs.missing_hour_policy 须为 {_MISSING_HOUR_POLICIES} 之一，"
+            f"收到 {policy!r}")
+
+    if data:
+        raise SessionConfigError(f"会话配置未知键：{sorted(data)}（{path}）")
+    return SessionPolicy(
+        rollover_local=local_time, rollover_tz=tz,
+        pre_minutes=pre, post_minutes=post,
+        exempt_symbols=frozenset(exempt),
+        extended_ends=extended,
+        spread_gate_multiplier=float(mult),
+        missing_hour_policy=policy,
+    )
+

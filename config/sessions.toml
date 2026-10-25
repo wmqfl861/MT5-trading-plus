@@ -1,0 +1,31 @@
+# 换日与禁入窗（T20，2026-10-26；决策 D10/D11）——回测引擎与实盘风控共用的
+# 唯一定义源（铁律 v3 第 11 条）。禁入规则只保留这一处：risk.toml 不再有时段。
+#
+# 换日时刻按交易所本地墙上时间定义（铁律第 1 条，禁止固定 UTC 小时）：
+# Exness 换日/隔夜费计费时刻 = 17:00 America/New_York =
+# 夏令时 21:00 GMT、冬令时 22:00 GMT（冬夏由 zoneinfo 自动切换）。
+
+version = 1
+
+[rollover]
+local_time = "17:00"
+tz = "America/New_York"
+
+[forbidden]
+# 禁入窗 = 换日时刻前 5 分钟到后 60 分钟（本地墙上时间）。
+pre_minutes = 5
+post_minutes = 60
+# 加密货币 7×24 交易、无换日结算：豁免换日禁入窗（隔夜费三倍日仍按品种规则计）。
+exempt_symbols = ["BTCUSD"]
+
+# 扩展禁入窗：指定品种把禁入窗的**结束**时刻延长到该本地时刻。
+# 初值到 23:00（研究范围报告：EURUSD 换日后点差恢复正常较慢）；
+# 待 10-26~10-30 DST 周 tick 实测定稿（docs/research/rollover-dst-2026-10-25.md）。
+[forbidden.extended.EURUSD]
+end_local = "23:00"
+
+[costs]
+# 点差闸门（T24 实盘开仓前使用）：当前点差 > 倍数 × 模型该小时 p90 → 跳过开仓。
+spread_gate_multiplier = 3.0
+# 点差模型某纽约本地小时缺统计时的策略：forbid = 该小时禁入、出场成本取全天最大 p90。
+missing_hour_policy = "forbid"

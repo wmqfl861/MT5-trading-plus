@@ -20,6 +20,9 @@
   （不产生任何 runs）。G5（锁箱一次性）必须显式 --approve。
 - contract_size 只认 {data-root}/specs/latest.json（与 run_backtest 同规：
   缺则报错，绝不静默按 1 折算）。
+- 禁入窗（T20）：screen/gate 默认加载 config/sessions.toml（与 run_backtest、
+  实盘风控共用），基准运行与锁箱运行按禁入窗推迟开仓；其 sha256 随
+  cost_model_version 写进台账。
 - gates_hash：config/gates.toml 存在时取其 sha256，否则空串（T12 起强制核对）。
 - 台账缺省 {data-root}/research/ledger.sqlite（data/ 不入库，本地持久）。
 """
@@ -46,8 +49,8 @@ from mt5quant.validation import stats as vstats  # noqa: E402
 from mt5quant.validation import walkforward as vwf  # noqa: E402
 from mt5quant.validation.robustness import BacktestSpec  # noqa: E402
 from run_backtest import (  # noqa: E402
-    ZeroCosts, build_costs, load_series, load_strategy,
-    resolve_contract_size,
+    SESSIONS_PATH, ZeroCosts, build_costs, entry_policy_for, load_series,
+    load_strategy, resolve_contract_size, sessions_sha256,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -118,16 +121,24 @@ def cmd_screen(args) -> int:
             bars_by_sym = {sym: load_series(args.data_root, sym,
                                             card.timeframe, args.end)
                            for sym in card.symbols}
+            # T20：禁入窗唯一来源 config/sessions.toml（sha 进 cost_model_version）
+            from mt5data.sessions import load_session_policy
+            sess_policy = load_session_policy(str(SESSIONS_PATH))
+            sess_sha = sessions_sha256(str(SESSIONS_PATH))
             # 成本按品种各自实测（点差/滑点是 per-symbol 的，不能借用别的品种）
             if args.costs == "auto":
                 costs_by_sym = {}
+                policy_by_sym = {}
                 for sym in card.symbols:
                     costs_by_sym[sym], cost_version = build_costs(
                         args.data_root, sym, args.spread_fraction,
-                        args.commission)
+                        args.commission, sessions_sha=sess_sha)
+                    policy_by_sym[sym] = entry_policy_for(
+                        costs_by_sym[sym], sym, sess_policy)
             else:
                 cost_version = "zero-v0"
                 costs_by_sym = {sym: ZeroCosts() for sym in card.symbols}
+                policy_by_sym = {sym: sess_policy for sym in card.symbols}
         except Exception as e:
             print(f"✗ 装配失败（未开跑，无 runs 记录）：{type(e).__name__}: {e}")
             return 1
@@ -149,7 +160,8 @@ def cmd_screen(args) -> int:
                         params=dict(params), contract_size=sizes[sym],
                         volume_lots=args.volume_lots,
                         initial_capital=args.initial_capital,
-                        timeframe=card.timeframe)
+                        timeframe=card.timeframe,
+                        session_policy=policy_by_sym[sym])
                     summary = summarize(result, cost_version=cost_version)
                     rid = ledger.record_run(
                         card_id=card.id, card_version=card.version,
@@ -239,15 +251,23 @@ def cmd_gate(args) -> int:
             bars_by_sym = {sym: load_series(args.data_root, sym,
                                             card.timeframe, args.end)
                            for sym in card.symbols}
+            # T20：禁入窗唯一来源 config/sessions.toml（sha 进 cost_model_version）
+            from mt5data.sessions import load_session_policy
+            sess_policy = load_session_policy(str(SESSIONS_PATH))
+            sess_sha = sessions_sha256(str(SESSIONS_PATH))
             if args.costs == "auto":
                 costs_by_sym = {}
+                policy_by_sym = {}
                 for sym in card.symbols:
                     costs_by_sym[sym], cost_version = build_costs(
                         args.data_root, sym, args.spread_fraction,
-                        args.commission)
+                        args.commission, sessions_sha=sess_sha)
+                    policy_by_sym[sym] = entry_policy_for(
+                        costs_by_sym[sym], sym, sess_policy)
             else:
                 cost_version = "zero-v0"
                 costs_by_sym = {sym: ZeroCosts() for sym in card.symbols}
+                policy_by_sym = {sym: sess_policy for sym in card.symbols}
         except Exception as e:
             print(f"✗ 装配失败（未开跑，无 runs 记录）：{type(e).__name__}: {e}")
             return 1
@@ -278,7 +298,8 @@ def cmd_gate(args) -> int:
                                 contract_size=sizes[symbol],
                                 volume_lots=args.volume_lots,
                                 initial_capital=args.initial_capital,
-                                timeframe=card.timeframe)
+                                timeframe=card.timeframe,
+                                session_policy=policy_by_sym[symbol])
             summary = summarize(base, cost_version=cost_version)
             run_id = ledger.record_run(metrics=summary, **common)
             print(f"— run#{run_id} {symbol} {card.timeframe} {params} -> "
@@ -349,7 +370,8 @@ def cmd_gate(args) -> int:
                                   contract_size=sizes[symbol],
                                   volume_lots=args.volume_lots,
                                   initial_capital=args.initial_capital,
-                                  timeframe=card.timeframe)
+                                  timeframe=card.timeframe,
+                                  session_policy=policy_by_sym[symbol])
                 lb_summary = summarize(lb, cost_version=cost_version)
                 mc = vrob.random_entry_check(
                     spec, bars, costs, base.trades, summary.get("sharpe"),

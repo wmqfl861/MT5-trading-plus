@@ -20,9 +20,15 @@
   --allow-zero-swap（零隔夜费会写进 manifest）。--costs zero 用零成本占位。
 - 时钟校验（R5）：读 {data-root}/server_clock.json 最新有效样本，与配置的
   server_utc_offset_hours 比对，超限拒绝运行；无有效样本仅警告。
+- 禁入窗（T20）：默认加载 config/sessions.toml（SessionPolicy，与实盘风控
+  共用的唯一定义源），禁入时段的开仓信号推迟到下一个允许的 bar 开盘；
+  其 sha256 写进 manifest 与 cost_model_version。点差模型按纽约本地小时
+  分桶，缺统计小时按 missing_hour_policy="forbid" 禁入并把 miss 标注写进
+  cost_model_version。
 - 每次运行写入独占目录 {out}/{SYMBOL}_{TF}_{UTC戳}_{随机}，不覆盖历史运行。
 """
 import argparse
+import hashlib
 import importlib
 import json
 import os
@@ -35,20 +41,30 @@ from mt5data.clock import (  # noqa: E402
     ClockMismatchError, check_server_offset, latest_valid_sample,
 )
 from mt5data.lockbox import research_bars  # noqa: E402
+from mt5data.sessions import SessionPolicy, load_session_policy  # noqa: E402
 from mt5data.store import TIMEFRAME_SECONDS  # noqa: E402
 from mt5data.ticks import load_ticks  # noqa: E402
 from mt5quant.backtest.engine_a import run_backtest  # noqa: E402
 from mt5quant.backtest.engine_b import run_backtest_ticks  # noqa: E402
 from mt5quant.backtest.report import make_run_dir, summarize, write_report  # noqa: E402
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SESSIONS_PATH = REPO_ROOT / "config" / "sessions.toml"
+
+
+def sessions_sha256(path: str) -> str:
+    """config/sessions.toml 的 sha256（写进 manifest 与 cost_model_version）。"""
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
 
 class ZeroCosts:
     """零成本占位：实现 engine_a.Costs Protocol。"""
 
-    def spread_p90(self, symbol, hour_utc, *, price=None):
+    def spread_p90(self, symbol, hour_ny, *, price=None):
         return 0.0
 
-    def slippage(self, symbol, hour_utc, *, price=None):
+    def slippage(self, symbol, hour_ny, *, price=None):
         return 0.0
 
     def commission_per_lot(self, symbol):
@@ -108,12 +124,23 @@ def _load_calibrated(data_root: str) -> dict | None:
 def build_costs(data_root: str, symbol: str, spread_fraction: float,
                 commission_per_lot: float = 0.0, *,
                 allow_zero_swap: bool = False,
-                spread_mode: str = "relative") -> tuple:
+                spread_mode: str = "relative",
+                sessions_sha: str | None = None) -> tuple:
     """tick 实测点差 + 佣金/隔夜费（calibrated.json > 品种快照 > 报错）。
 
-    spread_mode（R1/T3）：relative（默认）＝(ask−bid)/mid 按小时分位，
-    引擎按成交基准价缩放——近期点差结构可外推到价格水平不同的历史；
-    absolute＝旧口径（价格单位，忽略 price）。cost_version 里写明 rel/abs。
+    spread_mode（R1/T3）：relative（默认）＝(ask−bid)/mid 按**纽约本地小时**
+    分位（T20：换日尖峰不被 DST 摊薄），引擎按成交基准价缩放——近期点差
+    结构可外推到价格水平不同的历史；absolute＝旧口径（价格单位，忽略
+    price）。cost_version 里写明 rel/abs。
+
+    隔夜费（T20/H1）：calibrated 与快照两条路径的**三倍日一律取快照
+    swap_rollover3days**（经 mt5_to_py_weekday），计费时刻来自 SwapRule
+    默认（17:00 America/New_York，DST 感知）——校准费率按同一规则复算，
+    不再用 frozenset() 摊薄。
+
+    sessions_sha（T20）：config/sessions.toml 的 sha256；给出时写进
+    cost_version（sess[前 8 位]）。缺统计小时按 missing_hour_policy=forbid
+    标注（missNY[...]），由 entry_policy_for 并入引擎禁入。
 
     返回 (costs, cost_version)。佣金优先 calibrated 实测，其次 CLI 显式值；
     隔夜费优先 calibrated 实测费率（free_of_swap=true 属合法实测零费），其次
@@ -123,6 +150,7 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
         CommissionModel, Costs, SlippageModel, SpreadModel, SwapModel,
         SwapRule,
     )
+    from mt5quant.costs.swap import mt5_to_py_weekday
 
     ticks = load_ticks(data_root, symbol)
     if ticks is None or len(ticks) == 0:
@@ -159,14 +187,15 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
             cal_rate = (lng_r if lng_r is not None else 0.0,
                         sht_r if sht_r is not None else 0.0)
     if cal_rate is not None:
-        cands = cal_sw.get("charge_hour_candidates_utc") or [21]
-        ch = int(cands[0])
-        # 实测均值费率已含三倍日摊薄，按无三倍日规则使用（口径见 cost_version 标注）
+        # T20：三倍日一律取快照 swap_rollover3days——校准费率是"每夜"口径，
+        # 回测按同一规则（含 ×3）复算才与实测对上（探针 P3 的修复）。
+        # 快照缺品种/字段 → 如实报错，不静默按无三倍日。
+        snap_entry = _snapshot_swap_entry(data_root, symbol)
+        triple_py = mt5_to_py_weekday(snap_entry["swap_rollover3days"])
         swap = SwapModel(per_symbol={symbol: SwapRule(
             long_per_day=cal_rate[0], short_per_day=cal_rate[1],
-            triple_weekdays=frozenset(), charge_hour_utc=ch)})
-        ambig = "（时刻有歧义取首个）" if cal_sw.get("charge_hour_ambiguous") else ""
-        swap_tag = f"swap-cal(ch{ch}){ambig}"
+            triple_weekdays=frozenset({triple_py}))})
+        swap_tag = f"swap-cal(tri{triple_py})"
     elif cal_sw and cal_sw.get("free_of_swap") is True:
         swap = SwapModel(per_symbol={symbol: SwapRule(
             long_per_day=0.0, short_per_day=0.0)})
@@ -176,7 +205,7 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
         try:
             with open(snap_path, encoding="utf-8") as f:
                 snap = json.load(f)
-            swap = SwapModel.from_snapshot(snap, [symbol], charge_hour_utc=21)
+            swap = SwapModel.from_snapshot(snap, [symbol])
             swap_tag = "swap-snapshot"
         except (OSError, KeyError, NotImplementedError, ValueError) as e:
             if allow_zero_swap:
@@ -191,11 +220,60 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
                     "先跑 scripts/calibrate_costs.py / scripts/snapshot_specs.py，"
                     "或显式 --allow-zero-swap（会记录在 manifest）") from e
 
+    # ---- T20：缺统计小时（missing_hour_policy=forbid）写进 cost_version ----
+    missing = spread.missing_hours(symbol)
+    if missing:
+        if len(missing) > 8:
+            miss_tag = f"-missNY[{len(missing)}h]"
+        else:
+            miss_tag = "-missNY[" + ",".join(str(h) for h in missing) + "]"
+    else:
+        miss_tag = ""
+    sess_tag = f"-sess[{sessions_sha[:8]}]" if sessions_sha else ""
+
     costs = Costs(spread=spread, slippage_model=slip, commission=commission,
                   swap=swap)
-    print(f"✓ 成本：tick {len(ticks):,} 条实测点差（{mode_tag} p90"
-          f"{'×成交价' if mode_tag == 'rel' else ''}）；{comm_tag}；{swap_tag}")
-    return costs, f"tick-spread-p90[{mode_tag}]+slip{spread_fraction}-{comm_tag}-{swap_tag}"
+    print(f"✓ 成本：tick {len(ticks):,} 条实测点差（{mode_tag}@NY p90"
+          f"{'×成交价' if mode_tag == 'rel' else ''}）；{comm_tag}；{swap_tag}"
+          + (f"；缺统计 {len(missing)} 个纽约小时（forbid 禁入）" if missing else ""))
+    return (costs,
+            f"tick-spread-p90[{mode_tag}@NY]+slip{spread_fraction}"
+            f"-{comm_tag}-{swap_tag}{miss_tag}{sess_tag}")
+
+
+def _snapshot_swap_entry(data_root: str, symbol: str) -> dict:
+    """读快照里 symbol 的条目（calibrated 三倍日来源）；缺文件/品种/字段即抛。"""
+    snap_path = os.path.join(data_root, "specs", "latest.json")
+    try:
+        with open(snap_path, encoding="utf-8") as f:
+            snap = json.load(f)
+        entry = snap[symbol]
+    except (OSError, KeyError) as e:
+        raise ValueError(
+            f"{symbol} 的 calibrated 隔夜费率需要快照的 swap_rollover3days"
+            f"（三倍日，T20 不再按无三倍日摊薄），读 {snap_path} 失败：{e}"
+            "——先跑 scripts/snapshot_specs.py") from e
+    if "swap_rollover3days" not in entry:
+        raise ValueError(
+            f"{symbol} 快照条目缺 swap_rollover3days（旧快照），"
+            f"重跑 scripts/snapshot_specs.py")
+    return entry
+
+
+def entry_policy_for(costs, symbol: str, base_policy: SessionPolicy):
+    """把点差模型的缺统计小时并入禁入策略（T20：missing_hour_policy=forbid）。
+
+    costs 无 spread 属性（ZeroCosts 等）或策略不是 forbid → 原样返回。
+    """
+    if base_policy is None or base_policy.missing_hour_policy != "forbid":
+        return base_policy
+    spread = getattr(costs, "spread", None)
+    if spread is None:
+        return base_policy
+    missing = spread.missing_hours(symbol)
+    if not missing:
+        return base_policy
+    return base_policy.with_forbidden_hours({symbol: missing})
 
 
 def load_strategy(path: str):
@@ -281,13 +359,17 @@ def main() -> int:
         check_clock(args.data_root)
         bars = load_series(args.data_root, args.symbol, args.timeframe.upper(),
                            args.end)
+        # T20：禁入窗唯一来源 config/sessions.toml（与实盘风控共用）
+        sess_policy = load_session_policy(str(SESSIONS_PATH))
+        sess_sha = sessions_sha256(str(SESSIONS_PATH))
         if args.costs == "auto":
             costs, cost_version = build_costs(
                 args.data_root, args.symbol, args.spread_fraction,
                 args.commission, allow_zero_swap=args.allow_zero_swap,
-                spread_mode=args.spread_mode)
+                spread_mode=args.spread_mode, sessions_sha=sess_sha)
         else:
             costs, cost_version = ZeroCosts(), "zero-v0"
+        entry_policy = entry_policy_for(costs, args.symbol, sess_policy)
         if args.cost_version:
             cost_version = args.cost_version
         if args.engine == "b":
@@ -303,6 +385,7 @@ def main() -> int:
                 timeframe=args.timeframe.upper(),
                 latency_ms=args.latency_ms,
                 slippage_price=args.slippage_price,
+                session_policy=entry_policy,
             )
         else:
             result = run_backtest(
@@ -311,6 +394,7 @@ def main() -> int:
                 volume_lots=args.volume_lots,
                 initial_capital=args.initial_capital,
                 timeframe=args.timeframe.upper(),
+                session_policy=entry_policy,
             )
         summary = summarize(result, cost_version=cost_version)
         run_dir = make_run_dir(args.out, args.symbol, args.timeframe.upper())
@@ -322,7 +406,9 @@ def main() -> int:
                    "commission_per_lot": args.commission,
                    "allow_zero_swap": args.allow_zero_swap,
                    "engine": args.engine, "latency_ms": args.latency_ms,
-                   "slippage_price": args.slippage_price})
+                   "slippage_price": args.slippage_price,
+                   "sessions_path": str(SESSIONS_PATH),
+                   "sessions_sha256": sess_sha})
     except Exception as e:  # fail-fast：任何错误如实报出
         print(f"✗ {type(e).__name__}: {e}")
         return 1

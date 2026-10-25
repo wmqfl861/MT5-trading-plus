@@ -37,22 +37,23 @@ class SlippageModel:
         self.event_hours = frozenset(int(h) for h in event_hours)
         self.event_multiplier = float(event_multiplier)
 
-    def slippage(self, symbol: str, hour_utc: int,
+    def slippage(self, symbol: str, hour_ny: int,
                  *, price: float | None = None) -> float:
         """结构化接口：价格单位，恒为正（不利方向幅值）。
 
+        hour_ny 为纽约本地小时（T20：与 SpreadModel 分桶口径一致）；
         price（该笔成交的 bid 基准价）透传给 SpreadModel.spread_p90——
         relative 点差模型必须提供，缺失由其如实抛 ValueError。
         """
         if self.spread is None:
             raise ValueError("未注入 SpreadModel，无法按点差比例估计滑点")
-        p90 = self.spread.spread_p90(symbol, hour_utc, price=price)
+        p90 = self.spread.spread_p90(symbol, hour_ny, price=price)
         v = self.spread_fraction * p90 + self.fixed_price
-        if int(hour_utc) in self.event_hours:
+        if int(hour_ny) in self.event_hours:
             v *= self.event_multiplier
         if v < 0:
             raise ValueError(
-                f"{symbol} 小时 {hour_utc} 滑点计算为负（p90={p90}），拒绝有利方向成本")
+                f"{symbol} 小时 {hour_ny} 滑点计算为负（p90={p90}），拒绝有利方向成本")
         # v==0 合法：零点差品种 + 零固定滑点的如实配置（恒正约束改为非负）
         return float(v)
 

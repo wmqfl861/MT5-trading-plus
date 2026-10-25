@@ -15,8 +15,8 @@ from pathlib import Path
 import pytest
 
 from mt5gw.models import Deal, Position
+from mt5data.sessions import SessionPolicy
 from mt5live.riskproc import (
-    ForbiddenWindow,
     OrderRequest,
     RiskConfig,
     RiskConfigError,
@@ -33,6 +33,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "risk_process.py"
 
 NOW = datetime(2026, 10, 26, 14, 30, 0)  # 周一 14:30 UTC，非禁止时段
+
+# 禁入策略（T20）：与 config/sessions.toml 同构——17:00 纽约，前 5 后 60，
+# BTCUSD 豁免，EURUSD 扩展到 23:00 本地。check 的禁入判断唯一来源。
+POLICY = SessionPolicy(
+    rollover_local="17:00", rollover_tz="America/New_York",
+    pre_minutes=5, post_minutes=60,
+    exempt_symbols=frozenset({"BTCUSD"}),
+    extended_ends={"EURUSD": "23:00"},
+)
 M1 = 20261101  # magic：策略 1
 
 CONTRACT = {"XAUUSD": 100.0, "EURUSD": 100_000.0, "BTCUSD": 1.0}
@@ -50,8 +59,6 @@ def make_config(**overrides) -> RiskConfig:
         max_usd_exposure=200_000.0,
         max_orders_per_minute=3,
         daily_loss_cap_usd=500.0,
-        crypto_symbols=("BTCUSD",),
-        extra_forbidden=(ForbiddenWindow("EURUSD", 22, 23),),
     )
     kw.update(overrides)
     return RiskConfig(**kw)
@@ -99,12 +106,12 @@ def deal(*, entry="out", profit=0.0, commission=0.0, swap=0.0, fee=0.0,
 # ---- 规则 1：品种白名单 ----
 
 def test_whitelist_pass():
-    d = check(req("XAUUSD"), make_state(), make_config(), NOW)
+    d = check(req("XAUUSD"), make_state(), make_config(), NOW, POLICY)
     assert d.allowed, d.reason
 
 
 def test_whitelist_reject():
-    d = check(req("USTEC"), make_state(), make_config(), NOW)
+    d = check(req("USTEC"), make_state(), make_config(), NOW, POLICY)
     assert not d.allowed
     assert "USTEC" in d.reason
     assert "白名单" in d.reason
@@ -113,20 +120,20 @@ def test_whitelist_reject():
 # ---- 规则 2：单笔最大手数 ----
 
 def test_max_lots_boundary_pass():
-    d = check(req("XAUUSD", volume=0.5), make_state(), make_config(), NOW)
+    d = check(req("XAUUSD", volume=0.5), make_state(), make_config(), NOW, POLICY)
     assert d.allowed, d.reason
 
 
 def test_max_lots_reject():
-    d = check(req("XAUUSD", volume=0.51), make_state(), make_config(), NOW)
+    d = check(req("XAUUSD", volume=0.51), make_state(), make_config(), NOW, POLICY)
     assert not d.allowed
     assert "0.51" in d.reason
 
 
 def test_nonpositive_volume_rejected():
-    d = check(req("XAUUSD", volume=0.0), make_state(), make_config(), NOW)
+    d = check(req("XAUUSD", volume=0.0), make_state(), make_config(), NOW, POLICY)
     assert not d.allowed
-    d = check(req("XAUUSD", volume=-0.1), make_state(), make_config(), NOW)
+    d = check(req("XAUUSD", volume=-0.1), make_state(), make_config(), NOW, POLICY)
     assert not d.allowed
 
 
@@ -134,7 +141,7 @@ def test_nonpositive_volume_rejected():
 
 def test_positions_per_symbol_pass():
     state = make_state(positions=(pos("XAUUSD", 0.1), pos("XAUUSD", 0.1)))
-    d = check(req("XAUUSD"), state, make_config(), NOW)  # 第 3 个，未超
+    d = check(req("XAUUSD"), state, make_config(), NOW, POLICY)  # 第 3 个，未超
     assert d.allowed, d.reason
 
 
@@ -143,7 +150,7 @@ def test_positions_per_symbol_reject():
         pos("XAUUSD", 0.1), pos("XAUUSD", 0.1), pos("XAUUSD", 0.1),
         pos("EURUSD", 0.1),  # 其他品种不计入
     ))
-    d = check(req("XAUUSD"), state, make_config(), NOW)  # 第 4 个 XAUUSD
+    d = check(req("XAUUSD"), state, make_config(), NOW, POLICY)  # 第 4 个 XAUUSD
     assert not d.allowed
     assert "XAUUSD" in d.reason and "3" in d.reason
 
@@ -156,7 +163,7 @@ def test_usd_exposure_merged_pass():
         pos("XAUUSD", 0.5), pos("EURUSD", 0.5),
     ))
     # 新单 XAUUSD 0.1 → +24,000 → 199,000 ≤ 200,000
-    d = check(req("XAUUSD", volume=0.1), state, make_config(), NOW)
+    d = check(req("XAUUSD", volume=0.1), state, make_config(), NOW, POLICY)
     assert d.allowed, d.reason
 
 
@@ -165,7 +172,7 @@ def test_usd_exposure_merged_reject():
         pos("XAUUSD", 0.5), pos("EURUSD", 0.5),
     ))
     # 新单 XAUUSD 0.2 → +48,000 → 223,000 > 200,000
-    d = check(req("XAUUSD", volume=0.2), state, make_config(), NOW)
+    d = check(req("XAUUSD", volume=0.2), state, make_config(), NOW, POLICY)
     assert not d.allowed
     assert "223,000" in d.reason or "223000" in d.reason.replace(",", "")
 
@@ -174,7 +181,7 @@ def test_usd_exposure_missing_price_rejects():
     prices = dict(PRICES)
     del prices["BTCUSD"]
     state = make_state(prices=prices)
-    d = check(req("BTCUSD", volume=0.01), state, make_config(), NOW)
+    d = check(req("BTCUSD", volume=0.01), state, make_config(), NOW, POLICY)
     assert not d.allowed
     assert "BTCUSD" in d.reason and "price" in d.reason
 
@@ -184,7 +191,7 @@ def test_usd_exposure_missing_price_rejects():
 def test_frequency_window_pass():
     state = make_state(recent_order_times=(NOW - timedelta(seconds=30),
                                            NOW - timedelta(seconds=10)))
-    d = check(req("XAUUSD"), state, make_config(), NOW)  # 1 分钟内第 3 笔
+    d = check(req("XAUUSD"), state, make_config(), NOW, POLICY)  # 1 分钟内第 3 笔
     assert d.allowed, d.reason
 
 
@@ -192,7 +199,7 @@ def test_frequency_window_reject():
     state = make_state(recent_order_times=(NOW - timedelta(seconds=59),
                                            NOW - timedelta(seconds=30),
                                            NOW - timedelta(seconds=10)))
-    d = check(req("XAUUSD"), state, make_config(), NOW)  # 第 4 笔
+    d = check(req("XAUUSD"), state, make_config(), NOW, POLICY)  # 第 4 笔
     assert not d.allowed
     assert "3" in d.reason and "1 分钟" in d.reason
 
@@ -202,59 +209,97 @@ def test_frequency_window_excludes_exactly_60s_old():
     state = make_state(recent_order_times=(NOW - timedelta(seconds=60),
                                            NOW - timedelta(seconds=59),
                                            NOW - timedelta(seconds=10)))
-    d = check(req("XAUUSD"), state, make_config(), NOW)  # 计 2 笔 + 本笔 = 3
+    d = check(req("XAUUSD"), state, make_config(), NOW, POLICY)  # 计 2 笔 + 本笔 = 3
     assert d.allowed, d.reason
 
 
-# ---- 规则 6：禁止开仓时段（UTC 21:00–21:59 非加密；EURUSD 延至 23:00） ----
+# ---- 规则 6：禁止开仓时段（T20：SessionPolicy，17:00 纽约 = 夏 21:00 / 冬 22:00 UTC） ----
 
 @pytest.mark.parametrize("when", [
-    datetime(2026, 10, 26, 21, 0, 0),   # 边界起点（含）
+    datetime(2026, 10, 26, 20, 55, 0),   # 边界起点（含）：16:55 NY
+    datetime(2026, 10, 26, 21, 0, 0),
     datetime(2026, 10, 26, 21, 30, 0),
     datetime(2026, 10, 26, 21, 59, 59),
 ])
-def test_forbidden_session_reject(when):
-    d = check(req("XAUUSD"), make_state(), make_config(), when)
+def test_forbidden_session_reject_edt_week(when):
+    d = check(req("XAUUSD"), make_state(), make_config(), when, POLICY)
     assert not d.allowed
-    assert "21" in d.reason and "禁止" in d.reason
+    assert "forbidden_session" in d.reason and "禁止" in d.reason
 
 
 @pytest.mark.parametrize("when", [
-    datetime(2026, 10, 26, 20, 59, 59),
-    datetime(2026, 10, 26, 22, 0, 0),   # 边界终点（不含）
+    datetime(2026, 10, 26, 20, 54, 59),  # 禁入窗开始前
+    datetime(2026, 10, 26, 22, 0, 0),    # 边界终点（不含）：18:00 NY
 ])
-def test_forbidden_session_pass(when):
-    d = check(req("XAUUSD"), make_state(), make_config(), when)
+def test_forbidden_session_pass_edt_week(when):
+    d = check(req("XAUUSD"), make_state(), make_config(), when, POLICY)
     assert d.allowed, d.reason
+
+
+def test_forbidden_session_dst_summer_2110_reject():
+    # 夏令时（2026-07-15，EDT）：换日 = 21:00 UTC → 21:10 禁入
+    d = check(req("XAUUSD"), make_state(), make_config(),
+              datetime(2026, 7, 15, 21, 10, 0), POLICY)
+    assert not d.allowed
+
+
+def test_forbidden_session_dst_winter_2110_allowed_2210_reject():
+    # 冬令时（2026-12-15，EST）：换日 = 22:00 UTC → 21:10 允许、22:10 禁入
+    d_ok = check(req("XAUUSD"), make_state(), make_config(),
+                 datetime(2026, 12, 15, 21, 10, 0), POLICY)
+    assert d_ok.allowed, d_ok.reason
+    d_no = check(req("XAUUSD"), make_state(), make_config(),
+                 datetime(2026, 12, 15, 22, 10, 0), POLICY)
+    assert not d_no.allowed
 
 
 def test_btcusd_exempt_from_rollover_window():
     d = check(req("BTCUSD", volume=0.01), make_state(), make_config(),
-              datetime(2026, 10, 26, 21, 30, 0))
+              datetime(2026, 10, 26, 21, 30, 0), POLICY)
     assert d.allowed, d.reason
 
 
 @pytest.mark.parametrize("when,rejected", [
-    (datetime(2026, 10, 26, 22, 30, 0), True),    # EURUSD 扩展窗 22:00–22:59
-    (datetime(2026, 10, 26, 23, 0, 0), False),    # 23:00 起恢复
-    (datetime(2026, 10, 26, 20, 0, 0), False),
+    (datetime(2026, 10, 26, 22, 30, 0), True),    # 18:30 NY：EURUSD 扩展窗内
+    (datetime(2026, 10, 27, 3, 0, 0), False),     # 23:00 NY（次晨 03:00 UTC）边界不含
+    (datetime(2026, 10, 26, 20, 0, 0), False),    # 16:00 NY：窗开始前
 ])
 def test_eurusd_extended_window(when, rejected):
-    d = check(req("EURUSD"), make_state(), make_config(), when)
+    d = check(req("EURUSD"), make_state(), make_config(), when, POLICY)
     assert d.allowed == (not rejected), d.reason
+
+
+def test_risk_process_uses_session_policy_for_forbidden_time(tmp_path):
+    rp = make_process(tmp_path)
+    d = rp.check_order(req("XAUUSD"), make_state(),
+                       datetime(2026, 12, 15, 22, 10, 0))   # 冬令时换日后 10 分钟
+    assert not d.allowed and "禁止" in d.reason
+    d2 = rp.check_order(req("XAUUSD"), make_state(),
+                        datetime(2026, 12, 15, 21, 10, 0))  # 冬令时 21:10 允许
+    assert d2.allowed, d2.reason
+
+
+def test_risk_process_default_policy_loads_repo_sessions_toml():
+    # 不显式传策略 → RiskProcess 默认加载仓库 config/sessions.toml（唯一禁入定义源）
+    rp = RiskProcess(make_config(), live_dir="data/live-never-used")
+    assert rp.session_policy is not None
+    assert not rp.session_policy.entry_allowed(
+        "XAUUSD", datetime(2026, 7, 15, 21, 10))
+    assert rp.session_policy.entry_allowed(
+        "XAUUSD", datetime(2026, 12, 15, 21, 10))
 
 
 # ---- 规则 7：日亏损上限（≤ −cap → flatten_all + halt） ----
 
 def test_daily_loss_pass():
     state = make_state(today_realized=-300.0, today_floating=-150.0)  # -450
-    d = check(req("XAUUSD"), state, make_config(), NOW)
+    d = check(req("XAUUSD"), state, make_config(), NOW, POLICY)
     assert d.allowed, d.reason
 
 
 def test_daily_loss_reject_triggers_flatten_and_halt():
     state = make_state(today_realized=-400.0, today_floating=-100.0)  # 恰 -500
-    d = check(req("XAUUSD"), state, make_config(), NOW)
+    d = check(req("XAUUSD"), state, make_config(), NOW, POLICY)
     assert not d.allowed
     assert d.flatten_all and d.halt
     assert "-500" in d.reason or "500" in d.reason
@@ -262,14 +307,14 @@ def test_daily_loss_reject_triggers_flatten_and_halt():
 
 def test_daily_loss_deeper_reject():
     state = make_state(today_realized=-400.0, today_floating=-101.0)  # -501
-    d = check(req("XAUUSD"), state, make_config(), NOW)
+    d = check(req("XAUUSD"), state, make_config(), NOW, POLICY)
     assert not d.allowed and d.flatten_all and d.halt
 
 
 # ---- 规则 8：停机状态（halted） ----
 
 def test_halted_state_rejects_everything():
-    d = check(req("XAUUSD"), make_state(halted=True), make_config(), NOW)
+    d = check(req("XAUUSD"), make_state(halted=True), make_config(), NOW, POLICY)
     assert not d.allowed
     assert d.halt and not d.flatten_all
 
@@ -277,26 +322,20 @@ def test_halted_state_rejects_everything():
 # ---- 干净路径 ----
 
 def test_clean_check_ok_reason():
-    d = check(req("XAUUSD"), make_state(), make_config(), NOW)
+    d = check(req("XAUUSD"), make_state(), make_config(), NOW, POLICY)
     assert d.allowed
     assert d.reason == "ok"
 
 
 # ---- RiskConfig TOML 加载 ----
 
-TOML_BODY = """\
-version = 1
+TOML_BODY = """version = 1
 symbols = ["XAUUSD", "EURUSD", "BTCUSD"]
 max_lots_per_order = 0.5
 max_positions_per_symbol = 3
 max_usd_exposure = 200000.0
 max_orders_per_minute = 3
 daily_loss_cap_usd = 500.0
-
-[[forbidden]]
-symbol = "EURUSD"
-start_hour_utc = 22
-end_hour_utc = 23
 """
 
 
@@ -312,8 +351,7 @@ def test_load_risk_config_full(tmp_path):
     assert cfg.max_lots_per_order == 0.5
     assert cfg.max_usd_exposure == 200_000.0
     assert cfg.daily_loss_cap_usd == 500.0
-    assert cfg.extra_forbidden == (ForbiddenWindow("EURUSD", 22, 23),)
-    assert cfg.crypto_symbols == ("BTCUSD",)  # 缺省
+    # T20：禁入时段已迁 config/sessions.toml（单一定义源），risk.toml 不再有该节
 
 
 def test_load_risk_config_missing_key(tmp_path):
@@ -328,10 +366,19 @@ def test_load_risk_config_unknown_key(tmp_path):
         load_risk_config(write_toml(tmp_path, body))
 
 
-def test_load_risk_config_bad_window(tmp_path):
-    body = TOML_BODY.replace("start_hour_utc = 22", "start_hour_utc = 23")
-    with pytest.raises(RiskConfigError):
+def test_load_risk_config_rejects_legacy_forbidden_section(tmp_path):
+    # 旧版 [[forbidden]] / crypto_symbols 已迁 sessions.toml——出现即拒绝（防两处定义）
+    body = TOML_BODY + """
+[[forbidden]]
+symbol = "EURUSD"
+start_hour_utc = 22
+end_hour_utc = 23
+"""
+    with pytest.raises(RiskConfigError, match="forbidden"):
         load_risk_config(write_toml(tmp_path, body))
+    body2 = TOML_BODY + 'crypto_symbols = ["BTCUSD"]\n'
+    with pytest.raises(RiskConfigError, match="crypto_symbols"):
+        load_risk_config(write_toml(tmp_path, body2))
 
 
 def test_load_risk_config_missing_file(tmp_path):
@@ -368,7 +415,7 @@ def test_daily_pnl_excludes_balance_deals():
 
 def make_process(tmp_path, **kw) -> RiskProcess:
     return RiskProcess(make_config(), live_dir=str(tmp_path / "live"),
-                       heartbeat_timeout_s=120.0, **kw)
+                       heartbeat_timeout_s=120.0, session_policy=POLICY, **kw)
 
 
 def write_heartbeat_file(live: Path, runner_alive: bool, ts: datetime):

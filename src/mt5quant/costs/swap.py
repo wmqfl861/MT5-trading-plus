@@ -1,22 +1,32 @@
 """隔夜费模型：计费夜计数 + 三倍日，恒 ≤ 0（成本方向）。
 
-口径（与经纪商对账时逐项核对）：
-- 每日 charge_hour_utc（默认 21:00 UTC）为计费时刻；持仓区间 (from_ts, to_ts]
-  跨过的每个计费时刻记 1 夜（from 恰在计费时刻不记、to 恰在计费时刻要记）；
-- 计费时刻所在日期的星期 ∈ triple_weekdays（默认周三——FX 把周六日两夜并入
-  周三夜）→ 该夜 ×3；
+口径 v2（T20 / H1 / 决策 D10，2026-10-26；Exness 官方规则）：
+- 计费时刻 = charge_local（默认 "17:00"）在 charge_tz（默认 America/New_York）
+  的墙上时刻，逐日经 zoneinfo 换算成 UTC——夏令时 21:00 GMT、冬令时 22:00 GMT。
+  **禁止固定 UTC 小时**（铁律 v3 第 1 条：随夏令时移动的事件用本地时间定义）；
+- 只数落在 charge_weekdays（默认周一..周五）上的计费时刻——Exness 全部品种组
+  （含加密货币）周六、周日不收隔夜费；周末由三倍日补回；
+- 计费时刻所在**本地日期**的星期 ∈ triple_weekdays（默认周三——FX/金属把
+  周六日两夜并入周三夜）→ 该夜 ×3；
+- 持仓区间 (from_ts, to_ts] 跨过的计费时刻记夜：from 恰在计费时刻不记、
+  to 恰在计费时刻要记；
 - **恒返回 ≤ 0**：费率本身为正（罕见）也按成本方向取负——回测宁可高估成本。
 
 T5（R4）：SwapModel.from_snapshot 从品种快照（scripts/snapshot_specs.py 产出）
-构造规则——swap_mode 决定换算，swap_rollover3days（MT5 星期枚举）决定三倍日。
+构造规则——swap_mode 决定换算，swap_rollover3days（MT5 星期枚举，经
+mt5_to_py_weekday）决定三倍日。T20 起三倍日一律取快照值，实测校准路径同源
+（不再出现 triple_weekdays=frozenset() 的"摊薄"口径）。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+from mt5data.sessions import _parse_hhmm, local_to_utc_naive
 
 # ---- MT5 SYMBOL_SWAP_MODE_* 枚举（本机 MetaTrader5 包只读打印核对 2026-10-24，----
 # ---- 与 mt5.SYMBOL_SWAP_MODE_* 逐个相等；写死常量避免研究层依赖终端包）        ----
@@ -52,20 +62,34 @@ def mt5_to_py_weekday(mt5_day: int) -> int:
 
 @dataclass(frozen=True)
 class SwapRule:
-    """单品种隔夜规则（weekday 约定 Monday=0 … Sunday=6）。"""
+    """单品种隔夜规则（weekday 约定 Monday=0 … Sunday=6）。
+
+    charge_local/charge_tz 定义计费时刻的**本地墙上时间**（DST 感知）；
+    charge_weekdays 上的计费时刻才计费（默认工作日——周末不计，Exness 全品种组）。
+    """
 
     long_per_day: float
     short_per_day: float
     triple_weekdays: frozenset = frozenset({2})  # 周三
-    charge_hour_utc: int = 21
+    charge_weekdays: frozenset = frozenset({0, 1, 2, 3, 4})  # 周末不计（Exness 全部品种组）
+    charge_local: str = "17:00"                   # 计费时刻：交易所本地（Exness 换日）
+    charge_tz: str = "America/New_York"           # 夏令时 21:00 GMT / 冬令时 22:00 GMT
 
     def __post_init__(self):
-        if not 0 <= self.charge_hour_utc <= 23:
-            raise ValueError(f"charge_hour_utc 须 0..23，收到 {self.charge_hour_utc}")
+        try:
+            _parse_hhmm(self.charge_local)
+        except ValueError as e:
+            raise ValueError(f"charge_local 非法：{e}") from e
+        try:
+            ZoneInfo(self.charge_tz)
+        except Exception as e:
+            raise ValueError(f"charge_tz 未知时区：{self.charge_tz!r}") from e
         object.__setattr__(self, "triple_weekdays", frozenset(self.triple_weekdays))
-        for wd in self.triple_weekdays:
-            if not 0 <= wd <= 6:
-                raise ValueError(f"triple_weekdays 须 0..6（Monday=0），收到 {wd}")
+        object.__setattr__(self, "charge_weekdays", frozenset(self.charge_weekdays))
+        for name in ("triple_weekdays", "charge_weekdays"):
+            for wd in getattr(self, name):
+                if not 0 <= wd <= 6:
+                    raise ValueError(f"{name} 须 0..6（Monday=0），收到 {wd}")
 
 
 def _as_naive_utc(ts) -> pd.Timestamp:
@@ -76,23 +100,33 @@ def _as_naive_utc(ts) -> pd.Timestamp:
     return t
 
 
-def charge_nights(from_ts, to_ts, charge_hour_utc: int,
-                  triple_weekdays: frozenset = frozenset()) -> int:
+def _charge_moment_utc(day: date, rule: SwapRule) -> datetime:
+    """day（本地日）的计费时刻 → naive UTC datetime（zoneinfo，DST 感知）。"""
+    return local_to_utc_naive(day, rule.charge_tz, rule.charge_local)
+
+
+def charge_nights(from_ts, to_ts, rule: SwapRule) -> int:
     """(from_ts, to_ts] 内跨过的计费夜数（三倍日记 3；weekday 约定 Monday=0）。
 
+    只数 charge_weekdays 上的计费时刻（默认周一..周五——Exness 周六周日不收）；
+    计费时刻由 rule.charge_local / rule.charge_tz 经 zoneinfo 逐日换算。
     单位：夜（无单位）；from/to 接受 naive UTC 或 aware（后者先转 UTC）。
     """
     f = _as_naive_utc(from_ts)
     t = _as_naive_utc(to_ts)
     if t < f:
         raise ValueError(f"to_ts({to_ts}) 早于 from_ts({from_ts})")
+    tz = ZoneInfo(rule.charge_tz)
+    # 本地日范围放宽一天：UTC 时刻与其本地日可能差一个日历日
+    day = f.replace(tzinfo=timezone.utc).astimezone(tz).date() - timedelta(days=1)
+    end = t.replace(tzinfo=timezone.utc).astimezone(tz).date() + timedelta(days=1)
     total = 0
-    day = f.date()
-    end = t.date()
     while day <= end:
-        m = pd.Timestamp(day.year, day.month, day.day, charge_hour_utc)
-        if f < m <= t:
-            total += 3 if day.weekday() in triple_weekdays else 1
+        wd = day.weekday()
+        if wd in rule.charge_weekdays:
+            m = _charge_moment_utc(day, rule)
+            if f < m <= t:
+                total += 3 if wd in rule.triple_weekdays else 1
         day += timedelta(days=1)
     return total
 
@@ -159,13 +193,14 @@ class SwapModel:
 
     @classmethod
     def from_snapshot(cls, snap: dict, symbols: Iterable[str], *,
-                      charge_hour_utc: int,
                       account_currency: str = "USD") -> "SwapModel":
         """从品种快照（load_snapshot 的 dict）为指定品种构建规则。
 
         每手每夜金额换算见 per_lot_per_night；三倍日由 swap_rollover3days
-        （MT5 星期枚举周日=0）换算成 Python weekday。旧快照缺字段或遇到
-        未实现的 swap_mode 时如实抛错（KeyError / NotImplementedError）。
+        （MT5 星期枚举周日=0）换算成 Python weekday——一律取快照值（T20）。
+        计费时刻用 SwapRule 默认（17:00 America/New_York，DST 感知）。
+        旧快照缺字段或遇到未实现的 swap_mode 时如实抛错
+        （KeyError / NotImplementedError）。
         """
         rules: dict[str, SwapRule] = {}
         for name in symbols:
@@ -180,7 +215,6 @@ class SwapModel:
             rules[name] = SwapRule(
                 long_per_day=long_pd, short_per_day=short_pd,
                 triple_weekdays=frozenset({triple_py}),
-                charge_hour_utc=charge_hour_utc,
             )
         return cls(rules)
 
@@ -202,11 +236,5 @@ class SwapModel:
         if t < f:
             raise ValueError(f"to_ts({to_ts}) 早于 from_ts({from_ts})")
         per_day = rule_.long_per_day if side == "long" else rule_.short_per_day
-        nights = self._charge_nights(rule_, f, t)
+        nights = charge_nights(f, t, rule_)
         return -abs(nights * per_day)
-
-    @staticmethod
-    def _charge_nights(rule_: SwapRule, f: pd.Timestamp, t: pd.Timestamp) -> int:
-        """(f, t] 内跨过的计费夜数（三倍日记 3）。"""
-        return charge_nights(f, t, rule_.charge_hour_utc,
-                             triple_weekdays=rule_.triple_weekdays)

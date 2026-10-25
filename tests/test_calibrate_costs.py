@@ -18,6 +18,7 @@ from collections import namedtuple
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from mt5gw.models import AccountState, Deal
@@ -106,12 +107,12 @@ def load_script():
 WINDOW = (T(2026, 10, 19, 0, 0), T(2026, 10, 23, 23, 59, 59))
 
 
-def build(deals=None, snap=None):
+def build(deals=None, snap=None, window=WINDOW):
     mod = load_script()
     gw = FakeGateway(eur_deals() if deals is None else deals)
     return mod, mod.build_result(
-        gw, EUR_SNAP if snap is None else snap, *WINDOW,
-        now_utc=T(2026, 10, 24, 12, 0))
+        gw, EUR_SNAP if snap is None else snap, *window,
+        now_utc=T(2026, 12, 20, 12, 0))
 
 
 def test_commission_aggregates_hand_computed():
@@ -200,14 +201,22 @@ def test_symbol_missing_from_snapshot_warns_not_crashes():
 
 
 def test_nights_between_matches_engine_semantics():
+    """(from, to] 语义 + 周三 ×3 + 周末不计：与 mt5quant.costs.swap.charge_nights 同源
+    （T20：计费时刻 = SwapRule 的 17:00 纽约，夏令时周 = 21:00 UTC）。"""
+    from mt5quant.costs.swap import SwapRule
+
     mod = load_script()
-    # (from, to] 语义 + 周三 ×3：与 mt5quant.costs.swap.charge_nights 同源
+    rule = SwapRule(-7.0, -7.0, triple_weekdays=frozenset({2}))
+    assert mod.nights_between(T(2026, 10, 21, 20, 0), T(2026, 10, 22, 6, 0), rule) == 3
+    assert mod.nights_between(T(2026, 10, 21, 21, 0), T(2026, 10, 21, 21, 0), rule) == 0
+    # to 含端点：周三 20:59:59→21:00 恰跨计费时刻（当日三倍 → 3）；
+    # 周二同时刻 → 1
     assert mod.nights_between(
-        T(2026, 10, 21, 20, 0), T(2026, 10, 22, 6, 0), 21, triple_weekday=2) == 3
+        T(2026, 10, 21, 20, 59, 59), T(2026, 10, 21, 21, 0), rule) == 3
     assert mod.nights_between(
-        T(2026, 10, 21, 21, 0), T(2026, 10, 21, 21, 0), 21) == 0  # 空区间
-    assert mod.nights_between(
-        T(2026, 10, 21, 20, 59, 59), T(2026, 10, 21, 21, 0), 21) == 1  # to 含端点
+        T(2026, 10, 20, 20, 59, 59), T(2026, 10, 20, 21, 0), rule) == 1
+    assert mod.nights_between(T(2026, 10, 23, 20, 0), T(2026, 10, 26, 20, 0), rule) == 1
+    assert mod.nights_between(T(2026, 10, 19, 20, 0), T(2026, 10, 26, 20, 0), rule) == 7
 
 
 def test_write_outputs_and_commission_from_calibrated_roundtrip(tmp_path):
@@ -225,3 +234,90 @@ def test_write_outputs_and_commission_from_calibrated_roundtrip(tmp_path):
     for token in ("EURUSD", "50", "-7", "21"):
         assert token in md, f"报告缺 {token!r}"
     assert "2026-10-19" in md and "2026-10-23" in md  # 窗口写进表头
+
+
+# ------------------------------------------------- T20（H1）：校准口径 v2
+
+def test_rate_includes_triple_day_round_trip():
+    """周二→周四持仓、实际隔夜费 −40：校准费率 −10/夜（4 夜 = 周二×1+周三×3），
+    回测按同一规则（含三倍日）复算回 −40（探针 P3 的回归）。"""
+    deals = [
+        mk_deal(T(2026, 10, 20, 20, 0), "EURUSD", "buy", "in", 1.0, comm=30.0, pos=1),
+        mk_deal(T(2026, 10, 22, 6, 0), "EURUSD", "sell", "out", 1.0, comm=20.0,
+                swap=-40.0, pos=1),
+    ]
+    _, res = build(deals=deals)
+    sw = res["symbols"]["EURUSD"]["swap"]
+    assert sw["long"]["positions_with_swap"] == 1
+    assert sw["long"]["per_lot_per_night"] == pytest.approx(-10.0)   # −40 / 4 夜
+
+
+def test_calibrated_rate_round_trips_through_build_costs(tmp_path):
+    """校准产物 → run_backtest.build_costs：三倍日取快照（不再 frozenset()），
+    同一持仓区间复算回实测 −40。"""
+    from mt5data.ticks import save_ticks
+    from mt5quant.costs.swap import charge_nights
+    import importlib.util as ilu
+
+    deals = [
+        mk_deal(T(2026, 10, 20, 20, 0), "EURUSD", "buy", "in", 1.0, comm=30.0, pos=1),
+        mk_deal(T(2026, 10, 22, 6, 0), "EURUSD", "sell", "out", 1.0, comm=20.0,
+                swap=-40.0, pos=1),
+    ]
+    mod, res = build(deals=deals)
+    assert res["symbols"]["EURUSD"]["swap"]["long"]["per_lot_per_night"] == pytest.approx(-10.0)
+
+    root = tmp_path / "data"
+    mod.write_outputs(res, str(root))
+    (root / "specs").mkdir(parents=True)
+    (root / "specs" / "latest.json").write_text(json.dumps(EUR_SNAP), encoding="utf-8")
+    save_ticks(str(root), "EURUSD", pd.DataFrame({
+        "time_msc": [pd.Timestamp("2026-10-20 12:00:00").value // 10**6],
+        "bid": [1.1], "ask": [1.1002],
+        "last": [1.1001], "volume": [0.0], "flags": [2],
+    }))
+
+    rb_path = Path(__file__).resolve().parents[1] / "scripts" / "run_backtest.py"
+    spec = ilu.spec_from_file_location("run_backtest_t20", rb_path)
+    rb = ilu.module_from_spec(spec)
+    spec.loader.exec_module(rb)
+    costs, version = rb.build_costs(str(root), "EURUSD", 0.1)
+    assert "swap-cal" in version
+    fee = costs.overnight_fee("EURUSD", "long",
+                              datetime(2026, 10, 20, 20, 0),
+                              datetime(2026, 10, 22, 6, 0))
+    assert fee == pytest.approx(-40.0)   # 4 夜（含周三 ×3）× −10
+    # 计费时刻来自 SwapRule（17:00 NY），不是 calibrated 的旧 charge_hour 字段
+    rule = costs.swap.rule("EURUSD")
+    assert rule.triple_weekdays == frozenset({2})
+    assert rule.charge_local == "17:00" and rule.charge_tz == "America/New_York"
+    assert charge_nights(datetime(2026, 10, 20, 20, 0),
+                         datetime(2026, 10, 22, 6, 0), rule) == 4
+
+
+def test_free_of_swap_requires_crossing_charge_moment():
+    """免隔夜费判定改"跨计费时刻"：冬令时 22:00 入场、次日 20:00 出场
+    不跨周三 22:00 的计费时刻——不算过夜（旧"跨日期"口径会误判为过夜）。"""
+    deals = [
+        mk_deal(T(2026, 12, 15, 22, 0), "EURUSD", "buy", "in", 1.0, comm=30.0, pos=1),
+        mk_deal(T(2026, 12, 16, 20, 0), "EURUSD", "sell", "out", 1.0, comm=20.0,
+                swap=0.0, pos=1),
+    ]
+    _, res = build(deals=deals,
+                   window=(T(2026, 12, 14), T(2026, 12, 18)))
+    sw = res["symbols"]["EURUSD"]["swap"]
+    assert sw["free_of_swap"] is None       # 没有跨计费时刻的持仓：无从判断，不猜
+    assert res["account_free_of_swap"] is None
+
+
+def test_free_of_swap_true_when_crossing_charge_moment_with_zero_swap():
+    deals = [
+        mk_deal(T(2026, 12, 15, 20, 0), "EURUSD", "buy", "in", 1.0, comm=30.0, pos=1),
+        mk_deal(T(2026, 12, 16, 23, 0), "EURUSD", "sell", "out", 1.0, comm=20.0,
+                swap=0.0, pos=1),          # 跨周三 22:00（×3）计费时刻，swap 仍 0
+    ]
+    _, res = build(deals=deals,
+                   window=(T(2026, 12, 14), T(2026, 12, 18)))
+    sw = res["symbols"]["EURUSD"]["swap"]
+    assert sw["free_of_swap"] is True
+    assert sw["long"]["per_lot_per_night"] == 0.0

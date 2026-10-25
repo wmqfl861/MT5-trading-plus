@@ -559,3 +559,71 @@ def test_rejects_corrupt_ticks():
         run_backtest_ticks(BuyHold(), df, col_loader, FakeCosts(),
                            symbol="XAUUSD", params={}, contract_size=1.0,
                            timeframe="H1")
+
+
+# --------------------------------------------- T20（H2）：禁入窗推迟开仓（B-0.2）
+
+from mt5data.sessions import SessionPolicy  # noqa: E402
+from mt5quant.backtest.engine_b import ENGINE_VERSION_B  # noqa: E402
+
+
+def _pol_window(local_hhmm: str, tz: str = "UTC", *, pre: int = 0, post: int = 60,
+                **kw) -> SessionPolicy:
+    return SessionPolicy(rollover_local=local_hhmm, rollover_tz=tz,
+                         pre_minutes=pre, post_minutes=post, **kw)
+
+
+def test_engine_b_version_bumped_for_t20():
+    assert ENGINE_VERSION_B == "B-0.2"
+
+
+def test_session_policy_defers_entry_to_first_allowed_tick():
+    """禁入时段的开仓订单保留，等下一笔允许时刻的 tick 成交（B-0.2）。"""
+    df = base4()  # bar 10/11/12/13 UTC，收盘 11/12/13/14
+    ticks = [
+        tick("2026-01-05 10:30:00", 99.0, 99.2),
+        tick("2026-01-05 11:00:00", 99.9, 100.4),     # 订单就绪但 11:00 禁入
+        tick("2026-01-05 11:30:00", 99.8, 100.3),     # 仍禁入
+        tick("2026-01-05 12:00:00", 99.7, 100.1),     # 12:00 恢复 → 在此成交
+        tick("2026-01-05 12:59:59.999", 100.0, 100.4),
+        tick("2026-01-05 13:59:59.999", 103.0, 103.2),
+    ]
+    pol = _pol_window("11:00")                        # 禁入 [11:00, 12:00)
+    t = one_trade(run_b(df, ticks, ScriptStrategy([1], fill=1), session_policy=pol))
+    assert t["entry_time"] == ts("2026-01-05 12:00:00")
+    assert t["entry_price"] == pytest.approx(100.1)   # 12:00 tick 的 Ask
+    assert t["exit_reason"] == "end_of_data"
+
+
+def test_session_policy_never_blocks_close_and_reversal_closes():
+    # 反向信号落在禁入窗：旧仓照平（12:00 tick），新仓推迟到允许 tick
+    df = base4()
+    ticks = [
+        tick("2026-01-05 11:00:00", 99.9, 100.4),     # bar0 收盘 → 多头入场（11:00 允许）
+        tick("2026-01-05 11:59:59.999", 100.1, 100.5),
+        tick("2026-01-05 12:00:00", 99.7, 100.1),     # bar1 信号 -1 → 平多（不受限）
+        tick("2026-01-05 12:30:00", 99.8, 100.2),     # 空头禁入（[12:00,13:00)）
+        tick("2026-01-05 13:00:00", 99.6, 100.0),     # 恢复 → 空头入场
+        tick("2026-01-05 13:59:59.999", 103.0, 103.2),
+    ]
+    pol = _pol_window("12:00")
+    res = run_b(df, ticks, ScriptStrategy([1, -1], fill=-1), session_policy=pol)
+    assert len(res.trades) == 2
+    t1, t2 = res.trades.iloc[0], res.trades.iloc[1]
+    assert t1["exit_time"] == ts("2026-01-05 12:00:00") and t1["exit_reason"] == "signal"
+    assert t2["side"] == "short"
+    assert t2["entry_time"] == ts("2026-01-05 13:00:00")
+    assert t2["entry_price"] == pytest.approx(99.6)   # 空头按 Bid
+
+
+def test_session_policy_pending_until_data_end_is_cancelled_not_coverage_error():
+    """订单因禁入窗一直无法成交到数据末尾：作废（非 tick 覆盖问题），不抛错。"""
+    df = flat_bars(pd.Timestamp("2026-01-05 10:00"), 3)   # 收盘 11/12/13
+    ticks = [
+        tick("2026-01-05 11:00:00", 99.9, 100.4),     # 就绪但全程禁入 [11:00, 13:00)
+        tick("2026-01-05 12:00:00", 99.8, 100.3),
+    ]
+    pol = _pol_window("11:00", post=120)
+    res = run_b(df, ticks, ScriptStrategy([1], fill=1), session_policy=pol)
+    assert len(res.trades) == 0
+    assert list(res.equity) == pytest.approx([10_000.0] * 3)

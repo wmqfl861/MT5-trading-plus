@@ -167,7 +167,8 @@ def test_heatmap_hand_computed_both_symbols():
     assert hm.loc[("EURUSD", "H1"), 14] == pytest.approx(0.07275)
 
 
-def test_heatmap_missing_spread_hour_is_nan():
+def test_heatmap_missing_spread_hour_falls_back_to_daily_max():
+    """T20：缺统计小时不再 NaN/抛错——取全天最大 p90（保守）。"""
     spread, slip, comm = _models()
     extra = make_bars(["2026-10-19 15:00:00"], [2008.0], [2000.0], [2004.0])
     vol = _vol_fixture()
@@ -177,8 +178,9 @@ def test_heatmap_missing_spread_hour_is_nan():
                       {"XAUUSD": 100.0, "EURUSD": 100000.0},
                       vol, ["XAUUSD", "EURUSD"], ["H1"])
     assert list(hm.columns) == [14, 15]  # 列=vol 小时并集
-    assert math.isnan(hm.loc[("XAUUSD", "H1"), 15])  # 点差缺 15 点 → NaN
+    assert hm.loc[("XAUUSD", "H1"), 15] == pytest.approx(0.0765)  # 缺统计 → 全天最大 p90
     assert hm.loc[("XAUUSD", "H1"), 14] == pytest.approx(0.0765)
+    assert math.isnan(hm.loc[("EURUSD", "H1"), 15])  # EURUSD 无该小时成交 → NaN 照旧
 
 
 def test_heatmap_fail_fast_on_bad_inputs():

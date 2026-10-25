@@ -232,10 +232,10 @@ def test_later_signal_change_does_not_affect_earlier_entry():
 
 
 def test_execution_uses_execution_bar_hour():
-    df = base4()  # 执行 bar 为 11:00 UTC
+    df = base4()  # 执行 bar 为 11:00 UTC = 纽约本地 6 点（EST，T20 分桶口径）
     t = one_trade(run_backtest(ScriptStrategy([1], fill=1), df, HourlySlipCosts(),
                                symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1"))
-    assert t["entry_price"] == pytest.approx(100 + HALF + (SLIP + 0.01 * 11))
+    assert t["entry_price"] == pytest.approx(100 + HALF + (SLIP + 0.01 * 6))
 
 
 # ------------------------------------------------- SL/TP（用例 c）
@@ -607,9 +607,9 @@ def test_equity_marks_short_at_ask():
 
 # ------------------------------------------------- 成本接口 v2（R1 / 计划 T3）
 
-def test_engine_version_bumped_for_t7_exit_and_ruin_rules():
-    # A-1.2 → A-1.3：R7 reentry / R8 week_close 限 ≤H1 / R9 exit_fill_time / R16 爆仓标记
-    assert ENGINE_VERSION == "A-1.3"
+def test_engine_version_bumped_for_t20_session_policy():
+    # A-1.3 → A-1.4（T20）：禁入窗推迟开仓 + 成本小时改纽约本地口径
+    assert ENGINE_VERSION == "A-1.4"
 
 
 def test_engine_passes_price_to_cost_models_long_fills():
@@ -618,9 +618,10 @@ def test_engine_passes_price_to_cost_models_long_fills():
     rec = RecordingCosts()
     run_backtest(ScriptStrategy([1], fill=1), df, rec,
                  symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1")
-    # 多头估值按 Bid（close），不调点差模型 → 调用序列完全确定
-    assert rec.calls == [("spread", 11, 100.0), ("slip", 11, 100.0),
-                         ("spread", 13, 103.0), ("slip", 13, 103.0)]
+    # 多头估值按 Bid（close），不调点差模型 → 调用序列完全确定。
+    # 小时为纽约本地（2026-01-05 EST：UTC−5）——11:00 UTC→6 点、13:00 UTC→8 点
+    assert rec.calls == [("spread", 6, 100.0), ("slip", 6, 100.0),
+                         ("spread", 8, 103.0), ("slip", 8, 103.0)]
 
 
 def test_engine_passes_bar_prices_for_short_ask_trigger_and_marking():
@@ -824,3 +825,87 @@ def test_ruin_stops_new_entries_and_marks_result():
     assert res.ruined_at == df["time"].iloc[1]     # 首次权益 ≤ 0 的 bar
     # 出场净利 −701：bar3 起权益 = 1000 − 701 = 299（回升，但 ruined 已粘滞）
     assert res.equity.iloc[-1] == pytest.approx(299.0)
+
+
+# ------------------------------------------------- T20（H2）：禁入窗推迟开仓
+
+from mt5data.sessions import SessionPolicy  # noqa: E402
+
+
+def _pol_window(local_hhmm: str, tz: str = "UTC", *, pre: int = 0, post: int = 60,
+                **kw) -> SessionPolicy:
+    return SessionPolicy(rollover_local=local_hhmm, rollover_tz=tz,
+                         pre_minutes=pre, post_minutes=post, **kw)
+
+
+def test_session_policy_defers_entry_to_next_allowed_bar():
+    """信号在禁入时段开仓 → 推迟到下一个允许的 bar 开盘（A-1.4）。"""
+    df = base4()  # 2026-01-05 10/11/12/13 UTC
+    pol = _pol_window("11:00")           # 禁入 [11:00, 12:00) UTC
+    res = run_backtest(ScriptStrategy([1], fill=1), df, FlatCosts(), symbol="XAUUSD",
+                       contract_size=1.0, params={}, timeframe="H1",
+                       session_policy=pol)
+    t = one_trade(res)
+    assert t["entry_time"] == df["time"].iloc[2]   # bar1 禁入 → bar2（12:00）开盘
+    assert t["exit_reason"] == "end_of_data"
+    # 对照：无策略（None）行为不变——bar1 开盘即入
+    res0 = run_backtest(ScriptStrategy([1], fill=1), df, FlatCosts(), symbol="XAUUSD",
+                        contract_size=1.0, params={}, timeframe="H1")
+    assert one_trade(res0)["entry_time"] == df["time"].iloc[1]
+
+
+def test_session_policy_defers_while_window_persists():
+    # 禁入 [11:00, 14:00)：11、12、13 三根 bar 全禁 → 数据末尾前一根（14:00 允许）
+    # 没有第 5 根 → 整段无交易（信号持续到末尾也没有允许的 bar）
+    df = flat_bars(pd.Timestamp("2026-01-05 10:00"), 4)
+    pol = _pol_window("11:00", post=180)
+    res = run_backtest(ScriptStrategy([1], fill=1), df, FlatCosts(), symbol="XAUUSD",
+                       contract_size=1.0, params={}, timeframe="H1",
+                       session_policy=pol)
+    assert len(res.trades) == 0
+
+
+def test_session_policy_never_blocks_exit():
+    """平仓不受限：禁入时段内的 signal 出场照常执行。"""
+    df = base4()
+    pol = _pol_window("12:00")           # bar2（12:00）在禁入窗内
+    res = run_backtest(ScriptStrategy([1, 0], fill=0), df, FlatCosts(),
+                       symbol="XAUUSD", contract_size=1.0, params={},
+                       timeframe="H1", session_policy=pol)
+    t = one_trade(res)
+    assert t["entry_time"] == df["time"].iloc[1]    # 11:00 入场（允许）
+    assert t["exit_time"] == df["time"].iloc[2]     # 12:00 平仓照常（不受限）
+    assert t["exit_reason"] == "signal"
+
+
+def test_session_policy_reversal_closes_but_defers_new_side():
+    # 反向信号落在禁入窗：先平旧仓（不受限），新仓推迟到下一个允许 bar
+    df = base4()
+    pol = _pol_window("12:00")
+    res = run_backtest(ScriptStrategy([1, -1], fill=-1), df, FlatCosts(),
+                       symbol="XAUUSD", contract_size=1.0, params={},
+                       timeframe="H1", session_policy=pol)
+    assert len(res.trades) == 2
+    t1, t2 = res.trades.iloc[0], res.trades.iloc[1]
+    assert t1["exit_time"] == df["time"].iloc[2]    # 12:00 平多（允许）
+    assert t2["entry_time"] == df["time"].iloc[3]   # 空头推迟到 13:00 开盘
+
+
+def test_session_policy_dst_anchors_summer_and_winter():
+    # 真实 17:00 纽约策略：夏令时 21:00 UTC 禁入、冬令时 22:00 UTC 禁入
+    pol = SessionPolicy()   # 默认 17:00 America/New_York，前 5 后 60
+    july = flat_bars(pd.Timestamp("2026-07-15 20:00"), 3)   # 20/21/22 UTC（EDT）
+    res = run_backtest(ScriptStrategy([1], fill=1), july, FlatCosts(),
+                       symbol="XAUUSD", contract_size=1.0, params={},
+                       timeframe="H1", session_policy=pol)
+    t = one_trade(res)
+    # bar0 信号 → bar1（21:00 UTC）在 [20:55, 22:00) 内禁入 → bar2（22:00）开盘
+    assert t["entry_time"] == pd.Timestamp("2026-07-15 22:00")
+
+    dec = flat_bars(pd.Timestamp("2026-12-15 21:00"), 3)    # 21/22/23 UTC（EST）
+    res2 = run_backtest(ScriptStrategy([1], fill=1), dec, FlatCosts(),
+                        symbol="XAUUSD", contract_size=1.0, params={},
+                        timeframe="H1", session_policy=pol)
+    t2 = one_trade(res2)
+    # 22:00（冬令时换日）禁入 → 推迟到 23:00 开盘
+    assert t2["entry_time"] == pd.Timestamp("2026-12-15 23:00")

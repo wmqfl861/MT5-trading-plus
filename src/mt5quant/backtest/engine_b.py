@@ -21,6 +21,9 @@
   A 层是 bar 开盘标签；对账时"信号类成交"两层时间完全一致（bar 收盘后的
   第一笔 tick 通常即下一根 bar 的开盘 tick），收盘价类出场相差不足一根
   bar——这是 T10 对账容差的对象，不是缺陷。
+- 禁入窗（T20 / B-0.2，SessionPolicy）：开仓订单在禁入时段就绪时保留，
+  等第一个允许时刻的 tick 成交；平仓不受限；禁入窗未开到数据末尾 → 订单
+  作废（不视为覆盖不足）。与 A 层、实盘风控共用 config/sessions.toml。
 - bars_held = 出场 bar 序号 − 入场 bar 序号（成交 tick 所在 bar 区间），
   与 A 层口径一致。保护性出场后同向信号是否再入场沿用 A 层"目标仓位"
   语义（下一根 bar 收盘后重新下单；ExitRules.reentry 若落地由接线层处理）。
@@ -69,7 +72,8 @@ from mt5quant.backtest.engine_a import (
     _week_close_bars,
 )
 
-ENGINE_VERSION_B = "B-0.1"   # 2026-10-25 T9：首个 tick 级实现
+ENGINE_VERSION_B = "B-0.2"   # 2026-10-26 T20：SessionPolicy 禁入窗推迟开仓
+                             # （订单保留到第一个允许时刻的 tick；平仓不受限）
 
 
 class TickCoverageError(RuntimeError):
@@ -167,7 +171,8 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
                        initial_capital: float = 10_000.0,
                        timeframe: str | None = None,
                        latency_ms: int | float = 0,
-                       slippage_price: float = 0.0) -> BacktestResult:
+                       slippage_price: float = 0.0,
+                       session_policy=None) -> BacktestResult:
     """跑一次 B 层（tick 级）回测，语义详见模块 docstring。
 
     ticks_loader 契约：ticks_loader(start_msc=毫秒, end_msc=毫秒) →
@@ -176,6 +181,11 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
     contract_size 必填（口径同 A 层）；latency_ms 为订单就绪延迟（毫秒，
     含边界）；slippage_price 为每腿额外不利滑点（价格单位）。
     timeframe 缺省取 strategy.required_data.timeframe（B 层必须有周期秒数）。
+    session_policy（mt5data.sessions.SessionPolicy，缺省 None=不限制）：换日
+    禁入窗（T20/B-0.2）。就绪订单若在禁入时段到达允许成交的 tick → 订单保留，
+    等到第一个允许时刻的 tick 成交（等价 A 层"推迟到下一个允许的 bar 开盘"，
+    粒度更细）；**平仓不受限**。禁入窗一直未开到数据末尾 → 订单作废（不算
+    tick 覆盖问题，不抛 TickCoverageError）。与实盘风控共用 config/sessions.toml。
     """
     cs = _validate_contract_size(contract_size)
     if not (isinstance(volume_lots, (int, float)) and not isinstance(volume_lots, bool)
@@ -365,7 +375,11 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
             pending = ({"desired": desired, "ready_ms": close_ms[b] + int(latency_ms)}
                        if desired != cur else None)
         else:
-            if pending is not None:
+            if pending is not None and not (
+                    session_policy is not None and stream.last_msc is not None
+                    and pending["ready_ms"] <= stream.last_msc):
+                # 就绪晚于末笔 tick（真覆盖不足）→ 报错；
+                # 就绪早于末笔 tick 却未成交 → 只能是禁入窗未放开（T20）→ 作废
                 raise TickCoverageError(
                     f"{symbol} tick 覆盖不足：订单（目标仓位 {pending['desired']}）"
                     f"就绪时刻 {pd.Timestamp(pending['ready_ms'], unit='ms')} "
@@ -380,16 +394,21 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
         while last_closed < n - 1 and close_ms[last_closed + 1] <= tk[0]:
             last_closed += 1
             _close_bar(last_closed, stream)
-        # 订单成交：就绪时刻含边界
+        # 订单成交：就绪时刻含边界。开仓订单遇禁入时段 → 保留待下一笔
+        # 允许时刻的 tick（T20）；平仓单（desired=0）不受限
         entered = False
         if pending is not None and tk[0] >= pending["ready_ms"]:
             desired = pending["desired"]
-            pending = None
             if state is not None and state["dir"] != desired:
                 _close_at(tk, "signal")
             if desired != 0:
-                _open_at(tk, desired)
-                entered = True
+                if session_policy is None or session_policy.entry_allowed(
+                        symbol, tk[3]):
+                    pending = None
+                    _open_at(tk, desired)
+                    entered = True
+            else:
+                pending = None
         # SL/TP 逐 tick（入场 tick 自身不触发自己的止损）
         if state is not None and not entered:
             _protective(tk)

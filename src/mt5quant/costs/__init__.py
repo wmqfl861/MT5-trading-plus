@@ -38,15 +38,15 @@ class Costs:
     commission: CommissionModel
     swap: SwapModel
 
-    def spread_p90(self, symbol: str, hour_utc: int,
+    def spread_p90(self, symbol: str, hour_ny: int,
                    *, price: float | None = None) -> float:
-        """价格单位；price 语义见 SpreadModel.spread_p90（相对模型必需）。"""
-        return self.spread.spread_p90(symbol, hour_utc, price=price)
+        """价格单位（hour_ny=纽约本地小时，T20）；price 语义见 SpreadModel.spread_p90。"""
+        return self.spread.spread_p90(symbol, hour_ny, price=price)
 
-    def slippage(self, symbol: str, hour_utc: int,
+    def slippage(self, symbol: str, hour_ny: int,
                  *, price: float | None = None) -> float:
-        """价格单位；price 语义见 SlippageModel.slippage。"""
-        return self.slippage_model.slippage(symbol, hour_utc, price=price)
+        """价格单位（hour_ny=纽约本地小时，T20）；price 语义见 SlippageModel.slippage。"""
+        return self.slippage_model.slippage(symbol, hour_ny, price=price)
 
     def commission_per_lot(self, symbol: str) -> float:
         return self.commission.commission_per_lot(symbol)

@@ -18,7 +18,13 @@
   time_stop/week_close/end_of_data=该根 close）；空头 SL/TP 的 Ask 触发
   判断 = 当根 high（SL）/low（TP），开盘跳空检查 = 开盘价；逐 bar 估值 =
   当根 close。
-- 执行价（p 为 bid 口径的成交基准价，h 为执行 bar 开盘时刻的小时，
+- 禁入窗（T20 / A-1.4，SessionPolicy）：信号要求开仓的 bar 开盘若落在
+  config/sessions.toml 的禁入窗（换日 17:00 纽约 ± 配置分钟数、DST 感知）或
+  数据驱动禁入小时（点差缺统计）内 → 本根不开仓，信号持续时顺延到下一个
+  允许的 bar 开盘；**平仓（signal/SL/TP/time_stop/week_close）不受限**。
+  推迟期间信号归零则不再开仓。与实盘风控（mt5live.riskproc）共用同一份
+  SessionPolicy——回测与实盘的禁入规则同源（铁律 v3 第 11 条）。
+- 执行价（p 为 bid 口径的成交基准价，h 为执行 bar 的纽约本地小时（T20），
   spr=costs.spread_p90(symbol,h,price=p)、slip=costs.slippage(symbol,h,price=p)）：
       多头 entry = p + spr + slip    多头 exit = p − slip
       空头 entry = p − slip           空头 exit = p + spr + slip
@@ -82,10 +88,10 @@ import pandas as pd
 from mt5data.store import TIMEFRAME_SECONDS
 from mt5quant.strategies.base import REENTRY_MODES, ExitRules
 
-NY_TZ = "America/New_York"   # 周五当地收盘（17:00）换算用的时区
+NY_TZ = "America/New_York"   # 周五当地收盘（17:00）换算与点差分桶共用的时区
 _WEEK_CLOSE_LOCAL = dtime(17, 0)
-ENGINE_VERSION = "A-1.3"     # 2026-10-25 T7：R7 reentry / R8 week_close 限 ≤H1 /
-                             # R9 exit_fill_time / R16 爆仓标记
+ENGINE_VERSION = "A-1.4"     # 2026-10-26 T20：SessionPolicy 禁入窗推迟开仓 /
+                             # 成本小时改纽约本地口径（与 SpreadModel 分桶一致）
 
 # 按收盘价出场的 reason：成交时刻 = bar 收盘（bar 时间 + 周期）（R9）
 CLOSE_PRICE_REASONS = ("time_stop", "week_close", "end_of_data")
@@ -99,9 +105,11 @@ class Costs(Protocol):
 
     spread_p90/slippage 的 keyword-only price = 该笔成交的 bid 基准价：
     相对点差模型必须拿到 price（缺失抛 ValueError）；绝对模型忽略。
+    小时参数（hour_ny）为**纽约本地小时**（T20：点差模型按纽约小时分桶，
+    换日尖峰不被 DST 摊薄；引擎把 bar 时间换算后传入）。
     """
 
-    def spread_p90(self, symbol: str, hour_utc: int,
+    def spread_p90(self, symbol: str, hour_ny: int,
                    *, price: float | None = None) -> float:
         """该小时的点差全幅 p90（价格单位，每个来回恰计一次）。
 
@@ -109,9 +117,9 @@ class Costs(Protocol):
         """
         ...
 
-    def slippage(self, symbol: str, hour_utc: int,
+    def slippage(self, symbol: str, hour_ny: int,
                  *, price: float | None = None) -> float:
-        """该 UTC 小时的滑点幅值（价格单位，恒为正、不利方向）；price 同上。"""
+        """该纽约本地小时的滑点幅值（价格单位，恒为正、不利方向）；price 同上。"""
         ...
 
     def commission_per_lot(self, symbol: str) -> float:
@@ -269,7 +277,8 @@ def _validate_contract_size(contract_size) -> float:
 def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: dict,
                  contract_size: float,
                  volume_lots: float = 1.0, initial_capital: float = 10_000.0,
-                 timeframe: str | None = None) -> BacktestResult:
+                 timeframe: str | None = None,
+                 session_policy=None) -> BacktestResult:
     """跑一次 A 层回测。
 
     contract_size 必填（无默认值，防止静默按 1 折算）：每手每 1.0 价格变动的
@@ -278,6 +287,10 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
     timeframe 未显式给出时取 strategy.required_data.timeframe；必须能对应
     TIMEFRAME_SECONDS 的周期（Trade.exit_fill_time 需要 bar 周期算收盘时刻）。
     week_close_exit=True 另要求周期 ≤ H1（R8）。
+    session_policy（mt5data.sessions.SessionPolicy，缺省 None=不限制）：换日
+    禁入窗（T20/A-1.4）。信号要求在禁入时段开仓时，开仓推迟到下一个允许的
+    bar 开盘（信号持续为前提；信号归零则不再开）；**平仓不受限**。与实盘风控
+    共用同一份 config/sessions.toml（铁律 v3 第 11 条）。
     """
     cs = _validate_contract_size(contract_size)
     if not (isinstance(volume_lots, (int, float)) and not isinstance(volume_lots, bool)
@@ -305,6 +318,9 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
 
     n = len(bars)
     times = [pd.Timestamp(t) for t in bars["time"]]
+    # T20：点差/滑点按纽约本地小时分桶——bar 时间统一换算（DST 由 zoneinfo 处理）
+    ny_hours = (pd.to_datetime(bars["time"]).dt.tz_localize("UTC")
+                .dt.tz_convert(NY_TZ).dt.hour.to_numpy(dtype="int64"))
     opens = bars["open"].to_numpy(dtype="float64")
     highs = bars["high"].to_numpy(dtype="float64")
     lows = bars["low"].to_numpy(dtype="float64")
@@ -334,8 +350,8 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
         """平仓。base_price 为 bid 口径基准价（空头出场另加 spr 变成 Ask）。"""
         nonlocal state, realized, blocked_dir
         assert state is not None
-        spr = costs.spread_p90(symbol, times[j].hour, price=base_price)
-        slip = costs.slippage(symbol, times[j].hour, price=base_price)
+        spr = costs.spread_p90(symbol, int(ny_hours[j]), price=base_price)
+        slip = costs.slippage(symbol, int(ny_hours[j]), price=base_price)
         if state["dir"] == 1:
             exit_price = base_price - slip
         else:
@@ -371,8 +387,8 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
 
     def _open(j: int, desired: int) -> None:
         nonlocal state
-        spr = costs.spread_p90(symbol, times[j].hour, price=opens[j])
-        slip = costs.slippage(symbol, times[j].hour, price=opens[j])
+        spr = costs.spread_p90(symbol, int(ny_hours[j]), price=opens[j])
+        slip = costs.slippage(symbol, int(ny_hours[j]), price=opens[j])
         base = opens[j]
         if desired == 1:
             entry_price = base + spr + slip
@@ -428,17 +444,17 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
                 _close(j, tp, "take_profit")
             return
         if gap_check and (sl is not None or tp is not None):
-            spr_open = costs.spread_p90(symbol, times[j].hour, price=opens[j])
+            spr_open = costs.spread_p90(symbol, int(ny_hours[j]), price=opens[j])
             if sl is not None and opens[j] + spr_open >= sl:
                 _close(j, opens[j], "stop_gap")          # exit = open + spr + slip
             elif tp is not None and opens[j] + spr_open <= tp:
                 _close(j, tp - spr_open, "take_profit_gap")  # exit = tp + slip
         if state is not None and sl is not None:
-            spr_high = costs.spread_p90(symbol, times[j].hour, price=highs[j])
+            spr_high = costs.spread_p90(symbol, int(ny_hours[j]), price=highs[j])
             if highs[j] + spr_high >= sl:
                 _close(j, sl - spr_high, "stop")         # exit = sl + slip
         if state is not None and tp is not None:
-            spr_low = costs.spread_p90(symbol, times[j].hour, price=lows[j])
+            spr_low = costs.spread_p90(symbol, int(ny_hours[j]), price=lows[j])
             if lows[j] + spr_low <= tp:
                 _close(j, tp - spr_low, "take_profit")   # exit = tp + slip
 
@@ -452,7 +468,11 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
                 if state is not None:
                     _close(j, opens[j], "signal")
                 if desired != 0 and not ruined and desired != blocked_dir:
-                    _open(j, desired)   # 爆仓（R16）或同向禁入（R7）时不开新仓
+                    # T20：禁入窗内的开仓推迟——本根不开，信号持续时下一根
+                    # 允许的 bar 开盘再开（平仓已在上面照常执行，不受限）
+                    if session_policy is None or session_policy.entry_allowed(
+                            symbol, times[j]):
+                        _open(j, desired)   # 爆仓（R16）或同向禁入（R7）时不开新仓
         # 2) 持仓检查（入场当根同样适用盘中 SL/TP）
         if state is not None:
             _protective_exit(j)
@@ -467,7 +487,7 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
         if state is not None:
             mark = closes[j]
             if state["dir"] == -1:
-                mark = closes[j] + costs.spread_p90(symbol, times[j].hour,
+                mark = closes[j] + costs.spread_p90(symbol, int(ny_hours[j]),
                                                     price=closes[j])
             unreal = (mark - state["entry_price"]) * state["dir"] * state["lots"] * cs
         equity_vals[j] = initial_capital + realized + unreal

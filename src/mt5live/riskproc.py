@@ -20,9 +20,11 @@
 3. 品种白名单；4. 单笔最大手数；5. 每品种最大持仓数（账户内该品种全部
    持仓，不分 magic——风控保护整个账户）；6. 组合美元暴露上限（手数 ×
    contract_size × 现价的 USD 名义，全部品种合并计算）；7. 每分钟最大
-   下单数（60 秒滑窗，恰 60 秒前的单不计入）；8. 禁止开仓时段：内置
-   UTC 21:00–21:59 换日/结算窗（docs/research/scope-2026-10-25.md，
-   非加密品种，BTCUSD 豁免）+ 可配置扩展窗（如 EURUSD 延至 23:00）。
+   下单数（60 秒滑窗，恰 60 秒前的单不计入）；8. 禁止开仓时段：
+   SessionPolicy（config/sessions.toml，T20 唯一定义源）——换日 17:00
+   America/New_York 前后配置分钟数（夏令时 21:00 / 冬令时 22:00 GMT，
+   DST 感知），BTCUSD 等豁免品种、EURUSD 扩展窗同在该文件；回测引擎
+   （engine_a/engine_b）与这里读同一份配置（铁律 v3 第 11 条）。
 
 check 只裁决**开仓**请求；平仓任何时候都不经此门（禁止时段也允许平仓）。
 缺数据（品种无现价/合约大小）→ 拒单（reason 前缀 missing_data），
@@ -38,6 +40,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Mapping
 
+from mt5data.sessions import DEFAULT_SESSIONS_PATH, SessionPolicy, load_session_policy
 from mt5gw.snapshot import write_json_atomic
 from mt5live.monitor import (
     ALERT_HEARTBEAT_TIMEOUT,
@@ -52,7 +55,6 @@ from mt5live.monitor import (
     write_heartbeat,
 )
 
-BUILTIN_FORBIDDEN_HOUR_UTC = 21  # 换日/结算窗（scope-2026-10-25：非加密全部品种）
 FREQUENCY_WINDOW_S = 60.0        # 下单频率滑窗宽度
 
 HALT_FILE = "halt.json"
@@ -67,26 +69,25 @@ class RiskConfigError(RuntimeError):
     """风控配置文件缺失 / 键不合法 / 类型错误——拒绝启动。"""
 
 
+def _repo_sessions_path() -> str:
+    """仓库 config/sessions.toml 的绝对路径（本文件在 src/mt5live/ 下）。"""
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "config", "sessions.toml")
+
+
+def load_default_session_policy(path: str | None = None) -> SessionPolicy:
+    """加载默认禁入策略：显式路径 > 仓库 config/sessions.toml > cwd 相对默认。"""
+    for cand in (path, _repo_sessions_path(), DEFAULT_SESSIONS_PATH):
+        if cand and os.path.exists(cand):
+            return load_session_policy(cand)
+    raise RiskConfigError(
+        f"找不到 config/sessions.toml（尝试 {_repo_sessions_path()} 与 "
+        f"{DEFAULT_SESSIONS_PATH}）——T20 起禁入时段的唯一定义源，必须存在")
+
+
 # ---- 配置 ----
-
-@dataclass(frozen=True)
-class ForbiddenWindow:
-    """可配置的禁止开仓时段（UTC 整点窗，start 含 / end 不含，不跨零点）。"""
-
-    symbol: str
-    start_hour_utc: int
-    end_hour_utc: int
-
-    def __post_init__(self):
-        if not self.symbol:
-            raise ValueError("禁止时段品种不能为空")
-        if not (0 <= self.start_hour_utc < self.end_hour_utc <= 24):
-            raise ValueError(
-                f"禁止时段须满足 0 ≤ start < end ≤ 24（不跨零点）：{self}")
-
-    def covers(self, hour_utc: int) -> bool:
-        return self.start_hour_utc <= hour_utc < self.end_hour_utc
-
+# T20：禁止开仓时段已迁 config/sessions.toml（SessionPolicy，单一定义源），
+# risk.toml 不再有 crypto_symbols / [[forbidden]]——出现即按未知键拒绝。
 
 @dataclass(frozen=True)
 class RiskConfig:
@@ -99,8 +100,6 @@ class RiskConfig:
     max_usd_exposure: float               # 组合美元暴露上限（USD 名义）
     max_orders_per_minute: int            # 每分钟最大下单数（60 秒滑窗）
     daily_loss_cap_usd: float             # 日亏损上限（正数；≤ -cap 触发全平）
-    crypto_symbols: tuple[str, ...] = ("BTCUSD",)  # 豁免内置换日窗的品种
-    extra_forbidden: tuple[ForbiddenWindow, ...] = ()
 
     def __post_init__(self):
         if not self.symbols:
@@ -165,37 +164,11 @@ def load_risk_config(path: str) -> RiskConfig:
         "daily_loss_cap_usd": _as_float(
             require("daily_loss_cap_usd"), "daily_loss_cap_usd"),
     }
-    if "crypto_symbols" in data:
-        kw["crypto_symbols"] = _as_symbols(data.pop("crypto_symbols"),
-                                           "crypto_symbols")
-    if "forbidden" in data:
-        windows = data.pop("forbidden")
-        if not isinstance(windows, list):
-            raise RiskConfigError(f"forbidden 须为表数组，收到 {windows!r}")
-        parsed = []
-        try:
-            for i, w in enumerate(windows):
-                if not isinstance(w, dict):
-                    raise RiskConfigError(f"forbidden[{i}] 须为表：{w!r}")
-                unknown = sorted(
-                    set(w) - {"symbol", "start_hour_utc", "end_hour_utc"})
-                if unknown:
-                    raise RiskConfigError(f"forbidden[{i}] 未知键：{unknown}")
-                for k in ("symbol", "start_hour_utc", "end_hour_utc"):
-                    if k not in w:
-                        raise RiskConfigError(f"forbidden[{i}] 缺键：{k}")
-                parsed.append(ForbiddenWindow(
-                    symbol=w["symbol"],
-                    start_hour_utc=_as_int(w["start_hour_utc"],
-                                           f"forbidden[{i}].start_hour_utc"),
-                    end_hour_utc=_as_int(w["end_hour_utc"],
-                                         f"forbidden[{i}].end_hour_utc"),
-                ))
-        except ValueError as e:
-            raise RiskConfigError(f"{path} 风控配置不合法：{e}") from e
-        kw["extra_forbidden"] = tuple(parsed)
     if data:
-        raise RiskConfigError(f"风控配置未知键：{sorted(data)}（{path}）")
+        raise RiskConfigError(
+            f"风控配置未知键：{sorted(data)}（{path}）。禁止开仓时段自 T20 起"
+            "定义在 config/sessions.toml（SessionPolicy），risk.toml 不再"
+            "有 crypto_symbols / [[forbidden]]")
     try:
         return RiskConfig(**kw)
     except ValueError as e:
@@ -249,13 +222,13 @@ class AccountSnapshot:
 # ---- 纯函数检查器 ----
 
 def is_forbidden_open_time(symbol: str, now: datetime,
-                           config: RiskConfig) -> bool:
-    """禁止开仓时段判定：内置 UTC 21:00–21:59 非加密（crypto 豁免）+ 扩展窗。"""
-    hour = naive_utc(now).hour
-    if symbol not in config.crypto_symbols and hour == BUILTIN_FORBIDDEN_HOUR_UTC:
-        return True
-    return any(w.symbol == symbol and w.covers(hour)
-               for w in config.extra_forbidden)
+                           session_policy: SessionPolicy) -> bool:
+    """禁止开仓时段判定（T20）：SessionPolicy.entry_allowed 的取反。
+
+    窗口随 DST 移动（换日 17:00 纽约 = 夏 21:00 / 冬 22:00 GMT），
+    与回测引擎共用 config/sessions.toml（单一定义源）。
+    """
+    return not session_policy.entry_allowed(symbol, naive_utc(now))
 
 
 def _net_sign(side: str) -> float:
@@ -285,7 +258,7 @@ def _held_usd_exposure(state: RiskState) -> tuple[float, list[str]]:
 
 
 def check(order_request: OrderRequest, state: RiskState, config: RiskConfig,
-          now: datetime) -> RiskDecision:
+          now: datetime, session_policy: SessionPolicy) -> RiskDecision:
     """纯函数风控检查器（规则与顺序见模块 docstring；now 为 naive UTC）。"""
     # 1. 日亏损上限（最高优先：先于一切规则，触发即全平+停机）
     total = state.today_realized + state.today_floating
@@ -346,12 +319,12 @@ def check(order_request: OrderRequest, state: RiskState, config: RiskConfig,
         return RiskDecision(
             False, f"max_orders_per_minute: 1 分钟内已提交 {len(recent)} 笔，"
             f"加本笔超上限 {config.max_orders_per_minute} 笔")
-    # 8. 禁止开仓时段（内置 21:00–21:59 非加密 + 扩展窗；只禁开仓）
-    if is_forbidden_open_time(order_request.symbol, n, config):
+    # 8. 禁止开仓时段（config/sessions.toml 的换日窗，DST 感知；只禁开仓）
+    if is_forbidden_open_time(order_request.symbol, n, session_policy):
         return RiskDecision(
             False, f"forbidden_session: {order_request.symbol} UTC "
-            f"{n:%H:%M} 处于禁止开仓时段（内置 21:00–21:59 非加密"
-            f" / 配置扩展窗）")
+            f"{n:%H:%M} 处于禁止开仓时段（config/sessions.toml 换日窗，"
+            f"平仓不受限）")
     return RiskDecision(True, "ok")
 
 
@@ -384,10 +357,15 @@ class RiskProcess:
 
     def __init__(self, config: RiskConfig, *,
                  live_dir: str = os.path.join("data", "live"),
-                 heartbeat_timeout_s: float = DEFAULT_HEARTBEAT_TIMEOUT_S):
+                 heartbeat_timeout_s: float = DEFAULT_HEARTBEAT_TIMEOUT_S,
+                 session_policy: SessionPolicy | None = None):
         self.config = config
         self.live_dir = str(live_dir)
         self.heartbeat_timeout_s = float(heartbeat_timeout_s)
+        # T20：禁入窗唯一来源 config/sessions.toml；缺省从仓库路径加载
+        self.session_policy: SessionPolicy = (
+            session_policy if session_policy is not None
+            else load_default_session_policy())
         self.halt_path = os.path.join(self.live_dir, HALT_FILE)
         self.kill_switch_path = os.path.join(self.live_dir, KILL_SWITCH_FILE)
         self.commands_dir = os.path.join(self.live_dir, COMMANDS_SUBDIR)
@@ -408,7 +386,7 @@ class RiskProcess:
         if os.path.exists(self.halt_path):
             reason = self._read_halt_reason()
             return RiskDecision(False, f"halted: {reason}", halt=True)
-        return check(order_request, state, self.config, n)
+        return check(order_request, state, self.config, n, self.session_policy)
 
     # -- 主循环单轮 --
 
