@@ -315,3 +315,71 @@ def test_hook_check_staged_function(hook):
     assert hook.check_staged(
         [("M", "config/gates.toml"), ("M", "research/cards/H001.toml")],
         role="admin") == []
+
+
+# ------------------------------------------------- T38（H4/D25）：CI 白名单
+
+
+def test_hook_check_paths_function(hook):
+    """T38/D25：CI 与本地钩子共用的检查函数 check_paths——修改旧卡、改
+    bt.py、改钩子本身三种情形报违规；新增卡与策略库修改放行。"""
+    viol = hook.check_paths([("M", "research/cards/H003.toml")],
+                            role="research")
+    assert viol, "修改旧卡应报违规"
+    assert any("research/cards/H003.toml" in v for v in viol)
+    assert hook.check_paths([("M", "scripts/bt.py")], role="research"), \
+        "改 bt.py 应报违规"
+    assert hook.check_paths(
+        [("M", "scripts/hooks/pre-commit-readonly-paths")],
+        role="research"), "改钩子本身应报违规"
+    # 放行：新增卡（状态 A）与策略库修改
+    assert hook.check_paths([("A", "research/cards/H012-v2.toml")],
+                            role="research") == []
+    assert hook.check_paths(
+        [("M", "src/mt5quant/strategies/library/b1_donchian_breakout.py")],
+        role="research") == []
+
+
+def test_hook_check_paths_same_rules_as_check_staged(hook):
+    """同一份规则：check_paths 与 check_staged 对同批改动结论一致——
+    CI 与本地钩子不会各说各话（D25：规则与钩子同一份代码）。"""
+    changes = [("A", "research/cards/H001.toml"), ("M", "scripts/bt.py"),
+               ("M", "docs/p6/permissions.md"),
+               ("M", "src/mt5quant/strategies/library/x.py")]
+    assert hook.check_paths(changes, role="research") == \
+        hook.check_staged(changes, role="research")
+    assert hook.check_paths(changes, role="admin") == []
+    assert hook.check_paths(changes, role=None), "未指定角色 → 缺省拒绝"
+
+
+ALLOWLIST_YML = REPO_ROOT / ".github" / "workflows" / "research-allowlist.yml"
+
+
+def test_research_allowlist_workflow_wired():
+    """T38/D25：research-allowlist.yml 存在且与钩子共用同一份规则——
+    python -c 调 check_paths、diff 基线 origin/main...HEAD、PR 触发、
+    仅 research/** 头分支强制。"""
+    assert ALLOWLIST_YML.is_file(), f"缺 workflow：{ALLOWLIST_YML}"
+    text = ALLOWLIST_YML.read_text(encoding="utf-8")
+    for kw in ("pull_request", "check_paths", "pre-commit-readonly-paths",
+               "origin/main...HEAD", "research/"):
+        assert kw in text, f"research-allowlist.yml 缺：{kw}"
+
+
+def test_permissions_doc_t38_isolation_defaults():
+    """T38/D24：permissions.md 写清缺省研究库、--main-store/--ops-ack 语义、
+    研究账户运行方式（runas）与 main 分支保护步骤（U0 清单）。"""
+    text = PERMISSIONS.read_text(encoding="utf-8")
+    for kw in ("--main-store", "--ops-ack", "分支保护", "runas", "check_paths",
+               "research-allowlist"):
+        assert kw in text, f"permissions.md 缺：{kw}"
+
+
+def test_readme_t38_default_research_store():
+    """README 对齐 T38/D24：缺省即研究库 data_research；读主库须显式
+    --main-store（锁箱期另需 --ops-ack）。"""
+    text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "--main-store" in text, "README 缺读主库的显式 flag 说明"
+    assert "--ops-ack" in text, "README 缺锁箱期运维豁免说明"
+    assert "缺省" in text and "data_research" in text, \
+        "README 缺'缺省即研究库'的说明"

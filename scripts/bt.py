@@ -49,9 +49,14 @@
   与 load_gates 同口径——探针 P7：裸字节哈希在 CRLF 检出下两侧不一致），
   否则空串（T12 起强制核对）。
 - 台账缺省 {data-root}/research/ledger.sqlite（data/ 不入库，本地持久）。
-- 研究库（T27/H3）：--research-store 时 --data-root 缺省切到 data_research
-  （scripts/export_research_store.py 导出的隔离副本：只含 time < cutoff 的
-  K 线 + 成本缓存文件，无 tick；研究库无锁箱段，锁箱语义自然满足）。
+- 研究库缺省（T27/H3 + T38/H4/D24）：**--data-root 缺省即研究库
+  data_research**（scripts/export_research_store.py 导出的隔离副本：只含
+  time < cutoff 的 K 线 + 成本缓存文件，无 tick；研究库无锁箱段，锁箱语义
+  自然满足；--research-store 保留为兼容别名）。缺省时 data_research 不存在
+  → 报错指路 export_research_store，绝不静默回退主库。读主库须显式
+  --main-store（data_root=data）；读主库的锁箱期（--end 越过 cutoff）再加
+  --ops-ack（运维测量专用，台账 actor 记 ops，不产生研究结论）；G5 需读
+  锁箱段，只能经 --main-store + --approve 由管理员跑（研究库模式下拒绝）。
   台账缺省**不**跟随切换，仍落 data/research/ledger.sqlite——permissions.md
   的 ACL 里研究库对研究账户只读，可写的台账目录是 data\\research。
 - 代码指纹（T37/H3/M6，D23/D27）：screen/gate 运行前过
@@ -65,6 +70,7 @@
 import argparse
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -88,8 +94,8 @@ from mt5quant.validation import stats as vstats  # noqa: E402
 from mt5quant.validation import walkforward as vwf  # noqa: E402
 from mt5quant.validation.robustness import BacktestSpec  # noqa: E402
 from run_backtest import (  # noqa: E402
-    SESSIONS_PATH, ZeroCosts, build_costs, entry_policy_for, load_series,
-    load_strategy, resolve_contract_size, resolve_data_root,
+    SESSIONS_PATH, ZeroCosts, build_costs, classify_store, entry_policy_for,
+    load_series, load_strategy, resolve_contract_size, resolve_data_root,
     resolve_lots_mode, sessions_sha256,
 )
 from mt5quant.sizing import load_volume_limits  # noqa: E402
@@ -102,15 +108,55 @@ STRATEGY_FP_ROOT = Path(cards.__file__).resolve().parents[3]
 
 
 def _ledger_default(args) -> Path:
-    """台账缺省路径：--research-store 时固定 data/research/ledger.sqlite
-    （研究库对研究账户只读，可写台账目录是 data\\research——permissions.md）；
-    否则 {data-root}/research/ledger.sqlite。显式 --ledger 永远优先。"""
+    """台账缺省路径（T27/T38）：研究库模式（T38/D24 起为**缺省**）下固定
+    data/research/ledger.sqlite——研究库对研究账户只读，可写台账目录是
+    data\\research（permissions.md），缺省切换不改这一语义；--main-store
+    或显式 --data-root 时为 {data-root}/research/ledger.sqlite（主库时
+    与固定路径相同）。显式 --ledger 永远优先。"""
     if args.ledger is not None:
         return Path(args.ledger)
-    if getattr(args, "research_store", False):
+    data_root = resolve_data_root(
+        args.data_root, getattr(args, "research_store", False),
+        getattr(args, "main_store", False))
+    if classify_store(data_root) == "research":
         return Path("data") / "research" / "ledger.sqlite"
-    return Path(resolve_data_root(args.data_root, False)) / "research" \
-        / "ledger.sqlite"
+    return Path(data_root) / "research" / "ledger.sqlite"
+
+
+def _resolve_store(args) -> tuple[str, str]:
+    """T38/D24：解析数据根并执行守卫，返回 (data_root, store_kind)。
+
+    - 主库（data 字面/仓库内路径）未给 --main-store → ValueError（缺省只读
+      研究库；主库含完整锁箱段）；
+    - 研究库（缺省指向）不存在 → ValueError 指路 export_research_store，
+      绝不静默回退主库；
+    - 调用方打印并退出 1（不产生任何 runs / lockbox_uses）。
+    """
+    data_root = resolve_data_root(
+        args.data_root, getattr(args, "research_store", False),
+        getattr(args, "main_store", False))
+    kind = classify_store(data_root)
+    if kind == "main" and not getattr(args, "main_store", False):
+        raise ValueError(
+            f"读主库 {data_root} 须显式 --main-store（T38/D24：bt 缺省只读研究库"
+            " data_research；主库含完整锁箱段，仅管理员可读，读锁箱期另需"
+            " --ops-ack，G5 也只能经 --main-store 跑）")
+    if kind == "research" and not os.path.isdir(data_root):
+        raise ValueError(
+            f"研究库 {data_root} 不存在——T38/D24 起缺省数据根是研究库"
+            " data_research；请管理员在主库侧跑 scripts/export_research_store.py"
+            " 导出（只含 time < cutoff 的 K 线 + 成本缓存，无 tick），或显式"
+            " --data-root 指定数据目录；绝不静默回退主库")
+    return data_root, kind
+
+
+def _actor_for(args) -> str:
+    """T38/D24：--ops-ack（运维豁免读锁箱期）时台账 actor 记 ops——
+    Global Constraints：锁箱期数据只用于运维测量，台账记 actor=ops，
+    不产生研究结论。"""
+    if getattr(args, "ops_ack", False):
+        return "ops"
+    return args.actor
 
 # 参数选择规则枚举（附录 A v2；卡定义时 bt card check 校验，非法值拒绝）
 _SELECTION_METRICS = {
@@ -423,12 +469,20 @@ def cmd_screen(args) -> int:
     if card.migration_hint:
         print(f"⚠ 迁移提示：{card.migration_hint}")
 
+    # T38/D24：数据根解析 + 守卫（主库须显式 --main-store；缺省研究库须存在）
+    try:
+        data_root, store_kind = _resolve_store(args)
+    except ValueError as e:
+        print(f"✗ {e}")
+        return 1
     ledger_path = _ledger_default(args)
-    data_root = resolve_data_root(args.data_root,
-                                  getattr(args, "research_store", False))
-    if getattr(args, "research_store", False):
-        print(f"— 研究库模式（T27/H3）：--data-root 缺省 {data_root}"
+    research_mode = store_kind == "research"
+    if research_mode:
+        print(f"— 研究库模式（T27/H3；T38/D24 起为缺省）：data_root={data_root}"
               f"（无 tick，成本经缓存文件；台账 {ledger_path}）")
+    actor = _actor_for(args)                     # T38/D24：--ops-ack → ops
+    if actor != args.actor:
+        print(f"— --ops-ack：台账 actor 记为 ops（运维测量，不产生研究结论）")
     with Ledger(ledger_path) as ledger:
         # 先卡后测：未提交 / 工作区脏（P6）/ 提交晚于该卡文件首次运行 →
         # 拒绝（不产生任何 runs）
@@ -463,7 +517,9 @@ def cmd_screen(args) -> int:
             else:
                 vols_by_sym = None
             bars_by_sym = {sym: load_series(data_root, sym,
-                                            card.timeframe, args.end)
+                                            card.timeframe, args.end,
+                                            ops_ack=getattr(args, "ops_ack",
+                                                            False))
                            for sym in card.symbols}
             # T20：禁入窗唯一来源 config/sessions.toml（sha 进 cost_model_version）
             from mt5data.sessions import load_session_policy
@@ -477,8 +533,7 @@ def cmd_screen(args) -> int:
                     costs_by_sym[sym], cost_version = build_costs(
                         data_root, sym, args.spread_fraction,
                         args.commission, sessions_sha=sess_sha,
-                        research_store=getattr(args, "research_store",
-                                                False))
+                        research_store=research_mode)
                     policy_by_sym[sym] = entry_policy_for(
                         costs_by_sym[sym], sym, sess_policy)
             else:
@@ -533,7 +588,7 @@ def cmd_screen(args) -> int:
                         data_last=data_last, data_sha256=dsha,
                         engine_version=ENGINE_VERSION,
                         cost_model_version=cost_version, gates_hash=gates_hash,
-                        metrics=summary, actor=args.actor,
+                        metrics=summary, actor=actor,
                         strategy_sha=strategy_sha)
                     skipped = summary.get("skipped_zero_lots") or 0
                     print(f"✓ run#{rid} {label} -> "
@@ -550,7 +605,7 @@ def cmd_screen(args) -> int:
                         engine_version=ENGINE_VERSION,
                         cost_model_version=cost_version,
                         gates_hash=gates_hash, metrics=None,
-                        error=f"{type(e).__name__}: {e}", actor=args.actor,
+                        error=f"{type(e).__name__}: {e}", actor=actor,
                         strategy_sha=strategy_sha)
                     print(f"✗ run#{rid} {label} -> {type(e).__name__}: {e}")
 
@@ -596,14 +651,28 @@ def cmd_gate(args) -> int:
         print(f"✗ 未知关卡 {unknown}；合法：{list(vgate.GATE_ORDER)}")
         return 1
 
+    # T38/D24：数据根解析 + 守卫（主库须显式 --main-store；缺省研究库须存在）
+    try:
+        data_root, store_kind = _resolve_store(args)
+    except ValueError as e:
+        print(f"✗ {e}")
+        return 1
     ledger_path = _ledger_default(args)
-    data_root = resolve_data_root(args.data_root,
-                                  getattr(args, "research_store", False))
-    if getattr(args, "research_store", False):
-        print(f"— 研究库模式（T27/H3）：--data-root 缺省 {data_root}"
-              f"（无 tick，成本经缓存文件；台账 {ledger_path}）。G5 需读"
-              "锁箱段，只能由管理员在主库侧跑（--research-store 下无"
-              "lockbox.json）")
+    research_mode = store_kind == "research"
+    if research_mode:
+        print(f"— 研究库模式（T27/H3；T38/D24 起为缺省）：data_root={data_root}"
+              f"（无 tick，成本经缓存文件；台账 {ledger_path}）")
+    # T38/D24：G5 需读主库锁箱段——研究库（缺省数据根）没有锁箱段，一律拒绝
+    # （即使已 --approve）；须管理员显式 --main-store 后运行。G5 的锁箱读取
+    # 经 --approve/--approved-by 协议（T21a），不占 --ops-ack 运维豁免。
+    if "G5" in wanted and research_mode:
+        print("✗ G5（锁箱一次性）需读主库的锁箱段——研究库模式（缺省数据根"
+              " data_research）下无 lockbox.json，拒绝运行；须管理员显式"
+              " --main-store（并 --approve）后运行")
+        return 1
+    actor = _actor_for(args)                     # T38/D24：--ops-ack → ops
+    if actor != args.actor:
+        print(f"— --ops-ack：台账 actor 记为 ops（运维测量，不产生研究结论）")
     with Ledger(ledger_path) as ledger:
         committed = cards.committed_at(path)
         try:
@@ -658,7 +727,9 @@ def cmd_gate(args) -> int:
             else:
                 vols_by_sym = None
             bars_by_sym = {sym: load_series(data_root, sym,
-                                            card.timeframe, args.end)
+                                            card.timeframe, args.end,
+                                            ops_ack=getattr(args, "ops_ack",
+                                                            False))
                            for sym in card.symbols}
             # T20：禁入窗唯一来源 config/sessions.toml（sha 进 cost_model_version）
             from mt5data.sessions import load_session_policy
@@ -671,8 +742,7 @@ def cmd_gate(args) -> int:
                     costs_by_sym[sym], cost_version = build_costs(
                         data_root, sym, args.spread_fraction,
                         args.commission, sessions_sha=sess_sha,
-                        research_store=getattr(args, "research_store",
-                                                False))
+                        research_store=research_mode)
                     policy_by_sym[sym] = entry_policy_for(
                         costs_by_sym[sym], sym, sess_policy)
             else:
@@ -721,7 +791,7 @@ def cmd_gate(args) -> int:
             timeframe=card.timeframe, data_first=data_first,
             data_last=data_last, data_sha256=dsha,
             engine_version=ENGINE_VERSION, cost_model_version=cost_version,
-            gates_hash=gsha, actor=args.actor, strategy_sha=strategy_sha)
+            gates_hash=gsha, actor=actor, strategy_sha=strategy_sha)
         try:
             base_kwargs = dict(symbol=symbol, params=dict(params),
                                contract_size=sizes[symbol],
@@ -906,11 +976,20 @@ def build_parser() -> argparse.ArgumentParser:
                           help="module:Class，如 mt5quant.strategies.library.buy_hold:BuyHold")
     p_screen.add_argument("--cards-dir", default=str(REPO_ROOT / "research" / "cards"))
     p_screen.add_argument("--data-root", default=None,
-                          help="数据根；缺省 data，--research-store 时缺省"
-                               " data_research（显式给出者优先）")
+                          help="数据根；缺省 data_research（T38/D24），"
+                               "--main-store 时缺省 data（显式给出者优先；"
+                               "指到主库的仍须 --main-store）")
     p_screen.add_argument("--research-store", action="store_true",
-                          help="读导出的研究库 data_research（T27/H3；台账"
-                               "缺省仍落 data/research/ledger.sqlite）")
+                          help="（T27 兼容别名）读研究库 data_research——"
+                               "T38 起缺省即研究库，本 flag 通常不用；台账"
+                               "缺省仍落 data/research/ledger.sqlite")
+    p_screen.add_argument("--main-store", action="store_true",
+                          help="读主库 data（T38/D24：主库含完整锁箱段，须显式"
+                               "本 flag 才读；--end 越过 cutoff 的锁箱期另需"
+                               " --ops-ack）")
+    p_screen.add_argument("--ops-ack", action="store_true",
+                          help="运维豁免：允许读到锁箱期数据（--end 越过"
+                               " cutoff），仅限运维测量；台账 actor 记 ops")
     p_screen.add_argument("--ledger", default=None,
                           help="台账路径；缺省 {data-root}/research/ledger.sqlite"
                                "（--research-store 时固定 data/research/ledger.sqlite）")
@@ -946,11 +1025,20 @@ def build_parser() -> argparse.ArgumentParser:
                         help="G5 批准人（缺省记 --actor）")
     p_gate.add_argument("--cards-dir", default=str(REPO_ROOT / "research" / "cards"))
     p_gate.add_argument("--data-root", default=None,
-                        help="数据根；缺省 data，--research-store 时缺省"
-                             " data_research（显式给出者优先）")
+                        help="数据根；缺省 data_research（T38/D24），"
+                             "--main-store 时缺省 data（显式给出者优先；"
+                             "指到主库的仍须 --main-store）")
     p_gate.add_argument("--research-store", action="store_true",
-                        help="读导出的研究库 data_research（T27/H3；G5 需锁箱段"
-                             "，只能管理员在主库侧跑）")
+                        help="（T27 兼容别名）读研究库 data_research——"
+                             "T38 起缺省即研究库，本 flag 通常不用；G5 需锁箱"
+                             "段，只能由管理员在主库侧跑")
+    p_gate.add_argument("--main-store", action="store_true",
+                        help="读主库 data（T38/D24：主库含完整锁箱段，须显式"
+                             "本 flag 才读；G5 只能经本 flag 跑，锁箱期测量"
+                             "另需 --ops-ack）")
+    p_gate.add_argument("--ops-ack", action="store_true",
+                        help="运维豁免：允许读到锁箱期数据（--end 越过"
+                             " cutoff），仅限运维测量；台账 actor 记 ops")
     p_gate.add_argument("--ledger", default=None)
     p_gate.add_argument("--costs", choices=("auto", "zero"), default="auto",
                         help="与 run_backtest 同义；测试/冒烟用 zero")

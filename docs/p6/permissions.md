@@ -1,4 +1,4 @@
-# 权限隔离方案（P6 / T15，T27、T29 修订）
+# 权限隔离方案（P6 / T15，T27、T29、T38 修订）
 
 蓝图 §4 第 8 条：**研究 agent 不能改引擎、关卡、风控与门槛配置，读不到
 锁箱数据。** 本文档给出 Windows 侧的具体隔离手段；规则（谁做什么）见
@@ -41,8 +41,17 @@ shell 的 agent（一行 `read_parquet` 就能看完锁箱）。研究/审查账
 `scripts/export_research_store.py` 产出：只含 `time < cutoff` 的 K 线 +
 成本模型缓存文件，**不含 tick、不含 lockbox.json**——tick 库对研究账户
 拒读，研究侧成本经 `data_research\costs\spread_model.json` 缓存提供；
-研究库没有锁箱段，锁箱语义自然满足）。研究 CLI 用 `--research-store`
-（`--data-root` 缺省即 `data_research`）。
+研究库没有锁箱段，锁箱语义自然满足）。
+
+**研究侧 CLI 缺省（T38/H4/D24，2026-10 落地）**：`scripts/run_backtest.py`
+与 `scripts/bt.py` 的 `--data-root` 缺省即 `data_research`（`--research-store`
+保留为兼容别名）；缺省时研究库不存在 → 报错指路 `export_research_store`，
+**绝不静默回退主库**。读主库须显式 `--main-store`（`--data-root` 指到主库
+也一样要求）；读主库的锁箱期（`--end` 越过 cutoff）再加 `--ops-ack`
+（运维测量专用，run_backtest 记 manifest、bt 台账记 `actor=ops`）；G5 需
+锁箱段，只能由管理员经 `--main-store` + `--approve` 跑。数据根三分类
+（`run_backtest.classify_store`）：`data_research` → 研究库、`data` →
+主库、其余 → 临时/测试根。
 
 ```bat
 :: 主库 K 线与 tick：研究/审查账户完全拒读（deny 优先于任何 allow）
@@ -103,11 +112,20 @@ icacls "%REPO_ROOT%\config\gates.toml" /deny "MT5Research:(WD,AD,DE)" /deny "MT5
 
 主执行点是入库的 pre-commit 钩子 **`scripts/hooks/pre-commit-readonly-paths`**
 （Python，无扩展名；T29 起为**白名单 + 缺省拒绝**模式）。可导入函数：
+`check_paths(changes, role=None)`（**T38/D25：CI 共用的同一份规则**）、
 `check_staged(changes, role=None)`（按 `(状态, 路径)` 列表返回逐条违规
 信息）、`violation_reason(role, status, path)`（单条判定）、`parse_staged`
-（解析 `git diff --cached --name-status`）、`resolve_role`（命令行
-`--role` 优先于环境变量 `MT5QUANT_COMMIT_ROLE`）与薄壳 `main(argv, env)`；
-守护测试 `tests/test_p6_docs.py`。
+（解析 `git diff --name-status` 输出，含 CI 的 `origin/main...HEAD` 形态）、
+`resolve_role`（命令行 `--role` 优先于环境变量 `MT5QUANT_COMMIT_ROLE`）
+与薄壳 `main(argv, env)`；守护测试 `tests/test_p6_docs.py`。
+
+**CI 侧硬执行（T38/D25/H4）**：`.github/workflows/research-allowlist.yml`
+对 `research/**` 头分支发起的 PR 用 `git diff --name-status
+origin/main...HEAD` 取改动，`python -c` 装载钩子文件并调用
+`check_paths(changes, role="research")`——规则与本地钩子**同一份代码**，
+本地钩子的角色靠环境变量自报（H4：设 `admin` 即绕过），CI 侧绕不过。
+非 `research/**` 头分支的 PR 跳过检查并留 notice；强制力来自把该检查设为
+main 分支保护的 required status check（设置步骤见下"分支保护"清单）。
 
 白名单（研究/审查角色**只**放行以下路径，其余一律拒绝）：
 
@@ -168,13 +186,55 @@ runas /user:MT5Research "cmd /c type %REPO_ROOT%\data_research\lockbox_check.tmp
 icacls "C:\mt5-lockbox" & icacls "%REPO_ROOT%\data\lockbox.json" & icacls "%REPO_ROOT%\data_research"
 ```
 
-功能级验证（研究账户会话内）：`bt screen --research-store ...` 应能跑
-（读 `data_research`）；`bt screen ... --end <越过 cutoff 的时刻>` 对
-主库应失败（拒读 + LockboxError 双保险）；`bt gate` 改门槛后应拒绝运行
-（冻结指纹生效）。研究库新鲜度由管理员侧
+功能级验证（研究账户会话内）：`bt screen --card ...`（缺省即读
+`data_research`，无需 flag）应能跑；缺省下 `data_research` 不存在 →
+报错指路 `export_research_store`（不回退主库）；`--data-root data` 而无
+`--main-store` → 拒绝；`--main-store --end <越过 cutoff>` 而无 `--ops-ack`
+→ 锁箱报错；`bt gate --gates G5`（研究库模式）→ 拒绝并指路 `--main-store`；
+`bt gate` 改门槛后应拒绝运行（冻结指纹生效）。研究库新鲜度由管理员侧
 `scripts/export_research_store.py --verify-only` 复核。
 
-## 8. 备份与回滚
+## 8. 研究账户的运行方式（U0：用户操作，agent 不代办）
+
+ACL 只对"以哪个账户身份运行的进程"生效——研究 agent 必须真的运行在
+`MT5Research` 账户下，隔离才成立：
+
+1. **建账户**（管理员，一次性）：`net user MT5Research /add`（设强口令；
+   `MT5Review` 同理）；不需要远程桌面登录权限。
+2. **以研究账户运行会话**：计划任务（`/ru MT5Research /rp <口令>`）或
+   `runas /user:MT5Research "cmd /c ..."` 拉起研究 agent 的进程；工作副本
+   经 ACL 只读/只写分区给两账户（见 §2、§5）。
+3. **git 身份**：研究会话内设 `git config user.name`（如 `research-agent`）
+   与提交邮箱；环境变量 `MT5QUANT_COMMIT_ROLE=research`（钩子白名单按它
+   裁决；CI 侧还有 research-allowlist 兜底）。
+4. **分支纪律**：研究工作一律在 `research/**` 分支上做，经 PR 合并——
+   本地钩子可被 `--no-verify` 绕过（流程违规，靠台账 actor 与 git 历史
+   事后审计），CI 的 research-allowlist 检查绕不过（配合下述分支保护）。
+5. **台账**：写 `data\research\`（`--research-store`/缺省研究库模式下
+   bt 的台账缺省就是 `data\research\ledger.sqlite`，见 §3 加固段）。
+
+## 9. main 分支保护（U0：用户操作，agent 不代办）
+
+研究分支经 PR 合并、CI 路径白名单必须通过——把这一条变成硬约束，需要在
+GitHub 仓库设置里开启分支保护（管理员在网页上操作）：
+
+- [ ] Settings → Branches → Add branch protection rule，`Branch name
+      pattern` 填 `main`；
+- [ ] 勾选 **Require a pull request before merging**（研究/审查分支只能
+      经 PR 进 main；管理员直推 main 也会被拦——刻意，改引擎/门槛应留
+      PR 记录）；
+- [ ] 勾选 **Require status checks to pass before merging**，选中
+      `tests` 与 `research-allowlist` 两个检查（后者对 `research/**` 头
+      分支强制路径白名单，D25）；
+- [ ] 勾选 **Require branches to be up to date before merging**（避免
+      白名单检查基于过期的 main）；
+- [ ] 私有仓库的 GitHub Free 计划不含 required checks——若该项不可勾，
+      升级计划或改为人工核对 `research-allowlist` 为绿后再合并，并在
+      本清单旁注明实际做法；
+- [ ] 设完后用一条违规 PR（如 `research/test-hook` 分支改
+      `scripts/bt.py`）验证：`research-allowlist` 检查应为红。
+
+## 10. 备份与回滚
 
 改 ACL 前备份、出问题按表恢复：
 

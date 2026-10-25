@@ -28,10 +28,12 @@
     printf '#!/bin/sh\nexec .venv/Scripts/python.exe \
 scripts/hooks/pre-commit-readonly-paths "$@"\n' > .git/hooks/pre-commit
 
-设计：可导入函数（check_staged / violation_reason / parse_staged /
-resolve_role）+ 薄壳 main()，守护测试 tests/test_p6_docs.py 直接注入
-(状态, 路径)，不依赖真实 git 状态。绕过（git commit --no-verify）属违规
-操作，见规则文件。
+设计：可导入函数（check_paths（T38：CI 共用）/ check_staged /
+violation_reason / parse_staged / resolve_role）+ 薄壳 main()，守护测试
+tests/test_p6_docs.py 直接注入 (状态, 路径)，不依赖真实 git 状态；
+CI 侧 .github/workflows/research-allowlist.yml 用 python -c 调
+check_paths 对 research/** 分支 PR 执行同一规则（D25）。绕过
+（git commit --no-verify）属违规操作，见规则文件。
 """
 import os
 import subprocess
@@ -108,6 +110,19 @@ def check_staged(changes, role: str | None = None) -> list[str]:
     """对一批 (状态, 路径) 逐条检查，返回全部违规原因（空列表 = 放行）。"""
     return [m for m in (violation_reason(role, s, p) for s, p in changes)
             if m is not None]
+
+
+def check_paths(status_path_pairs, role: str | None = None) -> list[str]:
+    """T38/D25（H4）：CI 与本地钩子共用的同一份检查函数。
+
+    与 check_staged 同一实现（同一规则、同一违规文案）。CI 侧
+    .github/workflows/research-allowlist.yml 用 python -c 装载本文件并
+    调用本函数，对 research/** 分支 PR 的 origin/main...HEAD diff 按研究
+    角色规则硬性执行——本地钩子的角色取自环境变量（可自报 admin 绕过，
+    第四轮审核 H4），CI 侧不可绕过。独立命名是为了让"改钩子"与"改 CI"
+    都必然牵动这同一个符号，规则不会出现两份。
+    """
+    return check_staged(status_path_pairs, role)
 
 
 def parse_staged(out: str) -> list[tuple[str, str]]:

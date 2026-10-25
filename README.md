@@ -112,12 +112,17 @@ tick_volume, spread, real_volume`；只存**已收盘**的 bar（末根 bar 收�
 `data.parquet.bak-时间戳`）。跨进程写有按序列的文件锁；写入原子（临时文件 +
 fsync + os.replace）。品种名保留大小写（`XAUUSDm` 等后缀品种可用）。
 
-数据读取（T27/H3 物理隔离）：**主库 `data/bars`、`data/ticks` 仅限管理员
-与实盘侧**（含完整锁箱段，研究/审查账户拒读，ACL 见 `docs/p6/permissions.md`）。
-研究侧读**研究库** `data_research/`——管理员跑 `scripts/export_research_store.py`
-导出的隔离副本（只含 `time < cutoff` 的 K 线 + 成本模型缓存文件；tick 不进
-研究库，成本经 `data_research/costs/spread_model.json` 提供），CLI 加
-`--research-store` 即可（`--data-root` 缺省切到 `data_research`）：
+数据读取（T27/H3 物理隔离 + T38/H4 缺省切换）：**主库 `data/bars`、
+`data/ticks` 仅限管理员与实盘侧**（含完整锁箱段，研究/审查账户拒读，
+ACL 见 `docs/p6/permissions.md`）。研究侧读**研究库** `data_research/`
+——管理员跑 `scripts/export_research_store.py` 导出的隔离副本（只含
+`time < cutoff` 的 K 线 + 成本模型缓存文件；tick 不进研究库，成本经
+`data_research/costs/spread_model.json` 提供）。**`run_backtest.py` 与
+`bt.py` 的 `--data-root` 缺省即 `data_research`**（T38/D24；
+`--research-store` 为 T27 兼容别名，通常不用）；缺省时研究库不存在 →
+报错指路 `export_research_store`，不回退主库；读主库须显式 `--main-store`，
+读主库的锁箱期（`--end` 越过 cutoff）另需 `--ops-ack`（运维测量专用，
+bt 台账记 actor=ops）：
 
 ```python
 import duckdb, pandas as pd
@@ -193,11 +198,12 @@ cutoff 直接报错（绝不静默截断）；MCP `get_bars` 同一约束（越�
 ```bash
 .venv/Scripts/python.exe scripts/snapshot_specs.py      # 首次：写 data/specs/latest.json（含合约大小）
 .venv/Scripts/python.exe scripts/run_backtest.py --strategy mt5quant.strategies.library.buy_hold:BuyHold \
-    --symbol XAUUSD --timeframe H1 --params '{}' --end 2025-09-01 --commission 0 --research-store
+    --symbol XAUUSD --timeframe H1 --params '{}' --end 2025-09-01 --commission 0
 ```
 
-研究侧一律加 `--research-store`（读 `data_research`；主库 `data/bars`
-仅管理员与实盘侧可读）。
+研究侧缺省即读 `data_research`（T38 起无需 flag；`--research-store` 为
+兼容别名）；主库 `data/bars` 仅管理员与实盘侧可读（CLI 侧读主库须显式
+`--main-store`，锁箱期另需 `--ops-ack`）。
 
 审核报告与后续计划：`docs/reviews/`（各轮审核）、`docs/blueprint.md`（蓝图与现状）、
 `docs/superpowers/plans/2026-10-26-round5-hardening.md`（当前施工计划；上一轮为 `2026-10-26-round4-optimization.md`）。

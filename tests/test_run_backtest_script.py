@@ -491,17 +491,51 @@ def test_cli_risk_mode_requires_volume_bounds_in_specs(tmp_path, monkeypatch,
     assert "volume_min" in out or "snapshot_specs" in out
 
 
-# ------------------------------------------------- T27（H3）：研究库切换
+# ------------------------------------------------- T27（H3）+ T38（H4/D24）
+
+# T38/D24 缺省切换：研究侧 CLI 的 --data-root 缺省从 data 改为 data_research；
+# 读主库须显式 --main-store；读主库锁箱期再加 --ops-ack。
 
 
 def test_resolve_data_root_semantics():
-    """--research-store 语义：显式 --data-root 优先；否则 flag → data_research，
-    无 flag → data（主库缺省不变）。"""
+    """数据根解析矩阵（T38/D24）：
+    显式 --data-root 永远优先；--main-store → data；缺省（及保留兼容的
+    --research-store）→ data_research；--main-store 与 --research-store
+    同时给出 → 拒绝（口径二义）。"""
     mod = _load_script()
-    assert mod.resolve_data_root("some/root", False) == "some/root"
-    assert mod.resolve_data_root("some/root", True) == "some/root"
-    assert mod.resolve_data_root(None, False) == "data"
-    assert mod.resolve_data_root(None, True) == "data_research"
+    # 显式 --data-root 优先于一切 flag
+    assert mod.resolve_data_root("some/root", False, False) == "some/root"
+    assert mod.resolve_data_root("some/root", True, False) == "some/root"
+    assert mod.resolve_data_root("some/root", False, True) == "some/root"
+    # 缺省（T38 翻转：不再是 data）
+    assert mod.resolve_data_root(None, False, False) == "data_research"
+    # --research-store（T27 兼容别名）与缺省同一指向
+    assert mod.resolve_data_root(None, True, False) == "data_research"
+    # --main-store → 主库
+    assert mod.resolve_data_root(None, False, True) == "data"
+    # 两个 store flag 互斥
+    with pytest.raises(ValueError, match="互斥"):
+        mod.resolve_data_root(None, True, True)
+
+
+def test_classify_store_three_kinds():
+    """数据根三分类（T38/D24）：research（data_research 字面或仓库内绝对
+    路径）/ main（data 字面或仓库内绝对路径）/ custom（其余，测试与临时
+    数据根）。"""
+    mod = _load_script()
+    assert mod.classify_store("data_research") == "research"
+    assert mod.classify_store(str(mod.REPO_ROOT / "data_research")) == "research"
+    assert mod.classify_store("data") == "main"
+    assert mod.classify_store(str(mod.REPO_ROOT / "data")) == "main"
+    assert mod.classify_store(str(_tmp_root())) == "custom"
+    assert mod.classify_store("some/root") == "custom"
+
+
+def _tmp_root():
+    """不属于仓库两库的任意路径（classify_store 的 custom 用例）。"""
+    from pathlib import Path
+    import tempfile
+    return Path(tempfile.gettempdir()) / "mt5-t38-custom-root"
 
 
 def _research_store(tmp_path):
@@ -567,9 +601,11 @@ def test_cli_research_store_switch_uses_data_research(tmp_path, monkeypatch,
     assert "data_research" in manifest["extra"]["data_root"].replace("\\", "/")
 
 
-def test_cli_default_data_root_still_main_store(tmp_path, monkeypatch):
-    """对照：不给 --research-store 时 --data-root 缺省仍是 data（cwd 下
-    无 data/ → 报无数据，而不是去读 data_research）。"""
+def test_cli_default_reads_research_store_without_flags(tmp_path, monkeypatch,
+                                                        capsys):
+    """T38/D24 翻转（原 T27 对照用例反转）：不带任何 flag 时 --data-root
+    缺省即 data_research——cwd 下只有 data_research 没有 data/，成功即证明
+    缺省读的是研究库；manifest 记 research_store 模式。"""
     mod = _load_script()
     _research_store(tmp_path)
     monkeypatch.chdir(tmp_path)
@@ -577,9 +613,109 @@ def test_cli_default_data_root_still_main_store(tmp_path, monkeypatch):
         "run_backtest.py", "--strategy",
         "mt5quant.strategies.library.buy_hold:BuyHold",
         "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
-        "--costs", "zero", "--volume-lots", "0.01", "--allow-zero-swap",
+        "--volume-lots", "0.01", "--allow-zero-swap",
+        "--out", str(tmp_path / "out")])
+    assert mod.main() == 0, capsys.readouterr().out
+    assert "研究库" in capsys.readouterr().out
+    run_dir = sorted((tmp_path / "out").iterdir())[-1]
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["extra"]["research_store"] is True
+    assert "data_research" in manifest["extra"]["data_root"].replace("\\", "/")
+
+
+def test_cli_main_store_requires_explicit_flag(tmp_path, monkeypatch, capsys):
+    """T38/D24：--data-root 指到主库（字面 data 或仓库内绝对路径）而未给
+    --main-store → 拒绝并指路（缺省只读研究库，主库是显式豁免）。"""
+    mod = _load_script()
+    _research_store(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    base = ["run_backtest.py", "--strategy",
+            "mt5quant.strategies.library.buy_hold:BuyHold",
+            "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
+            "--volume-lots", "0.01", "--allow-zero-swap",
+            "--out", str(tmp_path / "out")]
+    # 字面 "data"
+    monkeypatch.setattr("sys.argv", base + ["--data-root", "data"])
+    assert mod.main() == 1
+    out = capsys.readouterr().out
+    assert "须显式 --main-store" in out and "主库" in out
+    # 仓库内绝对路径同样拦（绕不开：换个写法指同一目录不算显式豁免）
+    monkeypatch.setattr("sys.argv",
+                        base + ["--data-root", str(mod.REPO_ROOT / "data")])
+    assert mod.main() == 1
+    assert "须显式 --main-store" in capsys.readouterr().out
+    # 给了 --main-store → 守卫放行（cwd 无 data/，后续因缺 specs/数据失败，
+    # 但不再是守卫的拒绝）
+    monkeypatch.setattr("sys.argv", base + ["--data-root", "data",
+                                            "--main-store"])
+    assert mod.main() == 1
+    out = capsys.readouterr().out
+    assert "须显式 --main-store" not in out
+    assert "主库模式" in out                      # 已进入主库模式（显式豁免）
+    assert "合约大小未知" in out or "无可用数据" in out
+
+
+def test_cli_missing_research_store_points_to_export(tmp_path, monkeypatch,
+                                                     capsys):
+    """T38/D24：缺省（研究库模式）下 data_research 不存在 → 报错指路
+    export_research_store（绝不静默回退主库）。"""
+    mod = _load_script()
+    monkeypatch.chdir(tmp_path)            # cwd 空无一物：无 data 也无 data_research
+    monkeypatch.setattr("sys.argv", [
+        "run_backtest.py", "--strategy",
+        "mt5quant.strategies.library.buy_hold:BuyHold",
+        "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
+        "--volume-lots", "0.01", "--allow-zero-swap",
         "--out", str(tmp_path / "out")])
     assert mod.main() == 1
+    out = capsys.readouterr().out
+    assert "data_research" in out and "export_research_store" in out
+
+
+def _main_store_with_lockbox(tmp_path):
+    """cwd 相对的主库样式夹具：tmp/data 下 bars + lockbox.json（v1 序列键，
+    cutoff 落在 bars 中段）。"""
+    from mt5data.lockbox import write_config
+    from mt5data.store import save_bars
+
+    root = tmp_path / "data"
+    save_bars(str(root), "XAUUSD", "H1", _cli_bars())
+    write_config(str(root), {"XAUUSD/H1": "2026-01-06T00:00:00"})
+    return root
+
+
+def test_cli_main_store_ops_ack_gates_lockbox_period(tmp_path, monkeypatch,
+                                                     capsys):
+    """T38/D24：读主库（--main-store）的锁箱期（--end 越过 cutoff）必须显式
+    --ops-ack——不给 → LockboxError（沿用"显式请求不做静默截断"）；给了 →
+    放行并在 manifest 记 main_store / ops_ack（审计线索）。"""
+    import pandas as pd
+
+    mod = _load_script()
+    _main_store_with_lockbox(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    base = ["run_backtest.py", "--strategy",
+            "mt5quant.strategies.library.buy_hold:BuyHold",
+            "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
+            "--costs", "zero",
+            "--volume-lots", "0.01", "--allow-zero-swap",
+            "--contract-size", "100",
+            "--main-store", "--end", "2026-01-06 06:00",
+            "--out", str(tmp_path / "out")]
+    # 1) 不带 --ops-ack：越过 cutoff → 拒绝（锁箱边界如实报出）
+    monkeypatch.setattr("sys.argv", list(base))
+    assert mod.main() == 1
+    out = capsys.readouterr().out
+    assert "锁箱" in out
+    assert not (tmp_path / "out").exists() or not list(
+        (tmp_path / "out").iterdir())
+    # 2) 带 --ops-ack：运维豁免放行，完整读到锁箱段
+    monkeypatch.setattr("sys.argv", base + ["--ops-ack"])
+    assert mod.main() == 0, capsys.readouterr().out
+    run_dir = sorted((tmp_path / "out").iterdir())[-1]
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["extra"]["main_store"] is True
+    assert manifest["extra"]["ops_ack"] is True
 
 
 def test_cli_research_store_missing_cache_points_to_export(tmp_path,

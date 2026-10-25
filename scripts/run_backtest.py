@@ -7,15 +7,19 @@
         --research-store --end 2026-09-01 --out data/reports/backtests
 
 约定：
-- 数据根（T27/H3）：--research-store 显式切换缺省数据根为 data_research
-  （管理员用 scripts/export_research_store.py 导出的研究库：只含
-  time < cutoff 的 K 线 + 成本缓存文件，无 tick，锁箱语义自然满足——
-  研究库里没有锁箱段）；显式 --data-root 永远优先；缺省仍是 data。
+- 数据根（T27/H3 + T38/H4/D24）：**缺省读研究库 data_research**（管理员用
+  scripts/export_research_store.py 导出的隔离副本：只含 time < cutoff 的
+  K 线 + 成本缓存文件，无 tick，锁箱语义自然满足——研究库里没有锁箱段）；
+  缺省时 data_research 不存在 → 报错指路 export_research_store，绝不静默
+  回退主库。读主库须显式 --main-store（data_root=data；--data-root 指到
+  主库也一样要求该 flag）；读主库的锁箱期（--end 越过 cutoff）再加
+  --ops-ack（运维测量专用，manifest 记 ops_ack，不产生研究结论）。
   为什么用 CLI flag 而不是环境变量：命令行里可见、可审计、可复制，
   不依赖会话全局状态；真正的边界是 ACL（docs/p6/permissions.md），
-  flag 只是把研究工作流自然指向隔离副本。研究库模式下 --costs auto
-  必须命中 data_research/costs/spread_model.json（无 tick 可自建，
-  缺失报错指路 export_research_store）。
+  flag 只是把研究工作流自然指向隔离副本。--research-store（T27）保留为
+  兼容别名（缺省已是研究库）。研究库模式下 --costs auto 必须命中
+  data_research/costs/spread_model.json（无 tick 可自建，缺失报错指路
+  export_research_store）。
 - --end 经 mt5data.lockbox.research_bars（锁箱语义：显式越过 cutoff 的请求
   直接报错，绝不静默截断）；无 lockbox.json 时返回全量，行为与直读一致。
 - 金额口径：contract_size 取 --contract-size，否则读
@@ -76,7 +80,7 @@ from mt5data.clock import (  # noqa: E402
 )
 from mt5data.lockbox import research_bars  # noqa: E402
 from mt5data.sessions import SessionPolicy, load_session_policy  # noqa: E402
-from mt5data.store import TIMEFRAME_SECONDS  # noqa: E402
+from mt5data.store import TIMEFRAME_SECONDS, load_bars  # noqa: E402
 from mt5data.ticks import load_ticks, tick_watermark  # noqa: E402
 from mt5quant.backtest.engine_a import run_backtest  # noqa: E402
 from mt5quant.backtest.engine_b import run_backtest_ticks  # noqa: E402
@@ -87,19 +91,51 @@ from mt5quant.sizing import RiskSizing, load_volume_limits  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SESSIONS_PATH = REPO_ROOT / "config" / "sessions.toml"
 
-# T27（H3）：--research-store 的语义——显式 CLI flag 切换缺省数据根（不用
-# 环境变量：研究账户拿不到能写环境变量的 shell 也不该依赖隐式全局状态，
-# 命令行里可见的 flag 更可审计；真正的边界是 ACL（permissions.md），flag
-# 只是把研究工作流自然指向隔离副本）。显式 --data-root 永远优先。
+# T27（H3）+ T38（H4/D24）：数据根缺省即研究库 data_research（可选开关
+# 等于没有隔离——H4：--research-store 时代的缺省仍是主库）。不用环境变量：
+# 研究账户拿不到能写环境变量的 shell 也不该依赖隐式全局状态，命令行里可见
+# 的 flag 更可审计；真正的边界是 ACL（permissions.md），flag 只是把研究
+# 工作流自然指向隔离副本。显式 --data-root 永远优先（指到主库的仍须
+# --main-store 确认）。
 DEFAULT_DATA_ROOT = "data"
 RESEARCH_STORE_ROOT = "data_research"
 
 
-def resolve_data_root(explicit: str | None, research_store: bool) -> str:
-    """--data-root 显式值 > --research-store 缺省（data_research）> data。"""
+def resolve_data_root(explicit: str | None, research_store: bool = False,
+                      main_store: bool = False) -> str:
+    """--data-root 显式值 > --main-store（data）> 缺省/--research-store
+    （data_research，T38/D24 翻转）；--main-store 与 --research-store 同时
+    给出 → ValueError（口径二义）。"""
+    if main_store and research_store:
+        raise ValueError(
+            "--main-store 与 --research-store 互斥：读主库（--main-store，"
+            "缺省 data）或研究库（--research-store；T38 起缺省即研究库，"
+            "通常两个都不用）二选一")
     if explicit is not None:
         return explicit
-    return RESEARCH_STORE_ROOT if research_store else DEFAULT_DATA_ROOT
+    if main_store:
+        return DEFAULT_DATA_ROOT
+    return RESEARCH_STORE_ROOT
+
+
+def classify_store(data_root: str) -> str:
+    """T38/D24：数据根三分类——"research"（研究库 data_research）、
+    "main"（主库 data）、"custom"（其余：测试与临时数据根）。
+
+    判定取字面相对名或解析到仓库内对应目录（换写法指同一目录不改性质）；
+    custom 根不套研究库约束（水位核验等成本路径按主库口径走）。
+    """
+    p = Path(data_root)
+    if p == Path(RESEARCH_STORE_ROOT):
+        return "research"
+    if p == Path(DEFAULT_DATA_ROOT):
+        return "main"
+    rp = p.resolve()
+    if rp == (REPO_ROOT / RESEARCH_STORE_ROOT).resolve():
+        return "research"
+    if rp == (REPO_ROOT / DEFAULT_DATA_ROOT).resolve():
+        return "main"
+    return "custom"
 
 
 def sessions_sha256(path: str) -> str:
@@ -554,8 +590,12 @@ def load_strategy(path: str):
         raise ValueError(f"无法装载策略 {path!r}：{e}") from e
 
 
-def load_series(data_root, symbol, timeframe, end):
-    """读序列：经锁箱加载器（end 越过 cutoff 直接报错，绝不静默截断）。
+def load_series(data_root, symbol, timeframe, end, *, ops_ack: bool = False):
+    """读序列：默认经锁箱加载器（end 越过 cutoff 直接报错，绝不静默截断）。
+
+    ops_ack=True（T38/D24，沿用 T27 的 --ops-ack 语义）：运维豁免，直接
+    读库（含锁箱段行），供换日/成本/执行口径等测量——只用于运维，不产生
+    研究结论；调用方负责把 ops_ack 记进 manifest/台账（bt 侧记 actor=ops）。
 
     end 语义与 research_bars 一致：保留 time <= end 的行（含端点）——
     注意 end 时刻"开盘"的那根 bar 会整根纳入（含其整段 OHLC）；
@@ -566,6 +606,16 @@ def load_series(data_root, symbol, timeframe, end):
     end_ts = pd.Timestamp(end) if end else None
     if end_ts is not None and end_ts.tzinfo is not None:
         raise ValueError("--end 只接受不带时区的 UTC 时间（如 2026-09-01）")
+    if ops_ack:
+        df = load_bars(data_root, symbol, timeframe)
+        if df is None or len(df) == 0:
+            raise ValueError(f"无可用数据：{symbol} {timeframe}（--ops-ack 直读）")
+        if end_ts is not None:
+            df = df[df["time"] <= end_ts].reset_index(drop=True)
+            if len(df) == 0:
+                raise ValueError(
+                    f"无可用数据：{symbol} {timeframe}（--end {end} 截断后为空）")
+        return df
     df = research_bars(data_root, symbol, timeframe, end=end_ts)
     if df is None or len(df) == 0:
         suffix = (f"（--end {end} 截断后为空或序列不存在）" if end
@@ -583,13 +633,21 @@ def main() -> int:
                     help="M1/H1/D1 等（TIMEFRAME_SECONDS 之一）")
     ap.add_argument("--params", default="{}", help='JSON 字符串，如 \'{"k":1}\'')
     ap.add_argument("--data-root", default=None,
-                    help="数据根目录；缺省 data，--research-store 时缺省"
-                         " data_research（显式给出者永远优先）")
+                    help="数据根目录；缺省 data_research（T38/D24），"
+                         "--main-store 时缺省 data（显式给出者永远优先；"
+                         "指到主库的仍须 --main-store）")
     ap.add_argument("--research-store", action="store_true",
-                    help="读导出的研究库 data_research（T27/H3：只含"
-                         " time < cutoff 的 K 线与成本缓存文件；无 tick，"
-                         "锁箱语义自然满足）。研究/审查账户用这个，主库"
-                         "仅管理员与实盘侧可读")
+                    help="（T27 兼容别名）读导出的研究库 data_research——"
+                         "T38 起缺省即研究库，本 flag 通常不用；主库仅管理员"
+                         "与实盘侧可读（读主库用 --main-store）")
+    ap.add_argument("--main-store", action="store_true",
+                    help="读主库 data（T38/D24：缺省数据根是研究库"
+                         " data_research；主库含完整锁箱段，须显式给出本 flag"
+                         " 才读；--end 越过 cutoff 的锁箱期另需 --ops-ack）")
+    ap.add_argument("--ops-ack", action="store_true",
+                    help="运维豁免：允许读到主库锁箱期数据（--end 越过"
+                         " cutoff），仅用于换日/成本/执行口径测量，不产生研究"
+                         "结论；manifest 记 ops_ack（bt 侧台账记 actor=ops）")
     ap.add_argument("--end", default=None,
                     help="只用该 UTC 时刻及之前的数据（naive UTC；越过锁箱 cutoff 会报错）")
     ap.add_argument("--out", default="data/reports/backtests")
@@ -638,16 +696,42 @@ def main() -> int:
     except ValueError as e:
         print(f"✗ --params 不是合法 JSON：{e}")
         return 1
-    data_root = resolve_data_root(args.data_root, args.research_store)
-    if args.research_store:
-        print(f"— 研究库模式（T27/H3）：--data-root 缺省 {data_root}"
-              "（无 tick，成本经 costs/spread_model.json 缓存；锁箱语义"
-              "自然满足——库里没有锁箱段）")
+    # ---- T38/D24：数据根解析与三重守卫（主库须显式豁免；研究库须存在） ----
+    try:
+        data_root = resolve_data_root(args.data_root, args.research_store,
+                                      args.main_store)
+    except ValueError as e:
+        print(f"✗ {e}")
+        return 1
+    store_kind = classify_store(data_root)
+    if store_kind == "main" and not args.main_store:
+        print(f"✗ 读主库 {data_root} 须显式 --main-store（T38/D24：本 CLI 缺省"
+              "只读研究库 data_research；主库含完整锁箱段，仅管理员与实盘侧"
+              "可读，读锁箱期另需 --ops-ack）")
+        return 1
+    research_mode = store_kind == "research"
+    if research_mode:
+        if not os.path.isdir(data_root):
+            print(f"✗ 研究库 {data_root} 不存在——T38/D24 起缺省数据根是研究库"
+                  " data_research；请管理员在主库侧跑"
+                  " scripts/export_research_store.py 导出（只含 time < cutoff"
+                  " 的 K 线 + 成本缓存，无 tick），或显式 --data-root 指定数据"
+                  "目录；绝不静默回退主库")
+            return 1
+        print(f"— 研究库模式（T27/H3；T38/D24 起为缺省）：data_root={data_root}"
+              "（无 tick，成本经 costs/spread_model.json 缓存；库内无锁箱段，"
+              "锁箱语义自然满足）")
         if args.build_cost_model:
             print("✗ 研究库没有 tick（对研究账户拒读），--build-cost-model"
                   " 无从建模型——请管理员在主库侧重跑 build_cost_model.py"
                   " 与 export_research_store.py")
             return 1
+    elif store_kind == "main":
+        print(f"— 主库模式（--main-store，T38/D24）：data_root={data_root}"
+              "（含完整锁箱段；--end 越过 cutoff 须 --ops-ack）")
+    if args.ops_ack:
+        print("⚠ --ops-ack（T38/D24）：本次允许读到锁箱期数据——仅限运维测量"
+              "（换日/成本/执行口径），不产生研究结论；manifest 已记 ops_ack")
     try:
         strategy_cls = load_strategy(args.strategy)
         # T37/D23：策略代码必须已提交且干净；指纹（strategy_sha）随
@@ -669,17 +753,18 @@ def main() -> int:
             print(f"✓ 定手数：固定 {lots} 手")
         check_clock(data_root)
         bars = load_series(data_root, args.symbol, args.timeframe.upper(),
-                           args.end)
+                           args.end, ops_ack=args.ops_ack)
         # T20：禁入窗唯一来源 config/sessions.toml（与实盘风控共用）
         sess_policy = load_session_policy(str(SESSIONS_PATH))
         sess_sha = sessions_sha256(str(SESSIONS_PATH))
         if args.costs == "auto":
             # T28/M8：CLI 主路径缺缓存先报错（不静默重读全部 tick——那正是
             # M8 要消除的 4 GB 隐性加载）；--build-cost-model 为显式直建通道。
-            # T27：研究库模式下缺缓存/新鲜度由 build_costs(research_store=True)
-            # 给出更准确的指路（export_research_store）。
+            # T27/T38：研究库模式（缺省）下缺缓存/新鲜度由
+            # build_costs(research_store=True) 给出更准确的指路
+            # （export_research_store）。
             cache_path = spread_model_cache_path(data_root)
-            if not args.research_store:
+            if not research_mode:
                 if args.build_cost_model:
                     from build_cost_model import build_cost_models  # scripts 目录
                     build_cost_models(data_root, [args.symbol],
@@ -694,7 +779,7 @@ def main() -> int:
                 data_root, args.symbol, args.spread_fraction,
                 args.commission, allow_zero_swap=args.allow_zero_swap,
                 spread_mode=args.spread_mode, sessions_sha=sess_sha,
-                research_store=args.research_store)
+                research_store=research_mode)
         else:
             costs, cost_version = ZeroCosts(), "zero-v0"
         entry_policy = entry_policy_for(costs, args.symbol, sess_policy)
@@ -746,7 +831,9 @@ def main() -> int:
                    "sizing": sizing_info,      # T23：定手数方式进 manifest
                    "sessions_path": str(SESSIONS_PATH),
                    "sessions_sha256": sess_sha,
-                   "research_store": bool(args.research_store),   # T27
+                   "research_store": research_mode,   # T27/T38：按数据根判定
+                   "main_store": store_kind == "main",  # T38/D24
+                   "ops_ack": bool(args.ops_ack),       # T38/D24：运维豁免
                    "data_root": str(data_root)})
     except Exception as e:  # fail-fast：任何错误如实报出
         print(f"✗ {type(e).__name__}: {e}")

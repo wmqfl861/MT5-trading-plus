@@ -532,8 +532,10 @@ def test_screen_research_store_switch(tmp_path, monkeypatch, capsys):
         assert led.stats("H099")["total_runs"] == 1
 
 
-def test_screen_default_data_root_unchanged(tmp_path, monkeypatch, capsys):
-    """对照：不给 --research-store 时缺省 data/——cwd 无 data → 装配失败。"""
+def test_screen_default_reads_research_store(tmp_path, monkeypatch, capsys):
+    """T38/D24 翻转（原"缺省 data/"对照用例反转）：不带任何 flag 时缺省即
+    研究库 data_research（cwd 下只有 data_research、无 data/，成功即证明）；
+    台账缺省仍固定 data/research/ledger.sqlite（T27 语义不随缺省切换）。"""
     mod = load_bt()
     make_research_root(tmp_path)
     cards_dir = write_card(tmp_path)
@@ -542,10 +544,114 @@ def test_screen_default_data_root_unchanged(tmp_path, monkeypatch, capsys):
     rc = mod.main(
         ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--volume-lots", "0.01"])
+    assert rc == 0, capsys.readouterr().out
+    ledger_default = tmp_path / "data" / "research" / "ledger.sqlite"
+    assert ledger_default.is_file()        # 台账不在只读的研究库里
+    with Ledger(ledger_default) as led:
+        assert led.stats("H099")["total_runs"] == 1
+
+
+def test_screen_main_store_requires_explicit_flag(tmp_path, monkeypatch,
+                                                  capsys):
+    """T38/D24：--data-root 指到主库（字面 data 或仓库内绝对路径）而未给
+    --main-store → 拒绝并指路。"""
+    mod = load_bt()
+    make_research_root(tmp_path)
+    cards_dir = write_card(tmp_path)
+    patch_card_git(monkeypatch, mod)
+    monkeypatch.chdir(tmp_path)
+    argv = ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+            "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+            "--costs", "zero", "--volume-lots", "0.01",
+            "--ledger", str(tmp_path / "l.sqlite")]
+    # 字面 "data"
+    rc = mod.main(argv + ["--data-root", "data"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "--main-store" in out and "主库" in out
+    # 仓库内绝对路径同样拦
+    rc = mod.main(argv + ["--data-root", str(mod.REPO_ROOT / "data")])
+    assert rc == 1
+    assert "--main-store" in capsys.readouterr().out
+    # --main-store → 守卫放行（cwd 无 data/，后续装配失败但不是守卫拒绝）
+    rc = mod.main(argv + ["--data-root", "data", "--main-store"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "--main-store" not in out
+    assert "装配失败" in out
+
+
+def test_screen_missing_research_store_points_to_export(tmp_path, monkeypatch,
+                                                        capsys):
+    """T38/D24：缺省（研究库模式）下 data_research 不存在 → 报错指路
+    export_research_store（绝不静默回退主库）。"""
+    mod = load_bt()
+    cards_dir = write_card(tmp_path)
+    patch_card_git(monkeypatch, mod)
+    monkeypatch.chdir(tmp_path)            # cwd 空无一物
+    rc = mod.main(
+        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero", "--volume-lots", "0.01",
          "--ledger", str(tmp_path / "l.sqlite")])
     assert rc == 1
-    assert "装配失败" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "data_research" in out and "export_research_store" in out
+
+
+def test_screen_ops_ack_unlocks_lockbox_and_records_actor_ops(tmp_path,
+                                                              monkeypatch,
+                                                              capsys):
+    """T38/D24：读锁箱期（--end 越过 cutoff）须显式 --ops-ack——不给 →
+    LockboxError（装配失败、无 runs）；给了 → 放行且台账 actor=ops
+    （Global Constraints：锁箱期数据只用于运维测量，台账记 actor=ops）。"""
+    from mt5data.lockbox import write_config
+
+    mod = load_bt()
+    root = make_data_root(tmp_path)
+    write_config(str(root), {"XAUUSD/H1": "2026-01-05T12:00:00"})  # bars 中段
+    cards_dir = write_card(tmp_path)
+    patch_card_git(monkeypatch, mod)
+    patch_strategy_fp(monkeypatch, mod, "a" * 64)
+    argv = ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+            "--data-root", str(root), "--ledger", str(tmp_path / "l.sqlite"),
+            "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+            "--costs", "zero", "--volume-lots", "0.01",
+            "--end", "2026-01-05 20:00"]          # 越过 cutoff 12:00
+    # 1) 不带 --ops-ack → 锁箱边界如实报出，不产生 runs
+    rc = mod.main(list(argv))
+    assert rc == 1
+    assert "锁箱" in capsys.readouterr().out
+    # 2) 带 --ops-ack → 放行；运行行 actor=ops（审计口径）
+    rc = mod.main(argv + ["--ops-ack"])
+    assert rc == 0, capsys.readouterr().out
+    with Ledger(tmp_path / "l.sqlite") as led:
+        actors = [r["actor"] for r in led.conn.execute(
+            "SELECT actor FROM runs").fetchall()]
+    assert actors == ["ops"]
+
+
+def test_gate_g5_refused_in_research_mode(tmp_path, monkeypatch, capsys):
+    """T38/D24：G5 需读主库锁箱段——研究库模式（缺省即研究库）下一律拒绝
+    并指路 --main-store（即使已 --approve）；台账/锁箱不产生任何行。"""
+    mod = load_bt()
+    make_research_root(tmp_path)
+    cards_dir = write_card(tmp_path)
+    patch_card_git(monkeypatch, mod)
+    patch_strategy_fp(monkeypatch, mod, "a" * 64)
+    monkeypatch.chdir(tmp_path)
+    rc = mod.main(
+        ["gate", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--volume-lots", "0.01",
+         "--gates", "G5", "--approve", "--approved-by", "user",
+         "--ledger", str(tmp_path / "l.sqlite")])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "--main-store" in out and "锁箱" in out
+    # 拒绝发生在开台账之前：库文件未创建（无 runs、无 lockbox_uses）
+    assert not (tmp_path / "l.sqlite").exists()
 
 
 # ------------------------------------------------- T37（H3/M6/D23/D27）
