@@ -202,10 +202,9 @@ def lots_for_risk(capital: float, risk_fraction: float, stop_distance: float,
 - 引擎增加 `sizing: RiskSizing | None`（与 `volume_lots` 二选一）；品种的 `vol_min/step/max` 从快照读取；
   每笔交易的手数写进 `Trade.volume_lots`；因手数为 0 跳过的入场计数写进 summary。
 - CLI 与关卡新增 `--risk-per-trade`（默认 0.005），manifest 记录定手数方式。
-- [ ] 失败测试先行：XAUUSD（合约 100）、资金 10,000、风险 0.5%、止损距离 5.0 → 0.10 手；
+- [x] 失败测试先行（证据：tests/test_sizing.py 12 条 + 两引擎 sizing 节；XAUUSD/10000/0.5%/5.0→0.10 手在 test_sizing.py::test_hand_computed_lots）：
       低于最小手数返回 0 且不开仓；`basis="equity"` 随权益变化。
-- [ ] **基线重跑**：六张卡在 T20（隔夜费、禁入）+ T23（定手数）新口径下重跑 screen 与 G0–G1
-      （过 G1 的继续跑 G2–G4），写 `gates-calibration-v2`：新旧结果对照，并说明每处变化来自哪项修正。
+- [x] **基线重跑**：六卡 screen+G0/G1 完成（auto 选参，台账 run#158-172）；无 G1 全过者故 G2–G4 未适用；报告 docs/research/gates-calibration-v2-2026-10-25.md（新旧对照+逐项归因：H002/H007 反转=爆仓伪影+周末隔夜费、H003 过线=纽约分桶+禁入、H006 可运行=缺小时策略）
 
 ## T22：关卡正负对照实验（H7）
 
