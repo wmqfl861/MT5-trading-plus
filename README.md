@@ -200,9 +200,12 @@ cutoff 直接报错（绝不静默截断）；MCP `get_bars` 同一约束（越�
 仅管理员与实盘侧可读）。
 
 审核报告与后续计划：`docs/reviews/`（各轮审核）、`docs/blueprint.md`（蓝图与现状）、
-`docs/superpowers/plans/2026-10-26-round4-optimization.md`（当前施工计划；上一轮为 `2026-10-25-review-fixes-p3b-p4.md`）。
+`docs/superpowers/plans/2026-10-26-round5-hardening.md`（当前施工计划；上一轮为 `2026-10-26-round4-optimization.md`）。
 
-> **当前禁止事项**（第四轮审核，详见蓝图 v3 §2）：修好 G5 之前不跑 G5；实盘风控接线（计划 T24）完成前，不以非干跑模式启动 `scripts/live_runner.py`。
+> **当前禁止事项**（第五轮审核，详见蓝图 v3.1 §2）：
+> - 计划 T30–T34 完成、影子盘跑满 1 个交易日之前，不以非干跑模式（含模拟盘）启动 `scripts/live_runner.py`。原因：止损出场后对账会永久暂停全部策略，按风险定手数会逐 bar 调仓，第二次全平指令会被吞掉。
+> - T37、T39 完成之前不跑 G5。
+> - T35–T38 完成之前不开新研究卡。
 
 ## 每日调度
 
