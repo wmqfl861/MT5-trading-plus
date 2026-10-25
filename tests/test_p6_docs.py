@@ -1,11 +1,18 @@
-"""T15（P6）：agent 规则文件与权限隔离的轻量守护测试。
+"""T15（P6）/ T29：agent 规则文件与权限白名单钩子的轻量守护测试。
 
-守护三件事（文档即契约，被改空/删句即红）：
+守护四件事（文档即契约，被改空/删句即红）：
 1. docs/p6/research-agent.md 与 docs/p6/review-agent.md 存在，
-   且各自包含关键条款（先卡后测 / 锁箱 / 不改引擎 / 对抗性 / 策略是假的 等）；
+   且各自包含关键条款（先卡后测 / 锁箱 / 不改引擎 / 白名单 / 对抗性 /
+   策略是假的 / 卡谱系 v2）；
 2. docs/p6/permissions.md 含 icacls 命令样例、钩子脚本路径与 MCP 侧说明；
-3. scripts/hooks/pre-commit-readonly-paths（可导入函数 + 薄壳）对触碰
-   engine_a.py 等禁改路径的暂存返回非零，对研究路径放行。
+3. scripts/hooks/pre-commit-readonly-paths 为**白名单 + 缺省拒绝**模式
+   （T29 / M12）：研究、审查角色只放行——新增卡 research/cards/*.toml
+   （仅 git 状态 A）、src/mt5quant/strategies/library/**、
+   tests/test_strategies_*.py、docs/research/**；其余路径（含钩子自身、
+   scripts/、CI 配置、costs、research 包、data、config）一律拒绝；
+4. 规则文件与代码不再矛盾（T29 / L2）：版本迭代=同谱系新建文件
+   H###-v2.toml、旧文件不得再改；卡上 strategy 字段绑定策略类，
+   bt 拒绝其他策略。
 """
 import importlib.util
 from importlib.machinery import SourceFileLoader
@@ -19,10 +26,13 @@ REVIEW_RULES = REPO_ROOT / "docs" / "p6" / "review-agent.md"
 PERMISSIONS = REPO_ROOT / "docs" / "p6" / "permissions.md"
 HOOK_PATH = REPO_ROOT / "scripts" / "hooks" / "pre-commit-readonly-paths"
 
+# 研究/审查角色参数（钩子接受 --role；env 显式传 {} 保证测试不受宿主环境影响）
+RESEARCH = ["--role", "research"]
+
 
 def load_hook():
     """钩子无 .py 扩展名：用 SourceFileLoader 显式按源码加载（可导入函数）。"""
-    loader = SourceFileLoader("pre_commit_readonly_paths_t15", str(HOOK_PATH))
+    loader = SourceFileLoader("pre_commit_readonly_paths_t29", str(HOOK_PATH))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
@@ -33,7 +43,7 @@ def load_hook():
 
 
 def test_research_rules_core_clauses():
-    """研究 agent 规则：六条铁律关键词 + 命令白名单 + 禁改清单 + 全量报告。"""
+    """研究 agent 规则：六条铁律关键词 + 命令白名单 + 白名单外只读 + 全量报告。"""
     assert RESEARCH_RULES.is_file(), f"缺规则文件：{RESEARCH_RULES}"
     text = RESEARCH_RULES.read_text(encoding="utf-8")
     # 铁律关键词
@@ -43,9 +53,9 @@ def test_research_rules_core_clauses():
     for kw in ("bt card check", "bt screen", "run_backtest.py", "--end",
                "git log"):
         assert kw in text, f"研究规则缺白名单命令：{kw}"
-    # 禁改清单（引擎 / 关卡 / 风控 / 门槛）
+    # 白名单外只读（引擎 / 关卡 / 风控 / 门槛 仍在只读示例里）
     for kw in ("backtest", "validation", "mt5live", "gates.toml", "engine_"):
-        assert kw in text, f"研究规则缺禁改路径：{kw}"
+        assert kw in text, f"研究规则缺只读路径示例：{kw}"
     # 报告必须含全部运行结果（不许挑选性汇报）
     assert "全部运行结果" in text
 
@@ -56,6 +66,17 @@ def test_research_rules_six_rules_numbered():
     for i in range(1, 7):
         assert f"\n{i}. " in text or text.startswith(f"{i}. "), \
             f"研究规则缺第 {i} 条编号"
+
+
+def test_research_rules_card_lineage_v2():
+    """T29/L2：版本迭代=同谱系新建文件 H###-v2.toml、旧文件不得再改
+    （与蓝图附录 A v2、cards 的先卡后测判定一致，删去"改同一文件"矛盾）；
+    卡上 strategy 字段绑定策略类，bt 拒绝其他策略。"""
+    text = RESEARCH_RULES.read_text(encoding="utf-8")
+    assert "同谱系新建" in text, "研究规则缺谱系规则：同谱系新建 H###-v2.toml"
+    assert "不得再改" in text, "研究规则缺约束：旧版本文件不得再改"
+    assert "绑定策略类" in text, "研究规则缺卡字段说明：strategy 绑定策略类"
+    assert "其他策略" in text, "研究规则缺约束：bt 拒绝用其他策略跑该卡"
 
 
 def test_review_rules_core_clauses():
@@ -72,6 +93,15 @@ def test_review_rules_two_adversarial_examples():
     text = REVIEW_RULES.read_text(encoding="utf-8")
     assert "换品种" in text, "审查规则缺对抗性测试例子：换品种数据"
     assert "入场时间" in text, "审查规则缺对抗性测试例子：扰动入场时间"
+
+
+def test_review_rules_card_lineage_v2():
+    """审查规则同样对齐卡谱系 v2 与 strategy 绑定（L2）。"""
+    text = REVIEW_RULES.read_text(encoding="utf-8")
+    assert "同谱系新建" in text, "审查规则缺谱系规则：同谱系新建 H###-v2.toml"
+    assert "不得再改" in text, "审查规则缺约束：旧版本文件不得再改"
+    assert "绑定策略类" in text, "审查规则缺卡字段说明：strategy 绑定策略类"
+    assert "其他策略" in text, "审查规则缺约束：bt 拒绝用其他策略跑该卡"
 
 
 # ---------------------------------------------------------------- 权限隔离文档
@@ -91,7 +121,7 @@ def test_permissions_doc_acl_and_hook_and_mcp():
     assert "拒读" in text and "只读" in text
 
 
-# ---------------------------------------------------------------- pre-commit 钩子
+# ---------------------------------------------------------------- pre-commit 钩子（T29 白名单 + 缺省拒绝）
 
 
 @pytest.fixture()
@@ -100,8 +130,8 @@ def hook():
 
 
 def test_hook_blocks_staged_engine_a(hook, capsys):
-    """触碰 engine_a.py 的暂存 → 非零退出并指名路径（核心场景）。"""
-    rc = hook.main(["src/mt5quant/backtest/engine_a.py"])
+    """研究角色触碰 engine_a.py 的暂存 → 非零退出并指名路径（核心场景）。"""
+    rc = hook.main(RESEARCH + ["src/mt5quant/backtest/engine_a.py"], env={})
     assert rc != 0
     assert "engine_a.py" in capsys.readouterr().out
 
@@ -112,29 +142,138 @@ def test_hook_blocks_staged_engine_a(hook, capsys):
     "src/mt5quant/validation/gates.py",
     "src/mt5quant/validation/walkforward.py",
     "src/mt5live/risk.py",                     # 实盘/风控
-    "config/gates.toml",                       # 门槛配置
     "src\\mt5quant\\backtest\\engine_a.py",    # Windows 反斜杠也要拦
+    # ---- M12 漏项：黑名单没保住的路径，白名单模式下全部拒绝 ----
+    "src/mt5quant/costs/spread.py",            # 成本模型
+    "src/mt5quant/costs/swap.py",
+    "src/mt5quant/research/ledger.py",         # 台账/锁箱预算
+    "src/mt5data/ticks.py",                    # 数据层与锁箱加载器
+    "scripts/bt.py",                           # 先卡后测/台账的执行点
+    "scripts/run_backtest.py",
+    "scripts/hooks/pre-commit-readonly-paths", # 钩子自身（白名单的门锁）
+    ".github/workflows/tests.yml",             # CI 配置
+    "config/gates.toml",                       # 门槛配置
+    "config/risk.toml",
+    "config/sessions.toml",
+    "data/lockbox.json",
+    "data/research/ledger.sqlite",
+    "research/cards/H003.toml",                # 裸路径按 M 算：修改已提交的卡
+    "research/cards/notes.md",                 # cards 下只放行 *.toml
+    "research/cards/sub/H100.toml",            # 卡目录不嵌套子目录
+    "tests/test_p6_docs.py",                   # 本守护测试不在白名单
+    "tests/test_validation.py",
+    "docs/p6/research-agent.md",               # 研究角色不能改自己的规则
+    "docs/p6/review-agent.md",
+    "docs/p6/permissions.md",
+    "README.md",
+    "docs/blueprint.md",
 ])
-def test_hook_blocks_forbidden_paths(hook, staged):
-    assert hook.main([staged]) != 0, f"应拦截：{staged}"
+def test_hook_blocks_everything_outside_whitelist(hook, staged):
+    """白名单之外一律拒绝（研究/审查角色；缺省拒绝）。"""
+    assert hook.main(RESEARCH + [staged], env={}) != 0, f"应拦截：{staged}"
 
 
 @pytest.mark.parametrize("staged", [
-    "research/cards/H099.toml",
     "src/mt5quant/strategies/library/breakout.py",
+    "tests/test_strategies_baselines_b1.py",
     "docs/research/note-2026-10-24.md",
-    "docs/p6/research-agent.md",
 ])
 def test_hook_allows_research_paths(hook, staged):
-    """研究产出（卡、策略库、研究文档）不受限。"""
-    assert hook.main([staged]) == 0, f"不应拦截：{staged}"
+    """研究产出（策略库、策略测试、研究文档）放行；裸路径按 M 处理。"""
+    assert hook.main(RESEARCH + [staged], env={}) == 0, f"不应拦截：{staged}"
+
+
+# ---- T29 要求的五种情形 ----
+
+
+def test_hook_whitelist_new_card_allowed(hook):
+    """情形 1：新增卡（git 状态 A）放行——研究角色的核心产出。"""
+    assert hook.main(RESEARCH + ["A\tresearch/cards/H012-v2.toml"],
+                     env={}) == 0
+
+
+def test_hook_whitelist_modified_card_rejected(hook):
+    """情形 2：修改旧卡拒——已提交的卡不得修改，迭代=同谱系新建 v2 文件；
+    删除、重命名同样拒。"""
+    assert hook.main(RESEARCH + ["M\tresearch/cards/H003.toml"], env={}) != 0
+    assert hook.main(RESEARCH + ["D\tresearch/cards/H003.toml"], env={}) != 0
+    assert hook.main(RESEARCH + ["R\tresearch/cards/H003.toml"], env={}) != 0
+
+
+def test_hook_whitelist_cost_model_rejected(hook):
+    """情形 3：改成本模型拒（M12：黑名单漏项，白名单补上）。"""
+    assert hook.main(RESEARCH + ["M\tsrc/mt5quant/costs/spread.py"],
+                     env={}) != 0
+
+
+def test_hook_whitelist_bt_script_rejected(hook):
+    """情形 4：改 bt.py 拒——研究角色不能关掉先卡后测/改台账口径。"""
+    assert hook.main(RESEARCH + ["M\tscripts/bt.py"], env={}) != 0
+
+
+def test_hook_whitelist_hook_itself_rejected(hook):
+    """情形 5：改钩子自身拒——否则白名单可被研究角色拆掉。"""
+    assert hook.main(RESEARCH + ["M\tscripts/hooks/pre-commit-readonly-paths"],
+                     env={}) != 0
+
+
+# ---- 角色参数化：admin 全放行；缺省/未知角色拒绝 ----
+
+
+def test_hook_role_admin_allows_everything(hook):
+    """admin：引擎、门槛、钩子自身、旧卡修改全部放行。"""
+    paths = ["M\tsrc/mt5quant/backtest/engine_a.py",
+             "M\tconfig/gates.toml",
+             "M\tscripts/hooks/pre-commit-readonly-paths",
+             "M\tresearch/cards/H003.toml"]
+    assert hook.main(["--role", "admin"] + paths, env={}) == 0
+
+
+def test_hook_missing_role_denies_by_default(hook):
+    """缺省拒绝：未指定角色时连白名单路径也不放行（fail-closed）。"""
+    assert hook.main(["M\tsrc/mt5quant/strategies/library/breakout.py"],
+                     env={}) != 0
+    assert hook.main(["A\tresearch/cards/H012-v2.toml"], env={}) != 0
+
+
+def test_hook_unknown_role_denies(hook):
+    """未知角色一律拒绝。"""
+    assert hook.main(["--role", "root", "A\tresearch/cards/H012-v2.toml"],
+                     env={}) != 0
+
+
+def test_hook_role_from_env(hook):
+    """角色可经环境变量 MT5QUANT_COMMIT_ROLE 指定（真实钩子的主要入口）。"""
+    env = {"MT5QUANT_COMMIT_ROLE": "admin"}
+    assert hook.main(["M\tsrc/mt5quant/backtest/engine_a.py"], env=env) == 0
+    env = {"MT5QUANT_COMMIT_ROLE": "review"}
+    assert hook.main(["M\tconfig/gates.toml"], env=env) != 0
+    assert hook.main(["A\tresearch/cards/H012-v2.toml"], env=env) == 0
+
+
+def test_hook_cli_role_overrides_env(hook):
+    """命令行 --role 优先于环境变量。"""
+    env = {"MT5QUANT_COMMIT_ROLE": "admin"}
+    assert hook.main(["--role", "research",
+                      "M\tsrc/mt5quant/backtest/engine_a.py"], env=env) != 0
+
+
+def test_hook_delete_rejected_on_whitelist_path(hook):
+    """白名单路径也只放行 A/M：删除策略库/研究文档需走管理员。"""
+    assert hook.main(RESEARCH + ["D\tsrc/mt5quant/strategies/library/b1.py"],
+                     env={}) != 0
+    assert hook.main(RESEARCH + ["D\tdocs/research/note.md"], env={}) != 0
 
 
 def test_hook_check_staged_function(hook):
-    """可导入函数：check_staged 返回逐条原因（不依赖 git）。"""
+    """可导入函数：check_staged 按 (状态, 路径) 返回逐条原因（不依赖 git）。"""
     msgs = hook.check_staged(
-        ["config/gates.toml", "research/cards/H001.toml",
-         "src/mt5quant/backtest/engine_a.py"])
+        [("M", "config/gates.toml"), ("A", "research/cards/H001.toml"),
+         ("M", "src/mt5quant/backtest/engine_a.py")], role="research")
     assert len(msgs) == 2
     assert any("gates.toml" in m for m in msgs)
     assert any("engine_a.py" in m for m in msgs)
+    # admin 角色下同批改动全部放行
+    assert hook.check_staged(
+        [("M", "config/gates.toml"), ("M", "research/cards/H001.toml")],
+        role="admin") == []
