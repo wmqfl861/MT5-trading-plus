@@ -116,11 +116,10 @@ rollover 报告里列出四个品种的快照值并与官方表核对，不一�
 **Files:** 新建 `scripts/build_cost_model.py`；`src/mt5data/ticks.py`（`load_ticks(columns=...)`）；
 `scripts/run_backtest.py`、`scripts/bt.py`（加载缓存）；`src/mt5quant/backtest/engine_b.py`（性能）；测试。
 
-- [ ] `build_cost_model.py`：从 tick 只读 `time_msc/bid/ask` 三列，构建相对点差模型（T20 的纽约小时分桶），
+- [x] `build_cost_model.py`：从 tick 只读 `time_msc/bid/ask` 三列（证据：test_build_cost_model.py 5 条；生产缓存 data/costs/spread_model.json sha b2ff618d，4 品种 99,999,236 tick），构建相对点差模型（T20 的纽约小时分桶），
       写 `data/costs/spread_model.json`，内含各品种 tick 水位（rows、last_msc）与模型 sha256。
-- [ ] `build_costs` 改为加载该文件；tick 水位变化而模型未重建 → 报错并提示重建（不静默用旧模型）。
-- [ ] 引擎 B：不再为每笔 tick 构造 `pd.Timestamp`（只在成交时构造）；bar 边界用 `searchsorted` 预计算。
-      在 XAUUSD 一个月 tick 上测速，前后耗时写进提交说明（目标 ≥5 倍）。
+- [x] `build_costs` 改为加载该文件；水位变化报错不静默（证据：test_run_backtest_script.py 缓存节 6 条）
+- [x] 引擎 B：searchsorted 跳读+免逐笔 Timestamp，B-0.3；实测 XAUUSD 2026-09（659 万 tick）AlwaysLong 35.7s→3.7s（×9.6）、HalfTimeLong ×8.2，trades/equity 逐位一致（证据：commit 说明 + test_backtest_engine_b.py）
 - 验收：XAUUSD H1 单次回测不再加载原始 tick（峰值内存从约 4 GB 降到 1 GB 以内，写进提交说明）。
 
 ## T21：验证管线修正（C3、H4、H5、H6、M4、M5、M6、M7）
