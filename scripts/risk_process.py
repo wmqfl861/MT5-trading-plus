@@ -16,6 +16,9 @@
 用法：
     .venv/Scripts/python.exe scripts/risk_process.py --config config/risk.toml --once
     .venv/Scripts/python.exe scripts/risk_process.py --config config/risk.toml --loop --interval 10
+    # 影子盘（T34）：账户快照读 paper 状态文件，不连真实终端
+    .venv/Scripts/python.exe scripts/risk_process.py --config config/risk.toml --once \
+        --paper-state data/live/paper/state.json
 """
 from __future__ import annotations
 
@@ -31,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from mt5gw import GatewayConfig, MT5Gateway  # noqa: E402
 from mt5gw.errors import DataUnavailableError  # noqa: E402
 from mt5live.monitor import ALERT_ACCOUNT_POLL_ERROR, append_alert  # noqa: E402
+from mt5live.paper import PaperStateGateway  # noqa: E402（T34 --paper-state）
 from mt5live.riskproc import (  # noqa: E402
     AccountSnapshot,
     CycleResult,
@@ -50,8 +54,12 @@ def _open_gateway(gw_config_path: str) -> MT5Gateway:
     return gw
 
 
-def build_snapshot(gw: MT5Gateway, now: datetime) -> AccountSnapshot:
-    """轮询账户：状态 + 全部持仓 + 当日（UTC 00:00 起）全部成交流水。"""
+def build_snapshot(gw, now: datetime) -> AccountSnapshot:
+    """轮询账户：状态 + 全部持仓 + 当日（UTC 00:00 起）全部成交流水。
+
+    gw 是"带 account 的网关对象"：真终端 MT5Gateway，或 T34 影子盘的
+    PaperStateGateway（--paper-state，读 paper 状态文件、不碰真实账户）。
+    """
     state = gw.account.state()
     if state.currency != "USD":
         raise ValueError(
@@ -63,12 +71,13 @@ def build_snapshot(gw: MT5Gateway, now: datetime) -> AccountSnapshot:
                            deals=tuple(deals))
 
 
-def run_one_cycle(risk: RiskProcess, gw: MT5Gateway) -> CycleResult:
+def run_one_cycle(risk: RiskProcess, gw) -> CycleResult:
     """单轮（账户轮询失败如实抛 DataUnavailableError，由调用方决定重试）。"""
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     snap = build_snapshot(gw, now)
     res = risk.run_cycle(snap, now)
-    print(f"· {now:%Y-%m-%d %H:%M:%S} UTC 心跳={res.heartbeat_reason} "
+    mode = ("paper" if isinstance(gw, PaperStateGateway) else "live")
+    print(f"· {now:%Y-%m-%d %H:%M:%S} UTC [{mode}] 心跳={res.heartbeat_reason} "
           f"halt={'是' if res.halt_active else '否'} "
           f"flatten={'写入' if res.flatten_written else '—'} "
           f"日亏触发={'是' if res.daily_loss_breached else '否'}")
@@ -80,6 +89,10 @@ def main(argv=None) -> int:
     ap.add_argument("--config", default="config/risk.toml", help="风控配置 TOML")
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--gw-config", default="config.json", help="网关配置 JSON")
+    ap.add_argument("--paper-state", default=None,
+                    help="影子券商状态文件（T34）：账户快照读它而非真实终端"
+                         "（--paper 运行器的 data/live/paper/state.json）；"
+                         "给了就不连网关")
     ap.add_argument("--once", action="store_true", help="单轮后退出（默认行为）")
     ap.add_argument("--loop", action="store_true", help="常驻轮询")
     ap.add_argument("--interval", type=float, default=10.0, help="轮询间隔（秒）")
@@ -97,7 +110,14 @@ def main(argv=None) -> int:
         heartbeat_timeout_s=args.heartbeat_timeout)
 
     try:
-        gw = _open_gateway(args.gw_config)
+        if args.paper_state:
+            try:
+                gw = PaperStateGateway(args.paper_state)
+            except DataUnavailableError as e:
+                print(f"× 影子状态文件不可用：{e}")
+                return 2
+        else:
+            gw = _open_gateway(args.gw_config)
     except Exception as e:
         print(f"× 网关连接失败：{e}")
         return 2

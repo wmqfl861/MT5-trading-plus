@@ -10,9 +10,11 @@ MT5、绝不真实下单。
 / LiveSizer / LiveExecutor）的行为测试 + `--dry-run --offline` 端到端；
 T30 意图语义（C1/P8）、T31 只在开仓时定手数（C2/P9：ATR 逐 bar 变化不
 调仓）、T32 全平指令编号协议（C3/P10：连续两次全平、闸门同协议、损坏
-指令按有指令处理）与 scripts/live_retire.py 退役。Global Constraints 的
-三类必备情形：ATR 逐 bar 变化（test_t31_*）、服务器端 SL/TP 出场
-（test_t30_*，保持绿）、连续两次全平（test_t32_second_flatten_*）。
+指令按有指令处理）与 scripts/live_retire.py 退役；T34 影子盘一条龙
+（PaperBroker 全链路 + `--paper --dry-run --offline` 端到端冒烟）。Global
+Constraints 的三类必备情形：ATR 逐 bar 变化（test_t31_*）、服务器端 SL/TP
+出场（test_t30_* 与 test_t34_*，保持绿）、连续两次全平（test_t32_second_
+flatten_*）。
 """
 from __future__ import annotations
 
@@ -48,6 +50,7 @@ from mt5live.reconcile import (
     write_intent,
 )
 from mt5live.riskproc import AccountSnapshot, RiskProcess, load_risk_config
+from mt5live.paper import PaperBroker, PaperStateGateway
 from mt5live.runner import (
     MarketClosedError,
     SignalRunner,
@@ -1425,3 +1428,315 @@ def test_runner_once_survives_persistent_heartbeat_write_failure(tmp_path,
     # 心跳写失败不等于假装写过：文件不存在（风控会按超时停机——那是另一层
     # fail-closed，运行器进程本身活着才是本条修的语义）
     assert not (tmp_path / "data" / "live" / f"heartbeat-{MAGIC}.json").exists()
+
+
+# ================================================================ T34 影子盘
+#（M3/决策 D26：真实行情 + 影子券商，全链路运行——闸门、定手数、意图、对账、
+#  风控、全平协议照常，只有成交是模拟的。一条龙：决策 → 闸门 → paper 成交
+#  → 意图 → 对账一致（--paper-state 视图）→ 全平指令 → paper 全平 + ack）
+
+class PaperStack:
+    """影子栈：FakeBroker 只当行情源（quote/set_quote），PaperBroker 当
+    trading + account（同一对象双角色）；闸门/定手数/执行器/风控进程/对账
+    与真实链路同一套装配（T34 的组件契约）。"""
+
+    def __init__(self, tmp_path, *, magic: int = MAGIC,
+                 exit_rules: ExitRules | None = None,
+                 balance: float = 10_000.0):
+        from mt5quant.sizing import RiskSizing as _RS
+
+        self.magic = magic
+        base = tmp_path / f"paper-{magic}"
+        self.live_dir = str(base / "live")
+        self.data_root = str(base / "data")
+        os.makedirs(self.live_dir, exist_ok=True)
+        os.makedirs(self.data_root, exist_ok=True)
+        self.specs_path = write_text(
+            base / "data" / "specs" / "latest.json", json.dumps({
+                SYMBOL: {"contract_size": CONTRACT, "volume_min": VOL[0],
+                         "volume_step": VOL[1], "volume_max": VOL[2]},
+            }))
+        self.policy = load_session_policy(
+            write_text(base / "sessions.toml", SESSIONS_TOML))
+        self.risk_cfg = load_risk_config(
+            write_text(base / "risk.toml", RISK_TOML))
+        self.process = RiskProcess(self.risk_cfg, live_dir=self.live_dir,
+                                   session_policy=self.policy)
+        self.market = FakeBroker(SYMBOL, balance=balance,
+                                 contract_size=CONTRACT)
+        self.paper_state = os.path.join(self.live_dir, "paper", "state.json")
+        self.paper = PaperBroker(
+            self.market, state_path=self.paper_state,
+            contract_sizes={SYMBOL: CONTRACT}, balance=balance,
+            clock=lambda: T1)
+        self.gate = RiskGate(
+            self.process, account=self.paper, market=self.market,
+            specs_path=self.specs_path, live_dir=self.live_dir,
+            session_policy=self.policy)
+        self.cfg = LiveConfig(
+            symbol=SYMBOL, timeframe="M15",
+            strategy="tests.fakes_live:ClosingSignal", params={}, magic=magic,
+            lookback_bars=30, risk_fraction=0.005,
+            data_root=self.data_root, trigger_delay_s=5.0)
+        self.strategy = ClosingSignal(
+            exit_rules if exit_rules is not None else DEFAULT_RULES)
+        self._bars_df = None
+        self.runner = SignalRunner(
+            self.cfg, self.strategy,
+            bars_loader=lambda root, s, tf: self._bars_df,
+            quote_fn=lambda s: (self.market.bid, self.market.ask))
+        self.adapter = ExecutionAdapter(
+            self.paper, self.paper, self.market, symbol=SYMBOL, magic=magic)
+        self.sizer = LiveSizer(_RS(0.005, basis="equity"),
+                               account=self.paper, specs_path=self.specs_path)
+        self.executor = LiveExecutor(
+            self.adapter, symbol=SYMBOL, magic=magic, live_dir=self.live_dir,
+            rules=self.strategy.exit_rules, gate=self.gate, sizer=self.sizer)
+        self.hb_path = os.path.join(self.live_dir, f"heartbeat-{magic}.json")
+
+    def round(self, now: datetime, last: str = "up"):
+        """一轮 = paper 保护性出场轮询 + 运行器决策 + 执行器轮 + 心跳
+        （live_runner --paper 的主循环顺序）。"""
+        self.market.quote_time = now           # 行情新鲜（fake 的 quote 时刻）
+        protective = self.paper.poll_protective(now)
+        self._bars_df = grid_bars(boundary_open(now), last=last)
+        decision = self.runner.decide(now)
+        rr = self.executor.poll(decision, now)
+        write_heartbeat(self.hb_path, config=self.cfg, decision=decision,
+                        error=rr.error, dry_run=False, now=now)
+        return decision, rr, protective
+
+    def risk_cycle_from_paper(self, now: datetime):
+        """风控主循环一轮：账户快照来自 --paper-state 只读视图（不碰真实账户）。"""
+        mod = load_script("risk_process")
+        snap = mod.build_snapshot(PaperStateGateway(self.paper_state), now)
+        return self.process.run_cycle(snap, now)
+
+    def reconcile_from_paper(self, now: datetime):
+        mod = load_script("live_reconcile")
+        return mod.run_once(self.live_dir, PaperStateGateway(self.paper_state),
+                            volume_tolerance=1e-6, now=now)
+
+
+def test_t34_shadow_full_chain_decision_to_flatten(tmp_path):
+    """影子一条龙：决策 → 闸门 → paper 成交 → 意图 → 对账一致 → 全平指令
+    → paper 全平 + ack → 风控归档。全程无真实下单（成交只在 paper 账本）。"""
+    stack = PaperStack(tmp_path)
+
+    # 1) 决策 → 闸门（RiskGate 全套：日亏/停机/白名单/手数/持仓/暴露/频率/
+    #    禁入窗）→ PaperBroker 模拟成交（买按 Ask 100.2）
+    d1, rr1, _ = stack.round(T1, "up")
+    assert rr1.action == "open"
+    lots = expected_lots(d1)
+    pos = stack.paper.positions(SYMBOL)
+    assert len(pos) == 1 and pos[0].side == "buy"
+    assert pos[0].volume == pytest.approx(lots)
+    assert pos[0].magic == MAGIC and pos[0].price_open == pytest.approx(100.2)
+    assert stack.market.market_orders == []            # 行情源绝未被下单
+
+    # 2) 状态文件落盘（fileio 原子写）；意图 confirmed = 成交手数
+    with open(stack.paper_state, encoding="utf-8") as f:
+        book = json.load(f)
+    assert len(book["positions"]) == 1 and book["balance"] == \
+        pytest.approx(10_000.0)
+    it = intent_of(stack.live_dir)
+    assert it["status"] == "confirmed" and it["cause"] == d1.decision_id
+    assert it["volume"] == pytest.approx(lots)
+
+    # 3) 对账（--paper-state 只读视图替代真实账户）：一致、不暂停
+    rc, res = stack.reconcile_from_paper(T1 + timedelta(seconds=30))
+    assert rc == 0 and res.ok
+    assert pause_state(stack.live_dir) in (None, False)
+
+    # 4) 全平指令（风控编号协议）→ 执行器消费 → paper 全平 + ack 引用编号
+    cmd = write_flatten(stack.live_dir, reason="daily_loss_cap", now=T2)
+    d2, rr2, _ = stack.round(T2, "up")
+    assert rr2.action == "flatten"
+    assert stack.paper.positions() == []
+    ack = read_json(os.path.join(stack.live_dir, "commands",
+                                 f"flatten.ack-{MAGIC}"))
+    assert ack["id"] == cmd.id and ack["closed"] == 1
+    it2 = intent_of(stack.live_dir)
+    assert it2["volume"] == 0.0 and it2["cause"] == f"flatten:{cmd.id}"
+
+    # 5) 风控（--paper-state 快照）：全员 ack → 归档指令并清理 ack
+    write_heartbeat(stack.hb_path, config=stack.cfg, decision=d2, error=None,
+                    dry_run=False, now=T2 + timedelta(seconds=30))
+    res2 = stack.risk_cycle_from_paper(T2 + timedelta(seconds=30))
+    assert res2.flatten_archived
+    assert not os.path.exists(os.path.join(stack.live_dir, "commands",
+                                           "flatten.json"))
+
+    # 6) 全平后对账仍一致（意图 0 = paper 空仓）
+    rc2, _ = stack.reconcile_from_paper(T2 + timedelta(minutes=1))
+    assert rc2 == 0
+
+
+def test_t34_shadow_protective_exit_explained_in_chain(tmp_path):
+    """一条龙中途的 paper SL 出场：触发口径与引擎一致（多头按 Bid），
+    执行器同轮识别为 external_exit → 意图=实际 → 对账一致不暂停。"""
+    stack = PaperStack(tmp_path)
+    _, rr1, _ = stack.round(T1, "up")
+    assert rr1.action == "open"
+    sl = stack.paper.positions(SYMBOL)[0].sl          # 成交价 100.2 − 1.5×ATR
+    assert sl == pytest.approx(100.2 - 1.5 * 2.0)
+
+    # Bid 跌破 SL（Ask 仍在上方——错用 Ask 的实现不会触发）
+    stack.market.set_quote(sl - 0.3, sl + 0.5)
+    _, rr2, protective = stack.round(T2, "up")
+    assert len(protective) == 1
+    assert protective[0].reason == DEAL_REASON_SL
+    assert protective[0].price == pytest.approx(sl - 0.3)   # 多头按 Bid 成交
+    # 亏损入账（影子账本）：(96.9 − 100.2)×0.16×100 = −3.3×16 = −52.8
+    assert stack.paper.state().balance == pytest.approx(10_000.0 - 52.8)
+    # immediate 重入开新仓；上一笔已按 external_exit 解释（对账一致不暂停）
+    assert rr2.action == "open"
+    rc, res = stack.reconcile_from_paper(T2 + timedelta(seconds=30))
+    assert rc == 0 and res.ok
+    assert pause_state(stack.live_dir) in (None, False)
+
+
+def _paper_cli_env(tmp_path, *,
+                   strategy: str = "mt5quant.strategies.library.buy_hold:"
+                                   "BuyHold") -> dict:
+    """--paper CLI 测试的环境（specs/点差模型/会话/风控/live.toml）。"""
+    write_text(tmp_path / "data" / "specs" / "latest.json", json.dumps({
+        SYMBOL: {"contract_size": CONTRACT, "volume_min": VOL[0],
+                 "volume_step": VOL[1], "volume_max": VOL[2]}}))
+    from mt5quant.costs.spread import SpreadStat
+    SpreadModel(
+        {SYMBOL: {h: SpreadStat(median=0.02, p90=0.5, p99=0.8, n=100)
+                  for h in range(24)}},
+        {SYMBOL: 0.02}, mode="absolute").save(str(tmp_path / "spread.json"))
+    env = {
+        "specs": str(tmp_path / "data" / "specs" / "latest.json"),
+        "spread": str(tmp_path / "spread.json"),
+        "sessions": write_text(tmp_path / "sessions.toml", """
+version = 1
+[rollover]
+local_time = "17:00"
+tz = "America/New_York"
+[forbidden]
+pre_minutes = 0
+post_minutes = 0
+exempt_symbols = ["BTCUSD"]
+[costs]
+spread_gate_multiplier = 3.0
+missing_hour_policy = "forbid"
+"""),
+        "risk": write_text(tmp_path / "risk.toml", RISK_TOML),
+    }
+    env["config"] = write_text(tmp_path / "live.toml", f"""
+symbol = "{SYMBOL}"
+timeframe = "M15"
+strategy = "{strategy}"
+magic = {MAGIC}
+lookback_bars = 30
+risk_fraction = 0.005
+data_root = "{(tmp_path / 'data').as_posix()}"
+trigger_delay_s = 5.0
+""")
+    return env
+
+
+def test_t34_paper_dry_run_offline_end_to_end(tmp_path, capsys):
+    """--paper --dry-run --offline 合成数据端到端：不连 MT5、不下真实单，
+    全链路（决策 → 闸门 → paper 成交 → 意图/心跳）跑通；随后
+    live_reconcile / risk_process 用 --paper-state 复核同一状态文件。"""
+    mod = load_script("live_runner")
+    epoch = int(datetime.now(timezone.utc).timestamp())   # aware→真 UTC 纪元
+    boundary = epoch - epoch % TF_S
+    if boundary + 8 > epoch:                 # 距网格太近：等容差过期
+        _time.sleep(boundary + 8 - epoch)
+    last_open = boundary - TF_S
+    save_bars(str(tmp_path / "data"), SYMBOL, "M15",
+              grid_bars(pd.Timestamp(last_open, unit="s"), last="up"))
+    env = _paper_cli_env(tmp_path)
+
+    rc = mod.main(["--config", env["config"], "--once", "--dry-run", "--offline",
+                   "--paper", "--risk-config", env["risk"],
+                   "--sessions-config", env["sessions"],
+                   "--spread-model", env["spread"]])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "[paper offline]" in out and "影子账户" in out
+
+    # 心跳：dry_run=True（显式给了 --dry-run），决策已出、无错误
+    hb = read_json(os.path.join(str(tmp_path / "data"), "live",
+                                f"heartbeat-{MAGIC}.json"))
+    assert hb["dry_run"] is True and hb["last_decision"] is not None
+    assert hb["last_error"] is None
+    # 影子账本：BuyHold 开多仓（成交=模拟），意图 confirmed。BuyHold 无
+    # SL/TP 规则 → LiveSizer 用 fallback_stop_atr=1.0：距离 1.0×ATR(≈2.0)
+    # → 10000×0.5%/2.0/100 = 0.25 手
+    paper_state = os.path.join(str(tmp_path / "data"), "live", "paper",
+                               "state.json")
+    with open(paper_state, encoding="utf-8") as f:
+        book = json.load(f)
+    assert len(book["positions"]) == 1
+    assert book["positions"][0]["side"] == "buy"
+    assert book["positions"][0]["volume"] == pytest.approx(0.25)
+    it = read_json(os.path.join(str(tmp_path / "data"), "live",
+                                f"expected-{MAGIC}.json"))
+    assert it["status"] == "confirmed" and it["volume"] == pytest.approx(0.25)
+
+    # 对账 / 风控复核同一状态文件（--paper-state，不连网关）
+    rec = load_script("live_reconcile")
+    assert rec.main(["--data-dir", str(tmp_path / "data"), "--once",
+                     "--paper-state", paper_state]) == 0
+    risk_mod = load_script("risk_process")
+    assert risk_mod.main(["--config", env["risk"],
+                          "--data-dir", str(tmp_path / "data"), "--once",
+                          "--paper-state", paper_state]) == 0
+
+
+def test_t34_live_runner_paper_mode_wires_full_stack(tmp_path, monkeypatch,
+                                                     capsys):
+    """--paper（真终端行情路径）：PaperBroker 替换真实 trading/account——
+    网关替身（FakeBroker 只当行情源，绝不连真实 MT5）的 trading 从未被
+    调用；闸门/定手数/执行器照常装配，成交进影子账本。"""
+    mod = load_script("live_runner")
+    broker = FakeBroker(SYMBOL, contract_size=CONTRACT)
+    now = datetime(2026, 10, 28, 10, 0, 7)   # 决策墙钟由注入的终端替身给出
+    broker.set_bars(SYMBOL, "M15",
+                    bars_from_df(grid_bars(boundary_open(now), last="up")))
+    broker.quote_time = now
+    call_count = {"connect": 0}
+
+    class _FakeGW:
+        def __init__(self):
+            self.market = broker
+            self.account = broker
+            self.trading = broker
+
+        def connect(self):
+            call_count["connect"] += 1
+
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr("mt5gw.MT5Gateway.from_config_file",
+                        staticmethod(lambda p: _FakeGW()))
+    monkeypatch.setattr(mod, "now_utc", lambda: now)
+    env = _paper_cli_env(tmp_path)
+
+    rc = mod.main(["--config", env["config"], "--once", "--paper",
+                   "--risk-config", env["risk"],
+                   "--sessions-config", env["sessions"],
+                   "--spread-model", env["spread"]])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "[paper]" in out and "影子账户" in out
+    assert call_count["connect"] == 1            # 行情来自"网关"（真路径装配）
+    assert broker.market_orders == []            # 真实 trading 通道绝未被下单
+    assert broker.positions() == []              # 替身账户无持仓
+    paper_state = os.path.join(str(tmp_path / "data"), "live", "paper",
+                               "state.json")
+    with open(paper_state, encoding="utf-8") as f:
+        book = json.load(f)
+    assert len(book["positions"]) == 1           # 成交在影子账本
+    it = read_json(os.path.join(str(tmp_path / "data"), "live",
+                                f"expected-{MAGIC}.json"))
+    assert it["status"] == "confirmed" and it["volume"] == \
+        pytest.approx(book["positions"][0]["volume"])
+

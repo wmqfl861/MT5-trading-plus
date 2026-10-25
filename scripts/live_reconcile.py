@@ -13,6 +13,9 @@
 用法：
     .venv/Scripts/python.exe scripts/live_reconcile.py --data-dir data --once
     .venv/Scripts/python.exe scripts/live_reconcile.py --data-dir data --loop --interval 30
+    # 影子盘（T34）：actual 持仓读 paper 状态文件，不连真实终端
+    .venv/Scripts/python.exe scripts/live_reconcile.py --data-dir data --once \
+        --paper-state data/live/paper/state.json
 """
 from __future__ import annotations
 
@@ -32,6 +35,7 @@ from mt5live.monitor import (  # noqa: E402
     append_alert,
     naive_utc,
 )
+from mt5live.paper import PaperStateGateway  # noqa: E402（T34 --paper-state）
 from mt5live.reconcile import (  # noqa: E402
     DEFAULT_GRACE_S,
     ExpectedStateError,
@@ -52,12 +56,15 @@ def _open_gateway(gw_config_path: str) -> MT5Gateway:
     return gw
 
 
-def run_once(live_dir: str, gw: MT5Gateway, *,
+def run_once(live_dir: str, gw, *,
              volume_tolerance: float, alert: bool = True,
              now: datetime | None = None,
              grace_s: float = DEFAULT_GRACE_S,
              ) -> tuple[int, ReconcileResult | None]:
     """单轮对账（T30：意图语义 + 按策略暂停）；返回 (exit_code, 结果|None)。
+
+    gw 是"带 account 的网关对象"：真终端 MT5Gateway，或 T34 影子盘的
+    PaperStateGateway（--paper-state，读 paper 状态文件、不碰真实账户）。
 
     有差分的 magic 写 pause-<magic>.json（paused=true），其余登记 magic
     写回 paused=false；全局 pause.json 只留给人工，本函数不写。
@@ -104,6 +111,10 @@ def main(argv=None) -> int:
         description="持仓对账（意图 vs actual，按 magic 过滤、按策略暂停）")
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--gw-config", default="config.json", help="网关配置 JSON")
+    ap.add_argument("--paper-state", default=None,
+                    help="影子券商状态文件（T34）：actual 持仓读它而非真实"
+                         "终端（--paper 运行器的 data/live/paper/state.json）；"
+                         "给了就不连网关")
     ap.add_argument("--once", action="store_true", help="单轮后退出（默认行为）")
     ap.add_argument("--loop", action="store_true", help="常驻轮询")
     ap.add_argument("--interval", type=float, default=30.0, help="轮询间隔（秒）")
@@ -115,9 +126,12 @@ def main(argv=None) -> int:
 
     live_dir = os.path.join(args.data_dir, "live")
     try:
-        gw = _open_gateway(args.gw_config)
+        if args.paper_state:
+            gw = PaperStateGateway(args.paper_state)
+        else:
+            gw = _open_gateway(args.gw_config)
     except Exception as e:
-        print(f"× 网关连接失败：{e}")
+        print(f"× {'影子状态文件不可用' if args.paper_state else '网关连接失败'}：{e}")
         return 2
 
     try:

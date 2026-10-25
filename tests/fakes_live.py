@@ -306,6 +306,27 @@ class FakeBroker:
         raise ValueError(f"挂单 {ticket} 不存在（可能已成交/已撤销）")
 
 
+class QuoteMarket:
+    """最小行情源（只提供 quote；PaperBroker / 闸门测试注入用，T34）。
+
+    quote.time 恒为 _T0（无休市语义——陈旧判定不适用）；报价经 set_quote
+    逐轮驱动（造"报价序列"断言 SL/TP 触发时刻与成交价）。
+    """
+
+    def __init__(self, symbol: str = "XAUUSD", *, bid: float = 100.0,
+                 ask: float = 100.2):
+        self.symbol = symbol
+        self.bid = bid
+        self.ask = ask
+
+    def set_quote(self, bid: float, ask: float) -> None:
+        self.bid, self.ask = bid, ask
+
+    def quote(self, symbol: str) -> Quote:
+        return Quote(symbol=symbol, time=_T0, bid=self.bid, ask=self.ask,
+                     last=0.0, volume=0)
+
+
 # ---- toy 策略（runner 测试用；记录每次调用收到的窗口）----
 
 class LastBarDirection(BaseStrategy):
