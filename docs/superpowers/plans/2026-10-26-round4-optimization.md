@@ -151,21 +151,32 @@ def run_g5(ledger, card, *, lockbox_result, reference_returns, expected_trades: 
 - 锁箱运行：从 cutoff 前 `lookback_bars` 根起步，只统计 `entry_time ≥ cutoff` 的交易与 cutoff 之后的权益收益。
 - `lockbox_uses` 增加 `status` 列：读锁箱数据**之前**先写 `started`，评估结束再写结果；
   已有 `started` 记录的卡同样视为已用过（防止中途崩溃后重跑）。
-- [ ] 失败测试先行：保持优势的策略（锁箱夏普 2.0，参照 p5 = 0.8）通过；退化为随机（夏普 0.0）不通过；
+- [x] 失败测试先行：保持优势的策略（锁箱夏普 2.0，参照 p5 = 0.8）通过；退化为随机（夏普 0.0）不通过；
       夏普 5.0 通过但带告警；没有预热段时信号与带预热段不同（用 B1 构造）；`started` 后崩溃不能重跑。
+      （T41 补证据：tests/test_validation_gates.py::test_g5_advantage_maintained_passes /
+      test_g5_degenerated_to_random_fails / test_g5_suspiciously_good_passes_with_warning /
+      test_g5_started_row_blocks_rerun / test_load_lockbox_window_starts_lookback_before_cutoff（B1 构造，
+      断言无预热段信号与全史不同）；tests/test_validation_stats.py::test_block_bootstrap_sharpes_shape_and_determinism
+      等 5 条；提交 d568b47）
 
 **T21b G3 日历窗口（H5）**
 - `config/gates.toml` 的 `[g3]` 改为 `train_months_hourly = 24`、`test_months_hourly = 6`、
   `train_months_intraday = 12`、`test_months_intraday = 3`、`min_oos_ratio = 0.50`；重新冻结指纹。
 - 各段 `oos_net`、`oos_trades` 只计 `entry_time ≥ 测试窗起点` 的交易。
-- [ ] 失败测试先行：M5 序列的测试窗为 3 个日历月；预热段里的交易不计入 `oos_trades`。
+- [x] 失败测试先行：M5 序列的测试窗为 3 个日历月；预热段里的交易不计入 `oos_trades`。
+      （T41 补证据：tests/test_validation_walkforward.py::test_plan_windows_m5_test_window_is_three_calendar_months /
+      test_walkforward_warmup_trades_excluded_from_oos；提交 d568b47，同一提交重冻结 gates.toml v2 68f49237）
 
 **T21c G4 内存与试验计数（H6、M4）**
 - 回撤蒙特卡洛分批（每批 ≤ 20 次，37 万根时每个矩阵约 60 MB），改为块自助重采样（块长 = 一个交易日的 bar 数）。
 - N = 该谱系中按 (strategy, params, symbol, timeframe, data_sha256, cost_model_version) 去重后的成功运行数；
   试验夏普同样去重；报告同时给出项目级 N。
-- [ ] 失败测试先行：37 万根 × 1000 次的回撤模拟峰值内存 < 500 MB（`tracemalloc` 断言）；
+- [x] 失败测试先行：37 万根 × 1000 次的回撤模拟峰值内存 < 500 MB（`tracemalloc` 断言）；
       同一组参数先 screen 后 gate，N 只计 1 次。
+      （T41 补证据：tests/test_validation_stats.py::test_mc_drawdown_batched_memory_under_500mb（tracemalloc）；
+      tests/test_research_ledger.py::test_stats_dedup_same_config_counted_once /
+      test_stats_family_accumulates_card_versions；tests/test_research_bt_script.py::test_g4_trials_dedup_same_params_counted_once；
+      提交 d568b47）
 
 **T21d 卡谱系与先卡后测（H4）**
 - 卡字段新增 `family`、`parent`、`strategy`、`selection_rule`（见蓝图附录 A）；旧卡缺字段时
@@ -173,16 +184,26 @@ def run_g5(ledger, card, *, lockbox_result, reference_returns, expected_trades: 
 - 先卡后测按**卡文件**（id + version）判定：该文件的提交时间早于该文件首次运行，且
   `git status --porcelain -- <卡文件>` 为空（工作区干净）。
 - `--strategy` 与卡上的 `strategy` 不一致 → 拒绝运行。
-- [ ] 失败测试先行：探针 P6 的场景（改了没提交）被拒；`H012-v2` 是新文件，能在 `H012-v1` 跑过之后运行，
+- [x] 失败测试先行：探针 P6 的场景（改了没提交）被拒；`H012-v2` 是新文件，能在 `H012-v1` 跑过之后运行，
       且 N 累计两者；策略不匹配被拒。
+      （T41 补证据：tests/test_research_cards.py::test_p6_dirty_worktree_rejected /
+      test_worktree_clean_real_git_lifecycle；tests/test_research_ledger.py::test_stats_family_accumulates_card_versions
+      （H012-v1/v2 谱系 N 累计）；tests/test_research_bt_script.py::test_screen_rejects_dirty_worktree_card /
+      test_screen_rejects_strategy_mismatch；提交 d568b47）
 
 **T21e 参数选择与杂项（M5、M6、M7）**
 - `bt gate --params auto`（默认）：按卡的 `selection_rule` 从同一数据哈希、同一成本版本的 screen 运行里选参，
   并把选择过程（候选数、选中的 run_id）写进关卡报告；显式 `--params` 记为 `selection="manual"`。
 - `bt screen` 的 gates_hash 改用 `gates.gates_sha256`（探针 P7）。
 - 随机入场基准：入场时刻按策略实际入场的纽约本地小时分布抽样，多空比例与策略一致。
-- [ ] 失败测试先行：auto 选中净利最高的组合并记录 run_id；CRLF 文件两条命令记录同一哈希；
+- [x] 失败测试先行：auto 选中净利最高的组合并记录 run_id；CRLF 文件两条命令记录同一哈希；
       只在 10:00–11:00 入场的策略，其随机基准的入场也全部落在该时段。
+      （T41 补证据：tests/test_validation_gates.py::test_gate_params_auto_selects_max_net_profit_run /
+      test_gate_params_manual_selection_recorded / test_gate_params_auto_unknown_selection_rule_rejected；
+      tests/test_research_bt_script.py::test_gates_hash_lf_normalized_under_crlf；
+      tests/test_validation_robustness.py::test_random_entry_samples_only_strategy_entry_hours_ny /
+      test_random_entry_hour_mixture_limited_to_strategy_support / test_random_entry_side_ratio_matches_strategy；
+      提交 d23f32d）
 
 ## T23：共享定手数（M2）+ 基线重跑
 
@@ -219,19 +240,34 @@ def lots_for_risk(capital: float, risk_fraction: float, stop_distance: float,
 - 产出：每道关卡（G1–G4 各子检查）的检出率与误报率表。
 - 决策规则（写进报告）：真实夏普 1.0 时某道关卡检出率 < 50%，或负对照误报率 > 5%，就提出门槛调整，
   经用户确认后修改 `gates.toml` 并重新冻结。
-- [ ] 失败测试先行：植入器把 d=0 时数据逐位还原；`PlantedEdgeStrategy` 通过 G0；同一种子结果可复现。
+- [x] 失败测试先行：植入器把 d=0 时数据逐位还原；`PlantedEdgeStrategy` 通过 G0；同一种子结果可复现。
+      （T41 补证据：tests/test_validation_synthetic.py 17 条——test_plant_edge_zero_drift_bitwise_identity /
+      test_planted_edge_strategy_passes_g0 / test_plant_edge_deterministic_same_seed_same_output /
+      test_block_permute_seed_reproducible 等；tests/test_gate_calibration_script.py 10 条（含
+      test_positive_control_structure_and_detection、test_cli_quick_end_to_end）；提交 11402c0。
+      **注意：gate-power 报告未出**——全量正负对照实验尚未运行，检出率/误报率表完成后才写
+      `docs/research/gate-power-<日期>.md`（第五轮 T39 收尾，工具链已就绪））
 - 计算量：G2 随机入场在本实验里可降到 50 次（报告注明），正式关卡仍用 200 次。
 
 ## T25：执行语义对齐（M1、M3）
 
 **Files:** `engine_b.py`、`validation/lookahead.py`、`src/mt5live/runner.py`、测试。
 
-- [ ] 引擎 B 实现 `reentry="after_signal_change"`、`ruined` 标记与 `week_close ≤ H1` 校验。对齐测试：
+- [x] 引擎 B 实现 `reentry="after_signal_change"`、`ruined` 标记与 `week_close ≤ H1` 校验。对齐测试：
       tick 序列恰好复现 bar OHLC 时，A、B 两层在 `immediate` 与 `after_signal_change` 两种模式下交易时间一致。
-- [ ] 窗口不变性：G0 默认 100 个随机探针（种子由卡 id 派生，如 `zlib.crc32(id)`，可复现），并对一段连续 500 根 bar 逐根比对窗口信号与全史信号。
+      （T41 补证据：提交 9736586（引擎 B-0.5）；tests/test_backtest_engine_b.py 对齐节 14 个用例——
+      两模式下入场时刻完全相等、逐笔净利相等；ruined 粘滞与 week_close≤H1 校验同节覆盖）
+- [x] 窗口不变性：G0 默认 100 个随机探针（种子由卡 id 派生，如 `zlib.crc32(id)`，可复现），并对一段连续 500 根 bar 逐根比对窗口信号与全史信号。
       B1–B6 全部重跑 G0，结果写进 `gates-calibration-v2`。
-- [ ] 实盘运行器的计算窗口改为 `max(3 × lookback_bars, 1000)`（可配置），
+      （T41 补证据：tests/test_validation_lookahead.py::test_default_window_probes_is_100 /
+      test_g0_seed_derived_from_card_id_crc32 / test_sweep_catches_ema_full_history /
+      test_sweep_included_in_run_g0_verdict（连续 500 根扫描）；B1–B6 重跑 G0 全过见
+      docs/research/gates-calibration-v2-2026-10-25.md 第 2 节"六卡新结果（G0 全过）"；提交 9736586）
+- [x] 实盘运行器的计算窗口改为 `max(3 × lookback_bars, 1000)`（可配置），
       `required_data.lookback_bars` 只作为下限。
+      （T41 补证据：src/mt5live/runner.py（提交 9736586）；tests/test_mt5live_runner.py 计算窗口节——
+      test_window_default_is_compute_window_not_lookback / test_compute_window_clips_to_available_bars /
+      test_compute_window_bars_configurable / test_required_lookback_still_lower_bound_for_config）
 
 ## T24：实盘接线（C1、C2、M9、M10、M1 实盘部分）
 
@@ -267,16 +303,23 @@ class RiskGate:
 - 日报：`scripts/live_daily_report.py` 调用 `render_daily_report`，加入每日计划任务。
 
 **集成测试（tests/test_mt5live_integration.py，FakeMT5 + 临时目录，运行器、执行器、风控进程、对账一起跑）**
-- [ ] 正常开平仓；重复触发不重复下单；进程重启不重复下单
-- [ ] killSwitch：之后不再开仓，平仓照常
-- [ ] 日亏达到上限：写 flatten 与 halt → 执行器全平并确认 → 不再开仓
-- [ ] 冬令时日期 22:10 UTC 禁入、夏令时日期 21:10 UTC 禁入
-- [ ] 对账不一致 → pause → 不再开仓；恢复一致后自动解除
-- [ ] 心跳超时 → 全局停机
-- [ ] 周末与每日维护时段：不报错、不下单
-- [ ] 点差尖峰：跳过开仓
-- [ ] `after_signal_change`：止损后信号仍为 1 不重入；信号归零再变 1 后重入；重启后状态保持
+（T41 补证据总条：提交 4d8dcdc——当时 25 条跨进程集成测试 9 场景全过；第五轮 T30 起增至 32 条，CI 1325 passed @2f31c60）
+- [x] 正常开平仓；重复触发不重复下单；进程重启不重复下单
+      （test_scenario_1_open_close_duplicate_and_restart）
+- [x] killSwitch：之后不再开仓，平仓照常（test_scenario_2_kill_switch_blocks_open_allows_close）
+- [x] 日亏达到上限：写 flatten 与 halt → 执行器全平并确认 → 不再开仓
+      （test_scenario_3_daily_loss_flatten_chain / test_risk_process_archives_flatten_after_all_acks）
+- [x] 冬令时日期 22:10 UTC 禁入、夏令时日期 21:10 UTC 禁入（test_scenario_4_dst_forbidden_windows）
+- [x] 对账不一致 → pause → 不再开仓；恢复一致后自动解除（test_scenario_5_reconcile_pause_and_resume）
+- [x] 心跳超时 → 全局停机（test_scenario_6_heartbeat_timeout_global_halt /
+      test_risk_process_checks_all_registered_heartbeats）
+- [x] 周末与每日维护时段：不报错、不下单（test_scenario_7_weekend_and_maintenance_silent_skip）
+- [x] 点差尖峰：跳过开仓（test_scenario_8_spread_spike_skips_open / test_gate_missing_hour_forbids_open）
+- [x] `after_signal_change`：止损后信号仍为 1 不重入；信号归零再变 1 后重入；重启后状态保持
+      （test_scenario_9_after_signal_change / test_immediate_reentry_reopens_after_stop）
 - [ ] **干跑一个交易日**（真实终端，`--dry-run`）：日志脱敏后写 `docs/reports/live-dryrun-<日期>.md`
+      （T41 核实：不勾——干跑正在进行中，`docs/reports/` 下尚无 live-dryrun 报告；第五轮 T34 影子盘
+      会以完整链路重做此验收）
 
 ## T27：研究库隔离与锁箱预算（H3、M11）
 
@@ -285,35 +328,66 @@ class RiskGate:
 
 - [ ] `export_research_store.py`：把 `time < cutoff` 的 K 线导出到 `data_research/bars/**`（同布局，meta 记录来源哈希），
       连同 T28 的成本模型文件复制到 `data_research/costs/`；研究侧 CLI 的 `--data-root` 默认为 `data_research`。
-- [ ] 研究库导出后自检：研究库里任何序列的 `last_time` 都早于 cutoff，否则导出失败。
-- [ ] `permissions.md`：研究、审查账户对 `data\bars`、`data\ticks`、`C:\mt5-lockbox` 拒读，对 `data_research` 只读；
+      （T41 核实：不勾——导出与成本缓存随行已实现（提交 8d375d9，tests/test_export_research_store.py 10 条，
+      本机已导出 84 序列 636MB 自检通过）；但"缺省读 `data_research`"未做，实现为显式 `--research-store` 切换
+      （tests/test_research_bt_script.py::test_screen_research_store_switch / test_screen_default_data_root_unchanged），
+      缺省切换由第五轮 T38 落地（第五轮审核 H4））
+- [x] 研究库导出后自检：研究库里任何序列的 `last_time` 都早于 cutoff，否则导出失败。
+      （T41 补证据：tests/test_export_research_store.py::test_export_fails_when_series_missing_cutoff /
+      test_verify_flags_out_of_bound_series / test_verify_clean_store_passes；提交 8d375d9 提交说明记录本机自检通过）
+- [x] `permissions.md`：研究、审查账户对 `data\bars`、`data\ticks`、`C:\mt5-lockbox` 拒读，对 `data_research` 只读；
       README 删去"直读 data/bars"的示例，改为研究库用法，并注明主库仅限管理员与实盘侧。
-- [ ] `reconcile_ab.py` 读锁箱期数据必须显式 `--ops-ack`，并在台账里记一行 `actor=ops`。
-- [ ] 锁箱预算：台账新增 `lockbox_budget(cutoff, max_uses)`；G5 在预算用尽时拒绝。
+      （T41 补证据：提交 8d375d9 改写 docs/p6/permissions.md 与 README.md；tests/test_p6_docs.py::
+      test_permissions_doc_research_store_isolation / test_readme_research_store_not_main_store）
+- [x] `reconcile_ab.py` 读锁箱期数据必须显式 `--ops-ack`，并在台账里记一行 `actor=ops`。
+      （T41 补证据：tests/test_reconcile_ab.py::test_cli_requires_ops_ack_when_window_hits_lockbox /
+      test_cli_ops_ack_records_ledger_row_actor_ops；提交 8d375d9）
+- [x] 锁箱预算：台账新增 `lockbox_budget(cutoff, max_uses)`；G5 在预算用尽时拒绝。
       具体数值与退役规则等用户对 D16 的决定，未决定前 `max_uses` 默认 5。
+      （T41 补证据：tests/test_lockbox_budget.py 12 条（预算用尽拒绝、started 即计数、用尽不烧卡）；
+      提交 8d375d9；D16 仍待用户决定，缺省 5 与计划一致）
 
 ## T29：权限白名单与文档对齐（M12、L1、L2、L3）
 
-- [ ] `scripts/hooks/pre-commit-readonly-paths` 改为白名单：研究、审查角色只能新增 `research/cards/*.toml`
+- [x] `scripts/hooks/pre-commit-readonly-paths` 改为白名单：研究、审查角色只能新增 `research/cards/*.toml`
       （已提交的卡文件不得修改）、修改 `src/mt5quant/strategies/library/**`、`tests/test_strategies_*.py`、
       `docs/research/**`；其余路径一律拒绝。新增与修改用 `git diff --cached --name-status` 区分
       （卡文件只放行状态 `A`）。守护测试覆盖新增卡、修改旧卡、改成本模型、改 `bt.py`、改钩子本身五种情形；
       现有 `tests/test_p6_docs.py::test_hook_allows_research_paths` 里的 `docs/p6/research-agent.md`
       改为应拦截（研究规则由管理员维护，研究角色不能改自己的规则）。
-- [ ] `docs/p6/research-agent.md`、`review-agent.md` 与 T21 的谱系规则、T27 的研究库对齐（删去与代码矛盾的
+      （T41 补证据：提交 4c2fdfd；tests/test_p6_docs.py 五种情形——test_hook_whitelist_new_card_allowed /
+      test_hook_whitelist_modified_card_rejected / test_hook_whitelist_cost_model_rejected /
+      test_hook_whitelist_bt_script_rejected / test_hook_whitelist_hook_itself_rejected；
+      `docs/p6/research-agent.md` 已列入拦截清单（test_hook_blocks_everything_outside_whitelist，注释"研究角色
+      不能改自己的规则"）。注意：角色仍取自环境变量（第五轮 H4/T38 改 CI 白名单））
+- [x] `docs/p6/research-agent.md`、`review-agent.md` 与 T21 的谱系规则、T27 的研究库对齐（删去与代码矛盾的
       "version +1 改同一文件"）。
-- [ ] 本计划与上一份计划的复选框做一次核实：没有证据的取消勾选并注明原因
+      （T41 补证据：提交 4c2fdfd（两份规则文件对齐卡谱系 v2）；tests/test_p6_docs.py::
+      test_research_rules_card_lineage_v2 / test_review_rules_card_lineage_v2；研究库用法随 8d375d9 写进
+      permissions.md 与 README，test_permissions_doc_research_store_isolation 守护）
+- [x] 本计划与上一份计划的复选框做一次核实：没有证据的取消勾选并注明原因
       （例如上一份计划 T10 的 MT5 测试器对账）。
-- [ ] 每完成一个阶段，更新蓝图 §2 现状表（证据等级如实填写）。
+      （T41 补证据：上一份计划已核实——提交 7926184（T10 MT5 测试器取消勾选并注明、T3 实现补勾附证据）；
+      本计划 T21/T22/T24/T25/T26/T27/T29 由第五轮 T41（2026-10-26）逐条补证据或注明原因，见本文件各条）
+- [x] 每完成一个阶段，更新蓝图 §2 现状表（证据等级如实填写）。
+      （T41 补证据：阶段 A 后提交 18367fb（蓝图 §2 P2/P5 更新）；提交 7926184（P3/P4/P6/P7 按证据等级）；
+      第五轮开篇提交 37d503f（蓝图 v3.1，§2 改四级证据并如实降标 P7））
 
 ## T26：证据补齐（H7）
 
-- [ ] 多笔 A/B 对账：`MACrossRef` 同逻辑的 Python 策略加 ATR 止损、止盈，多空都做，在 XAUUSD H1 与 USTEC M5
+- [x] 多笔 A/B 对账：`MACrossRef` 同逻辑的 Python 策略加 ATR 止损、止盈，多空都做，在 XAUUSD H1 与 USTEC M5
       的 tick 覆盖期（2026-01 起）各跑一遍，`immediate` 与 `after_signal_change` 两种模式，合计 ≥ 100 笔；
       按出场类型给出时间差与净利差的分布。需要 `--ops-ack`（读锁箱期数据只做执行口径核对，不产生研究结论）。
+      （T41 补证据：docs/reports/reconciliation-v2-2026-10-25.md——1,101 笔配对（99.8%）、出场原因 100% 一致、
+      按出场类型的分布与超限归因；提交 4679b6a；tests/test_backtest_reference.py（参考策略）+
+      tests/test_reconcile_ab.py（--ops-ack 闸门）。偏离：USTEC tick 实际自 2026-10-11 起（非 2026-01），
+      已在报告 §8 写明）
 - [ ] MT5 策略测试器对账（U0 用户操作）：用户跑完 EA 后，agent 运行 `reconcile_mt5_tester.py` 并写报告。
+      （T41 核实：不勾——U0 用户操作未执行，`docs/reports/` 无对应报告；EA 与解析脚本已就绪
+      （tests/test_reconcile_mt5_tester.py））
 - [ ] 模拟盘影子对账（演练期间）：用演练期的真实 tick 回放 B 层，与模拟盘实际成交逐笔比对，
       按小时校准 `SlippageModel`（成本版本号递增）。
+      （T41 核实：不勾——两周演练尚未开始（第五轮 T30–T34 完成后进入，蓝图 §7），无演练期数据）
 - 报告：`docs/reports/reconciliation-v2-<日期>.md`。
 
 ---

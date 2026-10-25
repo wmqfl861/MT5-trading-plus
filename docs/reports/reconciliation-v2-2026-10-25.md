@@ -148,7 +148,7 @@ S6 中 B 提前 4 小时止盈后于 08:00 重入（immediate），A 于 12:00 �
   可用覆盖；如需更长 USTEC 窗口须先回补 tick（`scripts/download_ticks.py`）。
 - XAUUSD H1 用 0.1 手（1 手 × 2×ATR 止损在 8 个月窗口会触发爆仓标记，改变交易
   链）；USTEC 合约大小 1.0，用 1.0 手。
-- 成本装配出现 `missNY[17]`（点差模型缺 17 个纽约小时的统计）：`reconcile_ab.py`
+- 成本装配出现 `missNY[17]`（点差模型缺纽约 17 点这一小时的统计）：`reconcile_ab.py`
   不装配 SessionPolicy，两层同样不受禁入限制，不影响对账口径；正式回测路径会按
   forbid 禁入处理。
 - 本对账期间全量正负对照实验（T22）在后台占 CPU 并行运行，互不干扰；未触碰

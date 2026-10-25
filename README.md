@@ -207,6 +207,10 @@ cutoff 直接报错（绝不静默截断）；MCP `get_bars` 同一约束（越�
 > - T37、T39 完成之前不跑 G5。
 > - T35–T38 完成之前不开新研究卡。
 
+> **实盘口径备注**：日亏上限按 **UTC 自然日**（00:00 UTC 换日）计算，与交易日
+> （纽约 17:00 换日）不同——刻意选择：口径简单，且与回测年化口径一致
+> （`src/mt5live/riskproc.py::daily_pnl`；第五轮审核 L2）。
+
 ## 每日调度
 
 `scripts/setup_scheduled_tasks.ps1`（安装：右键"使用 PowerShell 运行"或

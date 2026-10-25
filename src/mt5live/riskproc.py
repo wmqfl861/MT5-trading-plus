@@ -339,6 +339,8 @@ def daily_pnl(deals, positions) -> tuple[float, float]:
 
     已实现 = 当日全部成交流水的 profit+commission+swap+fee（只计交易类
     entry，出入金绝不计入）；浮动 = 持仓 profit + swap。
+    「当日」按 UTC 自然日计算（00:00 UTC 换日），与交易日（纽约 17:00 换日）
+    不同——刻意选择：口径简单，且与回测年化（按 UTC bar 时间）一致（L2）。
     """
     realized = sum(d.profit + d.commission + d.swap + d.fee
                    for d in deals if d.entry in TRADE_ENTRY_KINDS)
