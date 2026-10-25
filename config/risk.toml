@@ -1,0 +1,18 @@
+# 风控配置（P7）——字段与 mt5live.riskproc.RiskConfig 一一对应。
+# 模拟盘阶段的保守默认；上实盘前由用户逐项复核（金额均为账户货币 USD）。
+# 内置规则：非 crypto_symbols 品种禁止 UTC 21:00–21:59 开仓（换日/结算窗）。
+
+version = 1
+symbols = ["XAUUSD", "BTCUSD", "EURUSD", "USTEC"]
+max_lots_per_order = 0.50
+max_positions_per_symbol = 3
+max_usd_exposure = 100000.0
+max_orders_per_minute = 6
+daily_loss_cap_usd = 500.0
+
+crypto_symbols = ["BTCUSD"]
+
+[[forbidden]]
+symbol = "EURUSD"
+start_hour_utc = 22
+end_hour_utc = 24
