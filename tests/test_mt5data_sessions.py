@@ -175,7 +175,7 @@ post_minutes = 60
 exempt_symbols = ["BTCUSD"]
 
 [forbidden.extended.EURUSD]
-end_local = "23:00"
+end_local = "18:30"
 
 [costs]
 spread_gate_multiplier = 3.0
@@ -188,7 +188,7 @@ def _policy() -> SessionPolicy:
         rollover_local="17:00", rollover_tz=NY_TZ,
         pre_minutes=5, post_minutes=60,
         exempt_symbols=frozenset({"BTCUSD"}),
-        extended_ends={"EURUSD": "23:00"},
+        extended_ends={"EURUSD": "18:30"},
     )
 
 
@@ -221,13 +221,13 @@ def test_exempt_symbol_allowed_in_rollover_window():
     assert p.entry_allowed("BTCUSD", datetime(2026, 12, 15, 22, 10))
 
 
-def test_extended_window_eurusd_until_23_local():
+def test_extended_window_eurusd_short_end():
     p = _policy()
-    # EURUSD 扩展到 23:00 本地：22:30 UTC = 18:30 NY 仍在 [16:55, 23:00) → 禁入
-    assert not p.entry_allowed("EURUSD", datetime(2026, 7, 15, 22, 30))
-    # 23:00 NY（=次日 03:00 UTC）边界不含 → 允许
-    assert p.entry_allowed("EURUSD", datetime(2026, 7, 16, 3, 0))
-    assert not p.entry_allowed("EURUSD", datetime(2026, 7, 16, 2, 59, 59))
+    # EURUSD 扩展到 18:30 本地：22:00 UTC = 17:00 NY 在 [16:55, 18:30) → 禁入；
+    # 22:30 UTC = 18:30 NY 边界不含 → 允许（P11 反转：不再 6 小时禁入）
+    assert not p.entry_allowed("EURUSD", datetime(2026, 7, 15, 22, 0))
+    assert p.entry_allowed("EURUSD", datetime(2026, 7, 15, 22, 30))
+    assert p.entry_allowed("EURUSD", datetime(2026, 7, 16, 1, 30))
     # 基础品种 18:00 NY（夏令时 22:00 UTC）已恢复，EURUSD 仍禁入（扩展窗差异）
     assert p.entry_allowed("XAUUSD", datetime(2026, 7, 15, 22, 0))
     assert not p.entry_allowed("EURUSD", datetime(2026, 7, 15, 22, 0))
@@ -271,6 +271,50 @@ def test_policy_validation_rejects_bad_values():
         SessionPolicy().with_forbidden_hours({"XAUUSD": (24,)})
 
 
+# ---- T35：扩展窗长度上限（>3 小时须 allow_long_window 显式放行） ----
+
+
+def test_extended_window_over_3h_rejected_without_flag():
+    # 17:00 → 23:00 = 6 小时 > 3 小时上限（旧 EURUSD 初值口径）→ 拒绝
+    with pytest.raises(ValueError, match="allow_long_window"):
+        SessionPolicy(extended_ends={"EURUSD": "23:00"})
+    with pytest.raises(ValueError, match="allow_long_window"):
+        SessionPolicy(extended_ends={"EURUSD": "20:05"})  # 185 分钟，超 3 小时 1 档也算
+
+
+def test_extended_window_exactly_3h_allowed():
+    # 17:00 → 20:00 恰 180 分钟（≤3 小时）→ 无须放行标志
+    p = SessionPolicy(extended_ends={"EURUSD": "20:00"})
+    assert p.extended_ends == {"EURUSD": "20:00"}
+
+
+def test_extended_window_over_3h_allowed_with_flag():
+    p = SessionPolicy(extended_ends={"EURUSD": "23:00"},
+                      extended_allow_long={"EURUSD"})
+    assert p.entry_allowed("EURUSD", datetime(2026, 7, 15, 12, 0))  # 正常构建
+
+
+def test_load_policy_rejects_long_window_and_reads_flag(tmp_path):
+    p = tmp_path / "sessions.toml"
+    base = SESSIONS_TOML.replace('end_local = "18:30"', 'end_local = "23:00"')
+    p.write_text(base, encoding="utf-8")
+    with pytest.raises(SessionConfigError, match="allow_long_window"):
+        load_session_policy(str(p))
+    # 显式 allow_long_window = true → 放行（理由写 TOML 注释，代码只认布尔）
+    p.write_text(base.replace(
+        'end_local = "23:00"', 'end_local = "23:00"\nallow_long_window = true'),
+        encoding="utf-8")
+    pol = load_session_policy(str(p))
+    assert pol.extended_ends == {"EURUSD": "23:00"}
+    assert pol.extended_allow_long == frozenset({"EURUSD"})
+    # 标志类型必须是布尔
+    p.write_text(base.replace(
+        'end_local = "23:00"', 'end_local = "23:00"\nallow_long_window = "yes"'),
+        encoding="utf-8")
+    with pytest.raises(SessionConfigError, match="allow_long_window"):
+        load_session_policy(str(p))
+
+
 def test_load_session_policy_from_toml(tmp_path):
     p = tmp_path / "sessions.toml"
     p.write_text(SESSIONS_TOML, encoding="utf-8")
@@ -278,7 +322,8 @@ def test_load_session_policy_from_toml(tmp_path):
     assert pol.rollover_local == "17:00" and pol.rollover_tz == NY_TZ
     assert pol.pre_minutes == 5 and pol.post_minutes == 60
     assert pol.exempt_symbols == frozenset({"BTCUSD"})
-    assert pol.extended_ends == {"EURUSD": "23:00"}
+    assert pol.extended_ends == {"EURUSD": "18:30"}
+    assert pol.extended_allow_long == frozenset()
     assert pol.spread_gate_multiplier == 3.0
     assert pol.missing_hour_policy == "forbid"
     assert not pol.entry_allowed("XAUUSD", datetime(2026, 7, 15, 21, 10))
@@ -305,13 +350,25 @@ def test_load_session_policy_strict_validation(tmp_path):
 
 
 def test_repo_sessions_toml_defaults_match_plan():
-    # 仓库实际配置：换日 17:00 NY、前 5 分钟到后 60 分钟、BTCUSD 豁免、
-    # EURUSD 扩展到 23:00、倍数 3.0、missing forbid（初值，待 DST 实测定稿）
+    # 仓库实际配置（T35 定稿）：换日 17:00 NY、前 5 分钟到后 60 分钟、BTCUSD 豁免、
+    # **无扩展窗**（EURUSD 23:00 初值已删——按纽约本地小时重测：工作日 18:00 已
+    # 完全恢复、残余尖峰来自周日开盘，见 docs/research/rollover-dst-2026-10-25.md）
     repo = Path(__file__).resolve().parents[1] / "config" / "sessions.toml"
     pol = load_session_policy(str(repo))
     assert pol.rollover_local == "17:00" and pol.rollover_tz == NY_TZ
     assert pol.pre_minutes == 5 and pol.post_minutes == 60
     assert pol.exempt_symbols == frozenset({"BTCUSD"})
-    assert pol.extended_ends == {"EURUSD": "23:00"}
+    assert pol.extended_ends == {}
     assert pol.spread_gate_multiplier == 3.0
     assert pol.missing_hour_policy == "forbid"
+
+
+def test_repo_policy_p11_reversal_eurusd():
+    # 探针 P11 反转（T35 失败测试清单第 1 条）：2026-07-15（EDT）换日 21:00 UTC、
+    # 基础禁入窗 20:55–22:00 UTC；此前扩展到 23:00 本地会把 20:55–03:00 全禁。
+    repo = Path(__file__).resolve().parents[1] / "config" / "sessions.toml"
+    pol = load_session_policy(str(repo))
+    assert not pol.entry_allowed("EURUSD", datetime(2026, 7, 15, 21, 30))   # 换日窗内
+    assert pol.entry_allowed("EURUSD", datetime(2026, 7, 15, 22, 30))       # 18:30 NY
+    assert pol.entry_allowed("EURUSD", datetime(2026, 7, 16, 1, 30))        # 21:30 NY
+    assert pol.entry_allowed("EURUSD", datetime(2026, 7, 15, 2, 30))        # 22:30 NY 前一晚（窗口外）

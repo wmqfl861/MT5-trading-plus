@@ -23,6 +23,11 @@ import pytest
 
 from mt5data.sessions import load_session_policy
 from mt5data.store import save_bars
+from mt5gw.models import (
+    DEAL_REASON_CLIENT,
+    DEAL_REASON_SL,
+    DEAL_REASON_TP,
+)
 from mt5live.config import LiveConfig
 from mt5live.executor import (
     ExecutionAdapter,
@@ -30,7 +35,12 @@ from mt5live.executor import (
     validate_live_strategy,
 )
 from mt5live.gate import LiveSizer, RiskGate
-from mt5live.reconcile import ExpectedStateError, load_expected_dir
+from mt5live.reconcile import (
+    ExpectedStateError,
+    Intent,
+    load_intents,
+    write_intent,
+)
 from mt5live.riskproc import AccountSnapshot, RiskProcess, load_risk_config
 from mt5live.runner import (
     MarketClosedError,
@@ -78,8 +88,6 @@ tz = "America/New_York"
 pre_minutes = 5
 post_minutes = 60
 exempt_symbols = ["BTCUSD"]
-[forbidden.extended.EURUSD]
-end_local = "23:00"
 [costs]
 spread_gate_multiplier = 3.0
 missing_hour_policy = "forbid"
@@ -123,6 +131,20 @@ def alerts_text(live_dir) -> str:
     p = os.path.join(live_dir, "alerts.log")
     with open(p, encoding="utf-8") as f:
         return f.read()
+
+
+def pause_file(live_dir, magic: int = MAGIC) -> str:
+    """T30/D20：对账暂停按策略隔离 → pause-<magic>.json（全局 pause.json 只留给人工）。"""
+    return os.path.join(live_dir, f"pause-{magic}.json")
+
+
+def pause_state(live_dir, magic: int = MAGIC) -> bool | None:
+    p = pause_file(live_dir, magic)
+    return read_json(p)["paused"] if os.path.exists(p) else None
+
+
+def intent_of(live_dir, magic: int = MAGIC) -> dict:
+    return read_json(os.path.join(live_dir, f"expected-{magic}.json"))
 
 
 class LiveStack:
@@ -215,16 +237,42 @@ class LiveStack:
             deals=tuple(self.broker.deals(day_start, now)))
         return self.process.run_cycle(snap, now)
 
-    def reconcile_once(self):
+    def reconcile_once(self, now: datetime | None = None):
         mod = load_script("live_reconcile")
         return mod.run_once(self.live_dir, FakeGateway(self.broker),
-                            volume_tolerance=1e-6)
+                            volume_tolerance=1e-6, now=now)
 
 
 def expected_lots(decision) -> float:
     """T23 同一函数按权益 10000、止损距离 = sl_atr×ATR 复算手数。"""
     return lots_for_risk(10_000.0, 0.005, decision.sl_atr * decision.atr,
                          CONTRACT, VOL[0], VOL[1], VOL[2])
+
+
+def reconcile_all(*stacks, now: datetime | None = None):
+    """跨全部 stack 的对账：真实世界只有一个账户——合并各 FakeBroker 的
+    持仓视图再跑 live_reconcile.run_once（多策略共用 live 目录的测试用）。"""
+    mod = load_script("live_reconcile")
+
+    class _MergedAccount:
+        def __init__(self, brokers):
+            self._brokers = brokers
+
+        def positions(self, symbol=None):
+            out = []
+            for b in self._brokers:
+                out.extend(b.positions(symbol))
+            return out
+
+    class _MergedGateway:
+        def __init__(self, brokers):
+            self.account = _MergedAccount(brokers)
+
+        def shutdown(self):
+            pass
+
+    gw = _MergedGateway([s.broker for s in stacks])
+    return mod.run_once(stacks[0].live_dir, gw, volume_tolerance=1e-6, now=now)
 
 
 # ================================================================ 场景 1
@@ -243,11 +291,12 @@ def test_scenario_1_open_close_duplicate_and_restart(tmp_path):
     assert pos[0].volume == pytest.approx(lots)
     assert stack.broker.market_orders[0]["magic"] == MAGIC
 
-    # expected-<magic>.json：对账进程的目标持仓契约
+    # expected-<magic>.json（T30 意图）：对账进程的目标持仓契约
     exp = read_json(os.path.join(stack.live_dir, f"expected-{MAGIC}.json"))
-    assert exp["positions"] == [
-        {"symbol": SYMBOL, "magic": MAGIC, "side": "buy",
-         "volume": pytest.approx(lots)}]
+    assert exp["symbol"] == SYMBOL and exp["magic"] == MAGIC
+    assert exp["side"] == "buy"
+    assert exp["volume"] == pytest.approx(lots)
+    assert exp["status"] == "confirmed" and exp["cause"] == d1.decision_id
 
     # 重复触发（同一 decision 再投递）：duplicate，不再下单
     rr_dup = stack.executor.poll(d1, T1 + timedelta(seconds=30))
@@ -265,7 +314,7 @@ def test_scenario_1_open_close_duplicate_and_restart(tmp_path):
     assert d2.signal == 0 and rr2.action == "close"
     assert stack.broker.positions(SYMBOL) == []
     exp2 = read_json(os.path.join(stack.live_dir, f"expected-{MAGIC}.json"))
-    assert exp2["positions"][0]["volume"] == 0.0
+    assert exp2["volume"] == 0.0 and exp2["status"] == "confirmed"
     assert heartbeats(stack.live_dir)["last_error"] is None
 
 
@@ -370,18 +419,19 @@ def test_scenario_4_dst_forbidden_windows(tmp_path):
 
 
 # ================================================================ 场景 5
-# 对账不一致 → pause → 不再开仓；恢复一致后自动解除
+# 对账不一致 → pause-<magic>（T30/D20：按策略隔离）→ 不再开仓；恢复一致后自动解除
 
 def test_scenario_5_reconcile_pause_and_resume(tmp_path):
     stack = LiveStack(tmp_path)
     _, rr1 = stack.round(T1, "flat")
     assert rr1.action == "hold"
 
-    # 账户出现不该有的持仓（该 magic 无目标）→ 对账不一致 → pause
+    # 账户出现不该有的持仓（该 magic 无目标）→ 对账不一致 → pause-<magic>
     stray = stack.broker.seed_position(side="buy", volume=0.05, magic=MAGIC)
     rc, _ = stack.reconcile_once()
     assert rc == 1
-    assert read_json(os.path.join(stack.live_dir, "pause.json"))["paused"]
+    assert read_json(pause_file(stack.live_dir))["paused"]
+    assert not os.path.exists(os.path.join(stack.live_dir, "pause.json"))  # 全局只留给人工
 
     # pause 期间开仓被拒
     n_orders = len(stack.broker.market_orders)
@@ -390,11 +440,11 @@ def test_scenario_5_reconcile_pause_and_resume(tmp_path):
     assert "reconcile_paused" in rr2.error
     assert len(stack.broker.market_orders) == n_orders
 
-    # 恢复一致 → pause.json 写回 false → 开仓自动解除
+    # 恢复一致 → pause-<magic>.json 写回 false → 开仓自动解除
     stack.broker.remove_position(stray.ticket)
     rc2, _ = stack.reconcile_once()
     assert rc2 == 0
-    assert not read_json(os.path.join(stack.live_dir, "pause.json"))["paused"]
+    assert not read_json(pause_file(stack.live_dir))["paused"]
     _, rr3 = stack.round(T3, "up")
     assert rr3.action == "open"
 
@@ -587,6 +637,223 @@ def test_immediate_reentry_reopens_after_stop(tmp_path):
     assert len(stack.broker.market_orders) == 2
 
 
+# ================================================================ T30 意图语义
+#（C1/P8 反转：expected-<magic>.json 改为意图——下单前 pending、订单后 confirmed、
+# 服务器端 SL/TP/SO 出场按成交原因识别；暂停按策略隔离）
+
+def _run_protective_exit_case(tmp_path, *, reason: int, comment: str,
+                              profit: float) -> None:
+    """保护性出场（SL/TP/SO）：识别为已解释 → 意图=实际净持仓；对账一致无暂停；
+    immediate 下一根照常重开、after_signal_change 禁止重入；另一策略不受影响。"""
+    for label, rules, expect in (
+            ("immediate", DEFAULT_RULES, "open"),
+            ("after_signal_change", ASC_RULES, "blocked_reentry")):
+        base = tmp_path / label
+        stack = LiveStack(base, exit_rules=rules)
+        other = LiveStack(base, magic=MAGIC_B)      # 同 live 目录的另一策略
+        _, rr1 = stack.round(T1, "up")
+        assert rr1.action == "open"
+        ticket = stack.broker.positions(SYMBOL)[0].ticket
+        stack.broker.close_external(ticket, profit=profit, comment=comment,
+                                    reason=reason)
+
+        # 执行器下一轮开头识别外部出场：reason 已解释 → 意图改为实际净持仓
+        _, rr2 = stack.round(T2, "up")
+        assert rr2.action == expect
+        if expect == "blocked_reentry":
+            # 禁入轮不下单：意图保持"已解释的空仓"
+            it = intent_of(stack.live_dir)
+            assert it["status"] == "confirmed"
+            assert it["cause"].startswith("external_exit:")
+            assert it["volume"] == 0.0
+        # 对账一致、无暂停（本 magic 与全局都没有；P8 死锁反转）
+        rc, _ = stack.reconcile_once(now=T2 + timedelta(seconds=30))
+        assert rc == 0
+        assert pause_state(stack.live_dir) in (None, False)
+        assert not os.path.exists(os.path.join(stack.live_dir, "pause.json"))
+        # 另一策略照常开仓：一个策略的出场不该停掉别人
+        _, rr_b = other.round(T2 + timedelta(minutes=15), "up")
+        assert rr_b.action == "open"
+
+
+def test_t30_sl_exit_reconcile_consistent_no_pause(tmp_path):
+    """止损出场（reason=SL）后对账一致、无暂停；两种重入模式行为正确。"""
+    _run_protective_exit_case(tmp_path, reason=DEAL_REASON_SL, comment="[sl]",
+                              profit=-30.0)
+
+
+def test_t30_tp_exit_reconcile_consistent_no_pause(tmp_path):
+    """止盈出场（reason=TP）同上。"""
+    _run_protective_exit_case(tmp_path, reason=DEAL_REASON_TP, comment="[tp]",
+                              profit=30.0)
+
+
+def test_t30_sl_exit_transient_pause_auto_releases(tmp_path):
+    """P8 原序：对账抢在执行器识别之前运行 → 只写本 magic 的短暂暂停，
+    执行器下一轮识别后自动解除（不再永久死锁）。"""
+    stack = LiveStack(tmp_path)
+    other = LiveStack(tmp_path, magic=MAGIC_B)
+    stack.round(T1, "up")
+    ticket = stack.broker.positions(SYMBOL)[0].ticket
+    stack.broker.close_external(ticket, profit=-30.0, comment="[sl]",
+                                reason=DEAL_REASON_SL)
+    # 识别发生前对账：意图（0.16 手）≠ 实际（空仓）→ 只暂停本 magic
+    rc, _ = reconcile_all(stack, other, now=T1 + timedelta(seconds=30))
+    assert rc == 1
+    assert read_json(pause_file(stack.live_dir))["paused"] is True
+    assert not os.path.exists(os.path.join(stack.live_dir, "pause.json"))
+    # 另一策略不受这个（本 magic 的）暂停影响
+    _, rr_b = other.round(T1 + timedelta(minutes=5), "up")
+    assert rr_b.action == "open"
+    # 执行器轮：识别止损出场 → 意图=空仓；开仓腿被残留暂停挡下（一轮而已）
+    _, rr = stack.round(T2, "up")
+    assert rr.action == "risk_rejected"
+    assert "reconcile_paused" in rr.error
+    assert intent_of(stack.live_dir)["cause"].startswith("external_exit:")
+    # 意图已解释 → 下一轮对账自动解除暂停
+    rc2, _ = reconcile_all(stack, other, now=T2 + timedelta(seconds=30))
+    assert rc2 == 0
+    assert not read_json(pause_file(stack.live_dir))["paused"]
+    # 暂停已解除：下一根照常重开（immediate）
+    _, rr3 = stack.round(T3, "up")
+    assert rr3.action == "open"
+
+
+def test_t30_manual_close_pauses_only_this_magic_until_acked(tmp_path, monkeypatch):
+    """人工平仓（reason=CLIENT）→ 只写 pause-<本magic>；另一 magic 照常开仓；
+    live_ack_external 登记实际持仓为意图后恢复。"""
+    stack = LiveStack(tmp_path)
+    other = LiveStack(tmp_path, magic=MAGIC_B)
+    _, rr1 = stack.round(T1, "up")
+    assert rr1.action == "open"
+    ticket = stack.broker.positions(SYMBOL)[0].ticket
+    stack.broker.close_external(ticket, profit=5.0, comment="manual",
+                                reason=DEAL_REASON_CLIENT)
+
+    # 对账（30 秒一轮 << bar 间隔）：意图 0.16 vs 实际 0 → 只暂停本 magic
+    rc, _ = stack.reconcile_once(now=T2)
+    assert rc == 1
+    assert read_json(pause_file(stack.live_dir))["paused"] is True
+    assert not os.path.exists(os.path.join(stack.live_dir, "pause.json"))
+    # 另一 magic 照常开仓
+    _, rr_b = other.round(T2 + timedelta(minutes=5), "up")
+    assert rr_b.action == "open"
+
+    # 本 magic 的执行器轮：CLIENT 不在已解释集合 → 不改意图、写告警、交给对账；
+    # 重开被本 magic 的暂停挡下
+    _, rr2 = stack.round(T2 + timedelta(minutes=10), "up")
+    assert rr2.action == "risk_rejected"
+    assert "reconcile_paused" in rr2.error
+    it = intent_of(stack.live_dir)
+    assert it["volume"] == pytest.approx(0.16)      # 意图未被洗白
+    assert not it["cause"].startswith("external_exit:")
+    assert "EXTERNAL_EXIT" in alerts_text(stack.live_dir)
+
+    # 人工确认：把当前实际持仓（空仓）登记为意图（cause=ack_external）
+    ack = load_script("live_ack_external")
+    monkeypatch.setattr(ack, "_open_gateway",
+                        lambda cfg: FakeGateway(stack.broker))
+    rc_ack = ack.main(["--data-dir", str(tmp_path), "--magic", str(MAGIC),
+                       "--reason", "人工平仓已核对"])
+    assert rc_ack == 0
+    it2 = intent_of(stack.live_dir)
+    assert it2["status"] == "confirmed" and it2["cause"] == "ack_external"
+    assert it2["volume"] == 0.0
+    assert "ACK_EXTERNAL" in alerts_text(stack.live_dir)
+
+    # 对账一致 → 暂停解除 → 恢复开仓
+    rc2, _ = reconcile_all(stack, other, now=T2 + timedelta(minutes=11))
+    assert rc2 == 0
+    assert not read_json(pause_file(stack.live_dir))["paused"]
+    _, rr3 = stack.round(T2 + timedelta(minutes=15), "up")
+    assert rr3.action == "open"
+
+
+def test_t30_reconcile_in_pending_window_does_not_pause(tmp_path):
+    """对账恰在"pending 已写、订单未回"时运行（FakeBroker 下单钩子里调用）
+    → 宽限期内不判 → 不暂停（C1 的短暂误报反转）。"""
+    stack = LiveStack(tmp_path)
+    seen = {}
+    orig = stack.broker.market_order
+
+    def hooked(*a, **kw):
+        # 此刻执行器已写 Intent(0.16, pending)，订单尚未回报，实际仍空仓
+        seen["rc"], seen["res"] = stack.reconcile_once(now=T1)
+        return orig(*a, **kw)
+
+    stack.broker.market_order = hooked
+    _, rr = stack.round(T1, "up")
+    assert rr.action == "open"
+    assert seen["rc"] == 0                       # pending 宽限 → 不判 → 不暂停
+    assert seen["res"].ok
+    assert pause_state(stack.live_dir) in (None, False)
+    assert not os.path.exists(os.path.join(stack.live_dir, "pause.json"))
+    # 订单回报后意图 confirmed=成交量 → 对账仍一致
+    rc2, _ = stack.reconcile_once(now=T1 + timedelta(seconds=5))
+    assert rc2 == 0
+
+
+def test_t30_partial_fill_intent_is_filled_volume_with_alert(tmp_path):
+    """部分成交 → 意图 = 成交量（confirmed），写告警；下一轮补足。"""
+    stack = LiveStack(tmp_path)
+    stack.broker.partial_volume = 0.08           # 请求 0.16 只成 0.08
+    d1, rr1 = stack.round(T1, "up")
+    assert rr1.action == "open"
+    assert any(o.partial for o in rr1.orders)
+    it = intent_of(stack.live_dir)
+    assert it["status"] == "confirmed"
+    assert it["cause"] == d1.decision_id
+    assert it["volume"] == pytest.approx(0.08)   # 意图=成交量（如实）
+    assert "PARTIAL_FILL" in alerts_text(stack.live_dir)
+    # 意图=实际 → 对账一致，不暂停
+    rc, _ = stack.reconcile_once(now=T1 + timedelta(seconds=5))
+    assert rc == 0
+    assert pause_state(stack.live_dir) in (None, False)
+
+    # 下一轮补足到目标手数
+    stack.broker.partial_volume = None
+    _, rr2 = stack.round(T2, "up")
+    assert rr2.action == "add"
+    assert intent_of(stack.live_dir)["volume"] == pytest.approx(0.16)
+    assert sum(p.volume for p in stack.broker.positions(SYMBOL)) == \
+        pytest.approx(0.16)
+
+
+def test_t30_legacy_expected_format_readable_new_writes_new_format(tmp_path):
+    """旧格式 expected-*.json 能读（兼容），写出的都是新格式。"""
+    live = tmp_path / "live"
+    live.mkdir(parents=True)
+    ts = datetime(2026, 10, 28, 10, 0)
+    # T24 及以前的旧格式（{"ts", "positions": [...]}）
+    (live / f"expected-{MAGIC}.json").write_text(json.dumps({
+        "ts": "2026-10-28T10:00:00+00:00",
+        "positions": [{"symbol": SYMBOL, "magic": MAGIC, "side": "buy",
+                       "volume": 0.16}]}), encoding="utf-8")
+    # 旧版单文件 expected.json 同样兼容
+    (live / "expected.json").write_text(json.dumps({
+        "ts": "2026-10-28T10:00:00+00:00",
+        "positions": [{"symbol": "EURUSD", "magic": MAGIC_B, "side": "sell",
+                       "volume": 0.1}]}), encoding="utf-8")
+    intents = load_intents(str(live))
+    assert intents == [
+        Intent(SYMBOL, MAGIC, "buy", 0.16, "confirmed", "legacy", ts),
+        Intent("EURUSD", MAGIC_B, "sell", 0.1, "confirmed", "legacy", ts),
+    ]
+
+    # 写出的是新格式（单意图对象，带 status/cause）
+    p = str(live / f"expected-{MAGIC}.json")
+    write_intent(p, Intent(SYMBOL, MAGIC, "buy", 0.16, "pending",
+                           "XAUUSD|M15|d1", ts))
+    raw = read_json(p)
+    assert set(raw) == {"symbol", "magic", "side", "volume", "status",
+                        "cause", "ts"}
+    assert raw["status"] == "pending" and raw["cause"] == "XAUUSD|M15|d1"
+    # 新格式读回
+    again = load_intents(str(live))
+    assert Intent(SYMBOL, MAGIC, "buy", 0.16, "pending", "XAUUSD|M15|d1",
+                  ts) in again
+
+
 # ================================================================ M1 启动校验
 
 def test_executor_rejects_time_stop_strategy(tmp_path):
@@ -703,22 +970,19 @@ def test_risk_process_archives_flatten_after_all_acks(tmp_path):
     assert list((cmds / "archive").glob("flatten-*.json"))
 
 
-def test_load_expected_dir_merges_all_magics(tmp_path):
+def test_load_intents_merges_all_magics(tmp_path):
     live = tmp_path / "live"
     live.mkdir()
-    ts = "2026-10-28T10:00:00+00:00"
-    (live / f"expected-{MAGIC}.json").write_text(json.dumps(
-        {"ts": ts, "positions": [
-            {"symbol": SYMBOL, "magic": MAGIC, "side": "buy",
-             "volume": 0.16}]}), encoding="utf-8")
-    (live / f"expected-{MAGIC_B}.json").write_text(json.dumps(
-        {"ts": ts, "positions": [
-            {"symbol": "EURUSD", "magic": MAGIC_B, "side": "sell",
-             "volume": 0.1}]}), encoding="utf-8")
-    state = load_expected_dir(str(live))
-    assert {p.magic for p in state.positions} == {MAGIC, MAGIC_B}
+    ts = datetime(2026, 10, 28, 10, 0)
+    write_intent(str(live / f"expected-{MAGIC}.json"),
+                 Intent(SYMBOL, MAGIC, "buy", 0.16, "confirmed", "d1", ts))
+    write_intent(str(live / f"expected-{MAGIC_B}.json"),
+                 Intent("EURUSD", MAGIC_B, "sell", 0.1, "confirmed", "d2", ts))
+    intents = load_intents(str(live))
+    assert {i.magic for i in intents} == {MAGIC, MAGIC_B}
+    assert all(i.status == "confirmed" for i in intents)
     with pytest.raises(ExpectedStateError):
-        load_expected_dir(str(tmp_path / "nowhere"))
+        load_intents(str(tmp_path / "nowhere"))
 
 
 # ================================================================ 日报脚本

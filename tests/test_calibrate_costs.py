@@ -321,3 +321,51 @@ def test_free_of_swap_true_when_crossing_charge_moment_with_zero_swap():
     sw = res["symbols"]["EURUSD"]["swap"]
     assert sw["free_of_swap"] is True
     assert sw["long"]["per_lot_per_night"] == 0.0
+
+
+# ---- T35：校准持仓脚本——品种覆盖与手数来源（scripts/calibration_positions.py） ----
+
+
+def _load_calibration_module():
+    import importlib.util as ilu
+    import sys as _sys
+    path = Path(__file__).resolve().parents[1] / "scripts" / "calibration_positions.py"
+    spec = ilu.spec_from_file_location("calibration_positions", path)
+    mod = ilu.module_from_spec(spec)
+    _sys.modules["calibration_positions"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+CAL_SPECS = {
+    "EURUSD": {"volume_min": 0.01},
+    "XAUUSD": {"volume_min": 0.01},
+    "BTCUSD": {"volume_min": 0.01},
+    "USTEC": {"volume_min": 0.05},
+}
+
+
+def test_calibration_orders_cover_all_four_symbols_with_volume_min():
+    cp = _load_calibration_module()
+    orders = cp.calibration_orders(CAL_SPECS)
+    # 四笔各有测量目的：EURUSD 跨周三、XAUUSD 跨周末、BTCUSD 验周末不收、USTEC 验周五三倍
+    assert [s for s, _ in orders] == ["EURUSD", "XAUUSD", "BTCUSD", "USTEC"]
+    # 手数一律取快照 volume_min，不写死（USTEC 的 0.05 必须来自快照）
+    assert dict(orders) == {"EURUSD": 0.01, "XAUUSD": 0.01,
+                            "BTCUSD": 0.01, "USTEC": 0.05}
+
+
+def test_calibration_orders_missing_symbol_raises_with_hint():
+    cp = _load_calibration_module()
+    with pytest.raises(KeyError, match="snapshot_specs"):
+        cp.calibration_orders({"EURUSD": {"volume_min": 0.01}})
+
+
+def test_calibration_orders_read_repo_snapshot():
+    """仓库真实快照（data/specs/latest.json）四品种齐全且手数为各自 volume_min。"""
+    cp = _load_calibration_module()
+    snapshot = Path(__file__).resolve().parents[1] / "data" / "specs" / "latest.json"
+    if not snapshot.exists():
+        pytest.skip("本机无 data/specs/latest.json（CI 环境跳过）")
+    orders = cp.calibration_orders(json.loads(snapshot.read_text(encoding="utf-8")))
+    assert dict(orders)["USTEC"] == 0.05

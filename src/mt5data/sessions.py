@@ -139,8 +139,11 @@ class SessionPolicy:
 
     禁入窗（非豁免品种）= 换日时刻前 pre_minutes 到后 post_minutes（本地墙上
     时间，zoneinfo 逐日换算，DST 感知）；extended_ends 把指定品种的禁入窗
-    **结束**时刻延长到该本地时刻（如 EURUSD 到 23:00——初值，待 DST 周实测
-    定稿，见 docs/research/rollover-dst-2026-10-25.md）。
+    **结束**时刻延长到该本地时刻。T35 起扩展窗长度（换日时刻 → end_local）
+    上限 3 小时：超过须在 sessions.toml 显式写 allow_long_window = true 并
+    附理由注释（数据依据见 docs/research/rollover-dst-2026-10-25.md 第 3 节；
+    初值 EURUSD 23:00 因口径错误已删——纽约本地小时重测显示工作日 18:00
+    已完全恢复，残余尖峰是周日开盘流动性，由点差闸门处理）。
     exempt_symbols 完全豁免换日窗（BTCUSD 7×24），但不豁免 forbidden_hours_ny
     （那是数据保护，不是时段规则）。
     forbidden_hours_ny 是**数据驱动**的补充禁入小时（点差模型缺统计的小时，
@@ -154,15 +157,19 @@ class SessionPolicy:
     post_minutes: int = 60
     exempt_symbols: frozenset = frozenset()
     extended_ends: Mapping[str, str] = field(default_factory=dict)
+    extended_allow_long: frozenset = frozenset()
     forbidden_hours_ny: Mapping[str, frozenset] = field(default_factory=dict)
     spread_gate_multiplier: float = 3.0
     missing_hour_policy: str = "forbid"
+
+    # 扩展窗长度上限（分钟）：换日时刻 → end_local 超过 3 小时须显式放行
+    EXTENDED_WINDOW_MAX_MINUTES = 180
 
     def __post_init__(self):
         _parse_hhmm(self.rollover_local)   # 非法即抛
         try:
             ZoneInfo(self.rollover_tz)
-        except Exception as e:
+        except Exception as e:  # ZoneInfoNotFoundError 等
             raise ValueError(f"未知时区 {self.rollover_tz!r}") from e
         for name in ("pre_minutes", "post_minutes"):
             v = getattr(self, name)
@@ -179,9 +186,17 @@ class SessionPolicy:
         for sym, end in self.extended_ends.items():
             if not sym:
                 raise ValueError("extended_ends 品种名不能为空")
-            if _hhmm_to_minutes(end) <= rollover_min:
+            end_min = _hhmm_to_minutes(end)
+            if end_min <= rollover_min:
                 raise ValueError(
                     f"{sym} 扩展窗结束 {end} 须晚于换日时刻 {self.rollover_local}")
+            if (end_min - rollover_min > self.EXTENDED_WINDOW_MAX_MINUTES
+                    and sym not in self.extended_allow_long):
+                raise ValueError(
+                    f"{sym} 扩展窗长度 {(end_min - rollover_min) // 60} 小时 "
+                    f"{(end_min - rollover_min) % 60} 分（{self.rollover_local}→{end}）"
+                    f"超过 {self.EXTENDED_WINDOW_MAX_MINUTES // 60} 小时上限；确有依据"
+                    f"请在 sessions.toml 写 allow_long_window = true 并附理由注释")
         for sym, hours in self.forbidden_hours_ny.items():
             for h in hours:
                 if not 0 <= int(h) <= 23:
@@ -189,6 +204,8 @@ class SessionPolicy:
         object.__setattr__(self, "exempt_symbols", frozenset(self.exempt_symbols))
         object.__setattr__(
             self, "extended_ends", dict(self.extended_ends))
+        object.__setattr__(
+            self, "extended_allow_long", frozenset(self.extended_allow_long))
         object.__setattr__(
             self, "forbidden_hours_ny",
             {s: frozenset(h) for s, h in self.forbidden_hours_ny.items()})
@@ -300,14 +317,24 @@ def _session_policy_from_dict(data: dict, path: str) -> SessionPolicy:
     if not isinstance(extended_raw, dict):
         raise SessionConfigError("forbidden.extended 须为表（品种 → {end_local}）")
     extended: dict[str, str] = {}
+    extended_allow: set[str] = set()
     for sym, sub in extended_raw.items():
-        if not isinstance(sub, dict) or set(sub) - {"end_local"} or "end_local" not in sub:
+        if (not isinstance(sub, dict)
+                or set(sub) - {"end_local", "allow_long_window"}
+                or "end_local" not in sub):
             raise SessionConfigError(
-                f"forbidden.extended.{sym} 须只含 end_local（HH:MM 本地时刻）")
+                f"forbidden.extended.{sym} 须只含 end_local（HH:MM 本地时刻）"
+                f"与可选 allow_long_window（布尔）")
         end = sub["end_local"]
         if not isinstance(end, str):
             raise SessionConfigError(f"forbidden.extended.{sym}.end_local 须为字符串")
+        allow = sub.get("allow_long_window", False)
+        if not isinstance(allow, bool):
+            raise SessionConfigError(
+                f"forbidden.extended.{sym}.allow_long_window 须为布尔，收到 {allow!r}")
         extended[sym] = end
+        if allow:
+            extended_allow.add(sym)
 
     costs = require("costs")
     if not isinstance(costs, dict):
@@ -331,6 +358,7 @@ def _session_policy_from_dict(data: dict, path: str) -> SessionPolicy:
         pre_minutes=pre, post_minutes=post,
         exempt_symbols=frozenset(exempt),
         extended_ends=extended,
+        extended_allow_long=frozenset(extended_allow),
         spread_gate_multiplier=float(mult),
         missing_hour_policy=policy,
     )

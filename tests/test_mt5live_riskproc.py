@@ -34,13 +34,13 @@ SCRIPT_PATH = REPO_ROOT / "scripts" / "risk_process.py"
 
 NOW = datetime(2026, 10, 26, 14, 30, 0)  # 周一 14:30 UTC，非禁止时段
 
-# 禁入策略（T20）：与 config/sessions.toml 同构——17:00 纽约，前 5 后 60，
-# BTCUSD 豁免，EURUSD 扩展到 23:00 本地。check 的禁入判断唯一来源。
+# 禁入策略（T20/T35）：与 config/sessions.toml 同构——17:00 纽约，前 5 后 60，
+# BTCUSD 豁免；EURUSD 扩展窗已删（T35：按纽约本地小时重测后不再需要）。
+# check 的禁入判断唯一来源。
 POLICY = SessionPolicy(
     rollover_local="17:00", rollover_tz="America/New_York",
     pre_minutes=5, post_minutes=60,
     exempt_symbols=frozenset({"BTCUSD"}),
-    extended_ends={"EURUSD": "23:00"},
 )
 M1 = 20261101  # magic：策略 1
 
@@ -260,11 +260,12 @@ def test_btcusd_exempt_from_rollover_window():
 
 
 @pytest.mark.parametrize("when,rejected", [
-    (datetime(2026, 10, 26, 22, 30, 0), True),    # 18:30 NY：EURUSD 扩展窗内
-    (datetime(2026, 10, 27, 3, 0, 0), False),     # 23:00 NY（次晨 03:00 UTC）边界不含
+    (datetime(2026, 10, 26, 22, 30, 0), False),   # 18:30 NY：扩展窗已删（T35/P11 反转），允许
+    (datetime(2026, 10, 26, 21, 30, 0), True),    # 17:30 NY：换日窗内（17:00–18:00）
+    (datetime(2026, 10, 27, 3, 0, 0), False),     # 23:00 NY：窗口早已结束
     (datetime(2026, 10, 26, 20, 0, 0), False),    # 16:00 NY：窗开始前
 ])
-def test_eurusd_extended_window(when, rejected):
+def test_eurusd_rollover_window_after_extension_removal(when, rejected):
     d = check(req("EURUSD"), make_state(), make_config(), when, POLICY)
     assert d.allowed == (not rejected), d.reason
 
