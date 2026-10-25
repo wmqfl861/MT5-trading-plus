@@ -1,0 +1,27 @@
+# H006：B5 纳指日内动量（USTEC M5，P5 基线）。
+# 机制引用：Gao, Han, Li & Zhou (2018) Market Intraday Momentum,
+# Journal of Financial Economics 129(1)：首个半小时收益预测最后半小时。
+# 先卡后测：第一次回测前已提交到 git。
+id = "H006"
+version = 1
+symbols = ["USTEC"]
+timeframe = "M5"
+session = "America/New_York 09:30-10:00 定方向，15:30-16:00 尾盘半小时同向持有（Gao et al. 2018 的原始窗口）"
+phenomenon = "市场日内动量：标普/ETF/期指开盘头半小时收益对尾盘半小时收益有显著正预测（Gao et al. 2018：首个与最后半小时是日内波动与成交量峰值，方向相关性在小样本外仍稳健）"
+mechanism = "隔夜与开盘信息在首半小时由知情与机构资金定价；收盘前的 MOC/再平衡执行盘（养老金、指数基金）按当日已确立方向增减敞口，迟到的日内交易者跟随——尾盘延续开盘方向，送钱方是承担隔夜风险意愿不足、尾盘才确认方向的迟到资金"
+should_fail_when = "盘中反转日（开盘方向被午盘消息否定，尾盘反向）；低波动周期（首半小时方向噪声大）——min_ret_atr 门槛即为此设"
+falsified_if = "样本内净利为负或 profit factor <1.2；成本 ×1.5 后期望转负（每日 1 笔 M5 交易对成本极敏感）；首半小时方向对尾盘收益的样本内相关符号为负（现象本身不成立）"
+graveyard_checked = []
+
+[rules]
+entry = "开盘头半小时（NY 09:30-10:00）收益 r=末根收盘−首根开盘；r>+min_ret_atr×ATR14 → 方向 +1，r<−门槛 → −1，否则 0（ATR 为简单 TR 均值，取头半小时末根 bar 值，不足则当日不交易）"
+exit = "信号恰在收盘本地时刻 ∈ [15:30,16:00) 的 bar 上取当日方向，其余为 0——引擎 15:30 整点开盘价入场、16:00 整点开盘价离场，持仓恰为尾盘半小时"
+stop = "引擎层 2.0×ATR14（Wilder，信号 bar 值）止损兜底（尾盘闪跌离场）"
+
+[params]
+min_ret_atr = [0.0, 0.5, 1.0, 1.5]
+
+[expected]
+trades_per_year = "约 240-250 笔/年（每日恰一笔，空头也计入；min_ret_atr 大时略少）"
+win_rate = "50-58%（Gao et al. 2018 报告的方向预测胜率量级）"
+payoff_ratio = "0.9-1.3"

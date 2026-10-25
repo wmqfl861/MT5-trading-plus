@@ -1,0 +1,27 @@
+# H007：B6 波动率目标多头（XAUUSD H1，P5 基线）。
+# 机制引用：Moreira & Muir (2017) Volatility-Managed Portfolios,
+# Journal of Finance 72(4)。先卡后测：第一次回测前已提交到 git。
+id = "H007"
+version = 1
+symbols = ["XAUUSD"]
+timeframe = "H1"
+session = "全时段（基准变体，同 H001 BuyHold 不限定交易时段）"
+phenomenon = "波动管理：按 1/σ² 缩放风险敞口的组合夏普更高——高波动期的下一期风险溢价并不按波动同比例补偿（Moreira & Muir 2017，股票与因子组合普遍成立）"
+mechanism = "波动聚集 + 杠杆约束：恐慌期（高波动）投资者风险承受收缩、溢价虽升但不足以补偿尾部风险，降低高波动期敞口改善组合形状；本策略因信号接口只支持 {-1,0,1}，连续缩放退化为二元开关（低波动持金、高波动空仓），是机制的保守近似——送钱方同 H001（风险溢价），波动管理只改善形状不创造 alpha"
+should_fail_when = "波动急剧转移的 V 型反弹（高波动后立即逼空，空仓错过最大反弹段）；高波动伴随持续上行（如 2024-2025 黄金牛市中的急涨段会被部分错过）"
+falsified_if = "夏普不高于同期 BuyHold（H001 对照）——波动管理失效则整个假设无意义；或二元开关换手成本吞掉全部形状改善"
+graveyard_checked = []
+
+[rules]
+entry = "已实现波动 vol=close.pct_change().rolling(vol_n).std() ≤ vol_target → 目标仓位 +1"
+exit = "vol > vol_target → 信号归零（引擎下一根开盘平仓）；再入场同理由 vol 回落后信号翻 1 驱动"
+stop = "无保护性出场（ExitRules 全缺省，与 BuyHold 同性质；引擎不模拟保证金，用小手数控制名义敞口）"
+
+[params]
+vol_n = [20, 60, 120]
+vol_target = [0.001, 0.0015, 0.002, 0.003]
+
+[expected]
+trades_per_year = "约 10-40 笔/年（风险开关换挡次数，随阈值与窗口变化大）"
+win_rate = "与样本期金价上行同向，>50%（多头基准的延续）"
+payoff_ratio = "不适用（长持段交易，单笔跨度大）"

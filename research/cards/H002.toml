@@ -1,0 +1,27 @@
+# H002：B1 唐奇安通道突破（XAUUSD + BTCUSD H1，P5 基线）。
+# 机制引用：Moskowitz, Ooi & Pedersen (2012) Time Series Momentum, JFE 104(2)。
+# 先卡后测：本卡在第一次回测前已提交到 git，提交时间即预测登记时间。
+id = "H002"
+version = 1
+symbols = ["XAUUSD", "BTCUSD"]
+timeframe = "H1"
+session = "全时段（周末休市自然断档；21:00-21:59 UTC 换日窗的禁止开仓由 P7 风控执行，信号层不感知）"
+phenomenon = "时间序列动量：各资产过去 1-12 个月收益的方向对后续同向收益有显著正预测（Moskowitz/Ooi/Pedersen 2012，58 个期货与远期品种）；N 日高点/低点突破是该现象的可交易化"
+mechanism = "趋势后期才入场/离场的慢资金（CTA 之外的配置盘、止损单持有者）在通道边界被系统性触发； breakout 之后的订单流延续方向——送钱方是反应迟钝的资金与被强平的对手盘"
+should_fail_when = "长期宽幅震荡市：通道上下沿反复假突破（whipsaw），小亏累积吃掉偶发大趋势；2013-2018 型黄金横盘段应明显亏损"
+falsified_if = "样本内净利为负；或 G2 参数邻域高原 <70%；或按年分段 <70% 年份盈利；或夏普不高于随机入场蒙特卡洛 95 分位；或 DSR 概率 <0.95"
+graveyard_checked = []
+
+[rules]
+entry = "收盘价突破前 entry_days×24 根 H1 的最高高点 → 目标仓位 +1；跌破最低低点 → -1（信号在突破 bar 收盘产生，引擎下一根开盘成交）"
+exit = "收盘跌破前 exit_days×24 根低点通道 → 平多（升破高点通道 → 平空）；或信号层时间止损：入场后 720 根（30 天）未出场 → 信号归零"
+stop = "引擎层 3.0×ATR14（Wilder，信号 bar 值）止损；止损后信号未翻转时按 reentry=immediate 缺省下一根开盘重入（趋势策略的常见取舍，如实计入成本）"
+
+[params]
+entry_days = [10, 20, 40]
+exit_days = [2, 4, 8]
+
+[expected]
+trades_per_year = "每品种约 8-15 笔/年（10-40 日通道换手低）；6 年样本单品种约 50-90 笔——可能低于 G1 的 H1≥150 门槛，基线角色是对照线，如实呈现"
+win_rate = "30-45%（低胜率高赔率的趋势跟踪形态）"
+payoff_ratio = "2.0-3.5"

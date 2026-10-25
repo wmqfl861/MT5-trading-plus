@@ -1,0 +1,28 @@
+# H004：B3 伦敦时段突破亚盘区间（EURUSD + XAUUSD M15，P5 基线）。
+# 现象依据：外汇日内波动/成交的时段季节性（Andersen & Bollerslev 1998
+# DM-$ 日内周期性；伦敦时段波动与定盘指令流）。先卡后测：第一次回测前
+# 已提交到 git。
+id = "H004"
+version = 1
+symbols = ["EURUSD", "XAUUSD"]
+timeframe = "M15"
+session = "Europe/London 00:00-08:00 构筑亚盘区间，08:00 本地开盘后跟入，exit_hour（11/12 点伦敦）整点收盘离场"
+phenomenon = "亚盘（东京时段）流动性薄、价格窄幅均衡；伦敦 08:00 开盘后欧洲指令流注入，突破亚盘高低点后上午时段沿突破方向延续（外汇'伦敦突破'的传统现象，日内波动在伦敦上午显著放大，Andersen & Bollerslev 1998）"
+mechanism = "伦敦定盘/企业对冲与欧洲基金在开盘集中执行，薄流动性亚盘区间内的止损单与期权障碍位成为大额指令流的目标价位；突破触发亚盘区间内头寸的止损连锁并吸引动能资金跟进——送钱方是亚盘挂单与止损盘"
+should_fail_when = "亚盘已提前走完趋势（伦敦开盘即回吐）；无主题的低波动周；重大数据（如美国 CPI/NFP）在伦敦上午公布日应被 ATR 止损控制损失"
+falsified_if = "样本内净利为负或 profit factor <1.2；成本 ×1.5 后期望转负；随机入场基准 95 分位不被超过；两品种（EURUSD/XAUUSD）都不为正（跨品种关卡）"
+graveyard_checked = []
+
+[rules]
+entry = "伦敦 08:00 本地后首根收盘 > 亚盘区间高点 → +1；< 区间低点 → -1；收盘回到区间内粘性维持，破对侧收盘反手"
+exit = "bar 收盘本地时刻达 exit_hour_ldn → 信号归零（引擎恰在整点开盘价平仓）；引擎层 1.0×ATR14 止损（止损后信号仍在则按缺省 immediate 重入）"
+stop = "1.0×ATR14（Wilder，信号 bar 值）；亚盘宽度 < min_range_atr×ATR14（简单 TR 均值）的窄区间日整日不交易"
+
+[params]
+exit_hour_ldn = [11, 12]
+min_range_atr = [0.0, 0.5, 1.0]
+
+[expected]
+trades_per_year = "每品种约 150-240 笔/年（每日至多一次主交易，EURUSD/XAUUSD 各自独立计数）"
+win_rate = "35-50%"
+payoff_ratio = "1.2-2.0"

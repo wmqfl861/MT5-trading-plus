@@ -1,0 +1,29 @@
+# H005：B4 带趋势过滤的均值回归（XAUUSD M15，P5 基线）。
+# 机制引用：Nagel (2012) Evaporating Liquidity, RFS 25(5)（做市回摆收益）
+# ；趋势过滤对冲时间序列动量（Moskowitz et al. 2012）。先卡后测：
+# 第一次回测前已提交到 git。
+id = "H005"
+version = 1
+symbols = ["XAUUSD"]
+timeframe = "M15"
+session = "全时段（M15 全小时纳入研究范围，scope-2026-10-25；21:00-21:59 UTC 换日窗禁开仓由 P7 风控执行）"
+phenomenon = "短期超调回归：价格偏离其 z_n 根滚动均值 2-3 个标准差后倾向回摆（短期反转是股票/商品横截面与时间序列上的稳健现象）"
+mechanism = "超调由急迫市价单（止损、追价、清算）造成，流动性提供者在极值处挂限价单赚取回摆补偿（Nagel 2012：反转收益在做市风险升高时最大）；SMA 趋势过滤把对手方限定为趋势中的获利回吐——裸逆势接刀在动量冲击下会失血，过滤后送钱方是追涨杀跌的市价单"
+should_fail_when = "单边动量冲击市（连续趋势不回头，z 极值持续加深）：止损与时间止损连续触发；低波动粘滞市（z 达不到 ±2，无交易，机会成本而非亏损）"
+falsified_if = "样本内净利为负；或去掉趋势过滤的对照（trend_n→∞ 语义）明显更好（说明过滤方向反了）；或随机入场基准 95 分位不被超过；或 DSR <0.95"
+graveyard_checked = []
+
+[rules]
+entry = "z=(close−rolling(z_n).mean)/rolling(z_n).std < −z_entry 且 close > SMA(trend_n) → +1（上升趋势中买深度回落）；z > +z_entry 且 close < SMA → −1（下降趋势中卖冲高）"
+exit = "z 回归中值（多头 z≥0 / 空头 z≤0）→ 信号归零；或 close 跌破/升破 SMA（趋势过滤失效）；或信号层时间止损：入场后 96 根未出场 → 归零"
+stop = "引擎层 2.0×ATR14（Wilder，信号 bar 值）止损；止损后信号仍在则按缺省 immediate 重入"
+
+[params]
+z_n = [20, 40, 80]
+z_entry = [2.0, 2.5, 3.0]
+trend_n = [50, 100, 200]
+
+[expected]
+trades_per_year = "约 150-400 笔/年（z 极值触发频率随参数变化大）"
+win_rate = "55-70%（均值回归：小赢多、大亏少）"
+payoff_ratio = "0.7-1.1"
