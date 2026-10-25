@@ -3,14 +3,24 @@
 计划要求的两类坏例（必须被窗口不变性抓出）：
 - EMA 全史计算（ewm 从窗口起点递推，截窗重算的末位信号不同）；
 - lookback 声明不足（实际用 rolling(30) 却声明 10）。
+
+T25（M3）：窗口不变性默认 100 个随机探针（种子由卡 id 派生 zlib.crc32，
+可复现，probes 可覆盖），另加"连续 500 根逐根比对"模式。
 """
 import math
+import zlib
 
 import pandas as pd
 
 from mt5quant.strategies import BaseStrategy, BuyHold, RequiredData
 from mt5quant.validation.lookahead import (
+    DEFAULT_G0_SEED,
+    DEFAULT_SWEEP_SPAN,
+    DEFAULT_WINDOW_PROBES,
     check_window_invariance,
+    check_window_invariance_sweep,
+    draw_probe_positions,
+    g0_seed,
     run_g0,
     scan_forbidden_patterns,
     static_scan,
@@ -185,3 +195,124 @@ def test_run_g0_fails_on_truncation_violation():
     out = run_g0(PeekNext(), wiggle_bars(), {}, source=CLEAN_SRC)
     assert out["passed"] is False
     assert out["truncation_violations"]
+
+
+# ------------------------------------------------- T25（M3）：探针密度与种子
+#
+# 窗口不变性从"5–8 个均匀探针"升级为：默认 100 个随机探针（种子由卡 id
+# 派生 zlib.crc32，同卡可复现；probes 可覆盖）+ 连续 500 根逐根比对模式。
+# B1/B4 的持有计数、B2/B3 的粘性状态是路径依赖状态机，随机 + 连续两种
+# 采样互补，单点漏检概率大幅下降。
+
+
+class _RecordingCausal(CausalSma):
+    """记录每次收到的窗口首行索引——探针位置的间接观测。"""
+
+    def __init__(self):
+        self.windows: list[int] = []
+
+    def generate_signals(self, bars, params):
+        self.windows.append(int(bars.index[0]))
+        return super().generate_signals(bars, params)
+
+
+def test_default_window_probes_is_100():
+    assert DEFAULT_WINDOW_PROBES == 100
+    out = run_g0(CausalSma(), wiggle_bars(), {}, source=CLEAN_SRC)
+    assert out["probes"] == 100
+
+
+def test_run_g0_probes_override_beats_default():
+    """--probes 覆盖默认（bt 接线侧透传；模块签名向后兼容）。"""
+    out = run_g0(CausalSma(), wiggle_bars(), {}, probes=7, source=CLEAN_SRC)
+    assert out["probes"] == 7
+    assert out["passed"] is True
+
+
+def test_g0_seed_derived_from_card_id_crc32():
+    assert g0_seed("H012") == zlib.crc32("H012".encode("utf-8"))
+    assert g0_seed(None) == DEFAULT_G0_SEED
+    out = run_g0(CausalSma(), wiggle_bars(), {}, source=CLEAN_SRC, card_id="H012")
+    assert out["seed"] == zlib.crc32("H012".encode("utf-8"))
+    out_no_card = run_g0(CausalSma(), wiggle_bars(), {}, source=CLEAN_SRC)
+    assert out_no_card["seed"] == DEFAULT_G0_SEED
+
+
+def test_probe_positions_reproducible_and_seed_sensitive():
+    a1 = draw_probe_positions(9, 599, 100, seed=1)
+    a2 = draw_probe_positions(9, 599, 100, seed=1)
+    b = draw_probe_positions(9, 599, 100, seed=2)
+    assert a1 == a2                          # 同种子同位置（可复现）
+    assert a1 != b                           # 种子变了位置就变
+    assert all(9 <= t <= 599 for t in a1)
+    assert len(a1) > 50                      # 100 抽取去重后覆盖仍足（591 选 100）
+    assert a1 == sorted(set(a1))
+    assert draw_probe_positions(9, 599, 0, seed=1) == []
+    assert draw_probe_positions(9, 8, 100, seed=1) == []   # 空区间
+
+
+def test_window_probe_positions_follow_seed():
+    """同卡两次运行探针位置完全一致；不同卡（不同种子）位置不同。"""
+    bars = wiggle_bars()
+    s1 = _RecordingCausal()
+    check_window_invariance(s1, bars, {}, probes=40, seed=g0_seed("H001"))
+    s2 = _RecordingCausal()
+    check_window_invariance(s2, bars, {}, probes=40, seed=g0_seed("H001"))
+    assert s1.windows == s2.windows          # 种子复现（去掉首笔全量信号调用）
+    s3 = _RecordingCausal()
+    check_window_invariance(s3, bars, {}, probes=40, seed=g0_seed("H002"))
+    assert s3.windows != s1.windows
+
+
+def test_g0_same_card_reproduces_violations():
+    o1 = run_g0(EmaFullHistory(), wiggle_bars(), {}, source=CLEAN_SRC,
+                card_id="B3")
+    o2 = run_g0(EmaFullHistory(), wiggle_bars(), {}, source=CLEAN_SRC,
+                card_id="B3")
+    assert o1["seed"] == o2["seed"]
+    assert o1["window_violations"] == o2["window_violations"]
+
+
+def test_under_declared_caught_by_random_probes_default():
+    """默认 100 个随机探针仍抓出声明不足（路径位置不再依赖均匀切点）。"""
+    bad = check_window_invariance(UnderDeclaredLookback(), wiggle_bars(), {})
+    assert bad and all(t >= 30 for t in bad)
+
+
+# ------------------------------------------------- T25（M3）：连续 500 根 sweep
+
+
+def test_sweep_catches_under_declared_lookback():
+    """连续 500 根逐根比对：声明 lookback=10 用 rolling(30) 的策略在末段
+    逐根露馅（随机探针可能漏掉的路径依赖位置被连续段覆盖）。"""
+    bad = check_window_invariance_sweep(UnderDeclaredLookback(), wiggle_bars(), {})
+    assert bad
+    assert all(100 <= t <= 599 for t in bad)   # 只看最近 500 根的连续段
+    assert all(t >= 30 for t in bad)
+
+
+def test_sweep_passes_causal_strategies():
+    assert check_window_invariance_sweep(CausalSma(), wiggle_bars(), {}) == []
+    assert check_window_invariance_sweep(BuyHold(), wiggle_bars(), {}) == []
+
+
+def test_sweep_catches_ema_full_history():
+    assert check_window_invariance_sweep(EmaFullHistory(), wiggle_bars(), {})
+
+
+def test_sweep_span_clamps_when_bars_short():
+    """n < span 时用可得区间（不足 span 不误报也不静默跳过）。"""
+    assert check_window_invariance_sweep(CausalSma(), wiggle_bars(120), {}) == []
+    bad = check_window_invariance_sweep(UnderDeclaredLookback(), wiggle_bars(120),
+                                        {})
+    assert bad and min(bad) >= 30
+
+
+def test_sweep_included_in_run_g0_verdict():
+    out = run_g0(EmaFullHistory(), wiggle_bars(), {}, source=CLEAN_SRC,
+                 card_id="H001")
+    assert out["window_sweep_violations"]
+    assert out["passed"] is False
+    assert out["sweep_span"] == DEFAULT_SWEEP_SPAN == 500
+    ok = run_g0(CausalSma(), wiggle_bars(), {}, source=CLEAN_SRC)
+    assert ok["window_sweep_violations"] == [] and ok["passed"] is True

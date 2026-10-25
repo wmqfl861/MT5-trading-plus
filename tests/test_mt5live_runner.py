@@ -94,16 +94,66 @@ def test_short_window_raises():
         r.decide(datetime(2026, 10, 20, 13, 0, 7))
 
 
-# ---- 窗口 = lookback_bars、同一份策略代码 ----
+# ---- 计算窗口 = max(3×lookback, 1000)，可配置；lookback 只作下限（T25/M3）----
 
-def test_window_is_exactly_lookback_bars():
+def test_window_default_is_compute_window_not_lookback():
+    """缺省计算窗口 = max(3×lookback_bars, 1000)（T25/M3：窗口不变性问题上
+    实盘侧的兜底——窗口远大于声明 lookback）；不足时喂全部已收盘 bar。"""
     strategy = LastBarDirection()
     r = mk_runner(strategy, BARS_UP, lookback_bars=30)
+    assert r.compute_window_bars == max(3 * 30, 1000) == 1000
     d = r.decide(NOW_DUE)
-    assert strategy.calls[0]["n"] == 30
-    # 40 根取尾部 30 → 首根 = 08:00 + 10×15m = 10:30
-    assert strategy.calls[0]["first_time"] == pd.Timestamp("2026-10-20 10:30")
-    assert d.bars_used == 30
+    # 40 根已收盘 < 1000 → 喂全部 40 根（≥ lookback 下限即可）
+    assert strategy.calls[0]["n"] == 40
+    assert strategy.calls[0]["first_time"] == pd.Timestamp("2026-10-20 08:00")
+    assert d.bars_used == 40
+
+
+def test_compute_window_clips_to_available_bars():
+    bars = const_range_bars(1300, 900, last_up=True)
+    strategy = LastBarDirection()
+    r = mk_runner(strategy, bars, lookback_bars=400)
+    # 3×400 = 1200 > 1000 → 1200；1300 根可用 → 喂尾 1200 根
+    assert r.compute_window_bars == 1200
+    # 直接对齐末根收盘：末根开盘 = 08:00 + 1299×15m，收盘再 +15m
+    last_open = pd.Timestamp("2026-10-20 08:00") + pd.Timedelta(minutes=15 * 1299)
+    close = last_open + pd.Timedelta(minutes=15)
+    d = r.decide(close.to_pydatetime() + timedelta(seconds=7))
+    assert strategy.calls[0]["n"] == 1200
+    assert strategy.calls[0]["first_time"] == last_open - pd.Timedelta(minutes=15 * 1199)
+    assert d.bars_used == 1200
+
+
+def test_compute_window_bars_configurable():
+    strategy = LastBarDirection()
+    bars = const_range_bars(60, 900, last_up=True)
+    r = SignalRunner(mk_config(lookback_bars=30), strategy,
+                     bars_loader=lambda root, s, tf: bars,
+                     quote_fn=lambda s: (100.0, 100.2),
+                     compute_window_bars=50)
+    assert r.compute_window_bars == 50
+    last_open = pd.Timestamp("2026-10-20 08:00") + pd.Timedelta(minutes=15 * 59)
+    close = last_open + pd.Timedelta(minutes=15)
+    d = r.decide(close.to_pydatetime() + timedelta(seconds=7))
+    assert strategy.calls[0]["n"] == 50
+    assert d.bars_used == 50
+
+
+def test_compute_window_bars_below_lookback_rejected():
+    with pytest.raises(ValueError, match="compute_window_bars"):
+        SignalRunner(mk_config(lookback_bars=30), LastBarDirection(),
+                     bars_loader=lambda root, s, tf: BARS_UP,
+                     compute_window_bars=20)
+
+
+def test_required_lookback_still_lower_bound_for_config():
+    """required_data.lookback_bars 只作下限：config.lookback_bars ≥ 声明值即可，
+    计算窗口另按 max(3×lookback, 1000) 取（不再等于 lookback）。"""
+    strategy = LastBarDirection()
+    strategy.required_data = type(strategy.required_data)(
+        symbols=(), timeframe="", lookback_bars=30)
+    r = mk_runner(strategy, BARS_UP, lookback_bars=30)   # 恰等于声明值：允许
+    assert r.compute_window_bars == 1000                 # 计算窗口远大于下限
 
 
 def test_signal_comes_from_last_bar_of_window():
@@ -137,7 +187,7 @@ def test_decision_id_deterministic_and_unique_per_bar():
 def test_sl_tp_prices_for_long_and_short():
     for bars, ref in ((BARS_UP, 100.2), (BARS_DOWN, 100.0)):  # 多用 Ask、空用 Bid
         d = mk_runner(LastBarDirection(), bars, quote=(100.0, 100.2)).decide(NOW_DUE)
-        window = bars.iloc[-30:]
+        window = bars.iloc[-min(1000, len(bars)):]   # T25：计算窗口（非 lookback）
         atr = float(atr_series(window, 14).iloc[-1])
         assert d.atr == pytest.approx(atr)
         if d.signal == 1:

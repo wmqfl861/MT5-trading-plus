@@ -5,8 +5,14 @@
   trigger_delay_s（容差，等定时刷新进程把已收盘 bar 落盘）才决策；
   墙钟处于 bar 中段时绝不会把正在形成的 bar 当作已收盘（双保险：网格 +
   逐根校验 time+周期 ≤ 墙钟）。
-- 只读已收盘 bar，窗口恒为配置的 lookback_bars 根（blueprint §4 第 5 条：
-  实盘只用最近 lookback_bars 根，结果必须与全史一致——窗口不变性）。
+- 只读已收盘 bar；计算窗口 = max(3×lookback_bars, 1000) 根（可配置
+  compute_window_bars，T25/M3——窗口不变性问题上实盘侧的兜底：喂远大于
+  声明 lookback 的窗口，EMA 类递推统计量与回测全史更接近；H1 计算很便宜）。
+  config.lookback_bars 仍是决策的**下限**（低于策略声明 required_data.
+  lookback_bars 拒绝启动；已收盘不足 lookback_bars 报"窗口不足"），
+  实际喂给策略的是 min(compute_window_bars, 已收盘根数)，
+  Decision.bars_used 如实记录（blueprint §4 第 5 条：实盘信号必须与全史
+  一致——窗口不变性由 G0 把关，运行器侧尽量给足窗口）。
   数据源经 store.load_bars 直读 parquet：**锁箱（lockbox）豁免**——锁箱
   约束的是研究侧防前视，实盘决策本来就该用最新已收盘数据，不适用；
   与定时刷新进程（唯一写者）之间只存在原子文件读，无写冲突（R14）。
@@ -34,6 +40,16 @@ from mt5quant.backtest.engine_a import atr_series
 from mt5quant.strategies.base import ExitRules
 
 ATR_PERIOD = 14   # 与 engine_a 默认一致（Wilder ATR）
+
+# T25（M3）：计算窗口缺省值——远大于声明的 lookback（H1 计算很便宜）
+COMPUTE_WINDOW_MIN_BARS = 1000          # 下限：至少 1000 根
+COMPUTE_WINDOW_LOOKBACK_MULTIPLE = 3    # 倍数：3 × lookback_bars
+
+
+def default_compute_window_bars(lookback_bars: int) -> int:
+    """计算窗口缺省值：max(3×lookback_bars, 1000)（T25/M3）。"""
+    return max(COMPUTE_WINDOW_LOOKBACK_MULTIPLE * int(lookback_bars),
+               COMPUTE_WINDOW_MIN_BARS)
 
 _EPS_VOLUME = 1e-9
 
@@ -72,7 +88,8 @@ class Decision:
     tp_atr: float | None
     sl: float | None                # 建议止损价（报价参考价口径，执行器按成交价修正）
     tp: float | None
-    bars_used: int                  # 实际喂给策略的窗口根数（= lookback_bars）
+    bars_used: int                  # 实际喂给策略的窗口根数
+                                    # （= min(compute_window_bars, 已收盘根数)，T25）
 
     def to_dict(self) -> dict:
         """心跳/日志用的 JSON 兼容视图。"""
@@ -103,13 +120,18 @@ class SignalRunner:
 
     def __init__(self, config, strategy, *, bars_loader=load_bars,
                  quote_fn=None, clock=None, atr_func=atr_series,
-                 atr_period: int = ATR_PERIOD):
+                 atr_period: int = ATR_PERIOD,
+                 compute_window_bars: int | None = None):
         """
         - bars_loader(root, symbol, timeframe) -> DataFrame | None：默认
           store.load_bars 直读（锁箱豁免，见模块 docstring）；
         - quote_fn(symbol) -> (bid, ask)：现价来源（实盘接 gw.market.quote；
           None = 无行情源，Decision 报价与建议 SL/TP 为 None）；
         - clock() -> naive UTC datetime：默认墙钟 UTC。
+        - compute_window_bars（T25/M3）：每次决策喂给策略的窗口长度，缺省
+          max(3×config.lookback_bars, 1000)；不得小于 config.lookback_bars
+          （后者是 required_data.lookback_bars 的下限承载，只作下限校验）。
+          已收盘不足计算窗口时喂全部已收盘 bar（仍须 ≥ lookback_bars）。
         """
         from mt5live.config import LiveConfig  # 局部导入避免环
 
@@ -121,12 +143,25 @@ class SignalRunner:
                 f"config.lookback_bars={config.lookback_bars} 小于策略声明 "
                 f"required_data.lookback_bars={required}（窗口不足会让策略/"
                 f"ATR 与回测口径不一致）")
+        if compute_window_bars is None:
+            compute_window_bars = default_compute_window_bars(config.lookback_bars)
+        if (not isinstance(compute_window_bars, int)
+                or isinstance(compute_window_bars, bool)
+                or compute_window_bars < 1):
+            raise ValueError(
+                f"compute_window_bars 必须是 ≥1 的整数，收到 {compute_window_bars!r}")
+        if compute_window_bars < config.lookback_bars:
+            raise ValueError(
+                f"compute_window_bars={compute_window_bars} 不得小于 "
+                f"config.lookback_bars={config.lookback_bars}（lookback_bars 是"
+                f" 策略声明回看的下限，计算窗口只能更大，见 T25/M3）")
         declared_tf = getattr(strategy.required_data, "timeframe", "") or ""
         if declared_tf and declared_tf.upper() != config.timeframe.upper():
             raise ValueError(
                 f"策略声明 timeframe={declared_tf!r} 与配置 {config.timeframe!r} 不符")
         self.config = config
         self.strategy = strategy
+        self.compute_window_bars = compute_window_bars
         self._loader = bars_loader
         self._quote_fn = quote_fn
         self._clock = clock or (lambda: datetime.now(timezone.utc)
@@ -184,7 +219,8 @@ class SignalRunner:
             raise ValueError(
                 f"窗口不足：需要 lookback_bars={cfg.lookback_bars} 根，"
                 f"已收盘仅 {len(closed)} 根（先回补历史数据）")
-        window = closed.iloc[-cfg.lookback_bars:]
+        # T25/M3：喂计算窗口（远大于声明 lookback）；不足时喂全部已收盘 bar
+        window = closed.iloc[-self.compute_window_bars:]
 
         sig = self._generate(window)
         signal = int(sig.iloc[-1])

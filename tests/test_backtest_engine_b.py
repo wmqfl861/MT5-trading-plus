@@ -574,10 +574,11 @@ def _pol_window(local_hhmm: str, tz: str = "UTC", *, pre: int = 0, post: int = 6
                          pre_minutes=pre, post_minutes=post, **kw)
 
 
-def test_engine_b_version_bumped_for_t23_risk_sizing():
-    # T23（M2）：RiskSizing 按风险定手数（B-0.4，与 A-1.5 同一函数）；
+def test_engine_b_version_bumped_for_t25_semantics():
+    # T25（M1）：reentry=after_signal_change / ruined 标记 / week_close≤H1
+    # 校验落地，三层执行语义对齐（B-0.5）。B-0.4 = T23 RiskSizing（M2）；
     # B-0.3 = T28/M8 性能改写（时间行为与 B-0.2 逐位一致）。
-    assert ENGINE_VERSION_B == "B-0.4"
+    assert ENGINE_VERSION_B == "B-0.5"
 
 
 def test_session_policy_defers_entry_to_first_allowed_tick():
@@ -779,3 +780,308 @@ def test_sizing_equity_basis_changes_lots_after_loss():
     # 第一笔：入场 ask 100.5、出场 bid 100.0 → (−0.5)×0.5×100 − 0.5 佣金
     assert lots_e[0] == pytest.approx(0.50)
     assert lots_e[1] == pytest.approx(0.49)
+
+
+# ------------------------------------------------- T25（M1）：执行语义对齐 B-0.5
+#
+# 三项语义与 A 层（A-1.3 R7/R8/R16）对齐：reentry="after_signal_change"、
+# ruined/ruined_at、week_close_exit 周期 ≤ H1。对齐证据 = A/B 两层在
+# immediate 与 after_signal_change 两模式下、tick 恰好复现 bar OHLC 的
+# 合成数据上交易时间一致、净利差仅来自点差建模（此处点差与模型一致 →
+# 逐笔净利也一致）。
+
+REENTRY_MODES_AB = ("immediate", "after_signal_change")
+
+
+def stop_touch_bars(n=22):
+    """flat H1（TR 恒 1.0 → ATR14 从 bar13 起恒 1.0）；bar18 low=98.6
+    恰等于多头止损触发价（entry 100.6 − 2×ATR 1.0）。"""
+    df = flat_bars(pd.Timestamp("2026-01-05 00:00"), n)
+    df.loc[18, "low"] = 98.6
+    return df
+
+
+def tp_touch_bars(n=22):
+    """bar18 high=102.6 恰等于多头止盈触发价（entry 100.6 + 2×ATR）。"""
+    df = flat_bars(pd.Timestamp("2026-01-05 00:00"), n)
+    df.loc[18, "high"] = 102.6
+    return df
+
+
+def short_stop_touch_bars(n=22):
+    """bar18 high=101.4 → ask=101.9 恰等于空头止损触发价（entry 99.9 + 2）。"""
+    df = flat_bars(pd.Timestamp("2026-01-05 00:00"), n)
+    df.loc[18, "high"] = 101.4
+    return df
+
+
+def ruin_bars(n=22):
+    """bar17 close=95（low 94.5）：多头浮亏 (95−100.6)×1000 = −5600，
+    权益 1000−5600 ≤ 0 → bar17 收盘爆仓；bar18 time_stop 出场。"""
+    df = flat_bars(pd.Timestamp("2026-01-05 00:00"), n)
+    df.loc[17, "close"] = 95.0
+    df.loc[17, "low"] = 94.5
+    return df
+
+
+def test_reentry_immediate_b_reenters_at_next_bar_open_tick():
+    """R7 默认（immediate）：止损后信号仍 1 → 下一根 bar 收盘下单、
+    下一根 bar 开盘 tick 成交重入（目标仓位语义）。"""
+    df = stop_touch_bars()
+    rules = ExitRules(stop_loss_atr=2.0)                # reentry 默认 immediate
+    strat = ScriptStrategy([0] * 15 + [1] * 7, fill=1, exit_rules=rules)
+    res = run_b(df, ohlc_ticks(df, S_MODEL), strat,
+                slippage_price=SLIP_MODEL)
+    assert len(res.trades) == 2
+    t1, t2 = res.trades.iloc[0], res.trades.iloc[1]
+    assert t1["exit_reason"] == "stop"
+    assert t1["exit_time"] == ts("2026-01-05 18:40:00")   # bar18 low tick
+    assert t1["exit_price"] == pytest.approx(98.5)        # 98.6 − slip
+    assert t2["entry_time"] == ts("2026-01-05 19:00:00")  # bar19 开盘 tick 重入
+    assert t2["entry_price"] == pytest.approx(100.6)
+    assert t2["exit_reason"] == "end_of_data"
+    assert res.ruined is False and res.ruined_at is None
+
+
+def test_reentry_after_signal_change_b_blocks_while_signal_holds():
+    """R7：after_signal_change——止损后信号仍 1 → 不再同向重入（只有 1 笔）。"""
+    df = stop_touch_bars()
+    rules = ExitRules(stop_loss_atr=2.0, reentry="after_signal_change")
+    strat = ScriptStrategy([0] * 15 + [1] * 7, fill=1, exit_rules=rules)
+    res = run_b(df, ohlc_ticks(df, S_MODEL), strat,
+                slippage_price=SLIP_MODEL)
+    assert len(res.trades) == 1
+    assert res.trades.iloc[0]["exit_reason"] == "stop"
+
+
+def test_reentry_after_signal_change_b_unblocks_when_signal_leaves():
+    """R7：信号归零（s18=0）→ 解禁；再回 1（s19=1）→ bar20 开盘 tick 重入。"""
+    df = stop_touch_bars()
+    rules = ExitRules(stop_loss_atr=2.0, reentry="after_signal_change")
+    sig = [0] * 15 + [1, 1, 1, 0, 1, 1, 1]
+    res = run_b(df, ohlc_ticks(df, S_MODEL), ScriptStrategy(sig, fill=1,
+                                                            exit_rules=rules),
+                slippage_price=SLIP_MODEL)
+    assert len(res.trades) == 2
+    t2 = res.trades.iloc[1]
+    assert t2["entry_time"] == ts("2026-01-05 20:00:00")  # bar20 开盘 tick
+    assert t2["side"] == "long"
+    assert t2["exit_reason"] == "end_of_data"
+
+
+def test_reentry_after_signal_change_b_take_profit_also_blocks():
+    """止盈同属保护性出场：after_signal_change 下同样禁同向重入。"""
+    df = tp_touch_bars()
+    rules = ExitRules(take_profit_atr=2.0, reentry="after_signal_change")
+    strat = ScriptStrategy([0] * 15 + [1] * 7, fill=1, exit_rules=rules)
+    res = run_b(df, ohlc_ticks(df, S_MODEL), strat,
+                slippage_price=SLIP_MODEL)
+    assert len(res.trades) == 1
+    t = res.trades.iloc[0]
+    assert t["exit_reason"] == "take_profit"
+    assert t["exit_time"] == ts("2026-01-05 18:20:00")    # bar18 high tick
+    assert t["exit_price"] == pytest.approx(102.5)        # 102.6 − slip
+
+
+def test_reentry_after_signal_change_b_reverse_direction_unblocks_and_opens():
+    """信号从 1 直接翻到 −1（止损后）：反向即"离开禁入方向"→ 解禁并开空
+    （A 层同语义：信号离开该方向含反向，反向开仓不受同向禁入约束）。"""
+    df = stop_touch_bars()
+    rules = ExitRules(stop_loss_atr=2.0, reentry="after_signal_change")
+    sig = [0] * 15 + [1, 1, 1] + [-1] * 4
+    res = run_b(df, ohlc_ticks(df, S_MODEL), ScriptStrategy(sig, fill=-1,
+                                                            exit_rules=rules),
+                slippage_price=SLIP_MODEL)
+    assert len(res.trades) == 2
+    t1, t2 = res.trades.iloc[0], res.trades.iloc[1]
+    assert t1["side"] == "long" and t1["exit_reason"] == "stop"
+    assert t2["side"] == "short"
+    assert t2["entry_time"] == ts("2026-01-05 19:00:00")  # bar19 开盘 tick
+    assert t2["exit_reason"] == "end_of_data"
+
+
+def test_ruined_b_marks_sticky_and_blocks_new_entries():
+    """R16：bar17 收盘权益 ≤ 0 → ruined/ruined_at 标记（粘滞），
+    time_stop 出场后信号仍 1 也不重入；权益序列如实记录负值。"""
+    df = ruin_bars()
+    rules = ExitRules(time_stop_bars=2)
+    strat = ScriptStrategy([0] * 15 + [1] * 7, fill=1, exit_rules=rules)
+    res = run_b(df, ohlc_ticks(df, S_MODEL), strat, contract_size=1000.0,
+                initial_capital=1000.0, slippage_price=SLIP_MODEL)
+    assert len(res.trades) == 1                          # 爆仓后无重入
+    t = res.trades.iloc[0]
+    assert t["exit_reason"] == "time_stop"
+    assert t["exit_price"] == pytest.approx(99.9)        # bar18 close 100 − slip
+    assert res.ruined is True
+    assert res.ruined_at == df["time"].iloc[17]          # 首次权益 ≤ 0 的 bar
+    # bar16 浮亏 −600、bar17 −5600（穿透 0）、bar18 起权益 299（粘滞）
+    assert list(res.equity)[16] == pytest.approx(400.0)
+    assert list(res.equity)[17] == pytest.approx(-4600.0)
+    assert list(res.equity)[18] == pytest.approx(299.0)
+
+
+def test_week_close_exit_b_rejects_timeframes_above_h1():
+    """R8：week_close_exit 只允许 ≤ H1（与 A 层同文案拒绝）。"""
+    rules = ExitRules(week_close_exit=True)
+    for tf in ("H4", "D1"):
+        df = flat_bars(pd.Timestamp("2026-01-05 10:00"), 6, tf=tf)
+        with pytest.raises(ValueError, match="week_close"):
+            run_b(df, [], ScriptStrategy([1], fill=1, exit_rules=rules),
+                  timeframe=tf)
+
+
+# --------------------------------------------- A/B 两模式对齐（T25 核心）
+
+def run_ab_pair(bars, strat, *, contract_size=1.0, initial_capital=10_000.0,
+                spread=S_MODEL):
+    """同一策略/数据跑 A、B 两层：B 用恰好复现 bar OHLC 的 tick
+    （bid=OHLC 价、ask=bid+spread），点差/滑点与 A 层模型一致。"""
+    costs = FakeCosts(half=S_MODEL, slip=SLIP_MODEL)
+    res_a = run_backtest(strat, bars, costs, symbol="XAUUSD", params={},
+                         contract_size=contract_size, timeframe="H1",
+                         volume_lots=1.0, initial_capital=initial_capital)
+    res_b = run_backtest_ticks(strat, bars, make_loader(ohlc_ticks(bars, spread)),
+                               costs, symbol="XAUUSD", params={},
+                               contract_size=contract_size, timeframe="H1",
+                               slippage_price=SLIP_MODEL, volume_lots=1.0,
+                               initial_capital=initial_capital)
+    return res_a, res_b
+
+
+def assert_ab_trades_aligned(res_a, res_b, tf="H1"):
+    """A/B 对齐断言（沿用 test_ab_parity_ohlc_reproducing_ticks 的对照口径）：
+    - 笔数/方向/出场理由/bars_held/手数逐笔相同；
+    - 信号类成交时间完全一致（B 恰在下一根 bar 开盘 tick 成交）；
+    - 出场成交：按收盘价出场（time_stop/week_close/end_of_data）= B 在
+      bar 收盘前最后一笔 tick（= A 的 exit_fill_time − 1ms）；盘中触发
+      （stop/take_profit/signal）= B 的成交 tick 落在 A 的出场 bar 区间内；
+    - 价格与净利逐笔一致（点差/滑点建模一致时差为 0）；权益逐 bar 一致。
+    """
+    ta, tb = res_a.trades.reset_index(drop=True), res_b.trades.reset_index(drop=True)
+    assert len(ta) > 0, "对齐用例必须至少有一笔交易"
+    assert len(ta) == len(tb)
+    tf_delta = pd.Timedelta(seconds=TIMEFRAME_SECONDS[tf])
+    for i in range(len(ta)):
+        a, b = ta.iloc[i], tb.iloc[i]
+        assert a["side"] == b["side"], f"第 {i} 笔方向不一致"
+        assert a["exit_reason"] == b["exit_reason"], f"第 {i} 笔出场理由不一致"
+        assert a["bars_held"] == b["bars_held"], f"第 {i} 笔 bars_held 不一致"
+        assert a["volume_lots"] == pytest.approx(b["volume_lots"])
+        assert a["entry_time"] == b["entry_time"], f"第 {i} 笔入场时间不一致"
+        if a["exit_reason"] in ("time_stop", "week_close", "end_of_data"):
+            assert b["exit_time"] == (a["exit_fill_time"]
+                                      - pd.Timedelta(milliseconds=1)), \
+                f"第 {i} 笔收盘价出场时间不一致"
+        else:
+            assert pd.Timedelta(0) <= b["exit_time"] - a["exit_time"] < tf_delta, \
+                f"第 {i} 笔盘中出场不在 A 层出场 bar 区间内"
+        assert a["entry_price"] == pytest.approx(b["entry_price"]), \
+            f"第 {i} 笔入场价不一致"
+        assert a["exit_price"] == pytest.approx(b["exit_price"]), \
+            f"第 {i} 笔出场价不一致"
+        assert a["net"] == pytest.approx(b["net"]), f"第 {i} 笔净利不一致"
+        assert a["swap"] == pytest.approx(b["swap"])
+    assert list(res_a.equity) == pytest.approx(list(res_b.equity))
+
+
+@pytest.mark.parametrize("reentry", REENTRY_MODES_AB)
+def test_ab_alignment_stop_then_hold_signal(reentry):
+    """止损后信号持续：immediate 下一开盘重入（2 笔）；ASC 阻断（1 笔）——
+    两层在两种模式下都逐笔对齐。"""
+    df = stop_touch_bars()
+    rules = ExitRules(stop_loss_atr=2.0, reentry=reentry)
+    strat = ScriptStrategy([0] * 15 + [1] * 7, fill=1, exit_rules=rules)
+    ra, rb = run_ab_pair(df, strat)
+    assert_ab_trades_aligned(ra, rb)
+    reasons = list(ra.trades["exit_reason"])
+    assert reasons == (["stop", "end_of_data"] if reentry == "immediate"
+                       else ["stop"])
+
+
+@pytest.mark.parametrize("reentry", REENTRY_MODES_AB)
+def test_ab_alignment_stop_then_signal_leaves_and_returns(reentry):
+    """止损后信号归零再回 1：两种模式都在 bar20 开盘重入（ASC 在 s18=0
+    时解禁，immediate 因 s18=0 本就不在场），时间逐笔一致。"""
+    df = stop_touch_bars()
+    rules = ExitRules(stop_loss_atr=2.0, reentry=reentry)
+    sig = [0] * 15 + [1, 1, 1, 0, 1, 1, 1]
+    strat = ScriptStrategy(sig, fill=1, exit_rules=rules)
+    ra, rb = run_ab_pair(df, strat)
+    assert_ab_trades_aligned(ra, rb)
+    assert list(ra.trades["exit_reason"]) == ["stop", "end_of_data"]
+    assert ra.trades.iloc[1]["entry_time"] == rb.trades.iloc[1]["entry_time"]
+
+
+@pytest.mark.parametrize("reentry", REENTRY_MODES_AB)
+def test_ab_alignment_take_profit(reentry):
+    """止盈出场 + （immediate）重入 /（ASC）阻断，两层逐笔对齐。"""
+    df = tp_touch_bars()
+    rules = ExitRules(take_profit_atr=2.0, reentry=reentry)
+    strat = ScriptStrategy([0] * 15 + [1] * 7, fill=1, exit_rules=rules)
+    ra, rb = run_ab_pair(df, strat)
+    assert_ab_trades_aligned(ra, rb)
+    reasons = list(ra.trades["exit_reason"])
+    assert reasons == (["take_profit", "end_of_data"] if reentry == "immediate"
+                       else ["take_profit"])
+
+
+@pytest.mark.parametrize("reentry", REENTRY_MODES_AB)
+def test_ab_alignment_short_stop(reentry):
+    """空头：Bid 入场 / Ask 触发止损（bar18 high=101.4 → ask 101.9），
+    两层入场价 99.9、出场价 102.0 逐位一致；两种模式同停/重入语义。"""
+    df = short_stop_touch_bars()
+    rules = ExitRules(stop_loss_atr=2.0, reentry=reentry)
+    strat = ScriptStrategy([0] * 15 + [-1] * 7, fill=-1, exit_rules=rules)
+    ra, rb = run_ab_pair(df, strat)
+    assert_ab_trades_aligned(ra, rb)
+    reasons = list(ra.trades["exit_reason"])
+    assert reasons == (["stop", "end_of_data"] if reentry == "immediate"
+                       else ["stop"])
+    assert ra.trades.iloc[0]["side"] == "short"
+
+
+@pytest.mark.parametrize("reentry", REENTRY_MODES_AB)
+def test_ab_alignment_reversal(reentry):
+    """反手（1 → −1）：signal 出场不算保护性出场，两种模式都不禁入；
+    同一笔 tick/同一开盘先平后开，时间与价格一致。"""
+    df = flat_bars(pd.Timestamp("2026-01-05 00:00"), 22)
+    rules = ExitRules(reentry=reentry)
+    sig = [0] * 15 + [1, 1, 1] + [-1] * 4
+    strat = ScriptStrategy(sig, fill=-1, exit_rules=rules)
+    ra, rb = run_ab_pair(df, strat)
+    assert_ab_trades_aligned(ra, rb)
+    assert list(ra.trades["side"]) == ["long", "short"]
+    assert list(ra.trades["exit_reason"]) == ["signal", "end_of_data"]
+
+
+@pytest.mark.parametrize("reentry", REENTRY_MODES_AB)
+def test_ab_alignment_ruin(reentry):
+    """爆仓：两层 ruined/ruined_at 一致，爆仓后不再开新仓（两种模式都
+    只剩 time_stop 那一笔）；权益序列（含负值）逐 bar 一致。"""
+    df = ruin_bars()
+    rules = ExitRules(time_stop_bars=2, reentry=reentry)
+    strat = ScriptStrategy([0] * 15 + [1] * 7, fill=1, exit_rules=rules)
+    ra, rb = run_ab_pair(df, strat, contract_size=1000.0, initial_capital=1000.0)
+    assert_ab_trades_aligned(ra, rb)
+    assert list(ra.trades["exit_reason"]) == ["time_stop"]
+    assert ra.ruined is True and rb.ruined is True
+    assert ra.ruined_at == rb.ruined_at == df["time"].iloc[17]
+
+
+@pytest.mark.parametrize("reentry", REENTRY_MODES_AB)
+def test_ab_alignment_time_stop_chain(reentry):
+    """time_stop 链（到期 bar 收盘价出场 → 信号持续时的再入场节奏）：
+    immediate 模式下 A"到期 bar 收盘出场、下一开盘重入"与 B"收盘前最后
+    一笔 tick 出场、下一开盘 tick 重入"逐笔对齐；ASC 下 time_stop 属保护性
+    出场 → 阻断，只剩一笔。"""
+    df = flat_bars(pd.Timestamp("2026-01-05 00:00"), 22)
+    rules = ExitRules(time_stop_bars=2, reentry=reentry)
+    strat = ScriptStrategy([0] * 15 + [1] * 7, fill=1, exit_rules=rules)
+    ra, rb = run_ab_pair(df, strat)
+    assert_ab_trades_aligned(ra, rb)
+    reasons = list(ra.trades["exit_reason"])
+    if reentry == "immediate":
+        assert reasons == ["time_stop", "time_stop"]   # bar18 出 → bar19 入 → bar21 出
+        assert ra.trades.iloc[1]["entry_time"] == ts("2026-01-05 19:00:00")
+    else:
+        assert reasons == ["time_stop"]

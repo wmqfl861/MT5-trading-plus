@@ -32,8 +32,21 @@
   手数；手数为 0 → 本笔订单作废并计数 skipped_zero_lots（写进 summary），
   信号持续时下一次 bar 收盘重新下单重试；Trade.volume_lots 如实记录。
 - bars_held = 出场 bar 序号 − 入场 bar 序号（成交 tick 所在 bar 区间），
-  与 A 层口径一致。保护性出场后同向信号是否再入场沿用 A 层"目标仓位"
-  语义（下一根 bar 收盘后重新下单；ExitRules.reentry 若落地由接线层处理）。
+  与 A 层口径一致。
+- 再入场（T25 / B-0.5，R7 对齐 A-1.3）：ExitRules.reentry="immediate"（默认）
+  ＝目标仓位语义——保护性出场后信号仍指向该方向时下一根 bar 收盘重新下单；
+  "after_signal_change"＝保护性出场（stop / take_profit / time_stop /
+  week_close；signal 出场不算，与 A 层 PROTECTIVE_REASONS 同源——B 层没有
+  stop_gap/take_profit_gap）后记 blocked_dir，信号离开该方向（变 0 或反向）
+  之前禁止同向开仓。解禁判定时点＝bar 收盘的下单决策（用刚收盘 bar 的
+  信号），与 A 层"下一根 bar 开盘用上一根收盘信号"同口径；期间反向信号的
+  反手单照常下单（平仓腿执行、开仓腿在成交时被跳过，同 A 层"先平后不开"）。
+- 爆仓标记（T25 / B-0.5，R16 对齐）：逐 bar 收盘权益 ≤ 0 时引擎停止开新仓
+  （已有持仓的各类出场照常执行），BacktestResult.ruined=True 且 ruined_at
+  记首次发生 bar 的时间（标记粘滞，权益回升不清除）；equity 序列如实记录
+  负值。判定时点＝bar 收盘（与 A 层逐 bar 收盘市值同口径）。
+- week_close_exit 只允许 ≤ H1 的周期（T25 / B-0.5，R8 对齐）：与 A 层
+  同文案拒绝（D1/H4 会提前一整根平仓）。
 - 金额口径与 A 层（C1 修复后）完全一致：contract_size 必填；
   gross = 价格差 × 手数 × contract_size（账户货币）；
   commission = 每手来回佣金 × 手数；swap = costs.overnight_fee(
@@ -79,6 +92,7 @@ from mt5quant.strategies.base import ExitRules
 # 复用 A 层的公开类型与校验器（单一语义来源；私有校验器若改名由集成测试兜住）
 from mt5quant.backtest.engine_a import (
     BacktestResult,
+    PROTECTIVE_REASONS,
     Trade,
     atr_series,
     _validate_bars,
@@ -88,10 +102,11 @@ from mt5quant.backtest.engine_a import (
     _week_close_bars,
 )
 
-ENGINE_VERSION_B = "B-0.4"   # 2026-10-26 T23：RiskSizing 按风险定手数（M2；
-                             # 语义与 A-1.5 同一函数，零手数订单作废计数）。
-                             # B-0.3 = T28/M8 性能改写（时间行为与 B-0.2 逐位
-                             # 一致）；B-0.2 = T20 禁入窗；B-0.1/B-0.0 见 git 历史
+ENGINE_VERSION_B = "B-0.5"   # 2026-10-26 T25：执行语义对齐 A 层（M1）——
+                             # reentry="after_signal_change"（blocked_dir 状态机）、
+                             # ruined/ruined_at 爆仓标记、week_close_exit ≤ H1
+                             # 校验（与 A 层同文案）。B-0.4 = T23 RiskSizing（M2）；
+                             # B-0.3 = T28/M8 性能改写；更早见 git 历史
 
 
 class TickCoverageError(RuntimeError):
@@ -225,6 +240,10 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
     tick 覆盖问题，不抛 TickCoverageError）。与实盘风控共用 config/sessions.toml。
     定手数（T23/B-0.4）：volume_lots 与 sizing 二选一（同给/同缺都拒）；
     sizing 模式必须另给 vol_min/vol_step/vol_max（口径同 A 层 A-1.5）。
+    执行语义（T25/B-0.5，与 A 层 A-1.3/A-1.5 对齐）：ExitRules.reentry=
+    "after_signal_change" 时保护性出场后信号离开原方向前禁同向开仓；
+    逐 bar 收盘权益 ≤ 0 → BacktestResult.ruined/ruined_at（粘滞）且不再
+    开新仓；week_close_exit 用于 > H1 周期直接 ValueError（同 A 层文案）。
     """
     cs = _validate_contract_size(contract_size)
     if sizing is not None and volume_lots is not None:
@@ -282,6 +301,12 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
 
     week_close_idx: frozenset = frozenset()
     if rules.week_close_exit:
+        # T25（R8 对齐）：与 A 层同文案拒绝 > H1 的周期
+        if tf_seconds > TIMEFRAME_SECONDS["H1"]:
+            raise ValueError(
+                f"week_close_exit 只允许 ≤ H1 的周期：按 bar 收盘时刻判定周五"
+                f"收盘，D1/H4 会提前一整根平仓（D1 在周四收盘强平），得到 "
+                f"{timeframe!r}")
         week_close_idx = _week_close_bars(times, tf_seconds)
 
     trades: list[Trade] = []
@@ -294,6 +319,12 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
     skipped_zero_lots = 0          # T23：手数为 0 而作废的订单（含 ATR 缺）
     equity_vals = [0.0] * n
     trade_field_names = {f.name for f in fields(Trade)}
+    # T25（R7 对齐）：after_signal_change 模式下保护性出场后的禁入方向
+    # （±1；0=无禁入）。immediate 模式不设禁入（保持目标仓位语义）。
+    blocked_dir = 0
+    # T25（R16 对齐）：权益 ≤ 0 后不再开新仓；ruined 粘滞，ruined_at 记首次 bar
+    ruined = False
+    ruined_at: pd.Timestamp | None = None
     # T28：state 的热字段镜像（逐笔 SL/TP 判定免字典查找；只在
     # _open_at/_close_at 两个唯一变更点随 state 同步）
     pos_dir = 0
@@ -363,7 +394,7 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
 
     def _close_at(m: int, bid: float, ask: float, reason: str) -> None:
         """按成交 tick 平仓：多头 Bid 卖出 / 空头 Ask 买入，另加不利滑点。"""
-        nonlocal state, realized, pending, pos_dir, pos_sl, pos_tp
+        nonlocal state, realized, pending, pos_dir, pos_sl, pos_tp, blocked_dir
         assert state is not None
         ts_ = pd.Timestamp(m, unit="ms")
         if state["dir"] == 1:
@@ -393,6 +424,11 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
             kwargs["exit_fill_time"] = ts_    # T7 字段：B 层即成交 tick 时刻
         trades.append(Trade(**kwargs))
         realized += net
+        if (rules.reentry == "after_signal_change"
+                and reason in PROTECTIVE_REASONS):
+            # T25（R7，同 A 层判定）：保护性出场（B 层不会出现 stop_gap/
+            # take_profit_gap）→ 禁同向再入场；immediate 模式不设禁入
+            blocked_dir = state["dir"]
         state = None
         pos_dir, pos_sl, pos_tp = 0, None, None
         # 持仓已被保护性出场平掉时，同向的"平仓单"已成空单，立即撤销
@@ -411,8 +447,8 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
 
     def _close_bar(b: int, stream: _TickStream) -> None:
         """bar b 收盘（时刻 = t_b + 周期）：覆盖检查 → 收盘前最后一笔 tick 的
-        bar 级出场 → 收盘市值 → 由 sig[b] 生成/替换目标仓位订单。"""
-        nonlocal state, pending, interval_need, prev
+        bar 级出场 → 收盘市值（含爆仓判定）→ 由 sig[b] 生成/替换目标仓位订单。"""
+        nonlocal state, pending, interval_need, prev, blocked_dir, ruined, ruined_at
         # 1) 覆盖检查：本 bar 区间曾有持仓/待成交订单却一笔 tick 都没有
         if interval_need and (prev is None or prev[0] < t_ms[b]):
             raise TickCoverageError(
@@ -439,12 +475,26 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
             mark = prev[1] if state["dir"] == 1 else prev[2]
             unreal = (mark - state["entry_price"]) * state["dir"] * state["lots"] * cs
         equity_vals[b] = initial_capital + realized + unreal
-        # 4) bar b 收盘 → 目标仓位订单（最后一根 bar 的信号永不执行，同 A 层）
+        if not ruined and equity_vals[b] <= 0:   # T25（R16）：爆仓（粘滞标记）
+            ruined = True
+            ruined_at = times[b]
+        # 4) bar b 收盘 → 目标仓位订单（最后一根 bar 的信号永不执行，同 A 层）。
+        # T25（R7/R16 对齐 A 层）：信号已离开禁入方向（变 0 或反向）→ 解禁；
+        # 开仓单被同向禁入 / 爆仓拦下时不产生订单（平仓/反手单照常——平仓腿
+        # 必须执行，反手单的开仓腿在成交时再裁决，同 A 层"先平后不开"）。
         if b < n - 1:
             desired = int(sig_arr[b])
+            if blocked_dir and desired != blocked_dir:
+                blocked_dir = 0
             cur = state["dir"] if state is not None else 0
-            pending = ({"desired": desired, "ready_ms": close_ms[b] + int(latency_ms)}
-                       if desired != cur else None)
+            if desired == cur:
+                pending = None
+            elif (desired == 0 or cur != 0
+                    or (not ruined and desired != blocked_dir)):
+                pending = {"desired": desired,
+                           "ready_ms": close_ms[b] + int(latency_ms)}
+            else:
+                pending = None    # 开仓被禁：不下单（空仓区间无引擎事件）
         else:
             if pending is not None and not (
                     session_policy is not None and stream.last_msc is not None
@@ -495,7 +545,10 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
                     close_next = (close_ms[last_closed + 1]
                                   if last_closed < n - 1 else None)
                 # 订单成交：就绪时刻含边界。开仓订单遇禁入时段 → 保留待下一笔
-                # 允许时刻的 tick（T20）；平仓单（desired=0）不受限
+                # 允许时刻的 tick（T20）；平仓单（desired=0）不受限。
+                # T25（R7/R16 对齐）：同向禁入 / 爆仓时开仓腿跳过、订单作废
+                #（反手平仓已在上面照常执行；信号持续时下一根 bar 收盘按新
+                # 信号重新裁决——与 A 层逐 bar 的判定节奏一致）。
                 entered = False
                 if pending is not None and m >= pending["ready_ms"]:
                     desired = pending["desired"]
@@ -504,9 +557,12 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
                     if desired != 0:
                         if session_policy is None or session_policy.entry_allowed(
                                 symbol, pd.Timestamp(m, unit="ms")):
-                            pending = None
-                            _open_at(m, bid, ask, desired)
-                            entered = True
+                            if not ruined and desired != blocked_dir:
+                                pending = None
+                                _open_at(m, bid, ask, desired)
+                                entered = True
+                            else:
+                                pending = None
                     else:
                         pending = None
                 # SL/TP 逐 tick（入场 tick 自身不触发自己的止损；内联省一次
@@ -545,4 +601,5 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
                           volume_lots=(None if sizing is not None
                                        else float(volume_lots)),
                           initial_capital=float(initial_capital),
+                          ruined=ruined, ruined_at=ruined_at,
                           skipped_zero_lots=skipped_zero_lots)
