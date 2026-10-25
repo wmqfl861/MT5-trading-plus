@@ -3,15 +3,18 @@
 铁律（docs/blueprint.md §4 第 10 条）：**风控进程独立于策略进程**。本模块
 只做检查与指令输出，绝不直接下单；全平/停机通过 data/live/ 下的文件传递：
 
-- ``data/live/heartbeat.json``——运行器每轮写；风控读，超时/缺失 → 置
-  runner_alive=false 并写 halt 文件（fail-closed：运行器未启动也拒绝交易）。
+- ``data/live/heartbeat-<magic>.json``——每个策略运行器各写一个（T24/M9；
+  旧版单文件 heartbeat.json 兼容读取）；风控读全部登记策略的心跳，
+  任一超时/缺失 → 置该文件 runner_alive=false 并写 halt 文件（fail-closed：
+  运行器未启动也拒绝交易）。
 - ``data/live/killSwitch``——一键停机：文件存在即 halt（不自动平仓，平仓由
   人工决定）；恢复 = 删除该文件与 halt.json。
 - ``data/live/halt.json``——``{"reason": str, "ts": iso}``，存在即停机；
   首次原因优先（已存在不覆盖），恢复须人工删除。
 - ``data/live/commands/flatten.json``——``{"command": "flatten_all",
-  "reason": str, "ts": iso}``，执行器全平后删除/改名该文件以示完成
-  （存在期间不重写）。
+  "reason": str, "ts": iso}``；执行器消费后写 ``commands/flatten.ack-<magic>``
+  确认（T24）；风控进程在**所有登记 magic**（心跳/expected 文件名）都确认后
+  把指令文件归档到 ``commands/archive/``（存在期间不重写）。
 
 规则（check，按序裁决，第一条违规即返回）：
 1. 日亏损上限：当日已实现 + 浮动 ≤ -daily_loss_cap_usd → 拒单且
@@ -48,11 +51,12 @@ from mt5live.monitor import (
     ALERT_RISK_HALT,
     TRADE_ENTRY_KINDS,
     append_alert,
+    heartbeat_files,
     heartbeat_status,
     iso_utc,
+    mark_heartbeat_stale,
     naive_utc,
-    read_heartbeat,
-    write_heartbeat,
+    read_heartbeat_path,
 )
 
 FREQUENCY_WINDOW_S = 60.0        # 下单频率滑窗宽度
@@ -61,6 +65,8 @@ HALT_FILE = "halt.json"
 KILL_SWITCH_FILE = "killSwitch"
 COMMANDS_SUBDIR = "commands"
 FLATTEN_FILE = "flatten.json"
+FLATTEN_ACK_FMT = "flatten.ack-{magic}"     # 执行器确认文件（T24）
+FLATTEN_ARCHIVE_SUBDIR = "archive"          # 全员确认后指令归档处（T24）
 
 DEFAULT_HEARTBEAT_TIMEOUT_S = 120.0
 
@@ -350,6 +356,31 @@ class CycleResult:
     halt_active: bool         # 本轮结束时 halt.json 存在
     flatten_written: bool     # 本轮新写入 flatten 指令
     daily_loss_breached: bool
+    flatten_archived: bool = False   # 本轮把 flatten 指令归档（全员已确认）
+
+
+def registered_magics(live_dir: str) -> set[int]:
+    """登记在案的 magic 集合（T24/M9）：每策略心跳 heartbeat-<magic>.json 与
+    执行器目标持仓 expected-<magic>.json 的文件名并集——风控进程据此检查
+    所有策略的心跳、确认所有执行器都消费了 flatten 指令。"""
+    out: set[int] = set()
+    try:
+        names = os.listdir(live_dir)
+    except OSError:
+        return out
+    for name in names:
+        for prefix in ("heartbeat-", "expected-"):
+            if name.startswith(prefix) and name.endswith(".json"):
+                body = name[len(prefix):-len(".json")]
+                try:
+                    out.add(int(body))
+                except ValueError:
+                    continue
+    return out
+
+
+class RiskProcess:
+    """绑定配置与 live 目录的风控进程（检查器 + 周期逻辑，不做任何下单）。"""
 
 
 class RiskProcess:
@@ -388,11 +419,21 @@ class RiskProcess:
             return RiskDecision(False, f"halted: {reason}", halt=True)
         return check(order_request, state, self.config, n, self.session_policy)
 
+    def trigger_flatten_and_halt(self, reason: str,
+                                 now: datetime | None = None) -> None:
+        """落实全平 + 停机的文件级后果（T24：RiskGate 在执行器路径上调用——
+        日亏在开仓检查时被发现也要立即写 flatten.json/halt.json，不等
+        风控主循环的下一轮）。已存在的不覆盖（首次原因优先）。"""
+        n = naive_utc(now if now is not None
+                      else datetime.now(timezone.utc))
+        self._write_flatten(reason, n)
+        self._write_halt(reason, n)
+
     # -- 主循环单轮 --
 
     def run_cycle(self, snapshot: AccountSnapshot | None,
                   now: datetime | None = None) -> CycleResult:
-        """一轮：心跳 → killSwitch → 账户日亏。返回本轮动作（见 CycleResult）。"""
+        """一轮：心跳（全部登记策略）→ killSwitch → 账户日亏 → flatten 归档。"""
         n = naive_utc(now if now is not None
                       else datetime.now(timezone.utc))
         if snapshot is not None and snapshot.currency != "USD":
@@ -403,23 +444,43 @@ class RiskProcess:
         flatten_written = False
         daily_breached = False
 
-        # 1) 心跳：超时/缺失 → 置 runner_alive=false 并写 halt（fail-closed）；
-        #    运行器自报停止（runner_alive=false）是干净退出，不触发停机。
-        hb = read_heartbeat(self.live_dir)
-        st = heartbeat_status(hb, n, timeout_s=self.heartbeat_timeout_s)
-        if st.reason in ("timeout", "missing"):
-            ts = hb.ts if hb is not None else n
-            write_heartbeat(self.live_dir, False, ts=ts)
-            halt_written |= self._write_halt(
-                "heartbeat_timeout" if st.reason == "timeout"
-                else "heartbeat_missing", n)
-            if not self._hb_alerted:
-                age = f"（最后心跳 {st.age_s:.0f} 秒前）" if st.age_s is not None else "（无心跳文件）"
-                append_alert(self.live_dir, ALERT_HEARTBEAT_TIMEOUT,
-                             f"运行器心跳 {st.reason}{age}，已停机", n)
-                self._hb_alerted = True
-        elif st.ok:
+        # 1) 心跳（T24/M9）：每策略一个 heartbeat-<magic>.json，任一超时/缺失
+        #    → 全局停机（fail-closed）；运行器自报停止是干净退出，不停机。
+        #    无任何心跳文件时维持旧语义（missing → 停机）。
+        worst = None          # (path, status)；优先级 timeout/missing > runner_stopped
+        for path in heartbeat_files(self.live_dir):
+            hb = read_heartbeat_path(path)
+            st = heartbeat_status(hb, n, timeout_s=self.heartbeat_timeout_s)
+            if st.ok:
+                continue
+            if worst is None or worst[1].reason == "runner_stopped":
+                worst = (path, st)
+        if worst is None and not heartbeat_files(self.live_dir):
+            worst = (None, heartbeat_status(None, n,
+                                            timeout_s=self.heartbeat_timeout_s))
+        if worst is not None:
+            path, st = worst
+            if st.reason in ("timeout", "missing"):
+                if path is not None:
+                    hb = read_heartbeat_path(path)
+                    if hb is not None:
+                        mark_heartbeat_stale(path, hb)
+                halt_written |= self._write_halt(
+                    "heartbeat_timeout" if st.reason == "timeout"
+                    else "heartbeat_missing", n)
+                if not self._hb_alerted:
+                    who = (f"（{os.path.basename(path)}）" if path is not None
+                           else "（无心跳文件）")
+                    age = (f"最后心跳 {st.age_s:.0f} 秒前，" if st.age_s is not None
+                           else "")
+                    append_alert(self.live_dir, ALERT_HEARTBEAT_TIMEOUT,
+                                 f"运行器心跳 {st.reason}{who}{age}，已全局停机", n)
+                    self._hb_alerted = True
+        else:
             self._hb_alerted = False
+
+        heartbeat_ok = worst is None
+        heartbeat_reason = worst[1].reason if worst is not None else "ok"
 
         # 2) 一键停机文件
         if os.path.exists(self.kill_switch_path):
@@ -433,10 +494,32 @@ class RiskProcess:
                 flatten_written |= self._write_flatten("daily_loss_cap", n)
                 halt_written |= self._write_halt("daily_loss_cap", n)
 
+        # 4) flatten 指令归档（T24）：所有登记 magic 都写 flatten.ack-<magic>
+        #    后才归档（移入 commands/archive/），防执行器漏消费。
+        flatten_archived = False
+        if os.path.exists(self.flatten_path):
+            flatten_archived = self._archive_flatten_if_acked(n)
+
         return CycleResult(
-            heartbeat_ok=st.ok, heartbeat_reason=st.reason,
+            heartbeat_ok=heartbeat_ok, heartbeat_reason=heartbeat_reason,
             halt_written=halt_written, halt_active=os.path.exists(self.halt_path),
-            flatten_written=flatten_written, daily_loss_breached=daily_breached)
+            flatten_written=flatten_written, daily_loss_breached=daily_breached,
+            flatten_archived=flatten_archived)
+
+    def _archive_flatten_if_acked(self, now: datetime) -> bool:
+        magics = registered_magics(self.live_dir)
+        if not magics:
+            return False                     # 没有登记策略：无从确认，不归档
+        for magic in magics:
+            if not os.path.exists(os.path.join(
+                    self.commands_dir, FLATTEN_ACK_FMT.format(magic=magic))):
+                return False
+        archive_dir = os.path.join(self.commands_dir, FLATTEN_ARCHIVE_SUBDIR)
+        os.makedirs(archive_dir, exist_ok=True)
+        stamp = iso_utc(now).replace(":", "").replace("+", "_")
+        os.replace(self.flatten_path,
+                   os.path.join(archive_dir, f"flatten-{stamp}.json"))
+        return True
 
     # -- 指令文件 --
 

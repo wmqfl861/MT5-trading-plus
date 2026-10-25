@@ -1,12 +1,14 @@
 """风控主循环 CLI（T14/P7，独立于策略进程运行——蓝图 §4 第 10 条）。
 
 每轮：
-1. 读 data/live/heartbeat.json——超时/缺失 → 置 runner_alive=false 并写
-   data/live/halt.json（fail-closed：运行器未启动也拒绝交易。恢复 = 人工
-   删除 halt.json；建议启动顺序：先运行器、后风控进程）；
+1. 读全部登记策略的心跳（data/live/heartbeat-<magic>.json，T24/M9；兼容
+   旧版单文件 heartbeat.json）——任一超时/缺失 → 置该文件 runner_alive=false
+   并写 data/live/halt.json（fail-closed：运行器未启动也拒绝交易。恢复 =
+   人工删除 halt.json；建议启动顺序：先运行器、后风控进程）；
 2. 检查 data/live/killSwitch——存在 → 写 halt.json（一键停机，不自动平仓）；
 3. 轮询账户——当日（UTC 日）已实现+浮动 ≤ -daily_loss_cap_usd → 写
-   data/live/commands/flatten.json（执行器全平后删除/改名该文件以示完成）。
+   data/live/commands/flatten.json（执行器全平后写 flatten.ack-<magic> 确认，
+   T24）；所有登记 magic 都确认后把指令文件归档到 commands/archive/。
 
 退出码：0 = 本轮完成（含"按规则写了 halt/flatten"——那是动作不是故障）；
 1 = 账户轮询失败（--once 模式）；2 = 配置/连接等不可恢复错误。

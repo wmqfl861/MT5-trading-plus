@@ -5,15 +5,18 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\setup_scheduled_tasks.ps1
 #
 # 删除（卸载全部任务；逐条执行）：
-#   schtasks /Delete /TN "MT5Quant\snapshot_specs" /F
-#   schtasks /Delete /TN "MT5Quant\refresh_bars"   /F
-#   schtasks /Delete /TN "MT5Quant\refresh_ticks"  /F
+#   schtasks /Delete /TN "MT5Quant\snapshot_specs"   /F
+#   schtasks /Delete /TN "MT5Quant\refresh_bars"     /F
+#   schtasks /Delete /TN "MT5Quant\refresh_ticks"    /F
+#   schtasks /Delete /TN "MT5Quant\live_daily_report" /F
 #
 # 任务一览（每日，本机时间）：
-#   MT5Quant\snapshot_specs  00:05  品种参数快照（scripts\task_snapshot_specs.cmd）
-#   MT5Quant\refresh_bars    00:10  K 线增量刷新（scripts\task_refresh_bars.cmd）
-#   MT5Quant\refresh_ticks   00:15  tick 增量刷新（scripts\task_refresh_ticks.cmd；
-#                                   仅当 data\ticks 已有品种目录时安装，否则跳过并提示）
+#   MT5Quant\snapshot_specs    00:05  品种参数快照（scripts\task_snapshot_specs.cmd）
+#   MT5Quant\refresh_bars      00:10  K 线增量刷新（scripts\task_refresh_bars.cmd）
+#   MT5Quant\refresh_ticks     00:15  tick 增量刷新（scripts\task_refresh_ticks.cmd；
+#                                     仅当 data\ticks 已有品种目录时安装，否则跳过并提示）
+#   MT5Quant\live_daily_report 00:20  实盘日报（scripts\task_live_daily_report.cmd；
+#                                     T24：render_daily_report → data\reports\live\）
 #
 # 实现说明：schtasks /TR 上限 261 字符，直接塞完整命令行必然超限——改为生成
 # 三个 .cmd 包装器（cd 钉仓库根 + 输出落 data\logs\task_*.log），/TR 只填包装器路径。
@@ -72,5 +75,10 @@ if (Test-Path $ticksDir) {
     Write-Host "data\ticks 不存在，跳过 MT5Quant\refresh_ticks（建 tick 库后重跑本脚本安装）"
 }
 
+# T24：实盘日报（昨天的 UTC 日；render_daily_report 落 data\reports\live\）
+New-DailyTask "live_daily_report" "00:20" `
+    (New-TaskWrapper "live_daily_report" "live_daily_report.py" `
+        ($cfgArg + " --date yesterday"))
+
 Write-Host ""
-Write-Host "完成。删除命令见本文件头部注释（三条 schtasks /Delete）。"
+Write-Host "完成。删除命令见本文件头部注释（四条 schtasks /Delete）。"

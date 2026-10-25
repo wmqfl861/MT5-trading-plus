@@ -290,9 +290,10 @@ def test_heartbeat_readable_by_t14b_monitor(tmp_path):
 
 
 def test_default_heartbeat_path_under_data_root():
+    # T24/M9：每策略一个心跳文件 heartbeat-<magic>.json
     assert default_heartbeat_path(mk_config()).endswith(
-        "live\\heartbeat.json") or default_heartbeat_path(mk_config()).endswith(
-        "live/heartbeat.json")
+        "live\\heartbeat-777.json") or default_heartbeat_path(
+        mk_config()).endswith("live/heartbeat-777.json")
     cfg = mk_config(heartbeat_path="x/hb.json")
     assert default_heartbeat_path(cfg) == "x/hb.json"
 

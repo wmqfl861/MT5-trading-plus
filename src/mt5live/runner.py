@@ -13,8 +13,10 @@
   实际喂给策略的是 min(compute_window_bars, 已收盘根数)，
   Decision.bars_used 如实记录（blueprint §4 第 5 条：实盘信号必须与全史
   一致——窗口不变性由 G0 把关，运行器侧尽量给足窗口）。
-  数据源经 store.load_bars 直读 parquet：**锁箱（lockbox）豁免**——锁箱
-  约束的是研究侧防前视，实盘决策本来就该用最新已收盘数据，不适用；
+  数据源两条路（T24/C2）：实盘/真终端干跑用 TerminalBarsSource（进程内
+  直接向终端取最近 N 根已收盘 bar，休市=报价陈旧→静默跳过）；parquet
+  （store.load_bars）只用于 `--dry-run --offline`——**锁箱（lockbox）豁免**
+  ——锁箱约束的是研究侧防前视，实盘决策本来就该用最新已收盘数据，不适用；
   与定时刷新进程（唯一写者）之间只存在原子文件读，无写冲突（R14）。
 - 信号语义与 engine_a 相同：s[i] 为 bar i 收盘时的目标仓位 ∈ {-1,0,1}，
   取窗口末位（= 刚收盘那根）。
@@ -30,12 +32,13 @@ from __future__ import annotations
 import json
 import math
 import os
+import time as _time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import pandas as pd
 
-from mt5data.store import TIMEFRAME_SECONDS, load_bars
+from mt5data.store import TIMEFRAME_SECONDS, drop_unclosed, load_bars
 from mt5quant.backtest.engine_a import atr_series
 from mt5quant.strategies.base import ExitRules
 
@@ -44,6 +47,15 @@ ATR_PERIOD = 14   # 与 engine_a 默认一致（Wilder ATR）
 # T25（M3）：计算窗口缺省值——远大于声明的 lookback（H1 计算很便宜）
 COMPUTE_WINDOW_MIN_BARS = 1000          # 下限：至少 1000 根
 COMPUTE_WINDOW_LOOKBACK_MULTIPLE = 3    # 倍数：3 × lookback_bars
+
+
+class MarketClosedError(RuntimeError):
+    """市场休市（最新报价陈旧超过阈值）——静默跳过本网格点，不是故障。
+
+    TerminalBarsSource.closed_bars 返回 None 时由 terminal_bars_loader
+    抛出；SignalRunner.decide 捕获后返回 None（周末、每日维护时段都走
+    这条路，不报"数据滞后"）。
+    """
 
 
 def default_compute_window_bars(lookback_bars: int) -> int:
@@ -171,6 +183,8 @@ class SignalRunner:
         self._params = strategy.validate_params(dict(config.params))
         self._tf_seconds = TIMEFRAME_SECONDS[config.timeframe.upper()]
         self._last_close: datetime | None = None   # 已决策过的最新网格点
+        self.market_closed_skips = 0               # 休市静默跳过的网格点数（日志用）
+        self._last_market_closed: str | None = None
 
     # ---- 触发网格 ----
 
@@ -198,7 +212,15 @@ class SignalRunner:
             return None
         cfg = self.config
         tf = self._tf_seconds
-        bars = self._loader(cfg.data_root, cfg.symbol, cfg.timeframe)
+        try:
+            bars = self._loader(cfg.data_root, cfg.symbol, cfg.timeframe)
+        except MarketClosedError as exc:
+            # 休市（周末/每日维护，报价陈旧）：静默跳过本网格点（计数的
+            # 日志由调用方负责），绝不当"数据滞后"报错
+            self._last_close = close_time     # 该网格点已处置，不再重试
+            self.market_closed_skips += 1
+            self._last_market_closed = str(exc)
+            return None
         if bars is None or len(bars) == 0:
             raise ValueError(
                 f"无可用 K 线：{cfg.symbol} {cfg.timeframe}（{cfg.data_root} 下"
@@ -279,33 +301,115 @@ class SignalRunner:
         return None if math.isnan(value) else value
 
 
-# ---- 心跳文件（供独立风控进程判活；格式是 T14b 的对接契约）----
+# ---- 终端行情源（T24/C2：运行器进程内直接向终端取最近 N 根已收盘 bar） ----
+
+class TerminalBarsSource:
+    """在运行器进程内向终端取最近 N 根已收盘 bar（mt5gw market 服务）。
+
+    - 休市判定：最新报价时刻距今超过 stale_quote_s（默认 120s）→ 返回
+      None（周末、每日维护时段——调用方静默跳过并记日志，不是故障）；
+    - 收盘判定沿用 store.drop_unclosed（末行收盘 ⇔ time+周期 ≤ 墙钟），
+      多取 1 根把正在形成的 bar 剔掉；
+    - 有行情但等不到预期 bar（终端/行情服务滞后）：在 max_wait_s 内以
+      poll_interval_s 重试，仍没有 → ValueError（"数据滞后"——真故障，
+      由运行器记录 last_error，绝不静默跳过）。
+    """
+
+    def __init__(self, market, *, stale_quote_s: float = 120.0,
+                 max_wait_s: float = 10.0, poll_interval_s: float = 0.5,
+                 clock=None):
+        if stale_quote_s <= 0 or max_wait_s < 0 or poll_interval_s <= 0:
+            raise ValueError(
+                f"stale_quote_s/max_wait_s/poll_interval_s 须为正（max_wait_s "
+                f"可为 0），收到 {stale_quote_s}/{max_wait_s}/{poll_interval_s}")
+        self._market = market
+        self._stale_quote_s = float(stale_quote_s)
+        self._max_wait_s = float(max_wait_s)
+        self._poll_interval_s = float(poll_interval_s)
+        self._clock = clock or (lambda: datetime.now(timezone.utc)
+                                .replace(tzinfo=None))
+
+    def closed_bars(self, symbol: str, timeframe: str,
+                    n: int) -> pd.DataFrame | None:
+        now = self._clock()
+        quote = self._market.quote(symbol)
+        if (now - quote.time).total_seconds() > self._stale_quote_s:
+            return None                       # 休市：静默跳过的信号
+        tf = TIMEFRAME_SECONDS[timeframe.upper()]
+        epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+        boundary = epoch - epoch % tf         # 最近网格点（= 应已收盘的收盘时刻）
+        expected_open = boundary - tf
+        expected_ts = pd.Timestamp(expected_open, unit="s")
+        # 重试预算按"次数"封顶（≈ max_wait_s / poll_interval_s 轮）：注入的
+        # clock 可以是冻结的模拟钟，不能拿它当日程表的死线。
+        attempts = max(1, int(self._max_wait_s / self._poll_interval_s) + 1)
+        for attempt in range(attempts):
+            rows = self._market.bars(symbol, timeframe, n + 1)
+            df = pd.DataFrame([{
+                "time": b.time, "open": b.open, "high": b.high,
+                "low": b.low, "close": b.close, "tick_volume": b.tick_volume,
+                "spread": b.spread, "real_volume": b.real_volume,
+            } for b in rows])
+            closed = drop_unclosed(df, timeframe, now)
+            if len(closed) and pd.Timestamp(closed["time"].iloc[-1]) >= expected_ts:
+                return closed
+            if attempt < attempts - 1:
+                _time.sleep(self._poll_interval_s)
+        latest = (pd.Timestamp(closed["time"].iloc[-1]).isoformat()
+                  if len(closed) else "无")
+        raise ValueError(
+            f"数据滞后：{symbol} {timeframe} 终端最新已收盘 bar "
+            f"{latest}，触发网格期望 {expected_ts.isoformat()}"
+            f"——已重试 {self._max_wait_s:.1f}s 仍无（行情服务/终端滞后）")
+
+
+def terminal_bars_loader(source: TerminalBarsSource, *, n: int):
+    """把 TerminalBarsSource 适配成 SignalRunner 的 bars_loader 签名。
+
+    closed_bars 返回 None（休市）→ 抛 MarketClosedError（runner 捕获后
+    静默跳过本网格点）。
+    """
+    def load(root, symbol, timeframe):
+        df = source.closed_bars(symbol, timeframe, n)
+        if df is None:
+            raise MarketClosedError(
+                f"{symbol} 休市（最新报价陈旧超过阈值），跳过本网格点")
+        return df
+    return load
+
+
+# ---- 心跳文件（供独立风控进程判活；格式是 T14b 的对接契约） ----
 
 def default_heartbeat_path(config) -> str:
+    """每策略一个心跳文件（T24/M9）：{data_root}/live/heartbeat-<magic>.json。"""
     return config.heartbeat_path or os.path.join(
-        config.data_root, "live", "heartbeat.json")
+        config.data_root, "live", f"heartbeat-{config.magic}.json")
 
 
 def write_heartbeat(path: str, *, config, decision: Decision | None = None,
                     error: str | None = None, dry_run: bool = False,
-                    pid: int | None = None) -> None:
+                    pid: int | None = None,
+                    now: datetime | None = None) -> None:
     """原子写心跳 JSON（tmp + os.replace）。
 
-    契约（风控/监控进程 T14b 消费，落点 {data_root}/live/heartbeat.json）：
-    - 兼容字段（monitor.read_heartbeat 必需）：runner_alive（运行器每轮写
+    契约（风控/监控进程 T14b 消费，落点 {data_root}/live/heartbeat-<magic>.json，
+    T24/M9 起每策略一个文件）：
+    - 兼容字段（monitor.read_heartbeat_path 必需）：runner_alive（运行器每轮写
       True；风控进程判活超时会改写为 False）、ts（ISO-8601 带 +00:00）；
     - 扩展字段：pid / updated_at_utc / symbol / timeframe / strategy /
       magic / risk_check_enabled / dry_run / last_decision / last_error；
     - 判活：ts（或 updated_at_utc）距今超过阈值（monitor 默认 120s）→ 告警；
     - last_decision：最近一次决策（decision_id/bar_close_time/signal/
-      volume_lots 等，null = 尚无决策）；volume_lots=null 且 signal≠0 时由
-      风控进程裁决手数后交执行器；
-    - last_error：最近一轮异常（null = 正常）；
-    - dry_run=true 表示执行器未接入，心跳仅表明信号侧存活。
+      volume_lots 等，null = 尚无决策）；
+    - last_error：最近一轮异常或风控拒绝原因（null = 正常）；
+    - dry_run=true 表示未下单（离线干跑或只打印决策）；
+    - now：显式时间戳（测试注入模拟时钟）；缺省用真实墙钟。
     """
-    ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    ts_dt = (now if now is not None
+             else datetime.now(timezone.utc)).replace(tzinfo=timezone.utc)
+    ts = ts_dt.isoformat(timespec="milliseconds")
     payload = {
-        "runner_alive": True,        # T14b monitor.read_heartbeat 的必需字段
+        "runner_alive": True,        # T14b monitor.read_heartbeat_path 的必需字段
         "ts": ts,                    # 同上；风控进程超时会整文件改写
         "pid": pid if pid is not None else os.getpid(),
         "updated_at_utc": ts,

@@ -1,25 +1,39 @@
-"""实盘信号运行器 CLI（T14a；风控/对账进程见 T14b）。
+"""实盘信号运行器 CLI（T14a + T24 实盘接线；风控/对账进程见 T14b）。
 
-示例：
-    # 干跑：不连 MT5、不下单，只打印决策 + 写心跳（验证配置与数据链路）
+用法：
+    # 干跑（离线合成数据）：不连 MT5、不下单，读 parquet + 写心跳
+    .venv/Scripts/python.exe scripts/live_runner.py --config live.toml \
+        --once --dry-run --offline
+
+    # 干跑（真实终端）：连网关只读行情（TerminalBarsSource 取 bar），不下单
     .venv/Scripts/python.exe scripts/live_runner.py --config live.toml \
         --once --dry-run
 
-    # 实跑（模拟盘）：bar 收盘后自动差分下单
+    # 实跑（模拟盘）：bar 收盘后自动差分下单（先过 RiskGate 风控闸门）
     .venv/Scripts/python.exe scripts/live_runner.py --config live.toml --loop
 
-约定：
-- 数据：只读 {data_root} 下的 K 线 parquet（定时刷新进程是唯一写者，
-  原子写 → 读写无冲突，R14 的"单写者"天然成立）；锁箱豁免见 mt5live.runner。
-- dry-run：不初始化 MT5、不调执行器，只产出决策与心跳。
-- 心跳每轮更新（含无决策的轮次），风控进程按 updated_at_utc 判活。
-- 决策异常（数据滞后/窗口不足等）记入心跳 last_error 后继续轮询，
-  绝不吞错后盲目下单；执行异常原样上抛并停机退出（等人工/风控处置）。
+约定（T24）：
+- 数据来源（C2）：实盘与真终端干跑用 TerminalBarsSource（进程内直接向终端
+  取最近 N 根已收盘 bar；休市=报价陈旧 → 静默跳过本轮并记日志；有行情但
+  等不到预期 bar 在 max_wait_s 内重试，仍无才报"数据滞后"）。parquet 只用于
+  `--dry-run --offline`。
+- 执行（C1）：LiveExecutor 每轮先查 commands/flatten.json（全平+确认），
+  开仓/加仓腿先过 RiskGate.check_open（拒绝 → 不下单，原因写心跳
+  last_error 与 alerts.log），平仓不受限；每次执行后写
+  expected-<magic>.json（对账进程读全部）。
+- 手数（M2）：volume_lots 缺省时按 risk_fraction 定手数（LiveSizer，
+  mt5quant.sizing.lots_for_risk——与回测同一函数）；风控只设上限。
+- 启动校验（M1）：策略用到 time_stop_bars / week_close_exit 直接拒绝启动
+  （实盘未实现，dry-run 同样校验）。
+- 心跳：每策略一个 {data_root}/live/heartbeat-<magic>.json，每轮更新
+  （含无决策轮次），风控进程按 ts 判活；决策异常记 last_error 后继续轮询，
+  执行异常原样上抛并停机退出（等人工/风控处置）。
 """
 from __future__ import annotations
 
 import argparse
 import importlib
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -29,9 +43,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mt5data.store import load_bars  # noqa: E402
 from mt5live.config import LiveConfig, load as load_config  # noqa: E402
-from mt5live.executor import ExecutionAdapter  # noqa: E402
-from mt5live.runner import (SignalRunner, default_heartbeat_path,  # noqa: E402
-                            write_heartbeat)
+from mt5live.executor import ExecutionAdapter, LiveExecutor, \
+    validate_live_strategy  # noqa: E402
+from mt5live.gate import LiveSizer, RiskGate  # noqa: E402
+from mt5live.riskproc import RiskConfigError, RiskProcess, load_risk_config  # noqa: E402
+from mt5live.runner import (  # noqa: E402
+    MarketClosedError,
+    SignalRunner,
+    TerminalBarsSource,
+    default_compute_window_bars,
+    default_heartbeat_path,
+    terminal_bars_loader,
+    write_heartbeat,
+)
+from mt5quant.sizing import RiskSizing  # noqa: E402
 
 
 def load_strategy(path: str):
@@ -65,52 +90,120 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--once", action="store_true", help="跑一轮即退出")
     mode.add_argument("--loop", action="store_true", help="常驻轮询")
     p.add_argument("--dry-run", action="store_true",
-                   help="不连 MT5、不下单，只打印决策与心跳")
+                   help="不下单：无 --offline 时连真实终端只读行情")
+    p.add_argument("--offline", action="store_true",
+                   help="干跑离线模式：不连 MT5，K 线读 parquet（仅配合"
+                        " --dry-run；C2 之后 parquet 只服务于此）")
     p.add_argument("--poll-interval", type=float, default=2.0,
                    help="轮询间隔秒（默认 2.0）")
     p.add_argument("--gateway-config", default=None,
                    help="网关配置路径（默认找 config.json / gateway.json）")
+    p.add_argument("--risk-config", default="config/risk.toml",
+                   help="风控配置 TOML（RiskGate/RiskProcess 用）")
+    p.add_argument("--sessions-config", default=None,
+                   help="config/sessions.toml 路径（缺省用仓库默认）")
+    p.add_argument("--spread-model", default="data/costs/spread_model.json",
+                   help="点差模型文件（点差闸门；不存在则该闸门关闭）")
+    p.add_argument("--stale-quote-s", type=float, default=120.0,
+                   help="报价陈旧阈值秒（超过=休市静默跳过，默认 120）")
+    p.add_argument("--max-wait-s", type=float, default=10.0,
+                   help="等终端出新 bar 的重试预算秒（默认 10）")
     return p
 
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if args.offline and not args.dry_run:
+        print("× --offline 只能配合 --dry-run 使用（实盘必须有终端行情源）")
+        return 2
     cfg: LiveConfig = load_config(args.config)
     strategy = load_strategy(cfg.strategy)()
+    validate_live_strategy(strategy)          # M1：未实现的出场规则拒启动
     heartbeat = default_heartbeat_path(cfg)
+    live_dir = os.path.join(cfg.data_root, "live")
+    specs_path = os.path.join(cfg.data_root, "specs", "latest.json")
 
     gw = None
     executor = None
     quote_fn = None
-    if not args.dry_run:
-        from mt5gw import MT5Gateway  # 延迟导入：dry-run 不触终端
+    if args.offline:
+        runner = SignalRunner(cfg, strategy, bars_loader=load_bars,
+                              clock=now_utc, quote_fn=None)
+    else:
+        from mt5gw import MT5Gateway  # 延迟导入：离线干跑不触终端
 
-        gw = MT5Gateway.from_config_file(find_gateway_config(args.gateway_config))
+        gw = MT5Gateway.from_config_file(
+            find_gateway_config(args.gateway_config))
         gw.connect()
 
         def quote_fn(symbol):            # noqa: F811 — 装配后的行情源
             q = gw.market.quote(symbol)
             return q.bid, q.ask
 
-        executor = ExecutionAdapter(
-            gw.trading, gw.account, gw.market,
-            symbol=cfg.symbol, magic=cfg.magic, deviation=cfg.deviation)
-    # dry-run 无行情源：决策的报价与建议 SL/TP 为 None（runner 约定）
-    runner = SignalRunner(cfg, strategy, bars_loader=load_bars, clock=now_utc,
-                          quote_fn=quote_fn)
+        source = TerminalBarsSource(
+            gw.market, stale_quote_s=args.stale_quote_s,
+            max_wait_s=args.max_wait_s, clock=now_utc)
+        runner = SignalRunner(
+            cfg, strategy,
+            bars_loader=terminal_bars_loader(
+                source, n=default_compute_window_bars(cfg.lookback_bars)),
+            clock=now_utc, quote_fn=quote_fn)
 
+        if not args.dry_run:
+            # 实跑：执行器 + 风控闸门 + 定手数（C1/M2/M10 全套接线）
+            try:
+                risk_cfg = load_risk_config(args.risk_config)
+            except RiskConfigError as e:
+                print(f"× 风控配置不合法：{e}")
+                gw.shutdown()
+                return 2
+            from mt5live.riskproc import load_default_session_policy
+            from mt5quant.costs.spread import SpreadModel
+            session_policy = load_default_session_policy(args.sessions_config)
+            spread_model = None
+            if args.spread_model and os.path.exists(args.spread_model):
+                spread_model = SpreadModel.load(args.spread_model)
+            process = RiskProcess(risk_cfg, live_dir=live_dir,
+                                  session_policy=session_policy)
+            gate = RiskGate(process, account=gw.account, market=gw.market,
+                            specs_path=specs_path, live_dir=live_dir,
+                            spread_model=spread_model,
+                            session_policy=session_policy)
+            sizer = (None if cfg.volume_lots is not None else
+                     LiveSizer(RiskSizing(cfg.risk_fraction, basis="equity"),
+                               account=gw.account, specs_path=specs_path))
+            adapter = ExecutionAdapter(
+                gw.trading, gw.account, gw.market,
+                symbol=cfg.symbol, magic=cfg.magic, deviation=cfg.deviation)
+            executor = LiveExecutor(
+                adapter, symbol=cfg.symbol, magic=cfg.magic, live_dir=live_dir,
+                rules=strategy.exit_rules, gate=gate, sizer=sizer)
+
+    sizing_desc = (f"固定 {cfg.volume_lots} 手" if cfg.volume_lots is not None
+                   else f"按风险 {cfg.risk_fraction}")
+    mode_desc = ("[dry-run offline]" if args.offline
+                 else "[dry-run]" if args.dry_run else "[LIVE]")
     print(f"mt5live 启动：{cfg.symbol} {cfg.timeframe} magic={cfg.magic} "
           f"strategy={cfg.strategy} lookback={cfg.lookback_bars} "
-          f"{'[dry-run]' if args.dry_run else '[LIVE]'}")
+          f"手数={sizing_desc} {mode_desc}")
     try:
+        skips_logged = runner.market_closed_skips
         while True:
+            now = now_utc()
             decision = None
             error = None
             try:
                 decision = runner.decide()
+            except MarketClosedError:
+                pass   # 理论上 runner 已捕获；双保险不刷错误
             except Exception as exc:   # 决策侧异常：记录并继续（数据滞后等可自愈）
                 error = f"{type(exc).__name__}: {exc}"
-                print(f"[{now_utc().isoformat()}] 决策异常：{error}", flush=True)
+                print(f"[{now.isoformat()}] 决策异常：{error}", flush=True)
+            if runner.market_closed_skips != skips_logged:
+                skips_logged = runner.market_closed_skips
+                print(f"[{now.isoformat()}] 休市跳过 {skips_logged}："
+                      f"{getattr(runner, '_last_market_closed', '')}",
+                      flush=True)
             if decision is not None:
                 print(f"[{decision.decided_at.isoformat()}] 决策 "
                       f"{decision.decision_id}：signal={decision.signal} "
@@ -119,25 +212,28 @@ def main(argv=None) -> int:
                       f"bid={decision.quote_bid} ask={decision.quote_ask} "
                       f"atr={decision.atr} sl={decision.sl} tp={decision.tp}",
                       flush=True)
-                if executor is not None:
-                    try:
-                        report = executor.execute(decision)
-                    except Exception as exc:
-                        # 执行侧异常：原样上抛前先把状态写进心跳（风控要能看到）
-                        write_heartbeat(heartbeat, config=cfg, decision=decision,
-                                        error=f"执行异常 {type(exc).__name__}: {exc}",
-                                        dry_run=args.dry_run)
-                        raise
-                    print(f"    执行 {report.action}：net {report.net_before} → "
-                          f"{report.net_after}，{len(report.orders)} 笔请求",
-                          flush=True)
-                    for o in report.orders:
-                        print(f"      {o.kind} ticket={o.ticket} vol={o.filled_volume}"
-                              f"/{o.requested_volume} price={o.price}"
-                              f"{' [部分成交]' if o.partial else ''}", flush=True)
-                    error = None
-                else:
-                    print("    [dry-run] 不下单", flush=True)
+            if executor is not None:
+                try:
+                    rr = executor.poll(decision, now)
+                except Exception as exc:
+                    # 执行侧异常：原样上抛前先把状态写进心跳（风控要能看到）
+                    write_heartbeat(heartbeat, config=cfg, decision=decision,
+                                    error=f"执行异常 {type(exc).__name__}: "
+                                          f"{exc}",
+                                    dry_run=args.dry_run)
+                    raise
+                print(f"    执行 {rr.action}：net {rr.net_before} → "
+                      f"{rr.net_after}，{len(rr.orders)} 笔请求"
+                      + (f"（{rr.error}）" if rr.error else ""), flush=True)
+                for o in rr.orders:
+                    print(f"      {o.kind} ticket={o.ticket} "
+                          f"vol={o.filled_volume}/{o.requested_volume} "
+                          f"price={o.price}"
+                          f"{' [部分成交]' if o.partial else ''}", flush=True)
+                if rr.error:
+                    error = rr.error
+            elif decision is not None:
+                print("    [dry-run] 不下单", flush=True)
             write_heartbeat(heartbeat, config=cfg, decision=decision,
                             error=error, dry_run=args.dry_run)
             if args.once:

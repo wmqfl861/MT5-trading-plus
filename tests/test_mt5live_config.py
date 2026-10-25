@@ -28,6 +28,7 @@ timeframe = "H1"
 strategy = "mod:Cls"
 magic = 777
 lookback_bars = 50
+risk_fraction = 0.005
 """
 
 
@@ -55,13 +56,34 @@ def test_load_full_toml(tmp_path):
 
 def test_minimal_toml_gets_defaults(tmp_path):
     cfg = load(write_toml(tmp_path, MINIMAL_TOML))
-    assert cfg.volume_lots is None            # 缺省 → 手数交给风控进程
+    assert cfg.volume_lots is None            # 手数走 risk_fraction（按风险定）
+    assert cfg.risk_fraction == 0.005
     assert cfg.deviation == 20
     assert cfg.risk_check_enabled is True
     assert cfg.data_root == "data"
     assert cfg.trigger_delay_s == 5.0
     assert cfg.heartbeat_path is None
     assert cfg.params == {}
+
+
+def test_no_volume_source_rejected(tmp_path):
+    # 手数来源必须二选一（T24/M2）：都不给 = 静默 1 手的爆仓来源
+    text = MINIMAL_TOML.replace("risk_fraction = 0.005\n", "")
+    with pytest.raises(ValueError, match="二选一"):
+        load(write_toml(tmp_path, text))
+
+
+def test_both_volume_sources_rejected(tmp_path):
+    text = MINIMAL_TOML + "volume_lots = 0.01\n"
+    with pytest.raises(ValueError, match="只能给一个"):
+        load(write_toml(tmp_path, text))
+
+
+@pytest.mark.parametrize("bad", ['risk_fraction = 0', 'risk_fraction = 0.5',
+                                 'risk_fraction = -0.01'])
+def test_bad_risk_fraction_rejected(tmp_path, bad):
+    with pytest.raises(ValueError, match="risk_fraction"):
+        load(write_toml(tmp_path, patched_toml(bad)))
 
 
 def test_config_is_frozen(tmp_path):

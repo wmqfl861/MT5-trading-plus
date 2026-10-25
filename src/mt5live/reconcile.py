@@ -1,11 +1,13 @@
-"""mt5live.reconcile（T14/P7）：expected vs actual 持仓对账。
+"""mt5live.reconcile（T14/P7 + T24）：expected vs actual 持仓对账。
 
 对账口径：
-- expected：``data/live/expected.json``（信号运行器/执行器写入的目标持仓），
-  每 (symbol, magic) 一条净持仓（buy 正 / sell 负的净手数），缺项或
-  volume=0 表示该组合应为空仓；**完全未在文件中出现的 magic 视为不受管**
-  （手动单等）——因此运行器应为每个受管 magic 至少写一条（空仓写
-  volume=0），否则该 magic 的实际持仓不参与对账；
+- expected：T24 起每策略一个 ``data/live/expected-<magic>.json``（执行器
+  每轮写入的目标持仓）；``load_expected_dir`` 合并全部 ``expected-*.json``
+  （含旧版单文件 ``expected.json``），每 (symbol, magic) 一条净持仓
+  （buy 正 / sell 负的净手数），缺项或 volume=0 表示该组合应为空仓；
+  **完全未在任何 expected 文件中出现的 magic 视为不受管**（手动单等）——
+  因此执行器每轮都写（空仓写 volume=0），否则该 magic 的实际持仓不参与
+  对账；
 - actual：账户实际持仓，**按 magic 过滤**——expected 中出现的 magic 才参与
   对账，手动单（magic=0）与其他策略的持仓不纳入；
 - 差分三情形：``missing``（应有而无）、``unexpected``（有而不应）、
@@ -13,12 +15,14 @@
 
 暂停策略指令：``data/live/pause.json``（``{"paused": bool, "reason": str|null,
 "ts": iso, "diffs": [...]}``）——不一致时 paused=true，恢复一致时写回
-paused=false；执行器/运行器读 paused 字段决定是否暂停开仓。
+paused=false；执行器闸门（mt5live.gate.RiskGate）读 paused 字段决定是否
+暂停开仓。
 
 时间约定：内存中 naive UTC，文件中 ISO 时间带 +00:00（同 mt5live.monitor）。
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
 from dataclasses import dataclass
@@ -28,6 +32,7 @@ from mt5gw.snapshot import write_json_atomic
 from mt5live.monitor import iso_utc, naive_utc, parse_iso
 
 EXPECTED_FILE = "expected.json"
+EXPECTED_GLOB = "expected-*.json"   # T24：每策略一个目标持仓文件
 PAUSE_FILE = "pause.json"
 DEFAULT_VOLUME_TOLERANCE = 1e-6  # 手（volume_step 通常 0.01，纯浮点噪声容差）
 
@@ -114,6 +119,31 @@ def load_expected(path: str) -> ExpectedState:
         except (ValueError, TypeError) as e:
             raise ExpectedStateError(f"{path} positions[{i}] 不合法：{e}") from e
     return ExpectedState(ts=ts, positions=tuple(parsed))
+
+
+def load_expected_dir(live_dir: str) -> ExpectedState:
+    """合并 live 目录下全部 expected 文件（T24：expected-<magic>.json 逐个
+    + 旧版 expected.json），供对账进程一次读入所有受管 magic。
+
+    目录里没有任何 expected 文件 → ExpectedStateError（运行器先启动）；
+    单个文件损坏如实抛错（ExpectedStateError），绝不静默跳过该策略。
+    """
+    paths = sorted(glob.glob(os.path.join(live_dir, EXPECTED_GLOB)))
+    legacy = os.path.join(live_dir, EXPECTED_FILE)
+    if os.path.exists(legacy):
+        paths.append(legacy)
+    if not paths:
+        raise ExpectedStateError(
+            f"{live_dir} 下没有任何 expected 文件（expected-<magic>.json / "
+            f"{EXPECTED_FILE}）——运行器/执行器先启动写出目标持仓")
+    merged_ts: datetime | None = None
+    merged: list[ExpectedPosition] = []
+    for path in paths:
+        state = load_expected(path)
+        merged.extend(state.positions)
+        if merged_ts is None or state.ts > merged_ts:
+            merged_ts = state.ts
+    return ExpectedState(ts=merged_ts, positions=tuple(merged))
 
 
 @dataclass(frozen=True)

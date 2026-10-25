@@ -24,12 +24,13 @@ HEARTBEAT_FILE = "heartbeat.json"
 ALERTS_FILE = "alerts.log"
 DAILY_REPORT_SUBDIR = "live"  # data/reports/live/
 
-# 即时告警类别（任务约定的三类 + 账户轮询失败）
+# 即时告警类别（任务约定的三类 + 账户轮询失败 + 开仓被拒）
 ALERT_HEARTBEAT_TIMEOUT = "HEARTBEAT_TIMEOUT"    # 断线：心跳超时/缺失
 ALERT_RECONCILE_MISMATCH = "RECONCILE_MISMATCH"  # 持仓对账不一致
 ALERT_RISK_HALT = "RISK_HALT"                    # 风控触发停机
 ALERT_RISK_FLATTEN = "RISK_FLATTEN"              # 风控触发全平
 ALERT_ACCOUNT_POLL_ERROR = "ACCOUNT_POLL_ERROR"  # 账户轮询失败
+ALERT_RISK_REJECT = "RISK_REJECT"                # 开仓被风控/闸门拒绝（T24）
 
 DEFAULT_HEARTBEAT_TIMEOUT_S = 120.0
 
@@ -73,9 +74,11 @@ def write_heartbeat(live_dir: str, runner_alive: bool, *, ts: datetime) -> None:
     )
 
 
-def read_heartbeat(live_dir: str) -> Heartbeat | None:
-    """读心跳；文件不存在 → None，内容不合法 → ValueError（如实抛错）。"""
-    path = os.path.join(live_dir, HEARTBEAT_FILE)
+def read_heartbeat_path(path: str) -> Heartbeat | None:
+    """读指定路径的心跳文件（T24：每策略一个 heartbeat-<magic>.json）。
+
+    文件不存在 → None，内容不合法 → ValueError（如实抛错）。
+    """
     if not os.path.exists(path):
         return None
     with open(path, encoding="utf-8") as f:
@@ -94,6 +97,38 @@ def read_heartbeat(live_dir: str) -> Heartbeat | None:
     except (TypeError, ValueError) as e:
         raise ValueError(f"{path} ts 不是合法 ISO 时间：{data['ts']!r}") from e
     return Heartbeat(bool(data["runner_alive"]), ts)
+
+
+def heartbeat_files(live_dir: str) -> list[str]:
+    """live 目录下全部心跳文件路径：每策略 heartbeat-<magic>.json（T24/M9）
+    + 兼容的旧版单文件 heartbeat.json（存在才列入）。"""
+    per_magic = sorted(
+        os.path.join(live_dir, name)
+        for name in os.listdir(live_dir)
+        if name.startswith("heartbeat-") and name.endswith(".json"))
+    legacy = os.path.join(live_dir, HEARTBEAT_FILE)
+    if os.path.exists(legacy):
+        per_magic.append(legacy)
+    return per_magic
+
+
+def mark_heartbeat_stale(path: str, hb: Heartbeat) -> None:
+    """把超时的心跳文件改写为 runner_alive=false（保留其余字段）。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    data["runner_alive"] = False
+    data["ts"] = iso_utc(hb.ts)
+    write_json_atomic(path, data)
+
+
+def read_heartbeat(live_dir: str) -> Heartbeat | None:
+    """读默认心跳（旧版单文件路径；每策略文件用 read_heartbeat_path）。"""
+    return read_heartbeat_path(os.path.join(live_dir, HEARTBEAT_FILE))
 
 
 @dataclass(frozen=True)
