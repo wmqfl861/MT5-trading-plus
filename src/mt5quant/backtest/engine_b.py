@@ -24,6 +24,13 @@
 - 禁入窗（T20 / B-0.2，SessionPolicy）：开仓订单在禁入时段就绪时保留，
   等第一个允许时刻的 tick 成交；平仓不受限；禁入窗未开到数据末尾 → 订单
   作废（不视为覆盖不足）。与 A 层、实盘风控共用 config/sessions.toml。
+- 定手数（T23 / B-0.4，M2）：`sizing: RiskSizing` 与 `volume_lots` 二选一
+  （同给/同缺都拒），语义与 A 层 A-1.5 完全一致（同一函数
+  mt5quant.sizing.lots_for_risk）：按成交 tick 时点的资金（basis="initial"
+  初始资金 / "equity" = 初始资金 + 已实现净利）× risk_fraction 与止损距离
+  （策略 SL 距离或 fallback_stop_atr×信号 bar ATR；ATR 不可得 → 0 手）定
+  手数；手数为 0 → 本笔订单作废并计数 skipped_zero_lots（写进 summary），
+  信号持续时下一次 bar 收盘重新下单重试；Trade.volume_lots 如实记录。
 - bars_held = 出场 bar 序号 − 入场 bar 序号（成交 tick 所在 bar 区间），
   与 A 层口径一致。保护性出场后同向信号是否再入场沿用 A 层"目标仓位"
   语义（下一根 bar 收盘后重新下单；ExitRules.reentry 若落地由接线层处理）。
@@ -67,6 +74,7 @@ import numpy as np
 import pandas as pd
 
 from mt5data.store import TIMEFRAME_SECONDS
+from mt5quant.sizing import RiskSizing, lots_for_risk, validate_volume_bounds
 from mt5quant.strategies.base import ExitRules
 # 复用 A 层的公开类型与校验器（单一语义来源；私有校验器若改名由集成测试兜住）
 from mt5quant.backtest.engine_a import (
@@ -80,10 +88,10 @@ from mt5quant.backtest.engine_a import (
     _week_close_bars,
 )
 
-ENGINE_VERSION_B = "B-0.3"   # 2026-10-26 T28/M8：性能改写——月块向量化校验、
-                             # 免逐笔 pd.Timestamp、空仓区间 searchsorted 跳读
-                             # （时间行为与 B-0.2 逐位一致；B-0.2 = T20 禁入窗
-                             # 推迟开仓，B-0.1/B-0.0 见 git 历史）
+ENGINE_VERSION_B = "B-0.4"   # 2026-10-26 T23：RiskSizing 按风险定手数（M2；
+                             # 语义与 A-1.5 同一函数，零手数订单作废计数）。
+                             # B-0.3 = T28/M8 性能改写（时间行为与 B-0.2 逐位
+                             # 一致）；B-0.2 = T20 禁入窗；B-0.1/B-0.0 见 git 历史
 
 
 class TickCoverageError(RuntimeError):
@@ -192,12 +200,16 @@ class _TickStream:
 def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
                        symbol: str, params: dict,
                        contract_size: float,
-                       volume_lots: float = 1.0,
+                       volume_lots: float | None = None,
                        initial_capital: float = 10_000.0,
                        timeframe: str | None = None,
                        latency_ms: int | float = 0,
                        slippage_price: float = 0.0,
-                       session_policy=None) -> BacktestResult:
+                       session_policy=None,
+                       sizing: RiskSizing | None = None,
+                       vol_min: float | None = None,
+                       vol_step: float | None = None,
+                       vol_max: float | None = None) -> BacktestResult:
     """跑一次 B 层（tick 级）回测，语义详见模块 docstring。
 
     ticks_loader 契约：ticks_loader(start_msc=毫秒, end_msc=毫秒) →
@@ -211,11 +223,32 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
     等到第一个允许时刻的 tick 成交（等价 A 层"推迟到下一个允许的 bar 开盘"，
     粒度更细）；**平仓不受限**。禁入窗一直未开到数据末尾 → 订单作废（不算
     tick 覆盖问题，不抛 TickCoverageError）。与实盘风控共用 config/sessions.toml。
+    定手数（T23/B-0.4）：volume_lots 与 sizing 二选一（同给/同缺都拒）；
+    sizing 模式必须另给 vol_min/vol_step/vol_max（口径同 A 层 A-1.5）。
     """
     cs = _validate_contract_size(contract_size)
-    if not (isinstance(volume_lots, (int, float)) and not isinstance(volume_lots, bool)
-            and math.isfinite(volume_lots) and volume_lots > 0):
-        raise ValueError(f"volume_lots 必须是有限正数，收到 {volume_lots!r}")
+    if sizing is not None and volume_lots is not None:
+        raise ValueError(
+            "sizing 与 volume_lots 二选一：两者同时给出（"
+            f"sizing={sizing!r}, volume_lots={volume_lots!r}）")
+    if sizing is None and volume_lots is None:
+        raise ValueError(
+            "必须给出 volume_lots（固定手数）或 sizing（RiskSizing 按风险"
+            " 定手数）之一——不提供默认手数：静默的 1 手黄金在 1 万本金下"
+            "首次止损即爆仓（M2）")
+    if sizing is not None:
+        if vol_min is None or vol_step is None or vol_max is None:
+            raise ValueError(
+                "sizing 模式需要 vol_min/vol_step/vol_max（品种快照"
+                " volume_min/step/max，scripts 侧用 mt5quant.sizing."
+                "load_volume_limits 读取），缺 "
+                f"(min={vol_min!r}, step={vol_step!r}, max={vol_max!r})")
+        vol_bounds = validate_volume_bounds(vol_min, vol_step, vol_max)
+    else:
+        vol_bounds = None
+        if not (isinstance(volume_lots, (int, float)) and not isinstance(volume_lots, bool)
+                and math.isfinite(volume_lots) and volume_lots > 0):
+            raise ValueError(f"volume_lots 必须是有限正数，收到 {volume_lots!r}")
     if not (isinstance(initial_capital, (int, float))
             and not isinstance(initial_capital, bool)
             and math.isfinite(initial_capital) and initial_capital > 0):
@@ -258,6 +291,7 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
     last_closed = -1               # 最后已收盘 bar 的下标
     interval_need = False          # 当前 bar 区间内曾有持仓或待成交订单
     realized = 0.0
+    skipped_zero_lots = 0          # T23：手数为 0 而作废的订单（含 ATR 缺）
     equity_vals = [0.0] * n
     trade_field_names = {f.name for f in fields(Trade)}
     # T28：state 的热字段镜像（逐笔 SL/TP 判定免字典查找；只在
@@ -280,8 +314,29 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
         """按成交 tick 开仓：多头 Ask 买入 / 空头 Bid 卖出，另加不利滑点。
 
         T28：pd.Timestamp 只在成交时构造（不再逐笔构造）。
+        T23：sizing 模式按成交 tick 时点定手数（与 A 层同一函数）；手数为 0
+        → 本笔订单作废并计数（调用方已清 pending，信号持续时下一次 bar
+        收盘重新下单，与 A 层"逐 bar 重试"节奏一致）。
         """
-        nonlocal state, pos_dir, pos_sl, pos_tp
+        nonlocal state, pos_dir, pos_sl, pos_tp, skipped_zero_lots
+        sig_bar = last_closed                 # SL/TP 用信号 bar 的 ATR（已收盘）
+        entry_atr = float(atr_arr[sig_bar]) if sig_bar >= 0 else float("nan")
+        if sizing is not None:
+            if math.isnan(entry_atr):
+                lots = 0.0                    # 无风险距离（ATR 回看不足）
+            else:
+                stop_k = (rules.stop_loss_atr if rules.stop_loss_atr is not None
+                          else sizing.fallback_stop_atr)
+                capital = (initial_capital if sizing.basis == "initial"
+                           else initial_capital + realized)  # 成交时点不持仓
+                lots = lots_for_risk(capital, sizing.risk_fraction,
+                                     stop_k * entry_atr, cs,
+                                     vol_bounds[0], vol_bounds[1], vol_bounds[2])
+            if lots <= 0.0:
+                skipped_zero_lots += 1
+                return                        # 不开仓（订单作废已由调用方清掉）
+        else:
+            lots = volume_lots
         ts_ = pd.Timestamp(m, unit="ms")
         if desired == 1:
             entry_price = ask + slippage_price
@@ -289,8 +344,6 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
         else:
             entry_price = bid - slippage_price
             entry_spread = None               # 空头：挂出场腿（_close_at 补记）
-        sig_bar = last_closed                 # SL/TP 用信号 bar 的 ATR（已收盘）
-        entry_atr = float(atr_arr[sig_bar]) if sig_bar >= 0 else float("nan")
         sl = tp = None
         if not math.isnan(entry_atr):
             if rules.stop_loss_atr is not None:
@@ -301,7 +354,7 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
                       else entry_price - rules.take_profit_atr * entry_atr)
         state = {
             "dir": desired, "side": "long" if desired == 1 else "short",
-            "lots": volume_lots, "entry_price": entry_price, "entry_time": ts_,
+            "lots": lots, "entry_price": entry_price, "entry_time": ts_,
             "entry_bar": _bar_of(m), "entry_slip": slippage_price,
             "entry_spread": entry_spread, "entry_atr": entry_atr,
             "sl_k": rules.stop_loss_atr, "sl": sl, "tp": tp,
@@ -488,5 +541,8 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
     equity = pd.Series(equity_vals, index=bars.index, name="equity")
     return BacktestResult(trades=trades_df, equity=equity, bars=bars,
                           params=params, symbol=symbol, timeframe=timeframe,
-                          contract_size=cs, volume_lots=float(volume_lots),
-                          initial_capital=float(initial_capital))
+                          contract_size=cs,
+                          volume_lots=(None if sizing is not None
+                                       else float(volume_lots)),
+                          initial_capital=float(initial_capital),
+                          skipped_zero_lots=skipped_zero_lots)

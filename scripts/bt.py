@@ -36,6 +36,12 @@
   一个交易日的 bar 数（block_len）。
 - contract_size 只认 {data-root}/specs/latest.json（与 run_backtest 同规：
   缺则报错，绝不静默按 1 折算）。
+- 定手数（T23/M2）：--risk-per-trade 缺省 0.005（按风险定手数，与
+  run_backtest 同一 resolve_lots_mode 语义：--volume-lots 显式给出或
+  --risk-per-trade 0 → 固定手数；两者同时显式且风险>0 → 拒绝）。风险
+  定手数需要各品种快照 volume_min/step/max（缺则装配期报错，不产生
+  runs）；定手数方式随 metrics（summary["sizing"]）落台账，G2–G5 的
+  一切复算经 BacktestSpec.sizing 沿用同一口径。
 - 禁入窗（T20）：screen/gate 默认加载 config/sessions.toml（与 run_backtest、
   实盘风控共用），基准运行与锁箱运行按禁入窗推迟开仓；其 sha256 随
   cost_model_version 写进台账。
@@ -71,8 +77,9 @@ from mt5quant.validation import walkforward as vwf  # noqa: E402
 from mt5quant.validation.robustness import BacktestSpec  # noqa: E402
 from run_backtest import (  # noqa: E402
     SESSIONS_PATH, ZeroCosts, build_costs, entry_policy_for, load_series,
-    load_strategy, resolve_contract_size, sessions_sha256,
+    load_strategy, resolve_contract_size, resolve_lots_mode, sessions_sha256,
 )
+from mt5quant.sizing import load_volume_limits  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -264,13 +271,19 @@ def _g5_orchestrate(ledger, card, *, strategy, spec, params, base_summary,
                        or 0), 0)
     lb_bars, cutoff = vgate.load_lockbox_window(
         data_root, spec.symbol, card.timeframe, lookback_bars=lookback)
-    # 4) 回测；交易与收益只计 cutoff 之后
-    lb = run_backtest(strategy, lb_bars, costs, symbol=spec.symbol,
-                      params=dict(params), contract_size=spec.contract_size,
-                      volume_lots=spec.volume_lots,
-                      initial_capital=spec.initial_capital,
-                      timeframe=card.timeframe,
-                      session_policy=session_policy)
+    # 4) 回测；交易与收益只计 cutoff 之后（定手数口径与基准同一 spec）
+    lb_kwargs = dict(symbol=spec.symbol, params=dict(params),
+                     contract_size=spec.contract_size,
+                     initial_capital=spec.initial_capital,
+                     timeframe=card.timeframe,
+                     session_policy=session_policy)
+    if spec.sizing is not None:                     # T23：sizing 透传
+        lb_kwargs.update(volume_lots=None, sizing=spec.sizing,
+                         vol_min=spec.vol_min, vol_step=spec.vol_step,
+                         vol_max=spec.vol_max)
+    else:
+        lb_kwargs["volume_lots"] = spec.volume_lots
+    lb = run_backtest(strategy, lb_bars, costs, **lb_kwargs)
     entries = pd.to_datetime(lb.trades["entry_time"])
     lb_trades = lb.trades[entries >= cutoff]
     k = int(lb_bars["time"].searchsorted(pd.Timestamp(cutoff), side="left"))
@@ -366,6 +379,14 @@ def cmd_screen(args) -> int:
             strategy_cls = load_strategy(args.strategy)
             sizes = {sym: resolve_contract_size(args.data_root, sym, None)
                      for sym in card.symbols}
+            # T23：定手数口径（默认风险定手数；risk 模式逐品种读快照 vol 三元组）
+            lots, sizing, sizing_info = resolve_lots_mode(args.risk_per_trade,
+                                                          args.volume_lots)
+            if sizing is not None:
+                vols_by_sym = {sym: load_volume_limits(args.data_root, sym)
+                               for sym in card.symbols}
+            else:
+                vols_by_sym = None
             bars_by_sym = {sym: load_series(args.data_root, sym,
                                             card.timeframe, args.end)
                            for sym in card.symbols}
@@ -403,14 +424,31 @@ def cmd_screen(args) -> int:
             for params in combos:
                 label = f"{sym} {card.timeframe} {params}"
                 try:
-                    result = run_backtest(
-                        strategy_cls(), bars, costs_by_sym[sym], symbol=sym,
-                        params=dict(params), contract_size=sizes[sym],
-                        volume_lots=args.volume_lots,
-                        initial_capital=args.initial_capital,
-                        timeframe=card.timeframe,
-                        session_policy=policy_by_sym[sym])
+                    if sizing is not None:
+                        result = run_backtest(
+                            strategy_cls(), bars, costs_by_sym[sym], symbol=sym,
+                            params=dict(params), contract_size=sizes[sym],
+                            volume_lots=None, sizing=sizing,
+                            vol_min=vols_by_sym[sym][0],
+                            vol_step=vols_by_sym[sym][1],
+                            vol_max=vols_by_sym[sym][2],
+                            initial_capital=args.initial_capital,
+                            timeframe=card.timeframe,
+                            session_policy=policy_by_sym[sym])
+                    else:
+                        result = run_backtest(
+                            strategy_cls(), bars, costs_by_sym[sym], symbol=sym,
+                            params=dict(params), contract_size=sizes[sym],
+                            volume_lots=lots,
+                            initial_capital=args.initial_capital,
+                            timeframe=card.timeframe,
+                            session_policy=policy_by_sym[sym])
                     summary = summarize(result, cost_version=cost_version)
+                    summary["sizing"] = dict(   # T23：定手数方式随 metrics 落台账
+                        sizing_info,
+                        vol_min=vols_by_sym[sym][0] if vols_by_sym else None,
+                        vol_step=vols_by_sym[sym][1] if vols_by_sym else None,
+                        vol_max=vols_by_sym[sym][2] if vols_by_sym else None)
                     rid = ledger.record_run(
                         card_id=card.id, card_version=card.version,
                         strategy=args.strategy, params=params, symbol=sym,
@@ -419,9 +457,11 @@ def cmd_screen(args) -> int:
                         engine_version=ENGINE_VERSION,
                         cost_model_version=cost_version, gates_hash=gates_hash,
                         metrics=summary, actor=args.actor)
+                    skipped = summary.get("skipped_zero_lots") or 0
                     print(f"✓ run#{rid} {label} -> "
                           f"净利 {summary['net_profit']:.2f} "
-                          f"交易 {summary['trade_count']} 笔")
+                          f"交易 {summary['trade_count']} 笔"
+                          + (f"（零手数跳过 {skipped}）" if skipped else ""))
                 except Exception as e:  # 失败组合也进台账
                     failed += 1
                     rid = ledger.record_run(
@@ -507,6 +547,14 @@ def cmd_gate(args) -> int:
             strategy = load_strategy(args.strategy)()
             sizes = {sym: resolve_contract_size(args.data_root, sym, None)
                      for sym in card.symbols}
+            # T23：定手数口径（默认风险定手数；risk 模式逐品种读快照 vol 三元组）
+            lots, sizing, sizing_info = resolve_lots_mode(args.risk_per_trade,
+                                                          args.volume_lots)
+            if sizing is not None:
+                vols_by_sym = {sym: load_volume_limits(args.data_root, sym)
+                               for sym in card.symbols}
+            else:
+                vols_by_sym = None
             bars_by_sym = {sym: load_series(args.data_root, sym,
                                             card.timeframe, args.end)
                            for sym in card.symbols}
@@ -571,14 +619,25 @@ def cmd_gate(args) -> int:
             engine_version=ENGINE_VERSION, cost_model_version=cost_version,
             gates_hash=gsha, actor=args.actor)
         try:
-            base = run_backtest(strategy, bars, costs, symbol=symbol,
-                                params=dict(params),
-                                contract_size=sizes[symbol],
-                                volume_lots=args.volume_lots,
-                                initial_capital=args.initial_capital,
-                                timeframe=card.timeframe,
-                                session_policy=policy_by_sym[symbol])
+            base_kwargs = dict(symbol=symbol, params=dict(params),
+                               contract_size=sizes[symbol],
+                               initial_capital=args.initial_capital,
+                               timeframe=card.timeframe,
+                               session_policy=policy_by_sym[symbol])
+            if sizing is not None:                       # T23：同一口径
+                base_kwargs.update(volume_lots=None, sizing=sizing,
+                                   vol_min=vols_by_sym[symbol][0],
+                                   vol_step=vols_by_sym[symbol][1],
+                                   vol_max=vols_by_sym[symbol][2])
+            else:
+                base_kwargs["volume_lots"] = lots
+            base = run_backtest(strategy, bars, costs, **base_kwargs)
             summary = summarize(base, cost_version=cost_version)
+            summary["sizing"] = dict(
+                sizing_info,
+                vol_min=(vols_by_sym[symbol][0] if vols_by_sym else None),
+                vol_step=(vols_by_sym[symbol][1] if vols_by_sym else None),
+                vol_max=(vols_by_sym[symbol][2] if vols_by_sym else None))
             run_id = ledger.record_run(metrics=summary, **common)
             print(f"— run#{run_id} {symbol} {card.timeframe} {params} -> "
                   f"净利 {summary['net_profit']:.2f} "
@@ -589,11 +648,23 @@ def cmd_gate(args) -> int:
             print(f"✗ run#{run_id} 基准运行失败：{type(e).__name__}: {e}")
             return 1
 
-        spec = BacktestSpec(strategy=strategy, symbol=symbol,
-                            timeframe=card.timeframe,
-                            contract_size=sizes[symbol],
-                            volume_lots=args.volume_lots,
-                            initial_capital=args.initial_capital)
+        # T23：spec 带定手数口径 → G2/G3 一切复算经 run_engine 沿用同一口径
+        if sizing is not None:
+            spec = BacktestSpec(strategy=strategy, symbol=symbol,
+                                timeframe=card.timeframe,
+                                contract_size=sizes[symbol],
+                                volume_lots=None,
+                                initial_capital=args.initial_capital,
+                                sizing=sizing,
+                                vol_min=vols_by_sym[symbol][0],
+                                vol_step=vols_by_sym[symbol][1],
+                                vol_max=vols_by_sym[symbol][2])
+        else:
+            spec = BacktestSpec(strategy=strategy, symbol=symbol,
+                                timeframe=card.timeframe,
+                                contract_size=sizes[symbol],
+                                volume_lots=lots,
+                                initial_capital=args.initial_capital)
         seed = vstats.rng_seed(card.id)
         results: dict[str, dict] = {}
 
@@ -614,7 +685,8 @@ def cmd_gate(args) -> int:
                 spec, bars, costs, params, base_result=base,
                 base_summary=summary, grid=card.params,
                 bars_by_symbol=bars_by_sym, costs_by_symbol=costs_by_sym,
-                sizes_by_symbol=sizes, cfg=cfg, seed=seed))
+                sizes_by_symbol=sizes, cfg=cfg, seed=seed,
+                vols_by_symbol=vols_by_sym))    # T23：sizing 口径跨品种透传
         if "G3" in wanted:
             _run("G3", lambda: vwf.run_g3(
                 spec, bars, costs, grid=combos,
@@ -713,7 +785,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help="与 run_backtest 同义；测试/冒烟用 zero")
     p_screen.add_argument("--end", default=None,
                           help="只用该 UTC 时刻及之前的数据（锁箱语义同 run_backtest）")
-    p_screen.add_argument("--volume-lots", type=float, default=1.0)
+    p_screen.add_argument("--volume-lots", type=float, default=None,
+                          help="固定手数；显式给出即用固定手数（与 run_backtest 同义）")
+    p_screen.add_argument("--risk-per-trade", type=float, default=None,
+                          help="按风险定手数的单笔风险比例（缺省 0.005；0=固定手数；"
+                               "与 --volume-lots 同时显式给且>0 会拒绝）")
     p_screen.add_argument("--initial-capital", type=float, default=10_000.0)
     p_screen.add_argument("--spread-fraction", type=float, default=0.1)
     p_screen.add_argument("--commission", type=float, default=0.0)
@@ -742,7 +818,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="与 run_backtest 同义；测试/冒烟用 zero")
     p_gate.add_argument("--end", default=None,
                         help="只用该 UTC 时刻及之前的数据（锁箱语义同 run_backtest）")
-    p_gate.add_argument("--volume-lots", type=float, default=1.0)
+    p_gate.add_argument("--volume-lots", type=float, default=None,
+                        help="固定手数；显式给出即用固定手数（与 run_backtest 同义）")
+    p_gate.add_argument("--risk-per-trade", type=float, default=None,
+                        help="按风险定手数的单笔风险比例（缺省 0.005；0=固定手数；"
+                             "与 --volume-lots 同时显式给且>0 会拒绝）")
     p_gate.add_argument("--initial-capital", type=float, default=10_000.0)
     p_gate.add_argument("--spread-fraction", type=float, default=0.1)
     p_gate.add_argument("--commission", type=float, default=0.0)

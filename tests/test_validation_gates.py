@@ -492,8 +492,11 @@ def make_data_root(tmp_path):
     h1_bars().to_parquet(sdir / "data.parquet")
     specs = root / "specs"
     specs.mkdir(parents=True)
+    # T23：含手数上下限（bt 默认按风险定手数，装配需 volume_min/step/max）
     (specs / "latest.json").write_text(
-        json.dumps({"XAUUSD": {"contract_size": 100.0}}), encoding="utf-8")
+        json.dumps({"XAUUSD": {"contract_size": 100.0, "volume_min": 0.01,
+                               "volume_step": 0.01, "volume_max": 200.0}}),
+        encoding="utf-8")
     return root
 
 
@@ -667,7 +670,9 @@ def ramp_data_root(tmp_path, n=300, *, lockbox_cutoff_bar=None):
     specs = root / "specs"
     specs.mkdir(parents=True)
     (specs / "latest.json").write_text(
-        json.dumps({"XAUUSD": {"contract_size": 100.0}}), encoding="utf-8")
+        json.dumps({"XAUUSD": {"contract_size": 100.0, "volume_min": 0.01,
+                               "volume_step": 0.01, "volume_max": 200.0}}),
+        encoding="utf-8")
     cutoff = None
     if lockbox_cutoff_bar is not None:
         cutoff = bars["time"].iloc[lockbox_cutoff_bar]

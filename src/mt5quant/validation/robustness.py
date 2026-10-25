@@ -28,6 +28,7 @@ import pandas as pd
 
 from mt5quant.backtest.engine_a import run_backtest
 from mt5quant.backtest.report import bars_per_year, observed_bars_per_year
+from mt5quant.sizing import RiskSizing, validate_volume_bounds
 from mt5quant.strategies import BaseStrategy, BuyHold
 from mt5quant.strategies.base import ExitRules
 
@@ -36,24 +37,58 @@ NY_TZ = ZoneInfo("America/New_York")   # 与点差分桶/换日窗同一时区�
 
 @dataclass(frozen=True)
 class BacktestSpec:
-    """关卡内反复回测的装配参数（engine_a.run_backtest 的具名集合）。"""
+    """关卡内反复回测的装配参数（engine_a.run_backtest 的具名集合）。
+
+    T23：定手数口径二选一——volume_lots（固定手数）或 sizing（RiskSizing
+    按风险定手数）+ vol_min/vol_step/vol_max 三元组；两者同给/同缺都拒
+    （与引擎同一互斥规则，构造时即校验，绝不带错口径跑关卡）。sizing 模式
+    下 G2 的成本放大、参数邻域、随机入场等一切复算自动沿用同一口径
+    （run_engine 透传）。
+    """
 
     strategy: object
     symbol: str
     timeframe: str
     contract_size: float
-    volume_lots: float = 1.0
+    volume_lots: float | None = 1.0
     initial_capital: float = 10_000.0
+    sizing: RiskSizing | None = None
+    vol_min: float | None = None
+    vol_step: float | None = None
+    vol_max: float | None = None
+
+    def __post_init__(self):
+        if self.sizing is not None and self.volume_lots is not None:
+            raise ValueError(
+                f"BacktestSpec：sizing 与 volume_lots 二选一（sizing="
+                f"{self.sizing!r}, volume_lots={self.volume_lots!r}）——"
+                "关卡复算必须与基准运行同一口径")
+        if self.sizing is None and self.volume_lots is None:
+            raise ValueError(
+                "BacktestSpec：必须给出 volume_lots（固定手数）或 sizing"
+                "（RiskSizing）之一")
+        if self.sizing is not None:
+            if (self.vol_min is None or self.vol_step is None
+                    or self.vol_max is None):
+                raise ValueError(
+                    "BacktestSpec：sizing 模式需要 vol_min/vol_step/vol_max"
+                    f"（缺 min={self.vol_min!r}, step={self.vol_step!r},"
+                    f" max={self.vol_max!r}）")
+            validate_volume_bounds(self.vol_min, self.vol_step, self.vol_max)
 
 
 def run_engine(spec: BacktestSpec, bars: pd.DataFrame, costs, params: dict, *,
                strategy=None):
     """按 spec 跑一次 A 层（strategy 可覆盖，如 FixedSignals / BuyHold）。"""
-    return run_backtest(
-        strategy or spec.strategy, bars, costs, symbol=spec.symbol,
-        params=dict(params), contract_size=spec.contract_size,
-        volume_lots=spec.volume_lots, initial_capital=spec.initial_capital,
-        timeframe=spec.timeframe)
+    kwargs = dict(symbol=spec.symbol, params=dict(params),
+                  contract_size=spec.contract_size,
+                  initial_capital=spec.initial_capital, timeframe=spec.timeframe)
+    if spec.sizing is not None:          # T23：sizing 口径透传（引擎内互斥校验）
+        kwargs.update(sizing=spec.sizing, vol_min=spec.vol_min,
+                      vol_step=spec.vol_step, vol_max=spec.vol_max)
+    else:
+        kwargs["volume_lots"] = spec.volume_lots
+    return run_backtest(strategy or spec.strategy, bars, costs, **kwargs)
 
 
 class ScaledCosts:
@@ -233,8 +268,14 @@ def buy_hold_check(spec, bars, costs, trades, base_sharpe, cfg) -> dict:
 
 def cross_symbol_check(strategy, bars_by_symbol, costs_by_symbol,
                        sizes_by_symbol, params, timeframe, volume_lots,
-                       initial_capital, cfg) -> dict:
-    """同一逻辑在 ≥ cross_symbol_min 个品种上净利为正。"""
+                       initial_capital, cfg, *, sizing=None,
+                       vols_by_symbol=None) -> dict:
+    """同一逻辑在 ≥ cross_symbol_min 个品种上净利为正。
+
+    T23：sizing 模式下各品种用自己的 vol 三元组（vols_by_symbol[sym] =
+    (vol_min, vol_step, vol_max)，scripts 侧从快照读取）；缺品种即拒——
+    绝不借用别的品种的手数上下限。固定手数模式沿用 volume_lots。
+    """
     symbols = sorted(bars_by_symbol)
     if len(symbols) < cfg.cross_symbol_min:
         return {"passed": True, "applicable": False,
@@ -242,10 +283,25 @@ def cross_symbol_check(strategy, bars_by_symbol, costs_by_symbol,
                 "note": f"仅 {len(symbols)} 个品种可用，跨品种检查不适用"}
     nets = {}
     for sym in symbols:
-        spec = BacktestSpec(strategy=strategy, symbol=sym, timeframe=timeframe,
-                            contract_size=sizes_by_symbol[sym],
-                            volume_lots=volume_lots,
-                            initial_capital=initial_capital)
+        if sizing is not None:
+            vols = (vols_by_symbol or {}).get(sym)
+            if vols is None:
+                raise ValueError(
+                    f"跨品种检查缺 {sym} 的 vol 三元组（vol_min/step/max）——"
+                    "sizing 模式下每个品种必须有自己的快照手数上下限")
+            spec = BacktestSpec(strategy=strategy, symbol=sym,
+                                timeframe=timeframe,
+                                contract_size=sizes_by_symbol[sym],
+                                volume_lots=None,
+                                initial_capital=initial_capital,
+                                sizing=sizing, vol_min=vols[0],
+                                vol_step=vols[1], vol_max=vols[2])
+        else:
+            spec = BacktestSpec(strategy=strategy, symbol=sym,
+                                timeframe=timeframe,
+                                contract_size=sizes_by_symbol[sym],
+                                volume_lots=volume_lots,
+                                initial_capital=initial_capital)
         nets[sym] = _net_sum(run_engine(spec, bars_by_symbol[sym],
                                         costs_by_symbol[sym], params))
     positive = sum(1 for v in nets.values() if v > 0)
@@ -385,15 +441,21 @@ def random_entry_check(spec, bars, costs, base_trades, base_sharpe, *,
 
 def run_g2(spec, bars, costs, params, *, base_result, base_summary, grid,
            bars_by_symbol, costs_by_symbol, sizes_by_symbol, cfg,
-           seed: int) -> dict:
-    """G2 全部子检查（顺序执行，互不短路；details 全部落台账）。"""
+           seed: int, vols_by_symbol: dict | None = None) -> dict:
+    """G2 全部子检查（顺序执行，互不短路；details 全部落台账）。
+
+    T23：spec 带 sizing 时全部复算（成本放大、参数邻域、随机入场、延迟、
+    买入持有）经 run_engine 自动沿用同一按风险定手数口径；跨品种子检查
+    需要 vols_by_symbol（各品种 vol 三元组，bt.py 装配时从快照读取）。
+    """
     checks: dict[str, dict] = {}
     checks["cost_scaling"] = cost_scaling_check(spec, bars, costs, params, cfg)
     checks["param_plateau"] = param_plateau(spec, bars, costs, params, grid, cfg)
     checks["yearly_segments"] = yearly_segments(base_result.trades, cfg)
     checks["cross_symbol"] = cross_symbol_check(
         spec.strategy, bars_by_symbol, costs_by_symbol, sizes_by_symbol,
-        params, spec.timeframe, spec.volume_lots, spec.initial_capital, cfg)
+        params, spec.timeframe, spec.volume_lots, spec.initial_capital, cfg,
+        sizing=spec.sizing, vols_by_symbol=vols_by_symbol)
     base_sharpe = base_summary.get("sharpe")
     checks["random_entry_benchmark"] = random_entry_check(
         spec, bars, costs, base_result.trades, base_sharpe,

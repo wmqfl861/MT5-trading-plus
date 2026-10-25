@@ -89,7 +89,7 @@ def spec_of(strategy):
 
 def base_sharpe(strategy, bars, params):
     base = run_backtest(strategy, bars, Zero(), symbol="TST", params=params,
-                        contract_size=1.0, timeframe="H1")
+                        contract_size=1.0, timeframe="H1", volume_lots=1.0)
     return summarize(base)["sharpe"]
 
 

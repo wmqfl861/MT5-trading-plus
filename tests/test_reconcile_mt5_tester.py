@@ -292,7 +292,7 @@ def test_cli_end_to_end_matches_b_layer(tmp_path):
         str(root), "XAUUSD", start_msc=start_msc, end_msc=end_msc)
     res_b = run_backtest_ticks(BuyHold(), df, loader, ZeroCosts(),
                                symbol="XAUUSD", params={},
-                               contract_size=100.0, timeframe="H1")
+                               contract_size=100.0, timeframe="H1", volume_lots=1.0)
     # 把 B 层自己的成交写成 EA 的 CSV 形态 → 比对必须全零通过
     rows = []
     for i, t in enumerate(res_b.trades.itertuples(), 1):

@@ -119,6 +119,7 @@ def run_b(bars, ticks, strategy=None, costs=None, **kw):
     kw.setdefault("params", {})
     kw.setdefault("contract_size", 1.0)
     kw.setdefault("timeframe", "H1")
+    kw.setdefault("volume_lots", 1.0)   # T23：引擎不再给默认手数（二选一）
     return run_backtest_ticks(strategy or BuyHold(), bars, make_loader(ticks),
                                costs or FakeCosts(), **kw)
 
@@ -305,7 +306,7 @@ def test_coverage_error_when_no_ticks_loaded():
     with pytest.raises(TickCoverageError, match="覆盖"):
         run_backtest_ticks(BuyHold(), base4(), none_loader, FakeCosts(),
                            symbol="XAUUSD", params={}, contract_size=1.0,
-                           timeframe="H1")
+                           timeframe="H1", volume_lots=1.0)
 
 
 def test_coverage_error_pending_order_in_empty_interval():
@@ -355,11 +356,11 @@ def test_ab_parity_ohlc_reproducing_ticks():
     costs = FakeCosts(half=S_MODEL, slip=SLIP_MODEL)
     strat = ScriptStrategy([1], fill=1)
     res_a = run_backtest(strat, df, costs, symbol="XAUUSD", contract_size=1.0,
-                         params={}, timeframe="H1")
+                         params={}, timeframe="H1", volume_lots=1.0)
     res_b = run_backtest_ticks(strat, df, make_loader(ohlc_ticks(df, S_MODEL)),
                                costs, symbol="XAUUSD", params={},
                                contract_size=1.0, timeframe="H1",
-                               slippage_price=SLIP_MODEL)
+                               slippage_price=SLIP_MODEL, volume_lots=1.0)
     ta, tb = one_trade(res_a), one_trade(res_b)
     assert len(res_a.trades) == len(res_b.trades) == 1
     assert ta["side"] == tb["side"] == "long"
@@ -384,11 +385,11 @@ def test_ab_price_diff_only_from_spread_modeling():
     costs = FakeCosts(half=S_MODEL, slip=SLIP_MODEL)
     strat = ScriptStrategy([1], fill=1)
     ta = one_trade(run_backtest(strat, df, costs, symbol="XAUUSD",
-                                contract_size=1.0, params={}, timeframe="H1"))
+                                contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0))
     tb = one_trade(run_backtest_ticks(strat, df, make_loader(ohlc_ticks(df, 0.7)),
                                       costs, symbol="XAUUSD", params={},
                                       contract_size=1.0, timeframe="H1",
-                                      slippage_price=SLIP_MODEL))
+                                      slippage_price=SLIP_MODEL, volume_lots=1.0))
     assert tb["entry_price"] - ta["entry_price"] == pytest.approx(0.2)  # 0.7−0.5
     assert tb["exit_price"] == pytest.approx(ta["exit_price"])          # bid 腿不受影响
     assert tb["net"] - ta["net"] == pytest.approx(-0.2)
@@ -410,7 +411,7 @@ def test_monthly_streaming_windows():
     loader = make_loader(ticks)
     t = one_trade(run_backtest_ticks(BuyHold(), bars, loader, FakeCosts(),
                                      symbol="XAUUSD", params={},
-                                     contract_size=1.0, timeframe="H1"))
+                                     contract_size=1.0, timeframe="H1", volume_lots=1.0))
     # 请求区间 [bar0 收盘 23:00, 末根收盘前 01:59:59.999]，按月切两个窗口
     assert loader.calls == [
         (msc("2026-01-31 23:00:00"), msc("2026-01-31 23:59:59.999")),
@@ -513,11 +514,11 @@ def test_rejects_invalid_inputs():
              tick("2026-01-05 13:59:59.999", 103.0, 103.5)]
     with pytest.raises(TypeError, match="contract_size"):
         run_backtest_ticks(BuyHold(), df, make_loader(ticks), FakeCosts(),
-                           symbol="XAUUSD", params={}, timeframe="H1")
+                           symbol="XAUUSD", params={}, timeframe="H1", volume_lots=1.0)
     with pytest.raises(ValueError, match="contract_size"):
         run_backtest_ticks(BuyHold(), df, make_loader(ticks), FakeCosts(),
                            symbol="XAUUSD", params={}, contract_size=0,
-                           timeframe="H1")
+                           timeframe="H1", volume_lots=1.0)
     with pytest.raises(ValueError, match="volume_lots"):
         run_backtest_ticks(BuyHold(), df, make_loader(ticks), FakeCosts(),
                            symbol="XAUUSD", params={}, contract_size=1.0,
@@ -525,20 +526,20 @@ def test_rejects_invalid_inputs():
     with pytest.raises(ValueError, match="latency_ms"):
         run_backtest_ticks(BuyHold(), df, make_loader(ticks), FakeCosts(),
                            symbol="XAUUSD", params={}, contract_size=1.0,
-                           timeframe="H1", latency_ms=-1)
+                           timeframe="H1", latency_ms=-1, volume_lots=1.0)
     with pytest.raises(ValueError, match="slippage_price"):
         run_backtest_ticks(BuyHold(), df, make_loader(ticks), FakeCosts(),
                            symbol="XAUUSD", params={}, contract_size=1.0,
-                           timeframe="H1", slippage_price=-0.1)
+                           timeframe="H1", slippage_price=-0.1, volume_lots=1.0)
     # timeframe 不可解析（策略 required_data 也没给）
     with pytest.raises(ValueError, match="timeframe"):
         run_backtest_ticks(ScriptStrategy([1], fill=1), df, make_loader(ticks),
                            FakeCosts(), symbol="XAUUSD", params={},
-                           contract_size=1.0)
+                           contract_size=1.0, volume_lots=1.0)
     with pytest.raises(ValueError, match="信号"):
         run_backtest_ticks(ScriptStrategy([1], fill=2), df, make_loader(ticks),
                            FakeCosts(), symbol="XAUUSD", params={},
-                           contract_size=1.0, timeframe="H1")
+                           contract_size=1.0, timeframe="H1", volume_lots=1.0)
 
 
 def test_rejects_corrupt_ticks():
@@ -558,7 +559,7 @@ def test_rejects_corrupt_ticks():
     with pytest.raises(ValueError, match="列"):
         run_backtest_ticks(BuyHold(), df, col_loader, FakeCosts(),
                            symbol="XAUUSD", params={}, contract_size=1.0,
-                           timeframe="H1")
+                           timeframe="H1", volume_lots=1.0)
 
 
 # --------------------------------------------- T20（H2）：禁入窗推迟开仓（B-0.2）
@@ -573,10 +574,10 @@ def _pol_window(local_hhmm: str, tz: str = "UTC", *, pre: int = 0, post: int = 6
                          pre_minutes=pre, post_minutes=post, **kw)
 
 
-def test_engine_b_version_bumped_for_t20():
-    # T28（M8）改写性能（B-0.3）：月块向量化校验、免逐笔 pd.Timestamp、
-    # 空仓区间 searchsorted 跳读——时间行为与 B-0.2 逐位一致。
-    assert ENGINE_VERSION_B == "B-0.3"
+def test_engine_b_version_bumped_for_t23_risk_sizing():
+    # T23（M2）：RiskSizing 按风险定手数（B-0.4，与 A-1.5 同一函数）；
+    # B-0.3 = T28/M8 性能改写（时间行为与 B-0.2 逐位一致）。
+    assert ENGINE_VERSION_B == "B-0.4"
 
 
 def test_session_policy_defers_entry_to_first_allowed_tick():
@@ -690,3 +691,91 @@ def test_engine_b_perf_smoke_no_regression():
     elapsed = time.perf_counter() - t_start
     assert len(res.trades) == 1
     assert elapsed < 10.0, f"engine B 性能冒烟超时：{elapsed:.1f}s（2.4 万 tick）"
+
+
+# ------------------------------------------------- T23（M2）：RiskSizing 定手数
+
+from mt5quant.sizing import RiskSizing  # noqa: E402
+
+XAU_VOL = dict(vol_min=0.01, vol_step=0.01, vol_max=200.0)
+
+
+def _sizing_bars(n=30):
+    """恒定波幅 H1（sl_tp_bars 同款）：TR 恒 1.0 → ATR14 从 bar13 起恒 1.0。"""
+    return flat_bars(pd.Timestamp("2026-01-05 00:00"), n)
+
+
+def test_sizing_volume_lots_mutually_exclusive():
+    df = _sizing_bars()
+    ticks = ohlc_ticks(df, 0.5)
+    # 同给 → 拒
+    with pytest.raises(ValueError, match="二选一"):
+        run_backtest_ticks(BuyHold(), df, make_loader(ticks), FakeCosts(),
+                           symbol="XAUUSD", params={}, contract_size=100.0,
+                           timeframe="H1", volume_lots=1.0,
+                           sizing=RiskSizing(risk_fraction=0.005), **XAU_VOL)
+    # 同缺 → 拒
+    with pytest.raises(ValueError, match="volume_lots"):
+        run_backtest_ticks(BuyHold(), df, make_loader(ticks), FakeCosts(),
+                           symbol="XAUUSD", params={}, contract_size=100.0,
+                           timeframe="H1")
+    # sizing 缺 vol 三元组 → 拒
+    with pytest.raises(ValueError, match="vol_min"):
+        run_backtest_ticks(BuyHold(), df, make_loader(ticks), FakeCosts(),
+                           symbol="XAUUSD", params={}, contract_size=100.0,
+                           timeframe="H1", volume_lots=None,
+                           sizing=RiskSizing(risk_fraction=0.005))
+
+
+def test_sizing_lots_recorded_and_equal_to_shared_function():
+    """成交 tick 时点按风险定手数：合约 100、资金 10,000、风险 0.5%、
+    距离 = fallback 1.0×ATR 1.0 → 0.50 手（与 A 层同一函数同一结果）。"""
+    df = _sizing_bars()
+    ticks = ohlc_ticks(df, 0.5)
+    strat = ScriptStrategy([0] * 14 + [1] * 10, fill=0)
+    res = run_b(df, ticks, strat, contract_size=100.0,
+                initial_capital=10_000.0, volume_lots=None,
+                sizing=RiskSizing(risk_fraction=0.005), **XAU_VOL)
+    t = one_trade(res)
+    assert t["volume_lots"] == pytest.approx(0.50)
+    assert res.volume_lots is None
+    assert res.skipped_zero_lots == 0
+
+
+def test_sizing_zero_lots_cancels_order_and_counts():
+    """手数 0（资金 150：风险 0.75 → 0.0075 手 < 0.01）→ 订单作废、
+    不开仓；信号持续的每个 bar 收盘都重新下单 → 每次计数。"""
+    df = _sizing_bars(30)
+    ticks = ohlc_ticks(df, 0.5)
+    sig = [0] * 14 + [1] * 6 + [0] * 10      # bar14..19 信号为 1
+    strat = ScriptStrategy(sig)
+    res = run_b(df, ticks, strat, contract_size=100.0,
+                initial_capital=150.0, volume_lots=None,
+                sizing=RiskSizing(risk_fraction=0.005), **XAU_VOL)
+    assert len(res.trades) == 0
+    assert res.skipped_zero_lots == 6         # bar14..19 各一次订单
+
+
+def test_sizing_equity_basis_changes_lots_after_loss():
+    """basis="equity"：第一笔净亏后权益下降 → 第二笔 0.49 手；
+    basis="initial" 两笔同为 0.50（与 A 层语义一致）。"""
+    df = _sizing_bars(40)
+    ticks = ohlc_ticks(df, 0.5)
+    sig = [0] * 40
+    sig[14] = 1
+    sig[26] = 1
+    strat = ScriptStrategy(sig)
+    common = dict(contract_size=100.0, initial_capital=10_000.0,
+                  volume_lots=None)
+    res_i = run_b(df, ticks, strat, sizing=RiskSizing(risk_fraction=0.005,
+                                                      basis="initial"),
+                  **common, **XAU_VOL)
+    res_e = run_b(df, ticks, strat, sizing=RiskSizing(risk_fraction=0.005,
+                                                      basis="equity"),
+                  **common, **XAU_VOL)
+    lots_i = res_i.trades["volume_lots"].tolist()
+    lots_e = res_e.trades["volume_lots"].tolist()
+    assert lots_i == [pytest.approx(0.50), pytest.approx(0.50)]
+    # 第一笔：入场 ask 100.5、出场 bid 100.0 → (−0.5)×0.5×100 − 0.5 佣金
+    assert lots_e[0] == pytest.approx(0.50)
+    assert lots_e[1] == pytest.approx(0.49)

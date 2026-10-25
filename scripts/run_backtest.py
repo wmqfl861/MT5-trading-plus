@@ -33,12 +33,24 @@
   其 sha256 写进 manifest 与 cost_model_version。点差模型按纽约本地小时
   分桶，缺统计小时按 missing_hour_policy="forbid" 禁入并把 miss 标注写进
   cost_model_version。
+- 定手数（T23/M2）：**默认按风险定手数**——--risk-per-trade 缺省 0.005
+  （单笔风险 0.5% 资金；引擎按止损距离折算手数，见 mt5quant.sizing）。
+  语义（resolve_lots_mode）：
+    * --volume-lots 显式给出 → 固定手数（旧口径；与默认风险值不冲突）；
+    * --risk-per-trade 0 → 固定手数（手数取 --volume-lots，未给则 1.0）；
+    * --risk-per-trade >0 且 --volume-lots 同时显式给出 → 拒绝（口径二义）；
+    * 两者都未给 → 风险定手数 0.005。
+  风险定手数需要品种 vol_min/step/max：自动读 {data-root}/specs/latest.json
+  （mt5quant.sizing.load_volume_limits，缺数据报错指路 snapshot_specs），
+  定手数方式写进 manifest（extra.sizing）与 summary（skipped_zero_lots
+  为跳过的零手数入场计数）。
 - 每次运行写入独占目录 {out}/{SYMBOL}_{TF}_{UTC戳}_{随机}，不覆盖历史运行。
 """
 import argparse
 import hashlib
 import importlib
 import json
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -56,6 +68,7 @@ from mt5data.ticks import load_ticks, tick_watermark  # noqa: E402
 from mt5quant.backtest.engine_a import run_backtest  # noqa: E402
 from mt5quant.backtest.engine_b import run_backtest_ticks  # noqa: E402
 from mt5quant.backtest.report import make_run_dir, summarize, write_report  # noqa: E402
+from mt5quant.sizing import RiskSizing, load_volume_limits  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SESSIONS_PATH = REPO_ROOT / "config" / "sessions.toml"
@@ -101,6 +114,61 @@ def resolve_contract_size(data_root: str, symbol: str, override: float | None) -
         f"{symbol} 合约大小未知：先跑 scripts/snapshot_specs.py 生成 "
         f"{snap_path}，或显式传 --contract-size（XAUUSD 常见 100、EURUSD 100000）"
     )
+
+
+# ------------------------------------------------ T23（M2）：定手数口径解析
+#
+# CLI 语义（--risk-per-trade 与 --volume-lots，两者 argparse 默认均为 None）：
+#   * 都未给               → 风险定手数，risk_fraction=0.005（缺省即新口径）
+#   * 仅 --volume-lots     → 固定手数（旧口径；显式手数优先于缺省风险值）
+#   * 仅 --risk-per-trade>0→ 风险定手数（该比例）
+#   * 仅 --risk-per-trade 0→ 固定手数（手数取 --volume-lots，未给则 1.0）
+#   * 两者同时显式给出且风险>0 → 拒绝（口径二义：不知道该听谁的）
+# run_backtest 与 bt.py（screen/gate）共用本函数，保证两条路径同一语义。
+
+DEFAULT_RISK_PER_TRADE = 0.005
+
+
+def resolve_lots_mode(risk_per_trade: float | None,
+                      volume_lots: float | None) -> tuple[float | None,
+                                                           RiskSizing | None,
+                                                           dict]:
+    """把 CLI 手数参数解析成引擎入参（volume_lots, sizing, 说明 dict）。
+
+    说明 dict 写进 manifest（run_backtest）/台账 metrics（bt）：
+    {"mode": "risk", ...} 或 {"mode": "fixed", ...}。
+    """
+    if volume_lots is not None:
+        if not (isinstance(volume_lots, (int, float))
+                and math.isfinite(volume_lots) and volume_lots > 0):
+            raise ValueError(f"--volume-lots 必须是有限正数，收到 {volume_lots!r}")
+    if risk_per_trade is not None:
+        if not (isinstance(risk_per_trade, (int, float))
+                and math.isfinite(risk_per_trade) and risk_per_trade >= 0):
+            raise ValueError(
+                f"--risk-per-trade 必须是非负有限数（0 = 改用固定手数），"
+                f"收到 {risk_per_trade!r}")
+    explicit_risk = risk_per_trade is not None and risk_per_trade > 0
+    if explicit_risk and volume_lots is not None:
+        raise ValueError(
+            f"--risk-per-trade {risk_per_trade} 与 --volume-lots "
+            f"{volume_lots} 互斥：按风险定手数（--risk-per-trade，缺省 "
+            f"{DEFAULT_RISK_PER_TRADE}）或固定手数（--volume-lots）二选一"
+            "（--risk-per-trade 0 = 显式选固定手数）")
+    if volume_lots is not None:
+        return volume_lots, None, {
+            "mode": "fixed", "volume_lots": float(volume_lots)}
+    if explicit_risk:
+        return None, RiskSizing(risk_fraction=float(risk_per_trade)), {
+            "mode": "risk", "risk_fraction": float(risk_per_trade),
+            "basis": "initial", "fallback_stop_atr": 1.0}
+    if risk_per_trade is not None and risk_per_trade == 0:
+        return 1.0, None, {
+            "mode": "fixed", "volume_lots": 1.0,
+            "note": "--risk-per-trade 0 = 固定手数（未显式给 --volume-lots，取 1.0）"}
+    return None, RiskSizing(risk_fraction=DEFAULT_RISK_PER_TRADE), {
+        "mode": "risk", "risk_fraction": DEFAULT_RISK_PER_TRADE,
+        "basis": "initial", "fallback_stop_atr": 1.0}
 
 
 def check_clock(data_root: str, *, tol_s: float = 120.0) -> None:
@@ -458,7 +526,13 @@ def main() -> int:
     ap.add_argument("--end", default=None,
                     help="只用该 UTC 时刻及之前的数据（naive UTC；越过锁箱 cutoff 会报错）")
     ap.add_argument("--out", default="data/reports/backtests")
-    ap.add_argument("--volume-lots", type=float, default=1.0)
+    ap.add_argument("--risk-per-trade", type=float, default=None,
+                    help="按风险定手数：单笔风险占资金比例（缺省 0.005=0.5%%；"
+                         "传 0 = 改用 --volume-lots 固定手数）。需快照的 "
+                         "volume_min/step/max，缺则报错指路 snapshot_specs")
+    ap.add_argument("--volume-lots", type=float, default=None,
+                    help="固定手数（旧口径）；显式给出即用固定手数，与 "
+                         "--risk-per-trade>0 同时给会拒绝")
     ap.add_argument("--initial-capital", type=float, default=10_000.0)
     ap.add_argument("--costs", choices=("auto", "zero"), default="auto",
                     help="auto=本地 tick 实测点差+滑点（佣金/隔夜未配置按 0 并说明）；zero=零成本")
@@ -501,6 +575,17 @@ def main() -> int:
         strategy_cls = load_strategy(args.strategy)
         contract_size = resolve_contract_size(args.data_root, args.symbol,
                                               args.contract_size)
+        # T23：定手数口径（默认风险定手数 0.005；见 resolve_lots_mode 语义）
+        lots, sizing, sizing_info = resolve_lots_mode(args.risk_per_trade,
+                                                      args.volume_lots)
+        if sizing is not None:
+            vol_lo, vol_st, vol_hi = load_volume_limits(args.data_root,
+                                                        args.symbol)
+            sizing_info.update(vol_min=vol_lo, vol_step=vol_st, vol_max=vol_hi)
+            print(f"✓ 定手数：按风险 {sizing.risk_fraction:.4%}"
+                  f"（basis={sizing.basis}，vol {vol_lo}/{vol_st}/{vol_hi}）")
+        else:
+            print(f"✓ 定手数：固定 {lots} 手")
         check_clock(args.data_root)
         bars = load_series(args.data_root, args.symbol, args.timeframe.upper(),
                            args.end)
@@ -538,7 +623,11 @@ def main() -> int:
                     start_msc=start_msc, end_msc=end_msc),
                 costs, symbol=args.symbol, params=params,
                 contract_size=contract_size,
-                volume_lots=args.volume_lots,
+                volume_lots=lots,
+                sizing=sizing,
+                vol_min=sizing_info.get("vol_min") if sizing else None,
+                vol_step=sizing_info.get("vol_step") if sizing else None,
+                vol_max=sizing_info.get("vol_max") if sizing else None,
                 initial_capital=args.initial_capital,
                 timeframe=args.timeframe.upper(),
                 latency_ms=args.latency_ms,
@@ -549,7 +638,10 @@ def main() -> int:
             result = run_backtest(
                 strategy_cls(), bars, costs, symbol=args.symbol,
                 params=params, contract_size=contract_size,
-                volume_lots=args.volume_lots,
+                volume_lots=lots, sizing=sizing,
+                vol_min=sizing_info.get("vol_min") if sizing else None,
+                vol_step=sizing_info.get("vol_step") if sizing else None,
+                vol_max=sizing_info.get("vol_max") if sizing else None,
                 initial_capital=args.initial_capital,
                 timeframe=args.timeframe.upper(),
                 session_policy=entry_policy,
@@ -565,16 +657,24 @@ def main() -> int:
                    "allow_zero_swap": args.allow_zero_swap,
                    "engine": args.engine, "latency_ms": args.latency_ms,
                    "slippage_price": args.slippage_price,
+                   "sizing": sizing_info,      # T23：定手数方式进 manifest
                    "sessions_path": str(SESSIONS_PATH),
                    "sessions_sha256": sess_sha})
     except Exception as e:  # fail-fast：任何错误如实报出
         print(f"✗ {type(e).__name__}: {e}")
         return 1
 
+    lots_note = (f"风险{sizing_info['risk_fraction']:.4%}"
+                 if sizing_info["mode"] == "risk"
+                 else f"固定{sizing_info['volume_lots']:g}手")
     print(f"✓ {args.symbol} {args.timeframe.upper()} "
           f"bars={len(result.bars)} trades={summary['trade_count']} "
-          f"合约大小={contract_size:g} 净利={summary['net_profit']:.2f} "
+          f"合约大小={contract_size:g} 手数={lots_note} "
+          f"净利={summary['net_profit']:.2f} "
           f"回撤={summary['max_drawdown']:.2%}")
+    if summary.get("skipped_zero_lots"):
+        print(f"⚠ {summary['skipped_zero_lots']} 次入场因手数低于 vol_min 跳过"
+              f"（skipped_zero_lots，详见 summary.json）")
     print(f"报告：{report_path}")
     return 0
 

@@ -24,6 +24,18 @@
   允许的 bar 开盘；**平仓（signal/SL/TP/time_stop/week_close）不受限**。
   推迟期间信号归零则不再开仓。与实盘风控（mt5live.riskproc）共用同一份
   SessionPolicy——回测与实盘的禁入规则同源（铁律 v3 第 11 条）。
+- 定手数（T23 / A-1.5，M2）：`sizing: RiskSizing`（mt5quant.sizing，与
+  B 层、关卡、实盘共用同一函数）与 `volume_lots` **二选一**（同给/同缺都
+  拒——静默的默认 1 手正是 M2 记录的爆仓来源）。sizing 模式另需品种的
+  vol_min/vol_step/vol_max（快照 volume_min/step/max，scripts 侧由
+  load_volume_limits 读取传入）。每个入场按当时资金 × risk_fraction 与
+  止损距离（策略 SL 距离 = stop_loss_atr×ATR；无 SL 时 fallback_stop_atr×
+  ATR；ATR 不可得 → 无风险距离 → 手数按 0）定手数；basis="initial" 用
+  初始资金（默认，不复利，便于比较），"equity" 用入场时权益（初始资金 +
+  已实现净利；入场时点不持仓，无浮动盈亏）。手数为 0（含 ATR 不可得）→
+  跳过该入场并计数 BacktestResult.skipped_zero_lots（写进 summary；信号
+  持续时下一根 bar 以新资金/新 ATR 重试）；Trade.volume_lots 如实记录
+  每笔实际手数。
 - 执行价（p 为 bid 口径的成交基准价，h 为执行 bar 的纽约本地小时（T20），
   spr=costs.spread_p90(symbol,h,price=p)、slip=costs.slippage(symbol,h,price=p)）：
       多头 entry = p + spr + slip    多头 exit = p − slip
@@ -86,12 +98,14 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from mt5data.store import TIMEFRAME_SECONDS
+from mt5quant.sizing import RiskSizing, lots_for_risk, validate_volume_bounds
 from mt5quant.strategies.base import REENTRY_MODES, ExitRules
 
 NY_TZ = "America/New_York"   # 周五当地收盘（17:00）换算与点差分桶共用的时区
 _WEEK_CLOSE_LOCAL = dtime(17, 0)
-ENGINE_VERSION = "A-1.4"     # 2026-10-26 T20：SessionPolicy 禁入窗推迟开仓 /
-                             # 成本小时改纽约本地口径（与 SpreadModel 分桶一致）
+ENGINE_VERSION = "A-1.5"     # 2026-10-26 T23：RiskSizing 按风险定手数（M2；
+                             # sizing 与 volume_lots 二选一，零手数跳过计数）。
+                             # A-1.4 = T20 禁入窗推迟开仓/成本小时纽约本地口径
 
 # 按收盘价出场的 reason：成交时刻 = bar 收盘（bar 时间 + 周期）（R9）
 CLOSE_PRICE_REASONS = ("time_stop", "week_close", "end_of_data")
@@ -167,10 +181,13 @@ class BacktestResult:
     symbol: str
     timeframe: str
     contract_size: float | None = None   # 金额换算口径（写进 manifest）
-    volume_lots: float | None = None
+    volume_lots: float | None = None     # 固定手数模式才非 None（sizing 模式
+                                         # 每笔不同，看 Trade.volume_lots）
     initial_capital: float | None = None
     ruined: bool = False                 # 权益 ≤ 0 过（R16）：此后不再开新仓
     ruined_at: pd.Timestamp | None = None  # 首次权益 ≤ 0 的 bar 时间；未发生为 None
+    skipped_zero_lots: int = 0           # T23：按风险定手数为 0 而跳过的入场
+                                         # 尝试次数（含 ATR 不可得；写进 summary）
 
 
 def _wilder(values: pd.Series, period: int) -> pd.Series:
@@ -276,9 +293,14 @@ def _validate_contract_size(contract_size) -> float:
 
 def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: dict,
                  contract_size: float,
-                 volume_lots: float = 1.0, initial_capital: float = 10_000.0,
+                 volume_lots: float | None = None,
+                 initial_capital: float = 10_000.0,
                  timeframe: str | None = None,
-                 session_policy=None) -> BacktestResult:
+                 session_policy=None,
+                 sizing: RiskSizing | None = None,
+                 vol_min: float | None = None,
+                 vol_step: float | None = None,
+                 vol_max: float | None = None) -> BacktestResult:
     """跑一次 A 层回测。
 
     contract_size 必填（无默认值，防止静默按 1 折算）：每手每 1.0 价格变动的
@@ -291,11 +313,35 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
     禁入窗（T20/A-1.4）。信号要求在禁入时段开仓时，开仓推迟到下一个允许的
     bar 开盘（信号持续为前提；信号归零则不再开）；**平仓不受限**。与实盘风控
     共用同一份 config/sessions.toml（铁律 v3 第 11 条）。
+    定手数（T23/A-1.5）：volume_lots（固定手数）与 sizing（RiskSizing 按风险
+    定手数）**二选一**——同给/同缺都拒。sizing 模式必须另给 vol_min/
+    vol_step/vol_max（品种快照的 volume_min/step/max；缺一项即拒），开跑前
+    经 validate_volume_bounds 校验（零步长等直接拒绝）。详见模块 docstring。
     """
     cs = _validate_contract_size(contract_size)
-    if not (isinstance(volume_lots, (int, float)) and not isinstance(volume_lots, bool)
-            and math.isfinite(volume_lots) and volume_lots > 0):
-        raise ValueError(f"volume_lots 必须是有限正数，收到 {volume_lots!r}")
+    if sizing is not None and volume_lots is not None:
+        raise ValueError(
+            "sizing 与 volume_lots 二选一：两者同时给出（"
+            f"sizing={sizing!r}, volume_lots={volume_lots!r}）")
+    if sizing is None and volume_lots is None:
+        raise ValueError(
+            "必须给出 volume_lots（固定手数）或 sizing（RiskSizing 按风险"
+            " 定手数）之一——不提供默认手数：静默的 1 手黄金在 1 万本金下"
+            "首次止损即爆仓（M2）")
+    if sizing is not None:
+        if vol_min is None or vol_step is None or vol_max is None:
+            raise ValueError(
+                "sizing 模式需要 vol_min/vol_step/vol_max（品种快照"
+                " volume_min/step/max，scripts 侧用 mt5quant.sizing."
+                "load_volume_limits 读取），缺 "
+                f"(min={vol_min!r}, step={vol_step!r}, max={vol_max!r})")
+        vol_bounds = validate_volume_bounds(vol_min, vol_step, vol_max)
+    else:
+        vol_bounds = None
+        if not (isinstance(volume_lots, (int, float))
+                and not isinstance(volume_lots, bool)
+                and math.isfinite(volume_lots) and volume_lots > 0):
+            raise ValueError(f"volume_lots 必须是有限正数，收到 {volume_lots!r}")
     if not (isinstance(initial_capital, (int, float)) and math.isfinite(initial_capital)
             and initial_capital > 0):
         raise ValueError(f"initial_capital 必须是有限正数，收到 {initial_capital!r}")
@@ -338,6 +384,7 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
     trades: list[Trade] = []
     state: dict | None = None   # 持仓状态；None = 空仓
     realized = 0.0
+    skipped_zero_lots = 0       # T23：手数为 0 而跳过的入场尝试（含 ATR 缺）
     equity_vals = [0.0] * n
     # R7：after_signal_change 模式下保护性出场后的禁入方向（±1；0=无禁入）。
     # immediate 模式不设禁入（保持目标仓位语义）。
@@ -386,7 +433,32 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
         state = None
 
     def _open(j: int, desired: int) -> None:
-        nonlocal state
+        nonlocal state, skipped_zero_lots
+        sig_bar = j - 1                       # SL/TP 用信号 bar 的 ATR（已收盘）
+        entry_atr = float(atr_arr[sig_bar])
+        if math.isnan(entry_atr):
+            entry_atr = float("nan")
+        # T23：定手数（唯一函数 mt5quant.sizing.lots_for_risk）。风险距离 =
+        # 策略 SL 距离（stop_loss_atr×ATR）；无 SL 时 fallback_stop_atr×ATR；
+        # ATR 不可得 → 无风险距离 → 手数 0（跳过并计数）。
+        if sizing is not None:
+            if math.isnan(entry_atr):
+                lots = 0.0
+            else:
+                stop_k = (rules.stop_loss_atr if rules.stop_loss_atr is not None
+                          else sizing.fallback_stop_atr)
+                capital = (initial_capital if sizing.basis == "initial"
+                           else initial_capital + realized)   # 入场时点不持仓
+                lots = lots_for_risk(capital, sizing.risk_fraction,
+                                     stop_k * entry_atr, cs,
+                                     vol_bounds[0], vol_bounds[1], vol_bounds[2])
+            if lots <= 0.0:
+                # 不开仓；信号持续时下一根 bar 以新资金/新 ATR 重试（目标仓位
+                # 语义与禁入窗推迟一致）。每个尝试计数一次。
+                skipped_zero_lots += 1
+                return
+        else:
+            lots = volume_lots
         spr = costs.spread_p90(symbol, int(ny_hours[j]), price=opens[j])
         slip = costs.slippage(symbol, int(ny_hours[j]), price=opens[j])
         base = opens[j]
@@ -396,10 +468,6 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
         else:
             entry_price = base - slip
             spread_charged = None
-        sig_bar = j - 1                       # SL/TP 用信号 bar 的 ATR（已收盘）
-        entry_atr = float(atr_arr[sig_bar])
-        if math.isnan(entry_atr):
-            entry_atr = float("nan")
         sl = tp = None
         if not math.isnan(entry_atr):
             if rules.stop_loss_atr is not None:
@@ -410,7 +478,7 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
                       else entry_price - rules.take_profit_atr * entry_atr)
         state = {
             "dir": desired, "side": "long" if desired == 1 else "short",
-            "lots": volume_lots, "entry_price": entry_price, "entry_time": times[j],
+            "lots": lots, "entry_price": entry_price, "entry_time": times[j],
             "entry_bar": j, "entry_slip": slip, "spread_charged": spread_charged,
             "entry_atr": entry_atr, "sl_k": rules.stop_loss_atr, "sl": sl, "tp": tp,
         }
@@ -509,6 +577,9 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
     equity = pd.Series(equity_vals, index=bars.index, name="equity")
     return BacktestResult(trades=trades_df, equity=equity, bars=bars,
                           params=params, symbol=symbol, timeframe=timeframe,
-                          contract_size=cs, volume_lots=float(volume_lots),
+                          contract_size=cs,
+                          volume_lots=(None if sizing is not None
+                                       else float(volume_lots)),
                           initial_capital=float(initial_capital),
-                          ruined=ruined, ruined_at=ruined_at)
+                          ruined=ruined, ruined_at=ruined_at,
+                          skipped_zero_lots=skipped_zero_lots)

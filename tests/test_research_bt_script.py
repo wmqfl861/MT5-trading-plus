@@ -29,23 +29,30 @@ def load_bt():
 
 def h1_bars(n=6, tf="H1"):
     times = pd.date_range("2026-01-05 10:00", periods=n, freq="h")
+    # n<=6：旧口径递增收盘（既有手算断言用）；n>6：恒定 100（TR=1.0 →
+    # ATR14 从 bar13 起恒 1.0，供 T23 定手数用例做确定手数）
+    closes = ([100.0, 100.0, 101.0, 102.0, 103.0, 104.0][:n]
+              if n <= 6 else [100.0] * n)
     df = pd.DataFrame({
         "time": times, "open": 100.0, "high": 100.5, "low": 99.5,
-        "close": [100.0, 100.0, 101.0, 102.0, 103.0, 104.0][:n],
+        "close": closes,
         "tick_volume": 10, "spread": 5, "real_volume": 0,
     })[_COLUMNS]
     return df
 
 
-def make_data_root(tmp_path):
+def make_data_root(tmp_path, n=6):
     root = tmp_path / "data"
     sdir = root / "bars" / "XAUUSD" / "H1"
     sdir.mkdir(parents=True)
-    h1_bars().to_parquet(sdir / "data.parquet")
+    h1_bars(n).to_parquet(sdir / "data.parquet")
     specs = root / "specs"
     specs.mkdir(parents=True)
+    # T23：快照含手数上下限（volume_min/step/max）——默认风险定手数可用
     (specs / "latest.json").write_text(
-        json.dumps({"XAUUSD": {"contract_size": 100.0}}), encoding="utf-8")
+        json.dumps({"XAUUSD": {"contract_size": 100.0, "volume_min": 0.01,
+                               "volume_step": 0.01, "volume_max": 200.0}}),
+        encoding="utf-8")
     return root
 
 
@@ -373,3 +380,113 @@ def test_g4_trials_dedup_same_params_counted_once(tmp_path):
         assert n == 3          # k=1（screen+gate+v2 合一）、k=2、k=4（无夏普）
         assert sorted(sharpes) == sorted([1.0 / _math.sqrt(6000.0),
                                           2.0 / _math.sqrt(6000.0)])
+
+
+# ------------------------------------------------- T23（M2）：定手数口径
+
+
+def test_screen_default_risk_sizing_records_metrics(tmp_path, monkeypatch,
+                                                    capsys):
+    """缺省（不给 --volume-lots/--risk-per-trade）= 风险定手数 0.005：
+    交易手数 = 50/(ATR×合约)（bar 够长后入场），skipped_zero_lots 与
+    sizing 方式随 metrics 落台账。"""
+    mod = load_bt()
+    root = make_data_root(tmp_path, n=20)          # 20 根：bar13 起 ATR=1.0
+    # 末根收 105（高点覆盖）：入场 0.50 手 × 合约 100 × 涨 5 = 250
+    f = root / "bars" / "XAUUSD" / "H1" / "data.parquet"
+    df = h1_bars(20)
+    df.loc[19, ["close", "high"]] = [105.0, 105.5]
+    df.to_parquet(f)
+    cards_dir = write_card(tmp_path)
+    ledger_path = tmp_path / "ledger.sqlite"
+    patch_card_git(monkeypatch, mod)
+    rc = mod.main(
+        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero"])
+    assert rc == 0
+    with Ledger(ledger_path) as led:
+        r = led.conn.execute("SELECT metrics_json FROM runs").fetchone()
+    payload = json.loads(r["metrics_json"])
+    m = payload["metrics"]
+    assert m["trade_count"] == 1
+    assert m["skipped_zero_lots"] == 12            # bar2..13（sig_bar 无 ATR）
+    assert m["net_profit"] == 250.0                # 0.50 手（手数错则对不上）
+    assert m["sizing"]["mode"] == "risk"
+    assert m["sizing"]["risk_fraction"] == 0.005
+    assert m["sizing"]["vol_min"] == 0.01
+
+
+def test_screen_risk_and_volume_conflict_rejected(tmp_path, monkeypatch,
+                                                  capsys):
+    mod = load_bt()
+    root = make_data_root(tmp_path)
+    cards_dir = write_card(tmp_path)
+    patch_card_git(monkeypatch, mod)
+    rc = mod.main(
+        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(tmp_path / "l.sqlite"),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--risk-per-trade", "0.006",
+         "--volume-lots", "1.0"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "互斥" in out
+
+
+def test_screen_risk_mode_without_volume_bounds_fails_assembly(tmp_path,
+                                                               monkeypatch,
+                                                               capsys):
+    """快照缺 volume 字段 → 装配期报错（不产生 runs）。"""
+    mod = load_bt()
+    root = make_data_root(tmp_path)
+    (root / "specs" / "latest.json").write_text(
+        json.dumps({"XAUUSD": {"contract_size": 100.0}}), encoding="utf-8")
+    cards_dir = write_card(tmp_path)
+    patch_card_git(monkeypatch, mod)
+    rc = mod.main(
+        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(tmp_path / "l.sqlite"),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "volume_min" in out or "snapshot_specs" in out
+    # 装配失败不产生任何 runs（台账可能已建，但 runs 为空）
+    assert not (tmp_path / "l.sqlite").exists() or Ledger(
+        tmp_path / "l.sqlite", create=False).conn.execute(
+        "SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+
+
+def test_gate_risk_sizing_passes_spec_through_g2(tmp_path, monkeypatch,
+                                                 capsys):
+    """gate 默认风险定手数：基准运行与关卡（含 G2 的 sizing 透传链——
+    成本放大/参数邻域/随机入场全走 run_engine）同一口径；metrics.sizing
+    记录方式；G2 各子检查不因 sizing 接线抛错（结果过不过是另一回事）。"""
+    mod = load_bt()
+    root = make_data_root(tmp_path, n=20)
+    cards_dir = write_card(tmp_path)
+    ledger_path = tmp_path / "ledger.sqlite"
+    patch_card_git(monkeypatch, mod)
+    rc = mod.main(
+        ["gate", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--gates", "G0,G2", "--params", "{}"])
+    out = capsys.readouterr().out
+    # rc=1：玩具数据上 G2 的若干子检查（去最好 5% 等）合法失败；G0 通过。
+    # 本用例只验 sizing 接线：基准与 G2 全链跑完、无 error、口径记录正确。
+    assert rc == 1, out
+    assert "G0" in out and "G2" in out
+    with Ledger(ledger_path) as led:
+        r = led.conn.execute("SELECT metrics_json FROM runs").fetchone()
+        g2 = led.conn.execute(
+            "SELECT details_json FROM gates WHERE gate='G2'").fetchone()
+    m = json.loads(r["metrics_json"])["metrics"]
+    assert m["sizing"]["mode"] == "risk"
+    assert m["skipped_zero_lots"] == 12
+    det = json.loads(g2["details_json"])
+    assert "error" not in det                   # G2 全部子检查跑完（无接线错误）
+    assert set(det["checks"]) >= {"cost_scaling", "param_plateau",
+                                  "random_entry_benchmark", "delay_1_bar"}

@@ -165,7 +165,7 @@ def test_atr_series_parity_with_mt5mcp_indicators():
 def test_long_round_trip_hand_computed():
     df = base4()
     res = run_backtest(ScriptStrategy([1], fill=1), df, FlatCosts(),
-                       symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1")
+                       symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0)
     t = one_trade(res)
     # 入场：bar1 开盘 100 + half 0.5 + slip 0.1；出场：末根收盘 103 − slip 0.1
     assert t["side"] == "long"
@@ -198,7 +198,7 @@ def test_buy_hold_net_identity():
 def test_short_round_trip_hand_computed():
     df = base4()
     res = run_backtest(ScriptStrategy([-1], fill=-1), df, FlatCosts(),
-                       symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1")
+                       symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0)
     t = one_trade(res)
     assert t["side"] == "short"
     assert t["entry_price"] == pytest.approx(100 - SLIP)      # 空头 entry=bid−slip
@@ -214,9 +214,9 @@ def test_signal_bar_close_does_not_affect_next_open_fill():
     b = base4()
     b.loc[0, "close"] = 111.0  # 大改信号 bar 的收盘价
     ta = one_trade(run_backtest(ScriptStrategy([1], fill=1), a, FlatCosts(),
-                                symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1"))
+                                symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0))
     tb = one_trade(run_backtest(ScriptStrategy([1], fill=1), b, FlatCosts(),
-                                symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1"))
+                                symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0))
     assert ta["entry_price"] == tb["entry_price"]
     assert ta["entry_time"] == a["time"].iloc[1] == tb["entry_time"]
 
@@ -224,9 +224,9 @@ def test_signal_bar_close_does_not_affect_next_open_fill():
 def test_later_signal_change_does_not_affect_earlier_entry():
     df = base4()
     t1 = one_trade(run_backtest(ScriptStrategy([1, 0], fill=0), df, FlatCosts(),
-                                symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1"))
+                                symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0))
     t2 = one_trade(run_backtest(ScriptStrategy([1, 1], fill=1), df, FlatCosts(),
-                                symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1"))
+                                symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0))
     assert t1["entry_price"] == t2["entry_price"]
     assert t1["exit_reason"] == "signal" and t1["exit_time"] == df["time"].iloc[2]
 
@@ -234,7 +234,7 @@ def test_later_signal_change_does_not_affect_earlier_entry():
 def test_execution_uses_execution_bar_hour():
     df = base4()  # 执行 bar 为 11:00 UTC = 纽约本地 6 点（EST，T20 分桶口径）
     t = one_trade(run_backtest(ScriptStrategy([1], fill=1), df, HourlySlipCosts(),
-                               symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1"))
+                               symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0))
     assert t["entry_price"] == pytest.approx(100 + HALF + (SLIP + 0.01 * 6))
 
 
@@ -252,7 +252,7 @@ def test_sl_tp_double_touch_fills_at_stop():
     rules = ExitRules(stop_loss_atr=2.0, take_profit_atr=2.0)
     t = one_trade(run_backtest(ScriptStrategy([0] * 18 + [1], exit_rules=rules),
                                df, FlatCosts(), symbol="XAUUSD", contract_size=1.0, params={},
-                               timeframe="H1"))
+                               timeframe="H1", volume_lots=1.0))
     entry = 100 + HALF + SLIP  # bar19 开盘 100 入场
     assert t["entry_price"] == pytest.approx(entry)
     assert t["exit_reason"] == "stop"
@@ -267,7 +267,7 @@ def test_take_profit_single_touch():
     rules = ExitRules(stop_loss_atr=2.0, take_profit_atr=2.0)
     t = one_trade(run_backtest(ScriptStrategy([0] * 18 + [1], exit_rules=rules),
                                df, FlatCosts(), symbol="XAUUSD", contract_size=1.0, params={},
-                               timeframe="H1"))
+                               timeframe="H1", volume_lots=1.0))
     assert t["exit_reason"] == "take_profit"
     assert t["exit_price"] == pytest.approx(100.6 + 2.0 - SLIP)
 
@@ -278,7 +278,7 @@ def test_stop_loss_single_touch():
     rules = ExitRules(stop_loss_atr=2.0, take_profit_atr=5.0)
     t = one_trade(run_backtest(ScriptStrategy([0] * 18 + [1], exit_rules=rules),
                                df, FlatCosts(), symbol="XAUUSD", contract_size=1.0, params={},
-                               timeframe="H1"))
+                               timeframe="H1", volume_lots=1.0))
     assert t["exit_reason"] == "stop"
     assert t["exit_price"] == pytest.approx(100.6 - 2.0 - SLIP)
     assert t["exit_fill_time"] == t["exit_time"]   # 盘中出场：成交时刻=bar 时间
@@ -294,7 +294,7 @@ def test_time_stop_exits_at_close():
     t = one_trade(run_backtest(ScriptStrategy([0] * 5 + [1, 1, 1], fill=0,
                                              exit_rules=rules),
                                df, FlatCosts(), symbol="XAUUSD", contract_size=1.0, params={},
-                               timeframe="H1"))
+                               timeframe="H1", volume_lots=1.0))
     assert t["entry_time"] == df["time"].iloc[6]
     assert t["exit_time"] == df["time"].iloc[8]  # 持有满 2 根，第 8 根收盘出
     assert t["exit_reason"] == "time_stop"
@@ -322,7 +322,7 @@ def test_week_close_exit_january_est():
     t = one_trade(run_backtest(ScriptStrategy([1, 1, 1, 0], fill=0,
                                              exit_rules=rules),
                                df, FlatCosts(), symbol="XAUUSD", contract_size=1.0, params={},
-                               timeframe="H1"))
+                               timeframe="H1", volume_lots=1.0))
     assert t["exit_reason"] == "week_close"
     assert t["exit_time"] == df["time"].iloc[3]  # 21:00 UTC 那根
     assert t["exit_price"] == pytest.approx(102.0 - SLIP)
@@ -342,7 +342,7 @@ def test_week_close_exit_july_edt():
     t = one_trade(run_backtest(ScriptStrategy([1, 1, 1, 0], fill=0,
                                              exit_rules=rules),
                                df, FlatCosts(), symbol="XAUUSD", contract_size=1.0, params={},
-                               timeframe="H1"))
+                               timeframe="H1", volume_lots=1.0))
     assert t["exit_reason"] == "week_close"
     assert t["exit_time"] == df["time"].iloc[3]  # 20:00 UTC 那根
     assert t["exit_price"] == pytest.approx(102.0 - SLIP)
@@ -351,7 +351,7 @@ def test_week_close_exit_july_edt():
 def test_without_week_close_holds_over_weekend():
     df = week_bars("2026-01-09")
     t = one_trade(run_backtest(ScriptStrategy([1], fill=1), df, FlatCosts(),
-                               symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1"))
+                               symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0))
     assert t["exit_reason"] == "end_of_data"
     assert t["exit_time"] == df["time"].iloc[4]  # 次周一 00:00 那根
     assert t["swap"] == pytest.approx(4 * ONIGHT)  # 周五19:00→(次日)周二00:00：跨 4 个午夜（模型整段计夜）
@@ -362,7 +362,7 @@ def test_without_week_close_holds_over_weekend():
 def test_overnight_fee_charged_when_crossing_utc_date():
     df = flat_bars(pd.Timestamp("2026-01-05 22:00"), 4)  # 22,23,00,01 点
     res = run_backtest(ScriptStrategy([1, 1, 1, 0]), df, FlatCosts(),
-                       symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1")
+                       symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0)
     t = one_trade(res)
     assert t["entry_time"] == df["time"].iloc[1]  # 23:00 入场
     assert t["exit_time"] == df["time"].iloc[3]   # 次日 01:00 出场
@@ -375,7 +375,7 @@ def test_overnight_fee_charged_when_crossing_utc_date():
 def test_reversal_closes_then_opens_at_same_bar_open():
     df = base4()
     res = run_backtest(ScriptStrategy([1, -1], fill=-1), df, FlatCosts(),
-                       symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1")
+                       symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0)
     assert len(res.trades) == 2
     t1, t2 = res.trades.iloc[0], res.trades.iloc[1]
     assert t1["side"] == "long" and t1["exit_reason"] == "signal"
@@ -392,7 +392,7 @@ def test_equity_mark_to_market_per_bar():
     df = base4()
     res = run_backtest(ScriptStrategy([1], fill=1), df, FlatCosts(),
                        symbol="XAUUSD", contract_size=1.0, params={}, initial_capital=10_000.0,
-                       timeframe="H1")
+                       timeframe="H1", volume_lots=1.0)
     eq = res.equity
     assert list(eq.index) == list(df.index)
     entry = 100 + HALF + SLIP
@@ -409,7 +409,7 @@ def test_equity_mark_to_market_per_bar():
 def test_result_carries_context():
     df = base4()
     res = run_backtest(BuyHold(), df, FlatCosts(), symbol="XAUUSD", contract_size=1.0,
-                       params={}, timeframe="H1")
+                       params={}, timeframe="H1", volume_lots=1.0)
     assert isinstance(res, BacktestResult)
     assert res.symbol == "XAUUSD" and res.timeframe == "H1"
     assert res.params == {}
@@ -423,21 +423,21 @@ def test_rejects_signal_values_outside_allowed_set():
     df = base4()
     with pytest.raises(ValueError, match="信号"):
         run_backtest(BadValuesStrategy(), df, FlatCosts(),
-                     symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1")
+                     symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0)
 
 
 def test_rejects_non_monotonic_bars():
     df = base4().iloc[::-1].reset_index(drop=True)
     with pytest.raises(ValueError, match="升序"):
         run_backtest(BuyHold(), df, FlatCosts(),
-                     symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1")
+                     symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0)
 
 
 def test_rejects_unknown_params():
     df = base4()
     with pytest.raises(ValueError, match="未知参数"):
         run_backtest(BuyHold(), df, FlatCosts(),
-                     symbol="XAUUSD", contract_size=1.0, params={"k": 1}, timeframe="H1")
+                     symbol="XAUUSD", contract_size=1.0, params={"k": 1}, timeframe="H1", volume_lots=1.0)
 
 
 def test_rejects_invalid_exit_rules():
@@ -445,11 +445,11 @@ def test_rejects_invalid_exit_rules():
     with pytest.raises(ValueError, match="time_stop_bars"):
         run_backtest(ScriptStrategy([1], fill=1,
                                     exit_rules=ExitRules(time_stop_bars=0)),
-                     df, FlatCosts(), symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1")
+                     df, FlatCosts(), symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0)
     with pytest.raises(ValueError, match="stop_loss_atr"):
         run_backtest(ScriptStrategy([1], fill=1,
                                     exit_rules=ExitRules(stop_loss_atr=-1.0)),
-                     df, FlatCosts(), symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1")
+                     df, FlatCosts(), symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0)
 
 
 def test_overnight_fee_counts_intraday_charge_hour_crossing():
@@ -457,14 +457,14 @@ def test_overnight_fee_counts_intraday_charge_hour_crossing():
     必须记 1 夜（旧实现只在跨日界时才调用模型，恒漏计日内跨计费时刻）。"""
     df = flat_bars(pd.Timestamp("2026-01-05 00:30"), 44, tf="M30")  # 00:30…22:00
     t = one_trade(run_backtest(ScriptStrategy([1], fill=1), df, ChargeHourCosts(),
-                               symbol="XAUUSD", contract_size=1.0, params={}, timeframe="M30"))
+                               symbol="XAUUSD", contract_size=1.0, params={}, timeframe="M30", volume_lots=1.0))
     assert t["entry_time"] == pd.Timestamp("2026-01-05 01:00")
     assert t["exit_time"] == pd.Timestamp("2026-01-05 22:00")  # 末根强平
     assert t["swap"] == pytest.approx(-3.0)                    # 恰跨 21:00 一次
 
     ctrl = flat_bars(pd.Timestamp("2026-01-05 00:30"), 24, tf="M30")  # 00:30…12:00 不跨
     t2 = one_trade(run_backtest(ScriptStrategy([1], fill=1), ctrl, ChargeHourCosts(),
-                                symbol="XAUUSD", contract_size=1.0, params={}, timeframe="M30"))
+                                symbol="XAUUSD", contract_size=1.0, params={}, timeframe="M30", volume_lots=1.0))
     assert t2["swap"] == pytest.approx(0.0)
 
 
@@ -482,14 +482,14 @@ def gap_bars(open_, high, low, close):
 def test_contract_size_is_required_keyword():
     with pytest.raises(TypeError, match="contract_size"):
         run_backtest(BuyHold(), base4(), FlatCosts(), symbol="XAUUSD",
-                     params={}, timeframe="H1")
+                     params={}, timeframe="H1", volume_lots=1.0)
 
 
 def test_rejects_invalid_contract_size_and_volume():
     for bad in (0, -100.0, float("nan"), float("inf"), True, "100"):
         with pytest.raises(ValueError, match="contract_size"):
             run_backtest(BuyHold(), base4(), FlatCosts(), symbol="XAUUSD",
-                         contract_size=bad, params={}, timeframe="H1")
+                         contract_size=bad, params={}, timeframe="H1", volume_lots=1.0)
     with pytest.raises(ValueError, match="volume_lots"):
         run_backtest(BuyHold(), base4(), FlatCosts(), symbol="XAUUSD",
                      contract_size=100.0, params={}, volume_lots=0.0, timeframe="H1")
@@ -513,7 +513,7 @@ def test_money_fields_are_account_currency():
 def test_equity_in_account_currency():
     res = run_backtest(ScriptStrategy([1], fill=1), base4(), FlatCosts(),
                        symbol="XAUUSD", contract_size=100.0, params={},
-                       initial_capital=10_000.0, timeframe="H1")
+                       initial_capital=10_000.0, timeframe="H1", volume_lots=1.0)
     assert list(res.equity) == pytest.approx([10_000.0, 9_940.0, 9_940.0, 10_229.0])
     assert res.contract_size == 100.0 and res.volume_lots == 1.0
     assert res.initial_capital == 10_000.0
@@ -533,7 +533,7 @@ def test_r_multiple_uses_risk_in_account_currency():
     rules = ExitRules(stop_loss_atr=2.0, take_profit_atr=5.0)
     t = one_trade(run_backtest(ScriptStrategy([0] * 18 + [1], exit_rules=rules),
                                df, FlatCosts(), symbol="XAUUSD", contract_size=100.0,
-                               params={}, timeframe="H1"))
+                               params={}, timeframe="H1", volume_lots=1.0))
     assert t["gross"] == pytest.approx((98.5 - 100.6) * 100)
     assert t["r_multiple"] == pytest.approx(t["net"] / (2.0 * 1.0 * 100))
 
@@ -544,7 +544,7 @@ def test_long_stop_gap_fills_at_open_not_stop_price():
     rules = ExitRules(stop_loss_atr=2.0)
     t = one_trade(run_backtest(ScriptStrategy([0] * 18 + [1], fill=1, exit_rules=rules),
                                df, FlatCosts(), symbol="XAUUSD", contract_size=1.0,
-                               params={}, timeframe="H1"))
+                               params={}, timeframe="H1", volume_lots=1.0))
     assert t["exit_reason"] == "stop_gap"
     assert t["exit_price"] == pytest.approx(95.0 - SLIP)    # 按开盘价，不是 98.5
     assert t["bars_held"] == 1
@@ -555,7 +555,7 @@ def test_long_take_profit_gap_fills_at_tp_conservatively():
     rules = ExitRules(stop_loss_atr=2.0, take_profit_atr=2.0)
     t = one_trade(run_backtest(ScriptStrategy([0] * 18 + [1], fill=1, exit_rules=rules),
                                df, FlatCosts(), symbol="XAUUSD", contract_size=1.0,
-                               params={}, timeframe="H1"))
+                               params={}, timeframe="H1", volume_lots=1.0))
     assert t["exit_reason"] == "take_profit_gap"
     assert t["exit_price"] == pytest.approx(102.6 - SLIP)
 
@@ -566,7 +566,7 @@ def test_short_stop_triggers_on_ask():
     rules = ExitRules(stop_loss_atr=2.0)
     t = one_trade(run_backtest(ScriptStrategy([0] * 18 + [-1], fill=-1, exit_rules=rules),
                                df, FlatCosts(), symbol="XAUUSD", contract_size=1.0,
-                               params={}, timeframe="H1"))
+                               params={}, timeframe="H1", volume_lots=1.0))
     assert t["entry_price"] == pytest.approx(100.0 - SLIP)
     assert t["exit_reason"] == "stop"
     assert t["exit_price"] == pytest.approx(101.9 + SLIP)   # 价位即 Ask 口径，+slip
@@ -577,12 +577,12 @@ def test_short_take_profit_needs_ask_to_reach_level():
     miss = gap_bars(100.0, 100.5, 97.5, 100.0)   # bid 低点 97.5，Ask 低点 98.0 > 97.9
     t1 = one_trade(run_backtest(ScriptStrategy([0] * 18 + [-1], fill=-1, exit_rules=rules),
                                 miss, FlatCosts(), symbol="XAUUSD", contract_size=1.0,
-                                params={}, timeframe="H1"))
+                                params={}, timeframe="H1", volume_lots=1.0))
     assert t1["exit_reason"] == "end_of_data"
     hit = gap_bars(100.0, 100.5, 97.3, 100.0)    # Ask 低点 97.8 ≤ 97.9
     t2 = one_trade(run_backtest(ScriptStrategy([0] * 18 + [-1], fill=-1, exit_rules=rules),
                                 hit, FlatCosts(), symbol="XAUUSD", contract_size=1.0,
-                                params={}, timeframe="H1"))
+                                params={}, timeframe="H1", volume_lots=1.0))
     assert t2["exit_reason"] == "take_profit"
     assert t2["exit_price"] == pytest.approx(97.9 + SLIP)
 
@@ -592,7 +592,7 @@ def test_short_stop_gap_fills_at_open_ask():
     rules = ExitRules(stop_loss_atr=2.0)
     t = one_trade(run_backtest(ScriptStrategy([0] * 18 + [-1], fill=-1, exit_rules=rules),
                                df, FlatCosts(), symbol="XAUUSD", contract_size=1.0,
-                               params={}, timeframe="H1"))
+                               params={}, timeframe="H1", volume_lots=1.0))
     assert t["exit_reason"] == "stop_gap"
     assert t["exit_price"] == pytest.approx(103.0 + HALF + SLIP)
 
@@ -600,16 +600,17 @@ def test_short_stop_gap_fills_at_open_ask():
 def test_equity_marks_short_at_ask():
     res = run_backtest(ScriptStrategy([-1], fill=-1), base4(), FlatCosts(),
                        symbol="XAUUSD", contract_size=1.0, params={},
-                       initial_capital=10_000.0, timeframe="H1")
+                       initial_capital=10_000.0, timeframe="H1", volume_lots=1.0)
     # 入场 99.9；bar1/2 收盘 Ask=100.5 → 浮亏 0.6；末根平仓 103.6 → 净 −3.7−1.0
     assert list(res.equity) == pytest.approx([10_000.0, 9_999.4, 9_999.4, 9_995.3])
 
 
 # ------------------------------------------------- 成本接口 v2（R1 / 计划 T3）
 
-def test_engine_version_bumped_for_t20_session_policy():
-    # A-1.3 → A-1.4（T20）：禁入窗推迟开仓 + 成本小时改纽约本地口径
-    assert ENGINE_VERSION == "A-1.4"
+def test_engine_version_bumped_for_t23_risk_sizing():
+    # A-1.4 → A-1.5（T23）：RiskSizing 按风险定手数（M2；sizing 与
+    # volume_lots 二选一，零手数跳过计数）；A-1.4 = T20 禁入窗推迟开仓
+    assert ENGINE_VERSION == "A-1.5"
 
 
 def test_engine_passes_price_to_cost_models_long_fills():
@@ -617,7 +618,7 @@ def test_engine_passes_price_to_cost_models_long_fills():
     df = base4()  # bar1 11:00 开盘入场（open=100），末根 13:00 收盘 103 强平
     rec = RecordingCosts()
     run_backtest(ScriptStrategy([1], fill=1), df, rec,
-                 symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1")
+                 symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0)
     # 多头估值按 Bid（close），不调点差模型 → 调用序列完全确定。
     # 小时为纽约本地（2026-01-05 EST：UTC−5）——11:00 UTC→6 点、13:00 UTC→8 点
     assert rec.calls == [("spread", 6, 100.0), ("slip", 6, 100.0),
@@ -632,7 +633,7 @@ def test_engine_passes_bar_prices_for_short_ask_trigger_and_marking():
     rec = RecordingCosts()
     t = one_trade(run_backtest(ScriptStrategy([0] * 18 + [-1], fill=-1, exit_rules=rules),
                                df, rec, symbol="XAUUSD", contract_size=1.0,
-                               params={}, timeframe="H1"))
+                               params={}, timeframe="H1", volume_lots=1.0))
     spread_prices = rec.prices("spread")
     assert all(p is not None for p in spread_prices)
     assert 100.4 in spread_prices    # bar19 收盘估值 spr 的 price=close
@@ -668,7 +669,7 @@ def test_engine_relative_costs_hand_computed_contract_size_100():
     rel = 0.2 / 100.1
     df = base4()  # bar1 开盘 100 入场，末根收盘 103 强平
     res = run_backtest(ScriptStrategy([1], fill=1), df, _relative_costs(),
-                       symbol="XAUUSD", contract_size=100.0, params={}, timeframe="H1")
+                       symbol="XAUUSD", contract_size=100.0, params={}, timeframe="H1", volume_lots=1.0)
     t = one_trade(res)
     e_spr, e_slip = rel * 100.0, 0.1 * rel * 100.0        # 入场基准价=开盘 100
     x_slip = 0.1 * rel * 103.0                            # 出场基准价=收盘 103
@@ -710,7 +711,7 @@ def test_engine_relative_costs_double_price_doubles_spread_cost():
                     swap=SwapModel(per_symbol={"XAUUSD": SwapRule(
                         long_per_day=0.0, short_per_day=0.0)}))
     res = run_backtest(ScriptStrategy([1], fill=1), df2, costs2,
-                       symbol="XAUUSD", contract_size=100.0, params={}, timeframe="H1")
+                       symbol="XAUUSD", contract_size=100.0, params={}, timeframe="H1", volume_lots=1.0)
     t2 = one_trade(res)
     assert t2["spread_cost"] == pytest.approx(rel * 200.0 * 100.0)   # 入场基准 200
     assert t2["slippage_cost"] == pytest.approx(
@@ -731,7 +732,7 @@ def test_reentry_immediate_reenters_next_bar_after_stop():
     rules = ExitRules(stop_loss_atr=2.0)          # reentry 默认 "immediate"
     res = run_backtest(ScriptStrategy([0] * 14 + [1] * 5, fill=1, exit_rules=rules),
                        reentry_bars(), FlatCosts(), symbol="XAUUSD",
-                       contract_size=1.0, params={}, timeframe="H1")
+                       contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0)
     assert len(res.trades) == 2
     t1, t2 = res.trades.iloc[0], res.trades.iloc[1]
     assert t1["exit_reason"] == "stop" and t1["exit_time"] == res.bars["time"].iloc[16]
@@ -747,7 +748,7 @@ def test_reentry_after_signal_change_blocks_until_signal_leaves_direction():
     res = run_backtest(ScriptStrategy([0] * 14 + [1, 1, 1, 0, 1], fill=0,
                                       exit_rules=rules),
                        df, FlatCosts(), symbol="XAUUSD", contract_size=1.0,
-                       params={}, timeframe="H1")
+                       params={}, timeframe="H1", volume_lots=1.0)
     assert len(res.trades) == 2
     t1, t2 = res.trades.iloc[0], res.trades.iloc[1]
     assert t1["exit_reason"] == "stop"
@@ -760,7 +761,7 @@ def test_reentry_after_signal_change_no_reentry_while_signal_holds():
     rules = ExitRules(stop_loss_atr=2.0, reentry="after_signal_change")
     res = run_backtest(ScriptStrategy([0] * 14 + [1] * 5, fill=1, exit_rules=rules),
                        reentry_bars(), FlatCosts(), symbol="XAUUSD",
-                       contract_size=1.0, params={}, timeframe="H1")
+                       contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0)
     assert len(res.trades) == 1
     assert res.trades.iloc[0]["exit_reason"] == "stop"
 
@@ -774,7 +775,7 @@ def test_engine_rejects_invalid_reentry_value():
     with pytest.raises(ValueError, match="reentry"):
         run_backtest(ScriptStrategy([1], fill=1, exit_rules=rules), base4(),
                      FlatCosts(), symbol="XAUUSD", contract_size=1.0,
-                     params={}, timeframe="H1")
+                     params={}, timeframe="H1", volume_lots=1.0)
 
 
 def test_week_close_exit_rejects_timeframes_above_h1():
@@ -785,11 +786,11 @@ def test_week_close_exit_rejects_timeframes_above_h1():
         with pytest.raises(ValueError, match="week_close"):
             run_backtest(ScriptStrategy([1], fill=1, exit_rules=rules), df,
                          FlatCosts(), symbol="XAUUSD", contract_size=1.0,
-                         params={}, timeframe=tf)
+                         params={}, timeframe=tf, volume_lots=1.0)
     m30 = flat_bars(pd.Timestamp("2026-01-09 17:00"), 8, tf="M30")
     run_backtest(ScriptStrategy([1], fill=1, exit_rules=rules), m30,
                  FlatCosts(), symbol="XAUUSD", contract_size=1.0,
-                 params={}, timeframe="M30")   # ≤H1 的周期不受影响
+                 params={}, timeframe="M30", volume_lots=1.0)   # ≤H1 的周期不受影响
 
 
 def test_time_stop_exit_fill_time_is_bar_close_and_swap_counts_extra_night():
@@ -801,7 +802,7 @@ def test_time_stop_exit_fill_time_is_bar_close_and_swap_counts_extra_night():
     t = one_trade(run_backtest(ScriptStrategy([0] * 37 + [1, 1, 1], fill=0,
                                               exit_rules=rules),
                                df, ChargeHourCosts(), symbol="XAUUSD",
-                               contract_size=1.0, params={}, timeframe="M30"))
+                               contract_size=1.0, params={}, timeframe="M30", volume_lots=1.0))
     assert t["entry_time"] == pd.Timestamp("2026-01-05 19:30")
     assert t["exit_reason"] == "time_stop"
     assert t["exit_time"] == pd.Timestamp("2026-01-05 20:30")        # bar 时间（原义）
@@ -817,7 +818,7 @@ def test_ruin_stops_new_entries_and_marks_result():
     rules = ExitRules(time_stop_bars=2)
     res = run_backtest(ScriptStrategy([1], fill=1, exit_rules=rules), df, FlatCosts(),
                        symbol="XAUUSD", contract_size=1000.0, params={},
-                       initial_capital=1000.0, timeframe="H1")
+                       initial_capital=1000.0, timeframe="H1", volume_lots=1.0)
     assert len(res.trades) == 1                    # bar3 time_stop 出场后信号仍 1，但已爆仓
     t = res.trades.iloc[0]
     assert t["exit_reason"] == "time_stop"
@@ -844,13 +845,13 @@ def test_session_policy_defers_entry_to_next_allowed_bar():
     pol = _pol_window("11:00")           # 禁入 [11:00, 12:00) UTC
     res = run_backtest(ScriptStrategy([1], fill=1), df, FlatCosts(), symbol="XAUUSD",
                        contract_size=1.0, params={}, timeframe="H1",
-                       session_policy=pol)
+                       session_policy=pol, volume_lots=1.0)
     t = one_trade(res)
     assert t["entry_time"] == df["time"].iloc[2]   # bar1 禁入 → bar2（12:00）开盘
     assert t["exit_reason"] == "end_of_data"
     # 对照：无策略（None）行为不变——bar1 开盘即入
     res0 = run_backtest(ScriptStrategy([1], fill=1), df, FlatCosts(), symbol="XAUUSD",
-                        contract_size=1.0, params={}, timeframe="H1")
+                        contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0)
     assert one_trade(res0)["entry_time"] == df["time"].iloc[1]
 
 
@@ -861,7 +862,7 @@ def test_session_policy_defers_while_window_persists():
     pol = _pol_window("11:00", post=180)
     res = run_backtest(ScriptStrategy([1], fill=1), df, FlatCosts(), symbol="XAUUSD",
                        contract_size=1.0, params={}, timeframe="H1",
-                       session_policy=pol)
+                       session_policy=pol, volume_lots=1.0)
     assert len(res.trades) == 0
 
 
@@ -871,7 +872,7 @@ def test_session_policy_never_blocks_exit():
     pol = _pol_window("12:00")           # bar2（12:00）在禁入窗内
     res = run_backtest(ScriptStrategy([1, 0], fill=0), df, FlatCosts(),
                        symbol="XAUUSD", contract_size=1.0, params={},
-                       timeframe="H1", session_policy=pol)
+                       timeframe="H1", session_policy=pol, volume_lots=1.0)
     t = one_trade(res)
     assert t["entry_time"] == df["time"].iloc[1]    # 11:00 入场（允许）
     assert t["exit_time"] == df["time"].iloc[2]     # 12:00 平仓照常（不受限）
@@ -884,7 +885,7 @@ def test_session_policy_reversal_closes_but_defers_new_side():
     pol = _pol_window("12:00")
     res = run_backtest(ScriptStrategy([1, -1], fill=-1), df, FlatCosts(),
                        symbol="XAUUSD", contract_size=1.0, params={},
-                       timeframe="H1", session_policy=pol)
+                       timeframe="H1", session_policy=pol, volume_lots=1.0)
     assert len(res.trades) == 2
     t1, t2 = res.trades.iloc[0], res.trades.iloc[1]
     assert t1["exit_time"] == df["time"].iloc[2]    # 12:00 平多（允许）
@@ -897,7 +898,7 @@ def test_session_policy_dst_anchors_summer_and_winter():
     july = flat_bars(pd.Timestamp("2026-07-15 20:00"), 3)   # 20/21/22 UTC（EDT）
     res = run_backtest(ScriptStrategy([1], fill=1), july, FlatCosts(),
                        symbol="XAUUSD", contract_size=1.0, params={},
-                       timeframe="H1", session_policy=pol)
+                       timeframe="H1", session_policy=pol, volume_lots=1.0)
     t = one_trade(res)
     # bar0 信号 → bar1（21:00 UTC）在 [20:55, 22:00) 内禁入 → bar2（22:00）开盘
     assert t["entry_time"] == pd.Timestamp("2026-07-15 22:00")
@@ -905,7 +906,97 @@ def test_session_policy_dst_anchors_summer_and_winter():
     dec = flat_bars(pd.Timestamp("2026-12-15 21:00"), 3)    # 21/22/23 UTC（EST）
     res2 = run_backtest(ScriptStrategy([1], fill=1), dec, FlatCosts(),
                         symbol="XAUUSD", contract_size=1.0, params={},
-                        timeframe="H1", session_policy=pol)
+                        timeframe="H1", session_policy=pol, volume_lots=1.0)
     t2 = one_trade(res2)
     # 22:00（冬令时换日）禁入 → 推迟到 23:00 开盘
     assert t2["entry_time"] == pd.Timestamp("2026-12-15 23:00")
+
+
+# ------------------------------------------------- T23（M2）：RiskSizing 定手数
+
+from mt5quant.sizing import RiskSizing  # noqa: E402
+
+XAU_VOL = dict(vol_min=0.01, vol_step=0.01, vol_max=200.0)
+
+
+def sizing_bars(n=30):
+    """恒定波幅 H1：TR 恒 1.0 → ATR14 从 bar13 起恒 1.0（SL 距离=系数×1.0）。"""
+    return flat_bars(pd.Timestamp("2026-01-05 10:00"), n)
+
+
+def test_sizing_volume_lots_mutually_exclusive():
+    bars = sizing_bars()
+    strat = ScriptStrategy([0] * 14 + [1] * 15)
+    # 同给 → 拒
+    with pytest.raises(ValueError, match="二选一"):
+        run_backtest(strat, bars, FlatCosts(), symbol="XAUUSD", params={},
+                     contract_size=100.0, timeframe="H1", volume_lots=1.0,
+                     sizing=RiskSizing(risk_fraction=0.005), **XAU_VOL)
+    # 同缺 → 拒（引擎不给默认手数：静默 1 手黄金首次止损即爆仓，M2）
+    with pytest.raises(ValueError, match="volume_lots"):
+        run_backtest(strat, bars, FlatCosts(), symbol="XAUUSD", params={},
+                     contract_size=100.0, timeframe="H1")
+    # sizing 缺 vol 三元组 → 拒
+    with pytest.raises(ValueError, match="vol_min"):
+        run_backtest(strat, bars, FlatCosts(), symbol="XAUUSD", params={},
+                     contract_size=100.0, timeframe="H1", volume_lots=None,
+                     sizing=RiskSizing(risk_fraction=0.005))
+    # 零步长等非法 vol → 拒（开跑前校验，不是入场时才炸）
+    with pytest.raises(ValueError, match="vol_step"):
+        run_backtest(strat, bars, FlatCosts(), symbol="XAUUSD", params={},
+                     contract_size=100.0, timeframe="H1", volume_lots=None,
+                     sizing=RiskSizing(risk_fraction=0.005),
+                     vol_min=0.01, vol_step=0.0, vol_max=1.0)
+
+
+def test_sizing_uses_strategy_sl_distance_plan_case():
+    """计划逐条：合约 100、资金 10,000、风险 0.5%、SL 距离 5.0（ATR=1.0 ×
+    stop_loss_atr=5.0）→ 0.10 手；Trade.volume_lots 如实记录。"""
+    bars = sizing_bars()
+    strat = ScriptStrategy([0] * 14 + [1] * 15,
+                           exit_rules=ExitRules(stop_loss_atr=5.0))
+    res = run_backtest(strat, bars, FlatCosts(), symbol="XAUUSD", params={},
+                       contract_size=100.0, timeframe="H1", volume_lots=None,
+                       initial_capital=10_000.0,
+                       sizing=RiskSizing(risk_fraction=0.005), **XAU_VOL)
+    assert len(res.trades) == 1
+    assert res.trades.iloc[0]["volume_lots"] == pytest.approx(0.10)
+    assert res.volume_lots is None          # 固定手数字段不冒充 sizing 结果
+    assert res.skipped_zero_lots == 0
+
+
+def test_sizing_fallback_stop_when_no_sl():
+    """策略无 SL：风险距离 = fallback_stop_atr×ATR——fallback 2.0 的手数
+    恰为 1.0 的一半（同一资金同一 ATR）。"""
+    bars = sizing_bars()
+    sig = [0] * 14 + [1] * 15
+
+    def run(fallback):
+        strat = ScriptStrategy(sig)          # ExitRules()：无 SL/TP
+        return run_backtest(strat, bars, FlatCosts(), symbol="XAUUSD",
+                            params={}, contract_size=100.0, timeframe="H1",
+                            volume_lots=None, initial_capital=10_000.0,
+                            sizing=RiskSizing(risk_fraction=0.005,
+                                              fallback_stop_atr=fallback),
+                            **XAU_VOL)
+
+    lots1 = run(1.0).trades.iloc[0]["volume_lots"]
+    lots2 = run(2.0).trades.iloc[0]["volume_lots"]
+    assert lots1 == pytest.approx(0.50)      # 50 / (1.0×100) = 0.50
+    assert lots2 == pytest.approx(0.25)      # 50 / (2.0×100) = 0.25
+
+
+def test_sizing_skips_entry_when_atr_unavailable():
+    """ATR 回看不足（入场太早）→ 无风险距离 → 手数 0：跳过并计数；
+    信号持续到 ATR 可得后照常入场（逐 bar 重试）。"""
+    bars = sizing_bars(30)
+    strat = ScriptStrategy([1], fill=1)      # bar0 信号 → bar1 就想入场
+    res = run_backtest(strat, bars, FlatCosts(), symbol="XAUUSD", params={},
+                       contract_size=100.0, timeframe="H1", volume_lots=None,
+                       initial_capital=10_000.0,
+                       sizing=RiskSizing(risk_fraction=0.005), **XAU_VOL)
+    # bar1..14 共 14 次尝试因 ATR 不可得跳过（sig_bar=0..13；bar13 起有 ATR，
+    # 即 bar14 入场）→ 之后成交 1 笔
+    assert res.skipped_zero_lots == 13       # sig_bar 0..12 的 13 次尝试
+    assert len(res.trades) == 1
+    assert res.trades.iloc[0]["entry_time"] == pd.Timestamp("2026-01-06 00:00")

@@ -102,6 +102,9 @@ def summarize(result, *, cost_version: str = "v0") -> dict:
 
     ruined = bool(getattr(result, "ruined", False))
     ruined_at = getattr(result, "ruined_at", None)
+    # T23：按风险定手数为 0 而跳过的入场尝试（含 ATR 不可得）；旧结果对象
+    # （手工构造/引擎外合成）无此属性时按 0，与 ruined 的 getattr 口径一致
+    skipped_zero_lots = int(getattr(result, "skipped_zero_lots", 0) or 0)
 
     returns = equity.pct_change().dropna() if len(equity) > 1 else pd.Series(dtype="float64")
     sharpe = sortino = None
@@ -178,6 +181,7 @@ def summarize(result, *, cost_version: str = "v0") -> dict:
         "by_side": by_side,
         "ruined": ruined,
         "ruined_at": ruined_at.isoformat() if ruined_at else None,
+        "skipped_zero_lots": skipped_zero_lots,
     }
 
 

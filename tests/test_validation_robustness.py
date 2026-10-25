@@ -194,7 +194,7 @@ def test_cost_scaling_fails_when_costs_dominant(cfg):
     """基准仍盈利（净 +5）但 ×1.5 后为负：成本 20 → 25−20>0、25−30<0。"""
     costs = ConstCosts(spread=10.0, commission=10.0)
     base = run_backtest(LongMid(), uptrend(), costs, symbol="TST", params={},
-                        contract_size=1.0, timeframe="H1")
+                        contract_size=1.0, timeframe="H1", volume_lots=1.0)
     assert base.trades["net"].sum() > 0
     out = rob.cost_scaling_check(spec_of(LongMid()), uptrend(), costs, {}, cfg)
     assert out["passed"] is False
@@ -321,7 +321,7 @@ def test_buy_hold_benchmark_long_only_partial_exposure_fails(cfg):
     bars = uptrend(200, step=0.3)
     costs = ConstCosts(spread=0.02)
     result = run_backtest(LongMid(), bars, costs, symbol="TST", params={},
-                          contract_size=1.0, timeframe="H1")
+                          contract_size=1.0, timeframe="H1", volume_lots=1.0)
     base_sharpe = summarize(result)["sharpe"]
     out = rob.buy_hold_check(spec_of(LongMid()), bars, costs,
                              result.trades, base_sharpe, cfg)
@@ -332,7 +332,7 @@ def test_buy_hold_benchmark_long_only_partial_exposure_fails(cfg):
 def test_buy_hold_benchmark_not_long_only_is_na(cfg):
     bars = uptrend(200, step=0.3)
     result = run_backtest(ShortThenLong(), bars, ConstCosts(0.02), symbol="TST",
-                          params={}, contract_size=1.0, timeframe="H1")
+                          params={}, contract_size=1.0, timeframe="H1", volume_lots=1.0)
     out = rob.buy_hold_check(spec_of(ShortThenLong()), bars, ConstCosts(0.02),
                              result.trades, 0.5, cfg)
     assert out["passed"] is True
@@ -379,7 +379,7 @@ def test_random_signal_fails_random_entry_benchmark(cfg):
     strategy = rob.FixedSignals(sig)
     costs = ConstCosts(spread=0.3, commission=0.5)
     result = run_backtest(strategy, bars, costs, symbol="TST", params={},
-                          contract_size=1.0, timeframe="H1")
+                          contract_size=1.0, timeframe="H1", volume_lots=1.0)
     assert len(result.trades) >= 30            # 夹具自检：交易数足够
     base_sharpe = rob.equity_sharpe(result.equity, bars["time"], "H1")
     out = rob.random_entry_check(
@@ -409,7 +409,7 @@ def test_strong_trend_beats_random_entry_benchmark(cfg):
     strategy = rob.FixedSignals(sig)
     costs = ConstCosts(spread=0.05)
     result = run_backtest(strategy, bars, costs, symbol="TST", params={},
-                          contract_size=1.0, timeframe="H1")
+                          contract_size=1.0, timeframe="H1", volume_lots=1.0)
     assert len(result.trades) == 40
     base_sharpe = rob.equity_sharpe(result.equity, bars["time"], "H1")
     out = rob.random_entry_check(
@@ -430,7 +430,7 @@ def test_run_g2_overfit_on_noise_fails(cfg):
     runs = {}
     for k in grid["k"]:
         r = run_backtest(SmaK(), bars, costs, symbol="TST", params={"k": k},
-                         contract_size=1.0, timeframe="H1")
+                         contract_size=1.0, timeframe="H1", volume_lots=1.0)
         nets[k] = r.trades["net"].sum()
         runs[k] = r
     best_k = max(nets, key=nets.get)
@@ -475,7 +475,7 @@ def random_entry_of(sig, bars, *, side=1, sims=12, seed=2026):
     strategy = rob.FixedSignals(np.asarray(sig, dtype=int) * side)
     costs = ConstCosts(spread=0.05)
     result = run_backtest(strategy, bars, costs, symbol="TST", params={},
-                          contract_size=1.0, timeframe="H1")
+                          contract_size=1.0, timeframe="H1", volume_lots=1.0)
     assert len(result.trades) >= 3            # 夹具自检：确有交易
     base_sharpe = rob.equity_sharpe(result.equity, bars["time"], "H1")
     return rob.random_entry_check(
