@@ -189,7 +189,9 @@ cutoff 直接报错（绝不静默截断）；MCP `get_bars` 同一约束（越�
 ```
 
 审核报告与后续计划：`docs/reviews/`（各轮审核）、`docs/blueprint.md`（蓝图与现状）、
-`docs/superpowers/plans/2026-10-25-review-fixes-p3b-p4.md`（下一轮施工计划）。
+`docs/superpowers/plans/2026-10-26-round4-optimization.md`（当前施工计划；上一轮为 `2026-10-25-review-fixes-p3b-p4.md`）。
+
+> **当前禁止事项**（第四轮审核，详见蓝图 v3 §2）：修好 G5 之前不跑 G5；实盘风控接线（计划 T24）完成前，不以非干跑模式启动 `scripts/live_runner.py`。
 
 ## 每日调度
 
