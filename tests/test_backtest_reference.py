@@ -10,7 +10,9 @@
    不一致必须报错（引擎只读 ExitRules，参数副本只作记录，禁止静默分叉）；
 4. A/B 双引擎多笔冒烟（tick 复现 bar OHLC）：多头止损+immediate 重入、
    空头止盈、反向交叉 signal 出场+反手——每笔入场时间差 0、净利差 0，
-   止损/收盘价类出场时间差 < 1 根 bar（结构内差异）；
+   止损/收盘价类出场时间差 < 1 根 bar（结构内差异）；T40 机制核对
+   （B 成交=就绪后首笔 tick / 正确一侧第一笔穿价 / 收盘边界前最后一笔
+   tick；净利差三分量拆解"其余"≈0）在 reconcile_ab 的新口径下全绿；
 5. 隔离：参考策略不进 mt5quant.strategies（library）。
 """
 import importlib.util
@@ -292,6 +294,12 @@ def test_ab_long_stop_immediate_reentry_end_of_data():
     assert (rep.rows["entry_dt_ms"] == 0).all()          # 信号类入场时间一致
     assert r_stop["exit_dt_ms"] == 40 * 60 * 1000        # 止损在 low tick（+40m）
     assert r_eod["exit_dt_ms"] == 3_600_000 - 1          # 收盘前最后一笔 tick
+    # T40 机制核对：止损=正确一侧第一笔穿价 tick；收盘价类=边界前最后一笔 tick
+    assert r_stop["exit_check"] == "first_cross" and r_stop["exit_time_ok"]
+    assert r_stop["exit_note"] == ""
+    assert r_eod["exit_check"] == "last_tick" and r_eod["exit_time_ok"]
+    assert (rep.rows["entry_gap_ms"] == 0).all()         # 入场=边界后首笔 tick
+    assert (rep.rows["net_rest"].abs() < 1e-9).all()     # 拆解后"其余"≈0
     for col in ("entry_price_diff", "exit_price_diff", "net_diff"):
         assert (rep.rows[col].abs() < 1e-9).all(), rep.rows[col]
     assert rep.rows["row_ok"].all()
@@ -335,6 +343,8 @@ def test_ab_short_take_profit_and_end_of_data():
     r_tp, r_eod = rep.rows.iloc[0], rep.rows.iloc[1]
     assert r_tp["exit_reason_a"] == r_tp["exit_reason_b"] == "take_profit"
     assert r_eod["exit_reason_a"] == r_eod["exit_reason_b"] == "end_of_data"
+    # T40：空头止盈按 Ask（触发侧）第一笔穿价 tick 成交
+    assert r_tp["exit_check"] == "first_cross" and r_tp["exit_time_ok"]
     assert rep.trades_a["side"].tolist() == ["short", "short"]
     assert (rep.rows["entry_dt_ms"] == 0).all()
     for col in ("entry_price_diff", "exit_price_diff", "net_diff"):
@@ -371,6 +381,9 @@ def test_ab_signal_exit_and_reverse_entry():
     # signal 出场与入场都发生在 bar 边界 tick：时间差精确 0
     assert (rep.rows["entry_dt_ms"] == 0).all()
     assert r_sig["exit_dt_ms"] == 0
+    # T40：signal 出场=就绪后首笔 tick（此处即边界 tick 本身，非静默）
+    assert r_sig["exit_check"] == "first_tick" and r_sig["exit_time_ok"]
+    assert not r_sig["exit_silent"]
     for col in ("entry_price_diff", "exit_price_diff", "net_diff"):
         assert (rep.rows[col].abs() < 1e-9).all(), rep.rows[col]
     assert rep.rows["row_ok"].all()
