@@ -2,6 +2,10 @@
 
 全部走 FakeBroker（mt5gw 服务层替身）；真实下单由 mt5gw 保险丝管辖，不在测试范围。
 T30：LiveExecutor 的意图写入（pending → confirmed / 异常返回 / 被拒轮不洗白）。
+T31（D22）：只在开仓时定手数——同向持仓保持净手数不调仓（adapter 的 add/reduce
+腿仍在，但 LiveExecutor 正常轮次不再触达；固定手数配置被改动也不调）。
+T32（D21）：全平指令编号协议的执行器消费侧——ack 引用指令编号、已 ack 当前
+编号则 flatten_acked 不再平仓、新编号指令再次全平。
 """
 import json
 from datetime import datetime
@@ -288,7 +292,7 @@ def test_intent_confirmed_when_order_raises(tmp_path):
 
 
 def test_rejected_round_does_not_launder_intent(tmp_path):
-    """开仓被闸门拒（无平仓腿）：意图保持原值——被拒轮绝不改写（防洗白）。"""
+    """被拒轮绝不改写意图（防洗白）——开仓腿被闸门拒：无 pending、无洗白。"""
     from mt5live.riskproc import RiskDecision
 
     class _RejectGate:
@@ -296,15 +300,132 @@ def test_rejected_round_does_not_launder_intent(tmp_path):
             return RiskDecision(False, "test_reject")
 
     b = FakeBroker()
+    ex = _mk_executor(b, tmp_path, gate=_RejectGate())
+    d0 = mk_decision(signal=0, decision_id="XAUUSD|M15|d0")
+    assert ex.poll(d0, NOW).action == "hold"
+    before = read_intent(tmp_path)               # 首轮登记：意图=实际净持仓
+
+    d1 = mk_decision(signal=1, volume_lots=0.02, decision_id="XAUUSD|M15|d1")
+    rr = ex.poll(d1, NOW.replace(minute=15))
+    assert rr.action == "risk_rejected"
+    assert read_intent(tmp_path) == before       # 原样：无 pending、无洗白
+
+
+# ---- T31（D22）：实盘只在开仓时定手数，持仓期间不调仓 ----
+
+def test_t31_holding_keeps_net_and_skips_sizer(tmp_path):
+    """同向持仓：目标=净手数（保持入场时的手数），不调仓、不查定手数器。"""
+    b = FakeBroker()
+    b.seed_position(side="buy", volume=0.02, magic=MAGIC)
+    from mt5quant.strategies.base import ExitRules
+
+    ex = LiveExecutor(
+        mk_adapter(b), symbol=b.symbol, magic=MAGIC, live_dir=str(tmp_path),
+        rules=ExitRules(stop_loss_atr=1.5))      # 无 sizer：同向轮不应需要它
+    rr = ex.poll(mk_decision(signal=1, volume_lots=None, atr=2.0), NOW)
+    assert rr.action == "hold"
+    assert b.actions == []                       # 不下单、不平仓
+    assert read_intent(tmp_path)["volume"] == pytest.approx(0.02)
+
+
+def test_t31_fixed_lots_config_change_does_not_resize(tmp_path):
+    """固定手数配置被人为改动（0.02 → 0.03）且同向持仓 → 仍保持净手数
+    （不调仓）；意图不被改写。"""
+    b = FakeBroker()
     ex = _mk_executor(b, tmp_path)
     d1 = mk_decision(signal=1, volume_lots=0.02,
                      decision_id="XAUUSD|M15|d1")
     assert ex.poll(d1, NOW).action == "open"
-    before = read_intent(tmp_path)
+    after_open = read_intent(tmp_path)
 
-    ex2 = _mk_executor(b, tmp_path, gate=_RejectGate())   # 新决策、闸门拒绝
     d2 = mk_decision(signal=1, volume_lots=0.03,
                      decision_id="XAUUSD|M15|d2")
-    rr = ex2.poll(d2, NOW.replace(minute=15))
-    assert rr.action == "risk_rejected"
-    assert read_intent(tmp_path) == before               # 原样：无 pending、无洗白
+    rr = ex.poll(d2, NOW.replace(minute=15))
+    assert rr.action == "hold"
+    assert b.market_orders and len(b.market_orders) == 1
+    assert b.close_calls == []
+    assert read_intent(tmp_path) == after_open
+
+
+def test_t31_reverse_resizes_fresh_lots(tmp_path):
+    """反手：开仓腿按当时决策重定手数（这里固定手数=0.03，非旧仓 0.02）。"""
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    d1 = mk_decision(signal=1, volume_lots=0.02,
+                     decision_id="XAUUSD|M15|d1")
+    assert ex.poll(d1, NOW).action == "open"
+    d2 = mk_decision(signal=-1, volume_lots=0.03, atr=2.0,
+                     decision_id="XAUUSD|M15|d2")
+    rr = ex.poll(d2, NOW.replace(minute=15))
+    assert rr.action == "reverse"
+    assert b.market_orders[-1]["volume"] == pytest.approx(0.03)
+    assert rr.net_after == pytest.approx(-0.03)
+
+
+# ---- T32（D21）：全平指令编号协议——执行器消费侧 ----
+
+def _write_flatten_cmd(live_dir: str, *, reason: str = "daily_loss_cap"):
+    from mt5live.commands import write_flatten
+
+    return write_flatten(live_dir, reason=reason, now=NOW)
+
+
+def test_flatten_round_writes_ack_referencing_command_id(tmp_path):
+    """全平：平掉本 magic 全部持仓，ack 引用指令编号；意图 cause 升级为
+    flatten:<id>（与 T30 的 Intent cause 衔接）。"""
+    b = FakeBroker()
+    b.seed_position(side="buy", volume=0.02, magic=MAGIC)
+    ex = _mk_executor(b, tmp_path)
+    cmd = _write_flatten_cmd(str(tmp_path))
+    rr = ex.poll(mk_decision(signal=1, volume_lots=0.02), NOW)
+    assert rr.action == "flatten"
+    assert b.positions() == []
+    ack = json.loads((tmp_path / "commands" / f"flatten.ack-{MAGIC}")
+                     .read_text(encoding="utf-8"))
+    assert ack["id"] == cmd.id
+    assert ack["magic"] == MAGIC and ack["closed"] == 1
+    it = read_intent(tmp_path)
+    assert it["volume"] == 0.0 and it["status"] == "confirmed"
+    assert it["cause"] == f"flatten:{cmd.id}"
+
+
+def test_flatten_acked_round_skips_reclosing(tmp_path):
+    """本 magic 的 ack 已对应当前指令编号 → 返回 flatten_acked，
+    不再重复平仓、不下新仓。"""
+    b = FakeBroker()
+    b.seed_position(side="buy", volume=0.02, magic=MAGIC)
+    ex = _mk_executor(b, tmp_path)
+    _write_flatten_cmd(str(tmp_path))
+    ex.poll(mk_decision(signal=1, volume_lots=0.02), NOW)
+    n_closes = len(b.close_calls)
+
+    rr = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                             decision_id="XAUUSD|M15|d2"),
+                 NOW.replace(minute=15))
+    assert rr.action == "flatten_acked"
+    assert len(b.close_calls) == n_closes
+    assert b.market_orders == []
+
+
+def test_flatten_new_command_id_re_closes_after_archive(tmp_path):
+    """旧指令归档、ack 清理后出现新编号指令 → 再次全平并 ack 新编号。"""
+    from mt5live.commands import archive_if_all_acked, write_flatten
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    write_flatten(str(tmp_path), reason="r1", now=NOW)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02), NOW).action == \
+        "flatten"
+    assert archive_if_all_acked(str(tmp_path), {MAGIC}, NOW) is True
+    assert not (tmp_path / "commands" / "flatten.json").exists()
+
+    b.seed_position(side="sell", volume=0.03, magic=MAGIC)
+    cmd2 = write_flatten(str(tmp_path), reason="r2", now=NOW.replace(minute=30))
+    rr = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                             decision_id="XAUUSD|M15|d3"),
+                 NOW.replace(minute=30))
+    assert rr.action == "flatten"
+    assert b.positions() == []
+    ack2 = json.loads((tmp_path / "commands" / f"flatten.ack-{MAGIC}")
+                      .read_text(encoding="utf-8"))
+    assert ack2["id"] == cmd2.id

@@ -11,10 +11,14 @@
   人工决定）；恢复 = 删除该文件与 halt.json。
 - ``data/live/halt.json``——``{"reason": str, "ts": iso}``，存在即停机；
   首次原因优先（已存在不覆盖），恢复须人工删除。
-- ``data/live/commands/flatten.json``——``{"command": "flatten_all",
-  "reason": str, "ts": iso}``；执行器消费后写 ``commands/flatten.ack-<magic>``
-  确认（T24）；风控进程在**所有登记 magic**（心跳/expected 文件名）都确认后
-  把指令文件归档到 ``commands/archive/``（存在期间不重写）。
+- ``data/live/commands/flatten.json``（T32/D21 编号协议，读写一律经
+  ``mt5live.commands``）——``{"command": "flatten_all", "id": <uuid4>.hex,
+  "reason": str, "ts": iso}``；执行器消费后写引用编号的
+  ``commands/flatten.ack-<magic>``；风控进程在**所有登记 magic**（心跳/
+  expected 文件名）的 ack 编号都对应当前指令后，把指令归档到
+  ``commands/archive/`` 并删除这些 ack（旧编号的 ack 不算数——C3 的根因；
+  指令读不出 → 不归档并告警）。策略退役用 ``scripts/live_retire.py``
+  移走登记文件，使其不再计入仲裁。
 
 规则（check，按序裁决，第一条违规即返回）：
 1. 日亏损上限：当日已实现 + 浮动 ≤ -daily_loss_cap_usd → 拒单且
@@ -45,6 +49,14 @@ from typing import Mapping
 
 from mt5data.sessions import DEFAULT_SESSIONS_PATH, SessionPolicy, load_session_policy
 from mt5gw.snapshot import write_json_atomic
+from mt5live.commands import (
+    ALERT_COMMAND_UNREADABLE,
+    COMMANDS_SUBDIR,
+    CommandUnreadableError,
+    FLATTEN_FILE,
+    archive_if_all_acked,
+    write_flatten,
+)
 from mt5live.monitor import (
     ALERT_HEARTBEAT_TIMEOUT,
     ALERT_RISK_FLATTEN,
@@ -63,10 +75,8 @@ FREQUENCY_WINDOW_S = 60.0        # 下单频率滑窗宽度
 
 HALT_FILE = "halt.json"
 KILL_SWITCH_FILE = "killSwitch"
-COMMANDS_SUBDIR = "commands"
-FLATTEN_FILE = "flatten.json"
-FLATTEN_ACK_FMT = "flatten.ack-{magic}"     # 执行器确认文件（T24）
-FLATTEN_ARCHIVE_SUBDIR = "archive"          # 全员确认后指令归档处（T24）
+# 全平指令/确认文件的编号协议与归档实现见 mt5live.commands（T32/D21）；
+# COMMANDS_SUBDIR / FLATTEN_FILE 自那里导入（拼路径用）。
 
 DEFAULT_HEARTBEAT_TIMEOUT_S = 120.0
 
@@ -496,8 +506,9 @@ class RiskProcess:
                 flatten_written |= self._write_flatten("daily_loss_cap", n)
                 halt_written |= self._write_halt("daily_loss_cap", n)
 
-        # 4) flatten 指令归档（T24）：所有登记 magic 都写 flatten.ack-<magic>
-        #    后才归档（移入 commands/archive/），防执行器漏消费。
+        # 4) flatten 指令归档（T32/D21 编号协议）：所有登记 magic 的
+        #    ack.id == 当前指令 id 才归档并删除 ack（旧编号不算数——C3），
+        #    防执行器漏消费、也防旧 ack 吞掉新指令。
         flatten_archived = False
         if os.path.exists(self.flatten_path):
             flatten_archived = self._archive_flatten_if_acked(n)
@@ -509,19 +520,18 @@ class RiskProcess:
             flatten_archived=flatten_archived)
 
     def _archive_flatten_if_acked(self, now: datetime) -> bool:
+        """T32/D21：所有登记 magic 的 ack 编号对应当前指令 → 归档并删 ack
+        （mt5live.commands.archive_if_all_acked）；指令读不出 → 告警、
+        不归档（执行器按有指令处理，等人工清理）。"""
         magics = registered_magics(self.live_dir)
-        if not magics:
-            return False                     # 没有登记策略：无从确认，不归档
-        for magic in magics:
-            if not os.path.exists(os.path.join(
-                    self.commands_dir, FLATTEN_ACK_FMT.format(magic=magic))):
-                return False
-        archive_dir = os.path.join(self.commands_dir, FLATTEN_ARCHIVE_SUBDIR)
-        os.makedirs(archive_dir, exist_ok=True)
-        stamp = iso_utc(now).replace(":", "").replace("+", "_")
-        os.replace(self.flatten_path,
-                   os.path.join(archive_dir, f"flatten-{stamp}.json"))
-        return True
+        try:
+            return archive_if_all_acked(self.live_dir, magics, now)
+        except CommandUnreadableError as e:
+            append_alert(
+                self.live_dir, ALERT_COMMAND_UNREADABLE,
+                f"全平指令读不出，暂不归档（{e}）——执行器按有指令处理；"
+                "人工核对 commands/flatten.json", now)
+            return False
 
     # -- 指令文件 --
 
@@ -535,12 +545,22 @@ class RiskProcess:
         return True
 
     def _write_flatten(self, reason: str, now: datetime) -> bool:
-        """写全平指令；已存在（执行器未消费）不重写。返回是否本次写入。"""
-        if os.path.exists(self.flatten_path):
+        """写全平指令（T32/D21 编号协议，mt5live.commands.write_flatten）；
+        已存在（执行器未消费）→ 不重写（首次原因优先）。返回是否本次写入。
+
+        已有指令读不出 → 不覆盖、写告警（执行器仍会按"有指令"处理）。
+        """
+        existed = os.path.exists(self.flatten_path)
+        try:
+            write_flatten(self.live_dir, reason=reason, now=now)
+        except CommandUnreadableError as e:
+            append_alert(
+                self.live_dir, ALERT_COMMAND_UNREADABLE,
+                f"全平指令读不出，保留原文件不重写（{e}）——人工核对 "
+                "commands/flatten.json", now)
             return False
-        os.makedirs(self.commands_dir, exist_ok=True)
-        write_json_atomic(self.flatten_path, {
-            "command": "flatten_all", "reason": reason, "ts": iso_utc(now)})
+        if existed:
+            return False
         append_alert(self.live_dir, ALERT_RISK_FLATTEN,
                      f"全平指令：{reason}", now)
         return True

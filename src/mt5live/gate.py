@@ -261,8 +261,11 @@ class RiskGate:
             state, n)
         if decision.flatten_all:
             # 日亏在开仓检查时被发现：立即落实全平+停机文件（不等风控主循环
-            # 下一轮），执行器下一轮消费 flatten。killSwitch/halt 只有停机
-            # 语义（killSwitch 不自动平仓，平仓由人工决定），不写 flatten。
+            # 下一轮），执行器下一轮消费 flatten。全平指令走与风控主循环
+            # **同一编号协议**（T32/D21，mt5live.commands：带 uuid 编号、
+            # ack 引用编号、归档核对编号——闸门只写指令，不代执行器 ack）。
+            # killSwitch/halt 只有停机语义（killSwitch 不自动平仓，平仓由
+            # 人工决定），不写 flatten。
             self._process.trigger_flatten_and_halt("daily_loss_cap", n)
         if not decision.allowed:
             return decision

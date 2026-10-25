@@ -27,6 +27,13 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 from mt5gw.models import DEAL_REASON_SL, DEAL_REASON_SO, DEAL_REASON_TP
+from mt5live.commands import (
+    ALERT_COMMAND_UNREADABLE,
+    CommandUnreadableError,
+    read_ack,
+    read_flatten,
+    write_ack,
+)
 from mt5live.gate import ORDER_LOG_FILE, LiveSizer, RiskGate, alert_reject
 from mt5live.monitor import append_alert, iso_utc, naive_utc
 from mt5live.reconcile import (
@@ -289,42 +296,53 @@ class ExecutionAdapter:
 
 # ================================================================ T24 实盘接线
 #
-# LiveExecutor：执行器一侧的全部文件契约与风控接线（计划 T24 逐条，T30 改
-# expected 为"意图"语义，见下）：
-# - 每轮先查 data/live/commands/flatten.json：存在 → 平掉本 magic 全部持仓、
-#   写 commands/flatten.ack-<magic>（风控进程在所有登记 magic 确认后归档）；
+# LiveExecutor：执行器一侧的全部文件契约与风控接线（计划 T24 逐条；T30 改
+# expected 为"意图"语义；T31 定手数；T32 全平指令编号协议）：
+# - 每轮先查 data/live/commands/flatten.json（mt5live.commands 编号协议，
+#   T32/D21）：本 magic 的 ack 已对应当前指令编号 → 返回 flatten_acked，
+#   不再重复平仓、不下新仓；否则平掉本 magic 全部持仓、写引用编号的
+#   flatten.ack-<magic>（风控进程核对编号后归档并清理 ack）。指令文件
+#   读不出 → 按"有指令"处理（照样全平）并写告警（COMMAND_UNREADABLE）；
 # - 每轮开头识别外部出场（T30/C1）：上一轮已知持仓本轮消失且非执行器平仓
 #   → 按 position_id 查成交，reason ∈ {SL,TP,SO} → 已解释，意图改为实际
 #   净持仓（cause=external_exit:<deal>）；其他原因（人工/未知）→ 不改意图、
 #   写告警，交给对账进程；
-# - 开仓/加仓/反手的开仓腿先过 RiskGate.check_open（C1）；拒绝 → 不下单，
+# - 开仓/反手的开仓腿先过 RiskGate.check_open（C1）；拒绝 → 不下单，
 #   原因写心跳 last_error（调用方）与 alerts.log（ALERT_RISK_REJECT）；
 #   平仓不受限；
 # - 意图（T30/D19，data/live/expected-<magic>.json）：
 #   1) 下单前写 Intent(目标, "pending", cause=decision_id)——对账进程给
 #      60 秒宽限（"已决定、订单未回"的空档不误报）；
 #   2) 订单返回后写 Intent(实际净持仓, "confirmed")；部分成交如实记成交量
-#      并写告警（ALERT_PARTIAL_FILL）；
+#      并写告警（ALERT_PARTIAL_FILL），差额不再自动补足（D22 持仓期间
+#      不调仓——反手/全平时了结，或人工处置）；
 #   3) 被拒/跳过/无动作的轮次**绝不改写意图**——否则会把外部擅动的仓位漂移
 #      悄悄"洗白"成目标状态，对账就失去意义了；
 # - reentry="after_signal_change"（T25 同语义）：保护性出场后记 blocked_dir，
 #   持久化 state-<magic>.json，重启恢复；信号离开该方向（0 或反向）解禁；
 #   immediate 模式不设禁入；
-# - 手数：decision.volume_lots 为 None 时 LiveSizer 按风险定手数（T23 同一
-#   函数），0 手跳过并记录；
+# - 手数（T31/C2/D22）：**只在开仓时定手数，持仓期间不调仓**（与引擎
+#   A/B 一致——_open 只在信号改变持仓方向时调用）。同向持仓保持净手数
+#   （入场时的手数），不逐 bar 重算；反手、止损/止盈出场后再入场按**当时**
+#   的 ATR 与权益重新定手数；固定 volume_lots 同样只在净仓为 0/反向时
+#   生效（开仓腿手数=配置值）。加仓/减仓腿在正常轮次不会出现（目标恒为
+#   净持仓）——一旦出现（如固定手数配置被人为改动后叠加外部仓位变动）
+#   写告警（ALERT_UNEXPECTED_RESIZE），须人工核对；
 # - 启动校验（M1）：time_stop_bars / week_close_exit 未实现，策略用到即
 #   拒绝启动（validate_live_strategy，dry-run 同样校验）。
 # - 本地下单日志 data/live/orders.jsonl（每笔市价单一行，RiskGate 的频率
 #   滑窗数据源）。
 
 STATE_FILE_FMT = "state-{magic}.json"
-FLATTEN_ACK_FMT = "flatten.ack-{magic}"
-FLATTEN_FILE = "flatten.json"
-COMMANDS_SUBDIR = "commands"
+# 全平指令/确认文件（flatten.json、flatten.ack-<magic>）的读写一律经
+# mt5live.commands（T32/D21 编号协议），本层不再自带路径拼装。
 
-# 告警类别（T30；monitor 未定义的新类别，常量放本层）
-ALERT_PARTIAL_FILL = "PARTIAL_FILL"        # 部分成交：意图=成交量，差额留给下轮
+# 告警类别（T30/T31/T32；monitor 未定义的新类别，常量放本层）
+ALERT_PARTIAL_FILL = "PARTIAL_FILL"        # 部分成交：意图=成交量，如实记录
 ALERT_EXTERNAL_EXIT = "EXTERNAL_EXIT"      # 外部出场无法解释：不改意图，交给对账
+ALERT_UNEXPECTED_RESIZE = "UNEXPECTED_RESIZE"   # 持仓期间出现加/减仓腿（T31/D22：
+#   正常轮次不会出现——固定手数配置被人为改动、或仓位被外部改动后差分出
+#   加/减腿时兜底告警，须人工核对）
 
 # 已解释的外部出场（服务器端保护性出场/强平）：意图可改为实际净持仓
 _EXPLAINED_REASONS = frozenset({DEAL_REASON_SL, DEAL_REASON_TP, DEAL_REASON_SO})
@@ -354,9 +372,10 @@ def validate_live_strategy(strategy) -> ExitRules:
 class RoundReport:
     """LiveExecutor.poll 一轮的结果（action 语义见 LiveExecutor.poll）。"""
 
-    action: str                     # none/flatten/hold/duplicate/open/add/
-                                    # reduce/reverse/close/blocked_reentry/
-                                    # skipped_zero_lots/risk_rejected
+    action: str                     # none/flatten/flatten_acked/hold/duplicate/
+                                    # open/add/reduce/reverse/close/
+                                    # blocked_reentry/skipped_zero_lots/
+                                    # risk_rejected
     decision_id: str | None
     net_before: float
     net_after: float
@@ -382,7 +401,6 @@ class LiveExecutor:
         self._rules = rules
         self._gate = gate
         self._sizer = sizer
-        self._commands_dir = os.path.join(live_dir, COMMANDS_SUBDIR)
         self._state_path = os.path.join(
             live_dir, STATE_FILE_FMT.format(magic=magic))
         self._intent_path = os.path.join(
@@ -397,9 +415,19 @@ class LiveExecutor:
         n = naive_utc(now if now is not None
                       else datetime.now(timezone.utc).replace(tzinfo=None))
 
-        # 1) flatten 指令：平掉本 magic 全部持仓并确认（不下新仓）
-        if os.path.exists(os.path.join(self._commands_dir, FLATTEN_FILE)):
-            return self._consume_flatten(n)
+        # 1) flatten 指令（T32/D21 编号协议）：读不出 → 按"有指令"处理并告警
+        try:
+            cmd = read_flatten(self._live_dir)
+            unreadable = False
+        except CommandUnreadableError as e:
+            append_alert(
+                self._live_dir, ALERT_COMMAND_UNREADABLE,
+                f"magic {self._magic} 全平指令读不出（{e}）——按有指令处理"
+                "（全平）；修复或人工清理 commands/flatten.json", n)
+            cmd = None
+            unreadable = True
+        if cmd is not None or unreadable:
+            return self._consume_flatten(cmd, unreadable=unreadable, n=n)
 
         # 2) 外部出场检测（T30：SL/TP/SO 已解释 → 意图=实际净持仓；
         #    人工/未知 → 不改意图，交给对账进程）
@@ -432,8 +460,10 @@ class LiveExecutor:
                 net_after=self._adapter.net_volume(),
                 error=None)
 
-        # 5) 手数：配置钉死或按风险定（0 手 → 跳过并记录）
-        target = self._target_volume(decision)
+        # 5) 手数（T31/C2/D22：只在开仓时定，同向持仓保持净手数不调仓；
+        #    0 手 → 跳过并记录）
+        net = self._adapter.net_volume()
+        target = self._target_volume(decision, net)
         if decision.signal != 0 and target == 0.0:
             self._finish(n, decision.decision_id, ())
             reason = ("skipped_zero_lots: 按风险定手数为 0（ATR 缺失或风险额"
@@ -442,12 +472,13 @@ class LiveExecutor:
                 action="skipped_zero_lots", decision_id=decision.decision_id,
                 net_before=self._adapter.net_volume(),
                 net_after=self._adapter.net_volume(), error=reason)
-        if decision.signal != 0 and decision.volume_lots is None:
-            # 定手数结果回填决策（ExecutionAdapter 按 volume_lots 差分下单）
+        if decision.signal != 0:
+            # 目标手数回填决策：ExecutionAdapter 按 volume_lots 差分下单，
+            # 必须与本层算出的目标（同向=净手数）一致，否则 adapter 会按
+            # 配置手数自行差分出加/减仓腿（T31）
             decision = replace(decision, volume_lots=round(abs(target), 8))
 
         # 6) 差分计划 + 开仓腿过闸门（平仓腿不受限）+ 意图（pending→confirmed）
-        net = self._adapter.net_volume()
         report = self._plan_and_execute(decision, target, net, n)
         self._after_orders(decision, report, n)
         self._finish(n, decision.decision_id, report.orders)
@@ -455,17 +486,30 @@ class LiveExecutor:
 
     # ---- 各环节 ----
 
-    def _target_volume(self, decision) -> float:
+    def _target_volume(self, decision, net: float) -> float:
+        """目标净手数（有符号；T31/C2/D22——计划伪码逐字）。
+
+        **只在开仓时定手数，持仓期间不调仓**（与引擎 A/B 的 _open 时机
+        一致，铁律第 5 条）：
+        - 同向持仓 → 保持净手数（= 入场时的手数），不逐 bar 重算，也不查
+          定手数器（ATR/权益变化不再触发加减仓）；
+        - 净仓为 0（含止损/止盈出场后再入场）或反向 → 按当时的配置手数或
+          LiveSizer（当时 ATR 与权益）重新定手数；
+        - 固定 volume_lots 只在开仓腿生效（配置行为不变：开仓=配置值）。
+        """
         if decision.signal == 0:
             return 0.0
+        if net != 0 and (net > 0) == (decision.signal > 0):
+            return net                        # 同向持仓：保持入场时的手数，不调仓
         if decision.volume_lots is not None:
-            return float(decision.signal * decision.volume_lots)
-        if self._sizer is None:
+            lots = float(decision.volume_lots)
+        elif self._sizer is not None:
+            lots = self._sizer.lots_for(decision)
+        else:
             raise ValueError(
                 f"决策 {decision.decision_id} 无手数且未配置定手数器"
                 "（LiveSizer）——拒绝开仓")
-        lots = self._sizer.lots_for(decision)
-        return float(decision.signal * lots) if lots > 0 else 0.0
+        return decision.signal * lots if lots > 0 else 0.0
 
     def _plan_and_execute(self, decision, target: float, net: float,
                           n: datetime) -> RoundReport:
@@ -528,7 +572,8 @@ class LiveExecutor:
     def _after_orders(self, decision, report: RoundReport,
                       n: datetime) -> None:
         """订单返回后（本轮真下了单）：意图 = 实际净持仓（confirmed）；
-        部分成交如实记录（意图=成交量）并写告警。
+        部分成交如实记录（意图=成交量）并写告警；出现加/减仓腿（T31 后
+        正常轮次不该有）写告警。
 
         依据 orders 里有无开/平腿判定，而不是 action——反向被拒轮也会
         执行平仓腿（risk_rejected + close orders），意图同样要如实确认。
@@ -537,13 +582,21 @@ class LiveExecutor:
         if not any(o.kind in ("open", "close") for o in report.orders):
             return
         self._write_confirmed(decision.decision_id, n)
+        if report.action in ("add", "reduce"):
+            append_alert(
+                self._live_dir, ALERT_UNEXPECTED_RESIZE,
+                f"magic {self._magic} {decision.decision_id} 出现 {report.action}"
+                f" 腿（净 {report.net_before:+.2f} → 目标差异）——D22 持仓期间"
+                "不调仓，正常轮次不应加减仓（固定手数配置被人为改动？仓位被"
+                "外部改动？），须人工核对", n)
         for o in report.orders:
             if o.kind in ("open", "close") and o.partial:
                 append_alert(
                     self._live_dir, ALERT_PARTIAL_FILL,
                     f"magic {self._magic} {decision.decision_id} {o.kind} "
                     f"部分成交：请求 {o.requested_volume} 手只成 "
-                    f"{o.filled_volume} 手——意图按成交量登记，差额留给下轮",
+                    f"{o.filled_volume} 手——意图按成交量登记；差额不再自动"
+                    "补足（D22 持仓期间不调仓），反手/全平时了结或人工处置",
                     n)
 
     def _from_execution(self, report) -> RoundReport:
@@ -552,21 +605,32 @@ class LiveExecutor:
             net_before=report.net_before, net_after=report.net_after,
             orders=report.orders, error=None)
 
-    def _consume_flatten(self, n: datetime) -> RoundReport:
+    def _consume_flatten(self, cmd, *, unreadable: bool,
+                         n: datetime) -> RoundReport:
+        """全平指令的执行腿（T32/D21 编号协议）。
+
+        本 magic 的 ack 已对应当前指令编号 → **不再重复平仓**（返回
+        flatten_acked，不下新仓——指令归档由风控进程核对编号后完成）；
+        否则市价平掉本 magic 全部持仓并写引用编号的 ack。指令读不出
+        （unreadable=True，告警已在上层写）→ 按"有指令"处理：照常全平，
+        ack 的 id 记空串（无法引用；该文件修复/清理前每轮重复全平告警）。
+        """
         positions = self._adapter.positions()
         net_before = self._adapter.net_volume()
-        # 意图：全平在途（T32 会把 cause 升级为 flatten:<指令编号>）
-        self._write_pending(0.0, "flatten", n)
+        cmd_id = cmd.id if cmd is not None else ""
+        if not unreadable:
+            ack = read_ack(self._live_dir, self._magic)
+            if ack is not None and ack.id == cmd_id:
+                return RoundReport(
+                    action="flatten_acked", decision_id=None,
+                    net_before=net_before, net_after=net_before)
+        cause = f"flatten:{cmd_id}" if cmd_id else "flatten"
+        self._write_pending(0.0, cause, n)    # 意图：全平在途（T30 cause 衔接）
         outcomes = self._adapter.close_all()
-        ack_path = os.path.join(
-            self._commands_dir, FLATTEN_ACK_FMT.format(magic=self._magic))
-        os.makedirs(self._commands_dir, exist_ok=True)
-        with open(ack_path + ".tmp", "w", encoding="utf-8") as f:
-            json.dump({"magic": self._magic, "closed": len(positions),
-                        "ts": iso_utc(n)}, f, ensure_ascii=False)
-        os.replace(ack_path + ".tmp", ack_path)
+        write_ack(self._live_dir, self._magic, cmd_id,
+                  closed=len(positions), now=n)
         self._state["blocked_dir"] = 0      # 全平后禁入状态清零（无持仓可禁）
-        self._write_confirmed("flatten", n)
+        self._write_confirmed(cause, n)
         self._finish(n, decision_id=None, orders=outcomes)
         return RoundReport(
             action="flatten", decision_id=None, net_before=net_before,

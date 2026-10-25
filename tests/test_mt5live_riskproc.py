@@ -582,6 +582,94 @@ def test_run_cycle_requires_usd_account(tmp_path):
         rp.run_cycle(snapshot(currency="EUR"), NOW)
 
 
+# ---- T32（D21）：全平指令编号协议（mt5live.commands）----
+
+from mt5live.commands import (  # noqa: E402
+    CommandUnreadableError,
+    archive_if_all_acked,
+    read_flatten,
+    write_ack,
+    write_flatten,
+)
+
+M2 = 20261102  # 第二个 magic（ack 仲裁用）
+
+
+def test_write_flatten_numbered_and_idempotent(tmp_path):
+    """写指令带 uuid4 编号；已有未归档指令 → 返回它（首因优先，不覆盖）。"""
+    live = tmp_path / "live"
+    live.mkdir()
+    c1 = write_flatten(str(live), reason="daily_loss_cap", now=NOW)
+    assert c1.id and c1.reason == "daily_loss_cap" and c1.ts == NOW
+    data = read_json(live / "commands" / "flatten.json")
+    assert data["command"] == "flatten_all"
+    assert data["id"] == c1.id and data["reason"] == "daily_loss_cap"
+    # 再次写（原因不同）→ 返回既有指令，文件不动
+    c2 = write_flatten(str(live), reason="another", now=NOW)
+    assert c2 == c1
+    assert read_json(live / "commands" / "flatten.json")["reason"] == \
+        "daily_loss_cap"
+
+
+def test_read_flatten_missing_none_unreadable_raises(tmp_path):
+    """无文件 → None；文件损坏/缺字段（含旧格式无 id）→ CommandUnreadableError。"""
+    live = tmp_path / "live"
+    live.mkdir()
+    assert read_flatten(str(live)) is None
+    cmds = live / "commands"
+    cmds.mkdir()
+    (cmds / "flatten.json").write_text("{broken", encoding="utf-8")
+    with pytest.raises(CommandUnreadableError):
+        read_flatten(str(live))
+    # 旧格式（T24：无 id）按读不出处理——调用方按"有指令"处理
+    (cmds / "flatten.json").write_text(json.dumps(
+        {"command": "flatten_all", "reason": "x", "ts": NOW.isoformat()}),
+        encoding="utf-8")
+    with pytest.raises(CommandUnreadableError):
+        read_flatten(str(live))
+
+
+def test_archive_requires_all_acks_to_match_current_id(tmp_path):
+    """归档条件：所有登记 magic 的 ack.id == 当前指令 id（旧 id 不算数）；
+    归档后删除这些 ack。"""
+    live = tmp_path / "live"
+    live.mkdir()
+    cmd = write_flatten(str(live), reason="r", now=NOW)
+    # 空 magics → 无从确认，不归档
+    assert archive_if_all_acked(str(live), set(), NOW) is False
+    # 旧 id 的 ack 不触发归档
+    write_ack(str(live), M1, "stale-id", closed=0, now=NOW)
+    assert archive_if_all_acked(str(live), {M1, M2}, NOW) is False
+    assert (live / "commands" / "flatten.json").exists()
+    # M1 换成当前 id，M2 未 ack → 仍不归档
+    write_ack(str(live), M1, cmd.id, closed=0, now=NOW)
+    assert archive_if_all_acked(str(live), {M1, M2}, NOW) is False
+    assert (live / "commands" / "flatten.json").exists()
+    # 全部 ack 当前 id → 归档并删除 ack
+    write_ack(str(live), M2, cmd.id, closed=1, now=NOW)
+    assert archive_if_all_acked(str(live), {M1, M2}, NOW) is True
+    assert not (live / "commands" / "flatten.json").exists()
+    assert not (live / "commands" / f"flatten.ack-{M1}").exists()
+    assert not (live / "commands" / f"flatten.ack-{M2}").exists()
+    archived = list((live / "commands" / "archive").glob("flatten-*.json"))
+    assert archived and cmd.id[:8] in archived[0].name
+
+
+def test_riskproc_unreadable_flatten_not_archived_with_alert(tmp_path):
+    """指令读不出 → 风控进程不归档（fail-closed）并写告警。"""
+    rp = make_process(tmp_path)
+    live = tmp_path / "live"
+    cmds = live / "commands"
+    cmds.mkdir(parents=True)
+    (cmds / "flatten.json").write_text("oops", encoding="utf-8")
+    write_heartbeat_file(live, True, NOW - timedelta(seconds=10))
+    res = rp.run_cycle(None, NOW)
+    assert not res.flatten_archived
+    assert (cmds / "flatten.json").exists()
+    assert "COMMAND_UNREADABLE" in (live / "alerts.log").read_text(
+        encoding="utf-8")
+
+
 # ---- scripts/risk_process.py CLI（fake 网关，不连 MT5） ----
 
 AccRow = namedtuple(
