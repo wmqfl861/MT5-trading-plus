@@ -114,7 +114,7 @@ def slippage(self, symbol: str, hour_utc: int, *, price: float | None = None) ->
 - [x] 失败测试先行：价格翻倍 → 相对模型点差翻倍；absolute 模式行为与旧版逐位一致；
       引擎把 price 传给成本模型（用记录调用参数的假成本断言）；`contract_size=100` 的手算交易；
       cost_audit 比率在整体价格 ×2 时不变。测试里所有假成本类加 `price=None` 参数。
-- [ ] 实现；`run_backtest.py --costs auto` 默认 relative，`cost_model_version` 写明 `rel`。
+- [x] 实现；`run_backtest.py --costs auto` 默认 relative，`cost_model_version` 写明 `rel`。（T29 复核补勾——证据：提交 f87eba8 "feat(T3)"，test_costs_spread.py 相对口径 7 条 + test_run_backtest_script.py spread-mode 用例）
 
 ### T4：tick 按月分区 R3（1.5 天）
 
@@ -244,7 +244,8 @@ def run_backtest_ticks(strategy, bars, ticks_loader, costs, *, symbol, params, c
       （入场/出场时间、价格、净利），汇总每笔净利差的分布。
 - [x] 两个参考 EA：信号逻辑与 Python 版逐行对应（BuyHold；收盘价 SMA 快慢线交叉，参数写死），
       `OnTester` 把成交写成 CSV（`MQL5\Files`）。
-- [x] 在 MT5 策略测试器用"基于真实 tick"模式跑同一时段，`reconcile_mt5_tester.py` 与 B 层逐笔比对。
+- [ ] 在 MT5 策略测试器用"基于真实 tick"模式跑同一时段，`reconcile_mt5_tester.py` 与 B 层逐笔比对。
+      **（T29 复核：取消勾选——需 GUI 人工执行，从未运行，无证据；U0 待用户操作，EA 与解析脚本已就绪）**
 - [x] 把实测差异与约定容差写进报告和本计划（例如：信号类交易的时间必须完全一致；
       每笔净利差 ≤ 1 个点差）。容差确定后写进 `tests/` 的回归用例。
 
