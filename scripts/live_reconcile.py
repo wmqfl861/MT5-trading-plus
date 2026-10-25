@@ -1,12 +1,14 @@
-"""对账 CLI（T14/P7）：data/live/expected.json vs 账户实际持仓（按 magic 过滤）。
+"""对账 CLI（T14/P7 + T30/D19/D20）：意图 vs 账户实际持仓（按 magic 过滤）。
 
 - 启动即全量对账一次；--loop 时每 --interval 秒轮询；
-- 不一致：逐条打印差分，写 data/live/pause.json（paused=true）+
-  alerts.log 告警（loop 模式只在"一致 → 不一致"跳变时告警，不刷屏），
-  exit 1；
-- 一致：pause.json 写回 paused=false，exit 0；
-- expected.json 缺失/不合法、持仓查询失败：exit 2（--loop 模式等待重试，
-  运行器启动写出 expected.json 后自愈）。
+- 不一致：逐条打印差分，**只给有差分的 magic** 写 ``pause-<magic>.json``
+  （paused=true）+ alerts.log 告警（loop 模式只在跳变时告警，不刷屏），
+  exit 1；一致策略的 pause 文件写回 paused=false（自动解除）；
+  全局 ``pause.json`` 只留给人工，本进程**绝不写**；
+- pending 意图在 --grace-s（默认 60 秒）宽限内的 magic 本轮不判（下单
+  在途不误报）；
+- 意图文件缺失/不合法、持仓查询失败：exit 2（--loop 模式等待重试，
+  运行器启动写出 expected-<magic>.json 后自愈）。
 
 用法：
     .venv/Scripts/python.exe scripts/live_reconcile.py --data-dir data --once
@@ -25,12 +27,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mt5gw import GatewayConfig, MT5Gateway  # noqa: E402
 from mt5gw.errors import DataUnavailableError  # noqa: E402
-from mt5live.monitor import ALERT_RECONCILE_MISMATCH, append_alert  # noqa: E402
+from mt5live.monitor import (  # noqa: E402
+    ALERT_RECONCILE_MISMATCH,
+    append_alert,
+    naive_utc,
+)
 from mt5live.reconcile import (  # noqa: E402
+    DEFAULT_GRACE_S,
     ExpectedStateError,
     ReconcileResult,
     diff_positions,
-    load_expected_dir,
+    load_intents,
     write_pause,
 )
 
@@ -46,15 +53,19 @@ def _open_gateway(gw_config_path: str) -> MT5Gateway:
 
 
 def run_once(live_dir: str, gw: MT5Gateway, *,
-             volume_tolerance: float, alert: bool = True
+             volume_tolerance: float, alert: bool = True,
+             now: datetime | None = None,
+             grace_s: float = DEFAULT_GRACE_S,
              ) -> tuple[int, ReconcileResult | None]:
-    """单轮对账；返回 (exit_code, 对账结果|None)。
+    """单轮对账（T30：意图语义 + 按策略暂停）；返回 (exit_code, 结果|None)。
 
-    不一致即写暂停指令（pause.json paused=true）；一致写回 paused=false。
+    有差分的 magic 写 pause-<magic>.json（paused=true），其余登记 magic
+    写回 paused=false；全局 pause.json 只留给人工，本函数不写。
     """
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    n = naive_utc(now if now is not None
+                  else datetime.now(timezone.utc).replace(tzinfo=None))
     try:
-        exp = load_expected_dir(live_dir)   # T24：读全部 expected-<magic>.json
+        intents = load_intents(live_dir)   # T30：读全部 expected-<magic>.json
     except ExpectedStateError as e:
         print(f"× {e}")
         return 2, None
@@ -64,25 +75,33 @@ def run_once(live_dir: str, gw: MT5Gateway, *,
         print(f"× 持仓查询失败：{e}")
         return 2, None
 
-    res = diff_positions(exp.positions, actual,
+    res = diff_positions(intents, actual, now=n, grace_s=grace_s,
                          volume_tolerance=volume_tolerance)
+    paused_magics = sorted({d.magic for d in res.diffs})
+    for magic in sorted({i.magic for i in intents}):
+        if magic in paused_magics:
+            write_pause(live_dir, magic, paused=True,
+                        reason="reconcile_mismatch",
+                        diffs=[d for d in res.diffs if d.magic == magic],
+                        now=n)
+        else:
+            write_pause(live_dir, magic, paused=False, reason=None, now=n)
+
     if res.ok:
-        write_pause(live_dir, paused=False, reason=None, now=now)
-        print(f"· {now:%Y-%m-%d %H:%M:%S} UTC 对账一致（{len(actual)} 个持仓）")
+        print(f"· {n:%Y-%m-%d %H:%M:%S} UTC 对账一致（{len(actual)} 个持仓）")
         return 0, res
     for d in res.diffs:
         print(f"× {d.detail}")
-    write_pause(live_dir, paused=True, reason="reconcile_mismatch",
-                diffs=res.diffs, now=now)
     if alert:
         append_alert(live_dir, ALERT_RECONCILE_MISMATCH,
-                     f"{len(res.diffs)} 处持仓不一致，策略已暂停（详见 pause.json）",
-                     now)
+                     f"{len(res.diffs)} 处持仓不一致，已暂停 magic "
+                     f"{paused_magics}（详见 pause-<magic>.json）", n)
     return 1, res
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="持仓对账（expected vs actual）")
+    ap = argparse.ArgumentParser(
+        description="持仓对账（意图 vs actual，按 magic 过滤、按策略暂停）")
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--gw-config", default="config.json", help="网关配置 JSON")
     ap.add_argument("--once", action="store_true", help="单轮后退出（默认行为）")
@@ -90,6 +109,8 @@ def main(argv=None) -> int:
     ap.add_argument("--interval", type=float, default=30.0, help="轮询间隔（秒）")
     ap.add_argument("--volume-tolerance", type=float, default=1e-6,
                     help="净手数比较容差（手）")
+    ap.add_argument("--grace-s", type=float, default=DEFAULT_GRACE_S,
+                    help="pending 意图的宽限秒数（下单在途不判）")
     args = ap.parse_args(argv)
 
     live_dir = os.path.join(args.data_dir, "live")
@@ -105,11 +126,13 @@ def main(argv=None) -> int:
             while True:
                 _, res = run_once(live_dir, gw,
                                   volume_tolerance=args.volume_tolerance,
+                                  grace_s=args.grace_s,
                                   alert=was_ok is not False)
                 if res is not None:
                     was_ok = res.ok
                 time.sleep(args.interval)
-        rc, _ = run_once(live_dir, gw, volume_tolerance=args.volume_tolerance)
+        rc, _ = run_once(live_dir, gw, volume_tolerance=args.volume_tolerance,
+                         grace_s=args.grace_s)
         return rc
     except KeyboardInterrupt:
         print("· 手动停止")

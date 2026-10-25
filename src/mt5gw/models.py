@@ -142,6 +142,23 @@ class PendingOrder:
     expiration: datetime | None  # 0（无到期）如实为 None
 
 
+# MT5 deal.reason 常量（T30/C1）：成交原因，外部出场识别（SL/TP/SO=已解释）
+# 依据。取值以本机 MetaTrader5 包（5.0.6231）只读打印核对（2026-10-24，
+# 仅 dir()/getattr，绝不 initialize），与包内 DEAL_REASON_* 逐字一致：
+# 0=CLIENT（人工/终端）1=MOBILE 2=WEB 3=EXPERT（EA，即本执行器）
+# 4=SL（止损）5=TP（止盈）6=SO（强平/保证金）7=ROLLOVER 8=VMARGIN 9=SPLIT
+DEAL_REASON_CLIENT = 0
+DEAL_REASON_MOBILE = 1
+DEAL_REASON_WEB = 2
+DEAL_REASON_EXPERT = 3
+DEAL_REASON_SL = 4
+DEAL_REASON_TP = 5
+DEAL_REASON_SO = 6
+DEAL_REASON_ROLLOVER = 7
+DEAL_REASON_VMARGIN = 8
+DEAL_REASON_SPLIT = 9
+
+
 @dataclass(frozen=True)
 class Deal:
     ticket: int
@@ -159,6 +176,8 @@ class Deal:
     time: datetime
     comment: str
     magic: int
+    # T30：MT5 deal.reason 原值（见上方常量；旧式 row / 出入金流水可能缺 → None）
+    reason: int | None = None
 
 
 @dataclass(frozen=True)

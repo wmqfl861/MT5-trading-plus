@@ -181,6 +181,73 @@ def test_deals_pass_epoch_window_and_map_fields():
     assert d.commission == 0.0 and d.fee == -0.35 and d.comment == "smoke"
 
 
+def test_deals_map_reason_field():
+    """T30/C1：deal.reason 原值透传（SL/TP/SO 识别的依据）。"""
+    acct, fake = make()
+    DealRowR = namedtuple("DealRowR", DealRow._fields + ("reason",))
+    sl = DealRowR(7002, 9001, 9001, "XAUUSD", 1, 1, 0.1, 1945.0, -30.0, 0.0,
+                  0.0, 0.0, 1698000100, "[sl]", 20261022, 4)
+    client = DealRowR(7003, 9002, 9002, "XAUUSD", 1, 1, 0.1, 1950.0, 5.0, 0.0,
+                      0.0, 0.0, 1698000200, "manual", 20261022, 0)
+    fake.set_behavior("history_deals_get", value=(sl, client))
+    deals = acct.deals(datetime(2023, 10, 22, 15, 0), datetime(2023, 10, 22, 19, 0))
+    assert [d.reason for d in deals] == [4, 0]   # 0=CLIENT 是合法值，不是缺字段
+
+
+def test_deals_reason_missing_is_none():
+    """旧式 row（无 reason 字段）→ None，不冒充任何原因。"""
+    acct, fake = make()
+    deal = DealRow(7001, 9001, 9001, "EURUSD", 0, 0, 0.5, 1.1002, 12.5, 0.0,
+                   0.0, -0.35, 1698000000, "smoke", 20261022)
+    fake.set_behavior("history_deals_get", value=(deal,))
+    deals = acct.deals(datetime(2023, 10, 22, 15, 0), datetime(2023, 10, 22, 19, 0))
+    assert deals[0].reason is None
+
+
+def test_deal_reason_constants_match_package():
+    """常量与本机 MetaTrader5 包逐字核对过（2026-10-24 只读打印）——
+    防手滑改动破坏 SL/TP/SO 识别。"""
+    from mt5gw import models
+    assert models.DEAL_REASON_CLIENT == 0
+    assert models.DEAL_REASON_MOBILE == 1
+    assert models.DEAL_REASON_WEB == 2
+    assert models.DEAL_REASON_EXPERT == 3
+    assert models.DEAL_REASON_SL == 4
+    assert models.DEAL_REASON_TP == 5
+    assert models.DEAL_REASON_SO == 6
+    assert models.DEAL_REASON_ROLLOVER == 7
+    assert models.DEAL_REASON_VMARGIN == 8
+    assert models.DEAL_REASON_SPLIT == 9
+
+
+def test_deals_for_position_passes_position_kwarg():
+    """T30：按持仓 id 查成交（外部出场识别）——position= 形态透传。
+
+    FakeMT5.history_deals_get 只实现了 (date_from, date_to) 形态，这里
+    用其子类覆盖成 position= 关键字形态（真包文档：or filtered by
+    position id）。
+    """
+    deal = DealRow(7004, 9001, 9001, "XAUUSD", 1, 1, 0.1, 1945.0, -30.0, 0.0,
+                   0.0, 0.0, 1698000100, "[sl]", 20261022)
+
+    class _PosFake(FakeMT5):
+        def __init__(self):
+            super().__init__()
+            self.kwargs = None
+
+        def history_deals_get(self, **kwargs):   # 只接受 position= 形态
+            self.kwargs = kwargs
+            return (deal,)
+
+    stub = _PosFake()
+    conn = MT5Connection(mt5_module=stub)
+    conn.connect()
+    acct = AccountService(conn, stub)
+    deals = acct.deals_for_position(9001)
+    assert stub.kwargs == {"position": 9001}
+    assert len(deals) == 1 and deals[0].position_id == 9001
+
+
 def test_deals_include_balance_operations():
     acct, fake = make()
     deposit = DealRow(7000, 0, 0, "", 2, None, 0.0, 0.0, 10000.0, 0.0, 0.0, 0.0,

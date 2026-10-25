@@ -20,6 +20,8 @@ from datetime import datetime
 import pandas as pd
 
 from mt5gw.models import (
+    DEAL_REASON_EXPERT,
+    DEAL_REASON_SL,
     AccountState,
     Bar,
     Deal,
@@ -40,6 +42,9 @@ class FakeGateway:
         self.account = broker
         self.market = broker
         self.trading = broker
+
+    def shutdown(self):
+        """对齐 MT5Gateway 接口（脚本 main 的 finally 会调用；替身无资源）。"""
 
 
 class FakeBroker:
@@ -99,15 +104,22 @@ class FakeBroker:
         return ticket
 
     def _record_deal(self, *, entry: str, side: str, volume: float, price: float,
-                     profit: float, comment: str, magic: int) -> None:
+                     profit: float, comment: str, magic: int,
+                     position_id: int = 0, reason: int | None = None,
+                     time: datetime | None = None) -> None:
         self._deals.append(Deal(
-            ticket=self._next_deal_ticket(), order=0, position_id=0,
+            ticket=self._next_deal_ticket(), order=0, position_id=position_id,
             symbol=self.symbol, side=side, entry=entry, volume=volume,
             price=price, profit=profit, commission=0.0, swap=0.0, fee=0.0,
-            time=_T0, comment=comment, magic=magic))
+            time=time or _T0, comment=comment, magic=magic, reason=reason))
 
     def deals(self, since: datetime, to: datetime) -> list[Deal]:
         return [d for d in self._deals if since <= d.time <= to]
+
+    def deals_for_position(self, position_id: int) -> list[Deal]:
+        """按持仓 id 查全部成交（对齐 AccountService.deals_for_position；
+        T30 外部出场识别用——不看时间窗，跨"日"也找得到）。"""
+        return [d for d in self._deals if d.position_id == position_id]
 
     def seed_deal(self, *, profit: float = 0.0, magic: int,
                   entry: str = "out", time: datetime | None = None,
@@ -122,15 +134,21 @@ class FakeBroker:
         return d
 
     def close_external(self, ticket: int, *, profit: float = 0.0,
-                       comment: str = "[sl]") -> None:
-        """外部平仓（SL/TP 触发或人工）：不走执行器，流水如实记账。"""
+                       comment: str = "[sl]",
+                       reason: int = DEAL_REASON_SL) -> None:
+        """外部平仓（SL/TP 触发或人工）：不走执行器，流水如实记账。
+
+        reason 为 MT5 deal.reason（mt5gw.models.DEAL_REASON_*；真包核对的
+        常量）。缺省 SL——既有调用方（含探针 P8）都模拟止损出场。
+        """
         pos = self._take_position(ticket)
         self._positions = [p for p in self._positions if p.ticket != ticket]
         self.balance += profit
         self._record_deal(entry="out",
                           side="sell" if pos.side == "buy" else "buy",
                           volume=pos.volume, price=pos.price_current,
-                          profit=profit, comment=comment, magic=pos.magic)
+                          profit=profit, comment=comment, magic=pos.magic,
+                          position_id=ticket, reason=reason)
 
     def remove_position(self, ticket: int) -> None:
         self._take_position(ticket)
@@ -223,7 +241,8 @@ class FakeBroker:
             price_open=fill, price_current=fill, sl=sl or 0.0, tp=tp or 0.0,
             swap=0.0, profit=0.0, time=_T0, comment=comment, magic=magic or 0))
         self._record_deal(entry="in", side=side, volume=filled_vol, price=fill,
-                          profit=0.0, comment=comment, magic=magic or 0)
+                          profit=0.0, comment=comment, magic=magic or 0,
+                          position_id=ticket, reason=DEAL_REASON_EXPERT)
         return OrderResult(
             ok=True, filled=True, partial=partial,
             retcode=10010 if partial else 10009, comment="done",
@@ -250,7 +269,8 @@ class FakeBroker:
         self._record_deal(entry="out",
                           side="sell" if pos.side == "buy" else "buy",
                           volume=vol, price=exit_price, profit=profit,
-                          comment="close", magic=pos.magic)
+                          comment="close", magic=pos.magic,
+                          position_id=pos.ticket, reason=DEAL_REASON_EXPERT)
         return OrderResult(
             ok=True, filled=True, partial=False, retcode=10009, comment="close",
             order_ticket=ticket, deal_ticket=ticket, deal_price=exit_price,

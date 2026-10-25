@@ -1,22 +1,27 @@
-"""mt5live.reconcile（T14/P7 + T24）：expected vs actual 持仓对账。
+"""mt5live.reconcile（T14/P7 + T24 + T30/D19/D20）：意图 vs actual 持仓对账。
 
-对账口径：
-- expected：T24 起每策略一个 ``data/live/expected-<magic>.json``（执行器
-  每轮写入的目标持仓）；``load_expected_dir`` 合并全部 ``expected-*.json``
-  （含旧版单文件 ``expected.json``），每 (symbol, magic) 一条净持仓
-  （buy 正 / sell 负的净手数），缺项或 volume=0 表示该组合应为空仓；
-  **完全未在任何 expected 文件中出现的 magic 视为不受管**（手动单等）——
-  因此执行器每轮都写（空仓写 volume=0），否则该 magic 的实际持仓不参与
-  对账；
-- actual：账户实际持仓，**按 magic 过滤**——expected 中出现的 magic 才参与
-  对账，手动单（magic=0）与其他策略的持仓不纳入；
+对账口径（T30 起为"意图"语义，修复 C1/P8——服务器端 SL/TP 出场后对账
+死锁）：
+- 意图：每策略一个 ``data/live/expected-<magic>.json``（文件名沿用 T24，
+  风控进程的登记扫描不变），内容为一条 :class:`Intent`：
+  - 执行器**下单前**写目标持仓（``status="pending"``，cause=decision_id）；
+  - **订单返回后**写实际净持仓（``"confirmed"``；部分成交如实记成交量）；
+  - 服务器端保护性出场（reason ∈ {SL,TP,SO}，执行器按 position_id 查
+    当日成交识别）→ 意图改为实际净持仓（``"external_exit:<deal>"``）；
+  - 人工确认（``scripts/live_ack_external.py``）→ ``"ack_external"``；
+  - 兼容读 T24 及以前的旧格式（``{"ts", "positions": [...]}``，逐条记成
+    confirmed、cause="legacy"）与旧版单文件 ``expected.json``。
+- 实际：账户持仓，**按 magic 过滤**——意图中出现的 magic 才参与对账，
+  手动单（magic=0）与未登记策略的持仓不纳入；
 - 差分三情形：``missing``（应有而无）、``unexpected``（有而不应）、
-  ``mismatch``（净手数不一致，含方向相反）；浮点比较带容差（默认 1e-6 手）。
+  ``mismatch``（净手数不一致，含方向相反）；浮点比较带容差（默认 1e-6 手）；
+- **宽限**：``status="pending"`` 且 ``now - ts < grace_s``（默认 60 秒）的
+  magic 本轮整体不判——对账进程恰在"已决定、订单未回"的空档里运行时
+  不误报（C1 的短暂误报场景）。
 
-暂停策略指令：``data/live/pause.json``（``{"paused": bool, "reason": str|null,
-"ts": iso, "diffs": [...]}``）——不一致时 paused=true，恢复一致时写回
-paused=false；执行器闸门（mt5live.gate.RiskGate）读 paused 字段决定是否
-暂停开仓。
+暂停指令（T30/D20：按策略隔离）：对账进程只写 ``pause-<magic>.json``；
+全局 ``pause.json`` 只留给人工（写入路径保留 ``magic=None``）。闸门
+（mt5live.gate.RiskGate）同时读两者，任一 paused 即拒绝开仓。
 
 时间约定：内存中 naive UTC，文件中 ISO 时间带 +00:00（同 mt5live.monitor）。
 """
@@ -31,34 +36,57 @@ from datetime import datetime, timezone
 from mt5gw.snapshot import write_json_atomic
 from mt5live.monitor import iso_utc, naive_utc, parse_iso
 
-EXPECTED_FILE = "expected.json"
-EXPECTED_GLOB = "expected-*.json"   # T24：每策略一个目标持仓文件
-PAUSE_FILE = "pause.json"
-DEFAULT_VOLUME_TOLERANCE = 1e-6  # 手（volume_step 通常 0.01，纯浮点噪声容差）
+EXPECTED_FILE = "expected.json"          # 旧版单文件（只兼容读）
+EXPECTED_GLOB = "expected-*.json"       # T24 起每策略一个；T30 起内容为意图
+INTENT_FILE_FMT = "expected-{magic}.json"   # T30：意图文件名（沿用 T24 前缀，
+#   风控进程 registered_magics 的登记扫描不变）
+PAUSE_FILE = "pause.json"               # 全局暂停（只留给人工）
+PAUSE_MAGIC_FMT = "pause-{magic}.json"  # T30/D20：对账进程按策略写
+DEFAULT_VOLUME_TOLERANCE = 1e-6   # 手（volume_step 通常 0.01，纯浮点噪声容差）
+DEFAULT_GRACE_S = 60.0            # pending 宽限（秒）：下单在途不判
+
+STATUS_PENDING = "pending"        # 已决定、订单未回
+STATUS_CONFIRMED = "confirmed"    # 订单已回 / 出场已解释 / 人工已确认
+_STATUSES = (STATUS_PENDING, STATUS_CONFIRMED)
 
 _SIDES = ("buy", "sell")
 
 
 class ExpectedStateError(RuntimeError):
-    """预期持仓文件缺失 / 不是合法 JSON / 字段不合法——拒绝对账。"""
+    """意图文件缺失 / 不是合法 JSON / 字段不合法——拒绝对账。"""
 
 
 @dataclass(frozen=True)
-class ExpectedPosition:
-    """目标持仓：每 (symbol, magic) 一条，volume=0 表示空仓。"""
+class Intent:
+    """目标持仓意图（T30/D19）：每策略一个 expected-<magic>.json，一条。
+
+    side/volume 描述目标净持仓（volume=0 表示空仓）；status 区分
+    "pending"（已决定、订单未回，对账给 grace_s 宽限）与 "confirmed"；
+    cause 记这条意图的来历：decision_id | "flatten:<id>" |
+    "external_exit:<deal_ticket>" | "ack_external" | "legacy"（旧格式兼容读）
+    | "initial"（首次登记）。
+    """
 
     symbol: str
     magic: int
-    side: str  # "buy"/"sell"
-    volume: float
+    side: str                # "buy"/"sell"
+    volume: float            # 目标净手数（≥0）
+    status: str              # "pending"/"confirmed"
+    cause: str
+    ts: datetime             # naive UTC
 
     def __post_init__(self):
         if self.side not in _SIDES:
             raise ValueError(f"side 须为 buy/sell，收到 {self.side!r}")
+        if self.status not in _STATUSES:
+            raise ValueError(f"status 须为 {'/'.join(_STATUSES)}，"
+                             f"收到 {self.status!r}")
         if not isinstance(self.magic, int) or isinstance(self.magic, bool):
             raise ValueError(f"magic 须为整数，收到 {self.magic!r}")
         if not isinstance(self.volume, (int, float)) or self.volume < 0:
             raise ValueError(f"volume 须为非负数，收到 {self.volume!r}")
+        if not isinstance(self.cause, str) or not self.cause:
+            raise ValueError(f"cause 须为非空字符串，收到 {self.cause!r}")
 
     @property
     def net_volume(self) -> float:
@@ -66,67 +94,26 @@ class ExpectedPosition:
         return float(self.volume if self.side == "buy" else -self.volume)
 
 
-@dataclass(frozen=True)
-class ExpectedState:
-    ts: datetime
-    positions: tuple[ExpectedPosition, ...]
-
-
-def write_expected(path: str, ts: datetime, positions) -> None:
-    """运行器/执行器写目标持仓（原子写；格式是对账双方的集成契约）。"""
+def write_intent(path: str, intent: Intent) -> None:
+    """写意图文件（原子写；格式是执行器与对账进程的集成契约）。"""
     write_json_atomic(path, {
-        "ts": iso_utc(ts),
-        "positions": [
-            {"symbol": p.symbol, "magic": p.magic, "side": p.side,
-             "volume": float(p.volume)}
-            for p in positions
-        ],
+        "symbol": intent.symbol,
+        "magic": intent.magic,
+        "side": intent.side,
+        "volume": float(intent.volume),
+        "status": intent.status,
+        "cause": intent.cause,
+        "ts": iso_utc(intent.ts),
     })
 
 
-def load_expected(path: str) -> ExpectedState:
-    """读目标持仓文件；缺失/不合法 → ExpectedStateError（如实抛错）。"""
-    if not os.path.exists(path):
-        raise ExpectedStateError(f"预期持仓文件不存在：{path}（运行器先启动？）")
-    with open(path, encoding="utf-8") as f:
-        try:
-            data = json.load(f)
-        except json.JSONDecodeError as e:
-            raise ExpectedStateError(f"{path} 不是合法 JSON：{e}") from e
-    if not isinstance(data, dict):
-        raise ExpectedStateError(f"{path} 顶层须为对象，收到 {type(data).__name__}")
-    if "ts" not in data or "positions" not in data:
-        raise ExpectedStateError(f"{path} 缺 ts/positions 字段")
-    try:
-        ts = parse_iso(data["ts"])
-    except (TypeError, ValueError) as e:
-        raise ExpectedStateError(
-            f"{path} ts 不是合法 ISO 时间：{data['ts']!r}") from e
-    if not isinstance(data["positions"], list):
-        raise ExpectedStateError(
-            f"{path} positions 须为数组，收到 {type(data['positions']).__name__}")
-    parsed = []
-    for i, p in enumerate(data["positions"]):
-        if not isinstance(p, dict):
-            raise ExpectedStateError(f"{path} positions[{i}] 须为对象：{p!r}")
-        for key in ("symbol", "magic", "side", "volume"):
-            if key not in p:
-                raise ExpectedStateError(f"{path} positions[{i}] 缺字段 {key}")
-        try:
-            parsed.append(ExpectedPosition(
-                symbol=p["symbol"], magic=p["magic"], side=p["side"],
-                volume=p["volume"]))
-        except (ValueError, TypeError) as e:
-            raise ExpectedStateError(f"{path} positions[{i}] 不合法：{e}") from e
-    return ExpectedState(ts=ts, positions=tuple(parsed))
+def load_intents(live_dir: str) -> list[Intent]:
+    """读 live 目录下全部意图文件：expected-<magic>.json 逐个 + 旧版
+    expected.json（兼容）。单文件可以是新格式（单意图对象）或旧格式
+    （``{"ts", "positions": [...]}``，T24 及以前）。
 
-
-def load_expected_dir(live_dir: str) -> ExpectedState:
-    """合并 live 目录下全部 expected 文件（T24：expected-<magic>.json 逐个
-    + 旧版 expected.json），供对账进程一次读入所有受管 magic。
-
-    目录里没有任何 expected 文件 → ExpectedStateError（运行器先启动）；
-    单个文件损坏如实抛错（ExpectedStateError），绝不静默跳过该策略。
+    目录里没有任何文件 → ExpectedStateError（运行器先启动）；单个文件
+    损坏如实抛错（ExpectedStateError），绝不静默跳过该策略。
     """
     paths = sorted(glob.glob(os.path.join(live_dir, EXPECTED_GLOB)))
     legacy = os.path.join(live_dir, EXPECTED_FILE)
@@ -134,16 +121,65 @@ def load_expected_dir(live_dir: str) -> ExpectedState:
         paths.append(legacy)
     if not paths:
         raise ExpectedStateError(
-            f"{live_dir} 下没有任何 expected 文件（expected-<magic>.json / "
+            f"{live_dir} 下没有任何意图文件（expected-<magic>.json / "
             f"{EXPECTED_FILE}）——运行器/执行器先启动写出目标持仓")
-    merged_ts: datetime | None = None
-    merged: list[ExpectedPosition] = []
+    out: list[Intent] = []
     for path in paths:
-        state = load_expected(path)
-        merged.extend(state.positions)
-        if merged_ts is None or state.ts > merged_ts:
-            merged_ts = state.ts
-    return ExpectedState(ts=merged_ts, positions=tuple(merged))
+        out.extend(_load_intent_file(path))
+    return out
+
+
+def _load_intent_file(path: str) -> list[Intent]:
+    if not os.path.exists(path):
+        raise ExpectedStateError(f"意图文件不存在：{path}（运行器先启动？）")
+    with open(path, encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ExpectedStateError(f"{path} 不是合法 JSON：{e}") from e
+    if not isinstance(data, dict):
+        raise ExpectedStateError(
+            f"{path} 顶层须为对象，收到 {type(data).__name__}")
+    if "positions" in data:
+        return _load_legacy(path, data)      # T24 及以前的旧格式
+    try:
+        return [Intent(
+            symbol=data["symbol"], magic=data["magic"], side=data["side"],
+            volume=data["volume"], status=data["status"], cause=data["cause"],
+            ts=parse_iso(data["ts"]))]
+    except KeyError as e:
+        raise ExpectedStateError(f"{path} 缺字段 {e}") from e
+    except (TypeError, ValueError) as e:
+        raise ExpectedStateError(f"{path} 意图不合法：{e}") from e
+
+
+def _load_legacy(path: str, data: dict) -> list[Intent]:
+    """旧格式（T24 及以前）：{"ts": iso, "positions": [{symbol, magic,
+    side, volume}, ...]}——每条记成 confirmed 意图（cause="legacy"）。"""
+    try:
+        ts = parse_iso(data["ts"])
+    except (KeyError, TypeError, ValueError) as e:
+        raise ExpectedStateError(
+            f"{path} ts 不是合法 ISO 时间：{data.get('ts')!r}") from e
+    positions = data["positions"]
+    if not isinstance(positions, list):
+        raise ExpectedStateError(
+            f"{path} positions 须为数组，收到 {type(positions).__name__}")
+    out = []
+    for i, p in enumerate(positions):
+        if not isinstance(p, dict):
+            raise ExpectedStateError(f"{path} positions[{i}] 须为对象：{p!r}")
+        for key in ("symbol", "magic", "side", "volume"):
+            if key not in p:
+                raise ExpectedStateError(f"{path} positions[{i}] 缺字段 {key}")
+        try:
+            out.append(Intent(
+                symbol=p["symbol"], magic=p["magic"], side=p["side"],
+                volume=p["volume"], status=STATUS_CONFIRMED, cause="legacy",
+                ts=ts))
+        except (ValueError, TypeError) as e:
+            raise ExpectedStateError(f"{path} positions[{i}] 不合法：{e}") from e
+    return out
 
 
 @dataclass(frozen=True)
@@ -171,14 +207,29 @@ def _actual_net_volume(p) -> float:
     return float(p.volume if p.side == "buy" else -p.volume)
 
 
-def diff_positions(expected, actual, *,
+def diff_positions(intents, actual, *, now: datetime,
+                   grace_s: float = DEFAULT_GRACE_S,
                    volume_tolerance: float = DEFAULT_VOLUME_TOLERANCE,
                    ) -> ReconcileResult:
-    """逐 (symbol, magic) 净额差分（expected 与 actual 均可多条同组合，净额合并）。"""
+    """逐 (symbol, magic) 净额差分（意图与实际均可多条同组合，净额合并）。
+
+    ``status="pending"`` 且 ``now - ts < grace_s`` 的 magic 本轮**整体不判**
+    （下单在途的宽限——"已决定、订单未回"的空档里对账不误报）；其余
+    （confirmed、超时未回的 pending）按目标净额比对。
+    """
+    now = naive_utc(now)
+    in_flight: set[int] = set()
+    for i in intents:
+        if (getattr(i, "status", None) == STATUS_PENDING
+                and (now - naive_utc(i.ts)).total_seconds() < grace_s):
+            in_flight.add(i.magic)
+
     exp_net: dict[tuple[str, int], float] = {}
-    for e in expected:
-        key = (e.symbol, e.magic)
-        exp_net[key] = exp_net.get(key, 0.0) + e.net_volume
+    for i in intents:
+        if i.magic in in_flight:
+            continue                      # 本轮不判：整个 magic 跳过
+        key = (i.symbol, i.magic)
+        exp_net[key] = exp_net.get(key, 0.0) + i.net_volume
     managed_magics = {magic for _, magic in exp_net}
 
     act_net: dict[tuple[str, int], float] = {}
@@ -209,11 +260,18 @@ def diff_positions(expected, actual, *,
     return ReconcileResult(ok=not diffs, diffs=tuple(diffs))
 
 
-def write_pause(live_dir: str, *, paused: bool, reason: str | None,
-                diffs=(), now: datetime | None = None) -> str:
-    """维护 data/live/pause.json：不一致 → paused=true；恢复 → paused=false。"""
+def write_pause(live_dir: str, magic: int | None, *, paused: bool,
+                reason: str | None, diffs=(),
+                now: datetime | None = None) -> str:
+    """维护暂停指令（T30/D20：按策略隔离）。
+
+    magic 非 None → ``pause-<magic>.json``（对账进程的写路径：不一致 →
+    paused=true，恢复 → paused=false）；magic=None → 全局 ``pause.json``
+    （只留给人工）。返回写出的路径。
+    """
     n = naive_utc(now if now is not None else datetime.now(timezone.utc))
     data = {
+        "magic": magic,
         "paused": bool(paused),
         "reason": reason,
         "ts": iso_utc(n),
@@ -224,6 +282,8 @@ def write_pause(live_dir: str, *, paused: bool, reason: str | None,
             for d in diffs
         ],
     }
-    path = os.path.join(live_dir, PAUSE_FILE)
+    name = (PAUSE_FILE if magic is None
+            else PAUSE_MAGIC_FMT.format(magic=magic))
+    path = os.path.join(live_dir, name)
     write_json_atomic(path, data)
     return path

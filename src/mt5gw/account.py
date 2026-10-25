@@ -73,6 +73,9 @@ def _pending(row) -> PendingOrder:
 def _deal(row) -> Deal:
     side = _DEAL_SIDES.get(row.type, f"type{row.type}")
     entry = _DEAL_ENTRIES.get(getattr(row, "entry", -1), None)
+    # T30：deal.reason 原值（真包 int；旧式 row 缺字段 → None。注意 reason=0
+    # 是 DEAL_REASON_CLIENT，合法值，判 None 必须用 is 而非真值）
+    reason_raw = getattr(row, "reason", None)
     return Deal(
         ticket=row.ticket, order=row.order,
         position_id=getattr(row, "position_id", 0),
@@ -81,6 +84,7 @@ def _deal(row) -> Deal:
         profit=row.profit, commission=row.commission, swap=row.swap,
         fee=row.fee, time=_utc(row.time), comment=row.comment,
         magic=getattr(row, "magic", 0),
+        reason=int(reason_raw) if reason_raw is not None else None,
     )
 
 
@@ -160,6 +164,19 @@ class AccountService:
                 self._mt5.history_deals_get,
                 _epoch_seconds(since), _epoch_seconds(to),
             ),
+            _deal, "成交历史",
+        )
+
+    def deals_for_position(self, position_id: int) -> list[Deal]:
+        """按持仓 id 查该持仓的全部成交（含开仓与平仓腿；T30 外部出场识别用）。
+
+        走包的 history_deals_get(position=...) 形态；比时间窗查询更准——
+        执行器重启跨日也能拿到平仓腿的 reason。
+        """
+        return self._list_amb(
+            "deals_for_position",
+            lambda: self._conn.call_status(
+                self._mt5.history_deals_get, position=position_id),
             _deal, "成交历史",
         )
 

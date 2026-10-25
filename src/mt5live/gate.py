@@ -9,7 +9,8 @@ RiskGate.check_open 组装 RiskState（计划 T24 逐字）：
   60 秒滑窗由 RiskProcess.check 的规则 7 裁决）；
 - 当日盈亏（UTC 日内 deals 的已实现 + 持仓浮动，daily_pnl 同源）；
 - 停机标志（killSwitch / halt.json 由 RiskProcess.check_order 文件级
-  裁决；pause.json（对账暂停）在本闸门最前检查）
+  裁决；对账暂停 pause-<magic>.json（按策略，T30/D20）与全局 pause.json
+  （人工）在本闸门最前检查，任一暂停即拒开仓）
 → RiskProcess.check_order（含 SessionPolicy 的禁入窗检查）。
 
 点差闸门（T24/M10）：开仓前当前点差 > config/sessions.toml 的
@@ -130,15 +131,26 @@ def decision_symbol(decision) -> str:
 
 # ---- 风控闸门 ----
 
+PAUSE_FILE = "pause.json"                # 全局暂停（只留给人工）
+PAUSE_MAGIC_FMT = "pause-{magic}.json"   # T30/D20：对账进程按策略写
+
+
 @dataclass(frozen=True)
 class _Paused:
     paused: bool
     reason: str | None
 
 
-def read_pause(live_dir: str) -> _Paused:
-    """读对账暂停指令 pause.json（缺失/不合法 = 未暂停，不阻塞开仓）。"""
-    path = os.path.join(live_dir, "pause.json")
+def read_pause(live_dir: str, magic: int | None = None) -> _Paused:
+    """读暂停指令（T30/D20：只读；写路径在对账进程/人工）。
+
+    magic 给定 → ``pause-<magic>.json``（对账进程按策略写的暂停）；
+    magic=None → 全局 ``pause.json``（只留给人工）。缺失/不合法 = 未暂停
+    （T33 改为 fail-closed：读不出按暂停处理）。
+    """
+    name = (PAUSE_FILE if magic is None
+            else PAUSE_MAGIC_FMT.format(magic=magic))
+    path = os.path.join(live_dir, name)
     if not os.path.exists(path):
         return _Paused(False, None)
     try:
@@ -212,12 +224,18 @@ class RiskGate:
                    now: datetime | None = None) -> RiskDecision:
         n = naive_utc(now if now is not None else self._clock())
 
-        # 0) 对账暂停（reconcile 写 pause.json；恢复一致自动解除）
-        paused = read_pause(self._live_dir)
+        # 0) 对账暂停（T30/D20）：本策略 pause-<magic>.json（对账进程写）与
+        #    全局 pause.json（人工）任一暂停即拒开仓
+        paused = read_pause(self._live_dir, magic)
         if paused.paused:
             return RiskDecision(
-                False, f"reconcile_paused: 持仓对账不一致"
-                f"（{paused.reason or '详见 pause.json'}），暂停开仓")
+                False, f"reconcile_paused: 持仓对账不一致（magic {magic}，"
+                f"{paused.reason or f'详见 pause-{magic}.json'}），暂停开仓")
+        manual = read_pause(self._live_dir)
+        if manual.paused:
+            return RiskDecision(
+                False, f"reconcile_paused: 全局人工暂停（pause.json，"
+                f"{manual.reason or '原因见文件'}），暂停开仓")
 
         # 1) 组装 RiskState（各来源缺数据 → 检查器 missing_data 拒单）
         positions = tuple(self._account.positions())

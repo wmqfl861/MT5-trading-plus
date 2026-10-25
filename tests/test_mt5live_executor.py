@@ -1,21 +1,31 @@
 """ExecutionAdapter：目标仓位差分六情形、幂等、SL/TP 成交价修正、retcode 分类。
 
 全部走 FakeBroker（mt5gw 服务层替身）；真实下单由 mt5gw 保险丝管辖，不在测试范围。
+T30：LiveExecutor 的意图写入（pending → confirmed / 异常返回 / 被拒轮不洗白）。
 """
+import json
+from datetime import datetime
+
 import pytest
 
 from mt5gw.errors import OrderResultUnknownError, TradeRejectedError
 
-from mt5live.executor import ExecutionAdapter
+from mt5live.executor import ExecutionAdapter, LiveExecutor
 
 from tests.fakes_live import FakeBroker, mk_decision
 
 MAGIC = 777
+NOW = datetime(2026, 10, 20, 18, 0)
 
 
 def mk_adapter(broker, **kw):
     return ExecutionAdapter(broker, broker, broker,
                             symbol=broker.symbol, magic=MAGIC, **kw)
+
+
+def read_intent(tmp_path) -> dict:
+    with open(tmp_path / f"expected-{MAGIC}.json", encoding="utf-8") as f:
+        return json.load(f)
 
 
 # ---- 差分六情形 ----
@@ -225,3 +235,76 @@ def test_signal_without_volume_rejected():
     with pytest.raises(ValueError, match="volume_lots"):
         mk_adapter(b).execute(d)
     assert b.actions == []                    # 一单未发
+
+
+# ---- T30：LiveExecutor 的意图写入（expected-<magic>.json）----
+
+def _mk_executor(broker, tmp_path, *, gate=None):
+    from mt5quant.strategies.base import ExitRules
+
+    return LiveExecutor(
+        mk_adapter(broker), symbol=broker.symbol, magic=MAGIC,
+        live_dir=str(tmp_path), rules=ExitRules(stop_loss_atr=1.5),
+        gate=gate)
+
+
+def test_intent_pending_then_confirmed_across_order(tmp_path):
+    """下单前 pending → 订单返回后 confirmed(实际净持仓)（T30 语义 1/2）。"""
+    b = FakeBroker()
+    seen = {}
+    orig = b.market_order
+
+    def hooked(*a, **kw):
+        seen["intent"] = dict(read_intent(tmp_path))   # 订单已发、未回
+        return orig(*a, **kw)
+
+    b.market_order = hooked
+    ex = _mk_executor(b, tmp_path)
+    d = mk_decision(signal=1, volume_lots=0.02, atr=2.0)
+    rr = ex.poll(d, NOW)
+    assert rr.action == "open"
+    assert seen["intent"]["status"] == "pending"        # 下单在途
+    assert seen["intent"]["volume"] == pytest.approx(0.02)
+    assert seen["intent"]["cause"] == d.decision_id
+    it = read_intent(tmp_path)                          # 订单返回后
+    assert it["status"] == "confirmed"
+    assert it["volume"] == pytest.approx(0.02)
+    assert it["cause"] == d.decision_id
+
+
+def test_intent_confirmed_when_order_raises(tmp_path):
+    """订单异常返回（被拒）：意图如实写为当前实际净持仓（confirmed），
+    绝不留一个等不到回报的 pending。"""
+    b = FakeBroker()
+    b.error_on_market_order = TradeRejectedError(10019, "no money")
+    ex = _mk_executor(b, tmp_path)
+    d = mk_decision(signal=1, volume_lots=0.02)
+    with pytest.raises(TradeRejectedError):
+        ex.poll(d, NOW)
+    it = read_intent(tmp_path)
+    assert it["status"] == "confirmed"
+    assert it["volume"] == 0.0                          # 实际净持仓（空仓）
+    assert it["cause"] == d.decision_id
+
+
+def test_rejected_round_does_not_launder_intent(tmp_path):
+    """开仓被闸门拒（无平仓腿）：意图保持原值——被拒轮绝不改写（防洗白）。"""
+    from mt5live.riskproc import RiskDecision
+
+    class _RejectGate:
+        def check_open(self, *a, **kw):
+            return RiskDecision(False, "test_reject")
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    d1 = mk_decision(signal=1, volume_lots=0.02,
+                     decision_id="XAUUSD|M15|d1")
+    assert ex.poll(d1, NOW).action == "open"
+    before = read_intent(tmp_path)
+
+    ex2 = _mk_executor(b, tmp_path, gate=_RejectGate())   # 新决策、闸门拒绝
+    d2 = mk_decision(signal=1, volume_lots=0.03,
+                     decision_id="XAUUSD|M15|d2")
+    rr = ex2.poll(d2, NOW.replace(minute=15))
+    assert rr.action == "risk_rejected"
+    assert read_intent(tmp_path) == before               # 原样：无 pending、无洗白
