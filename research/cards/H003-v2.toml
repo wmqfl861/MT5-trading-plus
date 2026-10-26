@@ -1,0 +1,38 @@
+# H003-v2：B2 NY 开盘区间突破——reentry=after_signal_change + 周期 M5→M15
+#（谱系 H003 第二版，parent = H003 v1）。
+# 动机（gates-calibration-v3 归因 1 + 蓝图 §6）：v1（M5，reentry=immediate）v3 实测
+# 4,108 笔 / PF 1.03 / 毛利成本倍数 1.41（台账 run#375-380）——毛利方向为正但换手
+# 吃掉大头，换手主要由"1.0×ATR 止损 → immediate 同向重入"循环贡献；
+# after_signal_change 砍掉该循环；周期改 M15（信号口径不变：同一开盘区间逻辑，
+# M15 为 09:30/09:45 两根区间 bar），在更粗的 bar 上执行、按蓝图 §6 降低成本占比。
+# 绑定策略：NyOpeningRangeBreakoutAsc（本卡随带的库策略子类——reentry 是引擎层
+# ExitRules 类属性而非策略参数，须子类承载；信号层与 NyOpeningRangeBreakout 完全一致）。
+# 先卡后测：本卡在第一次回测前已提交到 git，提交时间即预测登记时间。
+id = "H003-v2"
+family = "H003"
+version = 2
+parent = "H003"
+strategy = "mt5quant.strategies.library.b2_opening_range_breakout_asc:NyOpeningRangeBreakoutAsc"
+symbols = ["USTEC"]
+timeframe = "M15"
+session = "America/New_York 09:30-10:00 构筑开盘区间（M15 为 09:30/09:45 两根 bar），10:00 后跟入，exit_hour（14/15 点 NY）整点收盘离场（避开冬季 21:00 UTC 换日/维护窗）"
+selection_rule = "max_net_profit"
+phenomenon = "承 v1：开盘区间（NY 09:30-10:00）的高低点被收盘突破后，当日倾向于沿突破方向延续；开盘首半小时是日内信息含量与成交量最大的时段（Gao et al. 2018）。v2 附加假设：v1 的正毛利主要来自区间突破后的第一段延续，而非止损后反复重入的段落"
+mechanism = "承 v1：隔夜信息在开盘竞价与首半小时集中定价，方向确立后机构执行算法（VWAP/TWAP 拆单）与迟到市价单在区间边界触发止损/追价连锁，订单流不平衡延续到午盘——送钱方是开盘追涨杀跌的散户市价单与被扫损的区间内头寸"
+should_fail_when = "承 v1：窄区间+消息面反复的日子（假突破多、双向扫损）；低波动周（区间宽度过滤会自动停手，其余日子靠 ATR 止损控制）。v2 特有：若砍掉止损-重入循环后毛利同步消失，说明 v1 的正期望本来就来自循环换手而非突破延续——本卡的机制叙述错误"
+falsified_if = "样本内净利为负或 profit factor <1.2；成本 ×1.5 后期望转负（仍对成本敏感，这是最可能死掉的关卡）；随机入场基准 95 分位不被超过；或交易数骤降而 PF 无改善（止损-重入循环不是成本主因的假设不成立）"
+graveyard_checked = ["docs/research/gates-calibration-v3-2026-10-26.md（H003 M5 v3：4,108 笔 PF 1.03、倍数 1.41，止损-重入循环为换手主因的归因）", "docs/research/scope-2026-10-25.md（成本随周期缩短陡增、M5 日内突破在本经纪商成本结构下不可行的结论）"]
+
+[rules]
+entry = "承 v1：NY 10:00 后首根收盘 > 开盘区间高点 → +1；< 区间低点 → -1；收盘回到区间内粘性维持，破对侧收盘反手（M15 上区间为 09:30/09:45 两根 bar 的高低极值）"
+exit = "承 v1：bar 收盘本地时刻达 exit_hour_ny → 信号归零（引擎恰在整点开盘价平仓）。v2 变化在引擎层：1.0×ATR14 止损属保护性出场，reentry=after_signal_change——信号离开原方向（归零或反向）之前禁止同向再入场，当日每个方向至多一段持仓（v1 为 immediate，止损后下一根开盘立刻重入）"
+stop = "承 v1：1.0×ATR14（Wilder，信号 bar 值）止损；区间宽度 < min_range_atr×ATR14（简单 TR 均值）的窄区间日整日不交易"
+
+[params]
+exit_hour_ny = [14, 15]
+min_range_atr = [0.0, 0.5, 1.0]
+
+[expected]
+trades_per_year = "约 250-600 笔/年（每日至多 1 次主入场 + 反手与方向切换后的再入场；v1 immediate 口径实测约 955 笔/年，其中大量为止损-重入循环——v2 应显著下降，且仍应高于 M15 的 ≥300 线；样本 ~4.3 年合计约 1,000-2,500 笔）"
+win_rate = "35-50%（承 v1）"
+payoff_ratio = "1.2-2.0（承 v1；砍掉重入循环后单笔盈亏分布的左尾应收窄）"

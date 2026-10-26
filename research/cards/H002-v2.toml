@@ -1,0 +1,39 @@
+# H002-v2：B1 唐奇安通道突破——BTCUSD 单品种卡（谱系 H002 第二版，parent = H002 v1）。
+# 动机（gates-calibration-v3，台账 run#357-374）：v1 合并卡（XAUUSD+BTCUSD）auto 选参
+# 40/4 在 XAUUSD 腿 PF 1.84 但交易数 127<150（H1 线），合并评估不过 G1；BTCUSD 腿
+# 10/20 日通道组合全部正期望（PF 1.21-1.51，净利 +12.5k~+35.2k，2021-06-17..2025-10-23
+# 约 4.35 年、每组合 170-245 笔）——单品种卡解决交易数门槛；40 日通道组合在 BTCUSD 腿
+# PF 0.84-1.14 且交易数 117-133 不足，网格一并收窄。机制引用承 v1：
+# Moskowitz, Ooi & Pedersen (2012) Time Series Momentum, JFE 104(2)。
+# 先卡后测：本卡在第一次回测前已提交到 git，提交时间即预测登记时间；
+# 策略代码指纹由 bt 首跑自动登记（T37）。
+id = "H002-v2"
+family = "H002"
+version = 2
+parent = "H002"
+strategy = "mt5quant.strategies.library.b1_donchian_breakout:DonchianBreakout"
+symbols = ["BTCUSD"]
+timeframe = "H1"
+session = "全时段（周末休市自然断档；21:00-21:59 UTC 换日窗的禁止开仓由 P7 风控执行，信号层不感知）"
+selection_rule = "max_net_profit"
+phenomenon = "承 v1：时间序列动量——各资产过去 1-12 个月收益的方向对后续同向收益有显著正预测（Moskowitz/Ooi/Pedersen 2012），N 日高/低点突破是该现象的可交易化。v2 附加观察：同一策略同一成本口径下 BTCUSD 腿正期望且交易数充足、XAUUSD 腿交易数不足（v3 台账 127<150），动量强度的品种异质性本身是本卡的检验对象"
+mechanism = "承 v1：趋势后期才入场/离场的慢资金（CTA 之外的配置盘、止损单持有者）在通道边界被系统性触发，breakout 之后的订单流延续方向——送钱方是反应迟钝的资金与被强平的对手盘。v2 补充：BTCUSD 7×24 交易、散户参与度高、叙事驱动的趋势自我强化周期长，订单流惯性来源比黄金更持续（这解释品种异质性，也是本卡只留 BTCUSD 的机制赌注）"
+should_fail_when = "承 v1：长期宽幅震荡市——通道上下沿反复假突破（whipsaw），小亏累积吃掉偶发大趋势；BTC 2022 年 LUNA/FTX 型深跌后的长横盘段与低波动收缩期应明显亏损"
+falsified_if = "样本内净利为负；或选中组合交易数 <150（v3 观察不再成立）；或 G2 参数邻域高原 <70%；或按年分段 <70% 年份盈利；或夏普不高于随机入场蒙特卡洛 95 分位；或 DSR 概率 <0.95"
+graveyard_checked = ["docs/research/gates-calibration-2026-10-25.md（v1 合并卡 XAUUSD 腿净亏证伪记录与 BTCUSD 腿正向线索）", "docs/research/gates-calibration-v3-2026-10-26.md（BTCUSD 分品种 run#366-374：10/20 日通道 PF 1.21-1.51、40 日通道 PF 0.84-1.14）"]
+
+[rules]
+entry = "承 v1：收盘价突破前 entry_days×24 根 H1 的最高高点 → 目标仓位 +1；跌破最低低点 → -1（信号在突破 bar 收盘产生，引擎下一根开盘成交）"
+exit = "承 v1：收盘跌破前 exit_days×24 根低点通道 → 平多（升破高点通道 → 平空）；或信号层时间止损：入场后 720 根（30 天）未出场 → 信号归零"
+stop = "承 v1：引擎层 3.0×ATR14（Wilder，信号 bar 值）止损；止损后信号未翻转时按 reentry=immediate 缺省下一根开盘重入（趋势策略的常见取舍，如实计入成本）"
+
+[params]
+# v1 网格收窄：entry_days 去掉 40（BTCUSD 腿 v3 实测 PF 0.84-1.14 且交易数
+# 117-133<150，不可能过 G1，只会放大选择效应）；6 组。
+entry_days = [10, 20]
+exit_days = [2, 4, 8]
+
+[expected]
+trades_per_year = "约 35-60 笔/年（v3 实测 10/20 日通道每组合 170-245 笔 / 4.35 年 ≈ 39-56 笔/年；样本内合计 170-245 笔，应过 H1≥150 交易数线）"
+win_rate = "22-30%（v3 实测 BTCUSD 腿 0.14-0.27；低胜率高赔率的趋势跟踪形态）"
+payoff_ratio = "2.0-3.5（承 v1）"
