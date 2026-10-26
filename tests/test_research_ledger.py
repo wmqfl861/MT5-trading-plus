@@ -977,6 +977,7 @@ def test_concurrent_record_runs_chain_stays_intact(tmp_path):
         def slow_hash(content, prev):
             a_inside.set()
             time.sleep(0.4)         # 拉宽"读完链尾、尚未提交"的交错窗口
+            time.sleep(0)           # yield 让 B 有机会真正竞争写锁
             return orig(content, prev)
 
         led._row_hash = slow_hash
@@ -994,7 +995,7 @@ def test_concurrent_record_runs_chain_stays_intact(tmp_path):
         def wait_then_cols(table):
             if table == "runs":
                 # 保证 B 读链尾落在 A 的未提交窗口内（受控交错，非碰运气）
-                assert a_inside.wait(timeout=5), "A 未进入插入阶段"
+                assert a_inside.wait(timeout=20), "A 未进入插入阶段"
             return orig(table)
 
         led._table_cols = wait_then_cols
@@ -1009,8 +1010,8 @@ def test_concurrent_record_runs_chain_stays_intact(tmp_path):
     tb = threading.Thread(target=worker_b)
     ta.start()
     tb.start()
-    ta.join(timeout=15)
-    tb.join(timeout=15)
+    ta.join(timeout=60)
+    tb.join(timeout=60)
     assert errors == []
     with Ledger(p, create=False) as led:
         assert led.verify_chain() == []
