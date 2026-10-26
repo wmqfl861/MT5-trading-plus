@@ -973,3 +973,97 @@ def test_flags_traverse_positive_and_g5_sources(gc):
     assert ("G5.expectation_positive", "high_false_positive") in flagged
     # 普通误报 1% 不触发
     assert ("G1.profit_factor", "high_false_positive") not in flagged
+
+
+def test_merge_rejects_fingerprint_mismatch(tmp_path, monkeypatch, capsys):
+    """T42（R8 计划）失败测试：分片 meta.fingerprint（git 提交、gates 哈希、
+    成本版本、脚本哈希）不一致 → 拒绝合并——不同代码/数据身份的运行不能
+    拼成同一实验的汇总（R7-N-I1：产物必须自证运行身份）。"""
+    mm = _load_merge_module(tmp_path, monkeypatch,
+                            name="merge_gate_power_fp")
+
+    def write(dirname, shard):
+        d = tmp_path / dirname
+        d.mkdir(exist_ok=True)
+        (d / "gate-power.json").write_text(json.dumps(shard, ensure_ascii=False),
+                                           encoding="utf-8")
+        return d
+
+    fp = {"git_commit": "a" * 40, "git_dirty": False,
+          "gates_sha256": "b" * 64, "cost_versions": {"TST H1": "v1"},
+          "script_sha256": "c" * 64}
+    base = _real_schema_shard([0, 1], g5_det_pass=True, g5_fp_day=False,
+                              g5_fp_slot=False)
+    base["meta"]["fingerprint"] = dict(fp)
+    d1 = write("s1", base)
+    out = tmp_path / "merged"
+    for key, bad_value in (
+            ("git_commit", "d" * 40),
+            ("gates_sha256", "e" * 64),
+            ("cost_versions", {"TST H1": "v2"}),
+            ("script_sha256", "f" * 64)):
+        other = _real_schema_shard([2, 3], g5_det_pass=True, g5_fp_day=False,
+                                   g5_fp_slot=False)
+        other["meta"]["fingerprint"] = {**fp, key: bad_value}
+        d2 = write("s2", other)
+        assert mm.main(["--shards", f"{d1},{d2}", "--out", str(out)]) == 1, key
+        assert "fingerprint" in capsys.readouterr().out
+    # 相同指纹 + 不相交种子 → 正常合并（对照组）
+    same = _real_schema_shard([2, 3], g5_det_pass=True, g5_fp_day=False,
+                              g5_fp_slot=False)
+    same["meta"]["fingerprint"] = dict(fp)
+    d_ok = write("s2", same)
+    assert mm.main(["--shards", f"{d1},{d_ok}", "--out", str(out)]) == 0
+    assert (out / "gate-power.json").is_file()
+
+
+def test_meta_records_run_fingerprint(gc, inputs, monkeypatch, tmp_path):
+    """T42（R8 计划）失败测试：产物 meta 带运行指纹——git 提交、工作区
+    干净位、冻结门槛哈希、各序列成本版本（含缓存/越幅/隔夜费 sha）、
+    校准脚本自身哈希；报告 Markdown 引用运行指纹节。R7-N-I1 的"产物
+    未记录运行身份"由此关闭。"""
+    small = {**inputs,
+             "bars_by_symbol": {"TST": inputs["bars_by_symbol"]["TST"]
+                                .iloc[:1200]}}
+    monkeypatch.setattr(gc, "load_gates_for_run", lambda: _quick_cfg())
+    monkeypatch.setattr(
+        gc, "BASELINES",
+        ({"name": "RND-FP", "factory":
+          lambda seed: RandomEntries(seed=int(seed), hold_bars=4,
+                                     event_every_bars=24),
+          "params": {}, "grid": {}, "symbols": ("TST",), "timeframe": "H1"},))
+    monkeypatch.setattr(
+        gc, "assemble_experiment",
+        lambda data_root, symbols, max_bars: {
+            "TST H1": {
+                "bars": small["bars_by_symbol"]["TST"],
+                "costs": small["costs_by_symbol"]["TST"],
+                "cost_version": "rel@NY/bar_open_m1#01888819+ov[eca09e24]",
+                "sizes": small["sizes_by_symbol"]["TST"],
+                "vols": small["vols_by_symbol"]["TST"],
+                "timeframe": "H1", "session_policy": None},
+        })
+    out_dir = tmp_path / "gates-fp"
+    rc = gc.main(["--phase", "both", "--quick", "--seeds", "2",
+                  "--symbols", "TST:H1", "--out", str(out_dir)])
+    assert rc == 0
+    payload = json.loads((out_dir / "gate-power.json").read_text(
+        encoding="utf-8"))
+    fp = payload["meta"]["fingerprint"]
+    # git 提交：仓库内运行（本地与 CI 都是 git checkout）→ 40 位十六进制
+    assert len(fp["git_commit"]) == 40 and \
+        all(c in "0123456789abcdef" for c in fp["git_commit"])
+    assert isinstance(fp["git_dirty"], bool)
+    # 门槛哈希与冻结文件同源；脚本哈希为本文件字节
+    assert fp["gates_sha256"] == load_gates()[1]
+    assert len(fp["script_sha256"]) == 64
+    import hashlib
+    from pathlib import Path as _P
+    script = _P(gc.__file__).resolve()
+    assert fp["script_sha256"] == hashlib.sha256(
+        script.read_bytes()).hexdigest()
+    # 成本版本按序列记录（monkeypatch 注入的版本字符串原样入指纹）
+    assert fp["cost_versions"] == {
+        "TST H1": "rel@NY/bar_open_m1#01888819+ov[eca09e24]"}
+    md = (out_dir / "gate-power.md").read_text(encoding="utf-8")
+    assert "运行指纹" in md and fp["git_commit"][:12] in md

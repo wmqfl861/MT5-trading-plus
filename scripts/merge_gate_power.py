@@ -187,6 +187,7 @@ META_IDENTITY_KEYS = (
     "phase", "baselines", "null_hypothesis", "null_defaults", "levels",
     "positive_symbols", "initial_capital", "risk_per_trade",
     "g2_random_entry_sims", "g5_bootstrap_sims",
+    "fingerprint",
 )
 
 

@@ -74,9 +74,11 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import itertools
 import json
 import math
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -187,6 +189,34 @@ def load_gates_for_run():
     """加载冻结门槛并把 G2 随机入场降次到实验口径（正式 200 不变）。"""
     cfg, _sha = vgate.load_gates()
     return dataclasses.replace(cfg, random_entry_sims=EXPERIMENT_G2_RANDOM_SIMS)
+
+
+def _run_fingerprint(inputs_by_key: dict, gates_sha: str) -> dict:
+    """T42（R7-N-I1）：运行身份指纹——git 提交、工作区干净位、冻结门槛
+    哈希、各序列成本版本（含点差缓存/越幅/隔夜费 sha）、本脚本字节哈希。
+    记录在产物 meta 里，合并器校验五分片一致；git 不可用时 commit 为空串
+    （合并器按"全部相同"处理，报告如实展示 '?'）。"""
+    repo = Path(__file__).resolve().parents[1]
+    commit, dirty = "", False
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=str(repo),
+            capture_output=True, text=True, timeout=15).stdout.strip()
+        dirty = bool(subprocess.run(
+            ["git", "status", "--porcelain"], cwd=str(repo),
+            capture_output=True, text=True, timeout=15).stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    script = Path(__file__).resolve()
+    return {
+        "git_commit": commit,
+        "git_dirty": dirty,
+        "gates_sha256": str(gates_sha),
+        "cost_versions": {key: str(pack.get("cost_version", "") or "")
+                          for key, pack in sorted(inputs_by_key.items())},
+        "script_sha256": hashlib.sha256(
+            script.read_bytes()).hexdigest(),
+    }
 
 
 def bars_per_day_of(timeframe: str) -> int:
@@ -926,7 +956,21 @@ def render_report(results: dict) -> str:
            if null_mode == "auto" else ""),
         f"- G2 随机入场蒙特卡洛：本实验降至 {meta.get('g2_random_entry_sims', '?')}"
         " 次（正式关卡 200 次不变）",
-        f"- 生成：{meta.get('generated_utc', '?')}（gate_calibration.py）", "",
+        f"- 生成：{meta.get('generated_utc', '?')}（gate_calibration.py）",
+    ]
+    fp = meta.get("fingerprint") or {}
+    if fp:
+        lines += [
+            f"- 运行指纹：git {str(fp.get('git_commit', ''))[:12] or '?'}"
+            + ("（工作区不干净）" if fp.get("git_dirty") else "")
+            + f"；gates[{str(fp.get('gates_sha256', ''))[:12]}]"
+            + f"；脚本[{str(fp.get('script_sha256', ''))[:12]}]",
+            "- 成本版本：" + "; ".join(
+                f"{k} → {v}" for k, v in
+                (fp.get("cost_versions") or {}).items()),
+        ]
+    lines += [
+        "",
         "## 决策规则", "",
         f"真实（校准后）夏普 {DECISION_LEVEL} 档某关卡子检查检出率 "
         f"< {LOW_DETECTION:.0%}，或负对照误报率（**任一零假设**）"
@@ -1101,6 +1145,7 @@ def assemble_experiment(data_root, keys, max_bars=None) -> dict:
         out[key] = {
             "bars": bars,
             "costs": costs,
+            "cost_version": str(_version),
             "sizes": resolve_contract_size(data_root, symbol, None),
             "vols": load_volume_limits(data_root, symbol),
             "timeframe": timeframe,
@@ -1242,6 +1287,8 @@ def main(argv=None) -> int:
     lb_cutoff = load_lockbox_cutoff(args.data_root)
 
     results: dict = {"meta": {
+        "fingerprint": _run_fingerprint(inputs_by_key,
+                                        vgate.load_gates()[1]),
         "phase": args.phase, "seeds": len(seeds), "levels": levels,
         "g2_random_entry_sims": int(g2_sims),
         "null_hypothesis": args.null_hypothesis,
