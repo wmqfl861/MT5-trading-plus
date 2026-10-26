@@ -186,6 +186,12 @@ def test_calibrate_drift_reaches_target(gc, cfg, inputs):
     assert abs(out["achieved_sharpe"] - 1.0) <= 0.35
     assert out["iterations"] <= 6
     assert len(out["history"]) >= 2
+    # N-M1（第七轮复审）：校准记录完整写入——目标/容差/收敛标志/迭代历史
+    assert out["target_sharpe"] == 1.0
+    assert out["tol"] == 0.15
+    assert isinstance(out["converged"], bool)
+    assert out["converged"] == (abs(out["achieved_sharpe"] - 1.0) <= 0.15)
+    assert all({"drift", "sharpe"} <= set(h) for h in out["history"])
 
 
 def test_positive_control_structure_and_detection(gc, cfg, inputs):
@@ -193,8 +199,7 @@ def test_positive_control_structure_and_detection(gc, cfg, inputs):
         "TST", "H1", target_sharpe=1.5, period_days=1, interval_hours=24,
         hold_bars=4, cfg=cfg, seed=0, max_iter=6, tol=0.2,
         initial_capital=10_000.0, risk_fraction=0.005, **inputs)
-    level_cal = {1.5: {"drift": cal["drift"],
-                       "achieved_sharpe": cal["achieved_sharpe"]}}
+    level_cal = {1.5: dict(cal)}          # N-M1：完整校准记录直传（不裁剪）
     setup = ("TST", "H1", level_cal, 1, 24, 4)
     kwargs = dict(levels=[1.5], seeds=[0, 1], cfg=cfg,
                   initial_capital=10_000.0, risk_fraction=0.005, **inputs)
@@ -204,6 +209,13 @@ def test_positive_control_structure_and_detection(gc, cfg, inputs):
     assert det["G0"] == 1.0
     assert 0.0 <= det["G4.deflated_sharpe"] <= 1.0
     assert result["calibration"]["TST H1"]["1.5"]["drift"] == cal["drift"]
+    # N-M1：报告承诺的 calibration.history 等完整记录逐字段进 JSON 产物
+    recorded = result["calibration"]["TST H1"]["1.5"]
+    assert recorded["history"] == cal["history"]
+    assert recorded["target_sharpe"] == 1.5
+    assert recorded["tol"] == 0.2
+    assert recorded["converged"] == cal["converged"]
+    assert recorded["iterations"] == len(cal["history"])
     again = gc.positive_control([setup], **kwargs)
     assert again["runs"] == result["runs"]         # 逐位可复现
 
@@ -282,6 +294,11 @@ def test_cli_quick_end_to_end(gc, inputs, monkeypatch, tmp_path):
         encoding="utf-8"))
     assert payload["meta"]["phase"] == "both"
     assert "negative" in payload and "positive" in payload
+    # N-M1：CLI 产物里的 calibration 是完整校准记录（history/目标/容差/收敛）
+    quick_cal = payload["positive"]["calibration"]["TST H1"]["1.0"]
+    assert {"drift", "achieved_sharpe", "history", "target_sharpe", "tol",
+            "converged", "iterations"} <= set(quick_cal)
+    assert isinstance(quick_cal["converged"], bool)
     md = next(out_dir.glob("*.md")).read_text(encoding="utf-8")
     assert "决策规则" in md
 
@@ -604,7 +621,9 @@ def test_merge_shards_recomputes_rates_and_flags(tmp_path, monkeypatch):
                             "G1.profit_factor": True}}
                 for s in seeds]
         return {"meta": {"seeds": len(seeds), "seeds_from": seeds_from,
-                         "baselines": ["X"],
+                         "baselines": ["X"], "null_hypothesis": "day",
+                         "null_defaults": {"X": "day"}, "levels": [],
+                         "positive_symbols": [], "phase": "negative",
                          "generated_utc": "2026-10-26T00:00:00+00:00"},
                 "negative": {"runs": runs, "by_null": {}, "merged": []},
                 "flags": []}
@@ -649,18 +668,29 @@ def _load_merge_module(tmp_path, monkeypatch, name="merge_gate_power_r6"):
 
 def _real_schema_shard(seeds, *, g5_det_pass, g5_fp_day, g5_fp_slot,
                        cal_drift=1.25):
-    """按 gate_calibration 当前单进程产物的真实 schema 造一个小分片：
+    """按 gate_calibration 当前单进程产物的真实 schema 造一个**条件完整**的
+    小分片（N-I4：合并器从实验设计生成应存在的完整条件清单——夹具本身必须
+    满足设计，删改后才用来构造缺组/错配场景）：
 
-    - negative.runs 带 null；positive.runs 带 setup（detection 的分组键）、
-      calibration 是 {setup: {level: {drift, achieved_sharpe}}} **字典**；
+    - negative.runs 带 null：baselines（H009-Sample，缺省 slot）× both 模式
+      两种零假设 + 每个正对照品种的 RND@{key} × 两种零假设；
+    - positive.runs 带 setup（detection 的分组键）× levels；
+      calibration 是 {setup: {level: 完整校准记录}} **字典**（N-M1 起带
+      history/target/tol/converged）；
     - g5.runs 带 setup/arm/null（arm="detection"|"false_positive"，
-      误报臂 null 区分 day/slot 两种零假设）。
+      误报臂 null 区分 day/slot 两种零假设）× levels × 全部臂。
     """
-    neg = [{"name": "H009-Sample", "seed": s, "null": "slot",
-            "sharpe": 0.1, "net_profit": 1.0, "trade_count": 10,
-            "passed_all": True,
-            "checks": {"G0": True, "G1.profit_factor": True}}
-           for s in seeds]
+
+    def neg_run(name, null, s):
+        return {"name": name, "seed": s, "null": null,
+                "sharpe": 0.1, "net_profit": 1.0, "trade_count": 10,
+                "passed_all": True,
+                "checks": {"G0": True, "G1.profit_factor": True}}
+
+    neg = [neg_run("H009-Sample", null, s)
+           for null in ("slot", "day") for s in seeds]
+    neg += [neg_run("RND@TST H1", null, s)
+            for null in ("slot", "day") for s in seeds]
     pos = [{"setup": "TST H1", "level": 1.0, "seed": s, "drift": cal_drift,
             "sharpe": 1.0, "net_profit": 5.0, "trade_count": 40,
             "passed_all": True,
@@ -686,20 +716,30 @@ def _real_schema_shard(seeds, *, g5_det_pass, g5_fp_day, g5_fp_slot,
     return {
         "meta": {"phase": "both", "seeds": len(seeds), "seeds_from": min(seeds),
                  "levels": [1.0], "g2_random_entry_sims": 50,
-                 "null_hypothesis": "both", "initial_capital": 100000.0,
+                 "null_hypothesis": "both",
+                 "null_defaults": {"H009-Sample": "slot"},
+                 "initial_capital": 100000.0,
                  "risk_per_trade": 0.005, "max_bars": None,
                  "baselines": ["H009-Sample"], "positive_symbols": ["TST H1"],
                  "g5_bootstrap_sims": 200, "generated_utc":
                      "2026-10-26T00:00:00+00:00"},
-        "negative": {"runs": neg, "by_null": {"slot": {"G0": 1.0}},
+        "negative": {"runs": neg,
+                     "by_null": {"slot": {"G0": 1.0}, "day": {"G0": 1.0}},
                      "false_positive_rates": {"G0": 1.0},
                      "merged": [], "merged_pass_rates": {}},
         "positive": {
             "runs": pos,
             "detection_rates": {"TST H1": {"1.0": {
                 "G0": 1.0, "G1.profit_factor": 1.0}}},
-            "calibration": {"TST H1": {"1.0": {"drift": cal_drift,
-                                               "achieved_sharpe": 1.02}}}},
+            "calibration": {"TST H1": {"1.0": {
+                "drift": cal_drift, "achieved_sharpe": 1.02,
+                "target_sharpe": 1.0, "tol": 0.15, "converged": True,
+                "iterations": 3, "max_iter": 6,
+                "history": [{"drift": 0.0, "sharpe": -0.1,
+                             "trade_count": 30, "net_profit": -2.0},
+                            {"drift": cal_drift, "sharpe": 1.02,
+                             "trade_count": 40, "net_profit": 5.0}]}}},
+        },
         "g5": {"runs": g5, "detection_rates": {}, "false_positive_rates": {},
                "window_bars": {"TST H1": 600}, "bootstrap_sims": 200,
                "design": "synthetic"},
@@ -794,6 +834,89 @@ def test_merge_rejects_actual_seed_defects(tmp_path, monkeypatch, capsys):
     d_extra = write("extra", extra)
     assert mm.main(["--shards", f"{good},{d_extra}", "--out", str(out)]) == 1
     assert "声明段外" in capsys.readouterr().out
+
+
+def test_merge_rejects_whole_missing_condition_group(tmp_path, monkeypatch,
+                                                     capsys):
+    """N-I4（第七轮复审）失败测试：删掉某分片一整个实验条件组（正对照
+    TST H1 × level=1.0 的全部记录）→ 拒绝合并并列出该条件。
+
+    旧实现只遍历"已出现的组"：整组缺样时该组根本不进校验，种子校验通过、
+    合并照常出产物（复现基线）。新实现从实验设计（meta）生成应存在的完整
+    条件清单，缺任一条件组即拒绝。"""
+    mm = _load_merge_module(tmp_path, monkeypatch, name="merge_gate_power_ni4")
+
+    def write(dirname, shard):
+        d = tmp_path / dirname
+        d.mkdir(exist_ok=True)
+        (d / "gate-power.json").write_text(json.dumps(shard, ensure_ascii=False),
+                                           encoding="utf-8")
+        return d
+
+    good = write("good", _real_schema_shard([0, 1], g5_det_pass=True,
+                                            g5_fp_day=False, g5_fp_slot=False))
+    out = tmp_path / "merged"
+
+    # 1) 整组缺样：分片 s1 删掉全部正对照记录（TST H1 × level=1.0）
+    lost = _real_schema_shard([2, 3], g5_det_pass=True, g5_fp_day=False,
+                              g5_fp_slot=False)
+    lost["positive"]["runs"] = []
+    d_lost = write("lost", lost)
+    assert mm.main(["--shards", f"{good},{d_lost}", "--out", str(out)]) == 1
+    text = capsys.readouterr().out
+    assert "'positive'" in text and "TST H1" in text and "1.0" in text
+    assert "整组" in text
+    assert not (out / "gate-power.json").exists()
+
+    # 2) 同理：G5 检出臂整组删除（null 条件组）也要拒绝并列出
+    lost_g5 = _real_schema_shard([2, 3], g5_det_pass=True, g5_fp_day=False,
+                                 g5_fp_slot=False)
+    lost_g5["g5"]["runs"] = [r for r in lost_g5["g5"]["runs"]
+                             if r["arm"] != "detection"]
+    d_g5 = write("lost_g5", lost_g5)
+    assert mm.main(["--shards", f"{good},{d_g5}", "--out", str(out)]) == 1
+    text = capsys.readouterr().out
+    assert "'g5'" in text and "detection" in text
+    assert not (out / "gate-power.json").exists()
+
+
+def test_merge_rejects_meta_identity_mismatch(tmp_path, monkeypatch, capsys):
+    """N-I4（第七轮复审）失败测试：分片 meta 的实验身份——levels、零假设
+    配置、资金/风险参数、G2/G5 模拟次数——不一致 → 拒绝合并（不同实验的
+    runs 不能拼成同一实验的汇总；旧实现只比 baselines）。"""
+    mm = _load_merge_module(tmp_path, monkeypatch, name="merge_gate_power_ni4b")
+
+    def write(dirname, shard):
+        d = tmp_path / dirname
+        d.mkdir(exist_ok=True)
+        (d / "gate-power.json").write_text(json.dumps(shard, ensure_ascii=False),
+                                           encoding="utf-8")
+        return d
+
+    base = _real_schema_shard([0, 1], g5_det_pass=True, g5_fp_day=False,
+                              g5_fp_slot=False)
+    d1 = write("s1", base)
+    out = tmp_path / "merged"
+
+    for key, bad_value in (
+            ("levels", [0.6, 1.0]),
+            ("null_hypothesis", "auto"),
+            ("initial_capital", 50000.0),
+            ("risk_per_trade", 0.01),
+            ("g2_random_entry_sims", 200),
+            ("g5_bootstrap_sims", 2000),
+            ("positive_symbols", ["TST H1", "TST2 M5"])):
+        other = _real_schema_shard([2, 3], g5_det_pass=True, g5_fp_day=False,
+                                   g5_fp_slot=False)
+        other["meta"][key] = bad_value
+        d2 = write("s2", other)
+        assert mm.main(["--shards", f"{d1},{d2}", "--out", str(out)]) == 1, key
+        assert key in capsys.readouterr().out
+    # 一致的身份 + 不相交种子 → 仍可正常合并（对照组）
+    d_ok = write("s2", _real_schema_shard([2, 3], g5_det_pass=True,
+                                          g5_fp_day=False, g5_fp_slot=False))
+    assert mm.main(["--shards", f"{d1},{d_ok}", "--out", str(out)]) == 0
+    assert (out / "gate-power.json").is_file()
 
 
 def test_merge_repo_root_requires_env_when_copied(tmp_path, monkeypatch):

@@ -20,6 +20,7 @@ from datetime import datetime
 import pandas as pd
 
 from mt5gw.models import (
+    DEAL_REASON_CLIENT,
     DEAL_REASON_EXPERT,
     DEAL_REASON_SL,
     AccountState,
@@ -176,6 +177,30 @@ class FakeBroker:
                           side="sell" if pos.side == "buy" else "buy",
                           volume=pos.volume, price=pos.price_current,
                           profit=profit, comment=comment, magic=pos.magic,
+                          position_id=ticket, reason=reason)
+
+    def reduce_external(self, ticket: int, volume: float, *, profit: float = 0.0,
+                        comment: str = "manual",
+                        reason: int = DEAL_REASON_CLIENT) -> None:
+        """外部部分减仓（人工）：不走执行器，余量保留同一 ticket，流水如实记账。
+
+        N-C1/R7：驱动"人工减仓（ticket 仍在，不是出场事件）→ 确认 →
+        再全平（ticket 消失，才是出场事件）"的复现序列。全平请用
+        close_external（volume 须严格小于持仓余量）。
+        """
+        pos = self._take_position(ticket)
+        vol = round(float(volume), 8)
+        if vol <= 1e-9 or vol >= pos.volume - 1e-9:
+            raise ValueError(
+                f"减仓量 {vol} 须在 (0, {pos.volume}) 内（全平用 close_external）")
+        remaining = round(pos.volume - vol, 8)
+        self._replace_position(dataclasses.replace(pos, volume=remaining))
+        self.balance += profit
+        exit_price = self.bid if pos.side == "buy" else self.ask
+        self._record_deal(entry="out",
+                          side="sell" if pos.side == "buy" else "buy",
+                          volume=vol, price=exit_price, profit=profit,
+                          comment=comment, magic=pos.magic,
                           position_id=ticket, reason=reason)
 
     def remove_position(self, ticket: int) -> None:

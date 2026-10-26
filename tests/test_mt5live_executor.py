@@ -498,9 +498,8 @@ def test_r6_flatten_cancels_pendings_before_ack(tmp_path):
 def test_r6_unexplained_exit_blocks_reopen_until_ack(tmp_path):
     """C2 复现 B 反转（执行器层）：人工平仓（CLIENT）→ 未决出场持久化；
     immediate 同向信号也不重开（先于对账运行，不依赖 pause）；
-    live_ack_external 确认（cause=ack_external）后恢复。平仓腿不受限。"""
+    live_ack_external 确认（绑定该事件）后恢复。平仓腿不受限。"""
     from mt5gw.models import DEAL_REASON_CLIENT
-    from mt5live.reconcile import STATUS_CONFIRMED, Intent, write_intent
 
     b = FakeBroker()
     ex = _mk_executor(b, tmp_path)
@@ -543,10 +542,10 @@ def test_r6_unexplained_exit_blocks_reopen_until_ack(tmp_path):
     assert b.positions() == []
     assert len(b.market_orders) == 1                      # 仍无新开仓
 
-    # 人工确认（live_ack_external 的落盘效果：confirmed + cause=ack_external）
-    write_intent(str(tmp_path / f"expected-{MAGIC}.json"),
-                 Intent(b.symbol, MAGIC, "buy", 0.0, STATUS_CONFIRMED,
-                        "ack_external", NOW.replace(minute=50)))
+    # 人工确认（live_ack_external 的落盘效果，N-C1/R7 绑定协议：绑定
+    # 未决事件 ticket + 确认时刻 + 净仓快照 0——此刻实际空仓）
+    _write_ack_external_intent(tmp_path, tickets=(ticket,), net=0.0,
+                               positions=[], now=NOW.replace(minute=50))
     rr2 = ex.poll(mk_decision(signal=1, volume_lots=0.02,
                               decision_id="XAUUSD|M15|d5"),
                   NOW.replace(minute=51))
@@ -559,9 +558,8 @@ def test_r6_unexplained_exit_blocks_reopen_until_ack(tmp_path):
 
 def test_r6_pending_exit_survives_restart_and_deal_query_failure(tmp_path):
     """C2：未决出场跨重启持久化；成交查询持续失败也保持未决（fail-closed），
-    人工 ack 仍能解除。"""
+    人工 ack（绑定协议）仍能解除。"""
     from mt5gw.models import DEAL_REASON_CLIENT
-    from mt5live.reconcile import STATUS_CONFIRMED, Intent, write_intent
 
     b = FakeBroker()
     ex = _mk_executor(b, tmp_path)
@@ -590,10 +588,179 @@ def test_r6_pending_exit_survives_restart_and_deal_query_failure(tmp_path):
                        .read_text(encoding="utf-8"))
     assert str(ticket) in state["pending_external_exits"]
 
-    # 人工确认 → 解除
-    write_intent(str(tmp_path / f"expected-{MAGIC}.json"),
-                 Intent(b.symbol, MAGIC, "buy", 0.0, STATUS_CONFIRMED,
-                        "ack_external", NOW.replace(minute=40)))
+    # 人工确认（绑定协议）→ 解除
+    _write_ack_external_intent(tmp_path, tickets=(ticket,), net=0.0,
+                               positions=[], now=NOW.replace(minute=40))
     assert ex2.poll(mk_decision(signal=1, volume_lots=0.02,
                                 decision_id="XAUUSD|M15|d4"),
                     NOW.replace(minute=41)).action == "open"
+
+
+# ================================================================ R7（第七轮审核）
+# C1 残留：净零残仓——多空各留 0.08 时净额恰 0，不得判全平完成
+# N-C1：人工确认绑定事件——旧确认不得放行确认之后的新出场
+
+def _write_ack_external_intent(tmp_path, *, tickets, net: float,
+                               positions, now) -> None:
+    """模拟 scripts/live_ack_external.py 的落盘效果（N-C1/R7 确认绑定协议）。
+
+    与脚本写出同一 JSON 形状（意图 7 字段 + confirmed_events 绑定）——
+    集成测试用真脚本核对形状不漂移。"""
+    from mt5live.fileio import write_json_atomic
+    from mt5live.monitor import iso_utc
+    from mt5live.reconcile import STATUS_CONFIRMED
+
+    write_json_atomic(str(tmp_path / f"expected-{MAGIC}.json"), {
+        "symbol": "XAUUSD", "magic": MAGIC,
+        "side": "buy" if net >= 0 else "sell", "volume": abs(net),
+        "status": STATUS_CONFIRMED, "cause": "ack_external",
+        "ts": iso_utc(now),
+        "confirmed_events": {
+            "tickets": sorted(int(t) for t in tickets),
+            "confirmed_at": iso_utc(now),
+            "net_volume": float(net),
+            "positions": list(positions),
+        },
+    })
+
+
+def test_r7_flatten_net_zero_residual_positions_not_acked(tmp_path):
+    """C1 残留复现：多空各 0.16 对冲仓全平、每笔只成一半 → 多空各残留
+    0.08、净额恰为 0——按净额判完成会写完成 ack（归档=全员真完成的语义
+    被打破）。正确判据是持仓明细：明细非空 → 不写 ack、写残仓告警，
+    下一轮继续平，明细清零后才写 ack。"""
+    from mt5live.commands import archive_if_all_acked, read_ack, write_flatten
+
+    b = FakeBroker()
+    b.seed_position(side="buy", volume=0.16, magic=MAGIC)
+    b.seed_position(side="sell", volume=0.16, magic=MAGIC)
+    ex = _mk_executor(b, tmp_path)
+    cmd = write_flatten(str(tmp_path), reason="daily_loss_cap", now=NOW)
+
+    b.partial_fill = 0.5                      # 每笔平仓请求只成一半
+    rr1 = ex.poll(mk_decision(signal=1, volume_lots=0.16), NOW)
+    assert rr1.action == "flatten"
+    leftovers = b.positions()
+    assert len(leftovers) == 2                # 多空各残留 0.08
+    assert sum(p.volume if p.side == "buy" else -p.volume
+               for p in leftovers) == pytest.approx(0.0)   # 净额恰为 0
+    # 净零但明细非空 → 残仓：不得写完成 ack（读不出 → None）
+    assert read_ack(str(tmp_path), MAGIC) is None
+    assert "FLATTEN_RESIDUAL" in (tmp_path / "alerts.log").read_text(
+        encoding="utf-8")
+    assert archive_if_all_acked(str(tmp_path), {MAGIC},
+                                NOW.replace(minute=10)) is False
+    assert (tmp_path / "commands" / "flatten.json").exists()
+
+    # 下一轮继续消费同一条指令（不得 flatten_acked）：残仓被平掉、
+    # 明细清零才写 ack，两次之后才归档
+    b.partial_fill = None
+    rr2 = ex.poll(mk_decision(signal=1, volume_lots=0.16,
+                              decision_id="XAUUSD|M15|d2"),
+                  NOW.replace(minute=15))
+    assert rr2.action == "flatten"
+    assert b.positions() == []
+    ack = read_ack(str(tmp_path), MAGIC)
+    assert ack is not None and ack.id == cmd.id
+    assert archive_if_all_acked(str(tmp_path), {MAGIC},
+                                NOW.replace(minute=30)) is True
+
+
+def test_r7_nc1_old_ack_cannot_release_new_external_exit(tmp_path):
+    """N-C1 复现序列：开 0.16 → 人工减至 0.08 并确认（绑定空事件集、
+    净仓快照 0.08）→ 无订单轮保留 cause=ack_external → 再次人工平掉余仓
+    → 执行器先于对账运行——旧确认不得放行新出场（旧实现 action=open
+    重开 0.16 是复现基线），必须 blocked_external_exit；再次人工确认
+    （这次绑定新事件）后恢复开仓。"""
+    from mt5gw.models import DEAL_REASON_CLIENT
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.16,
+                               decision_id="XAUUSD|M15|d1"), NOW).action == "open"
+    ticket = b.positions()[0].ticket
+
+    # 人工减仓至 0.08（ticket 仍在 → 不是出场事件）→ 无订单轮（hold，
+    # 意图不被改写）
+    b.reduce_external(ticket, 0.08, profit=2.0, comment="manual",
+                      reason=DEAL_REASON_CLIENT)
+    rr_hold = ex.poll(mk_decision(signal=1, volume_lots=0.16,
+                                  decision_id="XAUUSD|M15|d2"),
+                      NOW.replace(minute=15))
+    assert rr_hold.action == "hold"
+    assert len(b.market_orders) == 1
+
+    # 人工确认（N-C1/R7 协议：绑定被确认事件集合+确认时刻+净仓快照；
+    # 此刻无未决出场 → 绑定空集、快照 0.08）
+    _write_ack_external_intent(tmp_path, tickets=(), net=0.08,
+                               positions=[{"ticket": ticket, "side": "buy",
+                                           "volume": 0.08}],
+                               now=NOW.replace(minute=20))
+
+    # 无订单轮：意图保留 cause=ack_external（hold 不改写意图）
+    rr_hold2 = ex.poll(mk_decision(signal=1, volume_lots=0.16,
+                                   decision_id="XAUUSD|M15|d3"),
+                       NOW.replace(minute=30))
+    assert rr_hold2.action == "hold"
+    assert read_intent(tmp_path)["cause"] == "ack_external"
+
+    # 再次人工平掉余仓 → 执行器先于对账运行：新出场事件不被旧确认放行
+    b.close_external(ticket, profit=1.0, comment="manual",
+                     reason=DEAL_REASON_CLIENT)
+    rr = ex.poll(mk_decision(signal=1, volume_lots=0.16,
+                             decision_id="XAUUSD|M15|d4"),
+                 NOW.replace(minute=45))
+    assert rr.action == "blocked_external_exit"
+    assert len(b.market_orders) == 1                     # 没有重开 0.16
+    state = json.loads((tmp_path / f"state-{MAGIC}.json")
+                       .read_text(encoding="utf-8"))
+    assert str(ticket) in state["pending_external_exits"]  # 事件回到未决
+
+    # 再次人工确认（这次绑定新事件 ticket、快照=空仓）→ 解除防线恢复开仓
+    _write_ack_external_intent(tmp_path, tickets=(ticket,), net=0.0,
+                               positions=[], now=NOW.replace(minute=50))
+    rr2 = ex.poll(mk_decision(signal=1, volume_lots=0.16,
+                              decision_id="XAUUSD|M15|d5"),
+                  NOW.replace(minute=51))
+    assert rr2.action == "open"
+    assert len(b.market_orders) == 2
+    state2 = json.loads((tmp_path / f"state-{MAGIC}.json")
+                        .read_text(encoding="utf-8"))
+    assert state2["pending_external_exits"] == {}
+
+
+def test_r7_ack_without_event_binding_does_not_release(tmp_path):
+    """N-C1 fail-closed：旧格式确认（cause=ack_external 但无 confirmed_events
+    绑定）不得放行任何未决出场——永久有效的裸确认字符串正是原缺陷。"""
+    from mt5gw.models import DEAL_REASON_CLIENT
+    from mt5live.reconcile import STATUS_CONFIRMED, Intent, write_intent
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d1"), NOW).action == "open"
+    ticket = b.positions()[0].ticket
+    b.close_external(ticket, profit=5.0, comment="manual",
+                     reason=DEAL_REASON_CLIENT)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d2"),
+                   NOW.replace(minute=15)).action == "blocked_external_exit"
+
+    # 旧格式确认（无绑定）：意图 confirmed + cause=ack_external 落盘
+    write_intent(str(tmp_path / f"expected-{MAGIC}.json"),
+                 Intent(b.symbol, MAGIC, "buy", 0.0, STATUS_CONFIRMED,
+                        "ack_external", NOW.replace(minute=20)))
+    rr = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                             decision_id="XAUUSD|M15|d3"),
+                 NOW.replace(minute=21))
+    assert rr.action == "blocked_external_exit"          # 不放行
+    state = json.loads((tmp_path / f"state-{MAGIC}.json")
+                       .read_text(encoding="utf-8"))
+    assert str(ticket) in state["pending_external_exits"]
+
+    # 绑定协议的确认才解除
+    _write_ack_external_intent(tmp_path, tickets=(ticket,), net=0.0,
+                               positions=[], now=NOW.replace(minute=30))
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d4"),
+                   NOW.replace(minute=31)).action == "open"

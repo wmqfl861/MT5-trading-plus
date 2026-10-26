@@ -464,6 +464,9 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
     /品种不覆盖 → overshoot_model=None 保持 A-1.5 行为，版本串标
     no-overshoot。cost_model_version 纳入模型内容 sha 前 8 位、采样口径与
     越幅表 sha——不同缓存内容必产生不同版本串（台账去重据此区分成本假设）。
+    R7/I2 残留：swap 标签并入**实际费率身份** swap[sha 前 8 位]（per-symbol
+    规则摘要：long/short 每夜费率 + 三倍日）——calibrated 实测费率或快照
+    推算费率任何变化都改变版本串（此前费率 -1 与 -10 的版本串完全相同）。
 
     返回 (costs, cost_version)。佣金优先 calibrated 实测，其次 CLI 显式值；
     隔夜费优先 calibrated 实测费率（free_of_swap=true 属合法实测零费），其次
@@ -580,6 +583,20 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
     else:
         miss_tag = ""
     sess_tag = f"-sess[{sessions_sha[:8]}]" if sessions_sha else ""
+
+    # ---- R7/I2 残留：swap 实际费率身份入版本串 ----
+    # SwapModel 的 per-symbol 规则摘要（每品种 long/short 每夜费率 + 三倍日）
+    # 规范化序列化后 sha 前 8 位——费率 -1 改 -10（费用随之变化）版本串必
+    # 变；calibrated 实测、快照推算、显式零各路径的费率都流经这里。
+    # 计费时刻（17:00 America/New_York）是 SwapRule 常量默认，不随配置漂移。
+    _rule = swap.rule(symbol)
+    swap_digest8 = canonical_json_sha256({
+        symbol: {"long_per_night": float(_rule.long_per_day),
+                 "short_per_night": float(_rule.short_per_day),
+                 "triple_weekdays": sorted(int(d)
+                                           for d in _rule.triple_weekdays)},
+    })[:8]
+    swap_tag = f"{swap_tag}[{swap_digest8}]"
 
     # ---- T36/R6（C4）：缓存命中时装载越幅表并注入 Costs ----
     overshoot_model = None

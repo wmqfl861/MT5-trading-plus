@@ -36,8 +36,9 @@ from mt5live.commands import (
 )
 from mt5live.fileio import append_jsonl, write_json_atomic
 from mt5live.gate import ORDER_LOG_MAGIC_FMT, LiveSizer, RiskGate, alert_reject
-from mt5live.monitor import append_alert, iso_utc, naive_utc
+from mt5live.monitor import append_alert, iso_utc, naive_utc, parse_iso
 from mt5live.reconcile import (
+    DEFAULT_VOLUME_TOLERANCE,
     INTENT_FILE_FMT,
     STATUS_CONFIRMED,
     STATUS_PENDING,
@@ -329,8 +330,12 @@ class ExecutionAdapter:
 #   写告警（ALERT_EXTERNAL_EXIT），交给对账进程；
 # - 存在未解释外部出场（pending 非空）时**本 magic 停止开新仓**（平仓
 #   照常；action=blocked_external_exit），直到解释成功或 live_ack_external
-#   人工确认（意图 cause=ack_external）——这是闸门 read_pause 之外的
-#   第二道防线（C2/R6：不依赖对账进程稍后写 pause，先于对账运行也生效）；
+#   人工确认——这是闸门 read_pause 之外的第二道防线（C2/R6：不依赖对账
+#   进程稍后写 pause，先于对账运行也生效）。**N-C1/R7 起确认必须绑定
+#   事件**：live_ack_external 在意图文件附 confirmed_events（被确认的
+#   ticket 集合+确认时刻+确认时实际净持仓快照），执行器只清空绑定覆盖
+#   且确认后世界未变的事件——裸 cause=ack_external 不再永久放行后续
+#   新出场（旧确认放行新事件即原缺陷）；
 # - 开仓/反手的开仓腿先过 RiskGate.check_open（C1）；拒绝 → 不下单，
 #   原因写心跳 last_error（调用方）与 alerts.log（ALERT_RISK_REJECT）；
 #   平仓不受限；
@@ -461,11 +466,13 @@ class LiveExecutor:
         #    人工/未知 → 持久化为未决出场，交给对账进程；C2/R6）
         blocked = self._sync_external_exits(n)
 
-        # 2b) 人工确认（C2/R6）：live_ack_external 已把意图登记为
-        #     confirmed+ack_external → 未决外部出场视为已确认，解除防线
-        if (self._state["pending_external_exits"]
-                and self._external_exit_ack_confirmed()):
-            self._state["pending_external_exits"] = {}
+        # 2b) 人工确认（C2/R6 引入；N-C1/R7 改为**事件绑定**消费）：
+        #     live_ack_external 落盘的确认附带 confirmed_events（被确认的
+        #     ticket 集合+确认时刻+确认时实际净持仓快照）——只有绑定
+        #     覆盖的未决出场才被清空；确认之后新出现的消失回到 pending，
+        #     不得被旧确认放行（裸 cause=ack_external 永久有效是原缺陷）
+        if self._state["pending_external_exits"]:
+            self._consume_external_ack()
 
         if decision is not None:
             # 3) after_signal_change：信号离开禁入方向 → 解禁
@@ -698,25 +705,29 @@ class LiveExecutor:
         self._write_pending(0.0, cause, n)    # 意图：全平在途（T30 cause 衔接）
         positions = self._adapter.positions()
         outcomes = self._adapter.flatten_all()
-        # C1/R6：close_all 返回 ≠ 全平完成——重查持仓与挂单，均清零才写
-        # 完成 ack（判据看持仓明细，不凭净额为零或"订单已回"）
-        residual = self._adapter.net_volume()
+        # C1/R6+R7：close_all 返回 ≠ 全平完成——重查**持仓明细与挂单**，
+        # 均清零才写完成 ack。净额为零不等于空仓（C1 残留）：多空各残留
+        # 0.08 手时净额恰为 0，按净额判完成会把残仓当全平、归档随之发生；
+        # 净零但明细非空 → 视为残仓，与部分成交同路径继续消费
+        leftover_positions = self._adapter.positions()
         leftover_pendings = self._adapter.pending_orders()
-        if abs(residual) <= _EPS and not leftover_pendings:
+        if not leftover_positions and not leftover_pendings:
             write_ack(self._live_dir, self._magic, cmd_id,
                       closed=len(positions), now=n)
             self._state["blocked_dir"] = 0   # 全平后禁入状态清零（无持仓可禁）
             self._write_confirmed(cause, n)
         else:
-            # 残仓（部分成交）/ 撤单失败：不写完成 ack——下一轮继续消费
-            # 同一条指令直到清零；意图如实=当前残仓净额
+            # 残仓（部分成交/对冲残仓）/ 撤单失败：不写完成 ack——下一轮
+            # 继续消费同一条指令直到明细清零；意图如实=当前残仓净额
+            residual = self._adapter.net_volume()
             self._write_confirmed(cause, n)
             append_alert(
                 self._live_dir, ALERT_FLATTEN_RESIDUAL,
                 f"magic {self._magic} 全平指令 {cmd_id or '<读不出>'} 执行后"
-                f"仍有残仓 {residual:+.2f} 手、挂单 {len(leftover_pendings)}"
-                "张（部分成交/撤单失败）——不写完成 ack，下一轮继续平仓"
-                "直到清零；归档在此之前不会发生", n)
+                f"仍有持仓 {len(leftover_positions)} 张（净 {residual:+.2f}"
+                f" 手）、挂单 {len(leftover_pendings)} 张（部分成交/撤单失败）"
+                "——不写完成 ack，下一轮继续平仓直到清零；归档在此之前"
+                "不会发生", n)
         self._finish(n, decision_id=None, orders=outcomes)
         return RoundReport(
             action="flatten", decision_id=None, net_before=net_before,
@@ -830,18 +841,70 @@ class LiveExecutor:
                 str(d.reason) for d in closing))
         return None, "查不到平仓成交"
 
-    def _external_exit_ack_confirmed(self) -> bool:
-        """live_ack_external 的人工确认已落盘（意图 confirmed 且
-        cause=ack_external）→ 未决外部出场视为已确认（C2/R6 解除防线的
-        另一条路，与"解释成功"并列）。"""
+    def _read_external_ack(self):
+        """读 live_ack_external 的确认绑定（N-C1/R7）：意图 confirmed 且
+        cause=ack_external，且附 confirmed_events——{"tickets": 被确认的
+        ticket 集合, "confirmed_at": 确认时刻, "net_volume": 确认时实际
+        净持仓快照}。
+
+        旧格式（无 confirmed_events）→ None：裸 cause 字符串不构成对任何
+        事件的授权（fail-closed）。返回 None 或
+        (tickets: set[int], confirmed_at: datetime, net_volume: float)。
+        """
         try:
             with open(self._intent_path, encoding="utf-8") as f:
                 data = json.load(f)
         except (OSError, ValueError):
-            return False
-        return (isinstance(data, dict)
+            return None
+        if not (isinstance(data, dict)
                 and data.get("status") == STATUS_CONFIRMED
-                and data.get("cause") == "ack_external")
+                and data.get("cause") == "ack_external"):
+            return None
+        ev = data.get("confirmed_events")
+        if not isinstance(ev, dict):
+            return None                  # 无绑定：不放行任何未决事件
+        try:
+            tickets = {int(t) for t in ev.get("tickets") or ()}
+            confirmed_at = parse_iso(str(ev["confirmed_at"]))
+            net_volume = float(ev["net_volume"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return tickets, confirmed_at, net_volume
+
+    def _consume_external_ack(self) -> None:
+        """消费人工确认绑定（N-C1/R7）——仅清空**同时**满足以下条件的
+        未决出场项：
+
+        - ticket ∈ confirmed_events.tickets（人工核对过这个出场）；
+        - 事件登记时刻 ≤ 确认时刻（确认之后新出现的消失不被旧确认放行）；
+        - 当前实际净持仓 == 确认时刻快照（确认以来世界没再变——变了就
+          要重新人工核对，这份确认不再描述当前世界）。
+
+        任一条件不满足 → 该项保留在 pending（开仓防线继续生效）。
+        查询失败/字段损坏 → 不清（fail-closed）。
+        """
+        ack = self._read_external_ack()
+        if ack is None:
+            return
+        tickets, confirmed_at, net_at_ack = ack
+        pending = self._state["pending_external_exits"]
+        if not pending:
+            return
+        try:
+            net_now = self._adapter.net_volume()
+        except Exception:
+            return                      # 持仓查询失败：不凭旧快照放行
+        if abs(net_now - net_at_ack) > DEFAULT_VOLUME_TOLERANCE:
+            return                      # 确认后持仓又变：需重新确认
+        for ticket in sorted(pending):
+            if ticket not in tickets:
+                continue
+            try:
+                event_ts = parse_iso(str(pending[ticket].get("ts", "")))
+            except (TypeError, ValueError):
+                continue                # 事件时间不可判：不凭旧确认放行
+            if event_ts <= confirmed_at:
+                del pending[ticket]
 
     def _sync_external_exits(self, n: datetime) -> int:
         """每轮开头：外部出场状态机（T30/C1 + C2/R6）。

@@ -294,8 +294,23 @@ class RiskGate:
                 False, f"reconcile_paused: 全局人工暂停（pause.json，"
                 f"{manual.reason or '原因见文件'}），暂停开仓")
 
-        # 1) 组装 RiskState（各来源缺数据 → 检查器 missing_data 拒单）
-        positions = tuple(self._account.positions())
+        # 1) 组装 RiskState（各来源缺数据 → 检查器 missing_data 拒单）。
+        #    R7/N-C2 一致快照：账户提供 snapshot()（paper 目录聚合视图
+        #    PaperAccountView——live_runner 的 --paper 装配）→ **单次**调用取
+        #    同一版本的持仓+当日成交：两次独立查询之间落盘的平仓不会被
+        #    同时计为浮亏与已实现；聚合读失败（状态文件存在但读不出）
+        #    经异常如实上抛（执行器 risk_gate_error fail-closed）。
+        #    其他账户（真终端 mt5gw / 测试替身）退回逐查询（同进程内存
+        #    一致，无跨文件双计问题）。
+        day_start = n.replace(hour=0, minute=0, second=0, microsecond=0)
+        snap_fn = getattr(self._account, "snapshot", None)
+        if callable(snap_fn):
+            snap = snap_fn()
+            positions = snap.positions
+            deals = tuple(d for d in snap.deals if day_start <= d.time <= n)
+        else:
+            positions = tuple(self._account.positions())
+            deals = tuple(self._account.deals(day_start, n))
         contract_sizes = load_contract_sizes(self._specs_path)
         quotes: dict[str, tuple[float, float]] = {}
         for sym in {p.symbol for p in positions} | {symbol}:
@@ -303,8 +318,6 @@ class RiskGate:
             quotes[sym] = (float(q.bid), float(q.ask))
         prices = {s: (b + a) / 2.0 for s, (b, a) in quotes.items()}
         recent = read_recent_order_times(self._live_dir, n)
-        day_start = n.replace(hour=0, minute=0, second=0, microsecond=0)
-        deals = tuple(self._account.deals(day_start, n))
         realized, floating = daily_pnl(deals, positions)
         state = RiskState(
             positions=positions, contract_sizes=contract_sizes, prices=prices,

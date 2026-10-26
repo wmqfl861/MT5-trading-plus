@@ -113,7 +113,7 @@
 - 删除"由计划任务平仓"这句提示，或真的加上平仓计划任务——二选一，按实际写。
 
 **失败测试先行：**
-- [x] 2026-07-15 22:30 UTC 与 2026-07-16 01:30 UTC 的 EURUSD 允许开仓（探针 P11 反转）——`tests/test_mt5data_sessions.py::test_repo_policy_p11_reversal_eurusd`（提交 dd42fea）；全季节复核证据另见 rollover-dst §3.2.1（第六轮 I7，302,947 个分钟首笔样本）
+- [x] 2026-07-15 22:30 UTC 与 2026-07-16 01:30 UTC 的 EURUSD 允许开仓（探针 P11 反转）——`tests/test_mt5data_sessions.py::test_repo_policy_p11_reversal_eurusd`（提交 dd42fea）；全季节复核证据另见 rollover-dst §3.2.1（第六轮 I7，302,947 个分钟首笔样本）；R7 复核：I7 判"已修，限已观测范围"（10 月欧洲先切窗声明已撤回，全年外推保留边界）
 - [x] 扩展窗 > 3 小时且无 `allow_long_window` → 拒绝加载——`test_mt5data_sessions.py::test_extended_window_over_3h_rejected_without_flag`、`::test_load_policy_rejects_long_window_and_reads_flag`（dd42fea）
 - [x] `measure_rollover` 在合成 K 线上（构造 21:00 与 22:00 两种空档）判定正确——`tests/test_measure_rollover.py::test_judge_follows_new_york_on_synthetic_bars`、`::test_judge_follows_europe_on_synthetic_bars`、`::test_lockbox_window_skipped_without_ops_ack`（dd42fea）
 - [x] `watch_swap` 在 FakeBroker 上：swap 字段在 21:00 变化 → 记录 1 行，时刻正确——`tests/test_watch_swap.py::test_swap_change_at_2100_records_exactly_one_row`、`::test_state_persists_across_watcher_instances`（dd42fea）
@@ -176,6 +176,11 @@ def write_pause(live_dir: str, magic: int, *, paused: bool, reason: str | None,
 > 第六轮审核注记（R6）：上述正常路径全绿，但成交历史延迟/查询失败、执行器先于
 > 对账的人工出场竞态仍未闭环（R6-C2），探针 P8 已按双调度顺序改写复核。
 
+> 第七轮复核注记（R7，2026-10-26）：R7-C2 判"部分"——未决事件持久化、历史延迟重查、
+> 执行器先于对账时阻止重开均已补；但执行器只凭 `confirmed + cause=ack_external` 清空
+> 未决事件，旧人工确认可放行后续新出场事件并已复现自动重开（R7-N-C1：确认须绑定被核对
+> 的事件集合与持仓快照，不能把永久保留的原因字符串当作后续事件的授权）。
+
 ## T31：实盘只在开仓时定手数（C2，决策 D22）
 
 **Files:** `src/mt5live/executor.py`（`LiveExecutor._target_volume`）、`tests/test_mt5live_integration.py`。
@@ -230,6 +235,10 @@ def archive_if_all_acked(live_dir: str, magics: set[int], now: datetime) -> bool
 > 第六轮审核注记（R6）：正常全平路径已反转，但**全平部分成交仍写完成 ack**
 > （R6-C1，残余仓位被跳过）、`write_flatten` 多写者竞态（R6-I1）在修。
 
+> 第七轮复核注记（R7，2026-10-26）：R7-C1 判"部分"——单向残仓重试、撤挂单已补；但
+> executor.py 仍以**净额为零**判完成，多空各残留 0.08 手时 `ack=True`、下一轮
+> `flatten_acked`、归档成功（R6 原报告要求的持仓明细检查仍未落实）。
+
 ## T33：跨进程文件契约（M1、M2、M8、L3）
 
 **Files:** 新建 `src/mt5live/fileio.py`（`write_json_atomic`、`append_jsonl`，复用 `mt5gw.snapshot._atomic_replace` 的重试）；`runner.py`、`executor.py`、`gate.py`、`reconcile.py`、`riskproc.py`、`monitor.py`、`scripts/live_runner.py`；测试。
@@ -247,6 +256,12 @@ def archive_if_all_acked(live_dir: str, magics: set[int], now: datetime) -> bool
 
 > 第六轮审核注记（R6）：原子替换仍是固定 `.tmp` 名 + `write_flatten` 先读后建，
 > 多写者竞态在修（R6-I1）；实盘默认点差文件与 `SpreadModel.load` 不兼容（R6-I5）。
+
+> 第七轮复核注记（R7，2026-10-26）：R7-I1 判"部分"——唯一临时文件、正常创建/归档互斥、
+> 读取 `OSError` 转换已补；但新锁**超龄接管**存在"读旧 mtime、删除新锁"竞态，已复现两个
+> 调用同时进入临界区（R7-N-I2：须所有者标识与安全接管协议，或 OS 文件锁）。R6-I5 点差
+> 缓存加载**已修**（新加载器识别 v1/v2 包装并核对内容哈希，四品种加载成功，入口接线测试
+> 通过）。
 
 ## T34：影子券商 + 1 个交易日影子盘（M3，决策 D26）
 
@@ -266,7 +281,7 @@ class PaperBroker:
   - 1 个交易日，2 个策略（一个 `immediate`、一个 `after_signal_change`，M5 或 M15，确保有止损/止盈出场）；
   - 期间演练 killSwitch，以及用测试风控配置把日亏上限调低、连续触发两次全平。
 - [x] 失败测试先行：PaperBroker 的 SL/TP 触发口径与引擎一致（多头按 Bid、空头按 Ask）；状态文件重启可恢复——`tests/test_mt5live_paper.py::test_long_sl_triggers_on_bid_not_ask`、`::test_short_sl_triggers_on_ask_not_bid`、`::test_state_restart_recovers_positions_balance_and_deals`、`::test_paper_sl_exit_recognized_as_external_exit_after_restart`；影子一条龙 `tests/test_mt5live_integration.py::test_t34_shadow_full_chain_decision_to_flatten`、`::test_t34_shadow_protective_exit_explained_in_chain`、`::test_t34_paper_dry_run_offline_end_to_end`、`::test_t34_live_runner_paper_mode_wires_full_stack`（提交 a0e496d，影子/offline 端到端 28 测试）
-- [ ] 影子盘报告（脱敏）：决策数、订单数（应 = 入场 + 出场）、保护性出场数、暂停次数（无法解释的应为 0）、全平两次是否都执行、心跳与告警摘要——**未验收：修复 R6-C3（影子账本多写者同票号/互相覆盖、PaperAccountView 启动快照不刷新、浮盈不落盘）后重做**；组件测试全绿不能替代一天双策略真机影子盘。
+- [ ] 影子盘报告（脱敏）：决策数、订单数（应 = 入场 + 出场）、保护性出场数、暂停次数（无法解释的应为 0）、全平两次是否都执行、心跳与告警摘要——**未验收（R7-C3 判"部分"）**：分策略文件、票号隔离、查询刷新和无成交轮浮盈落盘已修；**账户级风控修复中**——运行器内闸门仍用本策略账户、聚合查询没有一致快照、读失败直接跳过策略（R7-N-C2，当前影子盘不能作为 T34 全链路风控验收证据），修复后重做；组件测试全绿不能替代一天双策略真机影子盘。
 
 ## T36：成本模型补强 + 基线 v3（H2、M7，决策 D29）
 
@@ -295,6 +310,14 @@ class PaperBroker:
 > 接线修复后重跑；`entry_policy_for` 未贯通 `min_days_per_hour`；越幅口径系
 > 相邻跳动代理（R6-I3）；回补覆盖见 costs-v3 §1（2026-01-02..10-23，10 月
 > 欧洲先切窗不含）。
+
+> 第七轮复核注记（R7，2026-10-26）：R7-C4 判"部分"——有效新格式越幅表的注入、回测与
+> 实盘 `min_days_per_hour` 检查已实现并有测试；越幅口径 R6-I3 **已修**（新主口径为前一
+> 分钟触发侧极值、回放首次触发并保留零越幅，`adjacent_jump` 单独标识）。但当前主库、
+> 研究库缓存内嵌越幅表仍为 version 1 `adjacent_jump`，加载后四品种均无 `overshoot_model`；
+> v3 修订节引用的 run#279–345 经查 67/67 条均为 `no-overshoot`（R7-N-C4，修订不得标作
+> 越幅成本验证通过）——**生产缓存重建中（R7-3），重建后复跑基线**；swap 实际费率仍未
+> 纳入成本身份版本串（R7-I2 部分）。
 
 ## T37：代码指纹 + 台账哈希链（H3、M6，决策 D23、D27）
 
@@ -330,6 +353,13 @@ def verify_chain(self) -> list[str]        # 返回断链或篡改的行；空�
 > 锚未验证历史前缀（R6-C5 台账防洗链修复中）；`cost_model_version` 不含缓存
 > 内容哈希（R6-I2）。
 
+> 第七轮复核注记（R7，2026-10-26）：R7-C5 判"部分"——写前验链、普通追加不再重封历史、
+> 快照检测直接删尾已补；但验链与追加不在同一写事务内、合法并发可断链、状态更新存在中途
+> 提交（R7-N-C3：应在取得写事务后统一完成验链/读链尾/写内容/审计/快照并一次提交）；审计
+> 事件内容未哈希、外部锚不核验历史前缀（R7-N-I3：改写 `old_content_json` 不报警、行数
+> 增长时不查原锚定位置前缀）。成本身份 R7-I2 判"部分"：点差内容哈希、sampling、越幅哈希
+> 已入版本串，swap 实际费率仍未纳入。
+
 ## T38：研究隔离落地（H4，决策 D24、D25）
 
 **Files:** `scripts/run_backtest.py`、`scripts/bt.py`（缺省数据根）；新建 `.github/workflows/research-allowlist.yml`；`scripts/hooks/pre-commit-readonly-paths`（把检查逻辑抽成可被 CI 调用的函数）；`docs/p6/permissions.md`、`README.md`；测试。
@@ -351,6 +381,11 @@ def verify_chain(self) -> list[str]        # 返回断链或篡改的行；空�
 > `tests/test_p6_docs.py::test_research_allowlist_workflow_loads_checker_from_main_baseline`
 > 用本地双目录模拟钉死；`--ops-ack` 仍可产生正式研究结果（R6-C6 在修）。
 
+> 第七轮复核注记（R7，2026-10-26）：R7-I4 判"部分"——检查器双 checkout 已修自改自过；
+> 但非 `research/*` 分支仍直接成功退出、workflow 本身仍由 PR 版本提供，可信身份/受保护
+> 执行入口这一层未完成。R6-C6 **已修**：`screen/gate` 入口直接拒绝 `--ops-ack`，研究加载
+> 不再透传；G5 要求主库类型，主库访问另有显式 `--main-store` 守卫（拒绝测试通过）。
+
 ## T39：关卡标定收尾（T22、M4、M5）
 
 **Files:** `src/mt5quant/validation/synthetic.py`、`scripts/gate_calibration.py`；测试；报告 `docs/research/gate-power-<日期>.md`。
@@ -369,7 +404,7 @@ def verify_chain(self) -> list[str]        # 返回断链或篡改的行；空�
   - `slot_permute_bars` 保持每个槽位的收益多重集不变——`tests/test_validation_synthetic.py::test_slot_permute_preserves_slot_return_multiset`、`::test_slot_permute_preserves_multiset_across_dst_switch`（提交 61829b2）
   - 种子相同 → 结果逐位一致——`tests/test_validation_synthetic.py::test_slot_permute_seed_reproducible`（61829b2）
   - 在植入"日内第 k 根 bar 漂移"的数据上，置换后漂移消失——`tests/test_validation_synthetic.py::test_slot_permute_destroys_planted_intraday_drift`（61829b2）
-- [ ] 正式标定实验（正/负对照 + G5 判别力，`docs/research/gate-power-<日期>.md`）——**未验收：修复 R6-C8（分片合并器与真实产物 schema 不兼容、G5 误报率错误合并、正对照检出率漏报）后重做**；探针 P12 亦示 G5 判别力（p5≈-1.37）仍不足以拦温和失效，报告不可缺席。
+- [ ] 正式标定实验（正/负对照 + G5 判别力，`docs/research/gate-power-<日期>.md`）——**未验收（R7）：现为历史分片诊断报告，正式统计验收未完成**。R7-C8 判"部分"：合并器 setup/字典型 calibration/G5 按 null 分桶/双源 flags 已修（五分片重算与正式 JSON 完全一致），合并脚本绝对路径 R7-M2 亦已修；但删除整实验条件仍可通过种子校验、数据/成本/关卡/实验配置未完整核验（R7-N-I4），且五分片均系修复前（2026-10-26 01:51 UTC 左右）启动、无运行指纹（R7-N-I1）——重做须附运行指纹、完整实验条件清单、有效样本数（G5 重复 level 仅 80 个独立条件）、校准收敛与不确定性（含 20 种子分布、USTEC 超 ±0.15 容差事实）、完整检查组合通过率（`passed_all` 0/160 须展示）及与真实流程相符的 G5 参照设计；统计解释限定已于 R7-5 补入 gate-power 报告头部；探针 P12 亦示 G5 判别力（p5≈-1.37）仍不足以拦温和失效，报告不可缺席。
 
 ## T40：A/B 对账口径收紧（H6，铁律第 14 条）
 
@@ -383,7 +418,7 @@ def verify_chain(self) -> list[str]        # 返回断链或篡改的行；空�
 - [x] 失败测试先行：
   - 人为把 B 层空头止损改成按 Bid 触发 → 被判违规（旧的 1R 容差测不出来）——`tests/test_reconcile_ab.py::test_short_stop_bid_trigger_flagged_old_1r_tolerance_missed_it`、`::test_default_tolerances_match_plan`（提交 2a97a00）
   - 静默边界的行不判违规——`tests/test_reconcile_ab.py::test_silent_boundary_entry_not_a_violation`、`::test_signal_exit_silent_boundary_not_a_violation`（2a97a00）
-- [ ] 用 T36 的成本模型重跑四组对账，写 v3 报告——**未验收：修复 R6-C4（越幅模型未接入正式回测/成本契约）与 R6-I6（对账以毫秒代 tick 身份，同毫秒多笔误判）后重做**；机制核对框架本身已落地（上两条测试）。
+- [ ] 用 T36 的成本模型重跑四组对账，写 v3 报告——**未验收：R7-I6（同毫秒 tick 身份）未修**（仍取该毫秒最后一笔、跳过入场毫秒，正确止损成交被判 `no_trigger_at_fill`）；越幅生产缓存重建中（R7-3）——I6 修复与缓存重建后一并重做；机制核对框架本身已落地（上两条测试）。
 
 ## T41：流程与文档（H6、L1–L4）
 
@@ -391,7 +426,7 @@ def verify_chain(self) -> list[str]        # 返回断链或篡改的行；空�
 - [x] **修正报告笔误**：对账 v2 报告把 `missNY[17]` 误写成"缺 17 个纽约小时"（L1），改为"缺纽约 17 点这一小时"——提交 eb913cc。
 - [x] **写明口径**：在文档里写明"日亏按 UTC 自然日"（L2）与"G3 测试窗收益含预热段持仓的浮动"（L4）——提交 eb913cc。
 - [x] **CI 纪律**：每次推送后用 `gh run watch` 或 Actions 页面确认结果；红了先修，修好之前不推新功能——第五轮实现提交（37d503f..97f21b6）逐个推送、Actions 全绿；第六轮审核独立实跑复核全量 1549 passed（2026-10-26）。
-- [x] **探针复跑**：每完成一个阶段，更新蓝图 §2 现状表（四级证据如实填写），并重跑探针脚本，把输出贴进提交说明——探针反转输出见提交说明 890838b（P8）/add348c（P9、P10）/dd42fea（P11）；蓝图 §2 于第六轮修复按审核事实更新（P7 影子盘/P4 台账/P2 越幅在修状态如实标注）；P8 探针已按第六轮 M1 改为双暂停文件 × 双调度顺序复跑。
+- [x] **探针复跑**：每完成一个阶段，更新蓝图 §2 现状表（四级证据如实填写），并重跑探针脚本，把输出贴进提交说明——探针反转输出见提交说明 890838b（P8）/add348c（P9、P10）/dd42fea（P11）；蓝图 §2 于第六轮修复按审核事实更新（P7 影子盘/P4 台账/P2 越幅在修状态如实标注）；P8 探针已按第六轮 M1 改为双暂停文件 × 双调度顺序复跑；第七轮复核（R7-M1 判已修：P8 探针双顺序输出与恢复逻辑相符）后，蓝图 §2 已再按 R7 更新（71dee8a、1609 passed；C6/I3/I5/M1/M2 已修、余项"部分/未修"如实标注并开列开放问题清单）。
 
 ---
 

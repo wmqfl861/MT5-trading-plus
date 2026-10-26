@@ -50,9 +50,18 @@
   chain_meta 存 last_rowid / row_count / head_hash 快照，每次合法写后
   刷新；verify_chain() 比对快照——行数变少（删行/删尾）、最大 rowid
   回退、链头与快照不符（整链被重算改写）、行数超过快照（绕过写方法的
-  伪造追加）都报出。攻击者若连 chain_meta 一起改写，则由 git 里的
-  **链式锚定**（scripts/ledger_anchor.py → docs/ops/ledger-anchors.md，
-  研究角色白名单外）对出——那是台账之外的证据。
+  伪造追加）都报出。ledger_events 的 head_hash 列存**行内容摘要**
+  （R7/N-I3：改写审计行 old/new 内容、行数不变也要报）。攻击者若连
+  chain_meta 一起改写，则由 git 里的**链式锚定**（scripts/
+  ledger_anchor.py → docs/ops/ledger-anchors.md，研究角色白名单外）
+  对出——那是台账之外的证据。
+
+写事务纪律（R7/N-C3）：所有写方法经 _txn()（BEGIN IMMEDIATE …
+COMMIT，异常整体回滚）——验链、读链尾、写内容、写审计记录、刷新快照
+**同一事务**，最后统一提交；辅助函数不开自己的连接上下文（嵌套即报错，
+旧行为里内层 `with conn:` 会把外层事务中途提交）。并发写在 BEGIN
+IMMEDIATE 上排队（连接 timeout=30s），两个 record_run 受控交错后链
+仍完好。
 
 旧库迁移（T37 + R6/C5）：打开时自动补 strategy_sha/prev_hash/row_hash
 列；旧行 strategy_sha='legacy'；三表哈希链自第一行重建（仅此迁移路径
@@ -75,6 +84,7 @@ import hashlib
 import json
 import math
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -222,7 +232,11 @@ def _canonical_json(content: dict) -> str:
 
 
 class Ledger:
-    """试验台账句柄；用完 close（或 with）。所有写入即时提交。"""
+    """试验台账句柄；用完 close（或 with）。
+
+    R7/N-C3：每个写方法一个 BEGIN IMMEDIATE 写事务（_txn），验链→读链
+    尾→写→审计→快照统一提交；读方法直接执行（autocommit 读）。
+    """
 
     def __init__(self, path, *, create: bool = True):
         p = Path(path)
@@ -231,23 +245,29 @@ class Ledger:
         elif not p.exists():
             raise FileNotFoundError(f"台账不存在：{p}")
         self.path = str(p)
-        self.conn = sqlite3.connect(self.path)
+        # R7/N-C3：autocommit 模式（isolation_level=None）+ 手工 BEGIN
+        # IMMEDIATE——写事务由 _txn() 显式管理，连接层不再隐式开启/提交
+        # 事务（旧行为里辅助函数的 `with conn:` 会在外层事务中途提交）。
+        # timeout=30s：并发写者在 BEGIN IMMEDIATE 上排队等待（busy
+        # timeout），而不是立刻报 database is locked。
+        self.conn = sqlite3.connect(self.path, timeout=30.0)
+        self.conn.isolation_level = None
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
-        with self.conn:
-            self.conn.executescript(_SCHEMA)
+        self._txn_depth = 0
+        self.conn.executescript(_SCHEMA)
         # T21a 迁移：老库的 lockbox_uses 无 status 列——补列，旧行按终态 done
         cols = {r["name"] for r in self.conn.execute(
             "PRAGMA table_info(lockbox_uses)")}
         if "status" not in cols:
-            with self.conn:
+            with self._txn():
                 self.conn.execute(
                     "ALTER TABLE lockbox_uses ADD COLUMN status TEXT"
                     " NOT NULL DEFAULT 'done'")
         # T27 迁移：老库的 lockbox_uses 无 cutoff 列（预算制度前）——补列，
         # 旧行 NULL = 既往锁箱，不计入任何 cutoff 的预算计数
         if "cutoff" not in cols:
-            with self.conn:
+            with self._txn():
                 self.conn.execute(
                     "ALTER TABLE lockbox_uses ADD COLUMN cutoff TEXT")
         # T37 迁移（H3/M6，D23/D27）：runs 加 strategy_sha/prev_hash/
@@ -258,7 +278,7 @@ class Ledger:
             "PRAGMA table_info(runs)")}
         pre_migration = "strategy_sha" not in runs_cols
         if pre_migration:
-            with self.conn:
+            with self._txn():
                 self.conn.execute(
                     "ALTER TABLE runs ADD COLUMN strategy_sha TEXT"
                     " NOT NULL DEFAULT 'legacy'")
@@ -267,7 +287,7 @@ class Ledger:
                 f"PRAGMA table_info({tbl})")}
             for col in ("prev_hash", "row_hash"):
                 if col not in tcols:
-                    with self.conn:
+                    with self._txn():
                         self.conn.execute(
                             f"ALTER TABLE {tbl} ADD COLUMN {col} TEXT"
                             " NOT NULL DEFAULT ''")
@@ -275,13 +295,13 @@ class Ledger:
             counts = {t: int(self.conn.execute(
                 f"SELECT COUNT(*) n FROM {t}").fetchone()["n"])
                 for t in _CHAIN_TABLES}
-            if any(counts.values()):
-                payload = {"ok": True, "error": None, "metrics": {
-                    "event": "t37-hash-chain-migration",
-                    **{t: counts[t] for t in _CHAIN_TABLES},
-                    "note": "旧行 strategy_sha=legacy；runs/gates/"
-                            "lockbox_uses 三链自第一行重建"}}
-                with self.conn:
+            with self._txn():
+                if any(counts.values()):
+                    payload = {"ok": True, "error": None, "metrics": {
+                        "event": "t37-hash-chain-migration",
+                        **{t: counts[t] for t in _CHAIN_TABLES},
+                        "note": "旧行 strategy_sha=legacy；runs/gates/"
+                                "lockbox_uses 三链自第一行重建"}}
                     self.conn.execute(
                         "INSERT INTO runs(card_id, card_version, strategy,"
                         " params_json, symbol, timeframe, data_first,"
@@ -293,19 +313,57 @@ class Ledger:
                         " 'ledger-v1', 'ledger-v1', '', ?, ?, 'migration')",
                         (json.dumps(payload, ensure_ascii=False),
                          datetime.now(timezone.utc).isoformat()))
-            for tbl in _CHAIN_TABLES:
-                self._rechain(tbl)
+                for tbl in _CHAIN_TABLES:
+                    self._rechain(tbl)
         # R6/C5：chain_meta 快照初始化（迁移——缺快照的表按当前状态登记，
-        # 旧行不重写；之后的删行/改写/绕道写入都会与快照对不上）
-        with self.conn:
+        # 旧行不重写；之后的删行/改写/绕道写入都会与快照对不上）。
+        # R7/N-I3：R6/C5 的旧快照对 ledger_events 无内容摘要（head_hash
+        # NULL 而行数非零）→ 按当前状态补初始化摘要（与首次登记同一信任
+        # 边界：初始化即当前；此后任何 old/new 内容改写都与摘要对不上）。
+        with self._txn():
             for tbl in _SNAPSHOT_TABLES:
                 has = self.conn.execute(
-                    "SELECT 1 FROM chain_meta WHERE table_name=?",
-                    (tbl,)).fetchone()
-                if has is None:
+                    "SELECT row_count, head_hash FROM chain_meta"
+                    " WHERE table_name=?", (tbl,)).fetchone()
+                stale_digest = (
+                    tbl == "ledger_events" and has is not None
+                    and has["head_hash"] is None
+                    and int(has["row_count"]) > 0)
+                if has is None or stale_digest:
                     self._snapshot_refresh(tbl)
 
     # ------------------------------------------------ 哈希链（T37/M6/D27；R6/C5）
+
+    @contextmanager
+    def _txn(self, *, immediate: bool = True):
+        """写事务（R7/N-C3）：BEGIN IMMEDIATE → … → COMMIT，异常整体回滚。
+
+        - **先取写锁再做事**：BEGIN IMMEDIATE 立刻持有保留锁，并发写者在
+          事务外排队（连接 timeout=30s 即 busy_timeout）；验链、读链尾、
+          写内容、写审计、刷新快照全部落在同一事务内、最后统一提交——
+          两次并发 record_run 受控交错后链仍完好（旧行为：链尾在事务外
+          读取，第三行接旧链尾 → verify 断链）；
+        - **中途异常全部回滚**（旧行为：辅助函数的 `with conn:` 把外层
+          修改中途提交，出现"关卡内容已变、快照仍旧"的半提交状态）；
+        - 辅助函数（_snapshot_refresh / _rechain / _append_chained /
+          _update_chained）不再各自开连接上下文——运行在调用方的事务里，
+          嵌套直接报错（防止谁又隐式提交调用方的事务）。
+        """
+        if self._txn_depth:
+            raise RuntimeError(
+                "嵌套写事务：辅助函数不得自带事务上下文（R7/N-C3——"
+                "内层连接上下文的提交会把外层事务中途落地）")
+        self.conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+        self._txn_depth += 1
+        try:
+            yield
+        except BaseException:
+            self.conn.execute("ROLLBACK")
+            raise
+        else:
+            self.conn.execute("COMMIT")
+        finally:
+            self._txn_depth -= 1
 
     def _table_cols(self, table: str) -> list[str]:
         """该表的内容列（除 prev_hash/row_hash 外全部，含主键）。"""
@@ -317,21 +375,48 @@ class Ledger:
         return hashlib.sha256(
             (_canonical_json(content) + prev).encode("utf-8")).hexdigest()
 
+    def _events_digest(self) -> str | None:
+        """ledger_events 全部行内容的 sha256（rowid 序，逐行规范化 JSON
+        + 记录分隔符）。空表 → None（与链式表的空表链头记法一致）。
+
+        R7/N-I3：审计附表不做行级哈希链，改以内容摘要进 chain_meta——
+        只比对行数/最大 rowid 时，改写 old/new_content_json（如把归档的
+        批准人换掉）不会被发现，历史状态被无声改写。
+        """
+        rows = self.conn.execute(
+            "SELECT event_id, table_name, row_key, action, old_content_json,"
+            " new_content_json, recorded_utc FROM ledger_events"
+            " ORDER BY rowid").fetchall()
+        if not rows:
+            return None
+        h = hashlib.sha256()
+        for r in rows:
+            h.update(_canonical_json(dict(r)).encode("utf-8"))
+            h.update(b"\x1e")                     # 行界（ASCII 记录分隔符）
+        return h.hexdigest()
+
     def _snapshot_refresh(self, table: str) -> None:
-        """把 chain_meta 中该表的快照刷新为当前状态（合法写之后调用）。"""
+        """把 chain_meta 中该表的快照刷新为当前状态（合法写之后调用）。
+
+        R7/N-C3：**不开自己的事务、不提交**——运行在调用方写事务内（或
+        迁移流程的事务里）。R7/N-I3：ledger_events 的 head_hash 列存
+        _events_digest()（内容摘要），链式表仍是链尾 row_hash。
+        """
         n, max_rid = self.conn.execute(
             f"SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM {table}"
         ).fetchone()
-        head = self.conn.execute(
-            f"SELECT row_hash FROM {table} ORDER BY rowid DESC LIMIT 1"
-        ).fetchone() if table in _CHAIN_TABLES else None
-        with self.conn:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO chain_meta(table_name, last_rowid,"
-                " row_count, head_hash, updated_utc) VALUES (?,?,?,?,?)",
-                (table, int(max_rid), int(n),
-                 head["row_hash"] if head else None,
-                 datetime.now(timezone.utc).isoformat()))
+        if table == "ledger_events":
+            head = self._events_digest()
+        else:
+            tail = self.conn.execute(
+                f"SELECT row_hash FROM {table} ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()
+            head = tail["row_hash"] if tail else None
+        self.conn.execute(
+            "INSERT OR REPLACE INTO chain_meta(table_name, last_rowid,"
+            " row_count, head_hash, updated_utc) VALUES (?,?,?,?,?)",
+            (table, int(max_rid), int(n), head,
+             datetime.now(timezone.utc).isoformat()))
 
     def _rechain(self, table: str) -> None:
         """整表重算哈希链（rowid 序，确定性：链值只依赖行内容序列）。
@@ -339,6 +424,7 @@ class Ledger:
         **仅限迁移**（T37 旧库补列后自第一行重建；R6/C5 起正常写入绝不
         走这里——合法追加经 _append_chained 增量延伸，状态更新经
         _update_chained 归档+定点重算，篡改证据不可能被正常写入洗掉）。
+        R7/N-C3：不开自己的事务——运行在迁移流程的写事务内。
         """
         cols = [r["name"] for r in self.conn.execute(
             f"PRAGMA table_info({table})")]
@@ -355,10 +441,9 @@ class Ledger:
                 (canon + prev).encode("utf-8")).hexdigest()
             updates.append((prev, row_hash, r["_rid"]))
             prev = row_hash
-        with self.conn:
-            self.conn.executemany(
-                f"UPDATE {table} SET prev_hash=?, row_hash=? WHERE rowid=?",
-                updates)
+        self.conn.executemany(
+            f"UPDATE {table} SET prev_hash=?, row_hash=? WHERE rowid=?",
+            updates)
 
     # ------------------------------------------- 写前验证与链式写入（R6/C5）
 
@@ -382,8 +467,9 @@ class Ledger:
 
         哈希按**入库后的实际值**计算（主键自增列插入后才有真值），因此
         先插入内容、再读回该行、再补 prev_hash/row_hash，最后刷新快照。
-        单写者假设（bt/reconcile 串行使用；并发写由 sqlite 写锁串行化，
-        极端交错会在下次 verify 报断链——fail-closed 方向）。
+        R7/N-C3：**运行在调用方的 BEGIN IMMEDIATE 事务内**——读链尾到
+        提交之间不可能插入其他写者（保留锁在手），并发 record_run 交错
+        也不会再出现"第三行接旧链尾"；本方法不开自己的事务（嵌套即报错）。
         """
         cols = self._table_cols(table)
         names = ", ".join(f'"{c}"' for c in cols)
@@ -392,18 +478,17 @@ class Ledger:
             f"SELECT row_hash FROM {table} ORDER BY rowid DESC LIMIT 1"
         ).fetchone()
         prev = tail["row_hash"] if tail else GENESIS_HASH
-        with self.conn:
-            cur = self.conn.execute(
-                f"INSERT INTO {table}({names}) VALUES ({ph})",
-                tuple(content[c] for c in cols))
-            rid = int(cur.lastrowid)
-            stored = self.conn.execute(
-                f"SELECT {names} FROM {table} WHERE rowid=?", (rid,)).fetchone()
-            row_hash = self._row_hash({c: stored[c] for c in cols}, prev)
-            self.conn.execute(
-                f"UPDATE {table} SET prev_hash=?, row_hash=? WHERE rowid=?",
-                (prev, row_hash, rid))
-            self._snapshot_refresh(table)
+        cur = self.conn.execute(
+            f"INSERT INTO {table}({names}) VALUES ({ph})",
+            tuple(content[c] for c in cols))
+        rid = int(cur.lastrowid)
+        stored = self.conn.execute(
+            f"SELECT {names} FROM {table} WHERE rowid=?", (rid,)).fetchone()
+        row_hash = self._row_hash({c: stored[c] for c in cols}, prev)
+        self.conn.execute(
+            f"UPDATE {table} SET prev_hash=?, row_hash=? WHERE rowid=?",
+            (prev, row_hash, rid))
+        self._snapshot_refresh(table)
         return rid
 
     def _update_chained(self, table: str, rid: int, new_content: dict, *,
@@ -417,39 +502,41 @@ class Ledger:
         UNIQUE(card_id) 与 gates 的 PRIMARY KEY(run_id, gate) 钉死
         "一次性/幂等重录"约束，拆掉约束反而弱化防重放；改写前的完整内容
         永远可从 ledger_events 重放。
+        R7/N-C3：**运行在调用方的写事务内**——归档、改写、重算、快照
+        刷新一荣俱荣一损俱损，中途异常全部回滚（不再出现"关卡已变、
+        快照仍旧"的半提交）；本方法不开自己的事务（嵌套即报错）。
         """
         cols = self._table_cols(table)
         names = ", ".join(f'"{c}"' for c in cols)
         old = self.conn.execute(
             f"SELECT {names} FROM {table} WHERE rowid=?", (rid,)).fetchone()
         assignments = ", ".join(f'"{c}"=?' for c in cols)
-        with self.conn:
+        self.conn.execute(
+            "INSERT INTO ledger_events(table_name, row_key, action,"
+            " old_content_json, new_content_json, recorded_utc)"
+            " VALUES (?,?,?,?,?,?)",
+            (table, row_key, action,
+             _canonical_json({c: old[c] for c in cols}),
+             _canonical_json(new_content),
+             datetime.now(timezone.utc).isoformat()))
+        self.conn.execute(
+            f"UPDATE {table} SET {assignments} WHERE rowid=?",
+            tuple(new_content[c] for c in cols) + (rid,))
+        # 从被改行起重算到链尾（被改行内容变 → row_hash 变 → 后继联动）
+        prev_row = self.conn.execute(
+            f"SELECT row_hash FROM {table} WHERE rowid<?"
+            " ORDER BY rowid DESC LIMIT 1", (rid,)).fetchone()
+        prev = prev_row["row_hash"] if prev_row else GENESIS_HASH
+        for r in self.conn.execute(
+                f"SELECT rowid AS _rid, {names} FROM {table}"
+                " WHERE rowid>=? ORDER BY rowid", (rid,)).fetchall():
+            h = self._row_hash({c: r[c] for c in cols}, prev)
             self.conn.execute(
-                "INSERT INTO ledger_events(table_name, row_key, action,"
-                " old_content_json, new_content_json, recorded_utc)"
-                " VALUES (?,?,?,?,?,?)",
-                (table, row_key, action,
-                 _canonical_json({c: old[c] for c in cols}),
-                 _canonical_json(new_content),
-                 datetime.now(timezone.utc).isoformat()))
-            self.conn.execute(
-                f"UPDATE {table} SET {assignments} WHERE rowid=?",
-                tuple(new_content[c] for c in cols) + (rid,))
-            # 从被改行起重算到链尾（被改行内容变 → row_hash 变 → 后继联动）
-            prev_row = self.conn.execute(
-                f"SELECT row_hash FROM {table} WHERE rowid<?"
-                " ORDER BY rowid DESC LIMIT 1", (rid,)).fetchone()
-            prev = prev_row["row_hash"] if prev_row else GENESIS_HASH
-            for r in self.conn.execute(
-                    f"SELECT rowid AS _rid, {names} FROM {table}"
-                    " WHERE rowid>=? ORDER BY rowid", (rid,)).fetchall():
-                h = self._row_hash({c: r[c] for c in cols}, prev)
-                self.conn.execute(
-                    f"UPDATE {table} SET prev_hash=?, row_hash=?"
-                    " WHERE rowid=?", (prev, h, r["_rid"]))
-                prev = h
-            self._snapshot_refresh("ledger_events")
-            self._snapshot_refresh(table)
+                f"UPDATE {table} SET prev_hash=?, row_hash=?"
+                " WHERE rowid=?", (prev, h, r["_rid"]))
+            prev = h
+        self._snapshot_refresh("ledger_events")
+        self._snapshot_refresh(table)
 
     def verify_chain(self) -> list[str]:
         """校验三表哈希链 + chain_meta 快照；返回问题描述列表（空 = 完好）。
@@ -461,6 +548,8 @@ class Ledger:
         - 行数 > 快照 → 绕过写方法的未登记写入；
         - 链头 ≠ 快照 → 整链被重算改写（行级校验全过也瞒不住）；
         - ledger_events（审计附表）行数/rowid 与快照比对，删审计行报出；
+          R7/N-I3：另比对**行内容摘要**（chain_meta.head_hash 存
+          _events_digest）——改写 old/new_content_json（行数不变）也报；
         - 攻击者连 chain_meta 一起改写 → 由 git 里的链式锚定对出
           （scripts/ledger_anchor.py --verify，docs/ops/ledger-anchors.md）。
         """
@@ -527,9 +616,11 @@ class Ledger:
                 problems.append(
                     f"{tbl}: 链头与快照不符（整链被重算改写或快照后"
                     "改写了行）")
-        # R6/C5：审计附表快照（ledger_events 不哈希链，删行/绕道写入要报）
+        # R6/C5：审计附表快照（ledger_events 不哈希链，删行/绕道写入要报）；
+        # R7/N-I3：行内容摘要比对——改写 old/new_content_json（行数不变，
+        # 如把归档的批准人换掉）同样要报
         snap = self.conn.execute(
-            "SELECT last_rowid, row_count FROM chain_meta"
+            "SELECT last_rowid, row_count, head_hash FROM chain_meta"
             " WHERE table_name='ledger_events'").fetchone()
         if snap is not None:
             n, max_rid = self.conn.execute(
@@ -547,6 +638,11 @@ class Ledger:
                 problems.append(
                     f"ledger_events: 最大 rowid {max_rid} < 快照 "
                     f"{snap['last_rowid']}（尾部被删）")
+            digest = self._events_digest()
+            if digest != snap["head_hash"]:
+                problems.append(
+                    "ledger_events: 行内容与快照摘要不符（审计事件的"
+                    " old/new 内容被改写）")
         return problems
 
     def close(self) -> None:
@@ -568,15 +664,17 @@ class Ledger:
         ensure_card_precedes_run，正常路径不会出现 None 进来）。
         R6/C5：写前先验证链（cards 表不在链上，但篡改台账上连卡登记
         也一并冻结，统一 fail-closed）。
+        R7/N-C3：验链与写入同一 BEGIN IMMEDIATE 事务。
         """
-        self._verify_or_raise()
-        with self.conn:
+        with self._txn():
+            self._verify_or_raise()
             self.conn.execute(
                 "INSERT OR REPLACE INTO cards(card_id, version, path,"
                 " git_commit, committed_at_utc, registered_utc)"
                 " VALUES (?,?,?,?,?,?)",
                 (card_id, version, path, git_commit,
-                 committed_at.isoformat() if committed_at is not None else None,
+                 committed_at.isoformat() if committed_at is not None
+                 else None,
                  datetime.now(timezone.utc).isoformat()))
 
     def record_run(self, *, card_id: str, card_version: int, strategy: str,
@@ -594,23 +692,27 @@ class Ledger:
         未计算的旧路径/迁移前语义——研究路径 bt.py 必须传真实指纹）。
         R6/C5：写前验证链（不完整 → LedgerTamperedError，不洗链）；
         追加只延伸链（_append_chained，增量计算 row_hash）。
+        R7/N-C3：验链、读链尾、写入、刷快照同一 BEGIN IMMEDIATE 事务
+        ——并发 record_run 受控交错后链必须完好（旧行为：验链与读链尾
+        都在事务外，第三行接旧链尾）。
         """
-        self._verify_or_raise()
         payload = {"ok": error is None, "error": error, "metrics": metrics}
-        return self._append_chained("runs", {
-            "run_id": None,
-            "card_id": card_id, "card_version": card_version,
-            "strategy": strategy,
-            "params_json": json.dumps(_san(params), ensure_ascii=False),
-            "symbol": symbol, "timeframe": timeframe,
-            "data_first": data_first, "data_last": data_last,
-            "data_sha256": data_sha256, "strategy_sha": strategy_sha,
-            "engine_version": engine_version,
-            "cost_model_version": cost_model_version,
-            "gates_hash": gates_hash,
-            "metrics_json": json.dumps(_san(payload), ensure_ascii=False),
-            "created_utc": _iso(created_utc), "actor": actor,
-        })
+        with self._txn():
+            self._verify_or_raise()
+            return self._append_chained("runs", {
+                "run_id": None,
+                "card_id": card_id, "card_version": card_version,
+                "strategy": strategy,
+                "params_json": json.dumps(_san(params), ensure_ascii=False),
+                "symbol": symbol, "timeframe": timeframe,
+                "data_first": data_first, "data_last": data_last,
+                "data_sha256": data_sha256, "strategy_sha": strategy_sha,
+                "engine_version": engine_version,
+                "cost_model_version": cost_model_version,
+                "gates_hash": gates_hash,
+                "metrics_json": json.dumps(_san(payload), ensure_ascii=False),
+                "created_utc": _iso(created_utc), "actor": actor,
+            })
 
     def record_gate(self, run_id: int, gate: str, passed: bool,
                     details: dict) -> None:
@@ -619,21 +721,23 @@ class Ledger:
         R6/C5：同 (run_id, gate) 重录保留原 INSERT OR REPLACE 语义，但
         旧行内容先归档进 ledger_events（不再悄悄改写），链经
         _update_chained 定点重算保持可验证。
+        R7/N-C3：验链/查重/追加（或归档改写）/刷快照同一写事务。
         """
-        self._verify_or_raise()
         content = {"run_id": run_id, "gate": gate,
                    "passed": 1 if passed else 0,
                    "details_json": json.dumps(_san(details),
                                               ensure_ascii=False)}
-        existing = self.conn.execute(
-            "SELECT rowid FROM gates WHERE run_id=? AND gate=?",
-            (run_id, gate)).fetchone()
-        if existing is None:
-            self._append_chained("gates", content)
-        else:
-            self._update_chained(
-                "gates", int(existing["rowid"]), content,
-                row_key=f"run_id={run_id}/{gate}", action="re-record")
+        with self._txn():
+            self._verify_or_raise()
+            existing = self.conn.execute(
+                "SELECT rowid FROM gates WHERE run_id=? AND gate=?",
+                (run_id, gate)).fetchone()
+            if existing is None:
+                self._append_chained("gates", content)
+            else:
+                self._update_chained(
+                    "gates", int(existing["rowid"]), content,
+                    row_key=f"run_id={run_id}/{gate}", action="re-record")
 
     def record_lockbox_use(self, card_id: str, *, approved_by: str,
                            result: dict, cutoff: str | None = None) -> None:
@@ -643,14 +747,16 @@ class Ledger:
         （T21a：读锁箱数据前先写 started，防中途崩溃后重跑）。
         cutoff（T27）：该次使用消耗的锁箱（ISO naive UTC），供预算计数。
         R6/C5：写前验证链；追加只延伸链。
+        R7/N-C3：验链与追加同一写事务。
         """
-        self._verify_or_raise()
-        self._append_chained("lockbox_uses", {
-            "card_id": card_id,
-            "used_at_utc": datetime.now(timezone.utc).isoformat(),
-            "approved_by": approved_by,
-            "result_json": json.dumps(_san(result), ensure_ascii=False),
-            "status": "done", "cutoff": _cutoff_iso(cutoff)})
+        with self._txn():
+            self._verify_or_raise()
+            self._append_chained("lockbox_uses", {
+                "card_id": card_id,
+                "used_at_utc": datetime.now(timezone.utc).isoformat(),
+                "approved_by": approved_by,
+                "result_json": json.dumps(_san(result), ensure_ascii=False),
+                "status": "done", "cutoff": _cutoff_iso(cutoff)})
 
     def record_lockbox_start(self, card_id: str, *, approved_by: str,
                              cutoff: str | None = None) -> None:
@@ -661,13 +767,15 @@ class Ledger:
         cutoff（T27）：预算计数口径，见 lockbox_budget。
         R6/C5：写前验证链（锁箱行被删过 → LedgerTamperedError，一次性
         不可能靠删行重置）。
+        R7/N-C3：验链与追加同一写事务。
         """
-        self._verify_or_raise()
-        self._append_chained("lockbox_uses", {
-            "card_id": card_id,
-            "used_at_utc": datetime.now(timezone.utc).isoformat(),
-            "approved_by": approved_by, "result_json": "{}",
-            "status": "started", "cutoff": _cutoff_iso(cutoff)})
+        with self._txn():
+            self._verify_or_raise()
+            self._append_chained("lockbox_uses", {
+                "card_id": card_id,
+                "used_at_utc": datetime.now(timezone.utc).isoformat(),
+                "approved_by": approved_by, "result_json": "{}",
+                "status": "started", "cutoff": _cutoff_iso(cutoff)})
 
     def finish_lockbox_use(self, card_id: str, *, result: dict,
                            approved_by: str = "bt",
@@ -680,37 +788,40 @@ class Ledger:
         R6/C5：started→done 是**归档式改写**——旧行内容先完整进
         ledger_events（审计可重放"改写前是什么"），行 row_hash 用
         (prev_hash, 新内容) 重算、后继行联动，链保持可验证。
+        R7/N-C3：验链/查 started/归档改写（或插入）/刷快照同一写事务
+        ——中途异常整体回滚。
         """
-        self._verify_or_raise()
         payload = json.dumps(_san(result), ensure_ascii=False)
-        started = self.conn.execute(
-            "SELECT rowid FROM lockbox_uses WHERE card_id=?"
-            " AND status='started'", (card_id,)).fetchone()
-        if started is not None:
-            cols = self._table_cols("lockbox_uses")
-            names = ", ".join(f'"{c}"' for c in cols)
-            row = self.conn.execute(
-                f"SELECT {names} FROM lockbox_uses WHERE rowid=?",
-                (started["rowid"],)).fetchone()
-            content = {c: row[c] for c in cols}
-            content["result_json"] = payload
-            content["status"] = "done"
-            self._update_chained(
-                "lockbox_uses", int(started["rowid"]), content,
-                row_key=f"card_id={card_id}", action="started->done")
-            return
-        exists = self.conn.execute(
-            "SELECT 1 FROM lockbox_uses WHERE card_id=?",
-            (card_id,)).fetchone()
-        if exists:
-            raise sqlite3.IntegrityError(
-                f"lockbox_uses.card_id={card_id} 已有终态记录"
-                "（UNIQUE 约束）——锁箱一次性已消耗")
-        self._append_chained("lockbox_uses", {
-            "card_id": card_id,
-            "used_at_utc": datetime.now(timezone.utc).isoformat(),
-            "approved_by": approved_by, "result_json": payload,
-            "status": "done", "cutoff": _cutoff_iso(cutoff)})
+        with self._txn():
+            self._verify_or_raise()
+            started = self.conn.execute(
+                "SELECT rowid FROM lockbox_uses WHERE card_id=?"
+                " AND status='started'", (card_id,)).fetchone()
+            if started is not None:
+                cols = self._table_cols("lockbox_uses")
+                names = ", ".join(f'"{c}"' for c in cols)
+                row = self.conn.execute(
+                    f"SELECT {names} FROM lockbox_uses WHERE rowid=?",
+                    (started["rowid"],)).fetchone()
+                content = {c: row[c] for c in cols}
+                content["result_json"] = payload
+                content["status"] = "done"
+                self._update_chained(
+                    "lockbox_uses", int(started["rowid"]), content,
+                    row_key=f"card_id={card_id}", action="started->done")
+                return
+            exists = self.conn.execute(
+                "SELECT 1 FROM lockbox_uses WHERE card_id=?",
+                (card_id,)).fetchone()
+            if exists:
+                raise sqlite3.IntegrityError(
+                    f"lockbox_uses.card_id={card_id} 已有终态记录"
+                    "（UNIQUE 约束）——锁箱一次性已消耗")
+            self._append_chained("lockbox_uses", {
+                "card_id": card_id,
+                "used_at_utc": datetime.now(timezone.utc).isoformat(),
+                "approved_by": approved_by, "result_json": payload,
+                "status": "done", "cutoff": _cutoff_iso(cutoff)})
 
     # ---------------------------------------------------------------- 读
 
@@ -759,32 +870,34 @@ class Ledger:
         R6/C5：写前验证链——lockbox_uses 行被删/链不完整时本方法直接
         LedgerTamperedError（fail-closed，删行不可能重置预算；查询类的
         快照兜底见 lockbox_used）。
+        R7/N-C3：验链/查预算/登记/计数同一写事务（读到的计数与登记
+        状态一致，不被并发写插入）。
         """
-        self._verify_or_raise()
         key = _cutoff_iso(cutoff)
         if key is None:
             raise ValueError("lockbox_budget 需要 cutoff（锁箱标识）")
-        row = self.conn.execute(
-            "SELECT max_uses FROM lockbox_budget WHERE cutoff=?",
-            (key,)).fetchone()
-        if row is None:
-            limit = DEFAULT_LOCKBOX_MAX_USES if max_uses is None \
-                else int(max_uses)
-            if limit <= 0:
-                raise ValueError(
-                    f"max_uses 必须为正整数，收到 {max_uses!r}——预算为零或"
-                    "负数应直接不登记 G5，而不是写进表里")
-            with self.conn:
+        with self._txn():
+            self._verify_or_raise()
+            row = self.conn.execute(
+                "SELECT max_uses FROM lockbox_budget WHERE cutoff=?",
+                (key,)).fetchone()
+            if row is None:
+                limit = DEFAULT_LOCKBOX_MAX_USES if max_uses is None \
+                    else int(max_uses)
+                if limit <= 0:
+                    raise ValueError(
+                        f"max_uses 必须为正整数，收到 {max_uses!r}——预算为"
+                        "零或负数应直接不登记 G5，而不是写进表里")
                 self.conn.execute(
                     "INSERT INTO lockbox_budget(cutoff, max_uses,"
                     " created_utc) VALUES (?,?,?)",
                     (key, limit,
                      datetime.now(timezone.utc).isoformat()))
-        else:
-            limit = int(row["max_uses"])
-        used = int(self.conn.execute(
-            "SELECT COUNT(*) n FROM lockbox_uses WHERE cutoff=?",
-            (key,)).fetchone()["n"])
+            else:
+                limit = int(row["max_uses"])
+            used = int(self.conn.execute(
+                "SELECT COUNT(*) n FROM lockbox_uses WHERE cutoff=?",
+                (key,)).fetchone()["n"])
         return {"cutoff": key, "max_uses": limit, "used": used,
                 "remaining": max(0, limit - used),
                 "exhausted": used >= limit}

@@ -771,16 +771,17 @@ def test_t30_manual_close_pauses_only_this_magic_until_acked(tmp_path, monkeypat
     assert not it["cause"].startswith("external_exit:")
     assert "EXTERNAL_EXIT" in alerts_text(stack.live_dir)
 
-    # 人工确认：把当前实际持仓（空仓）登记为意图（cause=ack_external）
+    # 人工确认：把当前实际持仓（空仓）登记为意图（cause=ack_external，
+    # N-C1/R7 绑定协议：绑定未决事件 ticket + 确认时刻 + 净仓快照）
     ack = load_script("live_ack_external")
-    monkeypatch.setattr(ack, "_open_gateway",
-                        lambda cfg: FakeGateway(stack.broker))
-    rc_ack = ack.main(["--data-dir", str(tmp_path), "--magic", str(MAGIC),
-                       "--reason", "人工平仓已核对"])
+    rc_ack = _ack_via_script(ack, monkeypatch, stack,
+                             now=T2 + timedelta(minutes=12),
+                             reason="人工平仓已核对")
     assert rc_ack == 0
     it2 = intent_of(stack.live_dir)
     assert it2["status"] == "confirmed" and it2["cause"] == "ack_external"
     assert it2["volume"] == 0.0
+    assert it2["confirmed_events"]["tickets"] == [ticket]
     assert "ACK_EXTERNAL" in alerts_text(stack.live_dir)
 
     # 对账一致 → 暂停解除 → 恢复开仓
@@ -1786,12 +1787,11 @@ def test_r6_manual_close_executor_before_reconcile_no_reopen(tmp_path,
     assert rc == 1
     assert read_json(pause_file(stack.live_dir))["paused"] is True
 
-    # 人工确认：未决清空 → 暂停解除 → 恢复开仓
+    # 人工确认（绑定该未决事件）→ 未决清空 → 暂停解除 → 恢复开仓
     ack = load_script("live_ack_external")
-    monkeypatch.setattr(ack, "_open_gateway",
-                        lambda cfg: FakeGateway(stack.broker))
-    rc_ack = ack.main(["--data-dir", str(tmp_path), "--magic", str(MAGIC),
-                       "--reason", "人工平仓已核对"])
+    rc_ack = _ack_via_script(ack, monkeypatch, stack,
+                             now=T2 + timedelta(seconds=45),
+                             reason="人工平仓已核对")
     assert rc_ack == 0
     rc2, _ = stack.reconcile_once(now=T2 + timedelta(minutes=1))
     assert rc2 == 0
@@ -1852,3 +1852,84 @@ def test_r6_deal_history_delayed_two_rounds_then_explained_recovers(tmp_path):
     assert rr5.action == "open"
     assert len(stack.broker.market_orders) == 2
 
+
+
+# ================================================================ R7（第七轮审核）
+# N-C1：人工确认必须绑定事件——旧确认不得放行确认之后的新出场（全链路，
+# 真脚本 scripts/live_ack_external.py，含确认绑定协议的落盘形状）
+
+def _ack_via_script(mod, monkeypatch, stack, *, now: datetime,
+                    magic: int = MAGIC, reason: str = "人工确认外部出场") -> int:
+    """真脚本 main() 入口跑一次人工确认，冻结脚本时钟到 now（测试钟面），
+    网关替身读 FakeBroker 持仓。"""
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.replace(tzinfo=tz) if tz is not None else now
+
+    monkeypatch.setattr(mod, "datetime", _Frozen)
+    monkeypatch.setattr(mod, "_open_gateway",
+                        lambda cfg: FakeGateway(stack.broker))
+    return mod.main(["--data-dir", str(Path(stack.live_dir).parent),
+                     "--magic", str(magic), "--reason", reason])
+
+
+def test_r7_nc1_stale_ack_cannot_release_new_exit_full_chain(tmp_path,
+                                                             monkeypatch):
+    """N-C1 全链路复现（报告序列）：开 0.16 → 人工减至 0.08 并确认（真脚本
+    落盘绑定：空事件集+净仓快照 0.08）→ 无订单轮保留 cause=ack_external →
+    再次人工平掉余仓 → 执行器先于对账运行——不得重开（旧实现 action=open
+    重开 0.16）；再次人工确认（这次绑定新事件）后经对账恢复开仓。"""
+    stack = LiveStack(tmp_path)
+    _, rr1 = stack.round(T1, "up")
+    assert rr1.action == "open"
+    ticket = stack.broker.positions(SYMBOL)[0].ticket
+
+    # 人工减仓至 0.08（ticket 仍在 → 不是出场事件）→ 无订单轮（hold）
+    stack.broker.reduce_external(ticket, 0.08, profit=2.0, comment="manual",
+                                 reason=DEAL_REASON_CLIENT)
+    _, rr_hold = stack.round(T2, "up")
+    assert rr_hold.action == "hold"
+    assert len(stack.broker.market_orders) == 1
+
+    # 人工确认（真脚本）：绑定此刻的未决出场（空集）+ 净仓快照 0.08
+    ack = load_script("live_ack_external")
+    rc = _ack_via_script(ack, monkeypatch, stack, now=T2 + timedelta(minutes=2),
+                         reason="人工减仓已核对")
+    assert rc == 0
+    ev = intent_of(stack.live_dir)["confirmed_events"]
+    assert ev["tickets"] == []                          # 无未决事件可绑定
+    assert ev["net_volume"] == pytest.approx(0.08)      # 确认时净仓快照
+    assert ev["positions"][0]["ticket"] == ticket
+
+    # 无订单轮：意图保留 cause=ack_external（hold 不改写意图）
+    _, rr_hold2 = stack.round(T3, "up")
+    assert rr_hold2.action == "hold"
+    assert intent_of(stack.live_dir)["cause"] == "ack_external"
+
+    # 再次人工平掉余仓 → 执行器先于对账运行：新出场事件不被旧确认放行
+    stack.broker.close_external(ticket, profit=1.0, comment="manual",
+                                reason=DEAL_REASON_CLIENT)
+    _, rr = stack.round(T4, "up")
+    assert rr.action == "blocked_external_exit"         # 旧实现：open（基线）
+    assert len(stack.broker.market_orders) == 1         # 没有重开 0.16
+    state = read_json(os.path.join(stack.live_dir, f"state-{MAGIC}.json"))
+    assert str(ticket) in state["pending_external_exits"]
+
+    # 对账此刻运行：意图 0.08 vs 实际 0 → 不一致暂停（叠加防线如实呈现）
+    rc_rec, _ = stack.reconcile_once(now=T4 + timedelta(seconds=30))
+    assert rc_rec == 1
+    assert read_json(pause_file(stack.live_dir))["paused"] is True
+
+    # 再次人工确认（这次绑定新事件 ticket、快照=空仓）→ 对账一致 → 恢复
+    rc2 = _ack_via_script(ack, monkeypatch, stack, now=T4 + timedelta(minutes=1),
+                          reason="余仓人工平仓已核对")
+    assert rc2 == 0
+    ev2 = intent_of(stack.live_dir)["confirmed_events"]
+    assert ev2["tickets"] == [ticket]
+    assert ev2["net_volume"] == pytest.approx(0.0)
+    rc3, _ = stack.reconcile_once(now=T4 + timedelta(minutes=2))
+    assert rc3 == 0
+    _, rr3 = stack.round(T5, "up")
+    assert rr3.action == "open"
+    assert len(stack.broker.market_orders) == 2

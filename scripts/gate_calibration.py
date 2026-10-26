@@ -489,6 +489,8 @@ def calibrate_drift(symbol, timeframe, *, target_sharpe, period_days=1,
            "achieved_sharpe": float(best["sharpe"]),
            "iterations": len(history), "history": history,
            "target_sharpe": float(target_sharpe),
+           "tol": float(tol), "max_iter": int(max_iter),
+           "converged": bool(abs(best["sharpe"] - target_sharpe) <= tol),
            "prior": {"sigma_open_to_open": sigma,
                      "events_per_year": events_per_year,
                      "bars_per_year": float(bpy),
@@ -499,7 +501,8 @@ def calibrate_drift(symbol, timeframe, *, target_sharpe, period_days=1,
     if log:
         log(f"[calibrate] {symbol} {timeframe} target={target_sharpe} "
             f"-> d={out['drift']:.6g} sharpe={out['achieved_sharpe']:.3f} "
-            f"({out['iterations']} runs)")
+            f"({'收敛' if out['converged'] else '未收敛'}，"
+            f"{out['iterations']} runs)")
     return out
 
 
@@ -511,8 +514,9 @@ def positive_control(setups, *, levels, seeds, cfg, bars_by_symbol,
     """植入已知优势 → 各档 × 各种子的关卡套件 → 检出率。
 
     setups: (symbol, timeframe, level_cal, period_days, interval_hours,
-    hold_bars)；level_cal = {level: {"drift": d, "achieved_sharpe": s}}
-    （calibrate_drift 的产出；positive_control 只执行不校准）。
+    hold_bars)；level_cal = {level: calibrate_drift 的完整产出}（N-M1/R7：
+    history/target/tol/converged 等完整校准记录原样进 JSON——报告引用
+    calibration.history，逐字段可复核；positive_control 只执行不校准）。
     种子 → 事件相位 + 数据起点偏移（(seed%10)×每日 bar 数），同一种子
     逐位可复现。session_policies[symbol] 覆盖 session_policy（单品种运行）。
     """
@@ -523,9 +527,8 @@ def positive_control(setups, *, levels, seeds, cfg, bars_by_symbol,
     for symbol, timeframe, level_cal, period_days, interval_hours, hold_bars \
             in setups:
         key = f"{symbol} {timeframe}"
-        calibration[key] = {str(level): {
-            "drift": info["drift"], "achieved_sharpe": info["achieved_sharpe"]}
-            for level, info in level_cal.items()}
+        calibration[key] = {str(level): dict(info)
+                            for level, info in level_cal.items()}
         bars = bars_by_symbol[symbol]
         policy = policies.get(symbol, session_policy)
         bpy_shift = bars_per_day_of(timeframe)
@@ -988,12 +991,13 @@ def render_report(results: dict) -> str:
             lines.append(f"| {check} | " + " | ".join(row) + " |")
         cal = (positive.get("calibration") or {}).get(key) or {}
         if cal:
-            lines += ["", "校准（扣成本后年化夏普 → 漂移 d）："
-                      + "；".join(
-                          f"≈{lv} → d={info['drift']:.6g}"
-                          f"（实测 {info['achieved_sharpe']:.2f}）"
-                          for lv, info in sorted(
-                              cal.items(), key=lambda kv: float(kv[0])))]
+            parts = []
+            for lv, info in sorted(cal.items(), key=lambda kv: float(kv[0])):
+                mark = "" if info.get("converged", True) else "，未收敛"
+                parts.append(f"≈{lv} → d={info['drift']:.6g}"
+                             f"（实测 {info['achieved_sharpe']:.2f}{mark}）")
+            lines += ["", "校准（扣成本后年化夏普 → 漂移 d；迭代过程/目标/容差"
+                      "见 JSON 的 calibration.history）：" + "；".join(parts)]
         lines.append("")
     g5 = results.get("g5") or {}
     if g5:
@@ -1336,8 +1340,9 @@ def main(argv=None) -> int:
                     sizes_by_symbol={symbol: pack["sizes"]},
                     vols_by_symbol={symbol: pack["vols"]},
                     session_policy=pack["session_policy"], log=log)
-                level_cal[level] = {"drift": cal["drift"],
-                                    "achieved_sharpe": cal["achieved_sharpe"]}
+                # N-M1/R7：完整校准记录（history/目标/容差/收敛）进 JSON——
+                # 报告"详见 JSON 的 calibration.history"的承诺由此成立
+                level_cal[level] = dict(cal)
             setups.append((symbol, timeframe, level_cal, period_days,
                            interval_hours, PLANTED_HOLD_BARS))
         pos = positive_control(

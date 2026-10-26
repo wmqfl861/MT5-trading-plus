@@ -66,8 +66,8 @@ from mt5live.config import LiveConfig, load as load_config  # noqa: E402
 from mt5live.executor import ExecutionAdapter, LiveExecutor, \
     validate_live_strategy  # noqa: E402
 from mt5live.gate import LiveSizer, RiskGate, load_contract_sizes  # noqa: E402
-from mt5live.paper import PAPER_STATE_RELPATH, BarQuoteMarket, \
-    PaperBroker, paper_state_path  # noqa: E402（T34 影子券商）
+from mt5live.paper import PAPER_STATE_DIR_RELPATH, PAPER_STATE_RELPATH, \
+    BarQuoteMarket, PaperAccountView, PaperBroker, paper_state_path  # noqa: E402（T34 影子券商）
 from mt5live.riskproc import RiskConfigError, RiskProcess, load_risk_config  # noqa: E402
 from mt5live.runner import (  # noqa: E402
     HeartbeatWriter,
@@ -219,9 +219,14 @@ def paper_state_file(live_dir: str, magic: int) -> str:
 
 def build_executor_stack(trading, account, market, *, cfg: LiveConfig,
                          strategy, args, live_dir: str, specs_path: str,
-                         gw) -> LiveExecutor | None:
+                         gw, gate_account=None) -> LiveExecutor | None:
     """执行器 + 风控闸门 + 定手数装配（实跑与影子盘共用同一套接线，
     C1/M2/M10 全套；T34 起 trading/account 可为 PaperBroker）。
+
+    gate_account：闸门的账户视图（缺省 = account）。R7/N-C2：--paper 装配
+    传 paper 目录的 PaperAccountView 聚合视图——闸门看**账户整体**（跨
+    magic 的持仓/成交/日亏，单次 snapshot 一致快照），执行器/定手数仍用
+    本策略账户（每策略只执行自己的决策）。
 
     返回 None = 配置不可恢复（已打印并关闭网关），调用方以退出码 2 结束。
     """
@@ -247,7 +252,8 @@ def build_executor_stack(trading, account, market, *, cfg: LiveConfig,
             return None
     process = RiskProcess(risk_cfg, live_dir=live_dir,
                           session_policy=session_policy)
-    gate = RiskGate(process, account=account, market=market,
+    gate = RiskGate(process, account=(gate_account if gate_account is not None
+                                      else account), market=market,
                     specs_path=specs_path, live_dir=live_dir,
                     spread_model=spread_model,
                     session_policy=session_policy)
@@ -277,8 +283,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="影子券商模式（T34/D26）：PaperBroker 本地模拟成交"
                         "（状态按策略落 {data_root}/live/paper/"
                         "state-<magic>.json——多运行器各写各的；风控/对账"
-                        "进程用 --paper-state 指 paper 目录聚合读），闸门/"
-                        "定手数/意图/对账/风控/全平协议全链路照常；绝不连"
+                        "进程用 --paper-state 指 paper 目录聚合读），闸门看"
+                        "paper 目录聚合视图（账户整体，R7/N-C2）、定手数/"
+                        "意图/对账/风控/全平协议全链路照常；绝不连"
                         "真实下单通道。行情源：真终端；配 --offline 用合成"
                         "报价（BarQuoteMarket）")
     p.add_argument("--paper-balance", type=float, default=10_000.0,
@@ -406,9 +413,20 @@ def main(argv=None) -> int:
             market, state_path=paper_state,
             contract_sizes=contract_sizes, balance=args.paper_balance,
             magic=cfg.magic)
+        # R7/N-C2：闸门看**账户整体**——paper 目录的聚合视图（全部
+        # state-<magic>.json，单次 snapshot 一致快照；读失败显式
+        # DataUnavailableError → 执行器 risk_gate_error fail-closed）。
+        # B 策略的闸门能看到 A 的持仓（max_positions_per_symbol 等账户级
+        # 规则跨 magic 生效）；执行器/定手数仍用本策略 PaperBroker——
+        # 每策略只执行自己的决策。本策略状态文件已随 PaperBroker 构造
+        # 落盘，聚合视图至少含本策略（构造不会因空目录失败）。
+        gate_view = PaperAccountView(
+            os.path.join(live_dir, PAPER_STATE_DIR_RELPATH),
+            alert_dir=live_dir)
         executor = build_executor_stack(
             paper, paper, market, cfg=cfg, strategy=strategy, args=args,
-            live_dir=live_dir, specs_path=specs_path, gw=gw)
+            live_dir=live_dir, specs_path=specs_path, gw=gw,
+            gate_account=gate_view)
         if executor is None:
             return 2
     elif not args.dry_run:

@@ -386,6 +386,32 @@ def test_short_stop_correct_first_ask_cross_passes():
     assert row["net_rest"] == pytest.approx(0.0, abs=1e-9)
 
 
+def test_short_stop_same_ms_follow_on_quote_no_false_alarm():
+    """I6（第七轮复审）失败测试：正确止损样例追加**同毫秒后续报价**——
+    B 仍正确在该毫秒首笔穿价 tick 成交（引擎逐 tick 消费，先到先成交），
+    对账不得误报 no_trigger_at_fill。
+
+    旧实现取"该毫秒最后一笔 tick"核对触发条件：追加的未穿价报价排在
+    成交 tick 之后 → 触发条件在最后一笔上不成立 → 正确成交被判违规。
+    tick 身份应为 (time_msc, 行内序号)。"""
+    mod = _load_script()
+    bars, t15, ticks = _short_stop_setup()
+    t_stop = t15 + timedelta(minutes=20)      # B 成交 tick（Ask 首穿 SL）
+    ticks.insert(2, tick(t_stop, 100.0, 100.7))   # 同毫秒后续报价：Ask 未穿
+    rep = mod.reconcile(
+        ScriptStrategy([0] * 14 + [-1], fill=0,
+                       exit_rules=ExitRules(stop_loss_atr=1.0)),
+        bars, make_loader(ticks), FakeCosts(),
+        symbol="XAUUSD", params={}, timeframe="H1",
+        contract_size=1.0, slippage_price=SLIP_MODEL)
+    assert rep.ok, rep.rows.to_string()
+    row = rep.rows.iloc[0]
+    assert row["exit_check"] == "first_cross"
+    assert row["exit_time_ok"]
+    assert row["exit_note"] == ""
+    assert rep.summary["violations"]["exit_time"] == 0
+
+
 # --------------------------------------------- 机制核对（ctx 级手造）
 
 def _ctx_rows(mod, trades_a, trades_b, ctx, pairs=None):
@@ -580,6 +606,81 @@ def test_protective_fill_price_mismatch_is_violation():
     assert row["exit_note"] == "fill_price_mismatch"
     assert not row["exit_time_ok"]
     assert not row["row_ok"]
+
+
+def test_same_ms_exit_first_crossing_tick_price_is_the_reference():
+    """I6（第七轮复审）失败测试：出场毫秒内多笔 tick 都穿价——成交价必须
+    与**首笔**穿价 tick 的触发侧价±滑点一致（引擎语义即首笔；多笔同价取
+    首笔）。在后续同毫秒 tick 的价格上成交 → fill_price_mismatch。
+
+    旧实现与"该毫秒最后一笔 tick"比对：错误地按第二笔成交反而核对通过、
+    按首笔正确成交反被误判（两个方向都错）。"""
+    mod = _load_script()
+    t15 = pd.Timestamp("2026-01-06 01:00")
+    t30 = t15 + timedelta(minutes=30)
+    bar_times = [pd.Timestamp("2026-01-05 10:00") + timedelta(hours=i)
+                 for i in range(20)]
+    atr = [np.nan] * 14 + [1.0] * 6
+    # SL=99.6（多头 Bid 侧）：t30 两笔同毫秒 tick 均穿价（bid 99.4 / 99.55）
+    ticks = [tick(t15, 100.0, 100.5),
+             tick(t30, 99.4, 99.9),
+             tick(t30, 99.55, 100.05),
+             tick(t15 + timedelta(minutes=59, seconds=59, milliseconds=999),
+                  100.0, 100.5)]
+    ctx = make_ctx(mod, ticks, rules=ExitRules(stop_loss_atr=1.0), atr=atr,
+                   bar_times=bar_times, slippage_price=0.1,
+                   costs=FakeCosts(overshoot=0.0))
+    a = (t15, t15, t15, "long", 1.0, 100.6, 99.5, -1.1, -1.1, 0.0,
+         0.0, 0.5, 0.0, "stop")
+    # B 按第二笔穿价 tick（99.55−0.1）而非首笔（99.4−0.1）成交 → 违规
+    b_bad = (t15, t30, t30, "long", 1.0, 100.6, 99.45, -1.15, -1.15, 0.0,
+             0.0, 0.5, 0.0, "stop")
+    rows = _ctx_rows(mod, [a], [b_bad], ctx)
+    row = rows.iloc[0]
+    assert row["exit_note"] == "fill_price_mismatch"
+    assert not row["exit_time_ok"]
+    # 同数据：B 按首笔穿价 tick 成交（99.4−0.1=99.3）→ 通过
+    b_ok = (t15, t30, t30, "long", 1.0, 100.6, 99.3, -1.3, -1.3, 0.0,
+            0.0, 0.5, 0.0, "stop")
+    rows = _ctx_rows(mod, [a], [b_ok], ctx)
+    assert rows.iloc[0]["exit_time_ok"]
+    assert rows.iloc[0]["exit_note"] == ""
+
+
+def test_entry_ms_ticks_after_entry_fill_checked_for_earlier_cross():
+    """I6（第七轮复审）失败测试：入场毫秒不整段跳过——引擎语义是"入场
+    成交 tick 自身不触发 SL/TP，**下一笔 tick 起**逐 tick 监控"，同毫秒内
+    排在入场 tick 之后的报价同样参与判定。
+
+    旧实现 searchsorted(side=right) 跳过入场毫秒全部 tick：入场同毫秒后续
+    tick 已穿价、B 却拖到 +30m 才出场时，earlier_cross 检不出来。"""
+    mod = _load_script()
+    t15 = pd.Timestamp("2026-01-06 01:00")
+    t30 = t15 + timedelta(minutes=30)
+    bar_times = [pd.Timestamp("2026-01-05 10:00") + timedelta(hours=i)
+                 for i in range(20)]
+    atr = [np.nan] * 14 + [1.0] * 6
+    # 空头：入场 99.9（bid100.0−滑点0.1）、SL=99.9+1×ATR=100.9（Ask 侧）。
+    # 入场 tick 之后同毫秒第二笔 Ask=100.95 已穿 SL —— 引擎应在该笔止损
+    ticks = [tick(t15, 100.0, 100.5),
+             tick(t15, 100.05, 100.95),
+             tick(t30, 100.1, 101.0)]
+    ctx = make_ctx(mod, ticks, rules=ExitRules(stop_loss_atr=1.0), atr=atr,
+                   bar_times=bar_times, slippage_price=0.1)
+    short_a = (t15, t15, t15, "short", 1.0, 99.9, 101.0, -1.1, -1.1, 0.0,
+               0.0, 0.5, 0.0, "stop")
+    # B 拖到 +30m 才止损 → 入场同毫秒的穿价 tick 必须被判 earlier_cross
+    b_late = (t15, t30, t30, "short", 1.0, 99.9, 101.1, -1.2, -1.2, 0.0,
+              0.0, 0.1, 0.0, "stop")
+    rows = _ctx_rows(mod, [short_a], [b_late], ctx)
+    assert rows.iloc[0]["exit_note"] == "earlier_cross"
+    assert not rows.iloc[0]["exit_time_ok"]
+    # 对照：入场/出场同毫秒，B 在穿价那笔（Ask100.95+0.1）成交 → 通过
+    b_same = (t15, t15, t15, "short", 1.0, 99.9, 101.05, -1.15, -1.15, 0.0,
+              0.0, 0.05, 0.0, "stop")
+    rows = _ctx_rows(mod, [short_a], [b_same], ctx)
+    assert rows.iloc[0]["exit_time_ok"]
+    assert rows.iloc[0]["exit_note"] == ""
 
 
 def test_short_protective_spread_difference_not_in_rest():

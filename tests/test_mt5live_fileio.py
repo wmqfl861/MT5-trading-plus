@@ -5,8 +5,9 @@ write_json_atomic / atomic_replace 直接复用 mt5gw.snapshot
 文件句柄时 os.replace 会失败，M1 的根因）；append_line / append_jsonl 用
 O_APPEND 单次 write（追加写对单行原子）+ 共享冲突重试（M8：多运行器并发
 追加不再交错出坏行）。R6（I1）：原子写临时文件带 pid+uuid 唯一后缀
-（多写者不再争用同一 tmp）；file_lock 跨进程文件锁（O_CREAT|O_EXCL +
-残锁接管）供指令创建等"先读后写"复合操作串行化。
+（多写者不再争用同一 tmp）；R7（I1 残留 N-I2）：file_lock 改为内核字节锁
+（msvcrt.locking / flock）——互斥由内核仲裁、崩溃自动释放，废除按 mtime
+的超龄接管（读旧 mtime 删新锁的双所有者竞态源头）。
 """
 import json
 import os
@@ -141,7 +142,9 @@ def test_r6_concurrent_write_json_atomic_no_exception_valid_result(tmp_path):
 
 
 def test_r6_file_lock_mutual_exclusion_release_and_stale_takeover(tmp_path):
-    """file_lock：互斥（第二个获取者短预算内拿不到）、释放即删、残锁接管。"""
+    """file_lock：互斥（第二个获取者短预算内拿不到）、释放后可再拿；
+    崩溃语义由内核保证（持锁进程死亡锁自动消失——残锁文件不再阻塞
+    后来者，也无须超龄接管；R7/I1 起锁文件常驻磁盘）。"""
     lock = str(tmp_path / "live" / "commands" / ".flatten.lock")
     with fileio.file_lock(lock):
         assert os.path.exists(lock)
@@ -158,20 +161,18 @@ def test_r6_file_lock_mutual_exclusion_release_and_stale_takeover(tmp_path):
         t.start()
         t.join()
         assert result["got"] is False              # 持锁期间他人拿不到
-    assert not os.path.exists(lock)                # 用完即删
-    # 释放后可再拿
+    # 释放后可再拿（锁文件常驻——内容/存在性不再承载互斥语义）
     with fileio.file_lock(lock, attempts=3, retry_s=0.01):
         assert os.path.exists(lock)
-    assert not os.path.exists(lock)
 
-    # 残锁接管：mtime 超过 stale_after → 直接接管（进程崩溃遗留）
+    # 崩溃遗留的"残锁"文件（无任何持有者）：内核锁已随进程消失 →
+    # 直接拿到、不阻塞（旧实现的超龄接管竞态源头已整体删除，见 R7）
     with open(lock, "w", encoding="utf-8") as f:
-        f.write("stale")
+        f.write("stale owner")
     old = time.time() - 3600.0
     os.utime(lock, (old, old))
-    with fileio.file_lock(lock, stale_after=600.0, attempts=3, retry_s=0.01):
+    with fileio.file_lock(lock, attempts=3, retry_s=0.01):
         assert os.path.exists(lock)
-    assert not os.path.exists(lock)
 
 
 def test_r6_concurrent_write_flatten_yields_single_command(tmp_path):
@@ -214,3 +215,80 @@ def test_r6_read_flatten_oserror_is_command_unreadable(tmp_path):
     os.makedirs(os.path.join(live, "commands", "flatten.json"))
     with pytest.raises(CommandUnreadableError):
         read_flatten(live)
+
+
+# ================================================================ R7（I1 残留/N-I2）
+# 锁的超龄接管竞态：读旧 mtime → 他人换新锁 → 恢复者删新锁 → 双所有者
+
+def test_r7_file_lock_stale_mtime_never_breaks_live_holder(tmp_path):
+    """N-I2 复现交错（报告序列）：接管者读到"超龄"mtime 后，另一持有者
+    仍活着持锁——接管者**不得**闯进临界区（旧实现：读 mtime → 直接删
+    路径 → 删掉活锁持有者的新锁 → 两个所有者）。互斥由内核文件锁保证，
+    mtime 做旧（崩溃残留的外观）不再构成接管依据。"""
+    lock = str(tmp_path / "live" / "commands" / ".flatten.lock")
+    with fileio.file_lock(lock):                      # 活锁持有者
+        assert os.path.exists(lock)
+        # 报告竞态的起点：锁文件被做旧成"崩溃残留"的外观
+        old = time.time() - 3600.0
+        os.utime(lock, (old, old))
+        got = {}
+
+        def taker():
+            try:
+                with fileio.file_lock(lock, attempts=2, retry_s=0.01):
+                    got["in"] = True
+            except TimeoutError:
+                got["in"] = False
+
+        t = threading.Thread(target=taker)
+        t.start()
+        t.join()
+        assert got["in"] is False        # 互斥不破（旧实现 True=双所有者）
+    # 释放后可再拿
+    with fileio.file_lock(lock, attempts=2, retry_s=0.01):
+        pass
+
+
+def test_r7_file_lock_release_never_deletes_live_successor(tmp_path):
+    """N-I2 释放侧竞态：持有者 A 的锁被做旧成"残锁"外观后，B 依超龄接管
+    进入临界区，A 此刻才释放——旧实现 A 的 finally 直接 os.remove 路径，
+    删掉的是 B 的锁，第三个竞争者 C 随即拿到锁与 B 并发。断言核心不变量：
+    任意时刻至多一个所有者在临界区（B、C 不得同时持有）。"""
+    lock = str(tmp_path / "live" / "commands" / ".flatten.lock")
+    a_holds = threading.Event()
+    a_may_release = threading.Event()
+    got = {}
+
+    def holder_a():
+        with fileio.file_lock(lock):
+            old = time.time() - 3600.0
+            os.utime(lock, (old, old))               # A 的锁被做旧
+            a_holds.set()
+            a_may_release.wait(5.0)                  # B 进（或超时）后再释放
+
+    def taker_b():
+        a_holds.wait(5.0)
+        try:
+            with fileio.file_lock(lock, attempts=3, retry_s=0.01):
+                got["b"] = True
+                a_may_release.set()                  # B 已在临界区
+                time.sleep(0.3)                      # 仍在临界区逗留
+        except TimeoutError:
+            got["b"] = False
+            a_may_release.set()
+
+    def taker_c():
+        a_may_release.wait(5.0)
+        try:
+            with fileio.file_lock(lock, attempts=3, retry_s=0.05):
+                got["c"] = True
+        except TimeoutError:
+            got["c"] = False
+
+    ts = [threading.Thread(target=f) for f in (holder_a, taker_b, taker_c)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    # B 与 C 不得同时持有（旧实现：A 释放删掉 B 的锁 → C 拿到 → 双所有者）
+    assert not (got.get("b") and got.get("c"))

@@ -30,6 +30,19 @@ PaperAccountView / PaperStateGateway **每查询重读**聚合（持仓合并、
 求和），**不碰真实账户**。旧版单文件 ``paper/state.json`` 已停用（多写者
 互相覆盖，见第六轮审核 C3）。
 
+R7/N-C2（账户级风控统一语义）：
+- **一致快照** ``PaperAccountView.snapshot()``：一次调用 glob 一次、每个
+  状态文件只读一次解析一次，返回同版本的持仓/成交/账户状态（不可变
+  ``PaperSnapshot``）——一次风控计算（RiskGate.check_open /
+  risk_process.build_snapshot）不再把 positions() 与 deals() 两次重读之间
+  落盘的同一笔亏损同时计为浮亏与已实现；跨文件快照时刻不一致时照常聚合
+  但在快照上标 ``inconsistent=True``（不阻断，供日报/告警）；
+- **读失败显式不可用**：状态文件**存在但读不出**（损坏/权限/结构非法）→
+  该次聚合查询抛 ``DataUnavailableError``（绝不静默按空聚合——那会把该
+  策略的持仓与亏损从风控口径变没），闸门经执行器 ``risk_gate_error``
+  路径 fail-closed 拒单、风控主循环按轮询失败告警重试；**文件不存在**
+  （策略未启动、glob 后被归档移走）不算失败。
+
 绝不 import MetaTrader5、绝不连终端下单：影子券商的全部"成交"都是本地记账。
 """
 from __future__ import annotations
@@ -38,6 +51,7 @@ import glob
 import json
 import os
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -486,6 +500,31 @@ def _deal_from_dict(d: dict) -> Deal:
 # 只读聚合账户视图：risk_process / live_reconcile 用状态文件替代真实账户。
 # R6/C3：持 paper 目录（或单状态文件），**每次查询都重读盘**——常驻风控/
 # 对账循环每轮自动看到各运行器的最新成交与浮盈，不再构造时快照一次。
+# R7/N-C2：查询内部经 snapshot()（glob 一次、每文件只读一次解析一次）；
+# 存在但读不出的状态文件显式 DataUnavailableError（绝不静默按空聚合）。
+
+@dataclass(frozen=True)
+class PaperSnapshot:
+    """一次 ``PaperAccountView.snapshot()`` 的不可变聚合快照（R7/N-C2）。
+
+    - positions / deals：全部状态文件合并（票号区间按 magic 派生不撞，
+      positions 按 ticket、deals 按 (time, ticket) 排序）——**同版本**：
+      每个文件只读一次解析一次，单文件内持仓与成交必然一致（同一笔
+      亏损不会既在持仓里计浮亏、又在流水里计已实现）；
+    - state：聚合账户状态（余额/权益 = 各文件求和）；
+    - file_ts：各状态文件 (basename, 快照时刻)——时刻取 equity_ts_utc
+      （缺则 updated_at_utc；都缺/解析失败 → None）；
+    - inconsistent：跨文件快照时刻不一致（或部分文件缺时刻）→ True，
+      **照常聚合不阻断**——只供日报/告警区分"某策略落盘滞后"，一致性
+      结论以单文件内持仓/成交同版本为准。
+    """
+
+    positions: tuple[Position, ...]
+    deals: tuple[Deal, ...]
+    state: AccountState
+    file_ts: tuple[tuple[str, datetime | None], ...]
+    inconsistent: bool
+
 
 class PaperAccountView:
     """从 paper 状态文件构造的只读聚合账户视图（不连终端、不下单）。
@@ -495,10 +534,17 @@ class PaperAccountView:
       多写者布局已停用）；
     - state_path 为 **单个状态文件**：单策略兼容（只读该文件）。
 
-    **每次查询（state/positions/deals/deals_for_position）都重新读盘**：
-    另一"进程"（运行器）落盘的新仓/平仓/浮盈，下一次查询即可见。读不到
-    的文件按空处理并告警（stderr；给了 alert_dir 再追加 alerts.log 的
-    ACCOUNT_POLL_ERROR），绝不打崩常驻调用方。
+    **每次查询（snapshot/state/positions/deals/deals_for_position）都重新
+    读盘**：另一"进程"（运行器）落盘的新仓/平仓/浮盈，下一次查询即可见；
+    每次查询内部是一次 snapshot()——glob 一次、每个文件只读一次解析一次，
+    单次查询内的持仓与成交同版本（R7/N-C2 一致快照）。
+
+    读失败分级（R7/N-C2，撤销 R6"按空处理"）：
+    - 状态文件**存在但读不出**（损坏/权限/结构非法）→ 该次查询抛
+      ``DataUnavailableError``（告警照写：stderr + alerts.log）——该策略
+      的持仓与亏损绝不静默从风控口径消失；闸门/风控主循环 fail-closed；
+    - **文件不存在**（策略未启动；glob 与 open 之间被归档移走）→ 不算
+      失败，视同该策略无状态。
 
     聚合语义：持仓/成交合并（票号区间按 magic 派生，天然不撞）、余额与
     权益求和；``latest_update_utc()`` 取各文件最新快照时刻。
@@ -521,7 +567,7 @@ class PaperAccountView:
                   "现写 paper/state-<magic>.json；如非有意指定，请改用 "
                   "--paper-state 指向 paper 目录", file=sys.stderr, flush=True)
 
-    # ---- 文件发现与逐查询重读 ----
+    # ---- 文件发现与一致快照（R7/N-C2） ----
 
     def _state_files(self) -> list[str]:
         """当前可见的状态文件（目录模式每调用重新 glob——新策略的状态
@@ -533,23 +579,78 @@ class PaperAccountView:
             return [self._state_path]
         return []
 
-    def _read_all(self) -> list[dict]:
-        """读全部状态文件；坏文件按空处理并告警（C3：不打崩调用方）。"""
-        docs: list[dict] = []
+    def _read_state_file(self, path: str) -> dict | None:
+        """读单个状态文件并校验结构（R7/N-C2 读失败分级）。
+
+        - 存在但读不出（OSError/坏 JSON/缺 balance）→ 告警后抛
+          DataUnavailableError：该策略的风控口径（持仓/成交/盈亏）不可
+          用，本次聚合查询整体拒判（fail-closed），绝不按空聚合；
+        - glob 后文件消失（FileNotFoundError：策略归档/清理瞬间）→
+          None（视同该策略未启动，不算失败）。
+        """
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or "balance" not in data:
+                raise ValueError("顶层须为带 balance 的对象")
+        except FileNotFoundError:
+            return None                     # glob 后被移走：视同不存在
+        except (OSError, ValueError) as e:
+            self._warn_unreadable(path, e)
+            raise DataUnavailableError(
+                f"影子状态文件 {path} 读取失败（{e}）——该策略的持仓/成交/"
+                "盈亏不可用，本次聚合查询拒绝（fail-closed：绝不静默按空"
+                "聚合把亏损从风控口径变没）；人工修复或删除该文件后自动"
+                "恢复") from e
+        return data
+
+    def snapshot(self) -> PaperSnapshot:
+        """一致快照（R7/N-C2）：一次调用 glob 一次、每个状态文件只读
+        一次解析一次，返回同版本的持仓/成交/账户状态。
+
+        跨文件快照时刻（equity_ts_utc）不一致 → ``inconsistent=True``
+        照常聚合（不阻断；单文件内持仓与成交仍必然同版本）。风控闸门
+        （RiskGate.check_open）与风控主循环（risk_process.build_snapshot）
+        用**单次** snapshot 组装一次风控计算的全部账户数据——两次独立
+        查询（positions() 后 deals()）之间落盘的平仓不会再被双计。
+        """
+        entries: list[tuple[str, dict]] = []
         for path in self._state_files():
-            try:
-                with open(path, encoding="utf-8") as f:
-                    data = json.load(f)
-                if not isinstance(data, dict) or "balance" not in data:
-                    raise ValueError("顶层须为带 balance 的对象")
-            except (OSError, ValueError) as e:
-                self._warn_unreadable(path, e)
+            data = self._read_state_file(path)
+            if data is None:
                 continue
-            docs.append(data)
-        return docs
+            entries.append((os.path.basename(path), data))
+        if not entries:
+            raise DataUnavailableError(
+                f"影子状态不可用：{self._state_path} 下构造时可见的 "
+                "state-*.json 此刻全部不存在——账户整体消失按数据不可用"
+                "处理（fail-closed），绝不静默当空账户聚合")
+        positions = sorted(
+            (p for _, d in entries
+             for p in (_position_from_dict(x) for x in d.get("positions", []))),
+            key=lambda p: p.ticket)
+        deals = sorted(
+            (d for _, doc in entries
+             for d in (_deal_from_dict(x) for x in doc.get("deals", []))),
+            key=lambda d: (d.time, d.ticket))
+        balance = sum(float(d.get("balance", 0.0)) for _, d in entries)
+        equity = sum(float(d.get("equity", d.get("balance", 0.0)))
+                     for _, d in entries)
+        file_ts = tuple((name, _doc_snapshot_ts(d)) for name, d in entries)
+        ts_values = [t for _, t in file_ts if t is not None]
+        inconsistent = (len(set(ts_values)) > 1
+                        or 0 < len(ts_values) < len(file_ts))
+        return PaperSnapshot(
+            positions=tuple(positions), deals=tuple(deals),
+            state=AccountState(
+                login=0, server="paper-shadow", company="PaperBroker (T34)",
+                currency="USD", leverage=100, balance=balance, equity=equity,
+                margin=0.0, margin_free=equity, margin_mode=2, trade_mode=0),
+            file_ts=file_ts, inconsistent=inconsistent)
 
     def _warn_unreadable(self, path: str, err: Exception) -> None:
-        msg = f"影子状态文件 {path} 读取失败（按空处理）：{err}"
+        msg = (f"影子状态文件 {path} 读取失败（数据不可用，本次查询拒绝——"
+               f"fail-closed）：{err}")
         print(f"⚠ {msg}", file=sys.stderr, flush=True)
         if self._alert_dir:
             try:
@@ -557,60 +658,46 @@ class PaperAccountView:
             except OSError:
                 pass          # 告警通道不可用：不让告警打崩溃读取方
 
-    # ---- AccountService 子集（聚合） ----
+    # ---- AccountService 子集（聚合；每次查询一次一致快照） ----
 
     def state(self) -> AccountState:
-        docs = self._read_all()
-        balance = sum(float(d.get("balance", 0.0)) for d in docs)
-        equity = sum(float(d.get("equity", d.get("balance", 0.0)))
-                     for d in docs)
-        return AccountState(
-            login=0, server="paper-shadow", company="PaperBroker (T34)",
-            currency="USD", leverage=100, balance=balance, equity=equity,
-            margin=0.0, margin_free=equity, margin_mode=2, trade_mode=0)
+        return self.snapshot().state
 
     def positions(self, symbol: str | None = None) -> list[Position]:
-        out = [p for d in self._read_all()
-               for p in (_position_from_dict(x)
-                         for x in d.get("positions", []))
-               if symbol is None or p.symbol == symbol]
-        out.sort(key=lambda p: p.ticket)
-        return out
+        snap = self.snapshot()
+        return [p for p in snap.positions
+                if symbol is None or p.symbol == symbol]
 
     def pending_orders(self, symbol: str | None = None) -> list:
         return []
 
     def deals(self, since: datetime, to: datetime) -> list[Deal]:
         lo, hi = naive_utc(since), naive_utc(to)
-        out = [d for doc in self._read_all()
-               for d in (_deal_from_dict(x) for x in doc.get("deals", []))
-               if lo <= d.time <= hi]
-        out.sort(key=lambda d: (d.time, d.ticket))
-        return out
+        return [d for d in self.snapshot().deals if lo <= d.time <= hi]
 
     def deals_for_position(self, position_id: int) -> list[Deal]:
-        out = [d for doc in self._read_all()
-               for d in (_deal_from_dict(x) for x in doc.get("deals", []))
-               if d.position_id == position_id]
-        out.sort(key=lambda d: (d.time, d.ticket))
-        return out
+        return [d for d in self.snapshot().deals
+                if d.position_id == position_id]
 
     def latest_update_utc(self) -> datetime | None:
         """全部状态文件里最新的快照时刻（equity_ts_utc 优先，缺则
         updated_at_utc；无任何可读文件 → None）。"""
-        ts: datetime | None = None
-        for d in self._read_all():
-            for key in ("equity_ts_utc", "updated_at_utc"):
-                raw = d.get(key)
-                if not raw:
-                    continue
-                try:
-                    t = parse_iso(str(raw))
-                except (ValueError, TypeError):
-                    continue
-                if ts is None or t > ts:
-                    ts = t
-        return ts
+        ts_list = [t for _, t in self.snapshot().file_ts if t is not None]
+        return max(ts_list) if ts_list else None
+
+
+def _doc_snapshot_ts(doc: dict) -> datetime | None:
+    """状态文件的快照时刻：equity_ts_utc 优先，缺则 updated_at_utc；
+    都缺/解析失败 → None（快照上据此标 inconsistent）。"""
+    for key in ("equity_ts_utc", "updated_at_utc"):
+        raw = doc.get(key)
+        if not raw:
+            continue
+        try:
+            return parse_iso(str(raw))
+        except (ValueError, TypeError):
+            continue
+    return None
 
 
 class PaperStateGateway:
@@ -674,6 +761,7 @@ __all__ = [
     "BarQuoteMarket",
     "PaperAccountView",
     "PaperBroker",
+    "PaperSnapshot",
     "PaperStateGateway",
     "paper_state_path",
 ]

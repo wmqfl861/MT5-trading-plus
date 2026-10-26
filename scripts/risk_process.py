@@ -62,16 +62,28 @@ def build_snapshot(gw, now: datetime) -> AccountSnapshot:
     gw 是"带 account 的网关对象"：真终端 MT5Gateway，或 T34 影子盘的
     PaperStateGateway（--paper-state：paper 目录聚合全部 state-<magic>.json
     或单状态文件，每查询重读——R6/C3、不碰真实账户）。
+
+    R7/N-C2：account 提供 snapshot()（PaperAccountView）→ **单次**调用取
+    同一版本的持仓+当日成交+状态——两次独立查询之间落盘的平仓不会被同时
+    计为浮亏与已实现；状态文件存在但读不出 → 经聚合视图抛
+    DataUnavailableError（调用方按轮询失败告警/重试，绝不静默当日盈亏
+    变 0）。真终端退回逐查询。
     """
-    state = gw.account.state()
+    snap_fn = getattr(gw.account, "snapshot", None)
+    snap = snap_fn() if callable(snap_fn) else None
+    state = snap.state if snap is not None else gw.account.state()
     if state.currency != "USD":
         raise ValueError(
             f"账户货币须为 USD（美元暴露/日亏口径），收到 {state.currency!r}")
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    positions = gw.account.positions()
-    deals = gw.account.deals(day_start, now)
-    return AccountSnapshot(currency=state.currency, positions=tuple(positions),
-                           deals=tuple(deals))
+    if snap is not None:
+        positions: tuple = snap.positions
+        deals = tuple(d for d in snap.deals if day_start <= d.time <= now)
+    else:
+        positions = tuple(gw.account.positions())
+        deals = tuple(gw.account.deals(day_start, now))
+    return AccountSnapshot(currency=state.currency, positions=positions,
+                           deals=deals)
 
 
 def run_one_cycle(risk: RiskProcess, gw) -> CycleResult:
@@ -116,7 +128,8 @@ def main(argv=None) -> int:
     try:
         if args.paper_state:
             try:
-                # alert_dir：影子状态读失败（按空处理）时同步落 alerts.log
+                # alert_dir：影子状态读失败（fail-closed 数据不可用）时
+                # 同步落 alerts.log
                 gw = PaperStateGateway(args.paper_state,
                                        alert_dir=risk.live_dir)
             except DataUnavailableError as e:

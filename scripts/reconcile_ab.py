@@ -31,8 +31,15 @@ load_ticks 月分区按品种加载窗口内 tick，reconcile() 复用同一个 
    正是机制语义，差的是行情本身没有报价。
 2. **保护性出场（stop / take_profit）**：B 层成交 tick = 按正确一侧
    （多头 Bid、空头 Ask）第一笔穿过价位的 tick——出场 tick 上必须已触发，
-   且入场 tick 之后、出场 tick 之前不存在任何已穿价（stop 或 TP，任一）
+   且入场成交 tick 之后、出场 tick 之前不存在任何已穿价（stop 或 TP，任一）
    的 tick；A 层 = 价位（跳空时为开盘价，机制参照）。零容差。
+   tick 身份 = (time_msc, 行内序号)（I6/第七轮）：同毫秒多笔 tick 时成交
+   tick = 该毫秒内首笔穿价 tick（引擎逐 tick 消费、先到先成交，多笔同价
+   取首笔；成交价即该 tick 触发侧价 ± slippage）；入场毫秒不整段跳过——
+   引擎语义是"入场成交 tick 自身不触发、**下一笔 tick 起**监控"，同毫秒内
+   排在入场 tick 之后的报价同样参与 earlier_cross 判定。engine_b 不输出
+   成交 tick 序号，入场 tick 按"与 B 入场成交价相等（入场侧价 ± 滑点）的
+   该毫秒内 tick"消歧，回退该毫秒首笔。
 3. **收盘价类出场（time_stop / week_close / end_of_data）**：B 层成交 =
    出场 bar 收盘边界（A 的 exit_fill_time）前最后一笔 tick，且落在出场
    bar 区间 [bar 开盘, 收盘) 内。零容差（B 实现语义即"prev tick"）。
@@ -353,18 +360,48 @@ def _cond_hit(level_name: str, level: float, is_long: bool,
     return (bid >= level) if is_long else (ask <= level)
 
 
+def _entry_fill_tick_index(w: tuple, b: pd.Series, ctx: MechanismContext,
+                           entry_ms: int) -> int:
+    """入场成交 tick 的行内序号（I6：tick 身份 = (time_msc, 行内序号)）。
+
+    引擎语义：入场 = 就绪时刻后**首笔** tick，成交 tick 自身不触发 SL/TP，
+    从**下一笔 tick** 起逐 tick 监控（含同毫秒内排在其后的报价）。engine_b
+    不输出成交 tick 序号，这里按成交价消歧：入场毫秒内首笔满足"成交价 =
+    入场侧价 ± slippage"（多头 Ask+slip / 空头 Bid−slip）的 tick；禁入窗把
+    成交推迟到同毫秒后续报价时也能对上；无同价 tick 回退该毫秒首笔
+    （无禁入窗时引擎就在首笔成交）。"""
+    msc_, bid_, ask_ = w
+    lo = int(np.searchsorted(msc_, entry_ms, side="left"))
+    hi = int(np.searchsorted(msc_, entry_ms, side="right"))
+    if lo >= hi:
+        return lo
+    slip = float(ctx.slippage_price)
+    entry_price = float(b["entry_price"])
+    is_long = str(b["side"]) == "long"
+    for k in range(lo, hi):
+        px = (float(ask_[k]) + slip) if is_long else (float(bid_[k]) - slip)
+        if abs(px - entry_price) <= 1e-9 * max(1.0, abs(px)):
+            return k
+    return lo
+
+
 def _check_protective_exit(probe: TickProbe, ctx: MechanismContext,
                            b: pd.Series) -> dict:
-    """保护性出场核对：B 成交 tick=正确一侧第一笔穿过价位的 tick。
+    """保护性出场核对：B 成交 tick = 正确一侧第一笔穿过价位的 tick。
 
-    - 出场 tick 上该出场原因的触发条件必须成立（按错一侧触发的实现在此
-      暴露为 no_trigger_at_fill）；
-    - 成交价 = 该 tick 触发侧价格 ± slippage_price（多头 Bid−slip /
-      空头 Ask+slip）——成交价坏在别处不会被越幅分量吞掉
-      （fill_price_mismatch）；
-    - 入场 tick 之后、出场 tick 之前不存在任何已穿价（SL 或 TP 任一）的
-    tick——引擎逐 tick 先查止损后查止盈，更早穿价必然更早出场
-    （earlier_cross）。
+    I6（第七轮复审）：tick 身份 = (time_msc, 行内序号)，不再"取该毫秒最后
+    一笔"或"整段跳过入场毫秒"——同毫秒多笔 tick 时旧口径会把 B 的正确成交
+    误判 no_trigger_at_fill / 放过真正的成交价错误：
+
+    - 出场成交 tick = 出场毫秒内、入场成交 tick 之后**首笔满足该出场原因
+      触发条件**的 tick（引擎逐 tick 消费、先到先成交，多笔同价取首笔），
+      按错误一侧触发的实现仍暴露为 no_trigger_at_fill；
+    - 成交价 = 该 tick 触发侧价格 ± slippage_price（多头 Bid−slip / 空头
+      Ask+slip）——B 若在后续同毫秒 tick 的价格上成交，在此暴露为
+      fill_price_mismatch（成交价坏在别处不会被越幅分量吞掉）；
+    - 入场成交 tick 之后、出场成交 tick 之前不存在任何已穿价（SL 或 TP
+      任一）的 tick——同毫秒内排在入场 tick 之后的报价同样参与判定
+      （引擎语义即"下一笔 tick 起"），更早穿价必然更早出场（earlier_cross）。
     """
     out = {"ok": False, "note": ""}
     is_long = str(b["side"]) == "long"
@@ -379,21 +416,31 @@ def _check_protective_exit(probe: TickProbe, ctx: MechanismContext,
     if len(w[0]) == 0 or int(w[0][-1]) != exit_ms:
         out["note"] = "no_ticks"
         return out
-    fill_bid, fill_ask = float(w[1][-1]), float(w[2][-1])
-    if not bool(_cond_hit(reason, levels[reason], is_long,
-                          np.array([fill_bid]), np.array([fill_ask]))[0]):
+    msc_, bid_, ask_ = w
+    k_entry = _entry_fill_tick_index(w, b, ctx, entry_ms)
+    # 出场毫秒组（窗口右端即 exit_ms，故尾部全组）内、入场 tick 之后：
+    # 首笔满足触发条件的 tick
+    lo_exit = int(np.searchsorted(msc_, exit_ms, side="left"))
+    start = max(k_entry + 1, lo_exit)
+    if start < len(msc_):
+        hits = np.flatnonzero(_cond_hit(reason, levels[reason], is_long,
+                                        bid_[start:], ask_[start:]))
+    else:
+        hits = np.array([], dtype="int64")
+    if hits.size == 0:
         out["note"] = "no_trigger_at_fill"
         return out
+    k_fill = start + int(hits[0])
+    fill_bid, fill_ask = float(bid_[k_fill]), float(ask_[k_fill])
     expected = (fill_bid - float(ctx.slippage_price) if is_long
                 else fill_ask + float(ctx.slippage_price))
     if abs(float(b["exit_price"]) - expected) > 1e-9 * max(1.0, abs(expected)):
         out["note"] = "fill_price_mismatch"
         return out
-    j0 = int(np.searchsorted(w[0], entry_ms, side="right"))   # 入场 tick 不自触发
-    if j0 < len(w[0]) - 1:
-        bid_, ask_ = w[1][j0:-1], w[2][j0:-1]
+    if k_fill > k_entry + 1:   # 入场 tick 不自触发，其后逐 tick（含同毫秒）
+        seg_bid, seg_ask = bid_[k_entry + 1:k_fill], ask_[k_entry + 1:k_fill]
         for name, lv in levels.items():
-            if bool(_cond_hit(name, lv, is_long, bid_, ask_).any()):
+            if bool(_cond_hit(name, lv, is_long, seg_bid, seg_ask).any()):
                 out["note"] = "earlier_cross"
                 return out
     out["ok"] = True
@@ -790,7 +837,9 @@ def reconcile(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
         "net_rest_tol_spreads": float(net_rest_tol_spreads),
         "close_exit": "exact: last tick before bar close, inside exit bar",
         "protective_exit": ("exact: first crossing tick on trigger side "
-                            "(long Bid / short Ask)"),
+                            "(long Bid / short Ask); tick identity = "
+                            "(time_msc, in-store seq)——同毫秒多笔取首笔"
+                            "穿价 tick，入场 tick 后下一笔起监控"),
     }
     summary["ok"] = bool(summary["violations"]["total"] == 0)
     return ReconcileReport(ok=summary["ok"], rows=rows, summary=summary,

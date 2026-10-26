@@ -995,3 +995,64 @@ def test_cost_version_cache_hit_equals_direct_build(tmp_path):
     # 直建无缓存 → 无越幅表可挂，标注 no-overshoot（缓存路径是 ov[...]）
     assert "no-overshoot" in ver_d and "ov[" not in ver_d
     assert "ov[" in ver_c
+
+
+# ----------------------------------------------- R7/I2 残留：swap 费率身份
+
+def _write_calibrated_swap(root, long_rate, short_rate=-0.5):
+    """calibrated.json + specs 快照（calibrated 三倍日来源）——swap 实测费率路径。"""
+    import os
+
+    costs = os.path.join(str(root), "costs")
+    os.makedirs(costs, exist_ok=True)
+    Path(costs, "calibrated.json").write_text(json.dumps({
+        "version": 1, "symbols": {"XAUUSD": {
+            "swap": {"free_of_swap": None,
+                     "long": {"per_lot_per_night": long_rate},
+                     "short": {"per_lot_per_night": short_rate}}}}}),
+        encoding="utf-8")
+    specs = os.path.join(str(root), "specs")
+    os.makedirs(specs, exist_ok=True)
+    Path(specs, "latest.json").write_text(json.dumps({
+        "XAUUSD": {"swap_rollover3days": 3, "contract_size": 100}}),
+        encoding="utf-8")
+
+
+def test_cost_version_binds_actual_swap_rates_calibrated(tmp_path):
+    """R7/I2 失败测试：calibrated 实测每夜费率 −1 → −10（实际费用随之
+    变化），cost_model_version 必须变化，且带 swap 规则摘要 sha8——此前
+    版本串完全相同，swap 费率不构成成本身份。"""
+    mod = _load_script()
+    root = _full_hour_ticks(tmp_path / "data")
+    _write_calibrated_swap(root, -1.0)
+    _, ver1 = mod.build_costs(str(root), "XAUUSD", 0.0, allow_zero_swap=True)
+    assert "swap-cal" in ver1
+    assert "swap-cal" in ver1 and "[" in ver1.split("swap-cal", 1)[1]
+    _write_calibrated_swap(root, -10.0)     # 只改费率
+    _, ver2 = mod.build_costs(str(root), "XAUUSD", 0.0, allow_zero_swap=True)
+    assert ver2 != ver1
+
+
+def test_cost_version_binds_actual_swap_rates_snapshot(tmp_path):
+    """快照推算路径同理：swap_long 费率变 → 版本串变（费率身份不分来路）。"""
+    import os
+
+    mod = _load_script()
+
+    def _snapshot_root(swap_long):
+        root = _full_hour_ticks(tmp_path / f"d{swap_long}" / "data")
+        specs = os.path.join(str(root), "specs")
+        os.makedirs(specs, exist_ok=True)
+        Path(specs, "latest.json").write_text(json.dumps({
+            "XAUUSD": {"swap_mode": 2, "swap_long": swap_long,
+                       "swap_short": -2.0, "swap_rollover3days": 3,
+                       "contract_size": 100, "currency_profit": "USD"}}),
+            encoding="utf-8")
+        return root
+
+    root1 = _snapshot_root(-1.0)
+    _, ver1 = mod.build_costs(str(root1), "XAUUSD", 0.0, allow_zero_swap=True)
+    assert "swap-snapshot" in ver1
+    root2 = _snapshot_root(-10.0)
+    _, ver2 = mod.build_costs(str(root2), "XAUUSD", 0.0, allow_zero_swap=True)
+    assert ver2 != ver1

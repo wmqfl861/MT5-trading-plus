@@ -32,12 +32,14 @@ from pathlib import Path
 
 import pytest
 
+from mt5gw.errors import DataUnavailableError
 from mt5gw.models import DEAL_REASON_EXPERT, DEAL_REASON_SL, DEAL_REASON_TP
 from mt5live.executor import ExecutionAdapter, LiveExecutor
 from mt5live.paper import (
     BarQuoteMarket,
     PaperAccountView,
     PaperBroker,
+    PaperSnapshot,
     PaperStateGateway,
     paper_state_path,
 )
@@ -778,9 +780,11 @@ def test_r6_poll_protective_persists_equity_snapshot_without_fills(tmp_path):
     assert view.latest_update_utc() == now
 
 
-def test_r6_view_skips_unreadable_state_file_with_alert(tmp_path, capsys):
-    """C3：读失败的状态文件按空处理并告警（stderr + alerts.log），
-    其余文件照常聚合——瞬时坏文件不打崩常驻风控/对账循环。"""
+def test_r7_gateway_unreadable_state_file_fails_closed(tmp_path, capsys):
+    """R7/N-C2（撤销 R6 的"按空处理"语义）：状态文件存在但读不出 → 聚合
+    查询显式 DataUnavailableError（绝不静默按空聚合——那会把该策略的
+    持仓/亏损从风控口径变没），告警照写（stderr + alerts.log）；
+    PaperStateGateway（--paper-state 装配）同一传播。"""
     market = QuoteMarket()
     a = make_magic_paper(tmp_path, MAGIC, market)
     a.market_order(SYMBOL, "buy", 0.1, magic=MAGIC)
@@ -790,8 +794,10 @@ def test_r6_view_skips_unreadable_state_file_with_alert(tmp_path, capsys):
 
     live = tmp_path / "live"
     gw = PaperStateGateway(paper_dir(tmp_path), alert_dir=str(live))
-    assert len(gw.account.positions()) == 1     # 坏文件按空，好文件照常
-    assert gw.account.state().balance == pytest.approx(10_000.0)
+    with pytest.raises(DataUnavailableError, match="state-99999999"):
+        gw.account.positions()
+    with pytest.raises(DataUnavailableError):
+        gw.account.state()
     err = capsys.readouterr().err
     assert "state-99999999.json" in err and "读取失败" in err
     alerts = (live / "alerts.log").read_text(encoding="utf-8")
@@ -833,6 +839,243 @@ def test_r6_live_runner_paper_state_file_warns_legacy(tmp_path, capsys):
     assert mod.paper_state_file(str(live), MAGIC) == state
     out = capsys.readouterr().out
     assert "state.json" in out and "旧版" in out
+
+
+# ================================================================ R7（第七轮审核 N-C2）
+# 影子账户分账后，账户级风控必须保持统一语义（C3 残留三复现全部反转）：
+# A. 运行器内闸门看**账户整体**：--paper 装配把 paper 目录的聚合视图
+#    （PaperAccountView，全部 state-*.json）交给 RiskGate——B 策略的闸门能
+#    看到 A 的持仓并拒 max_positions_per_symbol（每策略仍只执行自己的决策）；
+# B. 状态文件**存在但读不出** → 显式数据不可用（DataUnavailableError，
+#    聚合视图传播；闸门经执行器 risk_gate_error 路径 fail-closed 拒单），
+#    绝不静默按空聚合（原缺陷：A 浮亏 -306、文件读异常 → 聚合日亏变 0）；
+#    文件不存在（策略未启动）不算失败。
+# C. **一致快照**：一次风控计算只用同一版本的状态/持仓/成交——同一笔亏损
+#    不再同时计为浮亏与已实现（原缺陷：positions()/deals() 各自重读 →
+#    -306 计成 -612）；快照 = glob 一次、每文件只读一次解析一次；跨文件
+#    ts 不一致 → snapshot.inconsistent=True（照常聚合，不阻断）。
+
+RISK_TOML_CAP400 = RISK_TOML.replace("daily_loss_cap_usd = 50.0",
+                                     "daily_loss_cap_usd = 400.0")
+
+
+def gate_specs(tmp_path) -> str:
+    """闸门用的合约快照（data/specs/latest.json 替身）。"""
+    p = tmp_path / "specs" / "latest.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({SYMBOL: {"contract_size": CONTRACT}}),
+                 encoding="utf-8")
+    return str(p)
+
+
+def make_aggregate_gate(tmp_path, *, risk_toml: str = RISK_TOML,
+                        account=None):
+    """按 live_runner 的 R7/N-C2 装配闸门：account 缺省 = paper 目录聚合
+    视图（PaperAccountView）；显式传 account 可对照旧接线（本策略
+    PaperBroker 直接当闸门账户）。"""
+    from mt5live.gate import RiskGate
+
+    live = tmp_path / "live"
+    live.mkdir(parents=True, exist_ok=True)
+    process = RiskProcess(
+        load_risk_config(_write(tmp_path / "risk.toml", risk_toml)),
+        live_dir=str(live))
+    market = QuoteMarket()
+    gate = RiskGate(
+        process,
+        account=(account if account is not None
+                 else PaperAccountView(paper_dir(tmp_path))),
+        market=market, specs_path=gate_specs(tmp_path), live_dir=str(live))
+    return gate
+
+
+def test_r7_gate_aggregate_view_rejects_cross_magic_max_positions(tmp_path):
+    """N-C2 复现 A 反转：A 策略（magic M）已持同品种 3 仓（= 上限），B
+    策略（magic M+1）自己的 PaperBroker 看不到它们——旧接线（闸门只看本
+    策略账本）放行第 4 仓（原缺陷）；闸门换 paper 目录聚合视图后看到 A
+    的 3 仓 → max_positions_per_symbol 拒单。"""
+    market = QuoteMarket()
+    a = make_magic_paper(tmp_path, MAGIC, market)
+    for _ in range(3):
+        a.market_order(SYMBOL, "buy", 0.01, magic=MAGIC)    # A：3 仓 XAUUSD
+    b = make_magic_paper(tmp_path, MAGIC + 1, market)       # B：账本为空
+
+    # 对照（旧接线：闸门看本策略 PaperBroker）——B 视角 0 仓 → 放行
+    gate_own = make_aggregate_gate(tmp_path / "own", account=b)
+    assert gate_own.check_open(
+        SYMBOL, "buy", 0.01, MAGIC + 1, now=T0).allowed
+
+    # 新接线：聚合视图看到 A 的 3 仓 → 第 4 仓拒单
+    gate = make_aggregate_gate(tmp_path)
+    d = gate.check_open(SYMBOL, "buy", 0.01, MAGIC + 1, now=T0)
+    assert not d.allowed
+    assert "max_positions_per_symbol" in d.reason
+    assert "3" in d.reason                       # 如实报出 A 的持仓数
+
+
+def test_r7_single_strategy_behavior_unchanged(tmp_path):
+    """正常路径回归：单策略（目录只有一个状态文件）经聚合视图/快照的行为
+    不变——快照与逐查询结果一致、inconsistent=False、限额内开仓放行。"""
+    market = QuoteMarket()
+    a = make_magic_paper(tmp_path, MAGIC, market)
+    a.market_order(SYMBOL, "buy", 0.01, magic=MAGIC)
+
+    view = PaperAccountView(paper_dir(tmp_path))
+    snap = view.snapshot()
+    assert isinstance(snap, PaperSnapshot)
+    assert not snap.inconsistent               # 单文件：无跨文件不一致
+    assert len(snap.positions) == 1
+    assert snap.positions[0].ticket == view.positions()[0].ticket
+    assert snap.state.balance == pytest.approx(view.state().balance)
+    assert snap.state.equity == pytest.approx(view.state().equity)
+    assert len(snap.deals) == 1 and snap.deals[0].entry == "in"
+    assert view.latest_update_utc() is not None
+    assert len(view.deals(T0 - timedelta(hours=1),
+                          T0 + timedelta(hours=1))) == 1
+
+    gate = make_aggregate_gate(tmp_path)
+    assert gate.check_open(SYMBOL, "buy", 0.01, MAGIC, now=T0).allowed
+
+
+def test_r7_view_unreadable_state_file_fails_closed_with_alert(
+        tmp_path, capsys, monkeypatch):
+    """N-C2 复现 B 反转（撤销 R6 的"按空处理"语义）：A 当日已实现 -306、
+    其状态文件**存在但读不出** → 聚合查询显式 DataUnavailableError（该
+    策略的亏损不得从风控口径静默消失为 0），告警照写（stderr +
+    alerts.log）；闸门传播异常（执行器 risk_gate_error fail-closed 拒单
+    路径）；glob 后文件消失（策略未启动/清理瞬间）不算读失败。"""
+    market = QuoteMarket()
+    a = make_magic_paper(tmp_path, MAGIC, market)
+    a.market_order(SYMBOL, "buy", 0.3, sl=95.0, magic=MAGIC)
+    market.set_quote(90.0, 90.2)               # SL 触发：已实现 -306
+    closed = a.poll_protective(T0 + timedelta(minutes=1))
+    assert len(closed) == 1
+    assert closed[0].profit == pytest.approx(-306.0)
+    b = make_magic_paper(tmp_path, MAGIC + 1, market)   # B 的文件可读
+    b.market_order(SYMBOL, "buy", 0.01, magic=MAGIC + 1)
+
+    live = tmp_path / "live"
+    view = PaperAccountView(paper_dir(tmp_path), alert_dir=str(live))
+    state_file = paper_state_path(str(live), MAGIC)
+    with open(state_file, "w", encoding="utf-8") as f:
+        f.write("{ not json")                   # A 的状态文件读不出
+
+    # 好文件在场也整体拒判：绝不把 A 的 -306 静默聚合成 0
+    for query in (view.snapshot, view.state, view.positions,
+                  lambda: view.deals(T0 - timedelta(hours=1), T0)):
+        with pytest.raises(DataUnavailableError, match="state-"):
+            query()
+    with pytest.raises(DataUnavailableError):
+        view.deals_for_position(1)
+
+    # 闸门传播（执行器已有 risk_gate_error fail-closed 路径接住）
+    gate = make_aggregate_gate(tmp_path)
+    with pytest.raises(DataUnavailableError):
+        gate.check_open(SYMBOL, "buy", 0.01, MAGIC + 1,
+                        now=T0 + timedelta(minutes=2))
+
+    # 告警通道照旧：stderr + alerts.log（ACCOUNT_POLL_ERROR）
+    err = capsys.readouterr().err
+    assert f"state-{MAGIC}.json" in err
+    alerts = (live / "alerts.log").read_text(encoding="utf-8")
+    assert "ACCOUNT_POLL_ERROR" in alerts and f"state-{MAGIC}.json" in alerts
+
+    # glob 后文件被移走（策略未启动/归档瞬间）≠ 读失败：视同不存在照常聚合
+    b_file = paper_state_path(str(live), MAGIC + 1)
+    monkeypatch.setattr(
+        view, "_state_files",
+        lambda: [b_file, os.path.join(paper_dir(tmp_path),
+                                      "state-ghost.json")])
+    snap = view.snapshot()
+    assert len(snap.positions) == 1             # 只剩 B 的仓，不抛错
+
+
+def test_r7_snapshot_single_version_no_double_counted_loss(
+        tmp_path, monkeypatch):
+    """N-C2 复现 C 反转：positions() 读完后平仓落盘、deals() 再读 → 同一笔
+    -306 同时计为浮亏与已实现（组合 -612）。快照语义：一次调用 glob 一次、
+    每文件只读一次解析一次；闸门单次 snapshot 组装 → 只见 -306（不触
+    -400 上限、不触发全平）；跨文件 ts 不一致 → inconsistent=True 照常
+    聚合。"""
+    from mt5live.riskproc import daily_pnl
+
+    live = tmp_path / "live"
+    market = QuoteMarket()
+    a = make_magic_paper(tmp_path, MAGIC, market)
+    ticket = a.market_order(SYMBOL, "buy", 0.3, magic=MAGIC).order_ticket
+    market.set_quote(90.0, 90.2)
+    a.poll_protective(T0 + timedelta(minutes=1))   # 落盘 v1：浮亏 -306
+    state_file = paper_state_path(str(live), MAGIC)
+    v1 = _read_json(state_file)
+    assert v1["equity"] == pytest.approx(10_000.0 - 306.0)
+
+    a.close_position(ticket)                       # 平仓：已实现 -306（v2）
+    v2 = _read_json(state_file)
+    assert v2["balance"] == pytest.approx(10_000.0 - 306.0)
+    assert not v2["positions"] and len(v2["deals"]) == 2
+
+    def _put(doc):
+        Path(state_file).write_text(json.dumps(doc, ensure_ascii=False),
+                                    encoding="utf-8")
+
+    # 旧口径复现（对照）：positions() 与 deals() 各自重读，中间平仓落盘
+    # → 同一亏损双计 -612
+    _put(v1)
+    view_old = PaperAccountView(paper_dir(tmp_path))
+    pos_old = view_old.positions()                 # 读到 v1：浮亏 -306
+    _put(v2)                                       # 其后平仓落盘 v2
+    day_start = (T0 + timedelta(minutes=2)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    realized_old, floating_old = daily_pnl(
+        view_old.deals(day_start, T0 + timedelta(minutes=2)), pos_old)
+    assert floating_old == pytest.approx(-306.0)
+    assert realized_old == pytest.approx(-306.0)
+    assert realized_old + floating_old == pytest.approx(-612.0)
+
+    # 新口径：闸门单次 snapshot——文件被读（v1）后才"并发平仓"（落 v2），
+    # 快照内持仓与成交同版本 → 只有浮亏 -306，不触发 -400 全平
+    _put(v1)
+    view = PaperAccountView(paper_dir(tmp_path))
+    orig_read = view._read_state_file
+
+    def read_then_close(path):
+        data = orig_read(path)                     # 本快照读到的这一版
+        if os.path.basename(path) == os.path.basename(state_file):
+            _put(v2)                               # 读后即"平仓落盘"
+        return data
+
+    monkeypatch.setattr(view, "_read_state_file", read_then_close)
+    gate = make_aggregate_gate(tmp_path, risk_toml=RISK_TOML_CAP400,
+                               account=view)
+    d = gate.check_open(SYMBOL, "buy", 0.01, MAGIC,
+                        now=T0 + timedelta(minutes=2))
+    assert d.allowed and not d.flatten_all        # -306 > -400：不双计就放行
+    assert _read_json(state_file) == v2           # "平仓"确实发生过
+
+    # 快照读一次聚合一次：每个文件只读一次（glob 后逐文件单次读+解析）
+    _put(v1)
+    b = make_magic_paper(tmp_path, MAGIC + 1, market)
+    b.market_order(SYMBOL, "buy", 0.01, magic=MAGIC + 1)
+    view2 = PaperAccountView(paper_dir(tmp_path))
+    calls: list[str] = []
+    orig2 = view2._read_state_file
+    monkeypatch.setattr(
+        view2, "_read_state_file",
+        lambda path: (calls.append(path), orig2(path))[1])
+    snap = view2.snapshot()
+    assert len(calls) == 2                         # 两个文件各读一次
+    for path in view2._state_files():
+        assert calls.count(path) == 1
+    assert len(snap.positions) == 2                # 两个策略的仓都在
+    assert len(snap.deals) == 2
+
+    # 跨文件快照时刻不一致 → inconsistent=True（照常聚合，不阻断）
+    assert snap.inconsistent                       # a 的 ts = T0+1m，b = T0
+    same_ts = make_magic_paper(tmp_path / "same", MAGIC, market)
+    same_ts.market_order(SYMBOL, "buy", 0.01, magic=MAGIC)
+    snap1 = PaperAccountView(paper_dir(tmp_path / "same")).snapshot()
+    assert not snap1.inconsistent                  # 单文件无跨文件比较
+    assert snap1.file_ts[0][1] is not None         # 各文件带 ts
 
 
 # ---------------------------------------------------------------- I5：点差缓存包装

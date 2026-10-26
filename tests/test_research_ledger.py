@@ -1,13 +1,17 @@
 """试验台账（T11）：SQLite 表结构、失败运行也记一行、锁箱一次性、stats 计数。
 
-表结构按计划：cards / runs / gates / lockbox_uses（card_id UNIQUE）。
+表结构按计划：cards / runs / lockbox_uses（card_id UNIQUE）。
 R6/C5：写前验证（防洗链）、删尾/删锁箱行检测、状态更新归档进
 ledger_events、锚链验证。
+R7/N-C3：写事务原子性（BEGIN IMMEDIATE，验链→读链尾→写→审计→快照同
+事务）；R7/N-I3：ledger_events 行内容纳入校验摘要。
 """
 import hashlib
 import importlib.util
 import json
 import sqlite3
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -946,3 +950,142 @@ def test_anchor_verify_cli_mode(tmp_path, capsys):
                      "--verify"]) == 1
     assert "删" in capsys.readouterr().out
 
+
+
+# ================================================ R7/N-C3：写事务原子性
+
+def test_concurrent_record_runs_chain_stays_intact(tmp_path):
+    """N-C3 复现 A 的反转断言：两个连接受控交错 record_run——验链/读链尾/
+    写内容/刷快照必须在**同一写事务**（BEGIN IMMEDIATE）内完成，后到者
+    在事务外排队后再读链尾；两笔都成功且链完好。
+
+    旧行为（红）：A 读链尾后停一拍，B 读同一旧链尾并完成整笔追加，A 恢复
+    后第三行仍接旧链尾 → verify 报"行内容与 row_hash 不符 / prev_hash
+    与上一行不符"。
+    """
+    p = tmp_path / "ledger.sqlite"
+    with Ledger(p) as led:
+        record(led, run_n=1)
+
+    a_inside = threading.Event()   # A 已过链尾读取、处于插入→哈希阶段
+    errors: list = []
+
+    def worker_a():
+        led = Ledger(p, create=False)
+        orig = led._row_hash
+
+        def slow_hash(content, prev):
+            a_inside.set()
+            time.sleep(0.4)         # 拉宽"读完链尾、尚未提交"的交错窗口
+            return orig(content, prev)
+
+        led._row_hash = slow_hash
+        try:
+            record(led, run_n=2)
+        except BaseException as e:  # noqa: BLE001 — 如实收集线程内异常
+            errors.append(("A", e))
+        finally:
+            led.close()
+
+    def worker_b():
+        led = Ledger(p, create=False)
+        orig = led._table_cols
+
+        def wait_then_cols(table):
+            if table == "runs":
+                # 保证 B 读链尾落在 A 的未提交窗口内（受控交错，非碰运气）
+                assert a_inside.wait(timeout=5), "A 未进入插入阶段"
+            return orig(table)
+
+        led._table_cols = wait_then_cols
+        try:
+            record(led, run_n=3)
+        except BaseException as e:  # noqa: BLE001
+            errors.append(("B", e))
+        finally:
+            led.close()
+
+    ta = threading.Thread(target=worker_a)
+    tb = threading.Thread(target=worker_b)
+    ta.start()
+    tb.start()
+    ta.join(timeout=15)
+    tb.join(timeout=15)
+    assert errors == []
+    with Ledger(p, create=False) as led:
+        assert led.verify_chain() == []
+        rs = led.conn.execute(
+            "SELECT run_id, prev_hash, row_hash FROM runs"
+            " ORDER BY rowid").fetchall()
+        assert len(rs) == 3
+        assert rs[1]["prev_hash"] == rs[0]["row_hash"]
+        assert rs[2]["prev_hash"] == rs[1]["row_hash"]  # 第三行接**新**链尾
+
+
+def test_update_chained_midway_exception_rolls_back_everything(tmp_path):
+    """N-C3 复现 B 的反转断言：_update_chained 中途异常（审计事件已写、行
+    内容已改、快照未刷）→ **全部回滚**——关卡内容不变、无孤儿审计行、
+    verify 仍通过。
+
+    旧行为（红）：_snapshot_refresh 内部的连接上下文把外层修改中途提交，
+    关卡内容已变而 gates 快照仍旧 → verify 报链头与快照不符。
+    """
+    p = tmp_path / "l.sqlite"
+    with Ledger(p) as led:
+        rid = record(led)
+        led.record_gate(rid, "G0", False, {"attempt": 1})
+        n_events_before = led.conn.execute(
+            "SELECT COUNT(*) FROM ledger_events").fetchone()[0]
+        gate_before = led.conn.execute(
+            "SELECT details_json, prev_hash, row_hash FROM gates"
+        ).fetchone()
+
+        orig_refresh = led._snapshot_refresh
+
+        def boom(table):
+            if table == "gates":
+                raise RuntimeError("模拟中途崩溃（快照未刷）")
+            return orig_refresh(table)
+
+        led._snapshot_refresh = boom
+        with pytest.raises(RuntimeError, match="中途崩溃"):
+            led.record_gate(rid, "G0", True, {"attempt": 2})
+    with Ledger(p, create=False) as led2:
+        assert led2.verify_chain() == []
+        gate_after = led2.conn.execute(
+            "SELECT details_json, prev_hash, row_hash FROM gates").fetchone()
+        assert json.loads(gate_after["details_json"])["attempt"] == 1
+        assert (gate_after["prev_hash"], gate_after["row_hash"]) == \
+            (gate_before["prev_hash"], gate_before["row_hash"])
+        assert led2.conn.execute(
+            "SELECT COUNT(*) FROM ledger_events").fetchone()[0] \
+            == n_events_before          # 审计归档行也一并回滚
+
+
+# ================================================ R7/N-I3：审计内容哈希
+
+def test_ledger_events_content_rewrite_detected(tmp_path):
+    """N-I3 复现 A：改写 ledger_events 行内容（行数/rowid 都不变，如把
+    old_content_json 里的批准人改掉）→ verify 必须报——审计历史状态不能
+    被无声改写。
+
+    旧行为（红）：verify 只对 ledger_events 比对行数/最大 rowid，内容改写
+    返回空列表。
+    """
+    p = tmp_path / "l.sqlite"
+    with Ledger(p) as led:
+        rid = record(led)
+        led.record_lockbox_start("H001", approved_by="u")
+        led.finish_lockbox_use("H001", result={"passed": True})
+        assert led.verify_chain() == []
+    conn = sqlite3.connect(str(p))
+    with conn:   # 改写审计历史（不动行数/rowid）
+        conn.execute(
+            "UPDATE ledger_events SET old_content_json ="
+            " replace(old_content_json, '\"u\"', '\"attacker\"')"
+            " WHERE event_id=1")
+    conn.close()
+    with Ledger(p, create=False) as led2:
+        problems = led2.verify_chain()
+        assert any("ledger_events" in q and ("内容" in q or "改写" in q)
+                   for q in problems)
