@@ -564,9 +564,12 @@ def test_seeds_from_offsets_experiment_seeds(tmp_path):
     assert all(r["seed"] == 7 for r in d["negative"]["runs"])
 
 
-def test_merge_shards_recomputes_rates_and_flags(tmp_path):
-    """两个合成分片（种子不相交）合并：比率按合并后样本重算、种子重叠拒收。"""
+def test_merge_shards_recomputes_rates_and_flags(tmp_path, monkeypatch):
+    """两个合成分片（种子不相交）合并：比率按合并后样本重算、种子重叠拒收。
+    M2/R6：脚本被复制到临时目录后，仓库根必须经 MT5QUANT_REPO 提供（不再
+    有个人工作区绝对路径兜底）。"""
     import importlib.util as _ilu
+    monkeypatch.setenv("MT5QUANT_REPO", str(SCRIPT_PATH.parents[1]))
     mp = tmp_path / "merge_script.py"
     mp.write_text((SCRIPT_PATH.parent / "merge_gate_power.py")
                   .read_text(encoding="utf-8"), encoding="utf-8")
@@ -607,3 +610,224 @@ def test_merge_shards_recomputes_rates_and_flags(tmp_path):
     (d2 / "gate-power.json").write_text(json.dumps(
         shard(1, [1, 2], False)), encoding="utf-8")
     assert mm.main(["--shards", f"{d1},{d2}", "--out", str(out)]) == 1
+
+
+# ---- R6（C8+M2）：合并器与真实产物 schema / G5 分桶 / flags 双源 ----
+
+def _load_merge_module(tmp_path, monkeypatch, name="merge_gate_power_r6"):
+    """把合并器复制到临时目录加载（模拟他机/CI：__file__ 不在仓库内，
+    仓库根只能来自 MT5QUANT_REPO）。"""
+    import importlib.util as _ilu
+    monkeypatch.setenv("MT5QUANT_REPO", str(SCRIPT_PATH.parents[1]))
+    mp = tmp_path / "merge_script.py"
+    mp.write_text((SCRIPT_PATH.parent / "merge_gate_power.py")
+                  .read_text(encoding="utf-8"), encoding="utf-8")
+    spec = _ilu.spec_from_file_location(name, mp)
+    mm = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mm)
+    return mm
+
+
+def _real_schema_shard(seeds, *, g5_det_pass, g5_fp_day, g5_fp_slot,
+                       cal_drift=1.25):
+    """按 gate_calibration 当前单进程产物的真实 schema 造一个小分片：
+
+    - negative.runs 带 null；positive.runs 带 setup（detection 的分组键）、
+      calibration 是 {setup: {level: {drift, achieved_sharpe}}} **字典**；
+    - g5.runs 带 setup/arm/null（arm="detection"|"false_positive"，
+      误报臂 null 区分 day/slot 两种零假设）。
+    """
+    neg = [{"name": "H009-Sample", "seed": s, "null": "slot",
+            "sharpe": 0.1, "net_profit": 1.0, "trade_count": 10,
+            "passed_all": True,
+            "checks": {"G0": True, "G1.profit_factor": True}}
+           for s in seeds]
+    pos = [{"setup": "TST H1", "level": 1.0, "seed": s, "drift": cal_drift,
+            "sharpe": 1.0, "net_profit": 5.0, "trade_count": 40,
+            "passed_all": True,
+            "checks": {"G0": True, "G1.profit_factor": True}}
+           for s in seeds]
+    g5 = [{"setup": "TST H1", "arm": "detection", "null": None,
+           "level": 1.0, "seed": s, "drift": cal_drift, "sharpe": 1.2,
+           "expectancy": 1.0, "trade_count": 40, "p5": -1.3, "warned": False,
+           "checks": {"G5.expectation_positive": True,
+                      "G5.trade_count": True,
+                      "G5.sharpe_vs_reference": g5_det_pass,
+                      "G5.passed": g5_det_pass}}
+          for s in seeds]
+    g5 += [{"setup": "TST H1", "arm": "false_positive", "null": null,
+            "level": 1.0, "seed": s, "drift": 0.0, "sharpe": 0.1,
+            "expectancy": 0.0, "trade_count": 40, "p5": -1.3, "warned": False,
+            "checks": {"G5.expectation_positive": passed,
+                       "G5.trade_count": True,
+                       "G5.sharpe_vs_reference": passed,
+                       "G5.passed": passed}}
+           for null, passed in (("day", g5_fp_day), ("slot", g5_fp_slot))
+           for s in seeds]
+    return {
+        "meta": {"phase": "both", "seeds": len(seeds), "seeds_from": min(seeds),
+                 "levels": [1.0], "g2_random_entry_sims": 50,
+                 "null_hypothesis": "both", "initial_capital": 100000.0,
+                 "risk_per_trade": 0.005, "max_bars": None,
+                 "baselines": ["H009-Sample"], "positive_symbols": ["TST H1"],
+                 "g5_bootstrap_sims": 200, "generated_utc":
+                     "2026-10-26T00:00:00+00:00"},
+        "negative": {"runs": neg, "by_null": {"slot": {"G0": 1.0}},
+                     "false_positive_rates": {"G0": 1.0},
+                     "merged": [], "merged_pass_rates": {}},
+        "positive": {
+            "runs": pos,
+            "detection_rates": {"TST H1": {"1.0": {
+                "G0": 1.0, "G1.profit_factor": 1.0}}},
+            "calibration": {"TST H1": {"1.0": {"drift": cal_drift,
+                                               "achieved_sharpe": 1.02}}}},
+        "g5": {"runs": g5, "detection_rates": {}, "false_positive_rates": {},
+               "window_bars": {"TST H1": 600}, "bootstrap_sims": 200,
+               "design": "synthetic"},
+        "flags": [],
+    }
+
+
+def test_merge_real_schema_g5_buckets_flags_calibration(tmp_path, monkeypatch):
+    """R6/C8 失败测试（真实 schema）：
+    - G5 runs 按 setup 分组（生成器写 setup，不写 key）→ 合并不再 KeyError；
+    - G5 误报臂按 null（day/slot）分桶分别聚合（100% 与 0% 不得混成 50%）；
+    - flags 同时遍历普通正对照与 G5 检出率（正对照 100% 检出时，G5 检出 0%
+      仍须触发低检出率建议）；
+    - calibration 保持 {setup: …} 字典（转列表会让 render_report 崩）。
+    分片种子数故意不等（2 vs 3）：合并必须按拼接样本重算，而非平均分片比率。"""
+    mm = _load_merge_module(tmp_path, monkeypatch)
+    d1, d2 = tmp_path / "s1", tmp_path / "s2"
+    d1.mkdir(); d2.mkdir()
+    # 分片1：种子 0,1（G5 检出全挂；day 误报全过、slot 误报全挂）
+    (d1 / "gate-power.json").write_text(json.dumps(_real_schema_shard(
+        [0, 1], g5_det_pass=False, g5_fp_day=True, g5_fp_slot=False),
+        ensure_ascii=False), encoding="utf-8")
+    # 分片2：种子 2,3,4（同判定量，便于核对合并分母是 5 不是平均）
+    (d2 / "gate-power.json").write_text(json.dumps(_real_schema_shard(
+        [2, 3, 4], g5_det_pass=False, g5_fp_day=True, g5_fp_slot=False),
+        ensure_ascii=False), encoding="utf-8")
+    out = tmp_path / "merged"
+    rc = mm.main(["--shards", f"{d1},{d2}", "--out", str(out)])
+    assert rc == 0
+    m = json.loads((out / "gate-power.json").read_text(encoding="utf-8"))
+
+    # G5 检出率：setup 键（不是 key），样本 = 两分片 5 个种子
+    det = m["g5"]["detection_rates"]["TST H1"]["1.0"]
+    assert det["G5.sharpe_vs_reference"] == pytest.approx(0.0)
+    assert det["G5.expectation_positive"] == pytest.approx(1.0)
+    # G5 误报率按 null 分桶：day=5/5=100%，slot=0/5=0%（不混桶平均成 50%）
+    fp = m["g5"]["false_positive_rates"]
+    assert fp["day"]["G5.expectation_positive"] == pytest.approx(1.0)
+    assert fp["slot"]["G5.expectation_positive"] == pytest.approx(0.0)
+    # flags 双源：正对照检出 100% 不挡 G5 检出 0% 的低检出率建议；
+    # G5 day 误报 100% > 5% → 高误报建议（混桶平均 50% 同样会触发，但分桶
+    # 断言已排除混桶；slot 桶 0% 不得拉低 day 桶的最差值）
+    flagged = {(f["check"], f["kind"]) for f in m["flags"]}
+    assert ("G5.sharpe_vs_reference", "low_detection") in flagged
+    assert ("G5.expectation_positive", "high_false_positive") in flagged
+    assert ("G5.passed", "low_detection") not in flagged   # 汇总数据不进规则
+    # calibration 仍是字典（render_report 按 setup 取 .get）
+    assert isinstance(m["positive"]["calibration"], dict)
+    assert m["positive"]["calibration"]["TST H1"]["1.0"]["drift"] == 1.25
+    # 报告渲染不炸（旧实现 calibration 转列表 → AttributeError）
+    md = (out / "gate-power.md").read_text(encoding="utf-8")
+    assert "G5" in md and "门槛调整建议" in md
+
+
+def test_merge_rejects_actual_seed_defects(tmp_path, monkeypatch, capsys):
+    """R6/C8 失败测试：种子校验除 meta 外还核 runs 里的实际种子——
+    缺样（某条件少跑一个种子）/重复/越界都拒绝合并。"""
+    mm = _load_merge_module(tmp_path, monkeypatch)
+
+    def write(dirname, shard):
+        d = tmp_path / dirname
+        d.mkdir(exist_ok=True)
+        (d / "gate-power.json").write_text(json.dumps(shard,
+                                                      ensure_ascii=False),
+                                           encoding="utf-8")
+        return d
+
+    good = write("good", _real_schema_shard([0, 1], g5_det_pass=True,
+                                            g5_fp_day=False, g5_fp_slot=False))
+    out = tmp_path / "merged"
+
+    # 1) 缺样：meta 声明 2 个种子，negative 只跑了 seed 0
+    missing = _real_schema_shard([2, 3], g5_det_pass=True, g5_fp_day=False,
+                                 g5_fp_slot=False)
+    missing["negative"]["runs"] = missing["negative"]["runs"][:1]
+    d_miss = write("miss", missing)
+    assert mm.main(["--shards", f"{good},{d_miss}", "--out", str(out)]) == 1
+    assert "缺种子" in capsys.readouterr().out
+
+    # 2) 重复：同一条件同一种子出现两次
+    dup = _real_schema_shard([2, 3], g5_det_pass=True, g5_fp_day=False,
+                             g5_fp_slot=False)
+    dup["negative"]["runs"].append(dict(dup["negative"]["runs"][0]))
+    d_dup = write("dup", dup)
+    assert mm.main(["--shards", f"{good},{d_dup}", "--out", str(out)]) == 1
+    assert "重复" in capsys.readouterr().out
+
+    # 3) 越界：runs 里出现声明段之外的种子
+    extra = _real_schema_shard([2, 3], g5_det_pass=True, g5_fp_day=False,
+                               g5_fp_slot=False)
+    extra["negative"]["runs"][1]["seed"] = 99
+    d_extra = write("extra", extra)
+    assert mm.main(["--shards", f"{good},{d_extra}", "--out", str(out)]) == 1
+    assert "声明段外" in capsys.readouterr().out
+
+
+def test_merge_repo_root_requires_env_when_copied(tmp_path, monkeypatch):
+    """R6/M2 失败测试：脚本脱离仓库（复制到临时目录）且未设 MT5QUANT_REPO
+    → 明确报错（不再回退任何硬编码绝对路径）；指向没有 gate_calibration.py
+    的目录同样报错。"""
+    import importlib.util as _ilu
+
+    mp = tmp_path / "merge_script.py"
+    mp.write_text((SCRIPT_PATH.parent / "merge_gate_power.py")
+                  .read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.delenv("MT5QUANT_REPO", raising=False)
+    spec = _ilu.spec_from_file_location("merge_no_env", mp)
+    mod = _ilu.module_from_spec(spec)
+    with pytest.raises(RuntimeError, match="MT5QUANT_REPO"):
+        spec.loader.exec_module(mod)
+
+    monkeypatch.setenv("MT5QUANT_REPO", str(tmp_path))
+    spec2 = _ilu.spec_from_file_location("merge_bad_env", mp)
+    mod2 = _ilu.module_from_spec(spec2)
+    with pytest.raises(RuntimeError, match="gate_calibration"):
+        spec2.loader.exec_module(mod2)
+
+
+def test_flags_traverse_positive_and_g5_sources(gc):
+    """R6/C8 失败测试（gate_calibration 侧）：决策规则的检出率必须**同时**
+    遍历普通正对照与 G5 检出率——存在正对照时 G5 检出为 0 也要能触发低检出
+    率建议（主进程与合并器共用同一函数）；同名检查多 setup 取最小值。"""
+    level_rates = gc.flags_level_rates(
+        {"XAUUSD H1": {"1.0": {"G1.profit_factor": 0.9}},
+         "USTEC M5": {"1.0": {"G1.profit_factor": 0.6}}},
+        {"XAUUSD H1": {"1.0": {"G5.sharpe_vs_reference": 0.0,
+                               "G5.expectation_positive": 0.8,
+                               "G5.passed": 0.0}}})
+    assert level_rates["G1.profit_factor"] == pytest.approx(0.6)   # 跨 setup 最小
+    assert level_rates["G5.sharpe_vs_reference"] == 0.0            # G5 不被正对照挡掉
+    assert level_rates["G5.expectation_positive"] == 0.8
+    assert "G5.passed" not in level_rates                          # 汇总不进规则
+
+    flags = gc.compute_flags({
+        "positive": {"detection_rates": {
+            "XAUUSD H1": {"1.0": {"G1.profit_factor": 1.0}}}},
+        "g5": {"detection_rates": {"XAUUSD H1": {"1.0": {
+            "G5.sharpe_vs_reference": 0.0}}},
+            "false_positive_rates": {
+                "day": {"G5.expectation_positive": 0.07},
+                "slot": {"G5.expectation_positive": 0.0}}},
+        "negative": {"false_positive_rates": {"G1.profit_factor": 0.01}},
+    })
+    flagged = {(f["check"], f["kind"]) for f in flags}
+    # G5 检出 0% → 低检出率（正对照 100% 挡不住）
+    assert ("G5.sharpe_vs_reference", "low_detection") in flagged
+    # G5 误报按 null 取最差（day 7% > 5%，不被 slot 0% 稀释）
+    assert ("G5.expectation_positive", "high_false_positive") in flagged
+    # 普通误报 1% 不触发
+    assert ("G1.profit_factor", "high_false_positive") not in flagged

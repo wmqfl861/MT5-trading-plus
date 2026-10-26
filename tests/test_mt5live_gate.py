@@ -70,6 +70,67 @@ def make_gate(tmp_path):
     return gate, live
 
 
+# ---- R6/C4：点差闸门的最小覆盖天数（min_days_per_hour） ----
+
+def _gate_with_spread(tmp_path, stats_by_hour, *, min_days=20):
+    """带点差模型的闸门装配（NOW = 纽约 6 点 EDT；报价 100.0/100.03 绝对
+    点差 0.03 ≤ 3×p90=0.15，正常点差下只考察覆盖天数判定）。"""
+    from mt5data.sessions import load_session_policy
+    from mt5live.riskproc import RiskProcess, load_risk_config
+    from mt5quant.costs.spread import SpreadModel, SpreadStat
+
+    live = tmp_path / "live"
+    live.mkdir(parents=True, exist_ok=True)
+    specs = _write(tmp_path / "specs" / "latest.json",
+                   json.dumps({"XAUUSD": {"contract_size": 100.0}}))
+    toml = SESSIONS_TOML + f"min_days_per_hour = {min_days}\n"
+    policy = load_session_policy(_write(tmp_path / "s.toml", toml))
+    process = RiskProcess(load_risk_config(_write(tmp_path / "r.toml", RISK_TOML)),
+                          live_dir=str(live), session_policy=policy)
+    broker = FakeBroker()
+    broker.set_quote(100.0, 100.03)
+    model = SpreadModel(
+        {"XAUUSD": {h: st for h, st in stats_by_hour.items()}},
+        {"XAUUSD": 0.02}, mode="absolute")
+    gate = RiskGate(process, account=broker, market=broker, specs_path=specs,
+                    live_dir=str(live), spread_model=model,
+                    session_policy=policy)
+    return gate, live
+
+
+def test_spread_gate_forbids_insufficient_day_coverage(tmp_path):
+    """R6/C4 失败测试：该小时有统计但 n_days < min_days_per_hour（20）→
+    按 missing_hour_policy=forbid 禁入（此前闸门只取 stat.p90，一天样本的
+    小时在配置要求 20 天时仍放行）。"""
+    from mt5quant.costs.spread import SpreadStat
+
+    thin = {6: SpreadStat(median=0.02, p90=0.05, p99=0.08, n=100, n_days=3)}
+    gate, _live = _gate_with_spread(tmp_path, thin)
+    d = gate.check_open("XAUUSD", "buy", 0.01, MAGIC, now=NOW)
+    assert not d.allowed
+    assert "spread_gate" in d.reason and "覆盖不足" in d.reason
+    assert "3" in d.reason or "20" in d.reason     # 如实报出 n_days 与阈值
+
+    # 对照：覆盖足额（n_days=20）且点差正常 → 放行
+    ok = {6: SpreadStat(median=0.02, p90=0.05, p99=0.08, n=100, n_days=20)}
+    gate_ok, _ = _gate_with_spread(tmp_path / "ok", ok)
+    assert gate_ok.check_open("XAUUSD", "buy", 0.01, MAGIC, now=NOW).allowed
+
+
+def test_spread_gate_missing_hour_still_forbids(tmp_path):
+    """回归：小时完全无统计（tick 覆盖缺失）→ 禁入口径不变。"""
+    from mt5quant.costs.spread import SpreadStat
+
+    model_hours = {6: SpreadStat(median=0.02, p90=0.05, p99=0.08, n=100,
+                                 n_days=25)}
+    gate, _live = _gate_with_spread(tmp_path, model_hours)
+    # NOW 之后 2 小时 = 12:00 UTC = 纽约 8 点（不在模型里）
+    d = gate.check_open("XAUUSD", "buy", 0.01, MAGIC,
+                        now=NOW + timedelta(hours=2))
+    assert not d.allowed
+    assert "spread_gate" in d.reason and "无点差统计" in d.reason
+
+
 def alerts_of(live: Path) -> str:
     p = live / "alerts.log"
     return p.read_text(encoding="utf-8") if p.exists() else ""

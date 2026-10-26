@@ -366,6 +366,69 @@ def test_research_allowlist_workflow_wired():
         assert kw in text, f"research-allowlist.yml 缺：{kw}"
 
 
+def _load_hook_from(path: Path):
+    """从给定路径装载钩子模块（CI 双 checkout 各自路径下的副本）。"""
+    loader = SourceFileLoader(f"hook_at_{abs(hash(str(path)))}", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def test_research_allowlist_workflow_loads_checker_from_main_baseline(tmp_path):
+    """第六轮审核 I4：CI 白名单不得执行 PR 自己提供的检查器——PR 可同时
+    改 scripts/hooks/pre-commit-readonly-paths 使检查自通过。workflow 双
+    checkout（PR 合并态只供 diff 数据 + main 基准装载检查器与规则）。
+    本地模拟两个 checkout 目录结构：baseline/ 放当前 main 版钩子、PR
+    工作树放篡改版钩子（check_paths 恒返回无违规），断言按 workflow 的
+    装载路径装载的是基准版本——篡改版对同一 diff 无判别力，基准版照报。"""
+    text = ALLOWLIST_YML.read_text(encoding="utf-8")
+    # workflow 结构：两次 checkout；第二个 ref: main、独立 path=baseline
+    assert text.count("uses: actions/checkout@v5") == 2, \
+        "I4：应双 checkout（PR 合并态 + main 基准）"
+    assert "ref: main" in text and "path: baseline" in text, \
+        "I4：基准 checkout 应 ref: main 到独立 path"
+    # python 从基准路径装载（不是 PR 工作树路径）；fail-closed：基准缺失即失败
+    assert "baseline/scripts/hooks/pre-commit-readonly-paths" in text, \
+        "I4：装载路径应为 baseline/ 基准钩子"
+    assert "test -f baseline/scripts/hooks/pre-commit-readonly-paths" in text, \
+        "I4：基准钩子缺失应直接失败，不得回退 PR 版"
+    # diff 数据仍来自 PR 合并态工作树（第一 checkout，未 cd 进 baseline）
+    assert "origin/main...HEAD" in text
+    # 非 research/** 头分支维持直接成功（notice + exit 0）
+    assert 'if [[ "$head" != research/* ]]; then' in text
+
+    # —— 模拟双 checkout 目录结构 ——
+    base_hook = tmp_path / "baseline" / "scripts" / "hooks" / "pre-commit-readonly-paths"
+    pr_hook = tmp_path / "pr" / "scripts" / "hooks" / "pre-commit-readonly-paths"
+    real_src = HOOK_PATH.read_text(encoding="utf-8")
+    base_hook.parent.mkdir(parents=True)
+    pr_hook.parent.mkdir(parents=True)
+    base_hook.write_text(real_src, encoding="utf-8")       # main 基准版
+    # 篡改版 = 同一份钩子，check_paths 被换成恒空（PR 同时改检查器与本体）
+    tampered = real_src.replace("def check_paths(",
+                                "def _original_check_paths(", 1)
+    tampered += ("\n\n\ndef check_paths(status_path_pairs, role=None):\n"
+                 "    return []\n")
+    pr_hook.write_text(tampered, encoding="utf-8")
+
+    baseline_mod = _load_hook_from(base_hook)
+    tampered_mod = _load_hook_from(pr_hook)
+
+    diff = [("A", "research/cards/H012-v2.toml"),
+            ("M", "scripts/bt.py"),
+            ("M", "scripts/hooks/pre-commit-readonly-paths")]
+    # 判别力：若装载的是 PR 篡改版，同一 diff 静默通过（= 被利用的漏洞）
+    assert tampered_mod.check_paths(diff, role="research") == [], \
+        "篡改版应无判别力（本用例的前提）"
+    # 按 workflow 的装载路径（baseline）装载的是基准版：篡改不生效
+    viol = baseline_mod.check_paths(diff, role="research")
+    assert viol, "基准版应对越权改动报违规"
+    assert any("scripts/bt.py" in v for v in viol)
+    assert any("pre-commit-readonly-paths" in v for v in viol)
+    assert not any("H012" in v for v in viol), "新增卡仍放行"
+
+
 def test_permissions_doc_t38_isolation_defaults():
     """T38/D24：permissions.md 写清缺省研究库、--main-store/--ops-ack 语义、
     研究账户运行方式（runas）与 main 分支保护步骤（U0 清单）。"""

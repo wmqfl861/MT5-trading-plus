@@ -54,9 +54,11 @@
   time < cutoff 的 K 线 + 成本缓存文件，无 tick；研究库无锁箱段，锁箱语义
   自然满足；--research-store 保留为兼容别名）。缺省时 data_research 不存在
   → 报错指路 export_research_store，绝不静默回退主库。读主库须显式
-  --main-store（data_root=data）；读主库的锁箱期（--end 越过 cutoff）再加
-  --ops-ack（运维测量专用，台账 actor 记 ops，不产生研究结论）；G5 需读
-  锁箱段，只能经 --main-store + --approve 由管理员跑（研究库模式下拒绝）。
+  --main-store（data_root=data）。G5 需读锁箱段，只能经 --main-store +
+  --approve 由管理员跑——研究库模式与自定义 --data-root 一律拒绝
+  （R6/C6：主库校验对所有数据根模式生效）。**--ops-ack 不能用于
+  screen/gate**（R6/C6）：运维豁免仅供 reconcile_ab/measure 类运维命令
+  （那里的台账通道记 actor=ops），不能参与研究关卡与试验统计。
   台账缺省**不**跟随切换，仍落 data/research/ledger.sqlite——permissions.md
   的 ACL 里研究库对研究账户只读，可写的台账目录是 data\\research。
 - 代码指纹（T37/H3/M6，D23/D27）：screen/gate 运行前过
@@ -65,7 +67,10 @@
   （strategy_sha）随每次运行落 runs 表并参与去重 N 的七元组键；
   同一卡版本首跑登记指纹，之后代码指纹不同 → 拒绝运行（提示新建
   下一版本卡）；`bt ledger verify` 校验 runs/gates/lockbox_uses 三条
-  哈希链，链头由 scripts/ledger_anchor.py 每日锚定进 git。
+  哈希链 + chain_meta 快照（R6/C5：篡改/删尾/未登记写入逐项报出，
+  台账不完整时一切写入 fail-closed 抛 LedgerTamperedError），链头由
+  scripts/ledger_anchor.py 每日锚定进 git（docs/ops/ledger-anchors.md，
+  链式锚 + --verify 校验模式，R6/C5）。
 """
 import argparse
 import json
@@ -86,7 +91,7 @@ from mt5quant.backtest.report import (  # noqa: E402
     summarize,
 )
 from mt5quant.research import cards  # noqa: E402
-from mt5quant.research.ledger import Ledger  # noqa: E402
+from mt5quant.research.ledger import Ledger, LedgerTamperedError  # noqa: E402
 from mt5quant.validation import gates as vgate  # noqa: E402
 from mt5quant.validation import lookahead as vlook  # noqa: E402
 from mt5quant.validation import robustness as vrob  # noqa: E402
@@ -150,13 +155,22 @@ def _resolve_store(args) -> tuple[str, str]:
     return data_root, kind
 
 
-def _actor_for(args) -> str:
-    """T38/D24：--ops-ack（运维豁免读锁箱期）时台账 actor 记 ops——
-    Global Constraints：锁箱期数据只用于运维测量，台账记 actor=ops，
-    不产生研究结论。"""
+def _reject_ops_ack(args) -> bool:
+    """R6/C6：--ops-ack 不能用于研究命令（screen/gate）。
+
+    第六轮审核 C6：--ops-ack 曾被 screen/gate 接受，直接读到含锁箱段的
+    行情照常跑关卡登记（actor=ops 只是标签）——运维豁免由此进入研究关卡
+    与试验统计，锁箱隔离被旁路。运维测量锁箱期数据走独立入口
+    （scripts/reconcile_ab.py 已有 --ops-ack + actor=ops 通道），
+    研究命令一律拒绝。
+    """
     if getattr(args, "ops_ack", False):
-        return "ops"
-    return args.actor
+        print("✗ --ops-ack 不能用于研究命令 screen/gate（R6/C6）：运维豁免"
+              "仅供 reconcile_ab/measure 类运维命令读取锁箱期数据，不能"
+              "参与研究关卡与试验统计；运维测量请走 scripts/reconcile_ab.py"
+              "（actor=ops 通道）")
+        return True
+    return False
 
 # 参数选择规则枚举（附录 A v2；卡定义时 bt card check 校验，非法值拒绝）
 _SELECTION_METRICS = {
@@ -454,6 +468,8 @@ def cmd_card_check(args) -> int:
 # ---------------------------------------------------------------- screen
 
 def cmd_screen(args) -> int:
+    if _reject_ops_ack(args):                 # R6/C6：研究命令拒绝运维豁免
+        return 1
     path = _card_path(args.card, Path(args.cards_dir))
     try:
         card = cards.load_card(path)
@@ -480,9 +496,7 @@ def cmd_screen(args) -> int:
     if research_mode:
         print(f"— 研究库模式（T27/H3；T38/D24 起为缺省）：data_root={data_root}"
               f"（无 tick，成本经缓存文件；台账 {ledger_path}）")
-    actor = _actor_for(args)                     # T38/D24：--ops-ack → ops
-    if actor != args.actor:
-        print(f"— --ops-ack：台账 actor 记为 ops（运维测量，不产生研究结论）")
+    actor = args.actor    # R6/C6：--ops-ack 已在入口拒绝，研究命令 actor 恒为原值
     with Ledger(ledger_path) as ledger:
         # 先卡后测：未提交 / 工作区脏（P6）/ 提交晚于该卡文件首次运行 →
         # 拒绝（不产生任何 runs）
@@ -517,9 +531,7 @@ def cmd_screen(args) -> int:
             else:
                 vols_by_sym = None
             bars_by_sym = {sym: load_series(data_root, sym,
-                                            card.timeframe, args.end,
-                                            ops_ack=getattr(args, "ops_ack",
-                                                            False))
+                                            card.timeframe, args.end)
                            for sym in card.symbols}
             # T20：禁入窗唯一来源 config/sessions.toml（sha 进 cost_model_version）
             from mt5data.sessions import load_session_policy
@@ -625,6 +637,8 @@ def pd_iso(v) -> str:
 
 def cmd_gate(args) -> int:
     """关卡 G0–G5：基准运行入台账，逐关卡评估写 gates 表。"""
+    if _reject_ops_ack(args):                 # R6/C6：研究命令拒绝运维豁免
+        return 1
     path = _card_path(args.card, Path(args.cards_dir))
     try:
         card = cards.load_card(path)
@@ -662,17 +676,24 @@ def cmd_gate(args) -> int:
     if research_mode:
         print(f"— 研究库模式（T27/H3；T38/D24 起为缺省）：data_root={data_root}"
               f"（无 tick，成本经缓存文件；台账 {ledger_path}）")
-    # T38/D24：G5 需读主库锁箱段——研究库（缺省数据根）没有锁箱段，一律拒绝
-    # （即使已 --approve）；须管理员显式 --main-store 后运行。G5 的锁箱读取
-    # 经 --approve/--approved-by 协议（T21a），不占 --ops-ack 运维豁免。
+    # T38/D24 + R6/C6：G5 需读主库锁箱段，且**主库校验对所有数据根模式
+    # 生效**——研究库（缺省数据根）没有锁箱段，一律拒绝（即使已
+    # --approve）；自定义 --data-root 同样拒绝（第六轮审核 C6：custom
+    # 根可绕过 --main-store 检查，custom 根的数据未在主库授权与锁箱批准
+    # 协议下管理，不能产生正式 G5 关卡结果）。G5 的锁箱读取经
+    # --approve/--approved-by 协议（T21a），不占 --ops-ack 运维豁免。
     if "G5" in wanted and research_mode:
         print("✗ G5（锁箱一次性）需读主库的锁箱段——研究库模式（缺省数据根"
               " data_research）下无 lockbox.json，拒绝运行；须管理员显式"
               " --main-store（并 --approve）后运行")
         return 1
-    actor = _actor_for(args)                     # T38/D24：--ops-ack → ops
-    if actor != args.actor:
-        print(f"— --ops-ack：台账 actor 记为 ops（运维测量，不产生研究结论）")
+    if "G5" in wanted and store_kind != "main":
+        print("✗ G5（锁箱一次性）只能读主库：自定义 --data-root"
+              f"（{data_root}）不能用于 G5（R6/C6：custom 根的数据未在"
+              "主库授权与锁箱批准协议下管理，据此登记的 G5 结果不可信）；"
+              "须 --main-store（缺省 data）+ --approve 运行")
+        return 1
+    actor = args.actor    # R6/C6：--ops-ack 已在入口拒绝，研究命令 actor 恒为原值
     with Ledger(ledger_path) as ledger:
         committed = cards.committed_at(path)
         try:
@@ -727,9 +748,7 @@ def cmd_gate(args) -> int:
             else:
                 vols_by_sym = None
             bars_by_sym = {sym: load_series(data_root, sym,
-                                            card.timeframe, args.end,
-                                            ops_ack=getattr(args, "ops_ack",
-                                                            False))
+                                            card.timeframe, args.end)
                            for sym in card.symbols}
             # T20：禁入窗唯一来源 config/sessions.toml（sha 进 cost_model_version）
             from mt5data.sessions import load_session_policy
@@ -935,7 +954,8 @@ def cmd_ledger_stats(args) -> int:
 # ---------------------------------------------------------------- ledger verify
 
 def cmd_ledger_verify(args) -> int:
-    """T37/M6/D27：校验 runs/gates/lockbox_uses 三条哈希链（断链/篡改）。"""
+    """T37/M6/D27 + R6/C5：校验 runs/gates/lockbox_uses 三条哈希链 +
+    chain_meta 快照（断链/篡改/删尾/未登记写入）。"""
     ledger_path = Path(args.ledger) if args.ledger else \
         Path(args.data_root) / "research" / "ledger.sqlite"
     try:
@@ -948,10 +968,12 @@ def cmd_ledger_verify(args) -> int:
         print(f"✗ 台账哈希链校验失败（{len(problems)} 处）：")
         for p in problems:
             print(f"  - {p}")
-        print("— 与 docs/research/ledger-anchors.md 的锚定记录比对，可定位"
-              "改写发生的时间（D27）")
+        print("— 与 docs/ops/ledger-anchors.md 的锚定记录比对（R6/C5 链式"
+              "锚：scripts/ledger_anchor.py --verify），可定位改写发生的"
+              "时间（D27）；台账不完整期间一切写入被拒（防洗链）")
         return 1
-    print("✓ 台账哈希链完好（runs/gates/lockbox_uses 三链逐行校验通过）")
+    print("✓ 台账哈希链完好（runs/gates/lockbox_uses 三链逐行校验 +"
+          " chain_meta 快照比对通过）")
     return 0
 
 
@@ -984,12 +1006,12 @@ def build_parser() -> argparse.ArgumentParser:
                                "T38 起缺省即研究库，本 flag 通常不用；台账"
                                "缺省仍落 data/research/ledger.sqlite")
     p_screen.add_argument("--main-store", action="store_true",
-                          help="读主库 data（T38/D24：主库含完整锁箱段，须显式"
-                               "本 flag 才读；--end 越过 cutoff 的锁箱期另需"
-                               " --ops-ack）")
+                          help="读主库 data（T38/D24：主库含完整锁箱段，"
+                               "须显式本 flag 才读）")
     p_screen.add_argument("--ops-ack", action="store_true",
-                          help="运维豁免：允许读到锁箱期数据（--end 越过"
-                               " cutoff），仅限运维测量；台账 actor 记 ops")
+                          help="（R6/C6 起拒绝）：运维豁免仅供 reconcile_ab/"
+                               "measure 类运维命令，screen/gate 一律拒绝，"
+                               "不给锁箱期数据进入研究统计的旁路")
     p_screen.add_argument("--ledger", default=None,
                           help="台账路径；缺省 {data-root}/research/ledger.sqlite"
                                "（--research-store 时固定 data/research/ledger.sqlite）")
@@ -1034,11 +1056,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "段，只能由管理员在主库侧跑")
     p_gate.add_argument("--main-store", action="store_true",
                         help="读主库 data（T38/D24：主库含完整锁箱段，须显式"
-                             "本 flag 才读；G5 只能经本 flag 跑，锁箱期测量"
-                             "另需 --ops-ack）")
+                             "本 flag 才读；R6/C6 起 G5 只能经本 flag 跑——"
+                             "研究库与自定义 --data-root 一律拒绝）")
     p_gate.add_argument("--ops-ack", action="store_true",
-                        help="运维豁免：允许读到锁箱期数据（--end 越过"
-                             " cutoff），仅限运维测量；台账 actor 记 ops")
+                        help="（R6/C6 起拒绝）：运维豁免仅供 reconcile_ab/"
+                             "measure 类运维命令，gate 一律拒绝，不给锁箱期"
+                             "数据进入研究关卡的旁路")
     p_gate.add_argument("--ledger", default=None)
     p_gate.add_argument("--costs", choices=("auto", "zero"), default="auto",
                         help="与 run_backtest 同义；测试/冒烟用 zero")
@@ -1073,7 +1096,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except LedgerTamperedError as e:
+        # R6/C5：台账不完整 → 一切写入 fail-closed（防洗链）；
+        # 打印后退出 1，不产生任何 runs/gates/lockbox_uses 行。
+        print(f"✗ {e}")
+        return 1
 
 
 if __name__ == "__main__":

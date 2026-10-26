@@ -11,8 +11,9 @@
 
     # 影子盘（T34/M3，决策 D26）：真实行情 + 影子券商，全链路运行
     #（闸门、定手数、意图、对账、风控、全平协议照常；成交由 PaperBroker
-    #  本地模拟，绝不连真实下单通道；状态落 data/live/paper/state.json，
-    #  风控/对账进程用 --paper-state 读它）
+    #  本地模拟，绝不连真实下单通道；状态按策略落 data/live/paper/
+    #  state-<magic>.json——多运行器并行各写各的（R6/C3），风控/对账
+    #  进程用 --paper-state 指 paper 目录每轮聚合读）
     .venv/Scripts/python.exe scripts/live_runner.py --config live.toml \
         --once --paper
     #   影子 + 离线合成数据（冒烟：K 线读 parquet、报价由最新 bar 合成）
@@ -49,7 +50,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
+import json
 import os
 import sys
 import time
@@ -64,7 +67,7 @@ from mt5live.executor import ExecutionAdapter, LiveExecutor, \
     validate_live_strategy  # noqa: E402
 from mt5live.gate import LiveSizer, RiskGate, load_contract_sizes  # noqa: E402
 from mt5live.paper import PAPER_STATE_RELPATH, BarQuoteMarket, \
-    PaperBroker  # noqa: E402（T34 影子券商）
+    PaperBroker, paper_state_path  # noqa: E402（T34 影子券商）
 from mt5live.riskproc import RiskConfigError, RiskProcess, load_risk_config  # noqa: E402
 from mt5live.runner import (  # noqa: E402
     HeartbeatWriter,
@@ -74,6 +77,11 @@ from mt5live.runner import (  # noqa: E402
     default_compute_window_bars,
     default_heartbeat_path,
     terminal_bars_loader,
+)
+from mt5quant.costs.spread import (  # noqa: E402
+    BUCKET_TZ,
+    SpreadModel,
+    SpreadStat,
 )
 from mt5quant.sizing import RiskSizing  # noqa: E402
 
@@ -107,6 +115,108 @@ def find_gateway_config(override: str | None) -> str:
                      "请用 --gateway-config 指定")
 
 
+# ---- R6/I5：点差模型加载（与 run_backtest.load_spread_model_cache 同口径） ----
+# build_cost_model.py 的产物是缓存包装 {version, mode, watermarks, model,
+# model_sha256, built_at_utc, [overshoot, overshoot_sha256]}，而
+# SpreadModel.load 只认裸模型——直读包装会抛 bucket_tz=None（第六轮审核
+# I5）。这里做等价加载：校验包装 version 与内容 sha 后取内层模型重建；
+# 旧裸模型文件（SpreadModel.save 直写）保持兼容。
+
+_SPREAD_REBUILD_HINT = ("重跑 scripts/build_cost_model.py 重建"
+                        " data/costs/spread_model.json")
+
+
+def _canonical_json_sha256(payload: dict) -> str:
+    """模型负载的规范 sha256（与 run_backtest.canonical_json_sha256 同一
+    算法：sort_keys + 紧致分隔符——等价 dict 同哈希，校验才有意义）。"""
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                   separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def load_spread_model_for_live(path: str, symbol: str) -> SpreadModel:
+    """加载点差模型：兼容 build_cost_model.py 的缓存包装（v1/v2）与旧
+    裸模型文件（R6/I5）。
+
+    - 缓存包装（有 model 键）：校验 version ∈ {1, 2}、model_sha256 与
+      内层负载一致、bucket_tz 口径，然后从内层负载重建 SpreadModel；
+      品种必须已在模型中（fail-fast，与 run_backtest 同口径）；
+    - 裸模型（有 per_symbol 键）：SpreadModel.load（旧文件兼容）。
+
+    任何校验不过 → ValueError，报错指路 build_cost_model.py（绝不静默）。
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError) as e:
+        raise ValueError(
+            f"点差文件 {path} 不可读（{e}）——{_SPREAD_REBUILD_HINT}") from e
+    if not isinstance(doc, dict):
+        raise ValueError(f"点差文件 {path} 顶层须为对象"
+                         f"——{_SPREAD_REBUILD_HINT}")
+    if "model" in doc:
+        version = doc.get("version")
+        if version not in (1, 2):
+            raise ValueError(
+                f"点差缓存 {path} version={version!r} 不受支持（当前 1/2）"
+                f"——{_SPREAD_REBUILD_HINT}")
+        try:
+            payload = doc["model"]
+            sha = doc["model_sha256"]
+        except KeyError as e:
+            raise ValueError(
+                f"点差缓存 {path} 缺键 {e}——{_SPREAD_REBUILD_HINT}") from e
+        if _canonical_json_sha256(payload) != sha:
+            raise ValueError(
+                f"点差缓存 {path} 的 model_sha256 与模型内容不一致"
+                f"（文件被改动或写坏）——{_SPREAD_REBUILD_HINT}")
+        if payload.get("bucket_tz") != BUCKET_TZ:
+            raise ValueError(
+                f"点差缓存 bucket_tz={payload.get('bucket_tz')!r}"
+                f"（缺标注=UTC 分桶的旧文件），与纽约本地小时口径不兼容"
+                f"——{_SPREAD_REBUILD_HINT}")
+        try:
+            per = {s: {int(h): SpreadStat(**st) for h, st in hours.items()}
+                   for s, hours in payload["per_symbol"].items()}
+            overall = {s: float(v)
+                       for s, v in payload["overall_median"].items()}
+            model = SpreadModel(per, overall,
+                                mode=payload.get("mode", "absolute"),
+                                sampling=payload.get("sampling", "tick"))
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(
+                f"点差缓存 {path} 模型负载非法（{e}）"
+                f"——{_SPREAD_REBUILD_HINT}") from e
+        if symbol not in per:
+            raise ValueError(
+                f"{symbol} 不在点差缓存中（缓存品种：{sorted(per)}）"
+                f"——{_SPREAD_REBUILD_HINT}")
+        return model
+    if "per_symbol" in doc:
+        return SpreadModel.load(path)   # 旧裸模型文件（SpreadModel.save 直写）
+    raise ValueError(
+        f"点差文件 {path} 既不是缓存包装（缺 model 键）也不是裸模型"
+        f"（缺 per_symbol 键）——{_SPREAD_REBUILD_HINT}")
+
+
+# ---- R6/C3：每策略影子状态文件 ----
+
+def paper_state_file(live_dir: str, magic: int) -> str:
+    """本策略的影子状态文件路径（paper/state-<magic>.json）。
+
+    检测到旧版单文件 paper/state.json（多运行器互相覆盖的失效布局）时
+    标红告警——旧文件不再读写，提示人工核对后归档。
+    """
+    state_file = paper_state_path(live_dir, magic)
+    legacy = os.path.join(live_dir, PAPER_STATE_RELPATH)
+    if os.path.exists(legacy):
+        print_red(
+            f"⚠ 检测到旧版影子状态 {legacy}（单文件多写者布局已停用，"
+            "不再读写）——本策略状态改落 "
+            f"{state_file}；旧文件请人工核对后归档/删除")
+    return state_file
+
+
 def build_executor_stack(trading, account, market, *, cfg: LiveConfig,
                          strategy, args, live_dir: str, specs_path: str,
                          gw) -> LiveExecutor | None:
@@ -123,12 +233,18 @@ def build_executor_stack(trading, account, market, *, cfg: LiveConfig,
             gw.shutdown()
         return None
     from mt5live.riskproc import load_default_session_policy
-    from mt5quant.costs.spread import SpreadModel
     session_policy = load_default_session_policy(args.sessions_config)
     spread_model = None
     if (not args.no_spread_gate and args.spread_model
             and os.path.exists(args.spread_model)):
-        spread_model = SpreadModel.load(args.spread_model)
+        try:
+            spread_model = load_spread_model_for_live(args.spread_model,
+                                                      cfg.symbol)
+        except (OSError, ValueError) as e:
+            print(f"× 点差模型加载失败：{e}")
+            if gw is not None:
+                gw.shutdown()
+            return None
     process = RiskProcess(risk_cfg, live_dir=live_dir,
                           session_policy=session_policy)
     gate = RiskGate(process, account=account, market=market,
@@ -159,10 +275,12 @@ def build_parser() -> argparse.ArgumentParser:
                         " --dry-run；C2 之后 parquet 只服务于此）")
     p.add_argument("--paper", action="store_true",
                    help="影子券商模式（T34/D26）：PaperBroker 本地模拟成交"
-                        "（状态落 {data_root}/live/paper/state.json，风控/对账"
-                        "进程用 --paper-state 读），闸门/定手数/意图/对账/"
-                        "风控/全平协议全链路照常；绝不连真实下单通道。"
-                        "行情源：真终端；配 --offline 用合成报价（BarQuoteMarket）")
+                        "（状态按策略落 {data_root}/live/paper/"
+                        "state-<magic>.json——多运行器各写各的；风控/对账"
+                        "进程用 --paper-state 指 paper 目录聚合读），闸门/"
+                        "定手数/意图/对账/风控/全平协议全链路照常；绝不连"
+                        "真实下单通道。行情源：真终端；配 --offline 用合成"
+                        "报价（BarQuoteMarket）")
     p.add_argument("--paper-balance", type=float, default=10_000.0,
                    help="影子账户初始余额 USD（默认 10000；已有状态文件时"
                         "以文件为准）")
@@ -178,8 +296,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sessions-config", default=None,
                    help="config/sessions.toml 路径（缺省用仓库默认）")
     p.add_argument("--spread-model", default="data/costs/spread_model.json",
-                   help="点差模型文件（点差闸门；实盘缺文件拒绝启动，"
-                        "除非 --no-spread-gate）")
+                   help="点差模型文件（点差闸门；兼容 build_cost_model.py "
+                        "的缓存包装与旧裸模型文件——R6/I5；实盘缺文件拒绝"
+                        "启动，除非 --no-spread-gate）")
     p.add_argument("--no-spread-gate", action="store_true",
                    help="显式关闭点差闸门（T33/L3：实盘默认缺点差模型必须"
                         "拒启动；开启本开关会打红色警告）")
@@ -270,8 +389,10 @@ def main(argv=None) -> int:
         # T34 影子券商（决策 D26）：PaperBroker 替换真实 trading/account
         # （同一对象充当两个角色），market 仍是上面的行情源；其余链路——
         # 闸门、定手数、意图、对账、风控、全平协议——全部照常，只有成交
-        # 是模拟的。状态经 fileio 原子落 {live_dir}/paper/state.json，
-        # 重启恢复；风控/对账进程用 --paper-state 读同一路径。
+        # 是模拟的。R6/C3：状态按策略隔离，经 fileio 原子落
+        # {live_dir}/paper/state-<magic>.json（多运行器各写各的、票号
+        # 区间按 magic 派生不撞号），重启恢复；风控/对账进程用
+        # --paper-state 指向 paper 目录每轮聚合读取。
         try:
             contract_sizes = load_contract_sizes(specs_path)
         except (OSError, ValueError) as e:
@@ -280,9 +401,11 @@ def main(argv=None) -> int:
             if gw is not None:
                 gw.shutdown()
             return 2
+        paper_state = paper_state_file(live_dir, cfg.magic)  # 旧布局检测在内
         paper = PaperBroker(
-            market, state_path=os.path.join(live_dir, PAPER_STATE_RELPATH),
-            contract_sizes=contract_sizes, balance=args.paper_balance)
+            market, state_path=paper_state,
+            contract_sizes=contract_sizes, balance=args.paper_balance,
+            magic=cfg.magic)
         executor = build_executor_stack(
             paper, paper, market, cfg=cfg, strategy=strategy, args=args,
             live_dir=live_dir, specs_path=specs_path, gw=gw)
@@ -308,10 +431,11 @@ def main(argv=None) -> int:
           f"手数={sizing_desc} {mode_desc}")
     if paper is not None:
         st = paper.state()
-        print(f"    影子账户：state={os.path.join(live_dir, PAPER_STATE_RELPATH)}"
+        print(f"    影子账户：state={paper_state_path(live_dir, cfg.magic)}"
               f" balance={st.balance:.2f} equity={st.equity:.2f}"
               f" 持仓 {len(paper.positions())} 张"
-              "（风控/对账进程：--paper-state 指向同一路径）", flush=True)
+              "（风控/对账进程：--paper-state 指向 paper 目录聚合读取）",
+              flush=True)
     # T33/M1：心跳写入失败不退出（记日志下一轮重试，连续 3 次写告警）——
     # PermissionError 不再杀进程、随后心跳超时全局停机
     hb_writer = HeartbeatWriter(heartbeat, config=cfg, alert_dir=live_dir)

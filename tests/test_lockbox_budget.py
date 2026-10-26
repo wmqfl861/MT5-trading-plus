@@ -81,8 +81,34 @@ def test_budget_rejects_nonpositive_max_uses(tmp_path):
 
 def test_budget_counts_uses_per_cutoff_started_included(tmp_path):
     """used 按 cutoff 匹配计数；started 行同样占用预算；旧库 NULL 行
-    （既往锁箱/预算制度前）不计入当前 cutoff。"""
-    with Ledger(tmp_path / "l.sqlite") as led:
+    （既往锁箱/预算制度前）不计入当前 cutoff。
+
+    R6/C5：NULL cutoff 行以旧库形态**先建库再打开**（经迁移接管快照）——
+    台账打开后的裸 INSERT 属于绕过写方法的写入，会被防洗链校验拒绝
+    （见 test_research_ledger 的未登记写入用例）。"""
+    p = tmp_path / "l.sqlite"
+    con = sqlite3.connect(p)
+    con.executescript("""
+    CREATE TABLE runs(
+      run_id INTEGER PRIMARY KEY AUTOINCREMENT, card_id TEXT NOT NULL,
+      card_version INTEGER NOT NULL, strategy TEXT NOT NULL,
+      params_json TEXT NOT NULL, symbol TEXT NOT NULL, timeframe TEXT NOT NULL,
+      data_first TEXT, data_last TEXT, data_sha256 TEXT NOT NULL,
+      engine_version TEXT NOT NULL, cost_model_version TEXT NOT NULL,
+      gates_hash TEXT NOT NULL DEFAULT '', metrics_json TEXT NOT NULL,
+      created_utc TEXT NOT NULL, actor TEXT NOT NULL);
+    CREATE TABLE lockbox_uses(
+      card_id TEXT NOT NULL UNIQUE, used_at_utc TEXT NOT NULL,
+      approved_by TEXT NOT NULL, result_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'done');
+    """)
+    with con:
+        con.execute(
+            "INSERT INTO lockbox_uses(card_id, used_at_utc, approved_by,"
+            " result_json, status) VALUES ('H799', '2026-01-01T00:00:00+00:00',"
+            " 'u', '{}', 'done')")
+    con.close()
+    with Ledger(p) as led:                       # 打开迁移接管旧行（cutoff NULL）
         g3_card(led, "H801")
         g3_card(led, "H802")
         led.lockbox_budget(CUTOFF)
@@ -90,15 +116,8 @@ def test_budget_counts_uses_per_cutoff_started_included(tmp_path):
         b = led.lockbox_budget(CUTOFF)
         assert b["used"] == 1 and b["exhausted"] is False
         led.record_lockbox_start("H802", approved_by="u", cutoff=CUTOFF)
-        # 手造一行旧库形态（cutoff 为 NULL）——不计入
-        with led.conn:
-            led.conn.execute(
-                "INSERT INTO lockbox_uses(card_id, used_at_utc, approved_by,"
-                " result_json, status, cutoff)"
-                " VALUES ('H799', '2026-01-01T00:00:00+00:00', 'u', '{}',"
-                " 'done', NULL)")
         b = led.lockbox_budget(CUTOFF)
-        assert b["used"] == 2 and b["remaining"] == 3
+        assert b["used"] == 2 and b["remaining"] == 3   # H799（NULL）不计入
         # 另一个 cutoff 各有各的预算（退役旧锁箱 → 新 cutoff 重置）
         b2 = led.lockbox_budget("2026-10-01T00:00:00")
         assert b2["used"] == 0 and b2["remaining"] == 5

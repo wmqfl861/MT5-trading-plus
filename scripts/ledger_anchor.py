@@ -1,22 +1,32 @@
-"""链头锚定（T37/M6/D27）：把台账哈希链的链头追加写进 git 管理的 Markdown。
+"""链头锚定（T37/M6/D27；R6/C5 链式锚 + 校验模式）：把台账哈希链的链头
+追加写进 git 管理的 Markdown——docs/ops/ledger-anchors.md（R6/C5 起从
+docs/research/ 挪入 docs/ops/：锚文件是研究角色**白名单外**的证据，研究
+账户改不了自己的锚）。
 
 用法（计划任务每日跑，管理员把该文件随每日提交入 git）：
     .venv/Scripts/python.exe scripts/ledger_anchor.py
     .venv/Scripts/python.exe scripts/ledger_anchor.py \
         --ledger data/research/ledger.sqlite \
-        --anchor docs/research/ledger-anchors.md
+        --anchor docs/ops/ledger-anchors.md
+    .venv/Scripts/python.exe scripts/ledger_anchor.py --verify   # 校验模式
 
-- 只读打开台账（sqlite URI mode=ro：绝不触发 T37 迁移、绝不写台账文件）；
+- 只读打开台账（sqlite URI mode=ro：绝不触发迁移、绝不写台账文件）；
 - 每次运行把 runs/gates/lockbox_uses 三条链的（行数， 链头 row_hash）连同
   UTC 时刻各追加一行；三链（行数， 链头）与已记录的完全一致 → 不重复写
   （幂等，计划任务重复跑不会堆重复行）；
+- 链式锚（R6/C5）：每条锚定行带 prev_anchor（上一条锚的 anchor_hash，
+  首条接 GENESIS）和 anchor_hash = sha256(规范化内容 + prev_anchor)——
+  锚文件自成一条链，改历史锚行会破坏其后所有锚的哈希；
 - 为什么锚定有用（M6 的威胁模型：研究账户可直接写台账）：链上改一行或删
   一行会被 `bt ledger verify` 报出，但改写者可以整链重算；链头进了 git
   之后，重算出的新链头与锚定记录不符即暴露——删最后一行则行数对不上。
+  --verify 把两面对起来：锚文件链完整性 + 台账现状与锚历史的比对。
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import re
 import sqlite3
 import sys
@@ -25,26 +35,72 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LEDGER = REPO_ROOT / "data" / "research" / "ledger.sqlite"
-DEFAULT_ANCHOR = REPO_ROOT / "docs" / "research" / "ledger-anchors.md"
+# R6/C5：锚文件挪到 docs/ops/（研究角色白名单外；docs/research/** 可被
+# 研究账户改写，锚放在那里等于让被审计者保管审计证据）。
+DEFAULT_ANCHOR = REPO_ROOT / "docs" / "ops" / "ledger-anchors.md"
 
 CHAIN_TABLES = ("runs", "gates", "lockbox_uses")
+GENESIS_ANCHOR = "0" * 64
 
 _HEADER = """\
-# 台账链头锚定（T37/M6/D27）
+# 台账链头锚定（T37/M6/D27；R6/C5 链式锚）
 
 由 `scripts/ledger_anchor.py` 生成；管理员每日提交本文件（计划任务）。
 链头 = 各链式表按 rowid 最后一行的 `row_hash`；行数为该表当前行数。
-与本文件记录不符的台账即发生过改写/删行（即便整链被重算）——
-比对用 `bt ledger verify` + 本表。
+每条锚带 prev_anchor（上一条锚的 anchor_hash，首条接全零）与
+anchor_hash = sha256(内容 + prev_anchor)——锚文件自成链，改任何历史
+锚都会破坏其后所有锚。与本文件记录不符的台账即发生过改写/删行（即便
+整链被重算）；比对用 `scripts/ledger_anchor.py --verify`。
 
-| 锚定 UTC | 台账 | 表 | 行数 | 链头 row_hash |
-| --- | --- | --- | --- | --- |
+| 锚定 UTC | 台账 | 表 | 行数 | 链头 row_hash | prev_anchor | anchor_hash |
+| --- | --- | --- | --- | --- | --- | --- |
 """
 
 _ROW_RE = re.compile(
     r"^\|\s*(?P<ts>[^|]+?)\s*\|\s*(?P<ledger>[^|]+?)\s*\|"
     r"\s*(?P<table>[^|]+?)\s*\|\s*(?P<rows>\d+)\s*\|"
-    r"\s*(?P<head>[^|]*?)\s*\|$")
+    r"\s*(?P<head>[^|]*?)\s*\|\s*(?P<prev>[0-9a-f]{64})\s*\|"
+    r"\s*(?P<hash>[0-9a-f]{64})\s*\|$")
+
+
+def _parse_head(raw: str):
+    """锚文件里的链头列 → row_hash 或 None（空表记法）。"""
+    s = raw.strip()
+    return None if (not s or s.startswith("（")) else s
+
+
+def _parse_anchor_line(line: str):
+    m = _ROW_RE.match(line)
+    if m is None:
+        return None
+    return {"ts": m.group("ts").strip(), "ledger": m.group("ledger").strip(),
+            "table": m.group("table").strip(), "rows": int(m.group("rows")),
+            "head": _parse_head(m.group("head")),
+            "prev": m.group("prev"), "hash": m.group("hash")}
+
+
+def _read_entries(anchor_path) -> list[dict]:
+    p = Path(anchor_path)
+    if not p.is_file():
+        return []
+    out = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        e = _parse_anchor_line(line)
+        if e is not None:
+            out.append(e)
+    return out
+
+
+def _anchor_digest(ts: str, ledger: str, table: str, rows: int,
+                   head, prev: str) -> str:
+    """链式锚哈希：sha256(规范化锚内容 + prev_anchor)——内容含上一条锚
+    的哈希，改任何历史锚行都会使其后所有锚的 anchor_hash 对不上。"""
+    canon = json.dumps({"ts": ts, "ledger": ledger, "table": table,
+                        "rows": int(rows), "head": head,
+                        "prev_anchor": prev},
+                       sort_keys=True, ensure_ascii=False,
+                       separators=(",", ":"))
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
 
 def chain_heads(ledger_path) -> dict[str, dict]:
@@ -81,30 +137,30 @@ def _ledger_label(ledger_path) -> str:
 
 
 def write_anchor(anchor_path, ledger_path, *, now=None) -> bool:
-    """追加锚定行；三链（行数， 链头）与既有记录完全一致 → False（幂等）。
+    """追加锚定行（链式锚：prev = 锚文件最后一条 anchor_hash）；三链
+    （行数， 链头）与既有记录完全一致 → False（幂等）。
 
     返回 True = 本次写入了新行。
     """
     heads = chain_heads(ledger_path)
     p = Path(anchor_path)
     existing = p.read_text(encoding="utf-8") if p.exists() else ""
+    entries = _read_entries(p)
     label = _ledger_label(ledger_path)
     # 幂等：该台账在文件里已记录过完全相同的（表， 行数， 链头）三元组
-    recorded: set[tuple[str, int, str | None]] = set()
-    for line in existing.splitlines():
-        m = _ROW_RE.match(line)
-        if not m:
-            continue
-        head = m.group("head").strip()
-        recorded.add((m.group("table").strip(), int(m.group("rows")),
-                      None if head.startswith("（") else head))
-    current = {(t, heads[t]["rows"], heads[t]["head"])
-               for t in CHAIN_TABLES}
+    recorded = {(e["table"], e["rows"], e["head"]) for e in entries}
+    current = {(t, heads[t]["rows"], heads[t]["head"]) for t in CHAIN_TABLES}
     if current <= recorded:
         return False
     ts = (now or datetime.now(timezone.utc)).isoformat()
-    lines = [f"| {ts} | {label} | {t} | {heads[t]['rows']} | "
-             f"{heads[t]['head'] or '（空表）'} |" for t in CHAIN_TABLES]
+    prev = entries[-1]["hash"] if entries else GENESIS_ANCHOR
+    lines = []
+    for t in CHAIN_TABLES:
+        head = heads[t]["head"]
+        ah = _anchor_digest(ts, label, t, heads[t]["rows"], head, prev)
+        lines.append(f"| {ts} | {label} | {t} | {heads[t]['rows']} | "
+                     f"{head or '（空表）'} | {prev} | {ah} |")
+        prev = ah
     with open(p, "a", encoding="utf-8") as f:
         if not existing:
             f.write(_HEADER)
@@ -112,16 +168,82 @@ def write_anchor(anchor_path, ledger_path, *, now=None) -> bool:
     return True
 
 
+def verify_anchor(anchor_path, ledger_path) -> list[str]:
+    """R6/C5 校验模式的核心：比对台账链头与锚文件历史，返回问题列表
+    （空 = 一致）。
+
+    - 锚文件不存在 / 无锚定记录 / 某表没有锚定条目 → 缺历史锚；
+    - 逐条重算 anchor_hash（含 prev_anchor 链）→ 锚文件被改 / 锚链断裂；
+    - 台账现状 vs 该表最近一条锚：行数 < 锚定 → 锚后被删行/回滚；
+      行数相同但链头不同 → 整链被重算改写；行数 > 锚定 → 合法增长（锚
+      定之后的正常写入，待下次锚定收编）。
+    """
+    problems: list[str] = []
+    p = Path(anchor_path)
+    if not p.is_file():
+        return [f"锚文件不存在：{p}（缺历史锚——先跑 write 模式生成）"]
+    entries = _read_entries(p)
+    if not entries:
+        return [f"锚文件 {p} 无任何锚定记录（缺历史锚）"]
+    prev = GENESIS_ANCHOR
+    for i, e in enumerate(entries, 1):
+        if e["prev"] != prev:
+            problems.append(
+                f"锚#{i}（{e['table']}）：prev_anchor 与上一条锚不符"
+                "（锚链断裂——锚文件被删行或被改）")
+        expect = _anchor_digest(e["ts"], e["ledger"], e["table"], e["rows"],
+                                e["head"], e["prev"])
+        if e["hash"] != expect:
+            problems.append(
+                f"锚#{i}（{e['table']}）：anchor_hash 与内容不符"
+                "（锚文件历史被改）")
+        prev = e["hash"]
+    heads = chain_heads(ledger_path)
+    label = _ledger_label(ledger_path)
+    for t in CHAIN_TABLES:
+        mine = [e for e in entries
+                if e["table"] == t and e["ledger"] == label]
+        if not mine:
+            problems.append(
+                f"{t}：锚文件没有该台账该表的锚定历史（缺历史锚）")
+            continue
+        last = mine[-1]
+        cur_rows, cur_head = heads[t]["rows"], heads[t]["head"]
+        if cur_rows < last["rows"]:
+            problems.append(
+                f"{t}：现有 {cur_rows} 行 < 最近锚定 {last['rows']} 行"
+                "（锚定后被删行或回滚）")
+        elif cur_rows == last["rows"] and cur_head != last["head"]:
+            problems.append(
+                f"{t}：行数与锚定相同但链头不符（整链被重算改写）")
+    return problems
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="ledger_anchor",
-        description="把台账哈希链的链头锚定进 docs/research/ledger-anchors.md"
-                    "（T37/M6/D27；只读台账，幂等追加）")
+        description="把台账哈希链的链头锚定进 docs/ops/ledger-anchors.md"
+                    "（T37/M6/D27；R6/C5 链式锚；只读台账，幂等追加；"
+                    "--verify 为校验模式，不写锚文件）")
     ap.add_argument("--ledger", default=str(DEFAULT_LEDGER),
                     help=f"台账路径（缺省 {DEFAULT_LEDGER}）")
     ap.add_argument("--anchor", default=str(DEFAULT_ANCHOR),
                     help=f"锚定文件（缺省 {DEFAULT_ANCHOR}）")
+    ap.add_argument("--verify", action="store_true",
+                    help="校验模式：比对台账链头/行数与锚文件历史"
+                         "（含锚链完整性；缺历史锚、锚后被改写都报出），"
+                         "不写锚文件")
     args = ap.parse_args(argv)
+    if args.verify:
+        problems = verify_anchor(args.anchor, args.ledger)
+        if problems:
+            print(f"✗ 锚定校验失败（{len(problems)} 处）：")
+            for q in problems:
+                print(f"  - {q}")
+            return 1
+        print("✓ 锚定校验通过：锚文件链完整，三链（行数， 链头）与最近"
+              "锚定一致或在锚定后合法增长")
+        return 0
     heads = chain_heads(args.ledger)
     written = write_anchor(args.anchor, args.ledger)
     for t in CHAIN_TABLES:

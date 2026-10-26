@@ -860,6 +860,50 @@ def _fmt_pct(rate: float | None) -> str:
     return "—" if rate is None else f"{rate * 100:.0f}%"
 
 
+def flags_level_rates(positive_detection: dict, g5_detection: dict
+                      ) -> dict[str, float]:
+    """决策规则盯的 1.0 档检出率（R6/C8）：普通正对照与 G5 检出率是**两套
+    来源的关卡子检查，必须同时遍历**——绝不能 either/or（旧实现 `positive
+    or g5`：只要存在普通正对照，G5 检出率为零也不产生低检出率告警）。
+    同名检查跨 setup / 跨来源取最小值（最保守）；G5.passed 是汇总数据不参与。
+    """
+    level_rates: dict[str, float] = {}
+    for source in (positive_detection, g5_detection):
+        for by_level in source.values():
+            for check, rate in (by_level.get(str(DECISION_LEVEL))
+                                or {}).items():
+                if check == "G5.passed":
+                    continue
+                prev = level_rates.get(check)
+                level_rates[check] = (float(rate) if prev is None
+                                      else min(prev, float(rate)))
+    return level_rates
+
+
+def compute_flags(results: dict) -> list[dict]:
+    """产出报告的决策规则标记（主进程与 merge_gate_power 共用同一函数，
+    R6/C8）：
+
+    - 误报率：负对照 false_positive_rates（单进程/合并器均已按 null 取最差）
+      与 G5 各 null 误报率**逐检查取最大**（不得混桶平均或被 0% 桶稀释）；
+    - 检出率：flags_level_rates（正对照 + G5 双源，取最小）。
+    """
+    fp_rates = dict((results.get("negative") or {})
+                    .get("false_positive_rates") or {})
+    g5_block = results.get("g5") or {}
+    for null, rates in (g5_block.get("false_positive_rates") or {}).items():
+        for check, rate in rates.items():
+            if check == "G5.passed":        # 汇总数据，不进决策规则
+                continue
+            fp_rates[check] = max(fp_rates.get(check, 0.0), float(rate))
+    level_rates = flags_level_rates(
+        (results.get("positive") or {}).get("detection_rates") or {},
+        g5_block.get("detection_rates") or {})
+    if not (level_rates or fp_rates):
+        return []
+    return collect_flags(level_rates, fp_rates)
+
+
 def render_report(results: dict) -> str:
     """Markdown 汇总：每道关卡 × 每档优势的检出率 / 误报率（按零假设分列）
     + 合并评估变体 + G5 判别力 + 决策规则。"""
@@ -1332,28 +1376,9 @@ def main(argv=None) -> int:
                               ["session_policy"] for key in positive_keys},
             log=log)
 
-    detection_for_flags = (results.get("positive", {}).get("detection_rates")
-                           or {})
-    fp_rates = dict((results.get("negative") or {})
-                    .get("false_positive_rates") or {})
-    g5_block = results.get("g5") or {}
-    for null, rates in (g5_block.get("false_positive_rates") or {}).items():
-        for check, rate in rates.items():
-            if check == "G5.passed":        # 汇总数据，不进决策规则
-                continue
-            fp_rates[check] = max(fp_rates.get(check, 0.0), float(rate))
-    level_rates: dict[str, float] = {}
-    for key, by_level in (detection_for_flags
-                          or g5_block.get("detection_rates") or {}).items():
-        for check, rate in (by_level.get(str(DECISION_LEVEL)) or {}).items():
-            if check == "G5.passed":
-                continue
-            prev = level_rates.get(check)
-            level_rates[check] = rate if prev is None else min(prev, rate)
-    if level_rates or fp_rates:
-        results["flags"] = collect_flags(level_rates, fp_rates)
-    else:
-        results["flags"] = []
+    # R6/C8：flags 经 compute_flags——正对照与 G5 检出率同时遍历
+    # （旧实现 either/or：存在正对照时 G5 低检出率被整体跳过）。
+    results["flags"] = compute_flags(results)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)

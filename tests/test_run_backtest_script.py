@@ -121,14 +121,41 @@ def test_entry_policy_for_combines_missing_hours(tmp_path):
     root = _write_ticks(tmp_path / "data")
     costs, _ = mod.build_costs(str(root), "XAUUSD", 0.1, allow_zero_swap=True)
     base = load_session_policy(str(mod.SESSIONS_PATH))
-    pol = mod.entry_policy_for(costs, "XAUUSD", base)
+    # 覆盖阈值降到 1（tick 只有 1 天样本）：有统计小时放行、缺统计小时禁入
+    # （min_days=20 的缺覆盖禁入见 test_entry_policy_min_days_forbids_thin）
+    import dataclasses as dc
+    thin = dc.replace(base, min_days_per_hour=1)
+    pol = mod.entry_policy_for(costs, "XAUUSD", thin)
     # 缺统计小时（纽约 7 点 = 11:00 UTC EDT）禁入；换日窗照常
     from datetime import datetime
     assert not pol.entry_allowed("XAUUSD", datetime(2026, 10, 19, 11, 0))
     assert pol.entry_allowed("XAUUSD", datetime(2026, 10, 19, 12, 0))
     assert not pol.entry_allowed("XAUUSD", datetime(2026, 10, 19, 21, 10))  # 换日窗
     # 原策略不被改动
-    assert base.entry_allowed("XAUUSD", datetime(2026, 10, 19, 11, 0))
+    assert thin.entry_allowed("XAUUSD", datetime(2026, 10, 19, 11, 0))
+
+
+def test_entry_policy_min_days_forbids_thin_coverage(tmp_path):
+    """R6/C4 失败测试：有统计但 n_days < min_days_per_hour 的小时按缺统计
+    禁入（此前 entry_policy_for 只看小时有无统计——一天样本的小时在配置
+    要求 20 天时仍放行）。"""
+    from datetime import datetime
+
+    from mt5data.sessions import load_session_policy
+
+    mod = _load_script()
+    root = _write_ticks(tmp_path / "data")     # 只覆盖纽约 8 点，1 天样本
+    costs, _ = mod.build_costs(str(root), "XAUUSD", 0.1, allow_zero_swap=True)
+    base = load_session_policy(str(mod.SESSIONS_PATH))   # min_days_per_hour=20
+    pol = mod.entry_policy_for(costs, "XAUUSD", base)
+    # 纽约 8 点（12:00 UTC，EDT）有统计但 n_days=1 < 20 → 禁入
+    assert not pol.entry_allowed("XAUUSD", datetime(2026, 10, 19, 12, 0))
+    # 阈值降到 1 → 同一小时放行（缺统计小时照旧禁入）
+    import dataclasses as dc
+    pol1 = mod.entry_policy_for(
+        costs, "XAUUSD", dc.replace(base, min_days_per_hour=1))
+    assert pol1.entry_allowed("XAUUSD", datetime(2026, 10, 19, 12, 0))
+    assert not pol1.entry_allowed("XAUUSD", datetime(2026, 10, 19, 11, 0))
 
 
 def test_entry_policy_for_zero_costs_returns_base(tmp_path):
@@ -167,7 +194,11 @@ def test_missing_hour_forbid_defers_engine_entry_end_to_end(tmp_path):
         "tick_volume": 10, "spread": 5, "real_volume": 0,
     })[_COLUMNS]
     base = load_session_policy(str(mod.SESSIONS_PATH))
-    pol = mod.entry_policy_for(costs, "XAUUSD", base)
+    # 覆盖阈值降到 1（tick 只有 1 天样本；min_days=20 的禁入口径见
+    # test_entry_policy_min_days_forbids_thin）
+    import dataclasses as dc
+    pol = mod.entry_policy_for(costs, "XAUUSD",
+                               dc.replace(base, min_days_per_hour=1))
     res = run_backtest(AlwaysLong(), bars, costs, symbol="XAUUSD", params={},
                        contract_size=100.0, timeframe="H1", session_policy=pol, volume_lots=1.0)
     assert len(res.trades) == 1                    # 不抛错，且只有一笔
@@ -752,3 +783,215 @@ def test_cli_build_cost_model_refused_under_research_store(tmp_path,
         "--volume-lots", "0.01", "--allow-zero-swap"])
     assert mod.main() == 1
     assert "研究库" in capsys.readouterr().out
+
+
+# ------------------------------------------------- R6（C4+I2）：越幅接线与
+# 成本版本身份
+
+def _write_overshoot_cache(mod, root, symbol="XAUUSD", *, p50_by_hour=None):
+    """v2 缓存：点差模型 + 越幅表（build_cost_model --overshoot 的产物形状：
+    version 2 / sampling / overshoot / overshoot_sha256，两个 sha 均自洽）。"""
+    import os
+
+    from mt5data.ticks import load_ticks, tick_watermark
+    from mt5quant.costs import SpreadModel
+    from mt5quant.costs.overshoot import OvershootStat, StopOvershootModel
+
+    ticks = load_ticks(str(root), symbol, columns=["time_msc", "bid", "ask"])
+    model = SpreadModel.from_ticks(symbol, ticks, mode="relative")
+    path = mod.spread_model_cache_path(str(root))
+    doc = mod.save_spread_model_cache(path, model,
+                                      {symbol: tick_watermark(str(root), symbol)})
+    doc["version"] = 2
+    doc["sampling"] = model.sampling
+    om = StopOvershootModel({symbol: {
+        h: OvershootStat(p50=v, p90=v * 4.0, n=5, n_days=25)
+        for h, v in (p50_by_hour
+                     or {h: 0.001 for h in range(24)}).items()}})
+    doc["overshoot"] = om.to_dict()
+    doc["overshoot_sha256"] = mod.canonical_json_sha256(doc["overshoot"])
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+    return doc
+
+
+def test_build_costs_injects_overshoot_from_cache(tmp_path):
+    """R6/C4 失败测试：v2 缓存带越幅表 → build_costs 注入 Costs（引擎
+    stop_overshoot 非零），版本串带越幅 sha；此前 Costs 漏传 overshoot_model，
+    正式回测的越幅恒为 0。"""
+    mod = _load_script()
+    root = _full_hour_ticks(tmp_path / "data")
+    doc = _write_overshoot_cache(mod, root, p50_by_hour={
+        h: (0.002 if h == 8 else 0.001) for h in range(24)})
+    costs, ver = mod.build_costs(str(root), "XAUUSD", 0.0, allow_zero_swap=True)
+    assert f"ov[{doc['overshoot_sha256'][:8]}]" in ver
+    assert "no-overshoot" not in ver
+    assert costs.stop_overshoot("XAUUSD", 8, price=2000.0) == pytest.approx(
+        0.002 * 2000.0)
+    assert costs.stop_overshoot("XAUUSD", 9, price=2000.0) == pytest.approx(
+        0.001 * 2000.0)
+
+
+def test_build_costs_without_overshoot_keeps_a15_and_annotates(tmp_path):
+    """无越幅键（v1 缓存 / 直建）→ overshoot_model=None 保持 A-1.5 行为，
+    版本串如实标注 no-overshoot。"""
+    mod = _load_script()
+    root = _full_hour_ticks(tmp_path / "data")
+    _build_cache(mod, root)                    # v1 缓存（save_spread_model_cache）
+    costs, ver = mod.build_costs(str(root), "XAUUSD", 0.0, allow_zero_swap=True)
+    assert "no-overshoot" in ver and "ov[" not in ver
+    assert costs.stop_overshoot("XAUUSD", 8, price=2000.0) == 0.0
+
+
+def test_build_costs_legacy_adjacent_overshoot_not_injected(tmp_path):
+    """缓存里的越幅表是旧 version 1（只有 adjacent_jump 口径，无引擎用的
+    stop_level 统计）→ 不注入（注入会让引擎 stop 出场直接抛错）、不报错，
+    版本串标 no-overshoot 并打印重建指路。"""
+    mod = _load_script()
+    root = _full_hour_ticks(tmp_path / "data")
+    from mt5quant.costs.spread import BUCKET_TZ
+
+    legacy = {"version": 1, "bucket_tz": BUCKET_TZ,
+              "per_symbol": {"XAUUSD": {"8": {"p50": 0.001, "p90": 0.004,
+                                              "n": 5, "n_days": 25}}}}
+    p = mod.spread_model_cache_path(str(root))
+    doc = json.loads(Path(p).read_text(encoding="utf-8")) \
+        if Path(p).exists() else {}
+    if not doc:
+        _build_cache(mod, root)
+        doc = json.loads(Path(p).read_text(encoding="utf-8"))
+    doc["version"] = 2
+    doc["sampling"] = doc["model"].get("sampling", "bar_open_m1")
+    doc["overshoot"] = legacy
+    doc["overshoot_sha256"] = mod.canonical_json_sha256(legacy)
+    Path(p).write_text(json.dumps(doc), encoding="utf-8")
+    costs, ver = mod.build_costs(str(root), "XAUUSD", 0.0, allow_zero_swap=True)
+    assert "no-overshoot" in ver and "ov[" not in ver
+    assert costs.stop_overshoot("XAUUSD", 8, price=2000.0) == 0.0
+
+
+def test_build_costs_overshoot_sha_tamper_rejected(tmp_path):
+    """越幅表内容与 overshoot_sha256 不一致 → 拒绝加载（绝不静默跳过）。"""
+    mod = _load_script()
+    root = _full_hour_ticks(tmp_path / "data")
+    _write_overshoot_cache(mod, root)
+    p = mod.spread_model_cache_path(str(root))
+    doc = json.loads(Path(p).read_text(encoding="utf-8"))
+    doc["overshoot"]["per_symbol"]["XAUUSD"]["8"]["p50"] = 0.5   # 改内容不动 sha
+    Path(p).write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(ValueError, match="overshoot_sha256"):
+        mod.build_costs(str(root), "XAUUSD", 0.0, allow_zero_swap=True)
+
+
+def test_engine_stop_exit_includes_overshoot_via_build_costs(tmp_path):
+    """R6/C4 失败测试（端到端经 build_costs）：含越幅表的缓存装配出的成本
+    → 引擎 reason="stop" 的出场价比无越幅时恰好多扣该纽约小时越幅 p50×SL
+    （slip=0：无越幅的 stop 出场价就是 SL 价位）。"""
+    import dataclasses as dc
+
+    import pandas as pd
+
+    from mt5quant.backtest.engine_a import run_backtest
+    from mt5quant.strategies import BaseStrategy
+    from mt5quant.strategies.base import ExitRules
+
+    class LongAfterWarmup(BaseStrategy):
+        exit_rules = ExitRules(stop_loss_atr=1.5)
+
+        def generate_signals(self, bars, params):
+            sig = [0] * 14 + [1] * (len(bars) - 14)
+            return pd.Series(sig, index=bars.index, dtype="int64")
+
+    mod = _load_script()
+    root = _full_hour_ticks(tmp_path / "data")
+    _write_overshoot_cache(mod, root, p50_by_hour={
+        h: (0.002 if h == 8 else 0.001) for h in range(24)})
+    costs, _ver = mod.build_costs(str(root), "XAUUSD", 0.0, allow_zero_swap=True)
+    plain = dc.replace(costs, overshoot_model=None)
+
+    # 17 根 H1（2026-10-18 20:00 起）：bar0..14 TR=1（ATR14=1.0）；信号从
+    # bar14 转 1 → bar15 开盘入场（SL≈98.5）；bar16（2026-10-19 12:00 UTC =
+    # 纽约 8 点）盘中下穿 SL → reason="stop"
+    times = pd.date_range("2026-10-18 20:00", periods=17, freq="h")
+    bars = pd.DataFrame({
+        "time": times, "open": 100.0, "high": 100.5, "low": 99.5,
+        "close": 100.0, "tick_volume": 10, "spread": 5, "real_volume": 0,
+    })
+    bars.loc[15, ["high", "low", "close"]] = [100.2, 99.8, 99.9]
+    bars.loc[16, ["open", "high", "low", "close"]] = [99.0, 99.2, 97.0, 97.5]
+
+    def run(c):
+        res = run_backtest(LongAfterWarmup(), bars, c, symbol="XAUUSD",
+                           params={}, contract_size=100.0, timeframe="H1",
+                           volume_lots=1.0)
+        assert len(res.trades) == 1
+        return res.trades.iloc[0]
+
+    t_plain, t_ov = run(plain), run(costs)
+    assert t_plain["exit_reason"] == "stop"
+    assert t_ov["exit_reason"] == "stop"
+    sl = float(t_plain["exit_price"])          # slip=0、无越幅 → 恰为 SL 价位
+    # 出场 bar（2026-10-19 12:00 UTC）= 纽约 8 点：夹具里该小时 p50=0.002，
+    # 越幅 = 0.002 × SL 价位（独立于被测对象计算，不从 costs 反推）
+    expected = 0.002 * sl
+    assert t_ov["exit_price"] == pytest.approx(sl - expected)
+
+
+def test_cost_version_binds_cache_content_sampling_and_overshoot(tmp_path):
+    """R6/I2 失败测试：缓存内容（合法改 + 更新 sha）变化 → 版本串必须变化
+    ——点差内容、越幅表内容、采样口径任何一处不同都是不同的成本身份。"""
+    mod = _load_script()
+    root = _full_hour_ticks(tmp_path / "data")
+    _write_overshoot_cache(mod, root)
+    _, ver1 = mod.build_costs(str(root), "XAUUSD", 0.0, allow_zero_swap=True)
+    assert "/bar_open_m1#" in ver1          # 采样口径进版本串
+
+    def _patch(mutate):
+        p = mod.spread_model_cache_path(str(root))
+        doc = json.loads(Path(p).read_text(encoding="utf-8"))
+        mutate(doc)
+        doc["model_sha256"] = mod.canonical_json_sha256(doc["model"])
+        if "overshoot" in doc:
+            doc["overshoot_sha256"] = mod.canonical_json_sha256(
+                doc["overshoot"])
+        Path(p).write_text(json.dumps(doc), encoding="utf-8")
+
+    # 1) 点差模型内容变（p90 0.3/2400 → 0.5）→ 版本串变
+    _patch(lambda d: d["model"]["per_symbol"]["XAUUSD"]["8"].update(p90=0.5))
+    _, ver2 = mod.build_costs(str(root), "XAUUSD", 0.0, allow_zero_swap=True)
+    assert ver2 != ver1
+    # 2) 只变越幅表（点差不动）→ 版本串也变
+    _patch(lambda d: d["overshoot"]["per_symbol"]["XAUUSD"]["8"].update(
+        p50=0.123, p90=0.5))
+    _, ver3 = mod.build_costs(str(root), "XAUUSD", 0.0, allow_zero_swap=True)
+    assert ver3 != ver2 and ver3 != ver1
+    # 3) 采样口径变（同统计、bar_open_m1 → tick）→ 版本串变
+    _patch(lambda d: d["model"].update(sampling="tick"))
+    _, ver4 = mod.build_costs(str(root), "XAUUSD", 0.0, allow_zero_swap=True)
+    assert ver4 != ver3 and "/tick#" in ver4
+
+
+def test_cost_version_cache_hit_equals_direct_build(tmp_path):
+    """缓存命中与同内容直建的**点差身份**一致（sha 取自模型负载本身，不是
+    缓存文件——同一份统计两种来路同一 sha/采样标注）；越幅表只存在于缓存，
+    直建路径如实标 no-overshoot（与 I2 的身份区分不冲突）。"""
+    mod = _load_script()
+    root = _full_hour_ticks(tmp_path / "data")
+    _write_overshoot_cache(mod, root)
+    cached, ver_c = mod.build_costs(str(root), "XAUUSD", 0.0,
+                                    allow_zero_swap=True)
+    import os
+
+    p = mod.spread_model_cache_path(str(root))
+    os.remove(p)                       # 删缓存 → 直建路径（水位已无缓存可比）
+    direct, ver_d = mod.build_costs(str(root), "XAUUSD", 0.0,
+                                    allow_zero_swap=True)
+    sha8 = mod.canonical_json_sha256(cached.spread.to_dict())[:8]
+    assert f"/bar_open_m1#{sha8}" in ver_c
+    assert f"/bar_open_m1#{sha8}" in ver_d       # 同一统计同一身份段
+    assert direct.spread.stat(8).p90 == cached.spread.stat(8).p90
+    # 直建无缓存 → 无越幅表可挂，标注 no-overshoot（缓存路径是 ov[...]）
+    assert "no-overshoot" in ver_d and "ov[" not in ver_d
+    assert "ov[" in ver_c

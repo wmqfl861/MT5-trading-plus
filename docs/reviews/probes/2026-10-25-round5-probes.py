@@ -31,29 +31,48 @@ from tests.fakes_live import boundary_open, grid_bars  # noqa: E402
 from mt5live.runner import write_heartbeat  # noqa: E402
 
 
-def _paused(stack) -> bool | None:
-    p = os.path.join(stack.live_dir, "pause.json")
-    return it.read_json(p)["paused"] if os.path.exists(p) else None
+def _paused(stack, magics=(it.MAGIC,)) -> str:
+    """全局 pause.json 与各 pause-<magic>.json 的 paused 状态（None = 文件不存在）。
+
+    第六轮审核 M1：对账写的是分策略 pause-<magic>.json（T30/D20），全局
+    pause.json 只留给人工——只读全局文件打印 None 不能证明策略未暂停，
+    两者分别报告。"""
+    parts = []
+    g = os.path.join(stack.live_dir, "pause.json")
+    v = it.read_json(g)["paused"] if os.path.exists(g) else None
+    parts.append(f"全局={v}")
+    for m in magics:
+        p = os.path.join(stack.live_dir, f"pause-{m}.json")
+        v = it.read_json(p)["paused"] if os.path.exists(p) else None
+        parts.append(f"pause-{m}={v}")
+    return " ".join(parts)
 
 
 def p8_pause_deadlock() -> None:
-    print("=== P8 服务器端止损/止盈出场后，对账暂停能否自动解除（期望：能；且只暂停该策略）")
+    print("=== P8 服务器端止损/止盈出场后，对账暂停能否自动解除"
+          "（期望：能；且只暂停该策略；执行器先/对账先两种调度顺序均如此）")
     for label, rules in (("after_signal_change", it.ASC_RULES),
                          ("immediate", it.DEFAULT_RULES)):
-        with tempfile.TemporaryDirectory() as tmp:
-            st = it.LiveStack(Path(tmp), exit_rules=rules)
-            other = it.LiveStack(Path(tmp), magic=it.MAGIC_B)   # 同 live 目录的另一策略
-            st.round(it.T1, "up")
-            ticket = st.broker.positions(it.SYMBOL)[0].ticket
-            st.broker.close_external(ticket, profit=-30.0, comment="[sl]")
-            rc, _ = st.reconcile_once()
-            print(f"  [{label}] 开仓 → 止损 → 对账 rc={rc} paused={_paused(st)}")
-            for t, last in ((it.T2, "up"), (it.T3, "flat"), (it.T4, "up"), (it.T5, "up")):
-                _, rr = st.round(t, last)
-                rc, _ = st.reconcile_once()
-                print(f"    {t:%H:%M} 信号={last:<4} 执行器={rr.action:<16} 对账 rc={rc} paused={_paused(st)}")
-            _, rr_b = other.round(it.T5 + timedelta(minutes=15), "up")
-            print(f"    另一策略 magic {it.MAGIC_B} 开仓 → {rr_b.action}")
+        for order in ("executor_first", "reconcile_first"):
+            with tempfile.TemporaryDirectory() as tmp:
+                st = it.LiveStack(Path(tmp), exit_rules=rules)
+                other = it.LiveStack(Path(tmp), magic=it.MAGIC_B)   # 同 live 目录的另一策略
+                st.round(it.T1, "up")
+                ticket = st.broker.positions(it.SYMBOL)[0].ticket
+                st.broker.close_external(ticket, profit=-30.0, comment="[sl]")
+                print(f"  [{label}/{order}] 开仓 → 止损 →（出场后每轮按该顺序调度）")
+                for t, last in ((it.T2, "up"), (it.T3, "flat"), (it.T4, "up"), (it.T5, "up")):
+                    if order == "reconcile_first":
+                        rc, _ = st.reconcile_once()
+                        _, rr = st.round(t, last)
+                    else:
+                        _, rr = st.round(t, last)
+                        rc, _ = st.reconcile_once()
+                    print(f"    {t:%H:%M} 信号={last:<4} 执行器={rr.action:<16} "
+                          f"对账 rc={rc} {_paused(st)}")
+                _, rr_b = other.round(it.T5 + timedelta(minutes=15), "up")
+                print(f"    另一策略 magic {it.MAGIC_B} 开仓 → {rr_b.action}；"
+                      f"{_paused(st, magics=(it.MAGIC, it.MAGIC_B))}")
 
 
 def _round_tr(stack, now, last, tr):

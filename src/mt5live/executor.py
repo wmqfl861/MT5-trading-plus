@@ -151,6 +151,11 @@ class ExecutionAdapter:
         """本 magic 在本品种的全部持仓（LiveExecutor 轮询外部出场用）。"""
         return self._my_positions()
 
+    def pending_orders(self) -> list:
+        """本 magic 在本品种的全部挂单（LiveExecutor 全平完成判据用）。"""
+        return [o for o in self._account.pending_orders(self._symbol)
+                if o.magic == self._magic]
+
     def net_volume(self) -> float:
         """当前净头寸（有符号手数；buy 正 / sell 负）。"""
         return self._net_volume()
@@ -163,6 +168,14 @@ class ExecutionAdapter:
     def close_all(self) -> list[OrderOutcome]:
         """市价平掉本 magic 全部持仓（flatten 指令的执行腿，不过闸门）。"""
         return self._close_all(self._my_positions())
+
+    def flatten_all(self) -> list[OrderOutcome]:
+        """全平指令的完整执行腿（C1/R6）：撤本 magic 全部挂单 + 市价平掉
+        全部持仓。**完成与否不凭本返回值判定**——由 LiveExecutor 重查
+        持仓与挂单均清零后写完成 ack（部分成交残仓 → 下一轮继续）。"""
+        outcomes = self._cancel_stale_pendings()
+        outcomes.extend(self._close_all(self._my_positions()))
+        return outcomes
 
     def _signed_volume(self, positions) -> float:
         total = 0.0
@@ -298,16 +311,26 @@ class ExecutionAdapter:
 # ================================================================ T24 实盘接线
 #
 # LiveExecutor：执行器一侧的全部文件契约与风控接线（计划 T24 逐条；T30 改
-# expected 为"意图"语义；T31 定手数；T32 全平指令编号协议）：
+# expected 为"意图"语义；T31 定手数；T32 全平指令编号协议；R6 补 C1/C2）：
 # - 每轮先查 data/live/commands/flatten.json（mt5live.commands 编号协议，
 #   T32/D21）：本 magic 的 ack 已对应当前指令编号 → 返回 flatten_acked，
-#   不再重复平仓、不下新仓；否则平掉本 magic 全部持仓、写引用编号的
-#   flatten.ack-<magic>（风控进程核对编号后归档并清理 ack）。指令文件
-#   读不出 → 按"有指令"处理（照样全平）并写告警（COMMAND_UNREADABLE）；
-# - 每轮开头识别外部出场（T30/C1）：上一轮已知持仓本轮消失且非执行器平仓
-#   → 按 position_id 查成交，reason ∈ {SL,TP,SO} → 已解释，意图改为实际
-#   净持仓（cause=external_exit:<deal>）；其他原因（人工/未知）→ 不改意图、
-#   写告警，交给对账进程；
+#   不再重复平仓、不下新仓；否则撤掉本 magic 全部挂单、市价平掉全部持仓、
+#   **重查确认持仓与挂单均清零**才写引用编号的 flatten.ack-<magic> 并把
+#   意图改 confirmed(0)（C1/R6：部分成交残仓 → 不写 ack、意图如实=残仓、
+#   写告警，下一轮继续消费同一条指令直到清零；归档因此天然等价"全员真
+#   完成"）；指令文件读不出 → 按"有指令"处理（照样全平）并写告警
+#   （COMMAND_UNREADABLE）；
+# - 每轮开头识别外部出场（T30/C1；C2/R6 状态机化）：上一轮已知持仓本轮
+#   消失且非执行器平仓 → 按 position_id 查成交，reason ∈ {SL,TP,SO} →
+#   已解释，意图改为实际净持仓（cause=external_exit:<deal>）；其他原因
+#   （人工/未知/查无成交/查询失败）→ **持久化为 state-<magic>.json 的
+#   pending_external_exits**（ticket+最后已知量+时间），每轮开头重查这些
+#   ticket 的成交历史（历史延迟可见时持续重试，事件不丢失），不改意图、
+#   写告警（ALERT_EXTERNAL_EXIT），交给对账进程；
+# - 存在未解释外部出场（pending 非空）时**本 magic 停止开新仓**（平仓
+#   照常；action=blocked_external_exit），直到解释成功或 live_ack_external
+#   人工确认（意图 cause=ack_external）——这是闸门 read_pause 之外的
+#   第二道防线（C2/R6：不依赖对账进程稍后写 pause，先于对账运行也生效）；
 # - 开仓/反手的开仓腿先过 RiskGate.check_open（C1）；拒绝 → 不下单，
 #   原因写心跳 last_error（调用方）与 alerts.log（ALERT_RISK_REJECT）；
 #   平仓不受限；
@@ -345,6 +368,8 @@ ALERT_EXTERNAL_EXIT = "EXTERNAL_EXIT"      # 外部出场无法解释：不改�
 ALERT_UNEXPECTED_RESIZE = "UNEXPECTED_RESIZE"   # 持仓期间出现加/减仓腿（T31/D22：
 #   正常轮次不会出现——固定手数配置被人为改动、或仓位被外部改动后差分出
 #   加/减腿时兜底告警，须人工核对）
+ALERT_FLATTEN_RESIDUAL = "FLATTEN_RESIDUAL"     # C1/R6：全平部分成交残仓——
+#   不写完成 ack，下一轮继续平仓直到清零，归档在此之前不发生
 
 # 已解释的外部出场（服务器端保护性出场/强平）：意图可改为实际净持仓
 _EXPLAINED_REASONS = frozenset({DEAL_REASON_SL, DEAL_REASON_TP, DEAL_REASON_SO})
@@ -376,8 +401,8 @@ class RoundReport:
 
     action: str                     # none/flatten/flatten_acked/hold/duplicate/
                                     # open/add/reduce/reverse/close/
-                                    # blocked_reentry/skipped_zero_lots/
-                                    # risk_rejected
+                                    # blocked_reentry/blocked_external_exit/
+                                    # skipped_zero_lots/risk_rejected
     decision_id: str | None
     net_before: float
     net_after: float
@@ -433,8 +458,14 @@ class LiveExecutor:
             return self._consume_flatten(cmd, unreadable=unreadable, n=n)
 
         # 2) 外部出场检测（T30：SL/TP/SO 已解释 → 意图=实际净持仓；
-        #    人工/未知 → 不改意图，交给对账进程）
+        #    人工/未知 → 持久化为未决出场，交给对账进程；C2/R6）
         blocked = self._sync_external_exits(n)
+
+        # 2b) 人工确认（C2/R6）：live_ack_external 已把意图登记为
+        #     confirmed+ack_external → 未决外部出场视为已确认，解除防线
+        if (self._state["pending_external_exits"]
+                and self._external_exit_ack_confirmed()):
+            self._state["pending_external_exits"] = {}
 
         if decision is not None:
             # 3) after_signal_change：信号离开禁入方向 → 解禁
@@ -534,6 +565,39 @@ class LiveExecutor:
         needs_open_leg = (
             net == 0 or net * target < 0 or abs(target) > abs(net))
         if needs_open_leg:
+            # C2/R6 第二道防线：存在未解释的外部出场（pending 非空）→
+            # 本 magic 停止开新仓（平仓照常），直到成交历史解释为
+            # SL/TP/SO 或 live_ack_external 人工确认——不依赖对账进程
+            # 稍后写 pause（先于对账运行也生效）。
+            pending_exits = self._state.get("pending_external_exits") or {}
+            if pending_exits:
+                reason = ("external_exit_pending: 存在未解释的外部出场"
+                          f"（tickets {sorted(pending_exits)}）——本 magic "
+                          "暂停开新仓（平仓不受影响），直到解释为 SL/TP/SO"
+                          " 或 scripts/live_ack_external.py 人工确认")
+                append_alert(
+                    self._live_dir, ALERT_EXTERNAL_EXIT,
+                    f"magic {self._magic} {decision.decision_id}：{reason}", n)
+                if net * target < 0:
+                    # 反向：平仓腿照常（不受限），开仓腿被挡——先平后不开
+                    close_only = replace(decision, signal=0,
+                                         target_position=0,
+                                         volume_lots=0.0)
+                    self._write_pending(0.0, decision.decision_id, n)
+                    try:
+                        report = self._adapter.execute(close_only)
+                    except Exception:
+                        self._write_confirmed(decision.decision_id, n)
+                        raise
+                    return RoundReport(
+                        action="blocked_external_exit",
+                        decision_id=decision.decision_id, net_before=net,
+                        net_after=self._adapter.net_volume(),
+                        orders=tuple(report.orders), error=reason)
+                return RoundReport(
+                    action="blocked_external_exit",
+                    decision_id=decision.decision_id, net_before=net,
+                    net_after=self._adapter.net_volume(), error=reason)
             side = "buy" if target > 0 else "sell"
             leg_lots = (abs(target) if net * target <= 0
                         else abs(target - net))
@@ -610,15 +674,18 @@ class LiveExecutor:
 
     def _consume_flatten(self, cmd, *, unreadable: bool,
                          n: datetime) -> RoundReport:
-        """全平指令的执行腿（T32/D21 编号协议）。
+        """全平指令的执行腿（T32/D21 编号协议；C1/R6 完成判据强化）。
 
         本 magic 的 ack 已对应当前指令编号 → **不再重复平仓**（返回
         flatten_acked，不下新仓——指令归档由风控进程核对编号后完成）；
-        否则市价平掉本 magic 全部持仓并写引用编号的 ack。指令读不出
-        （unreadable=True，告警已在上层写）→ 按"有指令"处理：照常全平，
-        ack 的 id 记空串（无法引用；该文件修复/清理前每轮重复全平告警）。
+        否则撤掉本 magic 全部挂单、市价平掉全部持仓，**重查确认本 magic
+        持仓与挂单均清零**才写完成 ack 并把意图改 confirmed(0)。部分成交
+        留下残仓 → 不写 ack（归档天然失败、指令原地保留）、意图如实记
+        残仓净额并写告警（ALERT_FLATTEN_RESIDUAL）——下一轮继续消费同
+        一条指令，直到清零。指令读不出（unreadable=True，告警已在上层
+        写）→ 按"有指令"处理：照常全平，ack 的 id 记空串（无法引用；
+        该文件修复/清理前每轮重复全平告警）。
         """
-        positions = self._adapter.positions()
         net_before = self._adapter.net_volume()
         cmd_id = cmd.id if cmd is not None else ""
         if not unreadable:
@@ -629,11 +696,27 @@ class LiveExecutor:
                     net_before=net_before, net_after=net_before)
         cause = f"flatten:{cmd_id}" if cmd_id else "flatten"
         self._write_pending(0.0, cause, n)    # 意图：全平在途（T30 cause 衔接）
-        outcomes = self._adapter.close_all()
-        write_ack(self._live_dir, self._magic, cmd_id,
-                  closed=len(positions), now=n)
-        self._state["blocked_dir"] = 0      # 全平后禁入状态清零（无持仓可禁）
-        self._write_confirmed(cause, n)
+        positions = self._adapter.positions()
+        outcomes = self._adapter.flatten_all()
+        # C1/R6：close_all 返回 ≠ 全平完成——重查持仓与挂单，均清零才写
+        # 完成 ack（判据看持仓明细，不凭净额为零或"订单已回"）
+        residual = self._adapter.net_volume()
+        leftover_pendings = self._adapter.pending_orders()
+        if abs(residual) <= _EPS and not leftover_pendings:
+            write_ack(self._live_dir, self._magic, cmd_id,
+                      closed=len(positions), now=n)
+            self._state["blocked_dir"] = 0   # 全平后禁入状态清零（无持仓可禁）
+            self._write_confirmed(cause, n)
+        else:
+            # 残仓（部分成交）/ 撤单失败：不写完成 ack——下一轮继续消费
+            # 同一条指令直到清零；意图如实=当前残仓净额
+            self._write_confirmed(cause, n)
+            append_alert(
+                self._live_dir, ALERT_FLATTEN_RESIDUAL,
+                f"magic {self._magic} 全平指令 {cmd_id or '<读不出>'} 执行后"
+                f"仍有残仓 {residual:+.2f} 手、挂单 {len(leftover_pendings)}"
+                "张（部分成交/撤单失败）——不写完成 ack，下一轮继续平仓"
+                "直到清零；归档在此之前不会发生", n)
         self._finish(n, decision_id=None, orders=outcomes)
         return RoundReport(
             action="flatten", decision_id=None, net_before=net_before,
@@ -658,6 +741,35 @@ class LiveExecutor:
 
     # ---- 外部出场检测与状态持久化 ----
 
+    @staticmethod
+    def _parse_known(v) -> dict:
+        """known_positions 单项：{"dir": ±1, "volume": 手数}（C2/R6 起记
+        最后一次已知量）；兼容旧格式（纯方向整数，volume 缺省 0）。"""
+        if isinstance(v, dict):
+            return {"dir": int(v.get("dir", 0)),
+                    "volume": float(v.get("volume") or 0.0)}
+        return {"dir": int(v), "volume": 0.0}
+
+    @staticmethod
+    def _parse_pending(data) -> dict:
+        """pending_external_exits（C2/R6）：{ticket: {"dir","volume","ts"}}。
+        单项损坏时保留空壳条目（ticket 仍在、防线不撤——fail-closed）；
+        整体不是对象 → 空（等价旧状态文件）。"""
+        out: dict[int, dict] = {}
+        if isinstance(data, dict):
+            for k, v in data.items():
+                try:
+                    ticket = int(k)
+                except (TypeError, ValueError):
+                    continue
+                try:
+                    out[ticket] = {"dir": int(v["dir"]),
+                                   "volume": float(v.get("volume") or 0.0),
+                                   "ts": str(v.get("ts", ""))}
+                except (KeyError, TypeError, ValueError):
+                    out[ticket] = {"dir": 0, "volume": 0.0, "ts": ""}
+        return out
+
     def _load_state(self) -> dict:
         if os.path.exists(self._state_path):
             try:
@@ -665,14 +777,16 @@ class LiveExecutor:
                     data = json.load(f)
                 return {"blocked_dir": int(data.get("blocked_dir", 0)),
                         "known_positions": {
-                            int(k): int(v)
+                            int(k): self._parse_known(v)
                             for k, v in data.get("known_positions",
                                                  {}).items()},
+                        "pending_external_exits": self._parse_pending(
+                            data.get("pending_external_exits")),
                         "last_decision_id": data.get("last_decision_id")}
             except (OSError, ValueError, TypeError):
                 pass    # 状态文件损坏：从零开始（保守：无禁入、无已知持仓）
         return {"blocked_dir": 0, "known_positions": {},
-                "last_decision_id": None}
+                "pending_external_exits": {}, "last_decision_id": None}
 
     def _save_state(self) -> None:
         payload = {
@@ -680,70 +794,108 @@ class LiveExecutor:
             "updated_at_utc": iso_utc(datetime.now(timezone.utc)),
             "blocked_dir": int(self._state["blocked_dir"]),
             "known_positions": {
-                str(k): v for k, v in self._state["known_positions"].items()},
+                str(k): {"dir": int(v["dir"]), "volume": float(v["volume"])}
+                for k, v in self._state["known_positions"].items()},
+            "pending_external_exits": {
+                str(k): dict(v) for k, v in
+                self._state["pending_external_exits"].items()},
             "last_decision_id": self._state.get("last_decision_id"),
         }
         write_json_atomic(self._state_path, payload)   # T33：经 fileio（重试）
 
-    def _current_positions(self) -> dict[int, int]:
-        return {p.ticket: (1 if p.side == "buy" else -1)
+    def _current_positions(self) -> dict[int, dict]:
+        """{ticket: {"dir": ±1, "volume": 手数}}（buy=1/sell=-1；C2/R6 起
+        记最后一次已知量，供未决出场持久化）。"""
+        return {p.ticket: {"dir": 1 if p.side == "buy" else -1,
+                           "volume": float(p.volume)}
                 for p in self._adapter.positions()}
 
-    def _sync_external_exits(self, n: datetime) -> int:
-        """每轮开头：识别外部出场（非执行器平仓——执行器自己的平仓当轮
-        结束即同步 known_positions，两轮之间消失的持仓必然不是执行器平的）。
+    def _explain_exit(self, ticket: int):
+        """按持仓 id 查全部成交，找保护性出场（reason ∈ {SL,TP,SO}）。
 
-        已知持仓消失 → 按 position_id 查该持仓的全部成交（MT5 的
-        position= 查询，跨日也查得到）：
-        - 平仓成交 reason ∈ {SL, TP, SO} → **已解释**（服务器端保护性出场/
-          强平）：意图改为实际净持仓（confirmed，cause=external_exit:<deal>）；
-          after_signal_change 的禁入照旧；
-        - 其他原因（人工 CLIENT / 未知 / 查无成交 / 查询失败）→ **不改意图**、
-          写告警（ALERT_EXTERNAL_EXIT），交给对账进程处理——改了就会把
-          未经确认的漂移"洗白"。
-        多张持仓同时消失时，须**全部**已解释才改意图，否则整体交给对账。
+        返回 (deal, None)（已解释）或 (None, 描述)——查无平仓成交 /
+        查询失败 / reason 不在已解释集合（人工 CLIENT、未知）都算未解释。
+        """
+        try:
+            deals = self._adapter.deals_for_position(ticket)
+        except Exception as exc:   # 查询失败：按未解释处理（fail-closed）
+            return None, f"成交查询失败 {type(exc).__name__}: {exc}"
+        closing = [d for d in deals
+                   if d.entry in _CLOSING_ENTRIES and d.volume > 0]
+        hit = next((d for d in closing if d.reason in _EXPLAINED_REASONS), None)
+        if hit is not None:
+            return hit, None
+        if closing:
+            return None, ("平仓成交 reason=" + ",".join(
+                str(d.reason) for d in closing))
+        return None, "查不到平仓成交"
+
+    def _external_exit_ack_confirmed(self) -> bool:
+        """live_ack_external 的人工确认已落盘（意图 confirmed 且
+        cause=ack_external）→ 未决外部出场视为已确认（C2/R6 解除防线的
+        另一条路，与"解释成功"并列）。"""
+        try:
+            with open(self._intent_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return False
+        return (isinstance(data, dict)
+                and data.get("status") == STATUS_CONFIRMED
+                and data.get("cause") == "ack_external")
+
+    def _sync_external_exits(self, n: datetime) -> int:
+        """每轮开头：外部出场状态机（T30/C1 + C2/R6）。
+
+        - 未决出场（pending_external_exits）每轮开头**重查**成交历史
+          （deals_for_position）——历史延迟可见时持续重试直到解释，事件
+          不因 known_positions 被现值覆盖而丢失（复现 A）；
+        - 本轮消失的已知持仓：reason ∈ {SL,TP,SO} → 已解释；其他（人工
+          CLIENT / 未知 / 查无成交 / 查询失败）→ **持久化为未决出场**
+          （ticket + 最后已知量 + 时间）并写告警，交给对账进程；
+        - 意图改写（confirmed，cause=external_exit:<deals>）只在"本轮有
+          消失或解释成功、且未决队列已清空"时发生——多张同时消失须全部
+          解释，否则整体交给对账（不改意图，防洗白）；
+        - 未决非空 → _plan_and_execute 的开仓防线（C2/R6）挡开仓腿。
         返回当前 blocked_dir。
         """
         known = dict(self._state["known_positions"])
         current = self._current_positions()
-        gone = sorted(set(known) - set(current))
+        pending = dict(self._state["pending_external_exits"])
         blocked = int(self._state["blocked_dir"])
-        if gone:
-            explained: list = []       # (ticket, deal)
-            unexplained: list = []     # (ticket, 描述)
-            for ticket in gone:
-                try:
-                    deals = self._adapter.deals_for_position(ticket)
-                except Exception as exc:   # 查询失败：按未解释处理（fail-closed）
-                    unexplained.append(
-                        (ticket, f"成交查询失败 {type(exc).__name__}: {exc}"))
-                    continue
-                closing = [d for d in deals
-                           if d.entry in _CLOSING_ENTRIES and d.volume > 0]
-                hit = next((d for d in closing
-                            if d.reason in _EXPLAINED_REASONS), None)
-                if hit is not None:
-                    explained.append((ticket, hit))
-                elif closing:
-                    reasons = ",".join(str(d.reason) for d in closing)
-                    unexplained.append((ticket, f"平仓成交 reason={reasons}"))
-                else:
-                    unexplained.append((ticket, "查不到平仓成交"))
-            if not unexplained:
-                cause = "external_exit:" + ",".join(
-                    str(d.ticket) for _, d in explained)
-                self._write_confirmed(cause, n)
-            else:
-                for ticket, why in unexplained:
-                    append_alert(
-                        self._live_dir, ALERT_EXTERNAL_EXIT,
-                        f"magic {self._magic} 持仓 {ticket} 消失且无法解释"
-                        f"（{why}，须 ∈ SL/TP/SO）——不改意图，交给对账进程"
-                        f"（人工核对后 scripts/live_ack_external.py）", n)
+
+        explained_deals: list[str] = []      # 本轮解释成功的 deal ticket
+        # 1) 未决出场重查（成交历史延迟可见 → 持续重查直到解释）
+        for ticket in sorted(pending):
+            hit, _ = self._explain_exit(ticket)
+            if hit is not None:
+                del pending[ticket]
+                explained_deals.append(str(hit.ticket))
+        # 2) 本轮新消失的持仓
+        gone = sorted(set(known) - set(current))
+        for ticket in gone:
+            hit, why = self._explain_exit(ticket)
+            if hit is not None:
+                explained_deals.append(str(hit.ticket))
+                continue
+            pending[ticket] = {
+                "dir": int(known[ticket]["dir"]),
+                "volume": float(known[ticket]["volume"]),
+                "ts": iso_utc(n)}
+            append_alert(
+                self._live_dir, ALERT_EXTERNAL_EXIT,
+                f"magic {self._magic} 持仓 {ticket} 消失且无法解释"
+                f"（{why}，须 ∈ SL/TP/SO）——已记入未决出场（暂停开新仓），"
+                "不改意图，交给对账进程（人工核对后 "
+                "scripts/live_ack_external.py）", n)
+        # 3) 意图：本轮有解释成功且未决已清空 → 意图=实际净持仓
+        if explained_deals and not pending:
+            self._write_confirmed(
+                "external_exit:" + ",".join(sorted(explained_deals)), n)
         if gone and self._rules.reentry == "after_signal_change":
             for ticket in gone:
-                blocked = known[ticket]     # 非执行器平仓 → 禁同向再入（照旧）
+                blocked = known[ticket]["dir"]  # 非执行器平仓 → 禁同向再入（照旧）
         self._state["known_positions"] = current
+        self._state["pending_external_exits"] = pending
         self._state["blocked_dir"] = blocked
         return blocked
 

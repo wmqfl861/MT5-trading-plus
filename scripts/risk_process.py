@@ -16,9 +16,11 @@
 用法：
     .venv/Scripts/python.exe scripts/risk_process.py --config config/risk.toml --once
     .venv/Scripts/python.exe scripts/risk_process.py --config config/risk.toml --loop --interval 10
-    # 影子盘（T34）：账户快照读 paper 状态文件，不连真实终端
+    # 影子盘（T34）：账户快照读 paper 状态（目录=聚合全部 state-<magic>.json，
+    # 每轮重读——多运行器并行、常驻风控看到最新成交与浮盈；R6/C3），
+    # 不连真实终端；也可传单个状态文件（单策略兼容）
     .venv/Scripts/python.exe scripts/risk_process.py --config config/risk.toml --once \
-        --paper-state data/live/paper/state.json
+        --paper-state data/live/paper
 """
 from __future__ import annotations
 
@@ -58,7 +60,8 @@ def build_snapshot(gw, now: datetime) -> AccountSnapshot:
     """轮询账户：状态 + 全部持仓 + 当日（UTC 00:00 起）全部成交流水。
 
     gw 是"带 account 的网关对象"：真终端 MT5Gateway，或 T34 影子盘的
-    PaperStateGateway（--paper-state，读 paper 状态文件、不碰真实账户）。
+    PaperStateGateway（--paper-state：paper 目录聚合全部 state-<magic>.json
+    或单状态文件，每查询重读——R6/C3、不碰真实账户）。
     """
     state = gw.account.state()
     if state.currency != "USD":
@@ -90,8 +93,9 @@ def main(argv=None) -> int:
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--gw-config", default="config.json", help="网关配置 JSON")
     ap.add_argument("--paper-state", default=None,
-                    help="影子券商状态文件（T34）：账户快照读它而非真实终端"
-                         "（--paper 运行器的 data/live/paper/state.json）；"
+                    help="影子券商状态（T34/R6）：paper 目录（每轮聚合读全部"
+                         " state-<magic>.json——多运行器并行）或单个状态文件"
+                         "（单策略兼容）；账户快照读它而非真实终端，"
                          "给了就不连网关")
     ap.add_argument("--once", action="store_true", help="单轮后退出（默认行为）")
     ap.add_argument("--loop", action="store_true", help="常驻轮询")
@@ -112,9 +116,11 @@ def main(argv=None) -> int:
     try:
         if args.paper_state:
             try:
-                gw = PaperStateGateway(args.paper_state)
+                # alert_dir：影子状态读失败（按空处理）时同步落 alerts.log
+                gw = PaperStateGateway(args.paper_state,
+                                       alert_dir=risk.live_dir)
             except DataUnavailableError as e:
-                print(f"× 影子状态文件不可用：{e}")
+                print(f"× 影子状态不可用：{e}")
                 return 2
         else:
             gw = _open_gateway(args.gw_config)

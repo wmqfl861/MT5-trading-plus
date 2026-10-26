@@ -53,26 +53,40 @@ class FakeBroker:
     T24 扩展：账户状态（state/deals，权益=余额+浮动）、成交流水记账、
     外部平仓 close_external（模拟 SL/TP 触发）、终端 bar 缓存（bars/set_bars，
     供 TerminalBarsSource 按 mt5gw.market.MarketData.bars 签名取数）。
+
+    R6（I8 假件补强，不再为场景特制桩）：
+    - partial_fill：0<ratio<1 的成交比例——market_order 与 close_position
+      都按比例成交（DONE_PARTIAL，retcode 10010），驱动"全平只平掉一半"
+      的残仓场景（C1）；
+    - deals_delay_polls：成交历史延迟可见——一笔成交在记录后需再经 N 次
+      deals_for_position 查询才进入可见历史，驱动"历史延迟两轮才解释"
+      的外部出场状态机场景（C2 复现 A）。
     """
 
     def __init__(self, symbol: str = "XAUUSD", *, bid: float = 100.0,
                  ask: float = 100.2, fill_price: float | None = None,
                  partial_volume: float | None = None,
+                 partial_fill: float | None = None,
                  error_on_market_order=None,
-                 balance: float = 10_000.0, contract_size: float = 100.0):
+                 balance: float = 10_000.0, contract_size: float = 100.0,
+                 deals_delay_polls: int = 0):
         self.symbol = symbol
         self.bid = bid
         self.ask = ask
         self.fill_price = fill_price        # None → buy 按 ask、sell 按 bid 成交
-        self.partial_volume = partial_volume        # 非 None → DONE_PARTIAL
+        self.partial_volume = partial_volume        # 非 None → DONE_PARTIAL（绝对量）
+        self.partial_fill = partial_fill    # 非 None → 按比例成交（优先于上者）
         self.error_on_market_order = error_on_market_order  # 非 None → 抛该异常
         self.balance = balance                      # 账户余额（USD）
         self.contract_size = contract_size          # 平仓盈亏换算用
+        self.deals_delay_polls = deals_delay_polls  # 成交 N 次查询后才可见（I8）
         self.quote_time: datetime | None = None     # None → 报价时刻恒为 _T0
         self._next_ticket = 5001
         self._positions: list[Position] = []
         self._pending: list[PendingOrder] = []
         self._deals: list[Deal] = []
+        self._deal_visible_at: list[int] = []   # 与 _deals 对齐：可见的查询序号
+        self._deal_polls = 0                    # deals_for_position 累计调用数
         self._bars: dict[tuple[str, str], list[Bar]] = {}
         self.actions: list[tuple] = []      # 全局时序（断言"先平后开"等）
         self.market_orders: list[dict] = []
@@ -103,11 +117,17 @@ class FakeBroker:
             ticket += 1
         return ticket
 
+    def _append_deal(self, deal: Deal) -> None:
+        """记账一笔成交（I8/R6：含"延迟可见"水位——记录后第 N 次查询可见）。"""
+        self._deals.append(deal)
+        self._deal_visible_at.append(
+            self._deal_polls + self.deals_delay_polls + 1)
+
     def _record_deal(self, *, entry: str, side: str, volume: float, price: float,
                      profit: float, comment: str, magic: int,
                      position_id: int = 0, reason: int | None = None,
                      time: datetime | None = None) -> None:
-        self._deals.append(Deal(
+        self._append_deal(Deal(
             ticket=self._next_deal_ticket(), order=0, position_id=position_id,
             symbol=self.symbol, side=side, entry=entry, volume=volume,
             price=price, profit=profit, commission=0.0, swap=0.0, fee=0.0,
@@ -118,8 +138,16 @@ class FakeBroker:
 
     def deals_for_position(self, position_id: int) -> list[Deal]:
         """按持仓 id 查全部成交（对齐 AccountService.deals_for_position；
-        T30 外部出场识别用——不看时间窗，跨"日"也找得到）。"""
-        return [d for d in self._deals if d.position_id == position_id]
+        T30 外部出场识别用——不看时间窗，跨"日"也找得到）。
+
+        I8/R6：deals_delay_polls>0 时模拟"成交历史延迟可见"——一笔成交
+        记录后需再经 N 次**本查询**（每调用一次计一次）才进入可见历史；
+        deals(since, to)（日亏等全量流水）不受延迟影响。
+        """
+        self._deal_polls += 1
+        return [d for d, visible_at in zip(self._deals, self._deal_visible_at)
+                if d.position_id == position_id
+                and self._deal_polls >= visible_at]
 
     def seed_deal(self, *, profit: float = 0.0, magic: int,
                   entry: str = "out", time: datetime | None = None,
@@ -130,7 +158,7 @@ class FakeBroker:
             symbol=symbol or self.symbol, side="buy", entry=entry,
             volume=volume, price=100.0, profit=profit, commission=0.0,
             swap=0.0, fee=0.0, time=time or _T0, comment="seed", magic=magic)
-        self._deals.append(d)
+        self._append_deal(d)
         return d
 
     def close_external(self, ticket: int, *, profit: float = 0.0,
@@ -232,8 +260,12 @@ class FakeBroker:
             raise self.error_on_market_order
         fill = (self.fill_price if self.fill_price is not None
                 else (self.ask if side == "buy" else self.bid))
-        partial = self.partial_volume is not None
-        filled_vol = self.partial_volume if partial else volume
+        if self.partial_fill is not None:        # I8/R6：按比例成交
+            filled_vol = round(volume * float(self.partial_fill), 8)
+            partial = filled_vol < volume - 1e-9
+        else:
+            partial = self.partial_volume is not None
+            filled_vol = self.partial_volume if partial else volume
         ticket = self._next_ticket
         self._next_ticket += 1
         self._positions.append(Position(
@@ -255,26 +287,35 @@ class FakeBroker:
         vol = pos.volume if volume is None else volume
         if vol > pos.volume + 1e-9:
             raise ValueError(f"请求平仓 {vol} 手超出持仓余量 {pos.volume} 手")
+        if (self.partial_fill is not None
+                and vol * float(self.partial_fill) < vol - 1e-9):
+            # I8/R6：平仓腿按比例成交（驱动 C1"全平只平掉一半"残仓场景）
+            filled = round(vol * float(self.partial_fill), 8)
+            partial = True
+        else:
+            filled, partial = vol, False
         self.close_calls.append((ticket, vol))
         self.actions.append(("close", ticket, vol))
-        remaining = round(pos.volume - vol, 8)
+        remaining = round(pos.volume - filled, 8)
         if remaining > 1e-9:
             self._replace_position(dataclasses.replace(pos, volume=remaining))
         else:
             self._positions = [p for p in self._positions if p.ticket != ticket]
         exit_price = self.bid if pos.side == "buy" else self.ask
         direction = 1.0 if pos.side == "buy" else -1.0
-        profit = (exit_price - pos.price_open) * direction * vol * self.contract_size
+        profit = ((exit_price - pos.price_open) * direction * filled
+                  * self.contract_size)
         self.balance += profit
         self._record_deal(entry="out",
                           side="sell" if pos.side == "buy" else "buy",
-                          volume=vol, price=exit_price, profit=profit,
+                          volume=filled, price=exit_price, profit=profit,
                           comment="close", magic=pos.magic,
                           position_id=pos.ticket, reason=DEAL_REASON_EXPERT)
         return OrderResult(
-            ok=True, filled=True, partial=False, retcode=10009, comment="close",
+            ok=True, filled=True, partial=partial,
+            retcode=10010 if partial else 10009, comment="close",
             order_ticket=ticket, deal_ticket=ticket, deal_price=exit_price,
-            requested_volume=vol, volume=vol)
+            requested_volume=vol, volume=filled)
 
     def modify_position(self, ticket: int, *, sl: float | None = None,
                         tp: float | None = None) -> OrderResult:

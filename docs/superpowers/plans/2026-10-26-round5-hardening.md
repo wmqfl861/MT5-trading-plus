@@ -113,10 +113,10 @@
 - 删除"由计划任务平仓"这句提示，或真的加上平仓计划任务——二选一，按实际写。
 
 **失败测试先行：**
-- [ ] 2026-07-15 22:30 UTC 与 2026-07-16 01:30 UTC 的 EURUSD 允许开仓（探针 P11 反转）；
-- [ ] 扩展窗 > 3 小时且无 `allow_long_window` → 拒绝加载；
-- [ ] `measure_rollover` 在合成 K 线上（构造 21:00 与 22:00 两种空档）判定正确；
-- [ ] `watch_swap` 在 FakeBroker 上：swap 字段在 21:00 变化 → 记录 1 行，时刻正确。
+- [x] 2026-07-15 22:30 UTC 与 2026-07-16 01:30 UTC 的 EURUSD 允许开仓（探针 P11 反转）——`tests/test_mt5data_sessions.py::test_repo_policy_p11_reversal_eurusd`（提交 dd42fea）；全季节复核证据另见 rollover-dst §3.2.1（第六轮 I7，302,947 个分钟首笔样本）
+- [x] 扩展窗 > 3 小时且无 `allow_long_window` → 拒绝加载——`test_mt5data_sessions.py::test_extended_window_over_3h_rejected_without_flag`、`::test_load_policy_rejects_long_window_and_reads_flag`（dd42fea）
+- [x] `measure_rollover` 在合成 K 线上（构造 21:00 与 22:00 两种空档）判定正确——`tests/test_measure_rollover.py::test_judge_follows_new_york_on_synthetic_bars`、`::test_judge_follows_europe_on_synthetic_bars`、`::test_lockbox_window_skipped_without_ops_ack`（dd42fea）
+- [x] `watch_swap` 在 FakeBroker 上：swap 字段在 21:00 变化 → 记录 1 行，时刻正确——`tests/test_watch_swap.py::test_swap_change_at_2100_records_exactly_one_row`、`::test_state_persists_across_watcher_instances`（dd42fea）
 
 **报告：** `rollover-dst` 第 3 节写历史判定表与本周 swap 计费时刻，第 4 节写过夜实测费率与快照推算的对比。结论与 `SwapRule`、`sessions.toml` 不一致时，停下来报告用户。
 
@@ -166,12 +166,15 @@ def write_pause(live_dir: str, magic: int, *, paused: bool, reason: str | None,
 6. **人工确认**：`live_ack_external.py --magic N --reason "..."` 把当前实际持仓登记为意图（`cause=ack_external`，写日志），用于人工平仓后恢复交易。
 
 **失败测试先行（集成，LiveStack + 对账进程一起跑）：**
-- [ ] 止损出场（reason=SL）后对账一致、无暂停；`immediate` 下一根照常重开，`after_signal_change` 下禁止重入（探针 P8 反转）
-- [ ] 止盈出场（reason=TP）同上
-- [ ] 人工平仓（reason=CLIENT）→ 只写 `pause-<本magic>.json`；另一 magic 照常开仓；`live_ack_external` 之后恢复
-- [ ] 对账进程恰好在"pending 已写、订单未回"时运行（在 FakeBroker 下单钩子里调用对账）→ 不暂停
-- [ ] 部分成交 → 意图 = 成交量，有告警；下一轮补足
-- [ ] 旧格式 `expected-*.json` 能读（兼容），写出的都是新格式
+- [x] 止损出场（reason=SL）后对账一致、无暂停；`immediate` 下一根照常重开，`after_signal_change` 下禁止重入（探针 P8 反转）——`tests/test_mt5live_integration.py::test_t30_sl_exit_reconcile_consistent_no_pause`、`::test_t30_sl_exit_transient_pause_auto_releases`、`::test_immediate_reentry_reopens_after_stop`、`::test_scenario_9_after_signal_change`（提交 890838b）
+- [x] 止盈出场（reason=TP）同上——`test_mt5live_integration.py::test_t30_tp_exit_reconcile_consistent_no_pause`（890838b）
+- [x] 人工平仓（reason=CLIENT）→ 只写 `pause-<本magic>.json`；另一 magic 照常开仓；`live_ack_external` 之后恢复——`test_mt5live_integration.py::test_t30_manual_close_pauses_only_this_magic_until_acked`（890838b）
+- [x] 对账进程恰好在"pending 已写、订单未回"时运行（在 FakeBroker 下单钩子里调用对账）→ 不暂停——`test_mt5live_integration.py::test_t30_reconcile_in_pending_window_does_not_pause`（890838b）
+- [x] 部分成交 → 意图 = 成交量，有告警；下一轮补足——`test_mt5live_integration.py::test_t30_partial_fill_intent_is_filled_volume_with_alert`（890838b）
+- [x] 旧格式 `expected-*.json` 能读（兼容），写出的都是新格式——`test_mt5live_integration.py::test_t30_legacy_expected_format_readable_new_writes_new_format`（890838b）
+
+> 第六轮审核注记（R6）：上述正常路径全绿，但成交历史延迟/查询失败、执行器先于
+> 对账的人工出场竞态仍未闭环（R6-C2），探针 P8 已按双调度顺序改写复核。
 
 ## T31：实盘只在开仓时定手数（C2，决策 D22）
 
@@ -188,12 +191,12 @@ def _target_volume(self, decision, net: float) -> float:
     return decision.signal * lots if lots > 0 else 0.0
 ```
 
-- [ ] 失败测试先行：
-  - 6 根 bar 的 ATR 依次为 2.0/2.4/1.8/2.6/2.0/1.7、信号恒为 +1 → 市价单 1 笔、平仓 0 笔、持仓 1 张（探针 P9 反转）；
-  - 反手 → 平仓后按当时 ATR 与权益重新定手数；
-  - 止损后再入场 → 重新定手数；
-  - 固定 `volume_lots` 的配置行为不变。
-- [ ] 执行器文档写明：持仓期间不调仓；加仓、减仓只会在固定手数配置被人为改动后出现，并写告警。
+- [x] 失败测试先行：
+  - 6 根 bar 的 ATR 依次为 2.0/2.4/1.8/2.6/2.0/1.7、信号恒为 +1 → 市价单 1 笔、平仓 0 笔、持仓 1 张（探针 P9 反转）——`tests/test_mt5live_integration.py::test_t31_no_resize_while_holding_atr_changes`（提交 add348c）
+  - 反手 → 平仓后按当时 ATR 与权益重新定手数——`test_mt5live_integration.py::test_t31_reverse_resizes_at_current_atr_and_equity`、`tests/test_mt5live_executor.py::test_t31_reverse_resizes_fresh_lots`（add348c）
+  - 止损后再入场 → 重新定手数——`test_mt5live_integration.py::test_t31_reentry_after_stop_resizes_fresh`（add348c）
+  - 固定 `volume_lots` 的配置行为不变——`test_mt5live_integration.py::test_t31_fixed_volume_lots_behavior_unchanged`、`tests/test_mt5live_executor.py::test_t31_fixed_lots_config_change_does_not_resize`（add348c）
+- [x] 执行器文档写明：持仓期间不调仓；加仓、减仓只会在固定手数配置被人为改动后出现，并写告警——`src/mt5live/executor.py` 模块与 `_target_volume` docstring（"只在开仓时定手数，持仓期间不调仓"）+ 意外调仓 tripwire 告警路径（executor.py:593"正常轮次不应加减仓"）；行为由上两条测试钉死（add348c）
 
 ## T32：全平指令编号协议（C3，决策 D21）
 
@@ -218,11 +221,14 @@ def archive_if_all_acked(live_dir: str, magics: set[int], now: datetime) -> bool
 
 - **执行器**：本 magic 的 ack 已对应当前指令 id → 不再重复平仓（返回 `flatten_acked`，不下新仓）。否则全平并写 ack。
 - **`live_retire.py --magic N`**：确认该 magic 无持仓后，移走它的 heartbeat、expected、state 文件（归档），使它不再算作登记策略。
-- [ ] 失败测试先行：
-  - 第一次全平 → 归档 → 解除停机 → 第二次日亏 → 执行器再次全平（探针 P10 反转）；
-  - 旧 id 的 ack 不触发归档；
-  - 闸门触发的全平走同一协议；
-  - 指令文件损坏 → 执行器按"有指令"处理（全平），并告警。
+- [x] 失败测试先行：
+  - 第一次全平 → 归档 → 解除停机 → 第二次日亏 → 执行器再次全平（探针 P10 反转）——`tests/test_mt5live_integration.py::test_t32_second_flatten_command_executes_after_archive`（提交 add348c）
+  - 旧 id 的 ack 不触发归档——`tests/test_mt5live_riskproc.py::test_archive_requires_all_acks_to_match_current_id`（add348c）
+  - 闸门触发的全平走同一协议——`test_mt5live_integration.py::test_t32_gate_triggered_flatten_uses_numbered_protocol`（add348c）
+  - 指令文件损坏 → 执行器按"有指令"处理（全平），并告警——`test_mt5live_integration.py::test_t32_unreadable_flatten_command_treated_as_present`、`tests/test_mt5live_riskproc.py::test_riskproc_unreadable_flatten_not_archived_with_alert`（add348c）
+
+> 第六轮审核注记（R6）：正常全平路径已反转，但**全平部分成交仍写完成 ack**
+> （R6-C1，残余仓位被跳过）、`write_flatten` 多写者竞态（R6-I1）在修。
 
 ## T33：跨进程文件契约（M1、M2、M8、L3）
 
@@ -233,11 +239,14 @@ def archive_if_all_acked(live_dir: str, magics: set[int], now: datetime) -> bool
 - **停机类文件 fail-closed**：`read_pause` 读不出 → 暂停（原因 `pause_unreadable`），并告警。
 - **下单日志分文件**：改为 `orders-<magic>.jsonl`，闸门读全部 `orders-*.jsonl`（兼容旧 `orders.jsonl`）。坏行按"此刻的一笔下单"计入频率（保守），写告警，不阻断其他策略。
 - **点差模型缺失**：实盘找不到点差模型文件时拒绝启动，除非显式 `--no-spread-gate`（启动日志标红）。
-- [ ] 失败测试先行：
-  - monkeypatch `os.replace` 前两次抛 PermissionError → 心跳写入成功、运行器不退出；
-  - pause 文件损坏 → 拒绝开仓并给出原因；
-  - 另一策略的下单日志有坏行 → 本策略闸门照常裁决，且频率计数多计 1；
-  - 无点差模型且未给 `--no-spread-gate` → 启动失败。
+- [x] 失败测试先行：
+  - monkeypatch `os.replace` 前两次抛 PermissionError → 心跳写入成功、运行器不退出——`tests/test_mt5live_fileio.py::test_write_json_atomic_retries_transient_permission_error`、`tests/test_mt5live_integration.py::test_runner_once_survives_persistent_heartbeat_write_failure`（提交 84a74d5）
+  - pause 文件损坏 → 拒绝开仓并给出原因——`tests/test_mt5live_gate.py::test_corrupt_magic_pause_rejects_open_fail_closed`、`::test_corrupt_global_pause_rejects_open_fail_closed`（84a74d5）
+  - 另一策略的下单日志有坏行 → 本策略闸门照常裁决，且频率计数多计 1——`tests/test_mt5live_gate.py::test_bad_line_in_other_strategy_log_counts_one_now`（84a74d5）
+  - 无点差模型且未给 `--no-spread-gate` → 启动失败——`tests/test_mt5live_integration.py::test_live_runner_refuses_start_without_spread_model`、`::test_live_runner_no_spread_gate_flag_warns_red_and_proceeds`（84a74d5）
+
+> 第六轮审核注记（R6）：原子替换仍是固定 `.tmp` 名 + `write_flatten` 先读后建，
+> 多写者竞态在修（R6-I1）；实盘默认点差文件与 `SpreadModel.load` 不兼容（R6-I5）。
 
 ## T34：影子券商 + 1 个交易日影子盘（M3，决策 D26）
 
@@ -256,8 +265,8 @@ class PaperBroker:
 - **验收**：
   - 1 个交易日，2 个策略（一个 `immediate`、一个 `after_signal_change`，M5 或 M15，确保有止损/止盈出场）；
   - 期间演练 killSwitch，以及用测试风控配置把日亏上限调低、连续触发两次全平。
-- [ ] 失败测试先行：PaperBroker 的 SL/TP 触发口径与引擎一致（多头按 Bid、空头按 Ask）；状态文件重启可恢复。
-- [ ] 影子盘报告（脱敏）：决策数、订单数（应 = 入场 + 出场）、保护性出场数、暂停次数（无法解释的应为 0）、全平两次是否都执行、心跳与告警摘要。
+- [x] 失败测试先行：PaperBroker 的 SL/TP 触发口径与引擎一致（多头按 Bid、空头按 Ask）；状态文件重启可恢复——`tests/test_mt5live_paper.py::test_long_sl_triggers_on_bid_not_ask`、`::test_short_sl_triggers_on_ask_not_bid`、`::test_state_restart_recovers_positions_balance_and_deals`、`::test_paper_sl_exit_recognized_as_external_exit_after_restart`；影子一条龙 `tests/test_mt5live_integration.py::test_t34_shadow_full_chain_decision_to_flatten`、`::test_t34_shadow_protective_exit_explained_in_chain`、`::test_t34_paper_dry_run_offline_end_to_end`、`::test_t34_live_runner_paper_mode_wires_full_stack`（提交 a0e496d，影子/offline 端到端 28 测试）
+- [ ] 影子盘报告（脱敏）：决策数、订单数（应 = 入场 + 出场）、保护性出场数、暂停次数（无法解释的应为 0）、全平两次是否都执行、心跳与告警摘要——**未验收：修复 R6-C3（影子账本多写者同票号/互相覆盖、PaperAccountView 启动快照不刷新、浮盈不落盘）后重做**；组件测试全绿不能替代一天双策略真机影子盘。
 
 ## T36：成本模型补强 + 基线 v3（H2、M7，决策 D29）
 
@@ -275,11 +284,17 @@ class PaperBroker:
 4. **早年成本敏感性**：G2 的成本放大检查同时报告"2020 年以前点差 ×1.5"这一情形（只报告，不改门槛）。
 5. **重跑**：六张基线卡在新成本模型下重跑 screen 与 G0–G1（过 G1 的继续跑 G2–G4），写 `gates-calibration-v3`，与 v2 逐项对比并归因。
 
-- [ ] 失败测试先行：
-  - 合成 tick 上 `bar_open_m1` 采样结果与手算一致；
-  - `n_days` 不足 → 缺统计；
-  - 越幅只加在 `stop`；
-  - 流式构建与一次性构建结果一致（同一数据）。
+- [x] 失败测试先行：
+  - 合成 tick 上 `bar_open_m1` 采样结果与手算一致——`tests/test_costs_spread.py::test_bar_open_m1_sampling_matches_hand_computation`（提交 e8f0af0）
+  - `n_days` 不足 → 缺统计——`tests/test_costs_spread.py::test_n_days_counts_distinct_ny_dates_per_hour`、`::test_insufficient_n_days_is_missing_stats`（e8f0af0）
+  - 越幅只加在 `stop`——`tests/test_backtest_engine_a.py::test_stop_overshoot_added_to_long_stop_exit_only`、`::test_stop_overshoot_not_added_to_take_profit_or_gap_or_signal`（e8f0af0）
+  - 流式构建与一次性构建结果一致（同一数据）——`tests/test_costs_spread.py::test_builder_streaming_equals_one_shot`、`tests/test_costs_overshoot.py::test_reservoir_streaming_equals_one_shot`（e8f0af0）
+
+> 第六轮审核注记（R6）：模型已建，但 `build_costs()` 未把越幅表注入 `Costs`
+> （R6-C4 越幅接线修复中）——正式回测 `stop_overshoot()` 仍返回零，v3 基线待
+> 接线修复后重跑；`entry_policy_for` 未贯通 `min_days_per_hour`；越幅口径系
+> 相邻跳动代理（R6-I3）；回补覆盖见 costs-v3 §1（2026-01-02..10-23，10 月
+> 欧洲先切窗不含）。
 
 ## T37：代码指纹 + 台账哈希链（H3、M6，决策 D23、D27）
 
@@ -303,12 +318,17 @@ def verify_chain(self) -> list[str]        # 返回断链或篡改的行；空�
   - `bt ledger verify` 校验整条链；
   - `ledger_anchor.py` 把链头写进 `docs/research/ledger-anchors.md`，由管理员每日提交（计划任务）。
 - **旧库迁移**：旧行补 `strategy_sha = "legacy"`，并从第一行起重建哈希链。迁移本身记一行 `actor=migration`。
-- [ ] 失败测试先行：
-  - 改策略代码后用同参数重跑，N 加 1；
-  - 首跑后改代码 → 同卡版本拒绝运行；
-  - 策略文件未提交 → 拒绝运行；
-  - 手工改一行台账 → `verify` 报出该行；
-  - 删一行 → 报出断链。
+- [x] 失败测试先行：
+  - 改策略代码后用同参数重跑，N 加 1——`tests/test_research_ledger.py::test_dedup_n_includes_strategy_sha`（提交 bdaeebf）
+  - 首跑后改代码 → 同卡版本拒绝运行——`tests/test_research_bt_script.py::test_screen_refuses_changed_sha_same_card_version`（bdaeebf）
+  - 策略文件未提交 → 拒绝运行——`tests/test_research_cards.py::test_ensure_strategy_clean_uncommitted_rejected`、`tests/test_research_bt_script.py::test_screen_rejects_uncommitted_strategy`（bdaeebf）
+  - 手工改一行台账 → `verify` 报出该行——`tests/test_research_ledger.py::test_manual_row_edit_detected_by_verify`（bdaeebf）
+  - 删一行 → 报出断链——`tests/test_research_ledger.py::test_deleted_row_reported_as_chain_break`（bdaeebf）
+- 生产迁移与首次锚定：提交 c89cc26（185 行 legacy+迁移行，三链完好；`test_migration_on_copy_of_production_ledger` 先行验证）。
+
+> 第六轮审核注记（R6）：哈希链会被正常写入重新封链、删尾/删锁箱行不报警、
+> 锚未验证历史前缀（R6-C5 台账防洗链修复中）；`cost_model_version` 不含缓存
+> 内容哈希（R6-I2）。
 
 ## T38：研究隔离落地（H4，决策 D24、D25）
 
@@ -320,10 +340,16 @@ def verify_chain(self) -> list[str]        # 返回断链或篡改的行；空�
   - G5 路径要求 `--main-store`，并且已获批准。
 - **CI 路径白名单**：对 `research/**` 分支发起的 PR，`research-allowlist.yml` 用 `git diff --name-status origin/main...HEAD` 按研究角色规则检查，违规即失败。规则与本地钩子同一份代码。
 - **用户侧清单**：`permissions.md` 写清楚 ACL 命令、研究账户的运行方式、分支保护的设置步骤（见 U0）。
-- [ ] 失败测试先行：
-  - 不带参数时数据根为 `data_research`；
-  - 读 `data/` 而不带 `--main-store` → 报错；
-  - CI 检查函数对"修改旧卡、改 bt.py、改钩子本身"三种情形报违规，对新增卡与策略库修改放行。
+- [x] 失败测试先行：
+  - 不带参数时数据根为 `data_research`——`tests/test_research_bt_script.py::test_screen_default_reads_research_store`（提交 ab518cc）
+  - 读 `data/` 而不带 `--main-store` → 报错——`test_research_bt_script.py::test_screen_main_store_requires_explicit_flag`、`::test_screen_research_store_switch`（ab518cc）
+  - CI 检查函数对"修改旧卡、改 bt.py、改钩子本身"三种情形报违规，对新增卡与策略库修改放行——`tests/test_p6_docs.py::test_hook_check_paths_function`、`::test_hook_check_paths_same_rules_as_check_staged`、`::test_research_allowlist_workflow_wired`（ab518cc）
+
+> 第六轮审核注记（R6，I4 已修）：workflow 原从 PR checkout 装载检查器（PR 可
+> 同时改钩子自通过），已改双 checkout——检查器装载自 main 基准
+> `baseline/scripts/hooks/pre-commit-readonly-paths`，由
+> `tests/test_p6_docs.py::test_research_allowlist_workflow_loads_checker_from_main_baseline`
+> 用本地双目录模拟钉死；`--ops-ack` 仍可产生正式研究结果（R6-C6 在修）。
 
 ## T39：关卡标定收尾（T22、M4、M5）
 
@@ -339,10 +365,11 @@ def verify_chain(self) -> list[str]        # 返回断链或篡改的行；空�
 - **G5**：用与锁箱等长的合成窗口，量化 G5 的检出率与误报率。
 - **合并评估变体**：多品种合计交易数、同时要求每个品种为正（蓝图 §6 的提议）；只出数据，不改门槛。
 - **决策规则**（写进报告）：真实夏普 1.0 时某道关卡检出率 < 50%，或负对照误报率 > 5% → 提出门槛调整，经用户确认后修改 `gates.toml` 并重新冻结。
-- [ ] 失败测试先行：
-  - `slot_permute_bars` 保持每个槽位的收益多重集不变；
-  - 种子相同 → 结果逐位一致；
-  - 在植入"日内第 k 根 bar 漂移"的数据上，置换后漂移消失。
+- [x] 失败测试先行：
+  - `slot_permute_bars` 保持每个槽位的收益多重集不变——`tests/test_validation_synthetic.py::test_slot_permute_preserves_slot_return_multiset`、`::test_slot_permute_preserves_multiset_across_dst_switch`（提交 61829b2）
+  - 种子相同 → 结果逐位一致——`tests/test_validation_synthetic.py::test_slot_permute_seed_reproducible`（61829b2）
+  - 在植入"日内第 k 根 bar 漂移"的数据上，置换后漂移消失——`tests/test_validation_synthetic.py::test_slot_permute_destroys_planted_intraday_drift`（61829b2）
+- [ ] 正式标定实验（正/负对照 + G5 判别力，`docs/research/gate-power-<日期>.md`）——**未验收：修复 R6-C8（分片合并器与真实产物 schema 不兼容、G5 误报率错误合并、正对照检出率漏报）后重做**；探针 P12 亦示 G5 判别力（p5≈-1.37）仍不足以拦温和失效，报告不可缺席。
 
 ## T40：A/B 对账口径收紧（H6，铁律第 14 条）
 
@@ -353,17 +380,18 @@ def verify_chain(self) -> list[str]        # 返回断链或篡改的行；空�
   - **保护性出场**：B 层成交 tick = 按正确一侧（多头 Bid、空头 Ask）第一笔穿过价位的 tick；A 层 = 价位（跳空时为开盘价）；
   - **净利差拆解**：拆成"模型点差 vs 实际点差""止损越幅（T36）""其余"三项。"其余"> 1 个点差的行判为违规。
 - 用 T36 的成本模型重跑四组对账，写 v3 报告。
-- [ ] 失败测试先行：
-  - 人为把 B 层空头止损改成按 Bid 触发 → 被判违规（旧的 1R 容差测不出来）；
-  - 静默边界的行不判违规。
+- [x] 失败测试先行：
+  - 人为把 B 层空头止损改成按 Bid 触发 → 被判违规（旧的 1R 容差测不出来）——`tests/test_reconcile_ab.py::test_short_stop_bid_trigger_flagged_old_1r_tolerance_missed_it`、`::test_default_tolerances_match_plan`（提交 2a97a00）
+  - 静默边界的行不判违规——`tests/test_reconcile_ab.py::test_silent_boundary_entry_not_a_violation`、`::test_signal_exit_silent_boundary_not_a_violation`（2a97a00）
+- [ ] 用 T36 的成本模型重跑四组对账，写 v3 报告——**未验收：修复 R6-C4（越幅模型未接入正式回测/成本契约）与 R6-I6（对账以毫秒代 tick 身份，同毫秒多笔误判）后重做**；机制核对框架本身已落地（上两条测试）。
 
 ## T41：流程与文档（H6、L1–L4）
 
-- [ ] **补证据**：第四轮计划 T21、T22、T24、T25、T26、T27、T29 的复选框逐条补证据（测试名、报告路径），没有证据的不勾并注明原因。
-- [ ] **修正报告笔误**：对账 v2 报告把 `missNY[17]` 误写成"缺 17 个纽约小时"（L1），改为"缺纽约 17 点这一小时"。
-- [ ] **写明口径**：在文档里写明"日亏按 UTC 自然日"（L2）与"G3 测试窗收益含预热段持仓的浮动"（L4）。
-- [ ] **CI 纪律**：每次推送后用 `gh run watch` 或 Actions 页面确认结果；红了先修，修好之前不推新功能。
-- [ ] **探针复跑**：每完成一个阶段，更新蓝图 §2 现状表（四级证据如实填写），并重跑探针脚本，把输出贴进提交说明。
+- [x] **补证据**：第四轮计划 T21、T22、T24、T25、T26、T27、T29 的复选框逐条补证据（测试名、报告路径），没有证据的不勾并注明原因——提交 eb913cc（T24 干跑/T22 报告/T26 测试器与影子/T27 缺省切换四处如实不勾）。
+- [x] **修正报告笔误**：对账 v2 报告把 `missNY[17]` 误写成"缺 17 个纽约小时"（L1），改为"缺纽约 17 点这一小时"——提交 eb913cc。
+- [x] **写明口径**：在文档里写明"日亏按 UTC 自然日"（L2）与"G3 测试窗收益含预热段持仓的浮动"（L4）——提交 eb913cc。
+- [x] **CI 纪律**：每次推送后用 `gh run watch` 或 Actions 页面确认结果；红了先修，修好之前不推新功能——第五轮实现提交（37d503f..97f21b6）逐个推送、Actions 全绿；第六轮审核独立实跑复核全量 1549 passed（2026-10-26）。
+- [x] **探针复跑**：每完成一个阶段，更新蓝图 §2 现状表（四级证据如实填写），并重跑探针脚本，把输出贴进提交说明——探针反转输出见提交说明 890838b（P8）/add348c（P9、P10）/dd42fea（P11）；蓝图 §2 于第六轮修复按审核事实更新（P7 影子盘/P4 台账/P2 越幅在修状态如实标注）；P8 探针已按第六轮 M1 改为双暂停文件 × 双调度顺序复跑。
 
 ---
 

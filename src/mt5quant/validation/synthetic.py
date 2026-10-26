@@ -13,12 +13,17 @@
     归零）——策略打乱后的任何正期望只能来自运气，其过关率即误报率。
 
 - slot_permute_bars（日内卡，T39/M4）：同一纽约本地时刻（同一 bar
-  槽位）的 bar 收益在不同日期之间置换：
-  - 保留：每个槽位的收益多重集（各时段波动分布留在原槽位）、bar 数与
-    时间戳（时段结构不变）；
-  - 破坏：日内先后依赖与跨日次序——对当日平仓的策略这才是零假设
-    （日块置换保留每天完整的日内形状，对日内策略测出的"误报率"
-    含义不清，见第五轮审核 M4）；
+  槽位）的 bar **联合置换相对 OHLC 路径**——待置换对象是四元组
+  (r_i, o_i/c_i, h_i/c_i, l_i/c_i)（第六轮审核 C7：只置换 r_i 而 bar 内
+  比值逐位保留时，恒有 new_close/new_open == old_close/old_open，"开盘
+  入场、收盘出场"的单 bar 优势原样存活，对这类策略不是零假设）：
+  - 保留：每个槽位的收益多重集（各时段波动分布留在原槽位）**与** 每个
+    槽位的相对形状多重集（o/c、h/c、l/c 的分布留在原槽位）、bar 数与
+    时间戳（时段结构、按小时分桶的成本口径不变）；
+  - 破坏：日内先后依赖、跨日次序、以及**日期与整根标准化 bar 的对齐**
+    （单 bar 开→收优势 c_i/o_i 改从槽位多重集随机抽取，与日期解绑）
+    ——对当日平仓的策略这才是零假设（日块置换保留每天完整的日内形状，
+    对日内策略测出的"误报率"含义不清，见第五轮审核 M4）；
   - 两者都种子化：np.random.default_rng(seed)，同一种子逐位可复现。
 
 正对照（测检出率）——plant_edge + PlantedEdgeStrategy：
@@ -195,23 +200,38 @@ def _ny_local(times):
 
 
 def slot_permute_bars(bars: pd.DataFrame, *, seed: int) -> pd.DataFrame:
-    """日内零假设打乱（T39/M4）：同一纽约本地时刻（同一 bar 槽位）的
-    bar 收益在不同日期之间置换。
+    """日内零假设打乱（T39/M4；第六轮 C7 联合置换版）：同一纽约本地时刻
+    （同一 bar 槽位）的四元组 (r_i, o_i/c_i, h_i/c_i, l_i/c_i) 在该槽位
+    的日期位置间随机重排，再按新日期序列乘法重锚（prev_close 累乘）。
 
-    实现：bar i 的收益 r_i = close_i / close_{i-1}（i≥1；bar 0 锚定起点）。
-    把各槽位（NY 本地时:分）内、跨日期的收益多重集在该槽位的日期位置间
-    随机重排，再以 r' 逐 bar 乘法重锚价格水平（每根 bar 的 OHLC 同乘
-    该 bar 的重锚因子 → bar 内比值逐位保留）。
+    数学定义：bar i（i≥1）的收益 r_i = close_i / close_{i-1}，相对形状
+    s_i = (o_i/c_i, h_i/c_i, l_i/c_i)。槽位 = bar 时间的纽约本地时:分。
+    对每个槽位 s 取独立均匀随机置换 π_s，令
 
-    - 保留：每个槽位的收益多重集（各时段的波动分布原样留在原槽位）、
-      bar 数与时间戳（时段结构不变）→ 按小时分桶的成本口径不受影响；
-    - 破坏：日内先后依赖（相邻 bar 的收益不再来自同一天的同一段行情）
-      与跨日次序（每个槽位内部日期次序随机化，"用昨天同一时刻预测
-      今天"的可预测性归零）——日内策略打乱后的任何正期望只能来自运气；
+        T'_i = (r', s')_i = T_{π_s(i)}          （i ∈ 槽位 s，i ≥ 1）
+
+    重建：close'_i = close_0 × Π_{j≤i} r'_j（逐 bar 递推重锚），
+    (o', h', l')_i = s'_i × close'_i。等价说法：整根 bar 按**它自己的
+    前收标准化**（o/c_{-1}, h/c_{-1}, l/c_{-1}, c/c_{-1}）一起搬到新日期。
+    bar 0 是锚点：四元组不参与置换、四价逐位保留。
+
+    - 保留：每个槽位的收益多重集（各时段的波动分布原样留在原槽位）与
+      每个槽位的相对形状多重集、bar 数与时间戳（时段结构不变）→ 按小时
+      分桶的成本口径不受影响；
+    - 破坏：日内先后依赖（相邻 bar 不再来自同一天的同一段行情）、跨日
+      次序（每个槽位内部日期次序随机化，"用昨天同一时刻预测今天"归零）、
+      以及日期与单 bar 开→收路径的对齐：close'_i / open'_i =
+      close_{π(i)} / open_{π(i)} 从槽位多重集随机抽取——开盘入场、收盘
+      出场的单 bar 条件优势随槽位一起被打散（第六轮 C7；旧实现恒有
+      new_close/new_open == old_close/old_open）；
+    - 已知限制（如实声明）：保留每个时槽的收益/形状多重集，就不会消除
+      该时槽的**无条件**均值漂移（例如某槽位一半日期有 +d、一半没有，
+      置换后该槽位无条件均值仍是 d/2）——它消的是"日期条件"可预测性；
     - 与 block_permute_bars 并存：日内（当日平仓）卡用本函数，多日
       持仓卡仍用日块置换（按卡的持仓周期选零假设，见 gate_calibration）；
-    - 种子化：np.random.default_rng(seed)，槽位按本地时刻升序逐一置换，
-      同一种子逐位可复现。价格必须为正（乘法重锚的前提），否则如实报错。
+    - 种子化：np.random.default_rng(seed)，槽位按本地时刻升序逐一置换
+      （同一置换同时作用于收益与形状 → 四元组不拆散），同一种子逐位
+      可复现。价格必须为正（乘法重锚的前提），否则如实报错。
     """
     if len(bars) == 0:
         raise ValueError("bars 为空：无槽位收益可置换")
@@ -225,11 +245,14 @@ def slot_permute_bars(bars: pd.DataFrame, *, seed: int) -> pd.DataFrame:
         raise ValueError("槽位置换要求 OHLC 价格为正（乘法重锚），数据含非正值")
 
     closes = prices["close"]
+    # 四元组：收益（对前收）+ 相对形状（对本收）——置换对象，捆绑不拆散
     r_bar = np.ones(n, dtype="float64")
     r_bar[1:] = closes[1:] / closes[:-1]
+    shape = {col: prices[col] / closes
+             for col in ("open", "high", "low")}
     rng = np.random.default_rng(seed)
-    # 按槽位分组（i≥1），组内收益在日期位置间置换；bar 0 的槽位首元素
-    # 是锚点，不参与（它没有可定义的前一根 bar 收益）
+    # 按槽位分组（i≥1），组内四元组在日期位置间联合置换；bar 0 的槽位首
+    # 元素是锚点，不参与（它没有可定义的前一根 bar 收益）
     slots = slot_ids[1:]
     order = np.argsort(slots, kind="stable")
     sorted_slots = slots[order]
@@ -238,15 +261,24 @@ def slot_permute_bars(bars: pd.DataFrame, *, seed: int) -> pd.DataFrame:
     ends = np.concatenate((bounds, [len(order) - 1]))
     for s, e in zip(starts, ends):
         pos = order[s:e + 1]                # 该槽位各 bar 的全局索引 − 1
-        r_bar[pos + 1] = r_bar[pos + 1][rng.permutation(e + 1 - s)]
-    # 逐 bar 乘法重锚：level_i = close_0 × Π r'（等价于逐 bar 递推）
+        perm = rng.permutation(e + 1 - s)   # 同一置换作用于收益与形状
+        g = pos + 1
+        r_bar[g] = r_bar[g][perm]
+        for col in ("open", "high", "low"):
+            shape[col][g] = shape[col][g][perm]
+    # 逐 bar 乘法重锚：level_i = close_0 × Π r'（等价于逐 bar 递推），
+    # 新形状 = donor 的相对形状 × 新收盘 → 整根标准化 bar 搬到新日期
     level = np.empty(n, dtype="float64")
     level[0] = closes[0]
     level[1:] = closes[0] * np.cumprod(r_bar[1:])
-    factor = level / closes
+    rebuilt = {"close": level}
+    for col in ("open", "high", "low"):
+        arr = shape[col] * level
+        arr[0] = prices[col][0]         # bar 0 锚点逐位还原（避免浮点往返）
+        rebuilt[col] = arr
     out = bars.copy()
     for col in _PRICE_COLS:
-        out[col] = prices[col] * factor
+        out[col] = rebuilt[col]
     return out
 
 

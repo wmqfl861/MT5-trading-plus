@@ -9,12 +9,16 @@ diff_snapshots 给出两次快照间的逐字段变更，供成本模型审计�
 - raw 原始对象不进 JSON，只导出白名单标量字段；
 - captured_at_utc 是抓取时刻（ISO UTC），不参与参数比对——每次抓取必然
   不同，比它会淹没真实变更。
+- write_json_atomic 的临时文件名带 pid+uuid 唯一后缀（R6/I1：多个写者
+  并发写同一目标文件时不再争用同一 tmp——固定 path+".tmp" 会让其中
+  一个写者 FileNotFoundError）。
 """
 from __future__ import annotations
 
 import json
 import os
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -116,12 +120,23 @@ def _fsync_file(path: str) -> None:
 
 
 def write_json_atomic(path: str, obj) -> None:
-    """JSON 原子写：临时文件 + fsync + os.replace 带重试（供脚本复用）。"""
+    """JSON 原子写：唯一临时文件 + fsync + os.replace 带重试（供脚本复用）。
+
+    临时文件名带 pid+uuid 后缀（R6/I1）：两个写者并发写同一目标文件时
+    各用各的 tmp，替换失败（重试耗尽等）时清理自己的 tmp 再上抛。
+    """
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)
-    tmp = path + ".tmp"
+    tmp = f"{path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
     _fsync_file(tmp)
-    _atomic_replace(tmp, path)
+    try:
+        _atomic_replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)     # 自己的 tmp 自己清（唯一命名下不再被复用）
+        except OSError:
+            pass
+        raise

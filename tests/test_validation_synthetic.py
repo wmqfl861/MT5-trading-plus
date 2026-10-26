@@ -17,6 +17,19 @@
 - 同种子逐位复现（test_slot_permute_seed_reproducible）；
 - 植入"日内第 k 根 bar 漂移"的数据置换后漂移消失
   （test_slot_permute_destroys_planted_intraday_drift）。
+
+第六轮 C7（2026-10-26-review-round6-codex）：slot 置换改为**联合置换**
+(收益 r, bar 内相对路径 o/c、h/c、l/c) 四元组——旧实现只置换 close/close
+收益而逐位保留 bar 内比值，恒有 new_close/new_open == old_close/old_open，
+"开盘入场、收盘出场"的单 bar 优势原样存活（审核在仓库漂移样例复现：
+置换前后开→收漂移均 ≈ 0.0303554846）。新语义下同一槽位的整根标准化 bar
+一起换到新日期：
+- 每个槽位的收益多重集不变（原测试照常成立）；
+- 每个槽位的相对形状多重集（o/c、h/c、l/c）不变、但与日期解绑
+  （test_slot_permute_preserves_slot_shape_multiset）；
+- 单 bar 开→收漂移样例置换后条件漂移塌向槽位无条件均值
+  （test_slot_permute_destroys_planted_open_close_drift）；
+- bar 0 是锚点：不参与置换、四价逐位保留。
 """
 from zoneinfo import ZoneInfo
 
@@ -407,12 +420,17 @@ def test_slot_permute_keeps_timestamps_length_and_ohlc_relations():
     out = slot_permute_bars(bars, seed=1)
     assert len(out) == len(bars)
     assert out["time"].tolist() == bars["time"].tolist()
+    # 每根 bar 的 OHLC 关系仍成立（donor 形状满足的关系随重锚等比传递）
     assert (out["high"] >= out[["open", "close"]].max(axis=1) - 1e-12).all()
     assert (out["low"] <= out[["open", "close"]].min(axis=1) + 1e-12).all()
-    # bar 内形状（high/close、low/close 等比值）逐位保留：每根 bar 整体缩放
-    np.testing.assert_allclose(
+    # C7 后 bar 内形状**不再**逐位保留（形状随槽位置换换到新日期）——
+    # 至少有一根 bar 的 high/close 比值发生变化（置换非恒等）
+    assert not np.allclose(
         out["high"].to_numpy() / out["close"].to_numpy(),
-        bars["high"].to_numpy() / bars["close"].to_numpy(), rtol=1e-12)
+        bars["high"].to_numpy() / bars["close"].to_numpy(), rtol=1e-9)
+    # bar 0 是锚点：不参与置换，四价逐位保留
+    for col in ("open", "high", "low", "close"):
+        assert out.loc[0, col] == bars.loc[0, col]
 
 
 def test_slot_permute_preserves_slot_return_multiset():
@@ -488,6 +506,68 @@ def test_slot_permute_destroys_planted_intraday_drift():
          / out["close"].to_numpy(dtype="float64")[:-1] - 1.0)[
             _slot_of_day(out["time"])[1:] == k_slot]))
     assert abs(total_after - total_before) < 1e-12
+
+
+def test_slot_permute_preserves_slot_shape_multiset():
+    """C7 新不变量：每个 NY 槽位的相对形状多重集（o/c、h/c、l/c）原样留在
+    原槽位（各时段的 bar 形状分布保留），只是与日期解绑。"""
+    bars = daily_bars(100.0 * np.cumprod(1.0 + ar1_day_returns(30)),
+                      bars_per_day=4, start="2025-01-06", seed=8)
+    out = slot_permute_bars(bars, seed=4)
+    slots = _slot_of_day(bars["time"])
+    for num, den in (("open", "close"), ("high", "close"), ("low", "close")):
+        a = bars[num].to_numpy(dtype="float64") / bars[den].to_numpy(
+            dtype="float64")
+        b = out[num].to_numpy(dtype="float64") / out[den].to_numpy(
+            dtype="float64")
+        for s in np.unique(slots):
+            np.testing.assert_allclose(np.sort(a[slots == s]),
+                                       np.sort(b[slots == s]), rtol=1e-10)
+
+
+def test_slot_permute_destroys_planted_open_close_drift():
+    """C7 失败测试（第六轮审核反例）：开盘入场 → 收盘出场的**单 bar** 漂移
+    置换后必须塌向槽位无条件均值（≈d/2）。
+
+    旧实现只置换 close/close 收益、bar 内比值逐位保留 → 恒有
+    new_close/new_open == old_close/old_open，本样例（open=前收）的条件
+    开→收漂移 ≈ 0.0304 原样存活（审核复现值 0.0303554846）。新语义联合
+    置换 (r, o/c, h/c, l/c)：开→收收益 c/o = c_d/o_d 改从槽位多重集随机
+    抽取，日期对齐信息消失。"""
+    d = 0.03
+    bars = intraday_drift_bars(drift=d, drift_slot=1, drift_every=2)
+    slots = _slot_of_day(bars["time"])
+    k_slot = int(np.unique(slots)[1])          # 第 2 个槽位 = 日内第 2 根 bar
+    n_days = len(bars) // 4
+
+    def cond_open_close(df):
+        o = df["open"].to_numpy(dtype="float64")
+        c = df["close"].to_numpy(dtype="float64")
+        oc = c / o - 1.0
+        sl = _slot_of_day(df["time"])
+        idx = np.arange(1, len(df))
+        sel = (sl[1:] == k_slot) & ((idx // 4) % 2 == 0)
+        return float(np.mean(oc[1:][sel])), int(sel.sum())
+
+    before, n_sel = cond_open_close(bars)
+    assert n_sel == n_days // 2
+    assert before > 0.9 * d                    # 植入生效：条件开→收漂移 ≈ d
+    after, n_sel2 = cond_open_close(slot_permute_bars(bars, seed=13))
+    assert n_sel2 == n_sel
+    # 置换后：漂移日第 k 槽位的开→收收益是槽位多重集的随机抽取（≈一半含
+    # 漂移）→ 条件均值塌向 d/2（阈值留 3σ 余量；旧实现此处仍是 ≈d）
+    assert after < 0.62 * d
+    # 无条件（时段）分布原样保留：第 k 槽位开→收总均值不变（多重集未动）
+    total_before = float(np.mean(
+        (bars["close"].to_numpy(dtype="float64")
+         / bars["open"].to_numpy(dtype="float64") - 1.0)[
+            _slot_of_day(bars["time"]) == k_slot]))
+    out = slot_permute_bars(bars, seed=13)
+    total_after = float(np.mean(
+        (out["close"].to_numpy(dtype="float64")
+         / out["open"].to_numpy(dtype="float64") - 1.0)[
+            _slot_of_day(out["time"]) == k_slot]))
+    assert abs(total_after - total_before) < 1e-9
 
 
 def test_slot_permute_rejects_bad_input():

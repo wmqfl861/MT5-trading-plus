@@ -18,18 +18,26 @@ trading 与 account 两个角色；market 角色（quote / bars）由注入的�
   "第一笔穿价 tick"；engine_a 的 stop_gap / 止损越幅是回测侧的成本近似，
   不适用于券商模拟（T36 的越幅加在回测 A 层，不在这里重复加）。
 
-状态持久化：每次成交即经 mt5live.fileio.write_json_atomic 落
-``data/live/paper/state.json``（持仓逐字段、余额、全部成交流水、票据与成交
-序号），重启（新 PaperBroker、同一路径）恢复全部记账——票据序号接着发，
-绝不与历史碰撞。风控进程与对账进程用 ``--paper-state`` 经
-PaperAccountView / PaperStateGateway 读这个文件，**不碰真实账户**。
+状态持久化（R6/C3：多运行器并行）：**每策略一个状态文件**
+``data/live/paper/state-<magic>.json``（``paper_state_path(live_dir, magic)``）
+——两个运行器（不同 magic）各写各的文件、互不整份覆盖；票据与成交序号
+从 ``magic × 10^9`` 起跳的区间内单调递增，跨运行器天然不撞号。重启
+（新 PaperBroker、同一路径）恢复全部记账——序号接着发，绝不与历史碰撞。
+``poll_protective`` 每轮（含无成交轮）都把最新浮盈与 equity 快照时间戳
+落盘，风控日亏/对账读到的是当前值而不是上一次成交时的旧值。风控进程与
+对账进程用 ``--paper-state``（指向 paper 目录或单状态文件）经
+PaperAccountView / PaperStateGateway **每查询重读**聚合（持仓合并、余额
+求和），**不碰真实账户**。旧版单文件 ``paper/state.json`` 已停用（多写者
+互相覆盖，见第六轮审核 C3）。
 
 绝不 import MetaTrader5、绝不连终端下单：影子券商的全部"成交"都是本地记账。
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -46,18 +54,52 @@ from mt5gw.models import (
     Quote,
 )
 from mt5live.fileio import write_json_atomic
-from mt5live.monitor import iso_utc, naive_utc, parse_iso
+from mt5live.monitor import (
+    ALERT_ACCOUNT_POLL_ERROR,
+    append_alert,
+    iso_utc,
+    naive_utc,
+    parse_iso,
+)
 
-# 影子券商状态文件（相对 live 目录）；live_runner 固定落 <live>/paper/state.json
+# ---- 状态文件布局（R6/C3：每策略一个文件；聚合侧按 glob 收集） ----
+# paper 目录（相对 live 目录）：live_runner 落 <live>/paper/state-<magic>.json
+PAPER_STATE_DIR_RELPATH = "paper"
+# 聚合视图在 paper 目录下收集的状态文件（旧版单文件 state.json 不在其中）
+PAPER_STATE_GLOB = "state-*.json"
+# 旧版单文件布局（多写者互相覆盖，已停用；仅保留给 live_runner 检测告警）
 PAPER_STATE_RELPATH = os.path.join("paper", "state.json")
 
-_STATE_VERSION = 1
+
+def paper_state_path(live_dir: str, magic: int) -> str:
+    """每策略影子状态文件：<live_dir>/paper/state-<magic>.json。
+
+    live_runner（每进程一个策略/magic）固定用这个路径——两个运行器并行
+    各写各的文件，互不覆盖（R6/C3）。
+    """
+    return os.path.join(live_dir, PAPER_STATE_DIR_RELPATH,
+                        f"state-{int(magic)}.json")
+
+
+_STATE_VERSION = 2
 _EPS = 1e-9
 
 # 起始票据：与 FakeBroker / 真实终端的常见区间都拉开距离，便于从流水一眼
-# 分辨"影子成交"；重启后从状态文件接着发。
+# 分辨"影子成交"；重启后从状态文件接着发。R6/C3：每个 magic 的序号在
+# [magic×10^9, (magic+1)×10^9) 区间内单调递增——跨运行器不撞号。
+_TICKET_RANGE = 10**9
 _FIRST_TICKET = 7_000_001
 _FIRST_DEAL_TICKET = 8_000_001
+
+
+def _first_ticket(magic: int) -> int:
+    """该 magic 状态文件的起始票据（区间 [magic×10^9, (magic+1)×10^9)）。"""
+    return int(magic) * _TICKET_RANGE + _FIRST_TICKET
+
+
+def _first_deal_ticket(magic: int) -> int:
+    """该 magic 状态文件的起始成交号（与票据同区间、不同偏移）。"""
+    return int(magic) * _TICKET_RANGE + _FIRST_DEAL_TICKET
 
 
 def _now_utc() -> datetime:
@@ -89,24 +131,30 @@ class PaperBroker:
     def __init__(self, market, *, state_path: str,
                  contract_sizes: dict[str, float],
                  balance: float = 10_000.0,
-                 clock: Callable[[], datetime] | None = None):
+                 clock: Callable[[], datetime] | None = None,
+                 magic: int = 0):
         """
         - market：行情服务（quote(symbol) -> Quote；影子盘=真实终端
           mt5gw.MarketData，离线干跑=BarQuoteMarket）；
-        - state_path：状态文件路径（存在即恢复，balance 参数被文件覆盖）；
+        - state_path：状态文件路径（存在即恢复，balance 参数被文件覆盖；
+          生产布局 = paper_state_path(live_dir, magic)——每策略一个文件）；
         - contract_sizes：symbol → 合约大小（快照 data/specs/latest.json）；
         - balance：初始余额（仅无状态文件时生效）；
-        - clock：成交时刻来源（缺省墙钟 UTC；测试注入模拟钟）。
+        - clock：成交时刻来源（缺省墙钟 UTC；测试注入模拟钟）；
+        - magic：本策略 magic（R6/C3）——票据/成交序号在 magic×10^9 起跳
+          的区间内发号（跨运行器不撞号；缺省 0 = 旧 7000001 区间，兼容
+          单文件测试）。按单开仓的 magic 参数仍逐单标记持仓/成交。
         """
         self._market = market
         self._state_path = state_path
         self._contract_sizes = dict(contract_sizes)
         self._clock = clock or _now_utc
+        self._magic = int(magic)
         self.balance = float(balance)
         self._positions: list[Position] = []
         self._deals: list[Deal] = []
-        self._next_ticket = _FIRST_TICKET
-        self._next_deal_ticket = _FIRST_DEAL_TICKET
+        self._next_ticket = _first_ticket(self._magic)
+        self._next_deal_ticket = _first_deal_ticket(self._magic)
         had_state = os.path.exists(state_path)
         self._load()
         if not had_state:
@@ -240,6 +288,10 @@ class PaperBroker:
 
         行情取不到的品种本轮跳过（不打崩运行器主循环——真实服务器端
         SL/TP 的保护在影子模式里由下一轮补上），下轮照常。
+
+        R6/C3：**无论本轮有没有成交，结束时都把最新浮盈与 equity 快照
+        时间戳落盘**（save(now=n)）——风控日亏/对账读到的是当前浮亏，
+        而不是上一次成交时的旧值。
         """
         n = naive_utc(now if now is not None else self._clock())
         closed: list[Deal] = []
@@ -269,17 +321,26 @@ class PaperBroker:
                 pos, pos.volume, price, reason=reason,
                 comment="[sl]" if reason == DEAL_REASON_SL else "[tp]",
                 time=n))
+        self.save(now=n)   # 无成交轮也发布浮盈快照（equity_ts_utc = 本轮时刻）
         return closed
 
     # ---- 状态持久化（fileio 原子写；重启恢复） ----
 
-    def save(self) -> None:
-        """状态落盘：持仓（含最新浮动感）、余额、全部流水、票据序号。"""
+    def save(self, now: datetime | None = None) -> None:
+        """状态落盘：持仓（含最新浮动感）、余额、全部流水、票据序号、
+        equity 快照时间戳。
+
+        - now：浮盈/equity 的估值时刻（poll_protective 传本轮轮询时刻）；
+          缺省墙钟。文件里 updated_at_utc 恒为落盘墙钟。
+        """
         positions = [self._refresh(p) for p in self._positions]
+        snap_ts = naive_utc(now) if now is not None else _now_utc()
         payload = {
             "version": _STATE_VERSION,
             "paper": True,
+            "magic": self._magic,
             "updated_at_utc": iso_utc(_now_utc()),
+            "equity_ts_utc": iso_utc(snap_ts),
             "balance": self.balance,
             "equity": self.balance + sum(p.profit + p.swap for p in positions),
             "next_ticket": self._next_ticket,
@@ -298,9 +359,10 @@ class PaperBroker:
         with open(self._state_path, encoding="utf-8") as f:
             data = json.load(f)
         self.balance = float(data["balance"])
-        self._next_ticket = int(data.get("next_ticket", _FIRST_TICKET))
+        self._next_ticket = int(data.get("next_ticket",
+                                         _first_ticket(self._magic)))
         self._next_deal_ticket = int(data.get("next_deal_ticket",
-                                              _FIRST_DEAL_TICKET))
+                                              _first_deal_ticket(self._magic)))
         self._positions = [_position_from_dict(p)
                            for p in data.get("positions", [])]
         self._deals = [_deal_from_dict(dd) for dd in data.get("deals", [])]
@@ -421,65 +483,146 @@ def _deal_from_dict(d: dict) -> Deal:
 
 
 # ================================================================ --paper-state
-# 只读账户视图：risk_process / live_reconcile 用状态文件替代真实账户。
+# 只读聚合账户视图：risk_process / live_reconcile 用状态文件替代真实账户。
+# R6/C3：持 paper 目录（或单状态文件），**每次查询都重读盘**——常驻风控/
+# 对账循环每轮自动看到各运行器的最新成交与浮盈，不再构造时快照一次。
 
 class PaperAccountView:
-    """从 paper 状态文件构造的只读账户视图（不连终端、不下单）。
+    """从 paper 状态文件构造的只读聚合账户视图（不连终端、不下单）。
 
-    服务面对齐 risk_process.build_snapshot / live_reconcile.run_once 的
-    调用：state / positions / deals / deals_for_position（pending_orders
-    恒空）。浮动盈亏用落盘时快照（运行器每轮成交/轮询都会刷新落盘）。
+    - state_path 为 **paper 目录**：聚合目录下全部 ``state-<magic>.json``
+      （每策略一个运行器各写各的；旧版单文件 state.json **不**聚合——
+      多写者布局已停用）；
+    - state_path 为 **单个状态文件**：单策略兼容（只读该文件）。
+
+    **每次查询（state/positions/deals/deals_for_position）都重新读盘**：
+    另一"进程"（运行器）落盘的新仓/平仓/浮盈，下一次查询即可见。读不到
+    的文件按空处理并告警（stderr；给了 alert_dir 再追加 alerts.log 的
+    ACCOUNT_POLL_ERROR），绝不打崩常驻调用方。
+
+    聚合语义：持仓/成交合并（票号区间按 magic 派生，天然不撞）、余额与
+    权益求和；``latest_update_utc()`` 取各文件最新快照时刻。
     """
 
-    def __init__(self, state_path: str):
-        if not os.path.exists(state_path):
+    def __init__(self, state_path: str, *, alert_dir: str | None = None):
+        self._state_path = state_path
+        self._alert_dir = alert_dir
+        if not self._state_files():
             raise DataUnavailableError(
-                f"影子券商状态文件不存在：{state_path}——先以 --paper 启动"
-                "运行器写出 paper 状态")
-        with open(state_path, encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict) or "balance" not in data:
-            raise DataUnavailableError(
-                f"{state_path} 不是合法的 paper 状态文件（顶层须为带 "
-                "balance 的对象）")
-        self._data = data
-        self._positions = [_position_from_dict(p)
-                           for p in data.get("positions", [])]
-        self._deals = [_deal_from_dict(d) for d in data.get("deals", [])]
-        self._equity = float(data.get("equity", data["balance"]))
-        self._balance = float(data["balance"])
+                f"影子状态不可用：{state_path} 下没有 state-*.json（每策略"
+                "运行器写 paper/state-<magic>.json；旧版单文件 state.json "
+                "已停用不聚合）——先以 --paper 启动运行器；单策略也可直接"
+                "传状态文件路径")
+        if (os.path.isfile(state_path)
+                and os.path.basename(state_path) == "state.json"):
+            # 旧版单文件布局：运行器已改写 state-<magic>.json，这份可能是
+            # 升级前的陈旧快照——提示操作者，但仍如实读它（单文件本就合法）
+            print(f"⚠ 影子状态文件 {state_path} 是旧版单文件布局——运行器"
+                  "现写 paper/state-<magic>.json；如非有意指定，请改用 "
+                  "--paper-state 指向 paper 目录", file=sys.stderr, flush=True)
+
+    # ---- 文件发现与逐查询重读 ----
+
+    def _state_files(self) -> list[str]:
+        """当前可见的状态文件（目录模式每调用重新 glob——新策略的状态
+        文件出现后无需重建视图）。"""
+        if os.path.isdir(self._state_path):
+            return sorted(glob.glob(
+                os.path.join(self._state_path, PAPER_STATE_GLOB)))
+        if os.path.isfile(self._state_path):
+            return [self._state_path]
+        return []
+
+    def _read_all(self) -> list[dict]:
+        """读全部状态文件；坏文件按空处理并告警（C3：不打崩调用方）。"""
+        docs: list[dict] = []
+        for path in self._state_files():
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict) or "balance" not in data:
+                    raise ValueError("顶层须为带 balance 的对象")
+            except (OSError, ValueError) as e:
+                self._warn_unreadable(path, e)
+                continue
+            docs.append(data)
+        return docs
+
+    def _warn_unreadable(self, path: str, err: Exception) -> None:
+        msg = f"影子状态文件 {path} 读取失败（按空处理）：{err}"
+        print(f"⚠ {msg}", file=sys.stderr, flush=True)
+        if self._alert_dir:
+            try:
+                append_alert(self._alert_dir, ALERT_ACCOUNT_POLL_ERROR, msg)
+            except OSError:
+                pass          # 告警通道不可用：不让告警打崩溃读取方
+
+    # ---- AccountService 子集（聚合） ----
 
     def state(self) -> AccountState:
+        docs = self._read_all()
+        balance = sum(float(d.get("balance", 0.0)) for d in docs)
+        equity = sum(float(d.get("equity", d.get("balance", 0.0)))
+                     for d in docs)
         return AccountState(
             login=0, server="paper-shadow", company="PaperBroker (T34)",
-            currency="USD", leverage=100, balance=self._balance,
-            equity=self._equity, margin=0.0, margin_free=self._equity,
-            margin_mode=2, trade_mode=0)
+            currency="USD", leverage=100, balance=balance, equity=equity,
+            margin=0.0, margin_free=equity, margin_mode=2, trade_mode=0)
 
     def positions(self, symbol: str | None = None) -> list[Position]:
-        return [p for p in self._positions
-                if symbol in (None, p.symbol)]
+        out = [p for d in self._read_all()
+               for p in (_position_from_dict(x)
+                         for x in d.get("positions", []))
+               if symbol is None or p.symbol == symbol]
+        out.sort(key=lambda p: p.ticket)
+        return out
 
     def pending_orders(self, symbol: str | None = None) -> list:
         return []
 
     def deals(self, since: datetime, to: datetime) -> list[Deal]:
-        return [d for d in self._deals
-                if naive_utc(since) <= d.time <= naive_utc(to)]
+        lo, hi = naive_utc(since), naive_utc(to)
+        out = [d for doc in self._read_all()
+               for d in (_deal_from_dict(x) for x in doc.get("deals", []))
+               if lo <= d.time <= hi]
+        out.sort(key=lambda d: (d.time, d.ticket))
+        return out
 
     def deals_for_position(self, position_id: int) -> list[Deal]:
-        return [d for d in self._deals if d.position_id == position_id]
+        out = [d for doc in self._read_all()
+               for d in (_deal_from_dict(x) for x in doc.get("deals", []))
+               if d.position_id == position_id]
+        out.sort(key=lambda d: (d.time, d.ticket))
+        return out
+
+    def latest_update_utc(self) -> datetime | None:
+        """全部状态文件里最新的快照时刻（equity_ts_utc 优先，缺则
+        updated_at_utc；无任何可读文件 → None）。"""
+        ts: datetime | None = None
+        for d in self._read_all():
+            for key in ("equity_ts_utc", "updated_at_utc"):
+                raw = d.get(key)
+                if not raw:
+                    continue
+                try:
+                    t = parse_iso(str(raw))
+                except (ValueError, TypeError):
+                    continue
+                if ts is None or t > ts:
+                    ts = t
+        return ts
 
 
 class PaperStateGateway:
     """给 scripts 用的最小网关替身：account 指向 PaperAccountView。
 
     risk_process / live_reconcile 的 ``--paper-state`` 装配：不连真实
-    MT5 终端，只读影子券商状态文件。shutdown 无资源可释放。
+    MT5 终端，只读影子券商状态（目录 = 聚合全部 state-<magic>.json）。
+    shutdown 无资源可释放。alert_dir 给了则把读失败告警落 alerts.log。
     """
 
-    def __init__(self, state_path: str):
-        self.account = PaperAccountView(state_path)
+    def __init__(self, state_path: str, *, alert_dir: str | None = None):
+        self.account = PaperAccountView(state_path, alert_dir=alert_dir)
 
     def shutdown(self):
         pass
@@ -525,9 +668,12 @@ class BarQuoteMarket:
 
 
 __all__ = [
+    "PAPER_STATE_DIR_RELPATH",
+    "PAPER_STATE_GLOB",
     "PAPER_STATE_RELPATH",
     "BarQuoteMarket",
     "PaperAccountView",
     "PaperBroker",
     "PaperStateGateway",
+    "paper_state_path",
 ]

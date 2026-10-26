@@ -1,7 +1,11 @@
 """试验台账（T11）：SQLite 表结构、失败运行也记一行、锁箱一次性、stats 计数。
 
 表结构按计划：cards / runs / gates / lockbox_uses（card_id UNIQUE）。
+R6/C5：写前验证（防洗链）、删尾/删锁箱行检测、状态更新归档进
+ledger_events、锚链验证。
 """
+import hashlib
+import importlib.util
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -9,7 +13,17 @@ from pathlib import Path
 
 import pytest
 
-from mt5quant.research.ledger import Ledger
+from mt5quant.research.ledger import Ledger, LedgerTamperedError
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_anchor():
+    spec = importlib.util.spec_from_file_location(
+        "ledger_anchor_r6", REPO_ROOT / "scripts" / "ledger_anchor.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def record(led: Ledger, run_n=1, *, card_id="H001", error=None,
@@ -581,3 +595,354 @@ def test_migration_on_copy_of_production_ledger(tmp_path):
             "SELECT COUNT(*) FROM runs WHERE actor='migration'"
         ).fetchone()[0] == 1
     assert PROD_LEDGER.read_bytes() == prod_bytes   # 本体未被触碰
+
+
+# ================================================ R6/C5：防洗链/删尾/事件归档
+
+def test_write_after_tamper_refused_not_washed(tmp_path):
+    """C5 复现 A 的反转断言：篡改历史行 → verify 报 → 之后的**正常写入**
+    被 LedgerTamperedError 拒绝（不再 _rechain 把证据洗掉），篡改仍可检出。"""
+    p = tmp_path / "ledger.sqlite"
+    with Ledger(p) as led:
+        record(led, run_n=1)
+        record(led, run_n=2)
+        with led.conn:   # 模拟研究账户直连 sqlite 改行（不重算哈希）
+            led.conn.execute("UPDATE runs SET actor='hacker' WHERE run_id=1")
+        assert led.verify_chain()
+        with pytest.raises(LedgerTamperedError):
+            record(led, run_n=3)
+        problems = led.verify_chain()
+        assert any("run#1" in q and "篡改" in q for q in problems)
+        n = led.conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+        assert n == 2                        # 拒绝的写入没落库（证据保住）
+    with Ledger(p, create=False) as led2:    # 重开仍报：证据没有被洗掉
+        assert any("run#1" in q and "篡改" in q for q in led2.verify_chain())
+
+
+def test_tampered_gates_or_lockbox_blocks_all_writers(tmp_path):
+    """三链任一被篡改 → 所有写方法（record_gate / record_lockbox_start /
+    finish_lockbox_use / lockbox_budget / register_card）一律 fail-closed。"""
+    p = tmp_path / "ledger.sqlite"
+    with Ledger(p) as led:
+        rid = record(led)
+        led.record_gate(rid, "G0", True, {})
+        with led.conn:
+            led.conn.execute(
+                "UPDATE gates SET passed=0 WHERE run_id=?", (rid,))
+        assert led.verify_chain()
+        with pytest.raises(LedgerTamperedError):
+            record(led, run_n=2)
+        with pytest.raises(LedgerTamperedError):
+            led.record_gate(rid, "G1", True, {})
+        with pytest.raises(LedgerTamperedError):
+            led.record_lockbox_start("H001", approved_by="u")
+        with pytest.raises(LedgerTamperedError):
+            led.finish_lockbox_use("H001", result={})
+        with pytest.raises(LedgerTamperedError):
+            led.lockbox_budget("2026-10-01T00:00:00")
+        with pytest.raises(LedgerTamperedError):
+            led.register_card("H001", 1, "p", "c",
+                              datetime(2026, 1, 1, tzinfo=timezone.utc))
+
+
+def test_tail_deletion_detected_by_snapshot(tmp_path):
+    """C5 复现 B 的反转断言：删最后一行（无后继、内容哈希全对）→ verify
+    由 chain_meta 快照报"尾部被删"。"""
+    p = tmp_path / "ledger.sqlite"
+    with Ledger(p) as led:
+        for i in (1, 2, 3):
+            record(led, run_n=i)
+    conn = sqlite3.connect(str(p))
+    conn.execute("DELETE FROM runs WHERE run_id=3")
+    conn.commit()
+    conn.close()
+    with Ledger(p, create=False) as led:
+        problems = led.verify_chain()
+        assert any("runs" in q and "尾部" in q for q in problems)
+        with pytest.raises(LedgerTamperedError):
+            record(led, run_n=4)      # 删尾后的写入同样被拒
+
+
+def test_lockbox_row_deletion_detected_and_still_used(tmp_path):
+    """C5 复现 C 的反转断言：删唯一 lockbox_uses 行 → verify 报且
+    lockbox_used 仍 True（快照兜底），一次性预算不被重置，重插被拒。"""
+    p = tmp_path / "ledger.sqlite"
+    with Ledger(p) as led:
+        led.record_lockbox_use("H001", approved_by="u", result={},
+                               cutoff="2026-10-01T00:00:00")
+    conn = sqlite3.connect(str(p))
+    conn.execute("DELETE FROM lockbox_uses")
+    conn.commit()
+    conn.close()
+    with Ledger(p, create=False) as led:
+        problems = led.verify_chain()
+        assert any("lockbox_uses" in q and ("尾部" in q or "删" in q)
+                   for q in problems)
+        assert led.lockbox_used("H001") is True   # 快照在：仍算已用
+        with pytest.raises(LedgerTamperedError):  # 预算路径同样 fail-closed
+            led.lockbox_budget("2026-10-01T00:00:00")
+        with pytest.raises(LedgerTamperedError):
+            led.record_lockbox_start("H001", approved_by="u")
+
+
+def test_full_rechain_detected_by_head_snapshot(tmp_path):
+    """攻击者改内容并**整链重算**（含 row_hash/prev_hash）→ 行级校验全过，
+    但链头与 chain_meta 快照不符 → verify 报（整链重算瞒不过快照/锚定）。"""
+    p = tmp_path / "ledger.sqlite"
+    with Ledger(p) as led:
+        record(led, run_n=1)
+        record(led, run_n=2)
+    conn = sqlite3.connect(str(p))
+    conn.row_factory = sqlite3.Row
+    with conn:                                   # 改一行
+        conn.execute("UPDATE runs SET actor='hacker' WHERE run_id=1")
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(runs)")]
+    content_cols = [c for c in cols if c not in ("prev_hash", "row_hash")]
+    sel = ", ".join(f'"{c}"' for c in content_cols)
+    prev = "0" * 64                              # 手工整链重算（洗链）
+    for r in conn.execute(
+            f"SELECT rowid AS rid, {sel} FROM runs ORDER BY rowid").fetchall():
+        canon = json.dumps({c: r[c] for c in content_cols},
+                           sort_keys=True, ensure_ascii=False,
+                           separators=(",", ":"))
+        h = hashlib.sha256((canon + prev).encode("utf-8")).hexdigest()
+        conn.execute("UPDATE runs SET prev_hash=?, row_hash=? WHERE rowid=?",
+                     (prev, h, r["rid"]))
+        prev = h
+    conn.commit()
+    conn.close()
+    with Ledger(p, create=False) as led:
+        problems = led.verify_chain()
+        assert any("runs" in q and "快照" in q for q in problems)
+        with pytest.raises(LedgerTamperedError):
+            record(led, run_n=3)
+
+
+def test_forged_append_beyond_snapshot_detected(tmp_path):
+    """绕过写方法直接 INSERT（即使哈希算对）→ 行数超过快照 → verify 报。"""
+    p = tmp_path / "ledger.sqlite"
+    with Ledger(p) as led:
+        record(led, run_n=1)
+        tail = led.conn.execute(
+            "SELECT row_hash FROM runs ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()["row_hash"]
+    conn = sqlite3.connect(str(p))
+    conn.row_factory = sqlite3.Row
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(runs)")]
+    content_cols = [c for c in cols if c not in ("prev_hash", "row_hash",
+                                                 "run_id")]
+    content = {"card_id": "HX", "card_version": 1, "strategy": "s", "params_json": "{}",
+               "symbol": "X", "timeframe": "H1", "data_first": None,
+               "data_last": None, "data_sha256": "a" * 64, "strategy_sha": "f" * 64,
+               "engine_version": "e", "cost_model_version": "v",
+               "gates_hash": "", "metrics_json": "{}",
+               "created_utc": "2026-10-01T00:00:00+00:00", "actor": "forger"}
+    canon = json.dumps(content, sort_keys=True, ensure_ascii=False,
+                       separators=(",", ":"))
+    h = hashlib.sha256((canon + tail).encode("utf-8")).hexdigest()
+    names = ", ".join(f'"{c}"' for c in content_cols)
+    ph = ", ".join("?" for _ in content_cols)
+    with conn:
+        conn.execute(
+            f"INSERT INTO runs({names}, prev_hash, row_hash)"
+            f" VALUES ({ph}, ?, ?)",
+            tuple(content[c] for c in content_cols) + (tail, h))
+    conn.close()
+    with Ledger(p, create=False) as led:
+        problems = led.verify_chain()
+        assert any("runs" in q and ("快照" in q or "未登记" in q)
+                   for q in problems)
+
+
+def test_legal_append_extends_chain_incrementally(tmp_path):
+    """合法追加只延伸链（增量计算 row_hash）：既有行的 prev_hash/row_hash
+    一律不变；新行 prev_hash = 原链尾。"""
+    with Ledger(tmp_path / "l.sqlite") as led:
+        r1 = record(led, run_n=1)
+        before = {r["run_id"]: (r["prev_hash"], r["row_hash"])
+                  for r in led.conn.execute("SELECT * FROM runs")}
+        r2 = record(led, run_n=2)
+        after = {r["run_id"]: (r["prev_hash"], r["row_hash"])
+                 for r in led.conn.execute("SELECT * FROM runs")}
+        assert after[r1] == before[r1]              # 旧行不被重算
+        assert after[r2][0] == before[r1][1]        # 新行接在原链尾上
+        assert led.verify_chain() == []
+
+
+def test_finish_lockbox_use_archives_started_row_in_events(tmp_path):
+    """状态更新（started→done）不再悄悄改写：旧行内容进 ledger_events
+    （审计附表），行内容重算 row_hash，链保持可验证。"""
+    with Ledger(tmp_path / "l.sqlite") as led:
+        record(led)
+        led.record_lockbox_start("H001", approved_by="u",
+                                 cutoff="2026-10-01T00:00:00")
+        led.finish_lockbox_use("H001", result={"passed": True})
+        assert led.verify_chain() == []
+        evs = led.conn.execute(
+            "SELECT * FROM ledger_events ORDER BY event_id").fetchall()
+        assert len(evs) == 1
+        old = json.loads(evs[0]["old_content_json"])
+        assert old["status"] == "started"           # 归档的是改写前内容
+        assert old["approved_by"] == "u"
+        assert led.lockbox_status("H001") == "done"
+        row = led.conn.execute(
+            "SELECT * FROM lockbox_uses").fetchone()
+        assert row["approved_by"] == "u"            # 批准人与时刻保留
+
+
+def test_record_gate_re_record_archives_previous(tmp_path):
+    """gates 重录（原 INSERT OR REPLACE 改写路径）同样归档旧行内容。"""
+    with Ledger(tmp_path / "l.sqlite") as led:
+        rid = record(led)
+        led.record_gate(rid, "G0", False, {"attempt": 1})
+        led.record_gate(rid, "G0", True, {"attempt": 2})
+        assert led.verify_chain() == []
+        row = led.conn.execute("SELECT * FROM gates").fetchone()
+        assert json.loads(row["details_json"])["attempt"] == 2
+        old = json.loads(led.conn.execute(
+            "SELECT old_content_json FROM ledger_events").fetchone()[0])
+        assert old["passed"] == 0 and old["details_json"]
+
+
+def test_events_row_deletion_detected(tmp_path):
+    """审计附表 ledger_events 的行被删 → 快照行数对不上 → verify 报。"""
+    p = tmp_path / "l.sqlite"
+    with Ledger(p) as led:
+        rid = record(led)
+        led.record_gate(rid, "G0", False, {"a": 1})
+        led.record_gate(rid, "G0", True, {"a": 2})   # 产生一条 events
+    conn = sqlite3.connect(str(p))
+    conn.execute("DELETE FROM ledger_events")
+    conn.commit()
+    conn.close()
+    with Ledger(p, create=False) as led:
+        problems = led.verify_chain()
+        assert any("ledger_events" in q and "快照" in q for q in problems)
+
+
+# ----------------------------------------------- R6/C5：锚链（ledger_anchor）
+
+def _anchor_ledger(tmp_path, n=2):
+    p = tmp_path / "ledger.sqlite"
+    with Ledger(p) as led:
+        for i in range(n):
+            record(led, run_n=i + 1)
+    return p
+
+
+def test_anchor_rows_form_a_chain(tmp_path):
+    """锚定行带前一个锚的哈希（链式锚）：三条锚的 anchor_hash 逐条相链。"""
+    mod = load_anchor()
+    p = _anchor_ledger(tmp_path, n=2)
+    out = tmp_path / "anchors.md"
+    assert mod.write_anchor(out, p, now=datetime(2026, 10, 26, tzinfo=timezone.utc))
+    lines = [ln for ln in out.read_text(encoding="utf-8").splitlines()
+             if ln.startswith("|") and "---" not in ln
+             and not ln.startswith("| 锚定")]
+    assert len(lines) == 3                          # 三表各一条
+    hashes = [mod._parse_anchor_line(ln) for ln in lines]
+    assert hashes[0]["prev"] == "0" * 64            # 首锚接 GENESIS
+    assert hashes[1]["prev"] == hashes[0]["hash"]   # 逐条相链
+    assert hashes[2]["prev"] == hashes[1]["hash"]
+
+
+def test_anchor_verify_clean_then_tampered_file_reported(tmp_path):
+    """--verify：干净状态无问题；改锚文件历史行 → 锚链哈希不符 → 报。"""
+    mod = load_anchor()
+    p = _anchor_ledger(tmp_path, n=2)
+    out = tmp_path / "anchors.md"
+    mod.write_anchor(out, p)
+    with Ledger(p) as led:                          # 增长后再锚一次 → 两条锚
+        record(led, run_n=3)
+    mod.write_anchor(out, p)
+    assert mod.verify_anchor(out, p) == []
+    # 模拟对锚文件历史的篡改：把第一条锚（当时 2 行）的行数改大
+    text = out.read_text(encoding="utf-8")
+    tampered = text.replace("| runs | 2 |", "| runs | 9 |")
+    assert tampered != text                         # 夹具自检：确有替换
+    out.write_text(tampered, encoding="utf-8")
+    problems = mod.verify_anchor(out, p)
+    assert any("锚" in q for q in problems)
+
+
+def test_anchor_verify_flags_ledger_rewrite_after_anchor(tmp_path):
+    """锚定后台账被改写（整链重算）或删行 → 与锚不符 → 报。"""
+    mod = load_anchor()
+    p = _anchor_ledger(tmp_path, n=2)
+    out = tmp_path / "anchors.md"
+    mod.write_anchor(out, p)
+    assert mod.verify_anchor(out, p) == []
+    # 1) 锚后删尾（内容哈希全对、无后继断链）→ 行数 < 锚定行数 → 报
+    conn = sqlite3.connect(str(p))
+    conn.execute("DELETE FROM runs WHERE run_id=2")
+    conn.commit()
+    conn.close()
+    problems = mod.verify_anchor(out, p)
+    assert any("runs" in q and "删" in q for q in problems)
+    # 2) 锚后改内容并整链重算 → 行数相同但链头不符 → 报
+    p2 = _anchor_ledger(tmp_path / "second", n=2)
+    out2 = tmp_path / "anchors2.md"
+    mod.write_anchor(out2, p2)
+    conn = sqlite3.connect(str(p2))
+    conn.row_factory = sqlite3.Row
+    with conn:
+        conn.execute("UPDATE runs SET actor='hacker' WHERE run_id=1")
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(runs)")]
+    content_cols = [c for c in cols if c not in ("prev_hash", "row_hash")]
+    sel = ", ".join(f'"{c}"' for c in content_cols)
+    prev = "0" * 64
+    for r in conn.execute(
+            f"SELECT rowid AS rid, {sel} FROM runs ORDER BY rowid").fetchall():
+        canon = json.dumps({c: r[c] for c in content_cols},
+                           sort_keys=True, ensure_ascii=False,
+                           separators=(",", ":"))
+        h = hashlib.sha256((canon + prev).encode("utf-8")).hexdigest()
+        conn.execute("UPDATE runs SET prev_hash=?, row_hash=? WHERE rowid=?",
+                     (prev, h, r["rid"]))
+        prev = h
+    conn.commit()
+    conn.close()
+    problems = mod.verify_anchor(out2, p2)
+    assert any("runs" in q and "链头" in q for q in problems)
+
+
+def test_anchor_verify_missing_history_reported(tmp_path):
+    """缺历史锚（锚文件无记录 / 表无锚定条目）→ 报。"""
+    mod = load_anchor()
+    p = _anchor_ledger(tmp_path, n=1)
+    out = tmp_path / "anchors.md"
+    problems = mod.verify_anchor(out, p)          # 文件不存在
+    assert any("锚" in q for q in problems)
+    out.write_text(mod._HEADER.strip() + "\n", encoding="utf-8")
+    problems = mod.verify_anchor(out, p)          # 只有表头：无锚定记录
+    assert any("缺" in q or "无" in q for q in problems)
+    # 只锚 runs 一条（人为构造缺表锚定）：其余表 → 缺该表锚定历史
+    out.write_text(mod._HEADER.strip() + "\n", encoding="utf-8")
+    with open(out, "a", encoding="utf-8") as f:
+        heads = mod.chain_heads(p)
+        prev = "0" * 64
+        ts = "2026-10-26T00:00:00+00:00"
+        ah = mod._anchor_digest(ts, "l", "runs", heads["runs"]["rows"],
+                                heads["runs"]["head"], prev)
+        f.write(f"| {ts} | l | runs | {heads['runs']['rows']} | "
+                f"{heads['runs']['head']} | {prev} | {ah} |\n")
+    problems = mod.verify_anchor(out, p)
+    assert any("gates" in q and "锚定历史" in q for q in problems)
+
+
+def test_anchor_verify_cli_mode(tmp_path, capsys):
+    """CLI：--verify 干净返回 0；锚后改台账返回 1。"""
+    mod = load_anchor()
+    p = _anchor_ledger(tmp_path, n=2)
+    out = tmp_path / "anchors.md"
+    mod.write_anchor(out, p)
+    assert mod.main(["--ledger", str(p), "--anchor", str(out),
+                     "--verify"]) == 0
+    conn = sqlite3.connect(str(p))
+    conn.execute("DELETE FROM runs WHERE run_id=2")
+    conn.commit()
+    conn.close()
+    assert mod.main(["--ledger", str(p), "--anchor", str(out),
+                     "--verify"]) == 1
+    assert "删" in capsys.readouterr().out
+

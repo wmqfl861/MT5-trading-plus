@@ -50,7 +50,7 @@ from mt5live.reconcile import (
     write_intent,
 )
 from mt5live.riskproc import AccountSnapshot, RiskProcess, load_risk_config
-from mt5live.paper import PaperBroker, PaperStateGateway
+from mt5live.paper import PaperBroker, PaperStateGateway, paper_state_path
 from mt5live.runner import (
     MarketClosedError,
     SignalRunner,
@@ -581,8 +581,10 @@ def test_terminal_source_drops_forming_bar(tmp_path):
 # 点差尖峰：跳过开仓（当前点差 > 倍数 × 模型该纽约小时 p90）
 
 def _spread_model(hour_ny: int) -> SpreadModel:
+    # n_days：R6/C4 起点差闸门按覆盖天数判缺（n_days ≥ 20 才算有统计）
     return SpreadModel(
-        {SYMBOL: {hour_ny: SpreadStat(median=0.02, p90=0.05, p99=0.08, n=100)}},
+        {SYMBOL: {hour_ny: SpreadStat(median=0.02, p90=0.05, p99=0.08,
+                                      n=100, n_days=100)}},
         {SYMBOL: 0.02}, mode="absolute")
 
 
@@ -757,11 +759,13 @@ def test_t30_manual_close_pauses_only_this_magic_until_acked(tmp_path, monkeypat
     _, rr_b = other.round(T2 + timedelta(minutes=5), "up")
     assert rr_b.action == "open"
 
-    # 本 magic 的执行器轮：CLIENT 不在已解释集合 → 不改意图、写告警、交给对账；
-    # 重开被本 magic 的暂停挡下
+    # 本 magic 的执行器轮：CLIENT 不在已解释集合 → 不改意图、写告警、记入
+    # 未决出场（C2/R6）；重开被**执行器自己的防线**挡下（对账 pause 是叠加
+    # 的第二重，不是唯一防线）
     _, rr2 = stack.round(T2 + timedelta(minutes=10), "up")
-    assert rr2.action == "risk_rejected"
-    assert "reconcile_paused" in rr2.error
+    assert rr2.action == "blocked_external_exit"
+    assert "external_exit_pending" in rr2.error
+    assert read_json(pause_file(stack.live_dir))["paused"] is True  # 叠加防线仍在
     it = intent_of(stack.live_dir)
     assert it["volume"] == pytest.approx(0.16)      # 意图未被洗白
     assert not it["cause"].startswith("external_exit:")
@@ -1464,7 +1468,10 @@ class PaperStack:
                                    session_policy=self.policy)
         self.market = FakeBroker(SYMBOL, balance=balance,
                                  contract_size=CONTRACT)
-        self.paper_state = os.path.join(self.live_dir, "paper", "state.json")
+        # R6/C3：影子状态按策略落 paper/state-<magic>.json（多运行器各写
+        # 各的）；聚合视图（风控/对账）传 paper 目录
+        self.paper_state = paper_state_path(self.live_dir, magic)
+        self.paper_dir = os.path.join(self.live_dir, "paper")
         self.paper = PaperBroker(
             self.market, state_path=self.paper_state,
             contract_sizes={SYMBOL: CONTRACT}, balance=balance,
@@ -1507,14 +1514,15 @@ class PaperStack:
         return decision, rr, protective
 
     def risk_cycle_from_paper(self, now: datetime):
-        """风控主循环一轮：账户快照来自 --paper-state 只读视图（不碰真实账户）。"""
+        """风控主循环一轮：账户快照来自 --paper-state 只读视图（不碰真实账户；
+        R6/C3 起传 paper 目录——聚合全部 state-<magic>.json）。"""
         mod = load_script("risk_process")
-        snap = mod.build_snapshot(PaperStateGateway(self.paper_state), now)
+        snap = mod.build_snapshot(PaperStateGateway(self.paper_dir), now)
         return self.process.run_cycle(snap, now)
 
     def reconcile_from_paper(self, now: datetime):
         mod = load_script("live_reconcile")
-        return mod.run_once(self.live_dir, PaperStateGateway(self.paper_state),
+        return mod.run_once(self.live_dir, PaperStateGateway(self.paper_dir),
                             volume_tolerance=1e-6, now=now)
 
 
@@ -1605,7 +1613,8 @@ def _paper_cli_env(tmp_path, *,
                  "volume_step": VOL[1], "volume_max": VOL[2]}}))
     from mt5quant.costs.spread import SpreadStat
     SpreadModel(
-        {SYMBOL: {h: SpreadStat(median=0.02, p90=0.5, p99=0.8, n=100)
+        {SYMBOL: {h: SpreadStat(median=0.02, p90=0.5, p99=0.8, n=100,
+                                n_days=100)
                   for h in range(24)}},
         {SYMBOL: 0.02}, mode="absolute").save(str(tmp_path / "spread.json"))
     env = {
@@ -1666,11 +1675,11 @@ def test_t34_paper_dry_run_offline_end_to_end(tmp_path, capsys):
                                 f"heartbeat-{MAGIC}.json"))
     assert hb["dry_run"] is True and hb["last_decision"] is not None
     assert hb["last_error"] is None
-    # 影子账本：BuyHold 开多仓（成交=模拟），意图 confirmed。BuyHold 无
-    # SL/TP 规则 → LiveSizer 用 fallback_stop_atr=1.0：距离 1.0×ATR(≈2.0)
-    # → 10000×0.5%/2.0/100 = 0.25 手
-    paper_state = os.path.join(str(tmp_path / "data"), "live", "paper",
-                               "state.json")
+    # 影子账本（R6/C3：按策略落 paper/state-<magic>.json）：BuyHold 开多仓
+    # （成交=模拟），意图 confirmed。BuyHold 无 SL/TP 规则 → LiveSizer 用
+    # fallback_stop_atr=1.0：距离 1.0×ATR(≈2.0) → 10000×0.5%/2.0/100 = 0.25 手
+    paper_dir = os.path.join(str(tmp_path / "data"), "live", "paper")
+    paper_state = os.path.join(paper_dir, f"state-{MAGIC}.json")
     with open(paper_state, encoding="utf-8") as f:
         book = json.load(f)
     assert len(book["positions"]) == 1
@@ -1680,14 +1689,15 @@ def test_t34_paper_dry_run_offline_end_to_end(tmp_path, capsys):
                                 f"expected-{MAGIC}.json"))
     assert it["status"] == "confirmed" and it["volume"] == pytest.approx(0.25)
 
-    # 对账 / 风控复核同一状态文件（--paper-state，不连网关）
+    # 对账 / 风控复核同一状态目录（--paper-state，不连网关；聚合全部
+    # state-<magic>.json）
     rec = load_script("live_reconcile")
     assert rec.main(["--data-dir", str(tmp_path / "data"), "--once",
-                     "--paper-state", paper_state]) == 0
+                     "--paper-state", paper_dir]) == 0
     risk_mod = load_script("risk_process")
     assert risk_mod.main(["--config", env["risk"],
                           "--data-dir", str(tmp_path / "data"), "--once",
-                          "--paper-state", paper_state]) == 0
+                          "--paper-state", paper_dir]) == 0
 
 
 def test_t34_live_runner_paper_mode_wires_full_stack(tmp_path, monkeypatch,
@@ -1731,7 +1741,7 @@ def test_t34_live_runner_paper_mode_wires_full_stack(tmp_path, monkeypatch,
     assert broker.market_orders == []            # 真实 trading 通道绝未被下单
     assert broker.positions() == []              # 替身账户无持仓
     paper_state = os.path.join(str(tmp_path / "data"), "live", "paper",
-                               "state.json")
+                               f"state-{MAGIC}.json")   # R6/C3：按策略落盘
     with open(paper_state, encoding="utf-8") as f:
         book = json.load(f)
     assert len(book["positions"]) == 1           # 成交在影子账本
@@ -1739,4 +1749,100 @@ def test_t34_live_runner_paper_mode_wires_full_stack(tmp_path, monkeypatch,
                                 f"expected-{MAGIC}.json"))
     assert it["status"] == "confirmed" and it["volume"] == \
         pytest.approx(book["positions"][0]["volume"])
+
+
+# ================================================================ R6（第六轮审核 C2）
+# 外部出场状态机：未决持久化 + 执行器开仓第二道防线（复现 A/B 反转）
+
+def test_r6_manual_close_executor_before_reconcile_no_reopen(tmp_path,
+                                                              monkeypatch):
+    """C2 复现 B 反转：人工平仓后**执行器先于对账进程运行**——immediate
+    也不重开（原缺陷：直接重开并把新仓确认为合法，绕过人工确认）；
+    live_ack_external 确认后恢复。"""
+    stack = LiveStack(tmp_path)
+    _, rr1 = stack.round(T1, "up")
+    assert rr1.action == "open"
+    ticket = stack.broker.positions(SYMBOL)[0].ticket
+    stack.broker.close_external(ticket, profit=5.0, comment="manual",
+                                reason=DEAL_REASON_CLIENT)
+
+    # 执行器先跑（对账还没写 pause）：未解释出场 → 不重开
+    _, rr2 = stack.round(T2, "up")
+    assert rr2.action == "blocked_external_exit"
+    assert len(stack.broker.market_orders) == 1          # 没有重开
+    assert intent_of(stack.live_dir)["volume"] == pytest.approx(0.16)
+    state = read_json(os.path.join(stack.live_dir, f"state-{MAGIC}.json"))
+    assert str(ticket) in state["pending_external_exits"]
+    assert "EXTERNAL_EXIT" in alerts_text(stack.live_dir)
+
+    # 对账此刻才跑：意图 0.16 vs 实际 0 → 不一致 + 暂停（叠加，非唯一防线）
+    rc, _ = stack.reconcile_once(now=T2 + timedelta(seconds=30))
+    assert rc == 1
+    assert read_json(pause_file(stack.live_dir))["paused"] is True
+
+    # 人工确认：未决清空 → 暂停解除 → 恢复开仓
+    ack = load_script("live_ack_external")
+    monkeypatch.setattr(ack, "_open_gateway",
+                        lambda cfg: FakeGateway(stack.broker))
+    rc_ack = ack.main(["--data-dir", str(tmp_path), "--magic", str(MAGIC),
+                       "--reason", "人工平仓已核对"])
+    assert rc_ack == 0
+    rc2, _ = stack.reconcile_once(now=T2 + timedelta(minutes=1))
+    assert rc2 == 0
+    assert not read_json(pause_file(stack.live_dir))["paused"]
+    _, rr3 = stack.round(T3, "up")
+    assert rr3.action == "open"
+    assert len(stack.broker.market_orders) == 2
+
+
+def test_r6_deal_history_delayed_two_rounds_then_explained_recovers(tmp_path):
+    """C2 复现 A 反转：成交历史延迟两轮才可见——未决出场持久化、持续重查、
+    期间不开新仓（不丢事件、不重开）；第三轮解释为 SL → 意图=实际、
+    暂停解除、恢复开仓。"""
+    stack = LiveStack(tmp_path)
+    stack.broker.deals_delay_polls = 2        # 平仓成交要经 2 次查询才可见
+    _, rr1 = stack.round(T1, "up")
+    assert rr1.action == "open"
+    ticket = stack.broker.positions(SYMBOL)[0].ticket
+    stack.broker.close_external(ticket, profit=-30.0, comment="[sl]",
+                                reason=DEAL_REASON_SL)
+
+    # 第 1 轮：查无成交 → 未决持久化 + 告警；immediate 也不重开
+    _, rr2 = stack.round(T2, "up")
+    assert rr2.action == "blocked_external_exit"
+    state = read_json(os.path.join(stack.live_dir, f"state-{MAGIC}.json"))
+    assert str(ticket) in state["pending_external_exits"]
+    assert intent_of(stack.live_dir)["volume"] == pytest.approx(0.16)  # 不洗白
+    assert "EXTERNAL_EXIT" in alerts_text(stack.live_dir)
+
+    # 对账：意图 0.16 vs 实际 0 → 失败 + 暂停（复现 A 的症状如实呈现）
+    rc, _ = stack.reconcile_once(now=T2 + timedelta(seconds=30))
+    assert rc == 1
+    assert read_json(pause_file(stack.live_dir))["paused"] is True
+
+    # 第 2 轮：历史仍不可见 → 仍未决、继续挡（事件没有丢失）
+    _, rr3 = stack.round(T3, "up")
+    assert rr3.action == "blocked_external_exit"
+    assert len(stack.broker.market_orders) == 1
+    state3 = read_json(os.path.join(stack.live_dir, f"state-{MAGIC}.json"))
+    assert str(ticket) in state3["pending_external_exits"]
+
+    # 第 3 轮：历史可见 → SL 解释成功 → 未决清空、意图=实际（空仓）；
+    # 开仓腿此刻只被残留的对账暂停挡（叠加防线），不再是外部出场防线
+    _, rr4 = stack.round(T4, "up")
+    assert rr4.action == "risk_rejected"
+    assert "reconcile_paused" in rr4.error
+    it = intent_of(stack.live_dir)
+    assert it["cause"].startswith("external_exit:")
+    assert it["volume"] == 0.0
+    state4 = read_json(os.path.join(stack.live_dir, f"state-{MAGIC}.json"))
+    assert state4["pending_external_exits"] == {}
+
+    # 对账一致 → 暂停解除 → 恢复开仓
+    rc2, _ = stack.reconcile_once(now=T4 + timedelta(seconds=30))
+    assert rc2 == 0
+    assert not read_json(pause_file(stack.live_dir))["paused"]
+    _, rr5 = stack.round(T5, "up")
+    assert rr5.action == "open"
+    assert len(stack.broker.market_orders) == 2
 

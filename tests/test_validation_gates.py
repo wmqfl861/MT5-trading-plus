@@ -548,6 +548,13 @@ def gate_argv(root, cards_dir, ledger, gates, *extra):
             "--costs", "zero", "--gates", gates, *extra]
 
 
+def patch_as_main_store(monkeypatch, mod):
+    """R6/C6：G5 只认主库（--main-store）——生产 classify_store 只认
+    data/REPO_ROOT·data；测试的 tmp 数据根按"主库布局"使用（lockbox.json
+    + bars + specs 俱全），须显式伪装为主库并带 --main-store。"""
+    monkeypatch.setattr(mod, "classify_store", lambda p: "main")
+
+
 def test_gate_cli_refuses_tampered_frozen_sha(tmp_path, monkeypatch, capsys):
     mod = load_bt()
     root = make_data_root(tmp_path)
@@ -604,7 +611,9 @@ def test_gate_cli_g5_requires_approve_flag(tmp_path, monkeypatch, capsys):
     cards_dir = write_card(tmp_path)
     ledger = tmp_path / "l.sqlite"
     patch_card_git(monkeypatch, mod)
-    rc = mod.main(gate_argv(root, cards_dir, ledger, "G5"))
+    # R6/C6：G5 一律要求 --main-store（tmp 根按主库布局伪装）
+    patch_as_main_store(monkeypatch, mod)
+    rc = mod.main(gate_argv(root, cards_dir, ledger, "G5", "--main-store"))
     assert rc == 1
     assert "--approve" in capsys.readouterr().out
     with Ledger(ledger) as led:
@@ -942,6 +951,8 @@ def test_gate_cli_g5_orchestration_started_then_done(tmp_path, monkeypatch,
     cards_dir = write_card(tmp_path)
     ledger = tmp_path / "l.sqlite"
     patch_card_git(monkeypatch, mod)
+    # R6/C6：G5 只认主库——tmp 根按主库布局伪装并显式 --main-store
+    patch_as_main_store(monkeypatch, mod)
     from mt5quant.backtest.report import data_sha256
     research = bars[bars["time"] < cutoff].reset_index(drop=True)
     with Ledger(ledger) as led:
@@ -958,8 +969,9 @@ def test_gate_cli_g5_orchestration_started_then_done(tmp_path, monkeypatch,
                           "params": {}},
                          {"train_range": [100, 150], "test_range": [150, 200],
                           "params": {}}]})
-    rc = mod.main(gate_argv(root, cards_dir, ledger, "G5", "--approve",
-                            "--approved-by", "user", "--params", "{}"))
+    rc = mod.main(gate_argv(root, cards_dir, ledger, "G5", "--main-store",
+                            "--approve", "--approved-by", "user",
+                            "--params", "{}"))
     out = capsys.readouterr().out
     assert "G5" in out
     with Ledger(ledger) as led:

@@ -262,6 +262,11 @@ class RiskGate:
         self._spread_model = spread_model
         self._session_policy = (session_policy if session_policy is not None
                                 else process.session_policy)
+        # R6/C4：点差闸门的每小时最少覆盖天数从**会话策略**取（构造时定格，
+        # 与回测 entry_policy_for 同一来源 config/sessions.toml）——n_days
+        # 不足的小时按 missing_hour_policy="forbid" 禁入，不能只看 stat.p90。
+        self._spread_min_days = (self._session_policy.min_days_per_hour
+                                 if self._session_policy is not None else 0)
         self._clock = clock or (lambda: datetime.now(timezone.utc)
                                 .replace(tzinfo=None))
 
@@ -333,12 +338,27 @@ class RiskGate:
 
     def _spread_check(self, symbol: str, quote: tuple[float, float],
                       now: datetime) -> RiskDecision | None:
+        """点差闸门（M10 + R6/C4）。
+
+        stat 查询带上覆盖天数判定（阈值 min_days_per_hour 构造时从会话策略
+        取）：小时无统计（stat 抛 ValueError）**或 n_days 不足**都按
+        missing_hour_policy="forbid" 禁入——此前只取 stat.p90，一天样本的
+        小时在配置要求 20 天时仍放行。p90 阈值比较的口径不变（relative 按
+        比率、absolute 按价差）。
+        """
         bid, ask = quote
         hour_ny = now.replace(tzinfo=timezone.utc).astimezone(
             ZoneInfo(BUCKET_TZ)).hour
         model = self._spread_model
         try:
             stat = model.stat(hour_ny, symbol=symbol)
+            if stat.n_days < self._spread_min_days:
+                return RiskDecision(
+                    False,
+                    f"spread_gate: {symbol} 纽约小时 {hour_ny} 点差统计覆盖不足"
+                    f"（n_days={stat.n_days} < min_days_per_hour="
+                    f"{self._spread_min_days}，missing_hour_policy=forbid，"
+                    "该小时禁入；回补 tick 后重建 data/costs/spread_model.json）")
             p90 = stat.p90
         except ValueError:
             return RiskDecision(

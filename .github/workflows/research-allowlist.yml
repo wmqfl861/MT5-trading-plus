@@ -4,9 +4,12 @@ name: research-allowlist
 # 本地 pre-commit 钩子的角色取自环境变量 MT5QUANT_COMMIT_ROLE——可自报
 # admin 绕过（第四轮审核 H4）；CI 侧对 research/** 分支发起的 PR 用
 # git diff --name-status origin/main...HEAD 按研究角色规则检查，违规即失败。
-# 规则与 scripts/hooks/pre-commit-readonly-paths 是同一份代码：workflow
-# 里 python -c 装载该文件并调用 check_paths——改钩子或改本 workflow 都
-# 改不动"另一份"规则，因为只有一份。
+# 规则代码与 scripts/hooks/pre-commit-readonly-paths 是同一份，但**装载自
+# main 基准**（第六轮审核 I4）：PR 可以同时改钩子让检查自通过（自己检查
+# 自己），所以本 workflow 双 checkout——PR 合并态工作树只提供 diff 数据，
+# 检查器与规则取自第二个 checkout 的 main 基准（research 角色对
+# scripts/hooks/ 与 .github/ 只读，改不动 main 上的基准版本；本 workflow
+# 自身的改动会触发全量 pytest 工作流评审）。
 # 非 research/** 头分支的 PR（管理员/主会话分支）跳过检查并留 notice；
 # 真正的强制力来自 main 分支保护把本检查设为 required（用户操作，见
 # docs/p6/permissions.md 的 U0 清单——agent 不代办）。
@@ -27,9 +30,16 @@ jobs:
     env:
       PYTHONUTF8: "1"
     steps:
+      # PR 合并态（pull_request 事件的缺省 ref）：只作为待检查的 diff 数据
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0        # origin/main...HEAD 三点 diff 需要 main 历史
+      # main 基准（I4）：检查器与规则从这里装载，PR 改不到这份数据
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          path: baseline
+          fetch-depth: 1
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -41,14 +51,18 @@ jobs:
             echo "::notice title=research-allowlist::head branch '$head' is not research/** - allowlist not enforced (admin/main-session branch)"
             exit 0
           fi
+          # fail-closed：基准钩子不在（checkout 布局变化）即失败，绝不回退到 PR 版
+          test -f baseline/scripts/hooks/pre-commit-readonly-paths
           python - <<'PY'
           import subprocess
           import sys
           from importlib.machinery import SourceFileLoader
           import importlib.util
 
-          loader = SourceFileLoader("pre_commit_readonly_paths_ci",
-                                    "scripts/hooks/pre-commit-readonly-paths")
+          # I4：装载 main 基准版钩子（baseline/），不装载 PR 工作树里的版本——
+          # PR 同时篡改钩子与改动本体时，检查仍按 main 规则执行。
+          loader = SourceFileLoader("pre_commit_readonly_paths_baseline",
+                                    "baseline/scripts/hooks/pre-commit-readonly-paths")
           spec = importlib.util.spec_from_loader(loader.name, loader)
           mod = importlib.util.module_from_spec(spec)
           loader.exec_module(mod)
@@ -57,7 +71,8 @@ jobs:
               ["git", "diff", "--name-status", "origin/main...HEAD"],
               capture_output=True, text=True, check=True).stdout
           changes = mod.parse_staged(out)
-          print(f"research-allowlist: {len(changes)} changed path(s) vs origin/main")
+          print(f"research-allowlist: {len(changes)} changed path(s) vs origin/main"
+                " (checker loaded from main baseline)")
           violations = mod.check_paths(changes, role="research")
           if violations:
               print("X research-allowlist: PR contains changes outside the research"

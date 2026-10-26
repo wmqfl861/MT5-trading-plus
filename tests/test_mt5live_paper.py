@@ -12,7 +12,12 @@
 - 外部出场 reason 识别闭环：paper 的 SL 平仓被 LiveExecutor 识别为
   external_exit（已解释、不暂停对账）；
 - --paper-state：PaperAccountView / PaperStateGateway 从状态文件构造只读
-  账户视图（risk_process / live_reconcile 用，不碰真实账户）。
+  账户视图（risk_process / live_reconcile 用，不碰真实账户）；
+- R6/C3：每策略独立状态文件 paper/state-<magic>.json（票号区间按 magic
+  派生防撞号）+ 聚合视图每查询重读（多运行器并行、常驻风控/对账可见
+  最新成交与浮盈快照）；
+- R6/I5：live_runner 的点差模型加载兼容 build_cost_model.py 的 v2 缓存
+  包装（校验 version/sha 后取内层模型；旧裸模型文件兼容）。
 
 影子模式全链路一条龙（决策→闸门→paper 成交→意图→对账→全平）在
 tests/test_mt5live_integration.py（T34 场景）。
@@ -34,6 +39,7 @@ from mt5live.paper import (
     PaperAccountView,
     PaperBroker,
     PaperStateGateway,
+    paper_state_path,
 )
 from mt5live.riskproc import RiskProcess, load_risk_config
 from mt5quant.strategies.base import ExitRules
@@ -602,6 +608,361 @@ def test_bar_quote_market_quotes_last_closed_bar(tmp_path):
                            timeframe="M15")
     with pytest.raises(DataUnavailableError):
         empty.quote(SYMBOL)
+
+
+# ================================================================ R6（第六轮审核）
+# C3：影子账户多写者——每策略独立状态文件 state-<magic>.json（票号区间按
+# magic 派生防撞号）+ 聚合视图每查询重读（风控/对账不再构造时快照一次）；
+# I5：实盘点差模型加载兼容 build_cost_model.py 的 v2 缓存包装。
+
+def _read_json(path) -> dict:
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def paper_dir(tmp_path) -> str:
+    d = tmp_path / "live" / "paper"
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
+
+def make_magic_paper(tmp_path, magic: int, market=None, *,
+                     balance: float = 10_000.0, clock=None) -> PaperBroker:
+    """按 live_runner 的生产布局构造每策略影子券商（state-<magic>.json）。"""
+    return PaperBroker(
+        market if market is not None else QuoteMarket(),
+        state_path=paper_state_path(str(tmp_path / "live"), magic),
+        contract_sizes={SYMBOL: CONTRACT},
+        balance=balance, magic=magic,
+        clock=clock if clock is not None else (lambda: T0))
+
+
+def test_r6_two_brokers_separate_state_files_tickets_and_aggregate(tmp_path):
+    """C3 复现反转：两个运行器（不同 magic）并行开仓——各写各的
+    state-<magic>.json 互不覆盖（原缺陷：磁盘只剩第二个 magic）、票号区间
+    按 magic 派生不撞号（原缺陷：两实例同发 7000001）、聚合视图（paper
+    目录）持仓合并/余额求和看到全部。"""
+    market = QuoteMarket()
+    a = make_magic_paper(tmp_path, MAGIC, market)
+    b = make_magic_paper(tmp_path, MAGIC + 1, market)
+    ra = a.market_order(SYMBOL, "buy", 0.1, magic=MAGIC)
+    rb = b.market_order(SYMBOL, "sell", 0.05, magic=MAGIC + 1)
+
+    # 两状态文件各自完整（互不整份覆盖）
+    fa = os.path.join(paper_dir(tmp_path), f"state-{MAGIC}.json")
+    fb = os.path.join(paper_dir(tmp_path), f"state-{MAGIC + 1}.json")
+    assert os.path.exists(fa) and os.path.exists(fb)
+    da, db = _read_json(fa), _read_json(fb)
+    assert len(da["positions"]) == 1 and da["positions"][0]["magic"] == MAGIC
+    assert len(db["positions"]) == 1
+    assert db["positions"][0]["magic"] == MAGIC + 1
+    assert len(da["deals"]) == 1 and len(db["deals"]) == 1
+    assert da["balance"] == pytest.approx(10_000.0)
+
+    # 票号区间按 magic 派生（magic*10^9 起跳）：跨运行器不撞号
+    ta, tb = ra.order_ticket, rb.order_ticket
+    assert ta != tb
+    assert MAGIC * 10**9 < ta < (MAGIC + 1) * 10**9
+    assert (MAGIC + 1) * 10**9 < tb < (MAGIC + 2) * 10**9
+    assert MAGIC * 10**9 < ra.deal_ticket < (MAGIC + 1) * 10**9
+    assert (MAGIC + 1) * 10**9 < rb.deal_ticket < (MAGIC + 2) * 10**9
+
+    # 重启续号仍在自己的区间内（不与另一 magic 相撞）
+    a2 = make_magic_paper(tmp_path, MAGIC, market)
+    ra2 = a2.market_order(SYMBOL, "buy", 0.01, magic=MAGIC)
+    assert ra2.order_ticket > ta
+    assert MAGIC * 10**9 < ra2.order_ticket < (MAGIC + 1) * 10**9
+
+    # 聚合视图（目录模式）：持仓合并、余额求和、权益 = 各文件权益之和
+    view = PaperAccountView(paper_dir(tmp_path))
+    assert len(view.positions()) == 3            # a 两笔 + b 一笔
+    assert {p.magic for p in view.positions()} == {MAGIC, MAGIC + 1}
+    st = view.state()
+    assert st.currency == "USD"
+    assert st.balance == pytest.approx(20_000.0)
+    assert st.equity == pytest.approx(
+        _read_json(fa)["equity"] + _read_json(fb)["equity"])
+    assert len(view.deals(T0 - timedelta(hours=1),
+                          T0 + timedelta(hours=1))) == 3
+
+
+def test_r6_aggregate_view_refreshes_every_query(tmp_path):
+    """C3 复现反转：视图构造后另一"进程"写入的状态（新文件/新仓/平仓），
+    下一次查询即可见——常驻风控/对账每轮拿到新快照，不再构造时读一次。"""
+    market = QuoteMarket()
+    a = make_magic_paper(tmp_path, MAGIC, market)
+    ra = a.market_order(SYMBOL, "buy", 0.1, magic=MAGIC)
+    view = PaperAccountView(paper_dir(tmp_path))
+    assert len(view.positions()) == 1
+
+    # 另一运行器（另一"进程"）开仓：新状态文件 + 新仓 → 下一查询可见
+    b = make_magic_paper(tmp_path, MAGIC + 1, market)
+    rb = b.market_order(SYMBOL, "sell", 0.05, magic=MAGIC + 1)
+    assert len(view.positions()) == 2
+    assert rb.order_ticket in {p.ticket for p in view.positions()}
+    assert view.state().balance == pytest.approx(20_000.0)
+    assert len(view.deals(T0 - timedelta(hours=1),
+                          T0 + timedelta(hours=1))) == 2
+
+    # 同一文件的后续变更（平仓）下一查询也可见
+    a.close_position(ra.order_ticket)
+    assert len(view.positions()) == 1
+    assert view.deals_for_position(ra.order_ticket)[1].entry == "out"
+    assert view.latest_update_utc() is not None
+
+
+def test_r6_daily_loss_aggregates_across_magics(tmp_path):
+    """C3：日亏按聚合口径——两个 magic 各亏 25.5（单独均未触 50 上限），
+    聚合 -51 触发全平；单策略文件视图不触发（兼容单策略口径不变）。"""
+    live = tmp_path / "live"
+    live.mkdir(parents=True)
+    market = QuoteMarket()
+    magics = (MAGIC, MAGIC + 1)
+    brokers = [make_magic_paper(tmp_path, m, market) for m in magics]
+    for paper, magic in zip(brokers, magics):
+        paper.market_order(SYMBOL, "buy", 0.025, sl=95.0, magic=magic)
+    market.set_quote(90.0, 90.2)                # 各触发 SL：亏 25.5
+    for paper in brokers:
+        closed = paper.poll_protective(T0 + timedelta(minutes=1))
+        assert len(closed) == 1
+        assert closed[0].profit == pytest.approx(-25.5)
+
+    for m in (MAGIC, MAGIC + 1):
+        (live / f"heartbeat-{m}.json").write_text(json.dumps({
+            "runner_alive": True,
+            "ts": (T0 + timedelta(minutes=2)).isoformat() + "+00:00"}),
+            encoding="utf-8")
+
+    mod = load_script("risk_process")
+    risk_toml = _write(live.parent / "risk.toml", RISK_TOML)
+    process = RiskProcess(load_risk_config(risk_toml), live_dir=str(live))
+    now = T0 + timedelta(minutes=2)
+
+    # 单策略（文件视图）：-25.5 未触 -50 上限 → 不触发
+    single = mod.build_snapshot(
+        PaperStateGateway(paper_state_path(str(live), MAGIC)), now)
+    res_single = process.run_cycle(single, now)
+    assert not res_single.daily_loss_breached
+    assert not (live / "commands" / "flatten.json").exists()
+
+    # 聚合（目录视图）：-51 ≤ -50 → 触发全平（当日成交跨 magic 合并）
+    snap = mod.build_snapshot(PaperStateGateway(paper_dir(tmp_path)), now)
+    assert len(snap.deals) == 4 and snap.positions == ()
+    res = process.run_cycle(snap, now)
+    assert res.daily_loss_breached and res.flatten_written
+    assert (live / "commands" / "flatten.json").exists()
+
+
+def test_r6_poll_protective_persists_equity_snapshot_without_fills(tmp_path):
+    """C3 复现反转：无保护性成交的轮询也把最新浮盈与 equity 快照时间戳
+    落盘（原缺陷：本地浮亏 -102，磁盘仍是开仓时的 -2）。"""
+    market = QuoteMarket()
+    paper = make_magic_paper(tmp_path, MAGIC, market)
+    paper.market_order(SYMBOL, "buy", 0.1, sl=95.0, magic=MAGIC)
+    state_file = paper_state_path(str(tmp_path / "live"), MAGIC)
+    # 开仓时快照：bid 100.0 → floating = (100.0 − 100.2) × 0.1 × 100 = −2
+    assert _read_json(state_file)["equity"] == pytest.approx(10_000.0 - 2.0)
+
+    market.set_quote(98.98, 99.06)              # 未触发 SL（95）但浮亏加深
+    now = T0 + timedelta(minutes=3)
+    assert paper.poll_protective(now) == []     # 本轮无成交
+    data = _read_json(state_file)
+    # 落盘浮盈跟上本地：(98.98 − 100.2) × 0.1 × 100 = −12.2
+    assert data["positions"][0]["profit"] == pytest.approx(-12.2)
+    assert data["equity"] == pytest.approx(10_000.0 - 12.2)
+    assert data["equity"] == pytest.approx(paper.state().equity)
+    # equity 快照时间戳 = 本轮轮询时刻（聚合视图取最新 ts 的数据源）
+    from mt5live.monitor import parse_iso
+    assert parse_iso(data["equity_ts_utc"]) == now
+    view = PaperAccountView(state_file)
+    assert view.latest_update_utc() == now
+
+
+def test_r6_view_skips_unreadable_state_file_with_alert(tmp_path, capsys):
+    """C3：读失败的状态文件按空处理并告警（stderr + alerts.log），
+    其余文件照常聚合——瞬时坏文件不打崩常驻风控/对账循环。"""
+    market = QuoteMarket()
+    a = make_magic_paper(tmp_path, MAGIC, market)
+    a.market_order(SYMBOL, "buy", 0.1, magic=MAGIC)
+    bad = os.path.join(paper_dir(tmp_path), "state-99999999.json")
+    with open(bad, "w", encoding="utf-8") as f:
+        f.write("{ not json")
+
+    live = tmp_path / "live"
+    gw = PaperStateGateway(paper_dir(tmp_path), alert_dir=str(live))
+    assert len(gw.account.positions()) == 1     # 坏文件按空，好文件照常
+    assert gw.account.state().balance == pytest.approx(10_000.0)
+    err = capsys.readouterr().err
+    assert "state-99999999.json" in err and "读取失败" in err
+    alerts = (live / "alerts.log").read_text(encoding="utf-8")
+    assert "ACCOUNT_POLL_ERROR" in alerts
+    assert "state-99999999.json" in alerts
+
+
+def test_r6_view_dir_without_state_files_raises(tmp_path):
+    """目录/路径下没有任何 state-*.json → 构造即报不可用（fail-fast：
+    运行器还没写出影子状态时不许静默当空账户跑）；旧版单文件 state.json
+    在目录模式下不聚合。"""
+    from mt5gw.errors import DataUnavailableError
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(DataUnavailableError, match="state-"):
+        PaperAccountView(str(empty))
+    with pytest.raises(DataUnavailableError):
+        PaperAccountView(str(tmp_path / "nonexistent"))
+    legacy = tmp_path / "legacy" / "paper"
+    legacy.mkdir(parents=True)
+    (legacy / "state.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(DataUnavailableError):
+        PaperAccountView(str(legacy))
+
+
+def test_r6_live_runner_paper_state_file_warns_legacy(tmp_path, capsys):
+    """live_runner 的每策略状态文件路径 + 旧版单文件布局检测告警
+    （旧 state.json 不再读写，只提示人工核对后归档）。"""
+    mod = load_script("live_runner")
+    live = tmp_path / "live"
+    state = mod.paper_state_file(str(live), MAGIC)
+    assert state == paper_state_path(str(live), MAGIC)
+    assert os.path.basename(state) == f"state-{MAGIC}.json"
+    assert "旧版" not in capsys.readouterr().out     # 无旧文件：不告警
+
+    legacy = live / "paper" / "state.json"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("{}", encoding="utf-8")
+    assert mod.paper_state_file(str(live), MAGIC) == state
+    out = capsys.readouterr().out
+    assert "state.json" in out and "旧版" in out
+
+
+# ---------------------------------------------------------------- I5：点差缓存包装
+
+def _mk_spread_wrapper(path, *, version=2, symbols=(SYMBOL,), sha=None) -> None:
+    """按 build_cost_model.py 的产物格式写缓存包装（v2：version/mode/
+    watermarks/model/model_sha256/overshoot…）。"""
+    import hashlib
+    from mt5quant.costs.spread import SpreadModel, SpreadStat
+    model = SpreadModel(
+        {s: {h: SpreadStat(median=0.02, p90=0.5, p99=0.8, n=100)
+             for h in range(24)} for s in symbols},
+        {s: 0.02 for s in symbols}, mode="absolute")
+    payload = model.to_dict()
+    digest = hashlib.sha256(json.dumps(
+        payload, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")).hexdigest()
+    doc = {
+        "version": version, "mode": "absolute", "sampling": "tick",
+        "watermarks": {s: {"rows": 1, "first_msc": 0, "last_msc": 1}
+                       for s in symbols},
+        "model": payload,
+        "model_sha256": digest if sha is None else sha,
+        "built_at_utc": "2026-10-26T00:00:00+00:00",
+        "overshoot": {"per_symbol": {}},
+        "overshoot_sha256": "0" * 64,
+    }
+    Path(path).write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+
+
+def test_r6_live_spread_loader_accepts_v2_cache_wrapper(tmp_path):
+    """I5 复现反转：build_cost_model.py 的 v2 包装缓存（当前默认
+    data/costs/spread_model.json 的格式）经 live 加载路径成功取出内层模型
+    （原缺陷：SpreadModel.load 直读包装 → bucket_tz=None 崩）。"""
+    mod = load_script("live_runner")
+    path = str(tmp_path / "spread_model.json")
+    _mk_spread_wrapper(path)
+    model = mod.load_spread_model_for_live(path, SYMBOL)
+    assert model.mode == "absolute"
+    assert model.stat(7, symbol=SYMBOL).p90 == pytest.approx(0.5)
+    assert model.overall_median(SYMBOL) == pytest.approx(0.02)
+
+
+def test_r6_live_spread_loader_rejects_bad_wrapper_hinting_builder(tmp_path):
+    """I5：包装缺键/版本不符/sha 不符/品种缺失/四不像 → 报错指路
+    scripts/build_cost_model.py，绝不静默。"""
+    mod = load_script("live_runner")
+    p1 = str(tmp_path / "tampered.json")            # sha 不符（被手改/写坏）
+    _mk_spread_wrapper(p1, sha="0" * 64)
+    with pytest.raises(ValueError, match="build_cost_model"):
+        mod.load_spread_model_for_live(p1, SYMBOL)
+
+    p2 = str(tmp_path / "v3.json")                  # 版本不受支持
+    _mk_spread_wrapper(p2, version=3)
+    with pytest.raises(ValueError, match="version"):
+        mod.load_spread_model_for_live(p2, SYMBOL)
+
+    p3 = str(tmp_path / "nokey.json")               # 缺 model_sha256 键
+    _mk_spread_wrapper(p3)
+    doc = _read_json(p3)
+    del doc["model_sha256"]
+    Path(p3).write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(ValueError, match="build_cost_model"):
+        mod.load_spread_model_for_live(p3, SYMBOL)
+
+    p4 = str(tmp_path / "othersym.json")            # 品种不在缓存
+    _mk_spread_wrapper(p4, symbols=("BTCUSD",))
+    with pytest.raises(ValueError, match="不在点差缓存"):
+        mod.load_spread_model_for_live(p4, SYMBOL)
+
+    p5 = str(tmp_path / "junk.json")                # 既非包装也非裸模型
+    Path(p5).write_text(json.dumps({"foo": 1}), encoding="utf-8")
+    with pytest.raises(ValueError, match="build_cost_model"):
+        mod.load_spread_model_for_live(p5, SYMBOL)
+
+
+def test_r6_live_spread_loader_accepts_bare_model(tmp_path):
+    """I5：旧裸模型文件（SpreadModel.save 直写）保持兼容。"""
+    from mt5quant.costs.spread import SpreadModel, SpreadStat
+    mod = load_script("live_runner")
+    path = str(tmp_path / "bare.json")
+    SpreadModel(
+        {SYMBOL: {h: SpreadStat(median=0.02, p90=0.5, p99=0.8, n=100)
+                  for h in range(24)}},
+        {SYMBOL: 0.02}, mode="absolute").save(path)
+    model = mod.load_spread_model_for_live(path, SYMBOL)
+    assert model.stat(0, symbol=SYMBOL).median == pytest.approx(0.02)
+
+
+def test_r6_build_executor_stack_loads_v2_wrapper_via_live_path(tmp_path,
+                                                                capsys):
+    """I5 集成检查：构建器产物直接交给 live 启动装配
+    （build_executor_stack——--paper/--loop 的同一加载路径）→ 装配成功；
+    坏包装 → 干净报错返回 None（退出码 2 路径），不再 bucket_tz=None 崩栈。"""
+    import argparse
+    from mt5live.config import LiveConfig
+    mod = load_script("live_runner")
+    live = tmp_path / "live"
+    live.mkdir(parents=True)
+    specs = _write(tmp_path / "specs.json", json.dumps(
+        {SYMBOL: {"contract_size": CONTRACT, "volume_min": 0.01,
+                  "volume_step": 0.01, "volume_max": 1.0}}))
+    risk = _write(tmp_path / "risk.toml", RISK_TOML)
+    good = str(tmp_path / "spread_model.json")
+    _mk_spread_wrapper(good)
+
+    def _args(spread):
+        return argparse.Namespace(risk_config=risk, sessions_config=None,
+                                  no_spread_gate=False, spread_model=spread)
+
+    cfg = LiveConfig(
+        symbol=SYMBOL, timeframe="M15",
+        strategy="mt5quant.strategies.library.buy_hold:BuyHold",
+        magic=MAGIC, lookback_bars=5, volume_lots=0.1,
+        data_root=str(tmp_path))
+    market = QuoteMarket()
+    strategy = mod.load_strategy(cfg.strategy)()
+    ex = mod.build_executor_stack(
+        market, market, market, cfg=cfg, strategy=strategy,
+        args=_args(good), live_dir=str(live), specs_path=specs, gw=None)
+    assert ex is not None                       # v2 包装经 live 路径装配成功
+
+    bad = str(tmp_path / "bad.json")
+    _mk_spread_wrapper(bad, sha="0" * 64)
+    ex2 = mod.build_executor_stack(
+        market, market, market, cfg=cfg, strategy=strategy,
+        args=_args(bad), live_dir=str(live), specs_path=specs, gw=None)
+    assert ex2 is None                          # 坏包装：干净退出（exit 2）
+    out = capsys.readouterr().out
+    assert "点差模型加载失败" in out and "build_cost_model" in out
 
 
 def _write(path: Path, text: str) -> str:

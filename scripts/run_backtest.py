@@ -319,13 +319,17 @@ def load_spread_model_cache(path: str, symbol: str, *,
     3) 口径（mode）与请求一致；4) 品种在模型中且 tick 水位（rows/first/last）
     与当前库逐项一致。watermark=None（tick 库没了）而缓存还在属环境异常，同报错。
 
+    采样口径（T36/R6-I2）从**模型负载**读取（to_dict 自带 sampling 键；无键的
+    旧文件按 "tick"，与 SpreadModel.load 同规）——重建 SpreadModel 时不落回
+    缺省值，否则 cost_model_version 会把 tick 口径的缓存错标成 bar_open_m1。
+
     require_watermark=False（T27 研究库）：研究库 data_research **有意**不含
     tick（tick 对研究账户拒读），水位核验无从做起——缓存必须自带水位
     （第 4 检的前半仍执行），与主库 tick 的一致性由导出方
     scripts/export_research_store.py 在导出时把关。
     """
     from mt5quant.costs import SpreadModel
-    from mt5quant.costs.spread import BUCKET_TZ, SpreadStat
+    from mt5quant.costs.spread import BUCKET_TZ, SAMPLINGS, SpreadStat
 
     try:
         with open(path, encoding="utf-8") as f:
@@ -349,11 +353,16 @@ def load_spread_model_cache(path: str, symbol: str, *,
         raise ValueError(
             f"点差缓存 bucket_tz={payload.get('bucket_tz')!r}"
             f"（缺标注=UTC 分桶的旧文件），与纽约本地小时口径不兼容——{REBUILD_HINT}")
+    sampling = payload.get("sampling", "tick")   # 旧负载无键 → tick 口径
+    if sampling not in SAMPLINGS:
+        raise ValueError(
+            f"点差缓存 sampling 非法：{sampling!r}（合法 {SAMPLINGS}）"
+            f"——{REBUILD_HINT}")
     try:
         per = {s: {int(h): SpreadStat(**st) for h, st in hours.items()}
                for s, hours in payload["per_symbol"].items()}
         overall = {s: float(v) for s, v in payload["overall_median"].items()}
-        model = SpreadModel(per, overall, mode=cached_mode)
+        model = SpreadModel(per, overall, mode=cached_mode, sampling=sampling)
     except (KeyError, TypeError, ValueError) as e:
         raise ValueError(f"点差缓存 {path} 模型负载非法（{e}）——{REBUILD_HINT}") from e
     if symbol not in per:
@@ -376,6 +385,41 @@ def load_spread_model_cache(path: str, symbol: str, *,
                 f"当前 {watermark.get(k)!r}）——模型可能过期，{REBUILD_HINT}；"
                 "绝不静默沿用旧模型")
     return model
+
+
+def load_overshoot_from_cache(path: str, symbol: str):
+    """从 v2 点差缓存的顶层 overshoot/overshoot_sha256 键装载止损越幅表
+    （T36 写入、R6/C4 接线）。返回 (model|None, sha8|None, status)：
+
+    - ("loaded", model, sha8)：表存在、sha 自洽且 symbol 在**引擎口径**
+      （stop_level）下有覆盖 → 调用方注入 Costs（A-1.6 的 stop 出场越幅）；
+    - ("no-table", None, None)：v1 缓存/构建未加 --overshoot → 不注入
+      （保持 A-1.5 行为，cost_version 标 no-overshoot）；
+    - ("basis-coverage(<原因>)", None, None)：表在但 symbol 无 stop_level
+      统计（旧 version 1 adjacent_jump 表 / 品种不在主口径表）→ 同上不注入
+      （注入会让引擎 stop 出场在该品种上直接抛错）；
+    - overshoot_sha256 与内容不一致 → ValueError（缓存被改动，绝不静默跳过）。
+    """
+    from mt5quant.costs.overshoot import DEFAULT_BASIS, StopOvershootModel
+
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+    if "overshoot" not in doc:
+        return None, None, "no-table"
+    sha = doc.get("overshoot_sha256")
+    if not sha or canonical_json_sha256(doc["overshoot"]) != sha:
+        raise ValueError(
+            f"点差缓存 {path} 的 overshoot_sha256 与越幅表内容不一致"
+            f"（文件被改动或写坏）——请重建（scripts/build_cost_model.py "
+            "--overshoot）")
+    om = StopOvershootModel.from_dict(doc["overshoot"])
+    try:
+        # 探测 symbol 在引擎口径（stop_level，I3 后的主口径）下是否覆盖：
+        # 只缺品种会抛（缺小时有保守回退，不抛）
+        om.overshoot(symbol, 0, price=1.0, basis=DEFAULT_BASIS)
+    except ValueError as e:
+        return None, None, f"basis-coverage({e})"
+    return om, str(sha)[:8], "loaded"
 
 
 def build_costs(data_root: str, symbol: str, spread_fraction: float,
@@ -411,7 +455,15 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
 
     sessions_sha（T20）：config/sessions.toml 的 sha256；给出时写进
     cost_version（sess[前 8 位]）。缺统计小时按 missing_hour_policy=forbid
-    标注（missNY[...]），由 entry_policy_for 并入引擎禁入。
+    标注（missNY[...]），由 entry_policy_for 并入引擎禁入（覆盖天数阈值
+    min_days_per_hour 也从策略取——n_days 不足的小时同按缺统计禁入，T36）。
+
+    T36/R6（C4+I2）：缓存命中时从同一缓存文件装载止损越幅表（顶层
+    overshoot 键，build_cost_model --overshoot 写入）注入 Costs——
+    引擎 reason="stop" 的出场成交价加该纽约小时越幅 p50（A-1.6）。无越幅键
+    /品种不覆盖 → overshoot_model=None 保持 A-1.5 行为，版本串标
+    no-overshoot。cost_model_version 纳入模型内容 sha 前 8 位、采样口径与
+    越幅表 sha——不同缓存内容必产生不同版本串（台账去重据此区分成本假设）。
 
     返回 (costs, cost_version)。佣金优先 calibrated 实测，其次 CLI 显式值；
     隔夜费优先 calibrated 实测费率（free_of_swap=true 属合法实测零费），其次
@@ -529,20 +581,36 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
         miss_tag = ""
     sess_tag = f"-sess[{sessions_sha[:8]}]" if sessions_sha else ""
 
+    # ---- T36/R6（C4）：缓存命中时装载越幅表并注入 Costs ----
+    overshoot_model = None
+    ov_tag = "-no-overshoot"
+    if used_cache:
+        om, ov_sha8, ov_status = load_overshoot_from_cache(cache_path, symbol)
+        if om is not None:
+            overshoot_model = om
+            ov_tag = f"-ov[{ov_sha8}]"
+        else:
+            print(f"⚠ 缓存无止损越幅表（{ov_status}）：stop 出场不加越幅"
+                  "（A-1.5 行为）——重建加 --overshoot"
+                  "（scripts/build_cost_model.py）")
+
+    # ---- I2：版本串纳入模型内容 sha/采样口径/越幅有无（成本身份） ----
+    model_sha8 = canonical_json_sha256(spread.to_dict())[:8]
     costs = Costs(spread=spread, slippage_model=slip, commission=commission,
-                  swap=swap)
+                  swap=swap, overshoot_model=overshoot_model)
     if research_store:
         src = "研究库缓存命中（导出时已对照主库 tick 水位）"
     elif used_cache:
         src = f"缓存命中，tick 水位一致（{wm['rows']:,} 条实测）"
     else:
         src = f"tick {len(ticks):,} 条实测点差"
-    print(f"✓ 成本：{src}（{mode_tag}@NY p90"
+    print(f"✓ 成本：{src}（{mode_tag}@NY/{spread.sampling}#{model_sha8} p90"
           f"{'×成交价' if mode_tag == 'rel' else ''}）；{comm_tag}；{swap_tag}"
           + (f"；缺统计 {len(missing)} 个纽约小时（forbid 禁入）" if missing else ""))
     return (costs,
-            f"tick-spread-p90[{mode_tag}@NY]+slip{spread_fraction}"
-            f"-{comm_tag}-{swap_tag}{miss_tag}{sess_tag}")
+            f"tick-spread-p90[{mode_tag}@NY/{spread.sampling}#{model_sha8}]"
+            f"+slip{spread_fraction}-{comm_tag}-{swap_tag}{ov_tag}"
+            f"{miss_tag}{sess_tag}")
 
 
 def _snapshot_swap_entry(data_root: str, symbol: str) -> dict:
@@ -565,7 +633,9 @@ def _snapshot_swap_entry(data_root: str, symbol: str) -> dict:
 
 
 def entry_policy_for(costs, symbol: str, base_policy: SessionPolicy):
-    """把点差模型的缺统计小时并入禁入策略（T20：missing_hour_policy=forbid）。
+    """把点差模型的缺统计小时并入禁入策略（T20：missing_hour_policy=forbid；
+    T36/R6-C4：min_days_per_hour 也在策略上——n_days 不足阈值的小时同按
+    缺统计禁入，此前只看小时有无统计，一天样本的小时在要求 20 天时仍放行）。
 
     costs 无 spread 属性（ZeroCosts 等）或策略不是 forbid → 原样返回。
     """
@@ -574,7 +644,8 @@ def entry_policy_for(costs, symbol: str, base_policy: SessionPolicy):
     spread = getattr(costs, "spread", None)
     if spread is None:
         return base_policy
-    missing = spread.missing_hours(symbol)
+    missing = spread.missing_hours(
+        symbol, min_days_per_hour=base_policy.min_days_per_hour)
     if not missing:
         return base_policy
     return base_policy.with_forbidden_hours({symbol: missing})
