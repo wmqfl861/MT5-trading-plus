@@ -2,17 +2,21 @@ name: research-allowlist
 
 # T38/D25（H4）：路径白名单在 CI 侧硬性执行。
 # 本地 pre-commit 钩子的角色取自环境变量 MT5QUANT_COMMIT_ROLE——可自报
-# admin 绕过（第四轮审核 H4）；CI 侧对 research/** 分支发起的 PR 用
-# git diff --name-status origin/main...HEAD 按研究角色规则检查，违规即失败。
-# 规则代码与 scripts/hooks/pre-commit-readonly-paths 是同一份，但**装载自
+# admin 绕过（第四轮审核 H4）；CI 侧对 PR 用 git diff --name-status
+# origin/main...HEAD 按研究角色规则检查，违规即失败。
+# R8/I4 收口：检查对**所有 PR 头分支**强制执行（分支名不承载信任——
+# research 代理改个非 research/* 分支名绕过的洞已关闭）；管理员/主会话
+# 落库走直推 main，不经 pull_request 事件。规则代码与
+# scripts/hooks/pre-commit-readonly-paths 是同一份，但**装载自
 # main 基准**（第六轮审核 I4）：PR 可以同时改钩子让检查自通过（自己检查
 # 自己），所以本 workflow 双 checkout——PR 合并态工作树只提供 diff 数据，
 # 检查器与规则取自第二个 checkout 的 main 基准（research 角色对
 # scripts/hooks/ 与 .github/ 只读，改不动 main 上的基准版本；本 workflow
 # 自身的改动会触发全量 pytest 工作流评审）。
-# 非 research/** 头分支的 PR（管理员/主会话分支）跳过检查并留 notice；
-# 真正的强制力来自 main 分支保护把本检查设为 required（用户操作，见
-# docs/p6/permissions.md 的 U0 清单——agent 不代办）。
+# 工作流定义本身仍随 PR 版本执行（pull_request 事件语义）——把本检查设为
+# main 分支保护的 required check 属用户操作（见 docs/p6/permissions.md 的
+# U0 清单，agent 不代办）；落地前，绕过面已从"改分支名"收窄为"改工作流
+# 文件本身"（后者在研究角色白名单中为只读路径）。
 # 本步骤用 bash + heredoc：windows runner 自带 Git Bash，heredoc 体经 YAML
 # 块标量去缩进后落在脚本列 0（pwsh here-string 的收尾标记必须列 0，与
 # YAML 块缩进冲突）。
@@ -43,14 +47,15 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Enforce research path allowlist (research/** head branches)
+      - name: Enforce research path allowlist (all PR head branches)
         shell: bash
         run: |
+          # R8/I4 收口：对所有 PR 头分支强制执行——research 代理改用非
+          # research/* 分支名即可绕过的分支名逃逸口关闭。管理员/主会话的
+          # 落库路径是直推 main（不触发 pull_request 事件），不经本检查；
+          # 分支名不再承载任何信任。
           head="${{ github.head_ref }}"
-          if [[ "$head" != research/* ]]; then
-            echo "::notice title=research-allowlist::head branch '$head' is not research/** - allowlist not enforced (admin/main-session branch)"
-            exit 0
-          fi
+          echo "::notice title=research-allowlist::enforcing research-role path rules on PR head '$head'"
           # fail-closed：基准钩子不在（checkout 布局变化）即失败，绝不回退到 PR 版
           test -f baseline/scripts/hooks/pre-commit-readonly-paths
           python - <<'PY'

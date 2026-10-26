@@ -357,13 +357,20 @@ ALLOWLIST_YML = REPO_ROOT / ".github" / "workflows" / "research-allowlist.yml"
 
 def test_research_allowlist_workflow_wired():
     """T38/D25：research-allowlist.yml 存在且与钩子共用同一份规则——
-    python -c 调 check_paths、diff 基线 origin/main...HEAD、PR 触发、
-    仅 research/** 头分支强制。"""
+    python -c 调 check_paths、diff 基线 origin/main...HEAD、PR 触发。
+    R8/I4 收口：对**所有** PR 头分支强制执行（research 代理改个非
+    research/* 分支名就能绕过的洞关闭；管理员路径是直推 main，不经 PR，
+    不触发本工作流）。"""
     assert ALLOWLIST_YML.is_file(), f"缺 workflow：{ALLOWLIST_YML}"
     text = ALLOWLIST_YML.read_text(encoding="utf-8")
     for kw in ("pull_request", "check_paths", "pre-commit-readonly-paths",
                "origin/main...HEAD", "research/"):
         assert kw in text, f"research-allowlist.yml 缺：{kw}"
+    # 旧实现的分支名逃逸口（非 research/* 头分支 exit 0）必须不存在
+    assert "allowlist not enforced" not in text, \
+        "research-allowlist.yml 仍有头分支绕过分支（R7-I4）"
+    assert "所有 PR 头分支" in text, \
+        "research-allowlist.yml 未声明全头分支强制（R7-I4）"
 
 
 def _load_hook_from(path: Path):
@@ -395,8 +402,8 @@ def test_research_allowlist_workflow_loads_checker_from_main_baseline(tmp_path):
         "I4：基准钩子缺失应直接失败，不得回退 PR 版"
     # diff 数据仍来自 PR 合并态工作树（第一 checkout，未 cd 进 baseline）
     assert "origin/main...HEAD" in text
-    # 非 research/** 头分支维持直接成功（notice + exit 0）
-    assert 'if [[ "$head" != research/* ]]; then' in text
+    # R8/I4：不再有分支名逃逸口——非 research/* 头分支同样强制检查
+    assert 'if [[ "$head" != research/* ]]; then' not in text
 
     # —— 模拟双 checkout 目录结构 ——
     base_hook = tmp_path / "baseline" / "scripts" / "hooks" / "pre-commit-readonly-paths"
