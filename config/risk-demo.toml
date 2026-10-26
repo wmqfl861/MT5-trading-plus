@@ -1,0 +1,12 @@
+# 风控演练配置（T44 全平演练专用，2026-10-26）：daily_loss_cap_usd 调到
+# 0.5 USD——影子账户出现极小浮亏即触发日亏全平（flatten.json + halt.json），
+# 用于验证"连续触发两次、第二次同样全平"。仅传给风控进程演练重启用，
+# 不是日常运行配置（日常用 config/risk.toml）。
+
+version = 1
+symbols = ["XAUUSD", "BTCUSD", "EURUSD", "USTEC"]
+max_lots_per_order = 0.50
+max_positions_per_symbol = 3
+max_usd_exposure = 100000.0
+max_orders_per_minute = 6
+daily_loss_cap_usd = 0.5
