@@ -1067,3 +1067,37 @@ def test_meta_records_run_fingerprint(gc, inputs, monkeypatch, tmp_path):
         "TST H1": "rel@NY/bar_open_m1#01888819+ov[eca09e24]"}
     md = (out_dir / "gate-power.md").read_text(encoding="utf-8")
     assert "运行指纹" in md and fp["git_commit"][:12] in md
+
+
+def test_merge_md_includes_r7_supplement_sections(tmp_path, monkeypatch):
+    """T42（R7 解释限定 a/c/f/i 正式化）失败测试：合并产物 md 必须直接
+    呈现——①完整检查组合通过率（正对照 passed_all 按品种×档位、负对照
+    按零假设；正对照也可能全被拒，只看分检查表会漏掉这一事实）；
+    ②校准逐种子夏普分布（n/均值/中位/极值——seed=0 单点不代表档位强度）；
+    ③分品种 G5 误报率（品种间异质性显著，跨品种汇总会掩盖）。"""
+    mm = _load_merge_module(tmp_path, monkeypatch,
+                            name="merge_gate_power_supp")
+
+    def write(dirname, shard):
+        d = tmp_path / dirname
+        d.mkdir(exist_ok=True)
+        (d / "gate-power.json").write_text(json.dumps(shard, ensure_ascii=False),
+                                           encoding="utf-8")
+        return d
+
+    d1 = write("s1", _real_schema_shard([0, 1], g5_det_pass=True,
+                                        g5_fp_day=True, g5_fp_slot=False))
+    d2 = write("s2", _real_schema_shard([2, 3], g5_det_pass=True,
+                                        g5_fp_day=False, g5_fp_slot=False))
+    out = tmp_path / "merged-supp"
+    assert mm.main(["--shards", f"{d1},{d2}", "--out", str(out)]) == 0
+    md = (out / "gate-power.md").read_text(encoding="utf-8")
+    # ① 完整组合通过率：正对照（品种×档位）与负对照（零假设）分列
+    assert "完整组合通过率" in md
+    assert "正对照 passed_all" in md and "负对照 passed_all" in md
+    # ② 校准分布：n/均值/中位/极值按品种×档位
+    assert "校准逐种子分布" in md and "中位" in md
+    # ③ 分品种 G5 误报率
+    assert "分品种 G5 误报率" in md
+    # 分布行至少给出 TST H1 档位 1.0 的 n=4（两分片各 2 种子合并）
+    assert "n=4" in md

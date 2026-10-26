@@ -191,6 +191,97 @@ META_IDENTITY_KEYS = (
 )
 
 
+def _pct(values: list) -> str:
+    if not values:
+        return "—"
+    return f"{100.0 * sum(values) / len(values):.0f}%"
+
+
+def render_supplement(results: dict) -> str:
+    """T42：R7 解释限定 a/c/f/i 的正式化——完整组合通过率、校准逐种子
+    分布、分品种 G5 误报率。合并侧呈现层（分片 JSON 是原始数据；不改
+    gate_calibration.py——其字节哈希已进分片运行指纹，实验代码在分片
+    启动后保持不动）。"""
+    lines: list[str] = ["", "## 完整组合通过率（R7-解释限定 c）", ""]
+    positive = results.get("positive") or {}
+    pos_runs = positive.get("runs") or []
+    if pos_runs:
+        lines += ["正对照 passed_all（品种 × 档位——完整 G0–G4 组合下"
+                  "正对照也可能全部被拒，只看分检查表会掩盖这一事实）：",
+                  "",
+                  "| 品种 | 档位 | passed_all |", "| --- | --- | --- |"]
+        buckets: dict[tuple, list] = {}
+        for run in pos_runs:
+            buckets.setdefault((run.get("setup"), str(run.get("level"))),
+                               []).append(bool(run.get("passed_all")))
+        for (setup, level), vals in sorted(
+                buckets.items(), key=lambda kv: (kv[0][0], float(kv[0][1]))):
+            lines.append(f"| {setup} | 夏普≈{level} | "
+                         f"{sum(vals)}/{len(vals)}（{_pct(vals)}） |")
+        lines.append("")
+    negative = results.get("negative") or {}
+    neg_runs = negative.get("runs") or []
+    if neg_runs:
+        lines += ["负对照 passed_all（按零假设——零假设下完整组合通过率"
+                  "即最严格口径的误报率）：", "",
+                  "| 零假设 | passed_all |", "| --- | --- |"]
+        nbuckets: dict[str, list] = {}
+        for run in neg_runs:
+            nbuckets.setdefault(run.get("null") or "?", []) \
+                .append(bool(run.get("passed_all")))
+        for null in sorted(nbuckets):
+            vals = nbuckets[null]
+            lines.append(f"| {null} 置换 | {sum(vals)}/{len(vals)}"
+                         f"（{_pct(vals)}） |")
+        lines.append("")
+    lines += ["## 校准逐种子分布（R7-解释限定 f）", "",
+              "| 品种 | 档位 | n | 实测夏普均值 | 中位 | 最小~最大 |"
+              " 校准收敛 |",
+              "| --- | --- | --- | --- | --- | --- | --- |"]
+    calibration = positive.get("calibration") or {}
+    sharps: dict[tuple, list] = {}
+    for run in pos_runs:
+        sharps.setdefault((run.get("setup"), str(run.get("level"))), []) \
+            .append(float(run.get("sharpe") or 0.0))
+    for key, series in sorted(sharps.items(),
+                              key=lambda kv: (kv[0][0], float(kv[0][1]))):
+        setup, level = key
+        s = sorted(series)
+        n = len(s)
+        mean = sum(s) / n
+        median = (s[n // 2] if n % 2
+                  else (s[n // 2 - 1] + s[n // 2]) / 2)
+        info = (calibration.get(setup) or {}).get(level) or {}
+        converged = info.get("converged")
+        conv_s = {True: "收敛", False: "未收敛"}.get(converged, "?")
+        lines.append(f"| {setup} | ≈{level} | n={n} | {mean:.3f} | "
+                     f"{median:.3f} | {s[0]:.3f}~{s[-1]:.3f} | {conv_s} |")
+    lines.append("")
+    g5 = results.get("g5") or {}
+    g5_fp_runs = [r for r in (g5.get("runs") or [])
+                  if r.get("arm") == "false_positive"]
+    if g5_fp_runs:
+        lines += ["## 分品种 G5 误报率（R7-解释限定 i）", "",
+                  "| 品种 | 零假设 | G5.passed | G5.expectation_positive |",
+                  "| --- | --- | --- | --- |"]
+        gbuckets: dict[tuple, list] = {}
+        for run in g5_fp_runs:
+            gbuckets.setdefault((run.get("setup"), run.get("null") or "?"),
+                                []).append(run)
+        for (setup, null), runs in sorted(gbuckets.items()):
+
+            def _rate(check: str, _runs=runs) -> str:
+                vals = [bool((r.get("checks") or {}).get(check))
+                        for r in _runs]
+                return f"{sum(vals)}/{len(vals)}（{_pct(vals)}）"
+
+            lines.append(f"| {setup} | {null} 置换 | "
+                         f"{_rate('G5.passed')} | "
+                         f"{_rate('G5.expectation_positive')} |")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def _meta_identity_problems(docs: list[dict]) -> list[str]:
     """N-I4/R7：分片 meta 实验身份一致性——除 baselines 外还要求 levels、
     零假设配置（模式 + 各卡缺省 null）、正对照品种、资金/风险参数、G2/G5
@@ -377,7 +468,8 @@ def main(argv=None) -> int:
         json.dumps(results, ensure_ascii=False, indent=2,
                    default=gc._json_default), encoding="utf-8")
     (out / "gate-power.md").write_text(
-        gc.render_report(results), encoding="utf-8")
+        gc.render_report(results) + render_supplement(results),
+        encoding="utf-8")
     n_runs = sum(len((results.get(k) or {}).get("runs", []))
                  for k in ("negative", "positive", "g5"))
     print(f"— 合并 {len(docs)} 分片 / {len(all_seeds)} 种子 / {n_runs} 条运行 "
