@@ -545,3 +545,65 @@ def test_cli_quick_both_nulls_and_g5(gc, inputs, monkeypatch, tmp_path):
     assert "detection_rates" in g5
     md = (out_dir / "gate-power.md").read_text(encoding="utf-8")
     assert "G5" in md and "合并评估" in md
+
+
+# ---- 分片并行：--seeds-from 与合并器 ----
+
+def test_seeds_from_offsets_experiment_seeds(tmp_path):
+    """--seeds-from 7 → 负对照运行记录的 seed 全为 7（分片不相交的前提）。"""
+    mod = load_gc()
+    out = tmp_path / "shard7"
+    rc = mod.main(["--phase", "negative", "--baselines", "H002",
+                   "--null-hypothesis", "day", "--seeds", "1",
+                   "--seeds-from", "7", "--max-bars", "4000",
+                   "--out", str(out)])
+    assert rc == 0
+    d = json.loads((out / "gate-power.json").read_text(encoding="utf-8"))
+    assert d["meta"]["seeds_from"] == 7
+    assert d["negative"]["runs"]
+    assert all(r["seed"] == 7 for r in d["negative"]["runs"])
+
+
+def test_merge_shards_recomputes_rates_and_flags(tmp_path):
+    """两个合成分片（种子不相交）合并：比率按合并后样本重算、种子重叠拒收。"""
+    import importlib.util as _ilu
+    mp = tmp_path / "merge_script.py"
+    mp.write_text((SCRIPT_PATH.parent / "merge_gate_power.py")
+                  .read_text(encoding="utf-8"), encoding="utf-8")
+    spec = _ilu.spec_from_file_location("merge_gate_power", mp)
+    mm = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mm)
+
+    def shard(seeds_from, seeds, pass_g1):
+        runs = [{"name": "X", "seed": s, "null": "day",
+                 "sharpe": 0.1, "net_profit": 1.0, "trade_count": 10,
+                 "passed_all": pass_g1,
+                 "checks": {"G1.net_profit_positive": pass_g1,
+                            "G1.profit_factor": True}}
+                for s in seeds]
+        return {"meta": {"seeds": len(seeds), "seeds_from": seeds_from,
+                         "baselines": ["X"],
+                         "generated_utc": "2026-10-26T00:00:00+00:00"},
+                "negative": {"runs": runs, "by_null": {}, "merged": []},
+                "flags": []}
+
+    d1, d2 = tmp_path / "s1", tmp_path / "s2"
+    d1.mkdir(); d2.mkdir()
+    (d1 / "gate-power.json").write_text(json.dumps(
+        shard(0, [0, 1], True)), encoding="utf-8")
+    (d2 / "gate-power.json").write_text(json.dumps(
+        shard(2, [2, 3], False)), encoding="utf-8")
+    out = tmp_path / "merged"
+    rc = mm.main(["--shards", f"{d1},{d2}", "--out", str(out)])
+    assert rc == 0
+    m = json.loads((out / "gate-power.json").read_text(encoding="utf-8"))
+    assert len(m["negative"]["runs"]) == 4
+    assert m["meta"]["seeds"] == 4
+    # 合并后 2/4 过半 → 误报率 0.5（单分片各自为 1.0 / 0.0）
+    assert m["negative"]["false_positive_rates"][
+        "G1.net_profit_positive"] == pytest.approx(0.5)
+
+    # 种子重叠 → 拒绝
+    (d2 / "gate-power.json").write_text(json.dumps(
+        shard(1, [1, 2], False)), encoding="utf-8")
+    assert mm.main(["--shards", f"{d1},{d2}", "--out", str(out)]) == 1

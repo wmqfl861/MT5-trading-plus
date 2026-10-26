@@ -1084,6 +1084,9 @@ def build_parser() -> argparse.ArgumentParser:
                     "+ 正对照检出率 + G5 判别力 + 合并评估变体 → JSON+MD")
     ap.add_argument("--phase", choices=("negative", "positive", "both"),
                     default="both")
+    ap.add_argument("--seeds-from", type=int, default=0,
+                    help="种子起点（分片并行：各分片用不相交种子段，结果经 "
+                         "scripts/merge_gate_power.py 合并）")
     ap.add_argument("--seeds", type=int, default=DEFAULT_SEEDS,
                     help="每个条件的种子数（负对照与正对照共用）")
     ap.add_argument("--levels", default=",".join(str(v) for v in DEFAULT_LEVELS),
@@ -1135,7 +1138,7 @@ def nulls_for(mode: str, baseline_default: str) -> list[str]:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    seeds = list(range(args.seeds))
+    seeds = list(range(args.seeds_from, args.seeds_from + args.seeds))
     levels = [float(x) for x in str(args.levels).split(",") if x.strip()]
     g2_sims = args.g2_random_sims
     max_bars = args.max_bars
@@ -1209,6 +1212,7 @@ def main(argv=None) -> int:
         "engine_note": "run_gate_suite: n_trials=1（选择效应为 0），"
                        "G2 随机入场实验降次；G5 为实验镜像（无台账/批准，"
                        "不消耗一次性机会，锁箱 K 线未读取）",
+        "seeds_from": int(args.seeds_from),
         "generated_utc": datetime.now(timezone.utc).isoformat(),
     }}
     if args.phase in ("negative", "both"):
