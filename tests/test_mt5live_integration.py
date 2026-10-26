@@ -1387,9 +1387,12 @@ def test_live_runner_no_spread_gate_flag_warns_red_and_proceeds(tmp_path,
 
     monkeypatch.setattr("mt5gw.MT5Gateway.from_config_file",
                         staticmethod(lambda p: _FakeGW()))
+    gw_dummy = tmp_path / "gw.json"
+    gw_dummy.write_text("{}", encoding="utf-8")
     with pytest.raises(_Sentinel):
         mod.main(["--config", _runner_cfg(tmp_path), "--once", "--no-spread-gate",
-                  "--spread-model", str(tmp_path / "missing.json")])
+                  "--spread-model", str(tmp_path / "missing.json"),
+                  "--gateway-config", str(gw_dummy)])
     out = capsys.readouterr().out
     assert "\033[31m" in out                    # 标红
     assert "点差闸门" in out
@@ -1725,6 +1728,8 @@ def test_t34_live_runner_paper_mode_wires_full_stack(tmp_path, monkeypatch,
         def shutdown(self):
             pass
 
+    gw_dummy = tmp_path / "gw.json"
+    gw_dummy.write_text("{}", encoding="utf-8")
     monkeypatch.setattr("mt5gw.MT5Gateway.from_config_file",
                         staticmethod(lambda p: _FakeGW()))
     monkeypatch.setattr(mod, "now_utc", lambda: now)
@@ -1733,7 +1738,8 @@ def test_t34_live_runner_paper_mode_wires_full_stack(tmp_path, monkeypatch,
     rc = mod.main(["--config", env["config"], "--once", "--paper",
                    "--risk-config", env["risk"],
                    "--sessions-config", env["sessions"],
-                   "--spread-model", env["spread"]])
+                   "--spread-model", env["spread"],
+                  "--gateway-config", str(gw_dummy)])
     assert rc == 0
     out = capsys.readouterr().out
     assert "[paper]" in out and "影子账户" in out

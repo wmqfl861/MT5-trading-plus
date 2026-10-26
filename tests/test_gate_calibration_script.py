@@ -549,11 +549,30 @@ def test_cli_quick_both_nulls_and_g5(gc, inputs, monkeypatch, tmp_path):
 
 # ---- 分片并行：--seeds-from 与合并器 ----
 
-def test_seeds_from_offsets_experiment_seeds(tmp_path):
-    """--seeds-from 7 → 负对照运行记录的 seed 全为 7（分片不相交的前提）。"""
-    mod = load_gc()
+def test_seeds_from_offsets_experiment_seeds(gc, inputs, monkeypatch,
+                                             tmp_path):
+    """--seeds-from 7 → 负对照运行记录的 seed 全为 7（分片不相交的前提）。
+
+    数据经 assemble_experiment 注入小样本（干净克隆无 data_research/，
+    不依赖仓库本机数据）。
+    """
+    monkeypatch.setattr(
+        gc, "BASELINES",
+        ({"name": "H002", "factory": lambda seed: RandomEntries(seed=int(seed), hold_bars=4,
+                                          event_every_bars=24),
+          "params": {}, "grid": {}, "symbols": ("TST",), "timeframe": "H1"},))
+    monkeypatch.setattr(
+        gc, "assemble_experiment",
+        lambda data_root, symbols, max_bars: {
+            "TST H1": {"bars": inputs["bars_by_symbol"]["TST"],
+                        "costs": inputs["costs_by_symbol"]["TST"],
+                        "sizes": inputs["sizes_by_symbol"]["TST"],
+                        "vols": inputs["vols_by_symbol"]["TST"],
+                        "timeframe": "H1", "session_policy": None},
+        })
     out = tmp_path / "shard7"
-    rc = mod.main(["--phase", "negative", "--baselines", "H002",
+    rc = gc.main(["--phase", "negative", "--baselines", "H002",
+                   "--symbols", "TST:H1",
                    "--null-hypothesis", "day", "--seeds", "1",
                    "--seeds-from", "7", "--max-bars", "4000",
                    "--out", str(out)])
