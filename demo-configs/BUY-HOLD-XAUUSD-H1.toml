@@ -1,0 +1,15 @@
+# 阶段 F 模拟盘演练示例配置（T45，2026-10-26）：买入持有基准，XAUUSD H1。
+#
+# BuyHold 信号恒 1：启动后首个可交易网格开多并持有到演练结束——两周里
+# 验证"持仓期间零调仓"（入场 1 笔、期间 0 笔出场）与心跳/对账/日报链路的
+# 最纯粹样本；唯一一笔出场应来自演练结束的人工平仓或 killSwitch 全平。
+# 固定 0.01 手（演练手数上限；不给 risk_fraction，两者互斥）。
+# 启动：scripts/demo_run.ps1（--paper 影子券商，真终端行情）。
+symbol = "XAUUSD"
+timeframe = "H1"
+strategy = "mt5quant.strategies.library.buy_hold:BuyHold"
+params = {}
+magic = 902501
+lookback_bars = 2
+volume_lots = 0.01
+trigger_delay_s = 5

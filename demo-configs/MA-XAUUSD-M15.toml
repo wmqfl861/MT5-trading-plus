@@ -1,0 +1,17 @@
+# 阶段 F 模拟盘演练示例配置（T45，2026-10-26）：SMA 快慢线交叉，XAUUSD M15。
+#
+# MaCrossATR（reentry="immediate" 类缺省）：5/15 快慢线保证两周内有足量
+# 开平仓与 SL/TP 出场，覆盖 §7 的"SL/TP 出场后不触发暂停、按重入规则
+# 继续""每笔成交可归因""换日禁入拒单"等场景（10/30 参数两周成交太少）。
+# 手数按风险定（risk_fraction=0.005，与 T44 影子盘同口径；执行器只在
+# 开仓时定手数，持仓期间不调仓）。lookback_bars=30 ≥ slow 网格上界
+# （MaCrossATR.LOOKBACK_BARS）。
+# 启动：scripts/demo_run.ps1（--paper 影子券商，真终端行情）。
+symbol = "XAUUSD"
+timeframe = "M15"
+strategy = "mt5quant.backtest.reference:MaCrossATR"
+params = { fast = 5, slow = 15, stop_loss_atr = 2.0, take_profit_atr = 3.0 }
+magic = 902502
+lookback_bars = 30
+risk_fraction = 0.005
+trigger_delay_s = 5
