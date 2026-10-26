@@ -15,15 +15,21 @@
 
 上一轮五分片系修复前启动、无运行指纹（R7-N-I1）。本轮重跑：
 
-- [ ] 每分片产物 meta 带运行指纹：gate_calibration.py 已记录 seeds_from/sampling/成本版本
-      （含缓存 sha+越幅 sha+swap sha）；合并前 merge_gate_power 校验五分片指纹一致
-      （当前 _meta_identity_problems 已有；确认包含 git commit——若无则补一个
-      `git_commit` 进 meta 并校验）。失败测试：分片指纹不一致 → 合并拒绝。
-- [ ] 重建研究库缓存（R7-3 已重建主库 stop_level 口径；确认 data_research 同步）。
-- [ ] 跑 5 分片（seeds 0-3/4-7/8-11/12-15/16-19）并行；完成后 merge 出正式 gate-power。
-- [ ] 正式报告：docs/research/gate-power-v2-<日期>.md——含 run 指纹、完整条件清单、
-      校准收敛与分布、passed_all 事实、G5 参照限制；如决策规则触发则列门槛建议（只建议）。
-- [ ] 蓝图 §2 P4/P5 与路线图 C 行更新。
+- [x] 每分片产物 meta 带运行指纹（提交 2fa27a3）：meta.fingerprint = git 提交/工作区
+      干净位/冻结门槛哈希/各序列成本版本（含点差缓存+越幅+隔夜费身份 sha）/脚本字节
+      哈希；合并器把 fingerprint 纳入实验身份校验。失败测试 ×2：
+      test_merge_rejects_fingerprint_mismatch（不一致拒合）、
+      test_meta_records_run_fingerprint（meta 记录指纹）——均绿。
+- [x] 研究库缓存同步确认：五分片启动日志零"缓存无止损越幅表"警告；合并产物
+      meta.fingerprint.cost_versions 五序列全部含 `ov[eca09e24]`（stop_level 口径）。
+- [x] 5 分片（seeds 0-3/4-7/8-11/12-15/16-19）12:43 UTC 并行启动、~22:30 全部完成；
+      merge 出 data/reports/gates/gate-power-v2/gate-power.{json,md}（160+160+480 条，
+      13 条 flags；合并 md 含三节补充——完整组合通过率/校准逐种子分布/分品种 G5
+      误报率，提交 c63a86b，测试 test_merge_md_includes_r7_supplement_sections）。
+- [x] 正式报告：docs/research/gate-power-v2-2026-10-26.md（运行指纹、R7 解释限定
+      a–i 逐项回应、v1→v2 差异归因=越幅真实接入、门槛建议只建议、USTEC≈1.0
+      未收敛如实标注）。
+- [x] 蓝图 §2 P4/P5 与路线图 C 行更新（随本提交）。
 
 **注意：** 分片是后台计算（无 LLM 消耗），用 Bash 后台跑；种子与分片参数不变时
 成本版本会因缓存重建而变化（ov[eca09e24]），新运行自动与新缓存配对。
@@ -37,25 +43,30 @@ reconciliation-v3 报告的 §5–§7 还是占位。本轮重跑并回填：
 - [ ] 确认成本缓存为 stop_level 口径（ov[eca09e24]）， reconcile 的越幅分量用新表。
 - [ ] 回填 v3 报告：四组逐项结果表、按出场类型的分布、容差符合率、"其余"违规清单与归因。
 - [ ] 若结构差异超容差：分析原因（预期：换日窗点差建模差 vs 静默 tick），如实报告。
-- [ ] 蓝图 §2 P3 与路线图 E 行更新。
+- [x] 蓝图 §2 P3 与路线图 E 行更新（T42 随本提交一并更新至 R8 终态）。
 
 ## T44：T34 影子盘一日双策略（真终端，阶段 D′ 验收）
 
 R7 修复（账户级风控聚合视图、一致快照、确认绑定事件、净零残仓、内核字节锁）已落地。
 
-- [ ] 准备两份 paper 配置（M15，确保止损/止盈出场自然发生）：
-      XAUUSD immediate magic=902431 / EURUSD after_signal_change magic=902432。
-- [ ] 启动：2 个 --paper 运行器 + 1 个风控 --paper-state + 1 个对账 --paper-state --loop。
-- [ ] 白天演练：killSwitch 置放→确认→移除；用测试风控配置（日亏上限调低）触发**连续两次**全平。
-- [ ] 收盘后收集：决策数、订单数（= 入场 + 出场）、保护性出场数、暂停数（无法解释的应为 0）、
-      调仓数（持仓期间应为 0）、心跳与告警摘要。写 docs/reports/live-paper-2026-10-26.md。
-- [ ] 蓝图 §2 P7 / 路线图 D′ 行更新：通过则影子盘记"真机"证据，阶段 F 放行。
+- [x] 两份 paper 配置（M15）：XAUUSD immediate 902431 / EURUSD after_signal_change 902432
+      （data/live/paper-*.toml，SL/TP 由 ATR 自然触发——当日 SL 出场 5 次）。
+- [x] 四进程 10:58–21:04 UTC 连续运行（2 运行器 + 风控 + 对账，日志 data/live/paper-*.log）。
+- [x] 演练全过：killSwitch（10s 内 halt、两轮拒单进 alerts、13s 恢复）；连续两次日亏全平
+      （12:59:56 / 13:15:07，第二次同样真全平——uuid/command_id 绑定防旧 ack 提前归档，
+      归档滞留于永不 ack 的旧干跑 902426 属已知项，人工恢复并报告注明）。
+- [x] 收盘统计（docs/reports/live-paper-2026-10-26.md，脱敏）：83 决策 / 21 笔成交
+      （=入场 11+出场 10）、SL 保护性出场 5 次全解释零暂停、无法解释暂停 0、
+      持仓期间调仓 0、心跳无超时。demo_check.py 当日预检 6/7 过（日报项收盘后生成属预期）。
+- [x] 蓝图 §2 P7 / 路线图 D′ 行更新（提交 2a0b386，阶段 F 放行）。
 
 ## T45：阶段 F 准备 + 蓝图 + codex 复审
 
-- [ ] 模拟盘准备（不开跑）：0.01 手两周演练的运行器/风控/对账配置与启动脚本
-      （scripts/demo_run.ps1），验收清单从蓝图 §7 逐条转化为日志检查脚本（scripts/demo_check.py）。
-- [ ] 蓝图 §2 / §5 全表更新（T42/T43/T44 证据入表）。
+- [x] 模拟盘准备（不开跑，提交 81e4385）：demo_run.ps1（一键启动+七项预检）+
+      demo_check.py（蓝图 §7 八条逐日检查+演练证据汇总）+ demo-configs/ 两份示例；
+      demo_check.py 已用 2026-10-26 影子盘真实数据预验（6/7 过，日报项正确待生成）。
+- [x] 蓝图 §2 / §5 全表更新（T43 a4df077、T44 2a0b386、T42 随本提交；P3/P4/P5/P6/P7、
+      C/D′/E 行、禁止事项与开放问题清单同步至 R8 终态）。
 - [ ] codex 复审（gpt-6-astra max）：覆盖 8e8bb76..HEAD 的 R8 改动 + 三个验收报告。
 - [ ] 按复审结果修复或标注，最终推送。
 
