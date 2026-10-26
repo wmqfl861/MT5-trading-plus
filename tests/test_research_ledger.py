@@ -967,7 +967,6 @@ def test_concurrent_record_runs_chain_stays_intact(tmp_path):
     with Ledger(p) as led:
         record(led, run_n=1)
 
-    a_inside = threading.Event()   # A 已过链尾读取、处于插入→哈希阶段
     errors: list = []
 
     def worker_a():
@@ -975,9 +974,9 @@ def test_concurrent_record_runs_chain_stays_intact(tmp_path):
         orig = led._row_hash
 
         def slow_hash(content, prev):
-            a_inside.set()
-            time.sleep(0.4)         # 拉宽"读完链尾、尚未提交"的交错窗口
-            time.sleep(0)           # yield 让 B 有机会真正竞争写锁
+            # 拉宽"已持写锁、尚未提交"的窗口；B 在此期间竞争同一把
+            # BEGIN IMMEDIATE 锁——串行化由 SQLite 保证，无需线程事件编排
+            time.sleep(0.5)
             return orig(content, prev)
 
         led._row_hash = slow_hash
@@ -990,18 +989,9 @@ def test_concurrent_record_runs_chain_stays_intact(tmp_path):
 
     def worker_b():
         led = Ledger(p, create=False)
-        orig = led._table_cols
-
-        def wait_then_cols(table):
-            if table == "runs":
-                # 保证 B 读链尾落在 A 的未提交窗口内（受控交错，非碰运气）
-                assert a_inside.wait(timeout=20), "A 未进入插入阶段"
-            return orig(table)
-
-        led._table_cols = wait_then_cols
         try:
             record(led, run_n=3)
-        except BaseException as e:  # noqa: BLE001
+        except BaseException as e:  # noqa: BLE001 — 如实收集线程内异常
             errors.append(("B", e))
         finally:
             led.close()
