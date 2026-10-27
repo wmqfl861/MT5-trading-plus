@@ -188,7 +188,7 @@ def test_scan_ipv4_public_flagged_private_exempt(tmp_path):
     violations = scan_files(tmp_path, ["note.md"],
                             allowlist_path=tmp_path / "absent.txt")
     hits = [v for v in violations if "ipv4" in v]
-    assert len(hits) == 2      # 8.8.8.8 与 172.32.0.1
+    assert len(hits) == 2      # 公网 DNS 地址与 172 豁免段外地址各一
 
 
 def test_scan_skips_binary_and_venv(tmp_path):
