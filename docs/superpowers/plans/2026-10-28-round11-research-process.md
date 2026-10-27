@@ -192,10 +192,7 @@ def precheck(candidate, *, data_root, cost_model, research_years: dict[str, floa
 - **G4 取数**：G4 的 N 与试验夏普取自 `dsr_trial_scope` 指定的范围（`family` | `project`）。
 - **缺省不变**：现行 `gates.toml` 无此键，缺省仍按 `family`，保持冻结语义；`gates-v3.toml` 里写 `project`。
 - **报告**：关卡报告同时列出谱系、轮次、项目三种 N。
-- [ ] 失败测试先行：
-  - 两个谱系各 10 次试验，`project` 口径 N = 20、`family` 口径 N = 10；
-  - 标定运行不计入；
-  - 缺省口径与现行冻结门槛下的结果逐位不变。
+- [x] 全部完成（6494846+3e1c946，审核通过闭环）：审核双侧实跑缺省逐位一致+冻结 sha 核对；18 失败测试红→绿；生产台账已二次迁移重锚（run_class 446 行，verify 通过）。
 
 ## T66：低频事件模式与标定（D35）
 
@@ -279,11 +276,7 @@ def randomize_event_times(events, trading_days, *, seed: int) -> list[EventWindo
   - 能从终端补的：用现有下载脚本补齐，补后复跑质检；
   - 补不了的：写进序列 `meta.json` 的 `known_gaps`。研究工具（按年分段、walk-forward、事件研究）读到已知缺口时，在报告里注明该窗口样本不完整。
 - **EURUSD 2021-06**：优先处理这段 27 天缺口，写明是补齐了还是登记为已知缺口。
-- [ ] 失败测试先行：
-  - 探针 `docs/reviews/probes/2026-10-27-round12-gap-probe.py` 的场景——27 天缺口不得归为 `weekend`；
-  - 正常周末（含夏令时切换周 49 小时）仍归为 `weekend`；
-  - 周五提前收盘与周日晚开的常规偏差不误报；
-  - `known_gaps` 能被按年分段与事件研究读到。
+- [x] 全部完成（e599851）：独立成果审核通过（两库 168 序列迁移零误报独立重跑证实 0/84 不匹配、4 序列逐条集合级重建、DST 切换周实测、探针双 worktree 红绿）；EURUSD 28 天洞确认为券商服务器端无法补齐（全深等式+区间请求+跨 20 周期边界一致），known_gaps 登记 40 条带探测证据；消费点接线 G2/G3/按年分段（事件研究 T66 待接）。
 
 ## T80：预筛加固与运行类别（第十二轮 G2、G3、G4；与 T64 同批）
 
@@ -298,12 +291,7 @@ def randomize_event_times(events, trading_days, *, seed: int) -> list[EventWindo
   - `bt` 拒绝 CLI 传入保留的 actor 名（`calibration`、`ops`、`migration`）；
   - 台账 `runs` 新增 `run_class`（`research` | `calibration` | `ops` | `migration`），由 `bt` 按候选状态与轮次写入，进入哈希链；
   - T64 的研究 N 只按 `run_class = research` 计数。
-- [ ] 失败测试先行：
-  - 声明夏普 1.5、但毛收益与成本隐含夏普 0.3 → 检验力按 0.3 算；
-  - 已批准外部序列使研究年数增加，未批准来源不计入；
-  - `--actor calibration` 被拒；
-  - 样品卡运行的 `run_class = calibration`；
-  - 旧台账迁移后 `run_class` 按 actor 推断，并记一行迁移。
+- [x] 全部完成（6494846+审核修正 3e1c946）：隐含夏普（σ 品种性质闭式复核/声明 1.5 vs 隐含 0.19 按隐含算）；覆盖年数区间并集（审核发现重叠双计已修——真实库 USTEC 39.806y/BTCUSD 10.902y 逐位复算，7 项边界实验）；--actor 保留名三路拒；run_class 入哈希链篡改双向检出；旧库迁移 actor 推断+恰一行事件；轮次 N 非 None 分支 pin 测试。
 
 ## T81：外部数据来源结论落地（D36、第十二轮 G5）
 
