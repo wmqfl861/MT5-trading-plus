@@ -34,4 +34,11 @@ jobs:
           # 把汇总行（如 "388 passed in 20.1s"）写成注解：在 PR/提交的检查结果里直接可见
           $summary = Get-Content pytest-output.txt | Where-Object { $_ -match '\d+ (passed|failed|error)' } | Select-Object -Last 1
           Write-Output "::notice title=pytest::$summary"
+          # 失败时把每个 FAILED/ERROR 测试写成 error 注解（免鉴权可经 API 读到名单）
+          if ($code -ne 0) {
+            Get-Content pytest-output.txt |
+              Where-Object { $_ -match '^(FAILED|ERROR)' } |
+              Select-Object -First 30 |
+              ForEach-Object { Write-Output "::error title=failing-test::$($_.Trim())" }
+          }
           exit $code
