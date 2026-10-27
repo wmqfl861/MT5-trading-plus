@@ -50,6 +50,16 @@ R8 修正（第八轮终审 R8-I2 + R8-I7 渲染部分）：
   样本数性质，不构成门槛建议依据"。JSON 原始 flags 不动；
   gate_calibration.py 字节不动（其哈希在分片运行指纹里，五分片产物
   有效性依赖）——标注只发生在本合并器渲染层。
+
+R10 修正（第九轮复审 R9-I6 / T56）：
+- **指纹结构校验**：fingerprint 键存在时必须是**非空 dict** 且必需字段
+  类型/格式合法——git_commit **空串合法**（gate_calibration._run_fingerprint
+  文档化的"git 不可用"降级语义，产物如实展示），非空必须 40 位十六进制；
+  git_dirty 为 bool；gates_sha256/script_sha256 为 64 位十六进制；
+  cost_versions 为非空 dict 且值为 str。null/{}/缺字段/类型错/格式错
+  → 拒绝合并，且 **--allow-legacy 不豁免**（legacy 仅适用于键**整体不
+  存在**的历史无指纹产物；键在而不合法是伪造/截断/损坏）。分片间相等
+  比较维持不变（校验在前，比较照旧）。
 """
 from __future__ import annotations
 
@@ -57,6 +67,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -214,6 +225,66 @@ def _all_shards_missing_fingerprint(docs: list[dict]) -> bool:
     return all("fingerprint" not in (s.get("meta") or {}) for s in docs)
 
 
+# R9-I6（T56）：指纹必需字段及格式。gate_calibration._run_fingerprint 是
+# 指纹的唯一合法生产者，其产物恒满足：git_commit 为 str（git 不可用时是
+# **空串**——文档化降级语义，非空时为 git rev-parse 的 40 位小写十六进制）、
+# git_dirty 为 bool、gates_sha256/script_sha256 为 sha256 十六进制摘要、
+# cost_versions 为逐序列非空 {key: str}。键存在却不符合这些约束 = 不是
+# 该生产者的产物（伪造/截断/损坏），不属"历史无指纹"，--allow-legacy
+# 不豁免。
+_FINGERPRINT_FIELDS = ("git_commit", "git_dirty", "gates_sha256",
+                       "script_sha256", "cost_versions")
+_HEX40_RE = re.compile(r"[0-9a-f]{40}")
+_HEX64_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _fingerprint_problems(docs: list[dict]) -> list[str]:
+    """R9-I6（T56）：逐分片校验 meta.fingerprint **结构**（键存在时）——
+    必须是非空 dict 且必需字段类型/格式合法（见 _FINGERPRINT_FIELDS 注）。
+    null/{}/缺字段/类型错/格式错均按问题上报；键整体不存在的分片跳过
+    （是否允许缺键由 _all_shards_missing_fingerprint/--allow-legacy 判定，
+    不在本函数职责内）。"""
+    problems: list[str] = []
+    for idx, s in enumerate(docs):
+        if "fingerprint" not in (s.get("meta") or {}):
+            continue
+        fp = s["meta"]["fingerprint"]
+        where = f"分片{idx} meta.fingerprint"
+        if not isinstance(fp, dict) or not fp:
+            problems.append(
+                f"{where}={fp!r} 不是非空对象——畸形指纹拒绝合并"
+                "（--allow-legacy 仅适用于键整体不存在的历史产物，不豁免"
+                "畸形指纹）")
+            continue
+        missing = [k for k in _FINGERPRINT_FIELDS if k not in fp]
+        for k in missing:
+            problems.append(f"{where} 缺必需字段 {k!r}——畸形指纹拒绝合并")
+        if "git_commit" not in missing:
+            commit = fp["git_commit"]
+            if not isinstance(commit, str):
+                problems.append(f"{where}.git_commit={commit!r} 不是 str")
+            elif commit and not _HEX40_RE.fullmatch(commit):
+                # 空串合法（git 不可用降级）；非空必须 40 位十六进制
+                problems.append(
+                    f"{where}.git_commit={commit!r} 非空但不是"
+                    " 40 位十六进制（空串才是合法的 git 不可用降级）")
+        if "git_dirty" not in missing and not isinstance(fp["git_dirty"], bool):
+            problems.append(f"{where}.git_dirty={fp['git_dirty']!r} 不是 bool")
+        for k in ("gates_sha256", "script_sha256"):
+            if k in missing:
+                continue
+            v = fp[k]
+            if not isinstance(v, str) or not _HEX64_RE.fullmatch(v):
+                problems.append(f"{where}.{k}={v!r} 不是 64 位十六进制字符串")
+        if "cost_versions" not in missing:
+            cv = fp["cost_versions"]
+            if (not isinstance(cv, dict) or not cv
+                    or not all(isinstance(v, str) for v in cv.values())):
+                problems.append(f"{where}.cost_versions={cv!r} 不是非空"
+                                " dict[str,str]")
+    return problems
+
+
 def _pct(values: list) -> str:
     if not values:
         return "—"
@@ -348,13 +419,20 @@ def _meta_identity_problems(docs: list[dict],
 
     fingerprint 必填（R8-I2）：全部（而非部分）分片缺指纹时旧的"相等"
     校验对 None==None 恒过——现在拒绝合并，除非 allow_legacy（CLI
-    --allow-legacy；产物 meta 记 legacy_no_fingerprint=true 降级标记）。"""
+    --allow-legacy；产物 meta 记 legacy_no_fingerprint=true 降级标记）。
+
+    指纹结构校验（R9-I6/T56）：键**存在**时还必须逐分片通过
+    _fingerprint_problems 的类型/格式校验——null/{}/缺字段/类型错/格式错
+    同样让 None==None、{}=={} 的"相等"比较恒过、合并照常出产物（审核
+    探针 fingerprint_edges 反例）；畸形指纹不属于 legacy 豁免范围
+    （legacy 仅适用于键整体不存在的历史产物），allow_legacy 不豁免。"""
     problems: list[str] = []
     if _all_shards_missing_fingerprint(docs) and not allow_legacy:
         problems.append(
             "所有分片 meta 都缺 fingerprint——运行身份未封闭（R8-I2），"
             "拒绝合并；确需合并历史无指纹诊断产物请显式传 --allow-legacy"
             "（合并产物 meta 将记 legacy_no_fingerprint=true 降级）")
+    problems.extend(_fingerprint_problems(docs))     # R9-I6：畸形不属 legacy
     ref = docs[0].get("meta") or {}
     for key in META_IDENTITY_KEYS:
         ref_val = ref.get(key)
@@ -525,8 +603,10 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default=str(REPO / "data" / "reports" / "gates"))
     ap.add_argument("--allow-legacy", action="store_true",
                     help="允许合并**全部**缺 fingerprint 的历史无指纹诊断"
-                         "分片（部分缺部分有仍拒）；产物 meta 记 "
-                         "legacy_no_fingerprint=true 降级标记（R8-I2）")
+                         "分片（部分缺部分有仍拒；键存在但畸形——null/{}/"
+                         "缺字段/类型错/格式错——不属 legacy，仍拒，R9-I6）；"
+                         "产物 meta 记 legacy_no_fingerprint=true 降级标记"
+                         "（R8-I2）")
     args = ap.parse_args(argv)
 
     docs = []

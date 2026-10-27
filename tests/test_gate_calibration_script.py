@@ -626,11 +626,15 @@ def test_merge_shards_recomputes_rates_and_flags(tmp_path, monkeypatch):
                          "positive_symbols": [], "phase": "negative",
                          "generated_utc": "2026-10-26T00:00:00+00:00",
                          # R8-I2：fingerprint 必填（夹具补齐；无指纹历史
-                         # 产物走 --allow-legacy，另有专测）
+                         # 产物走 --allow-legacy，另有专测）；R9-I6/T56 起
+                         # cost_versions 还须非空 dict[str,str]——真实产物
+                         # （data/reports/gates/shard8-*）恒为非空（逐序列
+                         # 成本版本），夹具原用的 {} 与真实产物不符且会被
+                         # 畸形指纹校验拒绝，故改为非空
                          "fingerprint": {"git_commit": "a" * 40,
                                          "git_dirty": False,
                                          "gates_sha256": "b" * 64,
-                                         "cost_versions": {},
+                                         "cost_versions": {"TST H1": "const-v0"},
                                          "script_sha256": "c" * 64}},
                 "negative": {"runs": runs, "by_null": {}, "merged": []},
                 "flags": []}
@@ -1162,6 +1166,92 @@ def test_merge_fingerprint_required_unless_allow_legacy(tmp_path, monkeypatch,
     assert mm.main(["--shards", f"{d1},{mixed}", "--out", str(out),
                     "--allow-legacy"]) == 1
     assert "fingerprint" in capsys.readouterr().out
+
+
+def test_merge_rejects_malformed_fingerprint_beyond_legacy(tmp_path, monkeypatch,
+                                                           capsys):
+    """R9-I6（T56）失败测试：fingerprint 键存在但畸形——null/{}/缺字段/
+    类型错/格式错——拒绝合并，且 --allow-legacy 不豁免（legacy 仅适用于
+    键**整体不存在**的历史无指纹产物；键在而不合法是伪造/截断/损坏，不是
+    历史遗留，不得借用降级通道）。
+
+    审核探针（docs/reviews/probes/2026-10-27-round9-audit.py
+    fingerprint_edges）复现：对正式五分片副本把 meta.fingerprint 全部置
+    null 或 {} 时旧实现 exit 0 且无降级标记——"分片间相等"对 None==None
+    与 {}=={} 恒过，必填校验形同虚设。
+
+    合法边界：git_commit **空串合法**（gate_calibration._run_fingerprint
+    文档化的"git 不可用"降级语义，产物如实展示）；非空必须 40 位十六进制。"""
+    mm = _load_merge_module(tmp_path, monkeypatch,
+                            name="merge_gate_power_r9i6")
+
+    def write(dirname, shard):
+        d = tmp_path / dirname
+        d.mkdir(exist_ok=True)
+        (d / "gate-power.json").write_text(json.dumps(shard, ensure_ascii=False),
+                                           encoding="utf-8")
+        return d
+
+    def shard(seeds):
+        return _real_schema_shard(seeds, g5_det_pass=True, g5_fp_day=False,
+                                  g5_fp_slot=False)
+
+    good_fp = {"git_commit": "a" * 40, "git_dirty": False,
+               "gates_sha256": "b" * 64, "cost_versions": {"TST H1": "v1"},
+               "script_sha256": "c" * 64}
+    out = tmp_path / "merged"
+
+    # 1) 探针场景：全部（而非单个）分片同值畸形——分片间相等比较恒过，
+    #    只有逐分片结构校验能拦；--allow-legacy 同样不得放行
+    for label, bad in (("null", None), ("empty_object", {})):
+        s1, s2 = shard([0, 1]), shard([2, 3])
+        s1["meta"]["fingerprint"] = bad
+        s2["meta"]["fingerprint"] = bad
+        d1, d2 = write(f"all_{label}_1", s1), write(f"all_{label}_2", s2)
+        assert mm.main(["--shards", f"{d1},{d2}", "--out", str(out)]) == 1, label
+        assert mm.main(["--shards", f"{d1},{d2}", "--out", str(out),
+                        "--allow-legacy"]) == 1, label
+        assert "fingerprint" in capsys.readouterr().out, label
+        assert not (out / "gate-power.json").exists(), label
+
+    # 2) 单分片畸形（另一分片指纹完好）：缺字段/类型错/格式错全维度
+    d_good = write("good", shard([0, 1]))
+    malformed = [
+        (f"missing_{field}",
+         {k: v for k, v in good_fp.items() if k != field})
+        for field in ("git_commit", "git_dirty", "gates_sha256",
+                      "script_sha256", "cost_versions")]
+    malformed += [
+        ("git_dirty_str", {**good_fp, "git_dirty": "yes"}),
+        ("git_commit_short", {**good_fp, "git_commit": "deadbeef"}),
+        ("git_commit_not_str",
+         {**good_fp, "git_commit": 1234567890123456789012345678901234567890}),
+        ("gates_sha256_short", {**good_fp, "gates_sha256": "b" * 63}),
+        ("script_sha256_short", {**good_fp, "script_sha256": "c" * 63}),
+        ("cost_versions_empty", {**good_fp, "cost_versions": {}}),
+        ("cost_versions_not_str", {**good_fp, "cost_versions": {"TST H1": 1}}),
+        ("fingerprint_list", [good_fp]),
+    ]
+    for label, bad_fp in malformed:
+        other = shard([2, 3])
+        other["meta"]["fingerprint"] = bad_fp
+        d2 = write(f"bad_{label}", other)
+        assert mm.main(["--shards", f"{d_good},{d2}", "--out", str(out)]) == 1, label
+        assert mm.main(["--shards", f"{d_good},{d2}", "--out", str(out),
+                        "--allow-legacy"]) == 1, label
+        assert "fingerprint" in capsys.readouterr().out, label
+        assert not (out / "gate-power.json").exists(), label
+
+    # 3) 对照组合法边界：git_commit 空串（git 不可用降级）+ 其余字段完好
+    #    → 正常合并，产物指纹原样保留空串
+    s1, s2 = shard([0, 1]), shard([2, 3])
+    s1["meta"]["fingerprint"] = {**good_fp, "git_commit": ""}
+    s2["meta"]["fingerprint"] = {**good_fp, "git_commit": ""}
+    d1, d2 = write("nogit_1", s1), write("nogit_2", s2)
+    assert mm.main(["--shards", f"{d1},{d2}", "--out", str(out)]) == 0
+    m = json.loads((out / "gate-power.json").read_text(encoding="utf-8"))
+    assert m["meta"]["fingerprint"]["git_commit"] == ""
+    assert m["meta"]["fingerprint"]["cost_versions"] == {"TST H1": "v1"}
 
 
 def test_merge_annotates_structural_flag_lines(tmp_path, monkeypatch):
