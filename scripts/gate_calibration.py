@@ -1094,7 +1094,8 @@ def event_mode_calibration(bars, *, symbol: str, timeframe: str, costs,
                 rets = _returns(planted, base, costs)
                 hits += int(vevents.event_test(
                     rets, sims=test_sims, seed=seed)["p_value"] < alpha)
-            empirical = hits / float(pos_seeds)
+            # pos_seeds<1（CLI 正常用法不可达）跳过检验力行防除零（T66 审核修正）
+            empirical = (hits / float(pos_seeds)) if pos_seeds >= 1 else None
             net_delta = delta - cost_mean
             analytic = (vevents.event_power(net_delta, sigma_w, len(subset),
                                             alpha=alpha)
