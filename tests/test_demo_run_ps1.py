@@ -67,7 +67,8 @@ def run_ps1(*args: str, timeout: float = 120.0) -> subprocess.CompletedProcess:
         return "'" + s.replace("'", "''") + "'"
     inner = ("try { [Console]::OutputEncoding=[Text.Encoding]::UTF8 } "
              "catch { }; & " + _q(str(SCRIPT)) + " "
-             + " ".join(_q(a) for a in args))
+             + " ".join(_q(a) for a in args)
+             + " 6>&1 2>&1; exit $LASTEXITCODE")
     cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
            "-Command", inner]
     return subprocess.run(cmd, capture_output=True, timeout=timeout)
@@ -78,11 +79,18 @@ def out_text(proc: subprocess.CompletedProcess) -> str:
 
 
 def _diag(proc: subprocess.CompletedProcess) -> str:
-    """断言失败时的诊断文本：stdout + stderr 尾部（CI 无控制台/路径差异
-    的报错只在 stderr，否则注解里只剩 'AssertionError:'）。"""
+    """断言失败时的诊断文本。GitHub 注解只显示首行——首行带上 rc 与
+    预检 [X] 失败项（哪个工件/检查没过），正文附完整 stdout，尾部附
+    stderr（CI 无控制台会话的报错只在 stderr）。"""
+    out = out_text(proc)
+    failed_items = [ln.strip() for ln in out.splitlines()
+                    if ln.strip().startswith("[X]")]
+    first = f"rc={proc.returncode}"
+    if failed_items:
+        first += " 预检未过：" + "；".join(failed_items)[:200]
     err = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
     tail = ("\n[stderr] " + err[-600:]) if err else ""
-    return f"rc={proc.returncode}\n{out_text(proc)}{tail}"
+    return first + "\n" + out + tail
 
 
 @pytest.fixture(autouse=True)
