@@ -1,0 +1,995 @@
+{
+  "head": "0d24729d9a3bc3154d28adab718a11f6bda8195f",
+  "bytes_and_assertions": {
+    "gate_calibration_git_bytes_equal": true,
+    "git_blob_sha256": "429296fb7e7a9d1b0cf5b5c1309d5f4a7e7994c7e5f69026af40ad626ff18813",
+    "bom": {
+      "scripts/demo_run.ps1": {
+        "only_utf8_bom_added": true,
+        "size_delta": 3
+      },
+      "scripts/setup_scheduled_tasks.ps1": {
+        "only_utf8_bom_added": true,
+        "size_delta": 3
+      }
+    },
+    "assertion_expressions_unchanged_since_T49": {
+      "tests/test_demo_run_ps1.py": true,
+      "tests/test_p6_docs.py": true
+    }
+  },
+  "ci_shell": {
+    "before/injected": {
+      "exit": 0,
+      "checker_reached": false
+    },
+    "after/injected": {
+      "exit": 42,
+      "checker_reached": true
+    },
+    "after/missing_env": {
+      "exit": 1,
+      "checker_reached": false
+    },
+    "after/empty_env": {
+      "exit": 1,
+      "checker_reached": false
+    },
+    "after/missing_baseline": {
+      "exit": 1,
+      "checker_reached": false
+    }
+  },
+  "p14": {
+    "all_fingerprints_equal": true,
+    "fingerprint": {
+      "git_commit": "2fa27a3f5f7577f0b3693ea296f67b5bfca35618",
+      "git_dirty": true,
+      "gates_sha256": "68f49237d1b56df62691ab8516804349fce245e1dc3cdb8896bf03716f594357",
+      "cost_versions": {
+        "BTCUSD H1": "tick-spread-p90[rel@NY/bar_open_m1#01888819]+slip0.1-comm0-cli-swap-snapshot[a1340439]-ov[eca09e24]-sess[a7bfe5d2]",
+        "EURUSD M15": "tick-spread-p90[rel@NY/bar_open_m1#01888819]+slip0.1-comm0-calibrated-swap-snapshot[95bd5691]-ov[eca09e24]-sess[a7bfe5d2]",
+        "USTEC M5": "tick-spread-p90[rel@NY/bar_open_m1#01888819]+slip0.1-comm0-cli-swap-snapshot[c71b0267]-ov[eca09e24]-missNY[17]-sess[a7bfe5d2]",
+        "XAUUSD H1": "tick-spread-p90[rel@NY/bar_open_m1#01888819]+slip0.1-comm0-cli-swap-snapshot[f7bccb57]-ov[eca09e24]-missNY[17]-sess[a7bfe5d2]",
+        "XAUUSD M15": "tick-spread-p90[rel@NY/bar_open_m1#01888819]+slip0.1-comm0-cli-swap-snapshot[f7bccb57]-ov[eca09e24]-missNY[17]-sess[a7bfe5d2]"
+      },
+      "script_sha256": "2f4813dcbade20c6d886ea0b77a570e5d206f4da2a9f295955c0648a22d79c2c"
+    },
+    "git_script_hash_matches": false,
+    "git_script_matches_after_crlf_normalization": true,
+    "current_script_hash_matches": true,
+    "gates_hash_matches": true,
+    "shard_seeds": [
+      [
+        0,
+        4
+      ],
+      [
+        4,
+        4
+      ],
+      [
+        8,
+        4
+      ],
+      [
+        12,
+        4
+      ],
+      [
+        16,
+        4
+      ]
+    ],
+    "identity_problems": [],
+    "seed_problems": [],
+    "official_sections_equal": {
+      "negative": true,
+      "positive": true,
+      "g5": true,
+      "flags": true
+    },
+    "supplement_matches_official_md": true,
+    "counts": {
+      "negative": 160,
+      "positive": 160,
+      "g5": 480
+    },
+    "passed_all": {
+      "negative": 0,
+      "positive": 0
+    },
+    "flags": [
+      {
+        "check": "G1.gross_cost_multiple",
+        "kind": "low_detection",
+        "value": 0.0,
+        "rule": "真实夏普 1.0 档检出率 < 50%"
+      },
+      {
+        "check": "G1.profit_factor",
+        "kind": "low_detection",
+        "value": 0.0,
+        "rule": "真实夏普 1.0 档检出率 < 50%"
+      },
+      {
+        "check": "G2.cost_scaling",
+        "kind": "low_detection",
+        "value": 0.2,
+        "rule": "真实夏普 1.0 档检出率 < 50%"
+      },
+      {
+        "check": "G2.drop_best_5pct",
+        "kind": "low_detection",
+        "value": 0.0,
+        "rule": "真实夏普 1.0 档检出率 < 50%"
+      },
+      {
+        "check": "G2.random_entry_benchmark",
+        "kind": "low_detection",
+        "value": 0.4,
+        "rule": "真实夏普 1.0 档检出率 < 50%"
+      },
+      {
+        "check": "G1.net_profit_positive",
+        "kind": "high_false_positive",
+        "value": 0.11666666666666667,
+        "rule": "负对照误报率 > 5%"
+      },
+      {
+        "check": "G1.trade_count",
+        "kind": "high_false_positive",
+        "value": 1.0,
+        "rule": "负对照误报率 > 5%"
+      },
+      {
+        "check": "G2.delay_1_bar",
+        "kind": "high_false_positive",
+        "value": 0.15,
+        "rule": "负对照误报率 > 5%"
+      },
+      {
+        "check": "G2.param_plateau",
+        "kind": "high_false_positive",
+        "value": 0.42,
+        "rule": "负对照误报率 > 5%"
+      },
+      {
+        "check": "G2.random_entry_benchmark",
+        "kind": "high_false_positive",
+        "value": 0.09,
+        "rule": "负对照误报率 > 5%"
+      },
+      {
+        "check": "G3.oos_sharpe",
+        "kind": "high_false_positive",
+        "value": 0.23333333333333334,
+        "rule": "负对照误报率 > 5%"
+      },
+      {
+        "check": "G5.expectation_positive",
+        "kind": "high_false_positive",
+        "value": 0.275,
+        "rule": "负对照误报率 > 5%"
+      },
+      {
+        "check": "G5.sharpe_vs_reference",
+        "kind": "high_false_positive",
+        "value": 0.95,
+        "rule": "负对照误报率 > 5%"
+      }
+    ],
+    "distributions": {
+      "XAUUSD H1/0.3": {
+        "n": 20,
+        "mean": 0.02851318901979121,
+        "median": 0.18927052195923433,
+        "min": -0.8362271548820474,
+        "max": 0.5917034358368506,
+        "converged": true,
+        "history_length": 4,
+        "achieved_sharpe": 0.32784638261534643,
+        "target": 0.3,
+        "tol": 0.15
+      },
+      "XAUUSD H1/0.6": {
+        "n": 20,
+        "mean": 0.29944017765847236,
+        "median": 0.42780220223295706,
+        "min": -0.5281662266826296,
+        "max": 0.7974077802131023,
+        "converged": true,
+        "history_length": 4,
+        "achieved_sharpe": 0.6315737097600597,
+        "target": 0.6,
+        "tol": 0.15
+      },
+      "XAUUSD H1/1.0": {
+        "n": 20,
+        "mean": 0.6676753044736162,
+        "median": 0.7498131830466659,
+        "min": -0.09805571815981569,
+        "max": 1.1184364889961091,
+        "converged": true,
+        "history_length": 4,
+        "achieved_sharpe": 1.0257775131803797,
+        "target": 1.0,
+        "tol": 0.15
+      },
+      "XAUUSD H1/1.5": {
+        "n": 20,
+        "mean": 1.0721793941544138,
+        "median": 1.1633767599435436,
+        "min": 0.3683361330288489,
+        "max": 1.5483316281447397,
+        "converged": true,
+        "history_length": 3,
+        "achieved_sharpe": 1.4486412008819345,
+        "target": 1.5,
+        "tol": 0.15
+      },
+      "USTEC M5/0.3": {
+        "n": 20,
+        "mean": 0.20944306454658135,
+        "median": 0.28333993786747325,
+        "min": -0.46089998418834227,
+        "max": 1.2189502907038894,
+        "converged": true,
+        "history_length": 4,
+        "achieved_sharpe": 0.39821280247053437,
+        "target": 0.3,
+        "tol": 0.15
+      },
+      "USTEC M5/0.6": {
+        "n": 20,
+        "mean": 0.4322820162741024,
+        "median": 0.4522559723251789,
+        "min": -0.16662505801715058,
+        "max": 1.4564416637280875,
+        "converged": true,
+        "history_length": 6,
+        "achieved_sharpe": 0.6123020096051505,
+        "target": 0.6,
+        "tol": 0.15
+      },
+      "USTEC M5/1.0": {
+        "n": 20,
+        "mean": 1.2107483434296644,
+        "median": 1.0344019742858237,
+        "min": 0.5546062602538345,
+        "max": 2.286051445097382,
+        "converged": false,
+        "history_length": 7,
+        "achieved_sharpe": 1.3430208793514609,
+        "target": 1.0,
+        "tol": 0.15
+      },
+      "USTEC M5/1.5": {
+        "n": 20,
+        "mean": 1.4863660281628426,
+        "median": 1.2661560787312618,
+        "min": 0.8046925937847212,
+        "max": 2.5820947771407545,
+        "converged": true,
+        "history_length": 4,
+        "achieved_sharpe": 1.6005104894907192,
+        "target": 1.5,
+        "tol": 0.15
+      }
+    },
+    "g5": {
+      "XAUUSD H1/slot": {
+        "raw_n": 80,
+        "unique_seed_n": 20,
+        "passed": 40,
+        "p5_min": -1.3412518911556832,
+        "p5_max": -0.929928216924289
+      },
+      "XAUUSD H1/day": {
+        "raw_n": 80,
+        "unique_seed_n": 20,
+        "passed": 28,
+        "p5_min": -1.3412518911556832,
+        "p5_max": -0.929928216924289
+      },
+      "USTEC M5/slot": {
+        "raw_n": 80,
+        "unique_seed_n": 20,
+        "passed": 4,
+        "p5_min": -2.9929970714186913,
+        "p5_max": -1.6881029882147767
+      },
+      "USTEC M5/day": {
+        "raw_n": 80,
+        "unique_seed_n": 20,
+        "passed": 0,
+        "p5_min": -2.9929970714186913,
+        "p5_max": -1.6881029882147767
+      }
+    },
+    "missing_condition_rejected": true,
+    "changed_fingerprint_rejected": true,
+    "all_fingerprints_missing_problems": [
+      "所有分片 meta 都缺 fingerprint——运行身份未封闭（R8-I2），拒绝合并；确需合并历史无指纹诊断产物请显式传 --allow-legacy（合并产物 meta 将记 legacy_no_fingerprint=true 降级）"
+    ],
+    "changed_unchecked_identity_fields": {
+      "max_bars": [
+        "分片 meta.max_bars 不一致（分片0=None，分片1=100）——实验身份不同，拒绝合并"
+      ],
+      "g5_cutoff": [
+        "分片 meta.g5_cutoff 不一致（分片0='2025-10-24 00:00:00'，分片1='2024-10-24 00:00:00'）——实验身份不同，拒绝合并"
+      ],
+      "g5_window_source": [
+        "分片 meta.g5_window_source 不一致（分片0='lockbox_cutoff'，分片1='different'）——实验身份不同，拒绝合并"
+      ]
+    },
+    "missing_whole_g5": {
+      "seed_problems": [
+        "分片0 缺整臂 g5——实验设计（meta.phase='both'）要求该实验臂，产物无此区块，拒绝合并"
+      ],
+      "merge_exit": 1,
+      "g5_runs": null,
+      "reported_seeds": null
+    }
+  },
+  "fingerprint_edges": {
+    "missing": {
+      "exit": 1,
+      "legacy_no_fingerprint": false
+    },
+    "missing_with_allow_legacy": {
+      "exit": 0,
+      "legacy_no_fingerprint": true
+    },
+    "null": {
+      "exit": 0,
+      "legacy_no_fingerprint": false
+    },
+    "empty_object": {
+      "exit": 0,
+      "legacy_no_fingerprint": false
+    },
+    "missing_negative": {
+      "exit": 1,
+      "legacy_no_fingerprint": false
+    },
+    "missing_positive": {
+      "exit": 1,
+      "legacy_no_fingerprint": false
+    },
+    "missing_g5": {
+      "exit": 1,
+      "legacy_no_fingerprint": false
+    },
+    "structural_annotation": {
+      "fresh_render_contains_note": true,
+      "existing_official_md_contains_note": false
+    }
+  },
+  "p16_and_accept_edges": {
+    "p16": {
+      "accept_exit": 1,
+      "acceptance_claimed": false,
+      "output": "== 阶段 F 最终验收（--accept 严格口径：无样本/未覆盖=未验收） ==\n数据范围：2026-10-26 → 2026-10-26\n[不通过] 连续交易日覆盖（≥10 个交易日全齐）：仅覆盖 1 个交易日（<10）（2026-10-26 → 2026-10-26）\n[不通过] 各进程存活证据（逐日风控/对账/运行器）：magic [1] 没有任何运行器日志证据——无法证明运行器存活过\n[不通过] SL 与 TP 样本均存在：SL 样本 0 笔、TP 样本 0 笔（成交 0/0 + 运行器日志 0/0）——无样本=未验收（§7 要求 SL/TP 均有实测出场证据）\n[不通过] 双全平演练真实完成（两个不同 uuid + 两轮 ack closed）：仅 0 轮完成全平证据（uuid：（无）；归档指令 0 个、归档 ack 0 个）——§7 要求连续两次、第二次同样真全平（两个不同 uuid 指令 + 两轮完成 ack；RISK_FLATTEN 告警条数不能代替）\n[不通过] 实际点差样本存在且无超标小时：2026-10-26 当日无点差样本（无样本=未验收）\n\n逐日严格复核（覆盖跨度内交易日；无样本/无法判定项按不通过）：\n  2026-10-26：通过\n\n结论：未通过（未验收）——判据不满足 5 项、逐日复核异常 0 天；日常检查用 --day/--summary（宽松口径）。\n",
+      "day_exit": 0
+    },
+    "paper_only_fixture": {
+      "accept_exit": 0,
+      "acceptance_claimed": true,
+      "output": "== 阶段 F 最终验收（--accept 严格口径：无样本/未覆盖=未验收） ==\n数据范围：2026-11-02 → 2026-11-13\n[通过] 连续交易日覆盖（≥10 个交易日全齐）：2026-11-02 → 2026-11-13 共 10 个交易日全齐，其间无缺失工作日（周六日不计；假日按工作日近似，跨假日段须人工注明例外）\n[通过] 各进程存活证据（逐日风控/对账/运行器）：2026-11-02 → 2026-11-13 逐日（含周末 12 天）风控/对账/运行器（[902601]）均有存活证据\n[通过] SL 与 TP 样本均存在：SL 1 笔（成交 1 + 日志 0）、TP 1 笔（成交 1 + 日志 0）均已有实测样本\n[通过] 双全平演练真实完成（两个不同 uuid + 两轮 ack closed）：2 个不同 uuid 均有完成证据：aaaaaaaa(指令归档)、bbbbbbbb(指令归档)\n[通过] 实际点差样本存在且无超标小时：覆盖 10 个交易日日报均有点差比对样本且无**超标** 小时（滑点证据须 Demo 真实成交，PaperSoak 不产生经纪商滑点）\n\n逐日严格复核（覆盖跨度内交易日；无样本/无法判定项按不通过）：\n  2026-11-02：通过\n  2026-11-03：通过\n  2026-11-04：通过\n  2026-11-05：通过\n  2026-11-06：通过\n  2026-11-09：通过\n  2026-11-10：通过\n  2026-11-11：通过\n  2026-11-12：通过\n  2026-11-13：通过\n\n结论：验收通过——阶段 F 证据齐全（蓝图 §7，严格口径）。\n"
+    },
+    "orphan_acks_closed_zero": {
+      "accept_exit": 0,
+      "acceptance_claimed": true,
+      "output": "== 阶段 F 最终验收（--accept 严格口径：无样本/未覆盖=未验收） ==\n数据范围：2026-11-02 → 2026-11-13\n[通过] 连续交易日覆盖（≥10 个交易日全齐）：2026-11-02 → 2026-11-13 共 10 个交易日全齐，其间无缺失工作日（周六日不计；假日按工作日近似，跨假日段须人工注明例外）\n[通过] 各进程存活证据（逐日风控/对账/运行器）：2026-11-02 → 2026-11-13 逐日（含周末 12 天）风控/对账/运行器（[902601]）均有存活证据\n[通过] SL 与 TP 样本均存在：SL 1 笔（成交 1 + 日志 0）、TP 1 笔（成交 1 + 日志 0）均已有实测样本\n[通过] 双全平演练真实完成（两个不同 uuid + 两轮 ack closed）：2 个不同 uuid 均有完成证据：aaaaaaaa(ack closed=0)、bbbbbbbb(ack closed=0)\n[通过] 实际点差样本存在且无超标小时：覆盖 10 个交易日日报均有点差比对样本且无**超标** 小时（滑点证据须 Demo 真实成交，PaperSoak 不产生经纪商滑点）\n\n逐日严格复核（覆盖跨度内交易日；无样本/无法判定项按不通过）：\n  2026-11-02：通过\n  2026-11-03：通过\n  2026-11-04：通过\n  2026-11-05：通过\n  2026-11-06：通过\n  2026-11-09：通过\n  2026-11-10：通过\n  2026-11-11：通过\n  2026-11-12：通过\n  2026-11-13：通过\n\n结论：验收通过——阶段 F 证据齐全（蓝图 §7，严格口径）。\n"
+    },
+    "headings_only_reports": {
+      "accept_exit": 0,
+      "acceptance_claimed": true,
+      "output": "== 阶段 F 最终验收（--accept 严格口径：无样本/未覆盖=未验收） ==\n数据范围：2026-11-02 → 2026-11-13\n[通过] 连续交易日覆盖（≥10 个交易日全齐）：2026-11-02 → 2026-11-13 共 10 个交易日全齐，其间无缺失工作日（周六日不计；假日按工作日近似，跨假日段须人工注明例外）\n[通过] 各进程存活证据（逐日风控/对账/运行器）：2026-11-02 → 2026-11-13 逐日（含周末 12 天）风控/对账/运行器（[902601]）均有存活证据\n[通过] SL 与 TP 样本均存在：SL 1 笔（成交 1 + 日志 0）、TP 1 笔（成交 1 + 日志 0）均已有实测样本\n[通过] 双全平演练真实完成（两个不同 uuid + 两轮 ack closed）：2 个不同 uuid 均有完成证据：aaaaaaaa(指令归档)、bbbbbbbb(指令归档)\n[通过] 实际点差样本存在且无超标小时：覆盖 10 个交易日日报均有点差比对样本且无**超标** 小时（滑点证据须 Demo 真实成交，PaperSoak 不产生经纪商滑点）\n\n逐日严格复核（覆盖跨度内交易日；无样本/无法判定项按不通过）：\n  2026-11-02：通过\n  2026-11-03：通过\n  2026-11-04：通过\n  2026-11-05：通过\n  2026-11-06：通过\n  2026-11-09：通过\n  2026-11-10：通过\n  2026-11-11：通过\n  2026-11-12：通过\n  2026-11-13：通过\n\n结论：验收通过——阶段 F 证据齐全（蓝图 §7，严格口径）。\n"
+    },
+    "paper_logs_without_deal_records": {
+      "accept_exit": 0,
+      "acceptance_claimed": true,
+      "output": "== 阶段 F 最终验收（--accept 严格口径：无样本/未覆盖=未验收） ==\n数据范围：2026-11-02 → 2026-11-13\n[通过] 连续交易日覆盖（≥10 个交易日全齐）：2026-11-02 → 2026-11-13 共 10 个交易日全齐，其间无缺失工作日（周六日不计；假日按工作日近似，跨假日段须人工注明例外）\n[通过] 各进程存活证据（逐日风控/对账/运行器）：2026-11-02 → 2026-11-13 逐日（含周末 12 天）风控/对账/运行器（[902601]）均有存活证据\n[通过] SL 与 TP 样本均存在：SL 1 笔（成交 0 + 日志 1）、TP 1 笔（成交 0 + 日志 1）均已有实测样本\n[通过] 双全平演练真实完成（两个不同 uuid + 两轮 ack closed）：2 个不同 uuid 均有完成证据：aaaaaaaa(指令归档)、bbbbbbbb(指令归档)\n[通过] 实际点差样本存在且无超标小时：覆盖 10 个交易日日报均有点差比对样本且无**超标** 小时（滑点证据须 Demo 真实成交，PaperSoak 不产生经纪商滑点）\n\n逐日严格复核（覆盖跨度内交易日；无样本/无法判定项按不通过）：\n  2026-11-02：通过\n  2026-11-03：通过\n  2026-11-04：通过\n  2026-11-05：通过\n  2026-11-06：通过\n  2026-11-09：通过\n  2026-11-10：通过\n  2026-11-11：通过\n  2026-11-12：通过\n  2026-11-13：通过\n\n结论：验收通过——阶段 F 证据齐全（蓝图 §7，严格口径）。\n"
+    }
+  },
+  "demo_ps51_native_argument": {
+    "source_parses": true,
+    "received_argument_parse_exit": 1,
+    "detail": {
+      "parsed": false,
+      "line": 16,
+      "text": "            print(fFAIL\n",
+      "msg": "'(' was never closed"
+    },
+    "gateway_code_executed": false
+  },
+  "demo_volume_validation": {
+    "TOML_loaded_volume_lots": 0.02,
+    "launcher_volume_validation_exit": 0,
+    "stdout": "ACCEPT",
+    "no_gateway_or_runner_executed": true
+  },
+  "lifecycle": {
+    "recorded_logdir_other_mode": {
+      "exit": 0,
+      "existing_runner_detected": true
+    },
+    "changed_logdir_same_magic": {
+      "exit": 0,
+      "existing_runner_detected": false
+    }
+  },
+  "p17": {
+    "runs": {
+      "USTEC_M5_20261026T105826Z_20261027T002101Z_r8i3-2fe72d": {
+        "paired": 4170,
+        "only_a": 50,
+        "only_b": 1277,
+        "entry_bad": 21,
+        "exit_bad": 27,
+        "reason_bad": 34,
+        "net_bad": 94,
+        "reported_summary_ok": false,
+        "entry_notes": {
+          "before_ready": 21
+        },
+        "exit_notes": {
+          "level_unknown": 19,
+          "before_ready": 8
+        },
+        "net_bad_categories": {
+          "tp_cross": 50,
+          "reason_mismatch": 32,
+          "tp_gap": 5,
+          "cross_bar_skew": 7
+        },
+        "b_favorable_bad_rows": 88,
+        "pure_stop_rows": 1046,
+        "pure_stop_net_bad": 0,
+        "stop_to_nonstop_rows": 25,
+        "stop_to_nonstop_overshoot_sum": 0.0,
+        "additional_bad_without_invalid_overshoot": 0,
+        "summary_counts_match": true,
+        "largest_invalid_overshoot": {
+          "entry_time_a": "2026-02-10 01:10:00",
+          "exit_time_a": "2026-02-10 01:30:00",
+          "exit_time_b": "2026-02-10 01:35:00.144",
+          "exit_reason_b": "signal",
+          "net_diff": 4.484990275257587,
+          "net_overshoot_comp": 0.0,
+          "net_rest": 4.33962246511957,
+          "net_tol": 1.655367810136417,
+          "net_ok": false
+        }
+      },
+      "USTEC_M5_20261026T105826Z_2fe72d": {
+        "paired": 4170,
+        "only_a": 50,
+        "only_b": 1277,
+        "entry_bad": 21,
+        "exit_bad": 27,
+        "reason_bad": 34,
+        "net_bad": 73,
+        "reported_summary_ok": false,
+        "entry_notes": {
+          "before_ready": 21
+        },
+        "exit_notes": {
+          "level_unknown": 19,
+          "before_ready": 8
+        },
+        "net_bad_categories": {
+          "tp_cross": 50,
+          "reason_mismatch": 11,
+          "tp_gap": 5,
+          "cross_bar_skew": 7
+        },
+        "b_favorable_bad_rows": 67,
+        "pure_stop_rows": 1046,
+        "pure_stop_net_bad": 0,
+        "stop_to_nonstop_rows": 25,
+        "stop_to_nonstop_overshoot_sum": 1045.5155481301863,
+        "additional_bad_without_invalid_overshoot": 21,
+        "summary_counts_match": true,
+        "largest_invalid_overshoot": {
+          "entry_time_a": "2026-06-16 14:35:00",
+          "exit_time_a": "2026-06-16 14:40:00",
+          "exit_time_b": "2026-06-16 15:46:22.631",
+          "exit_reason_b": "take_profit",
+          "net_diff": 271.8154197550939,
+          "net_overshoot_comp": 271.61958261342,
+          "net_rest": 0.1958371416739055,
+          "net_tol": 1.9583741960918484,
+          "net_ok": true
+        }
+      },
+      "USTEC_M5_20261026T105954Z_1835cc": {
+        "paired": 3651,
+        "only_a": 0,
+        "only_b": 0,
+        "entry_bad": 0,
+        "exit_bad": 38,
+        "reason_bad": 43,
+        "net_bad": 62,
+        "reported_summary_ok": false,
+        "entry_notes": {},
+        "exit_notes": {
+          "level_unknown": 31,
+          "before_ready": 7
+        },
+        "net_bad_categories": {
+          "tp_cross": 50,
+          "reason_mismatch": 7,
+          "tp_gap": 5
+        },
+        "b_favorable_bad_rows": 61,
+        "pure_stop_rows": 877,
+        "pure_stop_net_bad": 0,
+        "stop_to_nonstop_rows": 36,
+        "stop_to_nonstop_overshoot_sum": 872.46608628999,
+        "additional_bad_without_invalid_overshoot": 34,
+        "summary_counts_match": true,
+        "largest_invalid_overshoot": {
+          "entry_time_a": "2026-06-29 13:30:00",
+          "exit_time_a": "2026-06-29 13:30:00",
+          "exit_time_b": "2026-06-29 13:30:32.100",
+          "exit_reason_b": "take_profit",
+          "net_diff": 139.48252842904185,
+          "net_overshoot_comp": 139.29546327425078,
+          "net_rest": 0.1870651547910711,
+          "net_tol": 1.913705674182544,
+          "net_ok": true
+        }
+      },
+      "USTEC_M5_20261026T105954Z_20261027T002101Z_r8i3-1835cc": {
+        "paired": 3651,
+        "only_a": 0,
+        "only_b": 0,
+        "entry_bad": 0,
+        "exit_bad": 38,
+        "reason_bad": 43,
+        "net_bad": 96,
+        "reported_summary_ok": false,
+        "entry_notes": {},
+        "exit_notes": {
+          "level_unknown": 31,
+          "before_ready": 7
+        },
+        "net_bad_categories": {
+          "reason_mismatch": 41,
+          "tp_cross": 50,
+          "tp_gap": 5
+        },
+        "b_favorable_bad_rows": 95,
+        "pure_stop_rows": 877,
+        "pure_stop_net_bad": 0,
+        "stop_to_nonstop_rows": 36,
+        "stop_to_nonstop_overshoot_sum": 0.0,
+        "additional_bad_without_invalid_overshoot": 0,
+        "summary_counts_match": true,
+        "largest_invalid_overshoot": {
+          "entry_time_a": "2026-02-10 01:10:00",
+          "exit_time_a": "2026-02-10 01:30:00",
+          "exit_time_b": "2026-02-10 01:35:00.144",
+          "exit_reason_b": "signal",
+          "net_diff": 4.484990275257587,
+          "net_overshoot_comp": 0.0,
+          "net_rest": 4.33962246511957,
+          "net_tol": 1.655367810136417,
+          "net_ok": false
+        }
+      },
+      "XAUUSD_H1_20261026T105752Z_20261027T002101Z_r8i3-e7d328": {
+        "paired": 161,
+        "only_a": 0,
+        "only_b": 0,
+        "entry_bad": 0,
+        "exit_bad": 0,
+        "reason_bad": 0,
+        "net_bad": 5,
+        "reported_summary_ok": false,
+        "entry_notes": {},
+        "exit_notes": {},
+        "net_bad_categories": {
+          "tp_cross": 4,
+          "tp_gap": 1
+        },
+        "b_favorable_bad_rows": 5,
+        "pure_stop_rows": 62,
+        "pure_stop_net_bad": 0,
+        "stop_to_nonstop_rows": 0,
+        "stop_to_nonstop_overshoot_sum": 0.0,
+        "additional_bad_without_invalid_overshoot": 0,
+        "summary_counts_match": true
+      },
+      "XAUUSD_H1_20261026T105752Z_e7d328": {
+        "paired": 161,
+        "only_a": 0,
+        "only_b": 0,
+        "entry_bad": 0,
+        "exit_bad": 0,
+        "reason_bad": 0,
+        "net_bad": 5,
+        "reported_summary_ok": false,
+        "entry_notes": {},
+        "exit_notes": {},
+        "net_bad_categories": {
+          "tp_cross": 4,
+          "tp_gap": 1
+        },
+        "b_favorable_bad_rows": 5,
+        "pure_stop_rows": 62,
+        "pure_stop_net_bad": 0,
+        "stop_to_nonstop_rows": 0,
+        "stop_to_nonstop_overshoot_sum": 0.0,
+        "additional_bad_without_invalid_overshoot": 0,
+        "summary_counts_match": true
+      },
+      "XAUUSD_H1_20261026T105800Z_15b701": {
+        "paired": 382,
+        "only_a": 1,
+        "only_b": 1,
+        "entry_bad": 0,
+        "exit_bad": 0,
+        "reason_bad": 0,
+        "net_bad": 18,
+        "reported_summary_ok": false,
+        "entry_notes": {},
+        "exit_notes": {},
+        "net_bad_categories": {
+          "tp_cross": 17,
+          "tp_gap": 1
+        },
+        "b_favorable_bad_rows": 18,
+        "pure_stop_rows": 134,
+        "pure_stop_net_bad": 0,
+        "stop_to_nonstop_rows": 0,
+        "stop_to_nonstop_overshoot_sum": 0.0,
+        "additional_bad_without_invalid_overshoot": 0,
+        "summary_counts_match": true
+      },
+      "XAUUSD_H1_20261026T105800Z_20261027T002101Z_r8i3-15b701": {
+        "paired": 382,
+        "only_a": 1,
+        "only_b": 1,
+        "entry_bad": 0,
+        "exit_bad": 0,
+        "reason_bad": 0,
+        "net_bad": 18,
+        "reported_summary_ok": false,
+        "entry_notes": {},
+        "exit_notes": {},
+        "net_bad_categories": {
+          "tp_cross": 17,
+          "tp_gap": 1
+        },
+        "b_favorable_bad_rows": 18,
+        "pure_stop_rows": 134,
+        "pure_stop_net_bad": 0,
+        "stop_to_nonstop_rows": 0,
+        "stop_to_nonstop_overshoot_sum": 0.0,
+        "additional_bad_without_invalid_overshoot": 0,
+        "summary_counts_match": true
+      }
+    },
+    "totals": {
+      "paired": 16728,
+      "only_a": 102,
+      "only_b": 2556,
+      "entry_bad": 42,
+      "exit_bad": 130,
+      "reason_bad": 154,
+      "net_bad": 371,
+      "pure_stop_rows": 4238,
+      "pure_stop_net_bad": 0,
+      "stop_to_nonstop_rows": 122,
+      "additional_bad_without_invalid_overshoot": 55,
+      "b_favorable_bad_rows": 357
+    },
+    "nonstop_as_overshoot_probe": {
+      "net_diff": 60.0,
+      "spread_comp": -0.0,
+      "overshoot_comp": 0.0,
+      "overshoot_applied": false,
+      "same_entry_bar": true,
+      "rest": 60.0,
+      "tol": 1.0,
+      "ok": false
+    }
+  },
+  "p18": {
+    "902431": {
+      "decisions": 41,
+      "deals": 15,
+      "entries": 8,
+      "exits": 7,
+      "SL": 3,
+      "TP": 0,
+      "balance": 9845.260999999999,
+      "equity": 9826.932999999999,
+      "open_positions": 1,
+      "closed_position_volume_mismatches": 0,
+      "execution_actions": {
+        "open": 6,
+        "none": 17769,
+        "hold": 32,
+        "flatten": 2,
+        "flatten_acked": 68,
+        "reverse": 2
+      },
+      "logged_order_kinds": {
+        "open": 8,
+        "close": 4
+      },
+      "protective_times": [
+        "2026-10-26T13:53:35.917230+00:00",
+        "2026-10-26T14:17:51.938051+00:00",
+        "2026-10-26T14:54:29.820093+00:00"
+      ],
+      "flatten_close_times": [
+        "2026-10-26T12:59:57.466162+00:00",
+        "2026-10-26T13:15:08.959319+00:00",
+        "2026-10-26T16:30:06.993843+00:00",
+        "2026-10-26T20:15:06.477659+00:00"
+      ]
+    },
+    "902432": {
+      "decisions": 42,
+      "deals": 6,
+      "entries": 3,
+      "exits": 3,
+      "SL": 2,
+      "TP": 0,
+      "balance": 9897.140000000001,
+      "equity": 9897.140000000001,
+      "open_positions": 0,
+      "closed_position_volume_mismatches": 0,
+      "execution_actions": {
+        "risk_rejected": 13,
+        "none": 17845,
+        "flatten": 2,
+        "flatten_acked": 68,
+        "open": 3,
+        "hold": 17,
+        "blocked_reentry": 8
+      },
+      "logged_order_kinds": {
+        "open": 3,
+        "close": 1
+      },
+      "protective_times": [
+        "2026-10-26T17:24:22.816018+00:00",
+        "2026-10-26T19:08:20.878541+00:00"
+      ],
+      "flatten_close_times": [
+        "2026-10-26T13:15:08.595939+00:00"
+      ]
+    },
+    "risk": {
+      "cycles": 3622,
+      "bad_heartbeat_cycles": 0,
+      "halt_cycles": 195
+    },
+    "reconcile": {
+      "consistent_cycles": 1208,
+      "inconsistent_cycles": 0
+    },
+    "flatten_archive": {
+      "flatten-bcc56ce9-20261026T131507-manual.json": {
+        "id": "bcc56ce9cd724378b7ff300f22a4279e",
+        "ts": "2026-10-26T13:15:07.270619+00:00"
+      },
+      "flatten-d5dd164c-20261026T125956-manual.json": {
+        "id": "d5dd164c8a8e4c2bbb2b9d9f58ff0ec2",
+        "ts": "2026-10-26T12:59:56.753713+00:00"
+      },
+      "flatten.ack-902431-drill2.json": {
+        "id": "bcc56ce9cd724378b7ff300f22a4279e",
+        "ts": "2026-10-26T13:15:08.935909+00:00",
+        "closed": 1,
+        "magic": 902431
+      },
+      "flatten.ack-902432-drill2.json": {
+        "id": "bcc56ce9cd724378b7ff300f22a4279e",
+        "ts": "2026-10-26T13:15:08.572334+00:00",
+        "closed": 1,
+        "magic": 902432
+      }
+    },
+    "alert_counts": {
+      "RISK_REJECT": 13,
+      "RISK_HALT": 3,
+      "RISK_FLATTEN": 2
+    },
+    "reject_counts": {
+      "max_lots": 11,
+      "kill_switch": 2
+    }
+  },
+  "p19": {
+    "ledger_verify_problems": [],
+    "anchor_verify_problems": [],
+    "baseline_run_count": 67,
+    "baseline_with_ov": 67,
+    "baseline_cards": [
+      "H002",
+      "H003",
+      "H004",
+      "H005",
+      "H006",
+      "H007"
+    ],
+    "ops_records": [
+      {
+        "run_id": 442,
+        "strategy": "mt5quant.backtest.reference:MaCrossATRAfterSignalChange",
+        "symbol": "XAUUSD",
+        "timeframe": "H1",
+        "created_utc": "2026-10-26T10:57:52.647126+00:00"
+      },
+      {
+        "run_id": 443,
+        "strategy": "mt5quant.backtest.reference:MaCrossATR",
+        "symbol": "XAUUSD",
+        "timeframe": "H1",
+        "created_utc": "2026-10-26T10:58:00.692750+00:00"
+      },
+      {
+        "run_id": 444,
+        "strategy": "mt5quant.backtest.reference:MaCrossATR",
+        "symbol": "USTEC",
+        "timeframe": "M5",
+        "created_utc": "2026-10-26T10:58:27.591519+00:00"
+      },
+      {
+        "run_id": 445,
+        "strategy": "mt5quant.backtest.reference:MaCrossATRAfterSignalChange",
+        "symbol": "USTEC",
+        "timeframe": "M5",
+        "created_utc": "2026-10-26T10:59:55.201703+00:00"
+      }
+    ],
+    "cache_loads": {
+      "data/costs/spread_model.json": {
+        "XAUUSD": {
+          "sha": "eca09e24",
+          "status": "loaded",
+          "loaded": true
+        },
+        "USTEC": {
+          "sha": "eca09e24",
+          "status": "loaded",
+          "loaded": true
+        },
+        "EURUSD": {
+          "sha": "eca09e24",
+          "status": "loaded",
+          "loaded": true
+        },
+        "BTCUSD": {
+          "sha": "eca09e24",
+          "status": "loaded",
+          "loaded": true
+        }
+      },
+      "data_research/costs/spread_model.json": {
+        "XAUUSD": {
+          "sha": "eca09e24",
+          "status": "loaded",
+          "loaded": true
+        },
+        "USTEC": {
+          "sha": "eca09e24",
+          "status": "loaded",
+          "loaded": true
+        },
+        "EURUSD": {
+          "sha": "eca09e24",
+          "status": "loaded",
+          "loaded": true
+        },
+        "BTCUSD": {
+          "sha": "eca09e24",
+          "status": "loaded",
+          "loaded": true
+        }
+      }
+    }
+  },
+  "recalc_comparison": {
+    "USTEC_M5_20261026T105826Z_2fe72d": {
+      "non_net_columns_equal_with_csv_float_roundoff": true,
+      "overshoot_matches": true,
+      "rest_matches": true,
+      "net_ok_matches": true,
+      "row_ok_matches": true,
+      "kept_stop_exit_checks_all_true": true,
+      "summary_violations_match": true,
+      "violation_listing_count": 94,
+      "violation_listing_classes_match": true,
+      "classes": {
+        "tp_cross": 50,
+        "reason_divergence": 23,
+        "reason_mismatch_other": 9,
+        "cross_bar_skew": 7,
+        "tp_gap": 5
+      },
+      "recalc": true,
+      "inherited_ops_ack": true,
+      "old_bad": 73,
+      "new_bad": 94,
+      "paired": 4170,
+      "stop_nonstop_old_overshoot_sum": 1045.5155481301863
+    },
+    "USTEC_M5_20261026T105954Z_1835cc": {
+      "non_net_columns_equal_with_csv_float_roundoff": true,
+      "overshoot_matches": true,
+      "rest_matches": true,
+      "net_ok_matches": true,
+      "row_ok_matches": true,
+      "kept_stop_exit_checks_all_true": true,
+      "summary_violations_match": true,
+      "violation_listing_count": 96,
+      "violation_listing_classes_match": true,
+      "classes": {
+        "tp_cross": 50,
+        "reason_divergence": 34,
+        "reason_mismatch_other": 7,
+        "tp_gap": 5
+      },
+      "recalc": true,
+      "inherited_ops_ack": true,
+      "old_bad": 62,
+      "new_bad": 96,
+      "paired": 3651,
+      "stop_nonstop_old_overshoot_sum": 872.46608628999
+    },
+    "XAUUSD_H1_20261026T105752Z_e7d328": {
+      "non_net_columns_equal_with_csv_float_roundoff": true,
+      "overshoot_matches": true,
+      "rest_matches": true,
+      "net_ok_matches": true,
+      "row_ok_matches": true,
+      "kept_stop_exit_checks_all_true": true,
+      "summary_violations_match": true,
+      "violation_listing_count": 5,
+      "violation_listing_classes_match": true,
+      "classes": {
+        "tp_cross": 4,
+        "tp_gap": 1
+      },
+      "recalc": true,
+      "inherited_ops_ack": true,
+      "old_bad": 5,
+      "new_bad": 5,
+      "paired": 161,
+      "stop_nonstop_old_overshoot_sum": 0.0
+    },
+    "XAUUSD_H1_20261026T105800Z_15b701": {
+      "non_net_columns_equal_with_csv_float_roundoff": true,
+      "overshoot_matches": true,
+      "rest_matches": true,
+      "net_ok_matches": true,
+      "row_ok_matches": true,
+      "kept_stop_exit_checks_all_true": true,
+      "summary_violations_match": true,
+      "violation_listing_count": 18,
+      "violation_listing_classes_match": true,
+      "classes": {
+        "tp_cross": 17,
+        "tp_gap": 1
+      },
+      "recalc": true,
+      "inherited_ops_ack": true,
+      "old_bad": 18,
+      "new_bad": 18,
+      "paired": 382,
+      "stop_nonstop_old_overshoot_sum": 0.0
+    }
+  },
+  "ops_rows_after_historical_445": [],
+  "old_rate_percent": 98.11095169775227,
+  "new_rate_percent": 97.45337159253945
+}
