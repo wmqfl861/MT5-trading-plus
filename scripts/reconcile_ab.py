@@ -50,10 +50,16 @@ load_ticks 月分区按品种加载窗口内 tick，reconcile() 复用同一个 
      −(spread_cost_b − spread_cost_a)；空头非跳空 stop/take_profit 例外
      取 0——A 层成交价"预减 spr 再加回"（engine_a._protective_exit）、
      B 层按触发侧价格成交，实际点差不进净利（只影响触发早晚）；
-   - 止损越幅分量（T36/A-1.6）＝(模型 p50 − B 实际越幅)×手数×合约大小，
-     仅 reason=stop 的行；stop_gap 双方都按开盘/穿价 tick 成交、TP 不
-     建模越幅，均取 0（其成交差如实落进"其余"）；
-   - 其余 = 残差（滑点差、bid 与 bar 开盘/收盘之差、跳空止盈保守口径等）。
+   - 止损越幅分量（T36/A-1.6；R8-I3/T48 收紧适用范围）＝
+     (模型 p50 − B 实际越幅)×手数×合约大小，仅 **A、B 同为 stop 出场
+     且入场同 bar** 的可比行：A=stop、B 以 signal/TP 出场时，两侧的
+     路径收益差不是"负越幅成本"，不得抵消（该类行为原因分叉，差额
+     如实落"其余"）；跨 bar 配对两侧止损价位不同，越幅差分不可比，
+     同样取 0；回推实际越幅（或模型越幅）为负——成交价根本未穿过
+     价位——时拒绝该分量。stop_gap 双方都按开盘/穿价 tick 成交、TP
+     不建模越幅，均取 0（其成交差如实落进"其余"）；
+   - 其余 = 残差（滑点差、bid 与 bar 开盘/收盘之差、跳空止盈保守口径、
+     出场原因分叉的路径收益差等）。
 5. **配对与原因**：配对窗 1 根 bar（对齐用，不是容差；超窗即 only_a/
    only_b 违规）；exit_reason 一致（stop_gap/take_profit_gap 与
    stop/take_profit 视为同因）。
@@ -121,6 +127,9 @@ SILENT_BOUNDARY_MS = 2_000    # 边界后 >2s 才有首笔 tick → "静默边�
                               # 单列不判违规（机制上 B 就该在该 tick 成交）
 NET_REST_TOL_SPREADS = 1.0    # 净利差拆解后"其余"分量 ≤ 1 个点差成本；
                               # 点差分量与越幅分量（机制已知差异）不设上限
+OVERSHOOT_NEG_TOL = 1e-9      # R8-I3：实际/模型越幅的非负判定容差（价格
+                              # 单位，浮点噪声级）——负"越幅"不是成本，
+                              # 拒绝该分量（差额如实落"其余"）
 
 QUICK_WINDOW_DAYS = 3         # --quick：对账窗裁到 tick 覆盖期末端天数
 
@@ -454,13 +463,33 @@ def _ny_hour(ts) -> int:
                .tz_convert(NY_TZ).hour)
 
 
+def _same_entry_bar(ctx: MechanismContext | None, a: pd.Series,
+                    b: pd.Series) -> bool | None:
+    """A/B 入场是否同一根 bar（按 ctx.bar_open_ms 的 bar 下标；无 ctx → None）。
+
+    R8-I3：越幅差分只在可比行上使用——跨 bar 配对的两侧入场价不同 →
+    止损价位不同，模型/实际越幅之差混入价位差，不能当作越幅抵消。"""
+    if ctx is None or not ctx.bar_open_ms:
+        return None
+    ia = bisect_right(ctx.bar_open_ms, _ms(a["entry_time"])) - 1
+    ib = bisect_right(ctx.bar_open_ms, _ms(b["entry_time"])) - 1
+    return ia == ib
+
+
 def _decompose_net(a: pd.Series, b: pd.Series, reason_key: str,
-                   reason_a: str, *, ctx: MechanismContext | None = None,
+                   reason_a: str, reason_b: str, *,
+                   ctx: MechanismContext | None = None,
                    net_rest_tol_spreads: float = NET_REST_TOL_SPREADS) -> dict:
     """net_diff = 点差分量 + 止损越幅分量 + 其余（见模块 docstring 第 4 条）。
 
-    返回 {net_diff, spread_comp, overshoot_comp, rest, tol, ok}；tol =
-    net_rest_tol_spreads × max(两侧 spread_cost)（"1 个点差"的金额）。"""
+    R8-I3（T48）：越幅分量仅在 **A、B 同为 stop 出场且入场同 bar** 的
+    可比行上使用——A=stop、B 以 signal/TP 出场时，两侧的路径收益差不是
+    "负越幅成本"，不做越幅抵消（差额如实落"其余"）；回推的实际越幅
+    （或模型越幅）为负——B 成交价根本未穿过价位——时同样拒绝该分量。
+
+    返回 {net_diff, spread_comp, overshoot_comp, overshoot_applied,
+    same_entry_bar, rest, tol, ok}；tol = net_rest_tol_spreads ×
+    max(两侧 spread_cost)（"1 个点差"的金额）。"""
     net_diff = _f(b, "net") - _f(a, "net")
     sc_a, sc_b = _f(a, "spread_cost"), _f(b, "spread_cost")
     is_long = str(a["side"]) == "long"
@@ -473,21 +502,28 @@ def _decompose_net(a: pd.Series, b: pd.Series, reason_key: str,
         spread_comp = -(sc_b - sc_a)
     else:
         spread_comp = 0.0
+    same_bar = _same_entry_bar(ctx, a, b)
     overshoot_comp = 0.0
-    if reason_a == "stop" and ctx is not None:
+    overshoot_applied = False
+    if reason_a == "stop" and reason_b == "stop" and same_bar:
         lots_cs = _f(b, "volume_lots") * float(ctx.contract_size)
         ov_actual = _b_stop_overshoot_actual(ctx, b)
         ov_model = _a_stop_overshoot_model(ctx, a, b)
         if math.isfinite(ov_actual) and math.isfinite(ov_model) \
-                and math.isfinite(lots_cs) and lots_cs > 0:
+                and math.isfinite(lots_cs) and lots_cs > 0 \
+                and ov_actual >= -OVERSHOOT_NEG_TOL \
+                and ov_model >= -OVERSHOOT_NEG_TOL:
             overshoot_comp = (ov_model - ov_actual) * lots_cs
+            overshoot_applied = True
     rest = net_diff - spread_comp - overshoot_comp
     if math.isfinite(sc_a) and math.isfinite(sc_b):
         tol = net_rest_tol_spreads * max(abs(sc_a), abs(sc_b))
     else:
         tol = 0.0
     return {"net_diff": net_diff, "spread_comp": spread_comp,
-            "overshoot_comp": overshoot_comp, "rest": rest, "tol": tol,
+            "overshoot_comp": overshoot_comp,
+            "overshoot_applied": overshoot_applied, "same_entry_bar": same_bar,
+            "rest": rest, "tol": tol,
             "ok": bool(math.isfinite(rest) and abs(rest) <= tol)}
 
 
@@ -545,7 +581,8 @@ _EMPTY_ROW_COLS = [
     "exit_time_a", "exit_time_b", "exit_dt_ms", "entry_price_a",
     "entry_price_b", "entry_price_diff", "exit_price_a", "exit_price_b",
     "exit_price_diff", "net_a", "net_b", "net_diff", "net_spread_comp",
-    "net_overshoot_comp", "net_rest", "net_tol", "exit_reason_a",
+    "net_overshoot_comp", "net_rest", "net_tol", "same_entry_bar",
+    "overshoot_applied", "exit_reason_a",
     "exit_reason_b", "reason_ok", "entry_first_tick_ms", "entry_gap_ms",
     "entry_boundary_gap_ms", "entry_silent", "entry_time_ok", "entry_note",
     "exit_check", "exit_first_tick_ms", "exit_gap_ms", "exit_boundary_gap_ms",
@@ -643,7 +680,7 @@ def build_diff_rows(trades_a, trades_b, pairs, *, tf_seconds: int,
                          "exit_note": "reason_unknown"}
 
         # ---- 净利差三分量拆解 ----
-        dec = _decompose_net(a, b, reason_key, reason_a, ctx=ctx,
+        dec = _decompose_net(a, b, reason_key, reason_a, reason_b, ctx=ctx,
                              net_rest_tol_spreads=net_rest_tol_spreads)
         row = {
             "match": "paired", "side": str(a["side"]),
@@ -662,6 +699,8 @@ def build_diff_rows(trades_a, trades_b, pairs, *, tf_seconds: int,
             "net_spread_comp": dec["spread_comp"],
             "net_overshoot_comp": dec["overshoot_comp"],
             "net_rest": dec["rest"], "net_tol": dec["tol"],
+            "same_entry_bar": dec["same_entry_bar"],
+            "overshoot_applied": bool(dec["overshoot_applied"]),
             "exit_reason_a": reason_a, "exit_reason_b": reason_b,
             "reason_ok": reason_ok, **entry_cols, **exit_cols,
             "net_ok": dec["ok"],
@@ -696,6 +735,7 @@ def _row_one_side(t, match: str) -> dict:
         "net_b": _f(t, "net") if match == "only_b" else None,
         "net_diff": None, "net_spread_comp": None,
         "net_overshoot_comp": None, "net_rest": None, "net_tol": None,
+        "same_entry_bar": None, "overshoot_applied": False,
         "exit_reason_a": str(t["exit_reason"]) if match == "only_a" else None,
         "exit_reason_b": str(t["exit_reason"]) if match == "only_b" else None,
         "reason_ok": False,
@@ -750,6 +790,18 @@ def summarize_net_diffs(rows: pd.DataFrame) -> dict:
                                "abs_max": None}
     n_only_a = int((rows["match"] == "only_a").sum()) if len(rows) else 0
     n_only_b = int((rows["match"] == "only_b").sum()) if len(rows) else 0
+    # R8-I3（T48）分口径：原因分叉（A=stop、B 非 stop——不做越幅抵消）与
+    # stop↔stop 同 bar 可比子集（越幅分量唯一适用的行）
+    n_reason_div = n_stop_stop_sb = 0
+    if len(paired) and {"exit_reason_a", "exit_reason_b"} <= set(paired.columns):
+        ra = paired["exit_reason_a"].astype(str)
+        rb = paired["exit_reason_b"].astype(str) \
+            .map(lambda s: _REASON_EQUIV.get(s, s))
+        n_reason_div = int(((ra == "stop") & (rb != "stop")).sum())
+        if "same_entry_bar" in paired.columns:
+            n_stop_stop_sb = int(((ra == "stop") & (rb == "stop")
+                                  & paired["same_entry_bar"].fillna(False)
+                                  .astype(bool)).sum())
     # 违规只统计已配对行——unmatched 行的 *_ok 恒 False，单列一档避免重复计数
     sub = paired
 
@@ -780,6 +832,8 @@ def summarize_net_diffs(rows: pd.DataFrame) -> dict:
         "net_diff": net_stats, "net_components": comp_stats,
         "n_silent_entry": _flag("entry_silent"),
         "n_silent_exit": (_flag("exit_silent")),
+        "n_reason_divergence_stop": n_reason_div,
+        "n_stop_stop_same_bar": n_stop_stop_sb,
         "violations": viol,
         "ok": viol["total"] == 0,
     }
@@ -921,12 +975,16 @@ def _print_report(report: ReconcileReport, paths: dict | None) -> None:
               f"其余 {comp.get('rest', {}).get('sum', 0):+.4f}"
               f"（|其余| p95={comp.get('rest', {}).get('abs_p95') or 0:.4f}）")
     print(f"违规：{s['violations']}")
+    print(f"分口径（R8-I3）：stop↔stop 同 bar {s.get('n_stop_stop_same_bar', 0)} 行"
+          f"（越幅可比）/ A-stop·B-非stop 原因分叉 "
+          f"{s.get('n_reason_divergence_stop', 0)} 行（不抵消越幅）")
     show = report.rows.head(MAX_PRINT_ROWS)
     if len(report.rows) > MAX_PRINT_ROWS:
         print(f"（仅显示前 {MAX_PRINT_ROWS} 行，全量见 diff.csv）")
     cols = ["match", "side", "entry_gap_ms", "exit_check", "exit_note",
             "entry_price_diff", "exit_price_diff", "net_diff",
-            "net_spread_comp", "net_overshoot_comp", "net_rest", "net_tol",
+            "net_spread_comp", "net_overshoot_comp", "overshoot_applied",
+            "net_rest", "net_tol",
             "exit_reason_a", "exit_reason_b", "row_ok"]
     with pd.option_context("display.width", 240):
         print(show[cols].to_string(index=False))

@@ -715,6 +715,140 @@ def test_short_protective_spread_difference_not_in_rest():
     assert row["net_ok"]
 
 
+# --------------------------------------------- R8-I3：越幅分量适用范围（T48）
+
+def _r8i3_ctx(mod, *, atr=(1.0, 1.0, 1.0), costs=None):
+    """R8-I3 纯函数拆解用的 ctx：bars 10/11/12 点、ATR 全 1（可选 None）。
+
+    costs=None 时 _a_stop_overshoot_model 直接返回 0（无模型挂点）。"""
+    start = pd.Timestamp("2026-01-05 10:00")
+    return mod.MechanismContext(
+        probe=None, rules=ExitRules(stop_loss_atr=1.0),
+        atr=np.array(atr, dtype="float64"),
+        bar_open_ms=[msc(start), msc(start + timedelta(hours=1)),
+                     msc(start + timedelta(hours=2))],
+        tf_seconds=3600, costs=costs, symbol="TEST", contract_size=1.0), start
+
+
+def test_p17_nonstop_exit_path_gain_is_not_overshoot():
+    """R8-I3 失败测试（P17 纯函数反例，docs/reviews/probes/
+    2026-10-26-round8-probes.py）：A 多头入场 100、止损 90、净利 −10；
+    B 同价入场、其后按 signal 在 150 出场、净利 +50。
+
+    旧实现输出 net_diff=60、overshoot_comp=60、rest=0、ok=True——把
+    **不同出场路径的收益差**当成了 B 穿过止损价位的"负越幅成本"抵消。
+    新口径：B 非 stop 出场 → 越幅分量 0，60 全额落"其余"→ 超容差违规。"""
+    mod = _load_script()
+    ctx, start = _r8i3_ctx(mod, atr=(10.0, 10.0, 10.0))
+    a = pd.Series({"side": "long",
+                   "entry_time": start + timedelta(hours=1),
+                   "entry_price": 100.0,
+                   "exit_time": start + timedelta(hours=1, minutes=1),
+                   "exit_price": 90.0, "exit_reason": "stop", "net": -10.0,
+                   "volume_lots": 1.0, "spread_cost": 1.0})
+    b = a.copy()
+    b["exit_reason"], b["exit_price"], b["net"] = "signal", 150.0, 50.0
+    b["exit_time"] = start + timedelta(hours=2)
+    dec = mod._decompose_net(a, b, "stop", "stop", "signal", ctx=ctx)
+    assert dec["net_diff"] == pytest.approx(60.0)
+    assert dec["tol"] == pytest.approx(1.0)
+    assert dec["same_entry_bar"] is True               # 入场可比、出场原因分叉
+    assert dec["overshoot_comp"] == pytest.approx(0.0, abs=1e-12)
+    assert not dec["overshoot_applied"]
+    assert dec["rest"] == pytest.approx(60.0)          # 路径差全额落"其余"
+    assert not dec["ok"]                               # 60 >> 1 个点差
+
+
+def test_stop_to_nonstop_row_no_overshoot_cancellation():
+    """R8-I3 失败测试（行级）：A=stop、B=take_profit 的配对行不再产生越幅
+    分量——B 的止盈收益（在止损价位以上）不是越幅成本；差额落"其余"并按
+    容差如实判定，汇总同时给出原因分叉计数。"""
+    mod = _load_script()
+    t15 = pd.Timestamp("2026-01-06 01:00")
+    t30 = t15 + timedelta(minutes=30)
+    bar_times = [pd.Timestamp("2026-01-05 10:00") + timedelta(hours=i)
+                 for i in range(20)]
+    atr = [np.nan] * 14 + [1.0] * 6
+    ticks = [tick(t15, 100.0, 100.5),
+             tick(t30, 101.5, 102.0),                     # B 的 TP 成交区
+             tick(t15 + timedelta(minutes=59, seconds=59, milliseconds=999),
+                  100.0, 100.5)]
+    ctx = make_ctx(mod, ticks, rules=ExitRules(stop_loss_atr=1.0), atr=atr,
+                   bar_times=bar_times, slippage_price=0.1,
+                   costs=FakeCosts(overshoot=0.0))
+    # A：SL=99.6，按 SL−滑点=99.5 止损出场；B：TP 在 101.4 成交
+    a = (t15, t15, t15, "long", 1.0, 100.6, 99.5, -1.1, -1.1, 0.0,
+         0.0, 0.5, 0.0, "stop")
+    b = (t15, t30, t30, "long", 1.0, 100.6, 101.4, 0.8, 0.8, 0.0,
+         0.0, 0.5, 0.0, "take_profit")
+    rows = _ctx_rows(mod, [a], [b], ctx)
+    row = rows.iloc[0]
+    assert bool(row["same_entry_bar"]) is True
+    # 旧行为：ov_actual=99.6−101.4=−1.8 → 越幅分量 +1.8 吞掉 1.9 的路径差
+    assert row["net_overshoot_comp"] == pytest.approx(0.0, abs=1e-12)
+    assert not bool(row["overshoot_applied"])
+    assert row["net_diff"] == pytest.approx(1.9)
+    assert row["net_rest"] == pytest.approx(1.9)         # 全额落"其余"
+    assert abs(row["net_rest"]) > row["net_tol"]
+    assert not row["net_ok"] and not row["row_ok"]
+    summary = mod.summarize_net_diffs(rows)
+    assert summary["violations"]["reason"] == 1          # stop↔TP 本就原因不一致
+    assert summary["n_reason_divergence_stop"] == 1      # A-stop/B-非stop 原因分叉
+    assert summary["n_stop_stop_same_bar"] == 0
+
+
+def test_negative_actual_overshoot_rejected():
+    """R8-I3 失败测试：B 虽记 stop、与 A 同 bar，但成交价在止损价位以上
+    （回推实际越幅为负）——负"越幅"不是成本，拒绝该分量：旧实现把
+    +1.4 的伪补偿抵掉 1.5 的净利差判 ok；新口径全额落"其余"判违规。"""
+    mod = _load_script()
+    ctx, start = _r8i3_ctx(mod)
+    t = start + timedelta(hours=1)
+    a = pd.Series({"side": "long", "entry_time": t, "entry_price": 100.6,
+                   "exit_time": t + timedelta(minutes=1),
+                   "exit_price": 99.5, "exit_reason": "stop", "net": -1.1,
+                   "volume_lots": 1.0, "spread_cost": 0.5})
+    b = a.copy()
+    b["exit_price"], b["net"] = 101.0, 0.4              # 高于 SL=99.6："越幅"为负
+    dec = mod._decompose_net(a, b, "stop", "stop", "stop", ctx=ctx)
+    assert dec["same_entry_bar"] is True
+    assert dec["overshoot_comp"] == pytest.approx(0.0, abs=1e-12)
+    assert not dec["overshoot_applied"]
+    assert dec["rest"] == pytest.approx(1.5)            # 0.4−(−1.1) 全额落"其余"
+    assert not dec["ok"]                                # 1.5 > 容差 0.5
+
+
+def test_cross_bar_stop_pair_overshoot_not_comparable():
+    """R8-I3：同为 stop 但入场跨 bar（配对窗内错位一根）——两侧入场价不同
+    → 止损价位不同，模型/实际越幅之差混入价位差，不可比：越幅分量取 0。
+    对照：同 bar 的 stop↔stop 仍照常使用越幅分量。"""
+    mod = _load_script()
+    ctx, start = _r8i3_ctx(mod)
+    a = pd.Series({"side": "long",
+                   "entry_time": start + timedelta(hours=1),
+                   "entry_price": 100.6,
+                   "exit_time": start + timedelta(hours=1, minutes=30),
+                   "exit_price": 99.5, "exit_reason": "stop", "net": -1.1,
+                   "volume_lots": 1.0, "spread_cost": 0.5})
+    b_cross = a.copy()
+    b_cross["entry_time"] = start + timedelta(hours=2)   # 晚一根 bar 入场
+    b_cross["entry_price"] = 101.6                       # SL=100.6（与 A 不同）
+    b_cross["exit_time"] = start + timedelta(hours=2, minutes=30)
+    b_cross["exit_price"] = 100.4
+    b_cross["net"] = 100.4 - 101.6
+    dec = mod._decompose_net(a, b_cross, "stop", "stop", "stop", ctx=ctx)
+    assert dec["same_entry_bar"] is False
+    assert dec["overshoot_comp"] == pytest.approx(0.0, abs=1e-12)
+    assert not dec["overshoot_applied"]
+    # 对照：同 bar、B 真穿价（99.3 < SL=99.6）→ 分量照常（0 − 0.3）
+    b_same = a.copy()
+    b_same["exit_price"], b_same["net"] = 99.3, 99.3 - 100.6
+    dec2 = mod._decompose_net(a, b_same, "stop", "stop", "stop", ctx=ctx)
+    assert dec2["same_entry_bar"] is True
+    assert dec2["overshoot_applied"]
+    assert dec2["overshoot_comp"] == pytest.approx(0.0 - 0.3)
+
+
 # --------------------------------------------- align_trades：贪心对齐
 
 def test_align_trades_pairs_and_flags_unmatched():
