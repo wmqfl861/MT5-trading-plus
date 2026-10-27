@@ -1,4 +1,6 @@
-# 阶段 F 模拟盘演练示例配置（T45，2026-10-26）：SMA 快慢线交叉，XAUUSD M15。
+# 阶段 F 影子盘（PaperSoak）示例配置（T45，2026-10-26）：SMA 快慢线交叉，XAUUSD M15。
+# 启动模式：demo_run.ps1 -Mode PaperSoak（--paper 影子券商；Demo 模式要求
+# 固定 volume_lots=0.01、禁 risk_fraction，见 DEMO-MA-XAUUSD-M15.toml）。
 #
 # MaCrossATR（reentry="immediate" 类缺省）：5/15 快慢线保证两周内有足量
 # 开平仓与 SL/TP 出场，覆盖 §7 的"SL/TP 出场后不触发暂停、按重入规则

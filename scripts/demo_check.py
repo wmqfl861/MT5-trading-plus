@@ -1,8 +1,30 @@
-"""scripts/demo_check.py（T45）：阶段 F 模拟盘演练验收检查（蓝图 §7 逐条转化）。
+"""scripts/demo_check.py（T45/T49）：阶段 F 演练检查（蓝图 §7 逐条转化）。
+
+两档口径（R8-I5：日常"没有发现异常"≠阶段"取得验收证据"，绝不共用布尔）：
+
+- 日常档 ``--day`` / ``--summary``（宽松显示）：逐日 7 项检查，返回 0
+  只要无异常**证据**（ok=False 项）；"无样本"（ok=None）如实标注、不判
+  不通过，但汇总不再宣称"全部通过"——只说"未发现异常证据（日常口径）"。
+- 验收档 ``--accept``（阶段 F 最终验收，严格）：在逐日严格复核（任何
+  ok=None 无样本/无法判定项 = 不通过）之上，另强制五条全期证据判据，
+  任一"无样本/未覆盖"= 未验收，退出码非 0：
+  1. 连续交易日覆盖 ≥10（工作日无缺日；假日历不可得，按周一至五近似，
+     跨假日段须人工在验收报告注明例外）；
+  2. 各进程存活证据（覆盖跨度内逐日：风控/对账进程有当日日志行；每个
+     magic 的运行器有当日日志行，或当日风控日志有"心跳=ok"行佐证——
+     风控每轮核对全部登记心跳，ok 即全部运行器心跳新鲜）；
+  3. SL 与 TP 样本均存在（全期成交 reason=4/5，或运行器日志
+     "保护性出场 … reason=4/5"行——Demo 真实成交路径同样落运行器日志）；
+  4. 双全平演练真实完成：两个**不同 uuid** 指令 + 两轮完成 ack（归档
+     指令文件本身即"全员 ack 核对通过"的证据；归档的 flatten.ack-* 同样
+     计）——不再以 RISK_FLATTEN 告警条数代替；
+  5. 实际点差样本存在且无超标小时（覆盖工作日日报存在、非"当日无点差
+     样本"、无"**超标**"行；超限小时由日报逐小时列出。滑点证据须 Demo
+     真实成交，PaperSoak 影子盘不产生经纪商滑点——如实标注不冒充）。
 
 只读检查（不连 MT5、不下单、不改任何状态文件）。数据源：
 - ``<data>/live/paper/state-<magic>.json``：影子券商账本（positions/deals，
-  含 reason——SL=4/TP=5/SO=6/EXPERT=3，见 mt5gw.models）；
+  含 reason——SL=4/TP=5/SO=6，见 mt5gw.models）；
 - ``<data>/live/expected-<magic>.json``（意图，T30/D19）、
   ``pause-<magic>.json``（对账按策略暂停，T30/D20）、
   ``state-<magic>.json``（执行器状态：pending_external_exits 未解释出场）、
@@ -11,7 +33,7 @@
   data/demo/）与 ``<data>/live/*.log``；
 - 日报：``<reports>/live/daily-YYYY-MM-DD.md``（live_daily_report.py 产物）。
 
-蓝图 §7 → 检查映射（一行一项）：
+蓝图 §7 → 日常检查映射（一行一项）：
 - 无法解释的持仓差异 = 0 ………… check_unexplained_diffs：最新日的意图 vs
   实际净持仓差分（mt5live.reconcile.diff_positions）+ 当日
   RECONCILE_MISMATCH / EXTERNAL_EXIT 告警是否至今未解除（pause 仍 paused、
@@ -37,20 +59,20 @@
   开仓成交时刻须全部在 config/sessions.toml 禁入窗之外（SessionPolicy.
   entry_allowed，DST 感知——冬令时窗自动落在 22:00 GMT）；拒单记录数取
   alerts.log 中含 forbidden_session 的 RISK_REJECT 条目（§7 演练项证据，
-  --summary 汇总要求两周内 ≥ 1 条）。
+  --summary 汇总展示；--accept 走上面的五条全期判据）。
 - 实际点差落在成本模型区间内 ………… check_daily_report：日报里
   compare_spreads 的"**超标**"行数 = 0（按小时比对由日报承担）。
 - 每日日报自动生成 ………… check_daily_report：daily-<day>.md 存在且非空。
 
 用法：
-    .venv/Scripts/python.exe scripts/demo_check.py --day 2026-11-10
-    .venv/Scripts/python.exe scripts/demo_check.py --summary
+    .venv/Scripts/python.exe scripts/demo_check.py --day 2026-11-10   # 日常
+    .venv/Scripts/python.exe scripts/demo_check.py --summary          # 全周汇总
+    .venv/Scripts/python.exe scripts/demo_check.py --accept           # 阶段 F 验收
     # 可选：--data-dir data --log-dir data/demo --reports-dir data/reports
     #       --sessions-config config/sessions.toml
 
-退出码：0 = 全部通过；1 = 存在不通过项；2 = 用法/数据错误。
---summary 额外汇总演练证据（RISK_HALT / RISK_FLATTEN 次数——§7 要求日亏
-全平连续两次，即 RISK_FLATTEN ≥ 2；禁入拒单条数；覆盖天数）。
+退出码：0 = 通过（日常档=无异常证据；--accept=验收通过）；1 = 存在不通过
+项（--accept 下即"未验收"）；2 = 用法/数据错误。
 """
 from __future__ import annotations
 
@@ -61,7 +83,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -83,6 +105,10 @@ TRADE_ENTRIES = frozenset({"in", "out", "inout", "out_by"})
 RUNNER_START_MARK = "mt5live 启动"
 EXIT_MARKS = ("收到中断，退出", "手动停止", "Traceback", "执行异常")
 TS_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2}T[0-9:.]+)\]")
+# 风控/对账进程行格式："· 2026-10-26 11:00:40 UTC [paper] 心跳=ok …"
+DOT_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2}) \d{2}:\d{2}:\d{2} UTC")
+HEARTBEAT_OK_MARK = "心跳=ok"          # 风控该轮全部登记心跳新鲜
+PROTECTIVE_LOG_RE = re.compile(r"保护性出场 \d+ 笔：.*?reason=(\d)")
 
 
 @dataclass
@@ -277,6 +303,74 @@ def log_start_events(logs: list[LogFile]) -> list[dict]:
             events.append({"magic": lf.magic, "ts": ts or lf.mtime,
                            "log": os.path.basename(lf.path)})
     return sorted(events, key=lambda e: e["ts"])
+
+
+def scan_log_days(logs: list[LogFile]) -> dict:
+    """逐进程"哪些天有日志行"证据（--accept 进程存活判据用）。
+
+    返回 {runner_days: {magic: set(date)}, risk_days, reconcile_days,
+    heartbeat_ok_days}——运行器行带 [ISO] 括号时间戳，风控/对账行是
+    "· YYYY-MM-DD HH:MM:SS UTC"格式，两种都认；风控行含"心跳=ok"另计入
+    heartbeat_ok_days（该轮全部登记策略心跳新鲜的证据）。"""
+    runner_days: dict[int | None, set] = {}
+    risk_days: set = set()
+    reconcile_days: set = set()
+    heartbeat_ok_days: set = set()
+
+    def _days_in_line(ln: str) -> set:
+        out = set()
+        for m in TS_RE.findall(ln):
+            try:
+                out.add(parse_iso(m).date())
+            except ValueError:
+                continue
+        for m in DOT_TS_RE.findall(ln):
+            try:
+                out.add(date.fromisoformat(m))
+            except ValueError:
+                continue
+        return out
+
+    for lf in logs:
+        if lf.kind == "runner":
+            for ln in lf.lines:
+                runner_days.setdefault(lf.magic, set()).update(_days_in_line(ln))
+        elif lf.kind == "risk":
+            for ln in lf.lines:
+                ds = _days_in_line(ln)
+                risk_days.update(ds)
+                if HEARTBEAT_OK_MARK in ln:
+                    heartbeat_ok_days.update(ds)
+        elif lf.kind == "reconcile":
+            for ln in lf.lines:
+                reconcile_days.update(_days_in_line(ln))
+    return {"runner_days": runner_days, "risk_days": risk_days,
+            "reconcile_days": reconcile_days,
+            "heartbeat_ok_days": heartbeat_ok_days}
+
+
+def _span_days(days: list[date]) -> list[date]:
+    """覆盖跨度内的全部日历日（min→max，含周末——风控/对账 24/7 不间断）。"""
+    if not days:
+        return []
+    out, cur = [], days[0]
+    while cur <= days[-1]:
+        out.append(cur)
+        cur += timedelta(days=1)
+    return out
+
+
+def _missing_weekdays(days: list[date]) -> list[date]:
+    """连续覆盖日之间缺失的工作日（周六日不算缺；假日历不可得，按周一至
+    五近似——跨假日段须人工在验收报告注明例外）。"""
+    missing: list[date] = []
+    for a, b in zip(days, days[1:]):
+        cur = a + timedelta(days=1)
+        while cur < b:
+            if cur.isoweekday() <= 5:
+                missing.append(cur)
+            cur += timedelta(days=1)
+    return missing
 
 
 # ---------------------------------------------------------------- §7 检查项
@@ -518,6 +612,192 @@ CHECKS = (
 )
 
 
+# ---------------------------------------------------------------- --accept 判据
+# 阶段 F 最终验收（R8-I5）：任何"无样本/未覆盖"= 不通过（未验收）。
+
+def accept_day_coverage(ctx) -> Check:
+    """判据 1：连续交易日覆盖 ≥10 个、全齐（工作日无缺日）。"""
+    name = "连续交易日覆盖（≥10 个交易日全齐）"
+    days = sorted(ctx["activity_days"])
+    if not days:
+        return Check(name, False,
+                     "无活动日证据（成交/告警/运行器日志/日报任一日皆无）"
+                     "——未覆盖")
+    n_trading = sum(1 for d in days if d.isoweekday() <= 5)
+    problems = []
+    if n_trading < 10:
+        problems.append(f"仅覆盖 {n_trading} 个交易日（<10）")
+    missing = _missing_weekdays(days)
+    if missing:
+        shown = "、".join(d.isoformat() for d in missing[:5])
+        problems.append("覆盖不连续，缺失交易日 " + shown
+                        + (f" 等 {len(missing)} 天" if len(missing) > 5 else ""))
+    if problems:
+        return Check(name, False,
+                     "；".join(problems) + f"（{days[0]} → {days[-1]}）")
+    return Check(name, True,
+                 f"{days[0]} → {days[-1]} 共 {n_trading} 个交易日全齐，"
+                 "其间无缺失工作日（周六日不计；假日按工作日近似，跨假日段"
+                 "须人工注明例外）")
+
+
+def accept_process_liveness(ctx) -> Check:
+    """判据 2：各进程存活证据——覆盖跨度内逐日（含周末，进程 24/7 不间断）：
+    风控/对账有当日日志行；每个 magic 的运行器有当日日志行，或当日风控
+    日志有"心跳=ok"行佐证（风控每轮核对全部登记心跳）。"""
+    name = "各进程存活证据（逐日风控/对账/运行器）"
+    days = sorted(ctx["activity_days"])
+    magics = ctx["runner_magics"]
+    if not days:
+        return Check(name, False, "无活动日，无从判定进程存活")
+    no_log = sorted(m for m in magics if not ctx["runner_magic_days"].get(m))
+    if not magics or no_log:
+        return Check(name, False,
+                     f"magic {no_log or magics or '?'} 没有任何运行器日志"
+                     "证据——无法证明运行器存活过")
+    problems = []
+    for d in _span_days(days):
+        if d not in ctx["risk_days"]:
+            problems.append(f"{d.isoformat()} 无风控进程日志行")
+        if d not in ctx["reconcile_days"]:
+            problems.append(f"{d.isoformat()} 无对账进程日志行")
+        if d in ctx["heartbeat_ok_days"]:
+            continue                     # 该轮全部登记心跳新鲜＝全员佐证
+        for m in magics:
+            if d not in ctx["runner_magic_days"].get(m, set()):
+                problems.append(
+                    f"{d.isoformat()} magic {m} 无运行器日志行"
+                    "（且当日无风控 心跳=ok 佐证）")
+    if problems:
+        shown = "；".join(problems[:6])
+        if len(problems) > 6:
+            shown += f" 等 {len(problems)} 项"
+        return Check(name, False, shown)
+    span = _span_days(days)
+    return Check(name, True,
+                 f"{span[0]} → {span[-1]} 逐日（含周末 {len(span)} 天）风控/"
+                 f"对账/运行器（{sorted(magics)}）均有存活证据")
+
+
+def accept_sl_tp_samples(ctx) -> Check:
+    """判据 3：SL 与 TP 样本均存在（全期成交 reason，或运行器日志
+    "保护性出场 … reason="行——Demo 真实成交路径同样落运行器日志）。"""
+    name = "SL 与 TP 样本均存在"
+    sl_deals = sum(1 for d in ctx["deals"] if d.get("reason") == REASON_SL)
+    tp_deals = sum(1 for d in ctx["deals"] if d.get("reason") == REASON_TP)
+    sl_log = tp_log = 0
+    for lf in ctx["logs"]:
+        if lf.kind != "runner":
+            continue
+        for m in PROTECTIVE_LOG_RE.finditer("\n".join(lf.lines)):
+            if m.group(1) == str(REASON_SL):
+                sl_log += 1
+            elif m.group(1) == str(REASON_TP):
+                tp_log += 1
+    sl, tp = sl_deals + sl_log, tp_deals + tp_log
+    if sl == 0 or tp == 0:
+        return Check(name, False,
+                     f"SL 样本 {sl} 笔、TP 样本 {tp} 笔（成交 {sl_deals}/"
+                     f"{tp_deals} + 运行器日志 {sl_log}/{tp_log}）——"
+                     "无样本=未验收（§7 要求 SL/TP 均有实测出场证据）")
+    return Check(name, True,
+                 f"SL {sl} 笔（成交 {sl_deals} + 日志 {sl_log}）、TP {tp} 笔"
+                 f"（成交 {tp_deals} + 日志 {tp_log}）均已有实测样本")
+
+
+def accept_double_flatten(ctx) -> Check:
+    """判据 4：双全平演练真实完成——两个不同 uuid 指令 + 两轮完成 ack。
+
+    证据取 <live>/commands/archive/：归档的 flatten-<id8>-*.json 指令文件
+    （归档仅在**全部**登记 magic 的完成 ack 编号核对通过后发生——归档本身
+    即"该轮全员真全平"的证据）；演练中人工归档的 flatten.ack-*（引用指令
+    编号、含 closed 计数）同样计。同 uuid 两份不算两轮。"""
+    name = "双全平演练真实完成（两个不同 uuid + 两轮 ack closed）"
+    arch = os.path.join(ctx["live_dir"], "commands", "archive")
+    cmd_ids: dict[str, str] = {}
+    for path in sorted(glob.glob(os.path.join(arch, "flatten-*.json"))):
+        try:
+            doc = _read_json(path)
+        except (OSError, ValueError):
+            continue
+        cid = str(doc.get("id", ""))
+        if doc.get("command") == "flatten_all" and cid:
+            cmd_ids[cid] = str(doc.get("reason", ""))
+    ack_ids: dict[str, int] = {}
+    for path in sorted(glob.glob(os.path.join(arch, "flatten.ack-*"))):
+        try:
+            doc = _read_json(path)
+        except (OSError, ValueError):
+            continue
+        cid = str(doc.get("id", ""))
+        if cid and "closed" in doc:
+            ack_ids[cid] = int(doc.get("closed", 0))
+    acked = set(cmd_ids) | set(ack_ids)
+    if len(acked) < 2:
+        ids = "、".join(c[:8] for c in sorted(acked)) or "（无）"
+        return Check(name, False,
+                     f"仅 {len(acked)} 轮完成全平证据（uuid：{ids}；归档指令 "
+                     f"{len(cmd_ids)} 个、归档 ack {len(ack_ids)} 个）——§7 "
+                     "要求连续两次、第二次同样真全平（两个不同 uuid 指令 + "
+                     "两轮完成 ack；RISK_FLATTEN 告警条数不能代替）")
+    detail = "、".join(
+        f"{c[:8]}({'指令归档' if c in cmd_ids else ''}"
+        f"{'ack closed=' + str(ack_ids[c]) if c in ack_ids else ''})"
+        for c in sorted(acked))
+    return Check(name, True, f"{len(acked)} 个不同 uuid 均有完成证据：{detail}")
+
+
+def accept_spread_samples(ctx) -> Check:
+    """判据 5：实际点差样本存在且无超标小时（覆盖工作日逐日：日报存在、
+    非"当日无点差样本"、无"**超标**"行；超限小时由日报逐小时列出——
+    超标即超出成本模型区间。滑点证据须 Demo 真实成交）。"""
+    name = "实际点差样本存在且无超标小时"
+    days = sorted(ctx["activity_days"])
+    if not days:
+        return Check(name, False, "无活动日——无从要求点差样本")
+    problems = []
+    weekdays = [d for d in _span_days(days) if d.isoweekday() <= 5]
+    for d in weekdays:
+        path = os.path.join(ctx["reports_dir"], "live",
+                            f"daily-{d.isoformat()}.md")
+        if not os.path.exists(path):
+            problems.append(f"{d.isoformat()} 日报缺失")
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            problems.append(f"{d.isoformat()} 日报不可读：{e}")
+            continue
+        if not text.strip():
+            problems.append(f"{d.isoformat()} 日报为空")
+        elif "当日无点差样本" in text:
+            problems.append(f"{d.isoformat()} 当日无点差样本（无样本=未验收）")
+        else:
+            n_breach = text.count("**超标**")
+            if n_breach:
+                problems.append(f"{d.isoformat()} 点差超标 {n_breach} 行"
+                                "（超限小时已由日报列出，超出模型区间）")
+    if problems:
+        shown = "；".join(problems[:6])
+        if len(problems) > 6:
+            shown += f" 等 {len(problems)} 项"
+        return Check(name, False, shown)
+    return Check(name, True,
+                 f"覆盖 {len(weekdays)} 个交易日日报均有点差比对样本且无"
+                 "**超标** 小时（滑点证据须 Demo 真实成交，PaperSoak 不产生"
+                 "经纪商滑点）")
+
+
+ACCEPT_CHECKS = (
+    accept_day_coverage,
+    accept_process_liveness,
+    accept_sl_tp_samples,
+    accept_double_flatten,
+    accept_spread_samples,
+)
+
+
 # ---------------------------------------------------------------- 汇总渲染
 
 def build_ctx(args) -> dict:
@@ -548,6 +828,19 @@ def build_ctx(args) -> dict:
         if lf.kind == "runner":
             log_tail_text[(lf.magic, os.path.basename(lf.path))] = \
                 "\n".join(lf.lines[-80:])
+    day_evidence = scan_log_days(logs)
+    runner_magic_days = day_evidence["runner_days"]
+    # 运行器 magic 全集：日志（含启动行 magic）∪ 影子状态 ∪ 意图文件——
+    # 有状态/意图却无日志 = 无法证明运行器存活过（--accept 不通过）
+    expected_magics = set()
+    for path in glob.glob(os.path.join(live_dir, "expected-*.json")):
+        m = re.search(r"expected-(\d+)\.json$", os.path.basename(path))
+        if m:
+            expected_magics.add(int(m.group(1)))
+    runner_magics = ({m for m in runner_magic_days if m is not None}
+                     | set(states.keys()) | expected_magics)
+    activity_days = (all_days
+                     | {d for ds in runner_magic_days.values() for d in ds})
     return {
         "live_dir": live_dir, "reports_dir": reports_dir,
         "states": states, "deals": deals, "alerts": alerts,
@@ -559,6 +852,12 @@ def build_ctx(args) -> dict:
         "session_policy": session_policy,
         "now": datetime.now(timezone.utc).replace(tzinfo=None),
         "all_days": all_days, "latest_day": max(all_days) if all_days else None,
+        "activity_days": activity_days,
+        "runner_magic_days": runner_magic_days,
+        "runner_magics": runner_magics,
+        "risk_days": day_evidence["risk_days"],
+        "reconcile_days": day_evidence["reconcile_days"],
+        "heartbeat_ok_days": day_evidence["heartbeat_ok_days"],
     }
 
 
@@ -595,19 +894,19 @@ def print_day(rep: DayReport) -> None:
 
 
 def print_summary(ctx, reps: list[DayReport]) -> None:
-    print("== 模拟盘演练验收汇总（蓝图 §7） ==")
+    print("== 模拟盘演练检查汇总（日常口径，蓝图 §7） ==")
     for rep in reps:
         n_ok = sum(1 for c in rep.checks if c.ok is True)
         n_bad = len(rep.failed)
         n_na = sum(1 for c in rep.checks if c.ok is None)
-        status = "全部通过" if (n_bad == 0 and n_na == 0) else (
+        status = "未见异常" if (n_bad == 0 and n_na == 0) else (
             f"{n_bad} 项不通过" if n_bad else "无未决样本")
         failed_names = "、".join(c.name for c in rep.failed) or "—"
         print(f"{rep.day.isoformat()}  通过 {n_ok} / 不通过 {n_bad} / "
               f"无样本 {n_na}（{status}）不通过项：{failed_names}")
     n_fail = sum(len(r.failed) for r in reps)
     print()
-    print("演练证据（§7 演练项，全期累计）：")
+    print("演练证据（§7 演练项，全期累计展示——最终验收以 --accept 为准）：")
     kinds = {}
     for a in ctx["alerts"]:
         kinds[a.kind] = kinds.get(a.kind, 0) + 1
@@ -626,12 +925,71 @@ def print_summary(ctx, reps: list[DayReport]) -> None:
     if n_fail:
         print(f"合计 {n_fail} 项不通过。")
     else:
-        print("全部通过。")
+        print("未发现异常证据（日常口径）——阶段 F 最终验收须另跑 --accept："
+              "连续覆盖/进程存活/SL 与 TP 样本/双全平（两个不同 uuid + 两轮"
+              "完成 ack）/点差样本任一无证据 = 未验收。")
+
+
+def run_accept(ctx) -> tuple[list[Check], list[tuple[date, list[str], list[str]]]]:
+    """--accept：五条全期判据 + 逐日严格复核（ok=None 无样本=不通过）。
+
+    逐日复核只跑覆盖跨度内的工作日（周末无交易/无日报，进程存活由判据 2
+    的逐日风控/对账/心跳证据覆盖）。"""
+    checks = [fn(ctx) for fn in ACCEPT_CHECKS]
+    problems: list[tuple[date, list[str], list[str]]] = []
+    days = sorted(ctx["activity_days"])
+    if days:
+        for d in _span_days(days):
+            if d.isoweekday() > 5:
+                continue
+            rep = run_day(ctx, d)
+            failed = [c.name for c in rep.checks if c.ok is False]
+            nas = [c.name for c in rep.checks if c.ok is None]
+            if failed or nas:
+                problems.append((d, failed, nas))
+    return checks, problems
+
+
+def print_accept(ctx, checks: list[Check],
+                 problems: list[tuple[date, list[str], list[str]]]) -> None:
+    print("== 阶段 F 最终验收（--accept 严格口径：无样本/未覆盖=未验收） ==")
+    days = sorted(ctx["activity_days"])
+    if days:
+        print(f"数据范围：{days[0].isoformat()} → {days[-1].isoformat()}")
+    for c in checks:
+        mark = "通过" if c.ok is True else "不通过"
+        print(f"[{mark}] {c.name}：{c.detail}")
+    print()
+    print("逐日严格复核（覆盖跨度内交易日；无样本/无法判定项按不通过）：")
+    weekdays = [d for d in _span_days(days) if d.isoweekday() <= 5]
+    if not weekdays:
+        print("  （无覆盖日——跳过）")
+    else:
+        bad = {d: (f, n) for d, f, n in problems}
+        for d in weekdays:
+            if d not in bad:
+                print(f"  {d.isoformat()}：通过")
+            else:
+                failed, nas = bad[d]
+                parts = []
+                if failed:
+                    parts.append("不通过：" + "、".join(failed))
+                if nas:
+                    parts.append("无样本（未验收）：" + "、".join(nas))
+                print(f"  {d.isoformat()}：" + "；".join(parts))
+    n_bad = sum(1 for c in checks if c.ok is not True)
+    print()
+    if n_bad == 0 and not problems:
+        print("结论：验收通过——阶段 F 证据齐全（蓝图 §7，严格口径）。")
+    else:
+        print(f"结论：未通过（未验收）——判据不满足 {n_bad} 项、逐日复核异常 "
+              f"{len(problems)} 天；日常检查用 --day/--summary（宽松口径）。")
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
-        description="阶段 F 模拟盘演练验收检查（蓝图 §7，只读不连 MT5）")
+        description="阶段 F 演练检查（蓝图 §7，只读不连 MT5；日常档宽松 / "
+                    "--accept 验收档严格）")
     ap.add_argument("--data-dir", default="data", help="数据根（live=data/live）")
     ap.add_argument("--log-dir", default="data/demo",
                     help="进程日志目录（另自动并入 <data-dir>/live/*.log）")
@@ -640,14 +998,25 @@ def main(argv=None) -> int:
     ap.add_argument("--sessions-config", default="config/sessions.toml",
                     help="会话配置（换日禁入窗唯一定义源）")
     g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument("--day", metavar="YYYY-MM-DD", help="单日验收报告")
-    g.add_argument("--summary", action="store_true", help="全期逐日汇总")
+    g.add_argument("--day", metavar="YYYY-MM-DD",
+                   help="单日日常检查（宽松：无异常证据即 0，无样本如实标注）")
+    g.add_argument("--summary", action="store_true",
+                   help="全期逐日汇总（日常口径，同 --day 宽松）")
+    g.add_argument("--accept", action="store_true",
+                   help="阶段 F 最终验收（严格）：连续覆盖/进程存活/SL 与 TP "
+                        "样本/双全平（两个不同 uuid + 两轮完成 ack）/点差样本"
+                        "——任何无样本/未覆盖 = 未验收，退出码非 0")
     args = ap.parse_args(argv)
 
     ctx = build_ctx(args)
     if not ctx["all_days"]:
         print("× 未发现任何演练数据（成交/告警/日报均无）——先启动 demo_run.ps1")
         return 2
+
+    if args.accept:
+        checks, problems = run_accept(ctx)
+        print_accept(ctx, checks, problems)
+        return 0 if (all(c.ok is True for c in checks) and not problems) else 1
 
     if args.day:
         try:

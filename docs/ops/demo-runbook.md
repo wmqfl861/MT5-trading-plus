@@ -1,9 +1,19 @@
-# 模拟盘演练运维手册（阶段 F，两周）
+# 演练运维手册（阶段 F，两周；T45/T49）
 
-演练 = `demo_run.ps1` 启动的 `--paper` 影子盘集群（真实行情 + PaperBroker
-本地记账，**绝不连真实下单通道**）：每策略一个运行器、一个风控 `--loop`、
-一个对账 `--loop`，全部只读聚合 `data\live\paper\state-<magic>.json`。
-验收标准见蓝图 §7；逐条检查器是 `scripts/demo_check.py`。
+`demo_run.ps1` 有两种**互斥模式**（无 `-Mode` 拒绝裸跑）——成交路径、手数
+口径与验收边界完全不同，不能混用：
+
+| | `-Mode PaperSoak`（影子盘延长观察） | `-Mode Demo`（MT5 模拟盘，蓝图阶段 F 正式口径） |
+|---|---|---|
+| 成交路径 | `--paper` PaperBroker 影子券商（真终端行情，**绝不连真实下单通道**） | 真实 demo 账户：下单经 MT5 网关（保险丝只放行 trade_mode=DEMO） |
+| 手数 | 按配置（示例 `risk_fraction=0.005`） | **固定 `volume_lots=0.01`**；出现 `risk_fraction` 或非 0.01 → 拒绝启动 |
+| 风控/对账 | `--paper-state` 聚合读 `data\live\paper\state-<magic>.json` | 直连 demo 终端（`--gw-config`），不用 paper 状态 |
+| 启动前专项预检 | 七项通用预检 | 七项通用预检 + 配置手数校验 + **DEMO 保险丝与网关预检**（只读 dry：连接、读账户核对 trade_mode=0、逐品种报价；绝不下单） |
+| 产生的证据 | 无经纪商成交滑点/拒单/重连证据 | 真实成交滑点、服务器端 SL/TP、拒单与重连均可观测 |
+| 验收口径 | 只做日常检查（`--day`/`--summary`）；**不能单独通过阶段 F 验收**（`--accept` 会因缺 SL/TP/点差等真实样本判未验收，如实失败） | 日常检查 + 第 10 个交易日后跑 `demo_check.py --accept`（严格验收） |
+
+共同骨架：每策略一个运行器、一个风控 `--loop`、一个对账 `--loop`。验收
+标准见蓝图 §7；检查器是 `scripts/demo_check.py`（两档口径，见 §2）。
 
 ## 1. 启动（第 0 天）
 
@@ -11,65 +21,93 @@
 # 一次性：安装每日/每周计划任务（演练期会自动检测 paper 状态切日报口径）
 powershell -ExecutionPolicy Bypass -File scripts\setup_scheduled_tasks.ps1
 
-# 启动演练集群（启动前自检：点差模型/研究缓存/合约快照/会话配置/风控配置/
-# 磁盘/magic 唯一，任一不过不启动任何进程）
-powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1
+# 影子盘延长观察（PaperSoak；示例配置 demo-configs\MA-XAUUSD-M15.toml）
+powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1 -Mode PaperSoak
+
+# MT5 模拟盘（Demo；示例配置 demo-configs\DEMO-MA-XAUUSD-M15.toml，固定 0.01 手）
+powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1 -Mode Demo
+
+# 只做预检与生命周期检测（不启动任何进程；Demo 模式含网关 dry 预检）
+powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1 -Mode Demo -PrecheckOnly
 ```
 
-- 产物：`data\demo\pids.txt`（PID 清单）、`data\demo\demo-run-*.json`（清单）、
-  每进程一个 `runner|risk|reconcile-<name>-<stamp>.log`（+ `.err`）。
+- 通用预检（两种模式同）：点差模型/研究缓存/合约快照/会话配置/风控配置/
+  磁盘/magic 唯一，任一不过不启动任何进程。Demo 另有手数校验与 DEMO
+  保险丝/网关预检（账户非模拟盘或读不到账户状态 → fail-closed 拒启动）。
+- **生命周期（单实例）**：启动前按 `data\demo\pids.txt` 检测存活实例
+  （PID 存在性；死 PID 不挡启动）。某 magic 已有存活运行器 → 跳过该策略
+  并告警，**绝不并行第二份**（同 magic 双写 state/意图/下单日志会互相
+  覆盖）；存活风控/对账同样跳过。`pids.txt` 是**追加式**带时间戳清单，
+  保留完整启动历史，不再覆盖。
+- 产物：`data\demo\pids.txt`（追加式 PID 清单）、`data\demo\demo-run-<Mode>-*.json`
+  （本次清单，含跳过的存活运行器）、每进程一个 `runner|risk|reconcile-<name>-<stamp>.log`（+ `.err`）。
 - 顺序已内建：先运行器（写意图/心跳/paper 状态）→ 8 秒后风控 → 对账。
   **不要**先起风控（心跳未落盘会被写成 halt.json 一键停机）。
-- 演练期 `data\live\paper` 存在，`MT5Quant\live_daily_report` 计划任务自动改读
-  `--paper-state`（不连真实账户）；演练结束归档 paper 目录后重跑安装脚本恢复
-  真账户口径。
-- 重启机器后：直接重跑 `demo_run.ps1`（paper 状态文件恢复全部记账，票据序号
-  接着发）。**每次重启都会生成新日志文件**——这是 demo_check 识别"重启"的
-  依据，属正常现象。
+- PaperSoak 演练期 `data\live\paper` 存在，`MT5Quant\live_daily_report`
+  计划任务自动改读 `--paper-state`（不连真实账户）；演练结束归档 paper
+  目录后重跑安装脚本恢复真账户口径。
+- 重启机器后：直接重跑同模式命令即可——脚本按 `pids.txt` 检测并跳过仍
+  存活的进程，只补已退出的角色（绝不满组重跑，见 §3）。**每次启动都生成
+  新日志文件**——这是 demo_check 识别"重启"的依据，属正常现象。
 
-## 2. 每日检查（每个交易日，5 分钟）
+## 2. 每日检查（每个交易日，5 分钟；两档口径）
 
 ```powershell
-# 当日（昨日 UTC 日）验收：7 项检查 + 退出码（0 过 / 1 有不通过 / 2 数据错）
+# 日常档 --day（宽松：无异常证据即退出码 0；"无样本"如实标注、不判不通过）
 .venv/Scripts/python.exe scripts/demo_check.py --day 2026-11-10
 
-# 日报（00:20 计划任务自动生成；演练期读 paper 状态 + 决策日志点差比对）
+# 日报（00:20 计划任务自动生成；PaperSoak 读 paper 状态 + 决策日志点差比对）
 type data\reports\live\daily-2026-11-10.md
 type data\logs\task_live_daily_report.log      # 任务输出（排查用）
 ```
 
+- 日常档返回 0 只说明"未发现异常证据"，**不等于取得验收证据**；汇总口径
+  同（`--summary` 不再宣称"全部通过"，只说"未发现异常证据（日常口径）"）。
 - 重点看：心跳连续性、无法解释持仓差异=0、日报存在且点差无 `**超标**`。
 - 心跳异常先看 `data\live\alerts.log` 与对应 `.err` 日志，再按 §3 处理。
 - 每周日 23:00 UTC（本机周一 07:00）`MT5Quant\demo_weekly_check` 自动跑
   `demo_check --summary` 全周汇总，落 `data\demo\weekly-check.md`（覆盖写）；
   平时手动：`.venv/Scripts/python.exe scripts/demo_check.py --summary`。
 
-## 3. 常见问题
+## 3. 常见问题（恢复原则：只移除停机信号；仅重启已确认退出的进程）
 
 **killSwitch 一键停机后恢复**（演练项，预期会触发一次）：
 ```powershell
 New-Item -ItemType File data\live\killSwitch      # 停：风控下一轮写 halt.json
 #   各执行器开仓腿随即被拒；这是"一键停机"演练项的证据（RISK_HALT 告警）
 Remove-Item data\live\killSwitch, data\live\halt.json -ErrorAction SilentlyContinue
-powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1   # 重启集群
+# 恢复 = 只移除停机信号；进程若还活着就什么都不用再启动（killSwitch 不杀进程）
 ```
 
-**进程重启**：
+**进程重启（R8-I6：绝不满组重跑）**：
 ```powershell
-Get-Content data\demo\pids.txt                     # 看 PID 清单
-taskkill /PID <pid> /F                             # 紧急停单个进程
-powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1   # 重启
+# ① 核对哪些进程真的退了：逐行看 pids.txt 的 PID 与对应日志尾部
+Get-Content data\demo\pids.txt
+Get-Process -Id <pid>            # 在 = 还活着，什么都不做
+Get-Content data\demo\runner-<magic>-<stamp>.log -Tail 20   # 尾部有
+#   "收到中断，退出"/Traceback = 真退出；taskkill /F 强杀不留退出说明
+
+# ② 只重启已确认退出的进程：重跑同模式命令即可——脚本按 pids.txt 检测
+#    存活实例并自动跳过，只补缺的运行器/风控/对账
+powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1 -Mode Demo   # 例
+
+# ③ 紧急停单个进程：
+taskkill /PID <pid> /F
+#   注意：taskkill /F 不留退出日志，demo_check 的"重启有说明"检查会不通过。
+#   计划内停止优先 Ctrl-C（日志留"收到中断，退出"）或先放 killSwitch；紧急
+#   强杀后，在 alerts.log 有当日 HEARTBEAT_TIMEOUT/RISK_HALT 佐证也可接受。
+
+# ④ 禁止：删除/清空 pids.txt 后全组重跑——同 magic 并行第二份运行器会双写
+#    state-<magic>.json、意图与下单日志（R8-I6）。pids.txt 是追加式历史，
+#    永远不要删。
 ```
-注意：`taskkill /F` 不留退出日志，demo_check 的"重启有说明"检查会不通过。
-计划内停止优先 Ctrl-C（日志留"收到中断，退出"）或先放 killSwitch；紧急
-强杀后，在 `alerts.log` 有当日 HEARTBEAT_TIMEOUT/RISK_HALT 佐证也可接受。
 
 **日报缺失/内容异常排查**（`data\reports\live\daily-*.md` 没生成）：
 1. `type data\logs\task_live_daily_report.log`——最常见：影子状态不可用
    （退出码 2，fail-closed 不落半截日报）→ 确认运行器活着、
    `data\live\paper\state-*.json` 存在且非空；
 2. 点差比对报 `model_sha256` 不一致 → 重跑 `scripts/build_cost_model.py`
-   重建 `data\costs\spread_model.json`（日报拒绝用被动过的模型）；
+   重建 `data\costs/spread_model.json`（日报拒绝用被动过的模型）；
 3. 手动补跑（与计划任务同参）：
 ```powershell
 .venv/Scripts/python.exe scripts/live_daily_report.py --date 2026-11-10 `
@@ -77,25 +115,36 @@ powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1   # 重启
     --spread-model data\costs\spread_model.json --log-dir data\demo
 ```
 
-## 4. 结束（第 10 个交易日后）
+## 4. 结束与最终验收（第 10 个交易日后；Demo 模式）
 
 ```powershell
-# 1) 逐日验收全过 + 演练证据汇总，落最终报告
-.venv/Scripts/python.exe scripts/demo_check.py --summary > data\demo\final-check.md
-#   §7 证据要求：RISK_FLATTEN ≥ 2（日亏全平连续两次）、禁入拒单 ≥ 1、
-#   覆盖 ≥ 10 个交易日、一键停机/心跳超时有重启恢复记录
+# 1) 阶段 F 最终验收（--accept 严格口径：任何"无样本/未覆盖"= 未验收，
+#    退出码非 0）——五条全期判据 + 逐日严格复核：
+#      · 连续交易日覆盖 ≥10（工作日无缺日）
+#      · 各进程存活证据（逐日风控/对账/运行器或"心跳=ok"佐证）
+#      · SL 与 TP 样本均存在
+#      · 双全平真实完成（两个不同 uuid 指令 + 两轮完成 ack）
+#      · 实际点差样本存在且无超标小时
+.venv/Scripts/python.exe scripts/demo_check.py --accept > data\demo\final-check.md
+#   通过（退出码 0）才算阶段 F 验收证据齐全；PaperSoak 模式跑 --accept
+#   会因缺真实成交样本如实失败——那正是两种模式的边界，不是工具缺陷。
 
-# 2) 停止全部演练进程
+# 2) 日常全周汇总留档（宽松口径，供运维浏览）
+.venv/Scripts/python.exe scripts/demo_check.py --summary > data\demo\weekly-final.md
+
+# 3) 停止全部演练进程
 New-Item -ItemType File data\live\killSwitch       # 先停开仓（留演练证据）
 Start-Sleep 15                                     # 等风控写 halt.json
 Get-Content data\demo\pids.txt | ForEach-Object { taskkill /PID ($_ -split "`t")[0] /F }
 Remove-Item data\live\killSwitch, data\live\halt.json -ErrorAction SilentlyContinue
 
-# 3) 收尾：删演练周任务；归档 paper 状态后重跑安装脚本（日报恢复真账户）
+# 4) 收尾：删演练周任务；归档 paper 状态后重跑安装脚本（日报恢复真账户）
 schtasks /Delete /TN "MT5Quant\demo_weekly_check" /F
 Move-Item data\live\paper data\demo\paper-final     # 归档（重跑安装脚本前）
 powershell -ExecutionPolicy Bypass -File scripts\setup_scheduled_tasks.ps1
 ```
 
-最终交付物：`data\demo\final-check.md`（逐日 7 项 + 演练证据）、
-`data\reports\live\daily-*.md`（每日日报）、`data\demo\*.log`（全程日志）。
+最终交付物：`data\demo\final-check.md`（--accept 验收结论 + 五判据 +
+逐日严格复核）、`data\demo\weekly-final.md`（日常汇总）、
+`data\reports\live\daily-*.md`（每日日报）、`data\demo\*.log`（全程日志）、
+`data\demo\pids.txt`（追加式完整进程清单）。
