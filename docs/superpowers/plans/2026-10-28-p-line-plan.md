@@ -197,6 +197,8 @@ def load_model(path, *, expected_sha256: str) -> dict               # 哈希不�
   - `ev_lower` 随 z 单调不增；全部低于门槛 → None；并列时取序最前者——`test_ev_lower_monotone_non_increasing_in_z`、`test_choose_none_when_all_below_threshold`、`test_choose_tie_takes_first_in_action_order`；
   - 模型文件往返一致，同一输入两次生成的哈希相同，哈希不符 → ModelIntegrityError——`test_to_dict_from_dict_roundtrip`、`test_same_input_same_hash`、`test_load_model_tampered_content_raises`。
 - [x] **真数据对账证据**（本机运行，不进 CI）：XAUUSD H1 研究库（52,146 根，成本 rel@NY p90 快照 + swap 快照）随机时点 200 个（seed=20261027），结局 loss 90 / win 85 / time 25，逐笔对照不一致 0 处、max|net_r−r_multiple|=0.000e+00；日志 `data/prob/t72-evidence-2026-10-27.log`（本机 worktree，结论存档于本提交说明）。随机时点不是研究结论，不违反禁止事项。
+  （CI 如实注：8d14c41 自身的 CI 因锚定测试同刻度偶发为红，与本任务内容无关；同树重跑 8739667 绿、修复后 d96c523 绿——见下方审核修正行。）
+- [ ] **审核修正（R12，2026-10-28）**：① 概率表 r̄ 收缩改按结局伪样本数 r̄_o=(Σr_o+m·p_base_o·r_base_o)/(k_o+m·p_base_o)——同分布格=基准条件均值、大样本趋近经验条件均值、EV 手算一致三测（test_rbar_same_distribution_equals_base_mean/test_rbar_large_n_approaches_empirical_conditional_mean/test_ev_from_lookup_matches_hand_calc）；② purge 改按 bar 下标（t+K+1 存在且 time<train_end），周末/节假日缺口测试（test_purge_weekend_gap_dropped_by_bar_index/test_purge_holiday_gap_dropped_by_bar_index）；③ 模型文件原子写对齐仓库统一模式（唯一 tmp+fsync+replace 带重试，tests/test_prob_artifact.py）；④ 新增切片 vs 全序列对账 100 例（|Δnet_r|<1e-6，test_slice_label_matches_full_series_engine）。待 CI 绿后勾选并附绿灯提交号。
 
 ## T73：拟合钩子、分段与模型身份（L）
 
@@ -264,6 +266,8 @@ class BaseStrategy:
 - **每张卡绑定一个子类**：止损止盈、局面、动作、网格都写成类常量，同 H003-v2 的子类做法。
 - **回看声明**：`lookback_bars` ≥ max(2,000, 480 + M, 200) + K + 24。
 - [x] **局面/动作/特征（不依赖 T73 拟合协议的部分）**：`situations.py`（Approach M/D/d + S1 网格/S2 前一交易日 17:00 NY 划界（DST 由 zoneinfo，EST 22:00/EDT 21:00 UTC 边界实测）/S3 B1 同法通道 shift(1)）+ `actions.py`（A1–A4 阻力支撑对称，b 与 m 取卡参数，A2 带 ±0.25 ATR）+ `features.py`（trend_sma200 / atr_pct_2000 有界窗口、未满窗 None）。测试 `test_strategies_prob_situations.py`（9）+ `test_strategies_prob_actions.py`（7）+ `test_strategies_prob_features.py`（4），共 20 个，先红后绿：A1–A4 触发与手算一致（阻力 `test_actions_hand_computed_resistance`、支撑 `test_support_actions_mirror_hand_case`）；镜像对称（价格围绕价位反射后 kind 互换、方向取反、bar 不变——`test_s1_support_touch_and_mirror`、`test_actions_mirror_symmetry`）。
+  （CI 如实注：572396d 自身的 CI 因锚定测试同刻度偶发为红，与本任务内容无关；绿灯证据来自 d96c523。）
+- [ ] **审核修正（R12，2026-10-28）**："接近价位"定义更正——本根进入触及带；前 M 根都在带外且价位同侧（阻力 high_j < L − d·ATR_j），其中至少一根 ≥ D·ATR；蓝图 P 线 §2.1 同步更正；渐进接近测试（旧定义拒绝、新定义触发，test_s1_ramp_approach_accepted_new_definition），既有手算测试全部复绿。待 CI 绿后勾选并附绿灯提交号。
 - [ ] **剩余项（依赖 T73 拟合协议，待 T63–T65 在 main 勾选后随 T73 一并落地）**：
   - 持有到第 K 根归零；止损后同一次触发不再重入（经引擎验证）；
   - G0：冻结模型下截断一致，窗口不变性 ≥ 100 个随机探针；

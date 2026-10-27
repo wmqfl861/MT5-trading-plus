@@ -277,6 +277,113 @@ def test_purge_drops_triggers_crossing_train_end():
     assert len(out2) == 2
 
 
+# ------------------------------------------------------------ purge 跨缺口
+
+def _bars_with_gap(n_before, gap_hours, n_after, *, start="2026-10-16"):
+    """连续 H1 bar，中间空 gap_hours 小时（模拟周末/节假日缺口）。"""
+    from datetime import timedelta
+    secs = TIMEFRAME_SECONDS["H1"]
+    t0 = pd.Timestamp(start)
+    times1 = [t0 + timedelta(seconds=secs * i) for i in range(n_before)]
+    t2 = times1[-1] + timedelta(hours=gap_hours + 1)
+    times2 = [t2 + timedelta(seconds=secs * i) for i in range(n_after)]
+    times = pd.DatetimeIndex(times1 + times2)
+    rng = np.random.default_rng(5)
+    n = len(times)
+    closes = 100 + np.cumsum(rng.normal(0, 0.3, size=n))
+    highs = closes + np.abs(rng.normal(0, 0.15, size=n))
+    lows = closes - np.abs(rng.normal(0, 0.15, size=n))
+    opens = closes + rng.normal(0, 0.05, size=n)
+    return pd.DataFrame({"time": times, "open": opens, "high": highs,
+                         "low": lows, "close": closes,
+                         "tick_volume": 1, "spread": 5, "real_volume": 0},
+                        columns=["time", "open", "high", "low", "close",
+                                 "tick_volume", "spread", "real_volume"])
+
+
+def test_purge_weekend_gap_dropped_by_bar_index():
+    """审核修正 2：周五晚触发、train_end 在周六——时间外推会误留（窗按
+    小时算落在周六前），标签窗实际跨缺口延伸到下周一，必须按 bar 下标剔除。"""
+    bars = _bars_with_gap(LOOKBACK_BARS + 30, gap_hours=47, n_after=40,
+                          start="2026-10-16")     # 330 根后缺口跨周末
+    t = LOOKBACK_BARS + 25                        # 触发 bar；t+7 越过缺口
+    tf_s = TIMEFRAME_SECONDS["H1"]
+    trig_time = bars["time"].iloc[t]
+    nxt = bars["time"].iloc[t + 7]                # K=6 → 出场 bar t+7（缺口后）
+    assert nxt > trig_time + pd.Timedelta(hours=8)   # 确认跨了缺口
+    bracket = Bracket(sl_atr=1.5, tp_atr=1.5, horizon_bars=6)
+    kw = dict(symbol="XAUUSD", timeframe="H1", bracket=bracket,
+              contract_size=CS, sizing=SIZING, vol_bounds=VOL)
+    # 旧口径的 train_end（时间外推窗 ≤ train_end，会误留）：
+    legacy_end = trig_time + pd.Timedelta(seconds=tf_s * 8) + pd.Timedelta(hours=2)
+    assert legacy_end > trig_time + pd.Timedelta(seconds=tf_s * 8)
+    # 新口径：t+7 的时刻在 train_end 之后 → 剔除
+    out = label_triggers(bars, _trig([trig_time]), LIGHT, train_end=legacy_end,
+                         **kw)
+    assert len(out) == 0
+    # train_end 放到 t+7 之后 → 保留
+    out2 = label_triggers(bars, _trig([trig_time]), LIGHT,
+                          train_end=nxt + pd.Timedelta(hours=1), **kw)
+    assert len(out2) == 1
+
+
+def test_purge_holiday_gap_dropped_by_bar_index():
+    """节假日（整天缺口）同理：单日缺口让时间外推漏剔。"""
+    bars = _bars_with_gap(LOOKBACK_BARS + 30, gap_hours=23, n_after=40)
+    t = LOOKBACK_BARS + 25                        # t+7 越过单日缺口
+    trig_time = bars["time"].iloc[t]
+    nxt = bars["time"].iloc[t + 7]
+    assert nxt - trig_time > pd.Timedelta(hours=10)   # 跨了单日缺口
+    bracket = Bracket(sl_atr=1.5, tp_atr=1.5, horizon_bars=6)
+    out = label_triggers(bars, _trig([trig_time]), LIGHT,
+                         train_end=trig_time + pd.Timedelta(hours=10),
+                         symbol="XAUUSD", timeframe="H1", bracket=bracket,
+                         contract_size=CS, sizing=SIZING, vol_bounds=VOL)
+    assert len(out) == 0
+
+
+# ------------------------------------------------------------ 切片 vs 全序列
+
+def test_slice_label_matches_full_series_engine():
+    """审核修正 5：触发离起点足够远时，切片标签与完整序列上直接跑引擎 A
+    的同一笔一致（出场原因相同，|Δnet_r| < 1e-6）——300 根切片不改口径。"""
+    bars = synth_bars(900, seed=23)
+    rng = np.random.default_rng(31)
+    idx = rng.integers(LOOKBACK_BARS + 60, len(bars) - 14, size=100)
+    sides = rng.choice([1, -1], size=100)
+    bracket = Bracket(sl_atr=1.5, tp_atr=1.5, horizon_bars=12)
+    out = label_triggers(bars, _trig([bars["time"].iloc[i] for i in idx],
+                                     side=sides.tolist()),
+                         LIGHT, symbol="XAUUSD", timeframe="H1",
+                         bracket=bracket, contract_size=CS,
+                         sizing=SIZING, vol_bounds=VOL)
+    assert len(out) == 100
+    n = len(bars)
+    for row, t, s in zip(out.itertuples(index=False), idx, sides):
+        script = [0] * n
+        for j in range(int(t), min(int(t) + bracket.horizon_bars, n)):
+            script[j] = int(s)
+        strat = ScriptedStrategy(script, ExitRules(
+            stop_loss_atr=bracket.sl_atr,
+            take_profit_atr=bracket.tp_atr,
+            reentry="after_signal_change"))
+        res = run_backtest(strat, bars, LIGHT, symbol="XAUUSD", params={},
+                           contract_size=CS, timeframe="H1", sizing=SIZING,
+                           vol_min=VOL[0], vol_step=VOL[1], vol_max=VOL[2])
+        trades = res.trades
+        assert len(trades) <= 1
+        if len(trades) == 0:
+            assert row.outcome == "skipped", (t, s, row.outcome)
+            continue
+        ref = trades.iloc[0]
+        expected = {"take_profit": "win", "take_profit_gap": "win",
+                    "stop": "loss", "stop_gap": "loss",
+                    "signal": "time"}[ref.exit_reason]
+        assert row.outcome == expected, (t, s, row.outcome, ref.exit_reason)
+        assert row.exit_reason == ref.exit_reason
+        assert abs(row.net_r - ref.r_multiple) < 1e-6
+
+
 # ------------------------------------------------------------ 入参校验
 
 def test_label_triggers_rejects_bad_inputs():

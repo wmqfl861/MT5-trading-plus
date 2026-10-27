@@ -28,24 +28,78 @@ def make_labels(n_above_win, n_above_loss, n_below_win, n_below_loss,
 
 
 def test_shrinkage_formula_exact():
-    """p_格 = (k + m·p_基准)/(n + m)；r̄ 同法；SE 按格内实际 n。"""
-    labels = make_labels(30, 30, 0, 0)          # 只用 above 填格；below 空
+    """p_格 = (k + m·p_基准)/(n + m)；r̄_o = (Σr_o + m·p_base_o·r_base_o)/
+    (k_o + m·p_base_o)（审核修正 1）；SE 按格内实际 n。"""
+    # 格内分布与基准不同（win 均值 2.2 vs 基准 1.9），公式检验才有区分度
+    labels = make_labels(30, 30, 0, 0, r_win=2.2)
     labels = labels[labels.trend_sma200 == "above"]
+    labels_other = make_labels(0, 0, 40, 60, r_win=1.9)   # below 格（凑基准分布）
+    labels_all = pd.concat([labels, labels_other], ignore_index=True)
     m, min_cell = 100, 10
-    tbl = ProbTable.fit(labels, group_by=["trend_sma200"],
+    tbl = ProbTable.fit(labels_all, group_by=["trend_sma200"],
                         prior_strength=m, min_cell=min_cell)
+    n_all = len(labels_all)
+    base = tbl.base_rate("A3")
+    p_bw = 70 / n_all                       # 基准：70 win / 160
     est = tbl.lookup("S1", "A3", {"trend_sma200": "above"})
     n = 60
-    p_base_win, p_base_loss = 30 / n, 30 / n
-    p_win = (30 + m * p_base_win) / (n + m)
-    p_loss = (30 + m * p_base_loss) / (n + m)
+    p_win = (30 + m * p_bw) / (n + m)
     assert est.n == n
     assert est.p_win == pytest.approx(p_win)
-    assert est.p_loss == pytest.approx(p_loss)
-    assert est.p_time == pytest.approx((0 + m * 0.0) / (n + m))
-    assert est.r_win == pytest.approx((30 * 1.9 + m * 1.9) / (n + m))
-    assert est.r_loss == pytest.approx((30 * -1.05 + m * -1.05) / (n + m))
+    assert est.p_loss == pytest.approx((30 + m * base.p_loss) / (n + m))
+    # r̄ 按结局伪样本数收缩（审核修正 1）
+    r_win = (30 * 2.2 + m * p_bw * base.r_win) / (30 + m * p_bw)
+    assert est.r_win == pytest.approx(r_win)
+    assert est.r_loss == pytest.approx(
+        (30 * -1.05 + m * base.p_loss * base.r_loss) / (30 + m * base.p_loss))
     assert est.se_win == pytest.approx(math.sqrt(p_win * (1 - p_win) / n))
+
+
+def test_rbar_same_distribution_equals_base_mean():
+    """审核修正 1（a）：格与基准同分布时 r̄ 精确等于基准条件均值。"""
+    labels = make_labels(40, 60, 0, 0)          # 全部 above，分布即基准
+    labels = labels[labels.trend_sma200 == "above"]
+    tbl = ProbTable.fit(labels, group_by=["trend_sma200"],
+                        prior_strength=100, min_cell=10)
+    est = tbl.lookup("S1", "A3", {"trend_sma200": "above"})
+    assert est.r_win == pytest.approx(1.9)       # 基准条件均值，不受 m 影响
+    assert est.r_loss == pytest.approx(-1.05)
+    assert est.r_time == pytest.approx(0.0)
+
+
+def test_rbar_large_n_approaches_empirical_conditional_mean():
+    """审核修正 1（b）：n 很大时 r̄ 趋近经验条件均值（而非 p×条件均值）。"""
+    labels = make_labels(90_000, 10_000, 0, 0, r_win=1.5)
+    labels = labels[labels.trend_sma200 == "above"]
+    tbl = ProbTable.fit(labels, group_by=["trend_sma200"],
+                        prior_strength=100, min_cell=100)
+    est = tbl.lookup("S1", "A3", {"trend_sma200": "above"})
+    assert est.r_win == pytest.approx(1.5, abs=1e-3)     # 旧式会趋近 0.9×1.5
+    assert est.r_loss == pytest.approx(-1.05, abs=1e-3)
+
+
+def test_ev_from_lookup_matches_hand_calc():
+    """审核修正 1（c）：查表估计经 ev_lower 得到的 EV 与手算一致。"""
+    from mt5quant.prob.decision import ev_lower
+    labels = make_labels(400, 500, 0, 0)
+    labels = labels[labels.trend_sma200 == "above"]
+    tbl = ProbTable.fit(labels, group_by=["trend_sma200"],
+                        prior_strength=100, min_cell=10)
+    est = tbl.lookup("S1", "A3", {"trend_sma200": "above"})
+    n, m = 900, 100
+    base = tbl.base_rate("A3")
+    k_w, k_l = 400, 500
+    p_win = (k_w + m * base.p_win) / (n + m)
+    p_loss = (k_l + m * base.p_loss) / (n + m)
+    r_win = (k_w * 1.9 + m * base.p_win * 1.9) / (k_w + m * base.p_win)  # 同分布→1.9
+    r_loss = (k_l * -1.05 + m * base.p_loss * -1.05) / (k_l + m * base.p_loss)
+    se_win = math.sqrt(p_win * (1 - p_win) / n)
+    se_loss = math.sqrt(p_loss * (1 - p_loss) / n)
+    z = 1.0
+    expected = ((p_win - z * se_win) * r_win + (p_loss + z * se_loss) * r_loss
+                + (1 - (p_win - z * se_win) - (p_loss + z * se_loss)) * est.r_time)
+    ev = ev_lower(est, z=z)
+    assert ev == pytest.approx(expected, rel=1e-12)
 
 
 def test_empty_cell_falls_back_to_base():

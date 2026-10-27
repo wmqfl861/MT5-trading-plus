@@ -2,15 +2,18 @@
 
 哈希按规范化 JSON（键排序、UTF-8、ensure_ascii=False、无多余空白）计算；
 文件内容（原始字节）与传入 expected_sha256 不符一律拒绝加载
-（ModelIntegrityError，fail-closed）。写入原子完成（临时文件 + os.replace，
-铁律 15）。NaN/Inf 拒绝序列化（allow_nan=False）。评估代码（D45：研究角色
-只读）。
+（ModelIntegrityError，fail-closed）。写入走仓库统一原子写模式（铁律 15，
+与 mt5gw.snapshot.write_json_atomic 同一形态：唯一临时文件 pid+uuid、
+fsync 落盘、os.replace 带重试、失败清理自己的 tmp）。NaN/Inf 拒绝序列化
+（allow_nan=False）。评估代码（D45：研究角色只读）。
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import time
+import uuid
 from pathlib import Path
 
 
@@ -23,6 +26,34 @@ def _canonical_bytes(model: dict) -> bytes:
                       separators=(",", ":"), allow_nan=False).encode("utf-8")
 
 
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """铁律 15 统一原子写（与 mt5gw.snapshot 同一模式；本包不 import 实盘
+    链路模块）：唯一 tmp（pid+uuid）→ fsync → os.replace 带重试（Windows
+    读者占句柄时，总预算约 3 秒）；替换失败清理自己的 tmp 再上抛。"""
+    tmp = path.parent / f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    tmp.write_bytes(data)
+    fd = os.open(str(tmp), os.O_RDWR)   # Windows：fsync 需写句柄
+    try:
+        os.fsync(fd)                    # 落盘后再替换，掉电不至半截
+    finally:
+        os.close(fd)
+    try:
+        for attempt in range(10):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.3)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def save_model(model: dict, root) -> tuple[str, str]:
     """把 model 规范化写入 root/<sha256>.json，返回 (路径, sha256)。
 
@@ -33,9 +64,7 @@ def save_model(model: dict, root) -> tuple[str, str]:
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     path = root / f"{digest}.json"
-    tmp = root / f".{digest}.json.tmp"
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    _atomic_write_bytes(path, data)
     return str(path), digest
 
 

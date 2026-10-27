@@ -87,8 +87,10 @@ def label_triggers(bars: pd.DataFrame, triggers: pd.DataFrame, costs, *,
     entry_time、exit_time、exit_reason（成交=引擎原因；未成交=
     zero_lots / no_fill / end_of_data）。
 
-    purge：train_end 给定时剔除标签窗（触发 bar 起 horizon_bars+2 根）越过
-    train_end 的触发——含未成交行（数据无关的保守口径）。
+    purge：train_end 给定时按 **bar 下标**剔除（审核修正 2）——保留条件为
+    t+K+1 存在于 bars 且 bars.time[t+K+1] < train_end（信号出场发生在
+    bar t+K+1 的开盘，该根的 open 是标签用到的最后信息）。按时间外推
+    （触发+(K+2)×周期）会跨周末/节假日缺口漏剔。
 
     vol_bounds = (vol_min, vol_step, vol_max)（品种快照三元组）。
     """
@@ -109,9 +111,11 @@ def label_triggers(bars: pd.DataFrame, triggers: pd.DataFrame, costs, *,
     keep = list(range(len(triggers)))
     if train_end is not None:
         limit = pd.Timestamp(train_end)
-        width = pd.Timedelta(seconds=tf_seconds * (bracket.horizon_bars + 2))
+        times = pd.to_datetime(bars["time"])
+        window_bar = bracket.horizon_bars + 1
         keep = [i for i in keep
-                if pd.Timestamp(triggers["time"].iloc[i]) + width <= limit]
+                if positions[i] + window_bar < len(bars)
+                and pd.Timestamp(times.iloc[positions[i] + window_bar]) < limit]
 
     n = len(bars)
     out = triggers.iloc[keep].copy()

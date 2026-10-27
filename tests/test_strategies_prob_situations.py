@@ -93,6 +93,27 @@ def test_s1_support_touch_and_mirror():
     assert [(e.kind, e.bar) for e in e2] == [("support", 26)]
 
 
+def test_s1_ramp_approach_accepted_new_definition():
+    """审核修正 3：渐进接近——窗口内并非每根都 ≥ D·ATR（近处 2 根只有
+    ~2 ATR），但曾在远端（10 ATR ≥ D=5）且全程带外同侧 → 触发。
+    旧定义（每根都 ≥ D）会拒绝此路径。"""
+    rows = [PLAT_BELOW] * 20                      # high=1990（距 2000 为 10）
+    rows.append((1994.5, 1996.0, 1994.0, 1995.0))    # 20：抬进（距 4）
+    rows.append((1996.0, 1997.0, 1995.5, 1996.5))    # 21（距 3，带外）
+    rows.append((1996.5, 1997.4, 1996.0, 1997.0))    # 22（距 2.6）
+    rows.append((1997.0, 1997.7, 1996.5, 1997.3))    # 23（距 2.3）
+    rows.append((1997.3, 1997.9, 1996.8, 1997.6))    # 24（距 2.1，仍带外）
+    rows.append((1998.0, 1999.9, 1997.5, 1998.5))    # 25：anchor 触带
+    rows += [PLAT_BELOW] * 3
+    bars = make_bars(rows)
+    events = find_level_events(
+        bars, s1_level_rows(bars, grid_step=50.0, approach=APPROACH,
+                            atr=atr_series(bars)),
+        situation="S1", approach=APPROACH, atr=atr_series(bars))
+    # 旧定义下 bar 21-24 距价位 < D（5×ATR），事件不存在；新定义存在
+    assert [(e.kind, e.level, e.bar) for e in events] == [("resistance", 2000.0, 25)]
+
+
 def test_s1_approach_too_close_no_event():
     """回看窗内已有 bar 距价位不足 D×ATR（带内盘整后再碰）→ 无事件。"""
     rows = [(1996.5, 1998.0, 1995.0, 1996.5)] * 26        # high 距 2000 仅 2 < 5

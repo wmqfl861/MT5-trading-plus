@@ -5,10 +5,13 @@ S3 20 日高低点。
 止盈单集中在整数位，止损单集中在整数位稍外侧）。三种局面统一输出
 "价位 × 方向（阻力/支撑）"事件：
 
-- **接近价位**（Approach）：最近 M 根 bar 与价位的距离都不小于 D 个 ATR
-  （阻力=价位−high_j ≥ D·ATR_j；支撑=low_j−价位 ≥ D·ATR_j），而本根的
-  high（阻力）或 low（支撑）落在价位 ±d 个 ATR 的带内。M、D、d 来自卡的
-  approach 配置，不进参数网格。
+- **接近价位**（Approach，审核修正 3）：本根的 high（阻力）或 low（支撑）
+  进入价位 ±d 个 ATR 的触及带；前 M 根 bar 都在触及带之外且位于价位同侧
+  （阻力：high_j < L − d·ATR_j；支撑：low_j > L + d·ATR_j），且其中
+  **至少一根**离价位不小于 D 个 ATR（曾从足够远处接近）。M、D、d 来自卡
+  的 approach 配置，不进参数网格。（旧定义"前 M 根每根都 ≥ D·ATR"要求本根
+  比上一根至少冲高 (D−d) 个 ATR，事件稀少且偏向大阳线——规格错误已在
+  蓝图 P 线 §2.1 同步更正。）
 - S1 网格间距写死在候选里（XAUUSD 50、EURUSD 0.0050、USTEC 100、
   BTCUSD 1000）；S2 交易日按 17:00 America/New_York 划分（铁律 1，DST 由
   zoneinfo 处理，"前一交易日"= 前一个**有 bar 的**会话）；S3 复用 B1 的
@@ -37,10 +40,13 @@ _EPS = 1e-9
 
 @dataclass(frozen=True)
 class Approach:
-    """"接近价位"的参数（卡的 approach：M / D / d）。"""
+    """"接近价位"的参数（卡的 approach：M / D / d）。
+
+    M：回看 bar 数（前 M 根都在触及带外、价位同侧，且至少一根达到 D）。
+    """
 
     lookback_bars: int        # M：接近阶段回看 bar 数
-    min_distance_atr: float   # D：接近阶段每根 bar 离价位至少 D 个 ATR
+    min_distance_atr: float   # D：窗口内至少一根 bar 离价位达到 D 个 ATR
     touch_atr: float          # d：触及带半宽（ATR 倍数）
 
     def __post_init__(self):
@@ -136,17 +142,27 @@ def levels_from_frame(rows: pd.DataFrame, *, columns: list[str]) -> pd.Series:
 
 def _approach_ok(highs, lows, i: int, level: float, kind: str,
                  approach: Approach, atr_arr) -> bool:
-    """接近条件：[i−M, i−1] 每根 bar 离价位 ≥ D·ATR（阻力在下方/支撑在上方）。"""
+    """接近条件（审核修正 3）：[i−M, i−1] 每根都在触及带外且位于价位同侧
+    （阻力：high_j < L − d·ATR_j；支撑：low_j > L + d·ATR_j），且其中至少
+    一根离价位 ≥ D·ATR（从足够远处接近过）。"""
+    far_enough = False
     for j in range(i - approach.lookback_bars, i):
         if j < 0:
             return False
         a = atr_arr[j]
         if not math.isfinite(a):
             return False
-        dist = (level - highs[j]) if kind == "resistance" else (lows[j] - level)
-        if dist < approach.min_distance_atr * a - _EPS:
-            return False
-    return True
+        if kind == "resistance":
+            if not highs[j] < level - approach.touch_atr * a + _EPS:
+                return False
+            if level - highs[j] >= approach.min_distance_atr * a - _EPS:
+                far_enough = True
+        else:
+            if not lows[j] > level + approach.touch_atr * a - _EPS:
+                return False
+            if lows[j] - level >= approach.min_distance_atr * a - _EPS:
+                far_enough = True
+    return far_enough
 
 
 def find_level_events(bars: pd.DataFrame, levels_by_bar: pd.Series, *,
@@ -154,8 +170,9 @@ def find_level_events(bars: pd.DataFrame, levels_by_bar: pd.Series, *,
                       atr: pd.Series) -> list[LevelEvent]:
     """对每 bar 的候选价位判定阻力/支撑触发（approach + 触及带内）。
 
-    阻力：|high_i − L| ≤ d·ATR_i 且 [i−M, i−1] 每根 high_j ≤ L − D·ATR_j；
-    支撑对称（low）。输出按 (bar, level, kind) 升序，确定性。
+    阻力：|high_i − L| ≤ d·ATR_i，且 [i−M, i−1] 每根 high_j < L − d·ATR_j
+    （带外同侧）、其中至少一根离价位 ≥ D·ATR；支撑对称（low）。
+    输出按 (bar, level, kind) 升序，确定性。
     """
     if situation not in ("S1", "S2", "S3"):
         raise ValueError(f"未知局面编号：{situation!r}")

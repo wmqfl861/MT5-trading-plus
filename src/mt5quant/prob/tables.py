@@ -41,21 +41,35 @@ def _se(p: float, n: int) -> float:
 
 def _aggregate(rows: pd.DataFrame, m: int,
                base: CellEstimate | None) -> CellEstimate | None:
-    """聚合 rows（win/loss/time 行）为一格估计，向 base 收缩（base=None 即基准自身）。"""
+    """聚合 rows（win/loss/time 行）为一格估计，向 base 收缩（base=None 即基准自身）。
+
+    概率收缩（审核修正 1）：p̂_o = (k_o + m·p_base_o)/(n + m)——伪样本 m 个按
+    基准率分摊到各结局。
+    净收益收缩按**结局的伪样本数**（审核修正 1）：r̄_o = (Σr_o +
+    m·p_base_o·r_base_o)/(k_o + m·p_base_o)——分子是"该结局的总收益"，分母
+    是"该结局的样本数（含伪样本）"，n→∞ 时趋近经验条件均值 Σr_o/k_o；
+    旧式 (Σr_o + m·r_base_o)/(n+m) 分母混入其他结局的计数，大样本时
+    趋近 p_o×条件均值，EV 被严重低估。
+    k_o 与 m·p_base_o 同时为 0（该结局格内外都无样本）→ r̄_o = 0。
+    """
     n = len(rows)
     if n == 0:
         return None
     k = {o: int((rows["outcome"] == o).sum()) for o in _USABLE_OUTCOMES}
     sums = {o: float(rows.loc[rows["outcome"] == o, "net_r"].sum())
             for o in _USABLE_OUTCOMES}
-    denom = n + m if base is not None else n
+    denom_p = n + m if base is not None else n
     ps, rs = {}, {}
     for o in _USABLE_OUTCOMES:
         if base is None:
-            ps[o], rs[o] = k[o] / n, (sums[o] / k[o] if k[o] else 0.0)
+            ps[o] = k[o] / n
+            rs[o] = sums[o] / k[o] if k[o] else 0.0
         else:
-            ps[o] = (k[o] + m * getattr(base, f"p_{o}")) / denom
-            rs[o] = (sums[o] + m * getattr(base, f"r_{o}")) / denom
+            pseudo = m * getattr(base, f"p_{o}")
+            ps[o] = (k[o] + pseudo) / denom_p
+            r_denom = k[o] + pseudo
+            rs[o] = ((sums[o] + pseudo * getattr(base, f"r_{o}")) / r_denom
+                     if r_denom > 0 else 0.0)
     est = CellEstimate(
         n=n, p_win=ps["win"], p_loss=ps["loss"], p_time=ps["time"],
         r_win=rs["win"], r_loss=rs["loss"], r_time=rs["time"],
