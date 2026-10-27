@@ -42,7 +42,7 @@ v3 → v3.1 的主要变化：
 | P5 基线 | 六卡 v3 报告已出（gates-calibration-v3，其修订节越幅误述已由 R7 指出并撤回） | 真数据 | 越幅缓存已按 stop_level 口径重建（R7-3，`ov[eca09e24]`）并经 T42 分片指纹自证真实装载（五序列成本版本全部含 ov 段）——越幅口径的**标定实验**已完成；六卡基线在越幅口径下的**逐卡复跑**仍待阶段 G 研究循环（v2 卡谱系承接）；v3 报告只代表点差采样口径修正的结论维持不变 |
 | P6 agent 流水线 | 规则、白名单钩子、研究库缺省切换（--main-store/--ops-ack）、CI 路径白名单（检查器装载自 main 基准，双 checkout；R8-I1 已修（T46/900ebf9）：head_ref 改步骤 env 传值、注入串只作数据、缺 env fail-closed） | 单元 | ACL 未落地、main 分支保护未开（U0 用户操作）——把检查设为 required check + 可信工作流入口属用户侧；workflow 文件路径在研究角色白名单中只读；--ops-ack 进入研究/G5 已修 |
 | P7 实盘 | 已接线：同步闸门、终端取 bar、全平编号协议、分策略暂停、意图语义、影子盘组件（T30–T34）；终审确认已修：全平持仓明细检查（C1）、确认绑定事件（C2/N-C1）、账户级聚合视图+一致快照+fail-closed（C3/N-C2）、内核字节锁（I1/N-I2）；T44 报告时间线已按 R8-M1 更正 | 集成 + **真机**（2026-10-26 影子盘一日双策略，D′ 已观测场景验收通过） | 残余（终审确认）：TP 出场 0 样本、经纪商实际成交滑点/断线重连未验证、全自动归档未演练（旧 magic 902426 登记致归档滞留须人工）——三项留阶段 F Demo 模式补证；夏令时窗内零开仓因 max_lots 先拒，独立 forbidden_session 演练待补 |
-| P8 模拟盘 → 实盘 | 阶段 F 待启动（T49/bcb831c 工具修复已落地：demo_run 双模式 PaperSoak/Demo（Demo=真实模拟盘成交+0.01 手强制+保险丝预检）、demo_check 三档（--accept 严格验收：缺样本=未验收）、单实例生命周期+追加式 pids；R9 复审通过后启动） | — | 影子盘 D′ 已观测场景通过（T44）；阶段 F 以 `-Mode Demo` 启动（DEMO-MA-XAUUSD-M15.toml, magic 902601, 0.01 手），两周后 `demo_check --accept` 终验收；PaperSoak 仅作延长观察不产生经纪商证据 |
+| P8 模拟盘 → 实盘 | 阶段 F 待启动（工具链经 R10+T59 收口并过独立成果审核：demo_run 双模式+config_check 真解析器 0.01 手强制+instances.json 跨 LogDir 生命周期+run-manifest 运行窗契约；demo_check --accept 九判据绑 Demo 证据（deals/drill-archive 契约联测端到端证实具备通过路径）；生产端 deals 证据流/归档演练保全/重连标记已落地） | — | 影子盘 D′ 已观测场景通过（T44）；阶段 F 以 `-Mode Demo` 启动（DEMO-MA-XAUUSD-M15.toml, magic 902601, 0.01 手），两周后 `demo_check --accept` 终验收；PaperSoak 仅延长观察不产生经纪商证据；启动时点待用户确认窗口；观察项 R1（多品种前滑点/归因键须收紧为 (magic, bar_key)）留档 |
 | MCP 远程数据 | 功能完成；非回环地址 fail-closed | 单元 | 用户侧 S1 清单未确认；仓库仍 public |
 
 **当前禁止事项**（修好之前）：
@@ -81,6 +81,14 @@ v3 → v3.1 的主要变化：
   验收/单实例，P16 反例回归）；R8-I7 报告措辞（T50a 已更正：结构性 flags 口径/p5 方向/
   验收降级）；R8-M1 T44 时间线（T50a 已更正）；R8-M2 蓝图内部冲突（本节同步处理）。
   待 R9 定向复审核实后逐项关闭。
+- **第九轮复审新发现（R9-I1..I6/M1）处置（R10+T59，成果审核通过）**：R9-I1 Demo
+  预检 PS5.1 传参（T51 已修：临时文件+防滥用）；R9-I2 0.01 手文本检查（T52 已修：
+  真解析器按实际加载值）；R9-I3 验收器 paper 借用（T53+T58+T59 已修：九判据绑
+  Demo 契约+生产端 deals 证据流）；R9-I4 双全平孤立 ack（T54+T58+T59 已修：三点
+  关联+归档保全）；R9-I5 单实例 LogDir 漏检（T55 已修：instances.json+锁临界区）；
+  R9-I6 指纹空值绕过（T56 已修：结构校验，legacy 不豁免畸形）；R9-M1 98.11% 已更正。
+  残余观察：R1 滑点/归因联接键多品种前收紧为 (magic, bar_key)；C-1~C-4 契约有
+  跨组联测钉死。
 - **产物**：gate-power-v2 正式报告已出并经 R8-I7 修订（`docs/research/gate-power-v2-2026-10-26.md`）；
   gates-calibration-v3 的越幅误述已由 R7-3 撤回修正；reconciliation-v3 已由 T48 出
   R8-I3 修订节（分口径符合率+五类归因+§9 新旧对照）。R7-M3（蓝图与证据索引）由本次
