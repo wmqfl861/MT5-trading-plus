@@ -1,0 +1,650 @@
+{
+  "P14_gate_artifacts_and_merge": {
+    "all_fingerprints_equal": true,
+    "fingerprint": {
+      "git_commit": "2fa27a3f5f7577f0b3693ea296f67b5bfca35618",
+      "git_dirty": true,
+      "gates_sha256": "68f49237d1b56df62691ab8516804349fce245e1dc3cdb8896bf03716f594357",
+      "cost_versions": {
+        "BTCUSD H1": "tick-spread-p90[rel@NY/bar_open_m1#01888819]+slip0.1-comm0-cli-swap-snapshot[a1340439]-ov[eca09e24]-sess[a7bfe5d2]",
+        "EURUSD M15": "tick-spread-p90[rel@NY/bar_open_m1#01888819]+slip0.1-comm0-calibrated-swap-snapshot[95bd5691]-ov[eca09e24]-sess[a7bfe5d2]",
+        "USTEC M5": "tick-spread-p90[rel@NY/bar_open_m1#01888819]+slip0.1-comm0-cli-swap-snapshot[c71b0267]-ov[eca09e24]-missNY[17]-sess[a7bfe5d2]",
+        "XAUUSD H1": "tick-spread-p90[rel@NY/bar_open_m1#01888819]+slip0.1-comm0-cli-swap-snapshot[f7bccb57]-ov[eca09e24]-missNY[17]-sess[a7bfe5d2]",
+        "XAUUSD M15": "tick-spread-p90[rel@NY/bar_open_m1#01888819]+slip0.1-comm0-cli-swap-snapshot[f7bccb57]-ov[eca09e24]-missNY[17]-sess[a7bfe5d2]"
+      },
+      "script_sha256": "2f4813dcbade20c6d886ea0b77a570e5d206f4da2a9f295955c0648a22d79c2c"
+    },
+    "git_script_hash_matches": false,
+    "git_script_matches_after_crlf_normalization": true,
+    "current_script_hash_matches": true,
+    "gates_hash_matches": true,
+    "shard_seeds": [
+      [
+        0,
+        4
+      ],
+      [
+        4,
+        4
+      ],
+      [
+        8,
+        4
+      ],
+      [
+        12,
+        4
+      ],
+      [
+        16,
+        4
+      ]
+    ],
+    "identity_problems": [],
+    "seed_problems": [],
+    "official_sections_equal": {
+      "negative": true,
+      "positive": true,
+      "g5": true,
+      "flags": true
+    },
+    "supplement_matches_official_md": true,
+    "counts": {
+      "negative": 160,
+      "positive": 160,
+      "g5": 480
+    },
+    "passed_all": {
+      "negative": 0,
+      "positive": 0
+    },
+    "flags": [
+      {
+        "check": "G1.gross_cost_multiple",
+        "kind": "low_detection",
+        "value": 0.0,
+        "rule": "真实夏普 1.0 档检出率 < 50%"
+      },
+      {
+        "check": "G1.profit_factor",
+        "kind": "low_detection",
+        "value": 0.0,
+        "rule": "真实夏普 1.0 档检出率 < 50%"
+      },
+      {
+        "check": "G2.cost_scaling",
+        "kind": "low_detection",
+        "value": 0.2,
+        "rule": "真实夏普 1.0 档检出率 < 50%"
+      },
+      {
+        "check": "G2.drop_best_5pct",
+        "kind": "low_detection",
+        "value": 0.0,
+        "rule": "真实夏普 1.0 档检出率 < 50%"
+      },
+      {
+        "check": "G2.random_entry_benchmark",
+        "kind": "low_detection",
+        "value": 0.4,
+        "rule": "真实夏普 1.0 档检出率 < 50%"
+      },
+      {
+        "check": "G1.net_profit_positive",
+        "kind": "high_false_positive",
+        "value": 0.11666666666666667,
+        "rule": "负对照误报率 > 5%"
+      },
+      {
+        "check": "G1.trade_count",
+        "kind": "high_false_positive",
+        "value": 1.0,
+        "rule": "负对照误报率 > 5%"
+      },
+      {
+        "check": "G2.delay_1_bar",
+        "kind": "high_false_positive",
+        "value": 0.15,
+        "rule": "负对照误报率 > 5%"
+      },
+      {
+        "check": "G2.param_plateau",
+        "kind": "high_false_positive",
+        "value": 0.42,
+        "rule": "负对照误报率 > 5%"
+      },
+      {
+        "check": "G2.random_entry_benchmark",
+        "kind": "high_false_positive",
+        "value": 0.09,
+        "rule": "负对照误报率 > 5%"
+      },
+      {
+        "check": "G3.oos_sharpe",
+        "kind": "high_false_positive",
+        "value": 0.23333333333333334,
+        "rule": "负对照误报率 > 5%"
+      },
+      {
+        "check": "G5.expectation_positive",
+        "kind": "high_false_positive",
+        "value": 0.275,
+        "rule": "负对照误报率 > 5%"
+      },
+      {
+        "check": "G5.sharpe_vs_reference",
+        "kind": "high_false_positive",
+        "value": 0.95,
+        "rule": "负对照误报率 > 5%"
+      }
+    ],
+    "distributions": {
+      "XAUUSD H1/0.3": {
+        "n": 20,
+        "mean": 0.02851318901979121,
+        "median": 0.18927052195923433,
+        "min": -0.8362271548820474,
+        "max": 0.5917034358368506,
+        "converged": true,
+        "history_length": 4,
+        "achieved_sharpe": 0.32784638261534643,
+        "target": 0.3,
+        "tol": 0.15
+      },
+      "XAUUSD H1/0.6": {
+        "n": 20,
+        "mean": 0.29944017765847236,
+        "median": 0.42780220223295706,
+        "min": -0.5281662266826296,
+        "max": 0.7974077802131023,
+        "converged": true,
+        "history_length": 4,
+        "achieved_sharpe": 0.6315737097600597,
+        "target": 0.6,
+        "tol": 0.15
+      },
+      "XAUUSD H1/1.0": {
+        "n": 20,
+        "mean": 0.6676753044736162,
+        "median": 0.7498131830466659,
+        "min": -0.09805571815981569,
+        "max": 1.1184364889961091,
+        "converged": true,
+        "history_length": 4,
+        "achieved_sharpe": 1.0257775131803797,
+        "target": 1.0,
+        "tol": 0.15
+      },
+      "XAUUSD H1/1.5": {
+        "n": 20,
+        "mean": 1.0721793941544138,
+        "median": 1.1633767599435436,
+        "min": 0.3683361330288489,
+        "max": 1.5483316281447397,
+        "converged": true,
+        "history_length": 3,
+        "achieved_sharpe": 1.4486412008819345,
+        "target": 1.5,
+        "tol": 0.15
+      },
+      "USTEC M5/0.3": {
+        "n": 20,
+        "mean": 0.20944306454658135,
+        "median": 0.28333993786747325,
+        "min": -0.46089998418834227,
+        "max": 1.2189502907038894,
+        "converged": true,
+        "history_length": 4,
+        "achieved_sharpe": 0.39821280247053437,
+        "target": 0.3,
+        "tol": 0.15
+      },
+      "USTEC M5/0.6": {
+        "n": 20,
+        "mean": 0.4322820162741024,
+        "median": 0.4522559723251789,
+        "min": -0.16662505801715058,
+        "max": 1.4564416637280875,
+        "converged": true,
+        "history_length": 6,
+        "achieved_sharpe": 0.6123020096051505,
+        "target": 0.6,
+        "tol": 0.15
+      },
+      "USTEC M5/1.0": {
+        "n": 20,
+        "mean": 1.2107483434296644,
+        "median": 1.0344019742858237,
+        "min": 0.5546062602538345,
+        "max": 2.286051445097382,
+        "converged": false,
+        "history_length": 7,
+        "achieved_sharpe": 1.3430208793514609,
+        "target": 1.0,
+        "tol": 0.15
+      },
+      "USTEC M5/1.5": {
+        "n": 20,
+        "mean": 1.4863660281628426,
+        "median": 1.2661560787312618,
+        "min": 0.8046925937847212,
+        "max": 2.5820947771407545,
+        "converged": true,
+        "history_length": 4,
+        "achieved_sharpe": 1.6005104894907192,
+        "target": 1.5,
+        "tol": 0.15
+      }
+    },
+    "g5": {
+      "XAUUSD H1/slot": {
+        "raw_n": 80,
+        "unique_seed_n": 20,
+        "passed": 40,
+        "p5_min": -1.3412518911556832,
+        "p5_max": -0.929928216924289
+      },
+      "XAUUSD H1/day": {
+        "raw_n": 80,
+        "unique_seed_n": 20,
+        "passed": 28,
+        "p5_min": -1.3412518911556832,
+        "p5_max": -0.929928216924289
+      },
+      "USTEC M5/slot": {
+        "raw_n": 80,
+        "unique_seed_n": 20,
+        "passed": 4,
+        "p5_min": -2.9929970714186913,
+        "p5_max": -1.6881029882147767
+      },
+      "USTEC M5/day": {
+        "raw_n": 80,
+        "unique_seed_n": 20,
+        "passed": 0,
+        "p5_min": -2.9929970714186913,
+        "p5_max": -1.6881029882147767
+      }
+    },
+    "missing_condition_rejected": true,
+    "changed_fingerprint_rejected": true,
+    "all_fingerprints_missing_problems": [],
+    "changed_unchecked_identity_fields": {
+      "max_bars": [],
+      "g5_cutoff": [],
+      "g5_window_source": []
+    },
+    "missing_whole_g5": {
+      "seed_problems": [],
+      "merge_exit": 0,
+      "g5_runs": 384,
+      "reported_seeds": 20
+    }
+  },
+  "P15_ci_branch_injection": {
+    "valid_git_branch": true,
+    "inert_branch": "audit\";exit${IFS}0;#",
+    "ordinary": {
+      "exit": 42,
+      "checker_reached": true
+    },
+    "injected": {
+      "exit": 0,
+      "checker_reached": false
+    }
+  },
+  "P16_demo_missing_evidence": {
+    "exit": 0,
+    "output": "== 模拟盘演练验收检查 2026-10-26（UTC 日） ==\n[通过] 无法解释持仓差异=0（意图 vs 实际）：意图与实际一致，无未解除的对账暂停/未决出场\n[通过] 每笔成交可归因（台账/日志有对应决策）：当日 0 笔成交全部可归因\n[通过] 持仓期间零调仓（市价单数=入场+出场）：开仓 0 + 出场 0，无加/减仓腿、无调仓告警\n[通过] SL/TP 出场后无未解除暂停：当日无保护性出场（无样本）\n[通过] 心跳连续性（中断有日志说明）：无心跳超时告警；无未说明的重启\n[通过] 换日禁入时段（含冬令时 22:00）：禁入窗内零开仓；拒单记录 0 条（当日无禁入窗开仓尝试——§7 演练项要求覆盖换日窗，见 --summary）\n[通过] 日报存在且点差无超标：日报存在；当日无点差样本（无法比对，如实标注）\n\n== 模拟盘演练验收汇总（蓝图 §7） ==\n2026-10-26  通过 7 / 不通过 0 / 无样本 0（全部通过）不通过项：—\n\n演练证据（§7 演练项，全期累计）：\n  一键停机/风控停机（RISK_HALT）：0 次\n  日亏全平（RISK_FLATTEN）：0 次——§7 要求连续触发两次（≥2），未达标\n  心跳超时停机（HEARTBEAT_TIMEOUT）：0 次（每次须有重启恢复记录）\n  换日禁入拒单（forbidden_session）：0 条——§7 要求覆盖换日窗（含冬令时 22:00），未达标\n  覆盖天数：1（§7 要求连续 10 个交易日）\n\n全部通过。\n"
+  },
+  "P17_reconciliation": {
+    "runs": {
+      "USTEC_M5_20261026T105826Z_2fe72d": {
+        "paired": 4170,
+        "only_a": 50,
+        "only_b": 1277,
+        "entry_bad": 21,
+        "exit_bad": 27,
+        "reason_bad": 34,
+        "net_bad": 73,
+        "reported_summary_ok": false,
+        "entry_notes": {
+          "before_ready": 21
+        },
+        "exit_notes": {
+          "level_unknown": 19,
+          "before_ready": 8
+        },
+        "net_bad_categories": {
+          "tp_cross": 50,
+          "reason_mismatch": 11,
+          "tp_gap": 5,
+          "cross_bar_skew": 7
+        },
+        "b_favorable_bad_rows": 67,
+        "pure_stop_rows": 1046,
+        "pure_stop_net_bad": 0,
+        "stop_to_nonstop_rows": 25,
+        "stop_to_nonstop_overshoot_sum": 1045.5155481301863,
+        "additional_bad_without_invalid_overshoot": 21,
+        "summary_counts_match": true,
+        "largest_invalid_overshoot": {
+          "entry_time_a": "2026-06-16 14:35:00",
+          "exit_time_a": "2026-06-16 14:40:00",
+          "exit_time_b": "2026-06-16 15:46:22.631",
+          "exit_reason_b": "take_profit",
+          "net_diff": 271.8154197550939,
+          "net_overshoot_comp": 271.61958261342,
+          "net_rest": 0.1958371416739055,
+          "net_tol": 1.9583741960918484,
+          "net_ok": true
+        }
+      },
+      "USTEC_M5_20261026T105954Z_1835cc": {
+        "paired": 3651,
+        "only_a": 0,
+        "only_b": 0,
+        "entry_bad": 0,
+        "exit_bad": 38,
+        "reason_bad": 43,
+        "net_bad": 62,
+        "reported_summary_ok": false,
+        "entry_notes": {},
+        "exit_notes": {
+          "level_unknown": 31,
+          "before_ready": 7
+        },
+        "net_bad_categories": {
+          "tp_cross": 50,
+          "reason_mismatch": 7,
+          "tp_gap": 5
+        },
+        "b_favorable_bad_rows": 61,
+        "pure_stop_rows": 877,
+        "pure_stop_net_bad": 0,
+        "stop_to_nonstop_rows": 36,
+        "stop_to_nonstop_overshoot_sum": 872.46608628999,
+        "additional_bad_without_invalid_overshoot": 34,
+        "summary_counts_match": true,
+        "largest_invalid_overshoot": {
+          "entry_time_a": "2026-06-29 13:30:00",
+          "exit_time_a": "2026-06-29 13:30:00",
+          "exit_time_b": "2026-06-29 13:30:32.100",
+          "exit_reason_b": "take_profit",
+          "net_diff": 139.48252842904185,
+          "net_overshoot_comp": 139.29546327425078,
+          "net_rest": 0.1870651547910711,
+          "net_tol": 1.913705674182544,
+          "net_ok": true
+        }
+      },
+      "XAUUSD_H1_20261026T105752Z_e7d328": {
+        "paired": 161,
+        "only_a": 0,
+        "only_b": 0,
+        "entry_bad": 0,
+        "exit_bad": 0,
+        "reason_bad": 0,
+        "net_bad": 5,
+        "reported_summary_ok": false,
+        "entry_notes": {},
+        "exit_notes": {},
+        "net_bad_categories": {
+          "tp_cross": 4,
+          "tp_gap": 1
+        },
+        "b_favorable_bad_rows": 5,
+        "pure_stop_rows": 62,
+        "pure_stop_net_bad": 0,
+        "stop_to_nonstop_rows": 0,
+        "stop_to_nonstop_overshoot_sum": 0.0,
+        "additional_bad_without_invalid_overshoot": 0,
+        "summary_counts_match": true
+      },
+      "XAUUSD_H1_20261026T105800Z_15b701": {
+        "paired": 382,
+        "only_a": 1,
+        "only_b": 1,
+        "entry_bad": 0,
+        "exit_bad": 0,
+        "reason_bad": 0,
+        "net_bad": 18,
+        "reported_summary_ok": false,
+        "entry_notes": {},
+        "exit_notes": {},
+        "net_bad_categories": {
+          "tp_cross": 17,
+          "tp_gap": 1
+        },
+        "b_favorable_bad_rows": 18,
+        "pure_stop_rows": 134,
+        "pure_stop_net_bad": 0,
+        "stop_to_nonstop_rows": 0,
+        "stop_to_nonstop_overshoot_sum": 0.0,
+        "additional_bad_without_invalid_overshoot": 0,
+        "summary_counts_match": true
+      }
+    },
+    "totals": {
+      "paired": 8364,
+      "only_a": 51,
+      "only_b": 1278,
+      "entry_bad": 21,
+      "exit_bad": 65,
+      "reason_bad": 77,
+      "net_bad": 158,
+      "pure_stop_rows": 2119,
+      "pure_stop_net_bad": 0,
+      "stop_to_nonstop_rows": 61,
+      "additional_bad_without_invalid_overshoot": 55,
+      "b_favorable_bad_rows": 151
+    },
+    "nonstop_as_overshoot_probe": {
+      "net_diff": 60.0,
+      "spread_comp": -0.0,
+      "overshoot_comp": 60.0,
+      "rest": 0.0,
+      "tol": 1.0,
+      "ok": true
+    }
+  },
+  "P18_paper_evidence": {
+    "902431": {
+      "decisions": 41,
+      "deals": 15,
+      "entries": 8,
+      "exits": 7,
+      "SL": 3,
+      "TP": 0,
+      "balance": 9845.260999999999,
+      "equity": 9826.932999999999,
+      "open_positions": 1,
+      "closed_position_volume_mismatches": 0,
+      "execution_actions": {
+        "open": 6,
+        "none": 17769,
+        "hold": 32,
+        "flatten": 2,
+        "flatten_acked": 68,
+        "reverse": 2
+      },
+      "logged_order_kinds": {
+        "open": 8,
+        "close": 4
+      },
+      "protective_times": [
+        "2026-10-26T13:53:35.917230+00:00",
+        "2026-10-26T14:17:51.938051+00:00",
+        "2026-10-26T14:54:29.820093+00:00"
+      ],
+      "flatten_close_times": [
+        "2026-10-26T12:59:57.466162+00:00",
+        "2026-10-26T13:15:08.959319+00:00",
+        "2026-10-26T16:30:06.993843+00:00",
+        "2026-10-26T20:15:06.477659+00:00"
+      ]
+    },
+    "902432": {
+      "decisions": 42,
+      "deals": 6,
+      "entries": 3,
+      "exits": 3,
+      "SL": 2,
+      "TP": 0,
+      "balance": 9897.140000000001,
+      "equity": 9897.140000000001,
+      "open_positions": 0,
+      "closed_position_volume_mismatches": 0,
+      "execution_actions": {
+        "risk_rejected": 13,
+        "none": 17845,
+        "flatten": 2,
+        "flatten_acked": 68,
+        "open": 3,
+        "hold": 17,
+        "blocked_reentry": 8
+      },
+      "logged_order_kinds": {
+        "open": 3,
+        "close": 1
+      },
+      "protective_times": [
+        "2026-10-26T17:24:22.816018+00:00",
+        "2026-10-26T19:08:20.878541+00:00"
+      ],
+      "flatten_close_times": [
+        "2026-10-26T13:15:08.595939+00:00"
+      ]
+    },
+    "risk": {
+      "cycles": 3622,
+      "bad_heartbeat_cycles": 0,
+      "halt_cycles": 195
+    },
+    "reconcile": {
+      "consistent_cycles": 1208,
+      "inconsistent_cycles": 0
+    },
+    "flatten_archive": {
+      "flatten-bcc56ce9-20261026T131507-manual.json": {
+        "id": "bcc56ce9cd724378b7ff300f22a4279e",
+        "ts": "2026-10-26T13:15:07.270619+00:00"
+      },
+      "flatten-d5dd164c-20261026T125956-manual.json": {
+        "id": "d5dd164c8a8e4c2bbb2b9d9f58ff0ec2",
+        "ts": "2026-10-26T12:59:56.753713+00:00"
+      },
+      "flatten.ack-902431-drill2.json": {
+        "id": "bcc56ce9cd724378b7ff300f22a4279e",
+        "ts": "2026-10-26T13:15:08.935909+00:00",
+        "closed": 1,
+        "magic": 902431
+      },
+      "flatten.ack-902432-drill2.json": {
+        "id": "bcc56ce9cd724378b7ff300f22a4279e",
+        "ts": "2026-10-26T13:15:08.572334+00:00",
+        "closed": 1,
+        "magic": 902432
+      }
+    },
+    "alert_counts": {
+      "RISK_REJECT": 13,
+      "RISK_HALT": 3,
+      "RISK_FLATTEN": 2
+    },
+    "reject_counts": {
+      "max_lots": 11,
+      "kill_switch": 2
+    }
+  },
+  "P19_cost_and_ledger": {
+    "ledger_verify_problems": [],
+    "anchor_verify_problems": [],
+    "baseline_run_count": 67,
+    "baseline_with_ov": 67,
+    "baseline_cards": [
+      "H002",
+      "H003",
+      "H004",
+      "H005",
+      "H006",
+      "H007"
+    ],
+    "ops_records": [
+      {
+        "run_id": 442,
+        "strategy": "mt5quant.backtest.reference:MaCrossATRAfterSignalChange",
+        "symbol": "XAUUSD",
+        "timeframe": "H1",
+        "created_utc": "2026-10-26T10:57:52.647126+00:00"
+      },
+      {
+        "run_id": 443,
+        "strategy": "mt5quant.backtest.reference:MaCrossATR",
+        "symbol": "XAUUSD",
+        "timeframe": "H1",
+        "created_utc": "2026-10-26T10:58:00.692750+00:00"
+      },
+      {
+        "run_id": 444,
+        "strategy": "mt5quant.backtest.reference:MaCrossATR",
+        "symbol": "USTEC",
+        "timeframe": "M5",
+        "created_utc": "2026-10-26T10:58:27.591519+00:00"
+      },
+      {
+        "run_id": 445,
+        "strategy": "mt5quant.backtest.reference:MaCrossATRAfterSignalChange",
+        "symbol": "USTEC",
+        "timeframe": "M5",
+        "created_utc": "2026-10-26T10:59:55.201703+00:00"
+      }
+    ],
+    "cache_loads": {
+      "data/costs/spread_model.json": {
+        "XAUUSD": {
+          "sha": "eca09e24",
+          "status": "loaded",
+          "loaded": true
+        },
+        "USTEC": {
+          "sha": "eca09e24",
+          "status": "loaded",
+          "loaded": true
+        },
+        "EURUSD": {
+          "sha": "eca09e24",
+          "status": "loaded",
+          "loaded": true
+        },
+        "BTCUSD": {
+          "sha": "eca09e24",
+          "status": "loaded",
+          "loaded": true
+        }
+      },
+      "data_research/costs/spread_model.json": {
+        "XAUUSD": {
+          "sha": "eca09e24",
+          "status": "loaded",
+          "loaded": true
+        },
+        "USTEC": {
+          "sha": "eca09e24",
+          "status": "loaded",
+          "loaded": true
+        },
+        "EURUSD": {
+          "sha": "eca09e24",
+          "status": "loaded",
+          "loaded": true
+        },
+        "BTCUSD": {
+          "sha": "eca09e24",
+          "status": "loaded",
+          "loaded": true
+        }
+      }
+    }
+  }
+}
