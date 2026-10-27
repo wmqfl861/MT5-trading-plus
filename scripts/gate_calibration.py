@@ -1,5 +1,5 @@
 """gate_calibration：T22 关卡正负对照实验（H7 判别力）+ T39 收尾
-（M4 日内零假设 / M5 G5 判别力 / 合并评估变体）。
+（M4 日内零假设 / M5 G5 判别力 / 合并评估变体）+ T66/D35 事件模式对照臂。
 
 用法（Git Bash，仓库根）：
     .venv/Scripts/python.exe scripts/gate_calibration.py --phase both \
@@ -7,6 +7,19 @@
     .venv/Scripts/python.exe scripts/gate_calibration.py --phase positive --quick
     .venv/Scripts/python.exe scripts/gate_calibration.py --phase negative \
         --baselines H002,H003 --null-hypothesis slot --seeds 5 --max-bars 60000
+    .venv/Scripts/python.exe scripts/gate_calibration.py --phase event \
+        --event-symbols "USTEC D1" --out data/reports/gates/   # T66/D35
+
+事件模式对照臂（--phase event，蓝图 v4 §6.4）：评估单位=事件（月末换月
+窗 / 伦敦定盘窗），主统计量=事件净收益均值的单侧检验。零假设=事件时间
+随机化（randomize_event_times：保持星期分布与月内三分位、matched 不重叠
+抽样池）；正对照=事件窗植入 δ（σ_w 倍数档位）。统计量分列：年块自助
+（event_test，与 0 比较——漂移资产上会把漂移当效应）、随机化参照
+（randomization_test，漂移稳健）、成本 ×1.5 否决（G2 成本放大的事件模式
+类比）与两者的联合口径。数据：已批准外部序列优先（fred USTEC D1 39.8
+年——月末事件天然适用），成本来自研究库缓存（与 T62 预筛同一份口径）。
+产物 event-power.json / event-power.md（不覆盖 gate-power.*）；与关卡 v3
+主检验的对接留 T65。
 
 负对照（测误报率）：两种零假设（T39/M4），**按卡的持仓周期选**（--null-
 hypothesis auto 缺省；both = 各跑一遍）：
@@ -846,6 +859,400 @@ def g5_power(setups, *, seeds, levels, cfg, bars_by_symbol, costs_by_symbol,
     }
 
 
+# ------------------------------------------------------- 事件模式对照（T66/D35）
+
+# 事件模式对照臂（蓝图 v4 §6.4）：评估单位=事件，主统计量=事件净收益均值
+# 的单侧检验。零假设=事件时间随机化（保持星期分布与月内位置、matched
+# 不重叠抽样池）；正对照=事件窗植入已知效应 δ（σ_w 倍数档位）。三个
+# 统计量分列：年块自助（event_test，与 0 比较）、随机化参照
+# （randomization_test，漂移稳健）、成本 ×1.5 否决（G2 成本放大的事件
+# 模式类比：×1.5 成本下净收益均值仍 > 0）。联合口径（主检验+成本否决）
+# 的误报/检出率都报——关卡 v3 事件模式主检验的选择规则留 T65。
+EVENT_DEFAULT_SYMBOLS = ("USTEC D1",)     # fred ext 39.8 年：现成的长序列
+EVENT_DELTA_LEVELS = (0.1, 0.25, 0.5, 1.0)   # δ 档位 = 每事件净效应 ÷ σ_w
+EVENT_POWER_N_GRID = (60, 120, 240, 480)     # 检验力曲线的事件数轴
+EVENT_ALPHA = 0.05
+
+
+class _ScaledCosts:
+    """成本模型 ×factor 包装（成本 ×1.5 否决臂；事件模式走
+    spread_p90/slippage/commission_per_lot/swap.rule 四个入口）。"""
+
+    def __init__(self, base, factor: float):
+        self._base, self._f = base, float(factor)
+
+    def spread_p90(self, symbol, hour_ny, *, price=None):
+        return self._base.spread_p90(symbol, hour_ny, price=price) * self._f
+
+    def slippage(self, symbol, hour_ny, *, price=None):
+        return self._base.slippage(symbol, hour_ny, price=price) * self._f
+
+    def commission_per_lot(self, symbol):
+        return self._base.commission_per_lot(symbol) * self._f
+
+    class _Swap:
+        def __init__(self, base_swap, factor):
+            self._base_swap, self._f = base_swap, factor
+
+        def rule(self, symbol):
+            r = self._base_swap.rule(symbol)
+            return dataclasses.replace(
+                r, long_per_day=r.long_per_day * self._f,
+                short_per_day=r.short_per_day * self._f)
+
+    @property
+    def swap(self):
+        base_swap = getattr(self._base, "swap", None)
+        return None if base_swap is None else self._Swap(base_swap, self._f)
+
+
+def load_event_bars(data_root, symbol: str, timeframe: str,
+                    *, ext_source: str | None = "fred",
+                    max_bars=None) -> tuple[pd.DataFrame, str]:
+    """事件臂 K 线：已批准外部序列（fred USTEC D1 39.8 年等）优先，缺则
+    研究库 bars（load_series 同源锁箱语义）。ext 读经 mt5data.ext 装载器
+    （manifest 完整性 fail-fast）并按 manifest.research_cutoff 防御性再截
+    （导出侧已 assert，读取侧不重复信任）。"""
+    from mt5data.ext.core import load_ext_series
+
+    if ext_source:
+        loaded = load_ext_series(str(Path(data_root) / "ext"), ext_source,
+                                 symbol, timeframe.upper())
+        if loaded is not None:
+            df, manifest = loaded
+            cutoff = manifest.get("research_cutoff")
+            if cutoff:
+                df = df[df["time"] < pd.Timestamp(cutoff)] \
+                    .reset_index(drop=True)
+            if max_bars and len(df) > int(max_bars):
+                df = df.iloc[-int(max_bars):].reset_index(drop=True)
+            return df, f"ext/{ext_source}"
+    from run_backtest import load_series
+    bars = load_series(str(data_root), symbol, timeframe.upper(), None)
+    if max_bars and len(bars) > int(max_bars):
+        bars = bars.iloc[-int(max_bars):].reset_index(drop=True)
+    return bars, "research"
+
+
+def event_mode_calibration(bars, *, symbol: str, timeframe: str, costs,
+                           contract_size: float, kind: str = "month_end",
+                           side_fn=None, last_n: int = 1, first_n: int = 3,
+                           neg_seeds: int = 20, levels=EVENT_DELTA_LEVELS,
+                           pos_seeds: int = 20, test_sims: int = 1000,
+                           neg_rand_sims: int = 199, pos_rand_sims: int = 99,
+                           alpha: float = EVENT_ALPHA,
+                           power_n_grid=EVENT_POWER_N_GRID,
+                           log=None) -> dict:
+    """事件模式正负对照（T66/D35 标定素材）。
+
+    - 负对照（误报率）：真实数据不植入 × randomize_event_times × 20 种子
+      → 三个统计量各自的拒绝率（年块自助 / 随机化参照 / ×1.5 成本否决
+      下的联合）；
+    - 正对照（检出率）：plant_event_effect 植入 δ 档位（σ_w 倍数）× 20
+      种子 → 同三个统计量的检出率 + 植入精度（净收益均值实移 vs δ）；
+    - 检验力曲线：事件数 × δ → 经验检出率（前 n 个等距事件子样本）+
+      解析 event_power 对照；
+    - 样本量规则：required_events 按 σ_w 与各 δ_net 档位折算。
+    """
+    from mt5quant.validation import events as vevents
+
+    if side_fn is None:
+        side_fn = lambda event: "long"  # noqa: E731
+    times = pd.to_datetime(bars["time"])
+    days = pd.DatetimeIndex(sorted(set(times.dt.normalize())))
+    if kind == "month_end":
+        events = vevents.month_end_events(days, last_n=last_n, first_n=first_n)
+        hold_bars = None
+    elif kind == "london_fix":
+        anchors = vevents.month_end_events(days, last_n=1, first_n=1)
+        month_end_days = pd.DatetimeIndex([e.entry_time for e in anchors])
+        events = vevents.london_fix_events(month_end_days)
+        hold_bars = 1
+    else:
+        raise ValueError(f"未知事件类别 {kind!r}（month_end | london_fix）")
+    if len(events) < 24:
+        raise ValueError(f"{symbol} {timeframe} 事件数 {len(events)} < 24"
+                         "——事件模式检验无从标定")
+    hold_bars = hold_bars if hold_bars is not None else max(
+        1, int(np.median([
+            days.get_loc(e.exit_time.normalize())
+            - days.get_loc(e.entry_time.normalize()) for e in events])))
+    sigma_w = vevents.window_volatility(bars, hold_bars)
+
+    def _returns(data, evs, cost_model):
+        return vevents.event_returns(data, evs, side_fn=side_fn,
+                                     costs=cost_model, symbol=symbol,
+                                     contract_size=contract_size)
+
+    costs_x15 = _ScaledCosts(costs, 1.5)
+    raw = _returns(bars, events, costs)
+    cost_mean = float(pd.to_numeric(raw["cost"]).mean())
+    seed_list = list(range(neg_seeds))
+
+    # 真实事件时间上的观测（诊断，不是对照臂：真实数据可能真有效应——
+    # 随机化检验拒绝=检出真实月末效应，如实单列供 C001 材料）
+    obs_boot = vevents.event_test(raw, sims=test_sims, seed=0)
+    obs_rand = vevents.randomization_test(
+        bars, events, side_fn=side_fn, costs=costs, symbol=symbol,
+        trading_days=days, sims=neg_rand_sims, seed=90_000,
+        contract_size=contract_size)
+    observed = {
+        "net_mean": float(pd.to_numeric(raw["net"]).mean()),
+        "gross_mean": float(pd.to_numeric(raw["gross"]).mean()),
+        "boot_p": obs_boot["p_value"], "rand_p": obs_rand["p_value"],
+        "note": ("真实事件时间的观测诊断（非对照臂）：随机化检验拒绝"
+                 "意味着真实数据在事件窗存在系统性收益——真实效应的检出，"
+                 "不是误报；候选论证（C001）用发表后证据，不取本观测当预期"),
+    }
+
+    # ---- 负对照：零假设 = 事件时间随机化（matched 不重叠抽样池）。
+    # 观测事件本身也在随机化时刻上——真实数据里存在真实效应时，在真实
+    # 事件时间上观测会**正确拒绝**（那不是误报）；误报率的定义是"零假设
+    # 下的拒绝率"，观测与零分布都取随机化时刻才是可交换的。
+    negative_runs = []
+    for seed in seed_list:
+        t0 = time.monotonic()
+        rand = vevents.randomize_event_times(events, days, seed=seed)
+        rets = _returns(bars, rand, costs)
+        boot = vevents.event_test(rets, sims=test_sims, seed=seed)
+        rets15 = _returns(bars, rand, costs_x15)
+        mean15 = float(pd.to_numeric(rets15["net"]).mean())
+        rat = vevents.randomization_test(
+            bars, rand, side_fn=side_fn, costs=costs, symbol=symbol,
+            trading_days=days, sims=neg_rand_sims, seed=10_000 + seed,
+            contract_size=contract_size)
+        negative_runs.append({
+            "seed": seed,
+            "boot_p": boot["p_value"], "boot_mean": boot["mean"],
+            "rand_p": rat["p_value"], "rand_null_mean": rat["null_mean"],
+            "x15_mean": mean15,
+            "reject_boot": bool(boot["p_value"] < alpha),
+            "reject_rand": bool(rat["p_value"] < alpha),
+            "reject_joint": bool(boot["p_value"] < alpha and mean15 > 0.0),
+            "reject_joint_rand": bool(rat["p_value"] < alpha and mean15 > 0.0),
+        })
+        if log:
+            log(f"[event/neg] {symbol} {timeframe} seed={seed} "
+                f"boot_p={boot['p_value']:.4f} rand_p={rat['p_value']:.4f} "
+                f"x15_mean={mean15:.5f} ({time.monotonic() - t0:.1f}s)")
+
+    # ---- 正对照：植入 δ 档位（σ_w 倍数）× 种子。植入在**随机化基线事件**
+    # 上（matched 零基线）：真实数据在真实月末窗存在系统性收益（观测诊断
+    # 单列）——在真实事件上植入会把检出率变成"真实效应+δ"的检出，归因
+    # 不清；基线随机化后窗上只剩 δ，检出率才对应档位本身。
+    positive_runs = []
+    for level in levels:
+        delta = float(level) * sigma_w
+        for seed in range(pos_seeds):
+            t0 = time.monotonic()
+            base = vevents.randomize_event_times(events, days,
+                                                 seed=30_000 + seed)
+            planted = vevents.plant_event_effect(bars, base, delta,
+                                                 side_fn=side_fn)
+            rets = _returns(planted, base, costs)
+            boot = vevents.event_test(rets, sims=test_sims, seed=seed)
+            rets15 = _returns(planted, base, costs_x15)
+            mean15 = float(pd.to_numeric(rets15["net"]).mean())
+            rat = vevents.randomization_test(
+                planted, base, side_fn=side_fn, costs=costs, symbol=symbol,
+                trading_days=days, sims=pos_rand_sims, seed=20_000 + seed,
+                contract_size=contract_size)
+            positive_runs.append({
+                "level": float(level), "delta": delta, "seed": seed,
+                "boot_p": boot["p_value"], "boot_mean": boot["mean"],
+                "rand_p": rat["p_value"],
+                "x15_mean": mean15,
+                "reject_boot": bool(boot["p_value"] < alpha),
+                "reject_rand": bool(rat["p_value"] < alpha),
+                "reject_joint": bool(boot["p_value"] < alpha and mean15 > 0.0),
+                "reject_joint_rand": bool(rat["p_value"] < alpha
+                                          and mean15 > 0.0),
+            })
+            if log:
+                log(f"[event/pos] {symbol} {timeframe} level={level} "
+                    f"seed={seed} boot_p={boot['p_value']:.4f} "
+                    f"rand_p={rat['p_value']:.4f} "
+                    f"({time.monotonic() - t0:.1f}s)")
+
+    # ---- 检验力曲线：事件数 × δ → 经验检出率 + 解析对照。基线同样取
+    # 随机化事件（零基线，检出归因于 δ；真实月末窗的系统性收益在观测
+    # 诊断里单列，不混进曲线）
+    power_runs = []
+    n_total = len(events)
+    n_grid = [n for n in power_n_grid if n < n_total] + [n_total]
+    for n in sorted(set(n_grid)):
+        stride = max(1, n_total // int(n))
+        subset = events[::stride][:int(n)]
+        for level in levels:
+            delta = float(level) * sigma_w
+            hits = 0
+            for seed in range(pos_seeds):
+                base = vevents.randomize_event_times(subset, days,
+                                                     seed=40_000 + seed)
+                planted = vevents.plant_event_effect(bars, base, delta,
+                                                     side_fn=side_fn)
+                rets = _returns(planted, base, costs)
+                hits += int(vevents.event_test(
+                    rets, sims=test_sims, seed=seed)["p_value"] < alpha)
+            empirical = hits / float(pos_seeds)
+            net_delta = delta - cost_mean
+            analytic = (vevents.event_power(net_delta, sigma_w, len(subset),
+                                            alpha=alpha)
+                        if net_delta > 0.0 else 0.0)
+            power_runs.append({
+                "n_events": len(subset), "level": float(level),
+                "delta": delta, "net_delta": net_delta,
+                "empirical_power": empirical, "analytic_power": float(analytic),
+                "seeds": int(pos_seeds),
+            })
+            if log:
+                log(f"[event/power] n={len(subset)} level={level} "
+                    f"empirical={empirical:.2f} analytic={analytic:.3f}")
+
+    # ---- 样本量规则（折算后净效应下检验力 ≥50% 所需事件数）
+    def _required(net: float, power: float):
+        return (vevents.required_events(net, sigma_w, alpha=alpha,
+                                        power=power) if net > 0.0 else None)
+
+    sample_size = {
+        "sigma_window": float(sigma_w), "cost_mean": cost_mean,
+        "hold_bars": int(hold_bars), "n_events_available": n_total,
+        "rows": [{
+            "level": float(level),
+            "delta_gross": float(level) * sigma_w,
+            "delta_net": float(level) * sigma_w - cost_mean,
+            "required_events_power50": _required(
+                float(level) * sigma_w - cost_mean, 0.5),
+            "required_events_power80": _required(
+                float(level) * sigma_w - cost_mean, 0.8),
+        } for level in levels],
+        "method": ("闭式 n=(z_α+z_p)²·(1+SR²/2)/SR²（Lo 2002 事件口径，"
+                   "SR=每事件净效应/σ_w；z 取 mt5quant.research.power 同一"
+                   "约定）；经验曲线见 power_runs（事件数×δ→检出率）"),
+    }
+
+    def _rate(rows, key):
+        return float(np.mean([bool(r[key]) for r in rows])) if rows else 0.0
+
+    detection = {}
+    for level in levels:
+        bucket = [r for r in positive_runs if r["level"] == float(level)]
+        detection[str(level)] = {key: _rate(bucket, key) for key in
+                                 ("reject_boot", "reject_rand",
+                                  "reject_joint", "reject_joint_rand")}
+    return {
+        "symbol": symbol, "timeframe": timeframe, "kind": kind,
+        "n_events": n_total, "first": str(days[0].date()),
+        "last": str(days[-1].date()),
+        "sigma_window": float(sigma_w), "cost_mean": cost_mean,
+        "hold_bars": int(hold_bars),
+        "levels": [float(x) for x in levels],
+        "alpha": float(alpha), "test_sims": int(test_sims),
+        "neg_rand_sims": int(neg_rand_sims), "pos_rand_sims": int(pos_rand_sims),
+        "negative_runs": negative_runs,
+        "false_positive_rates": {key: _rate(negative_runs, key) for key in
+                                 ("reject_boot", "reject_rand",
+                                  "reject_joint", "reject_joint_rand")},
+        "observed_diagnostic": observed,
+        "positive_runs": positive_runs, "detection_rates": detection,
+        "power_runs": power_runs, "sample_size_rule": sample_size,
+        "cost_model_note": ("点差来回全幅一次（入/出场小时较不利侧）/"
+                            "滑点双边/佣金每手来回/隔夜更不利侧×实际计费夜"
+                            "——与 T62 预筛同一份口径（mt5quant.validation."
+                            "events docstring）"),
+    }
+
+
+def render_event_report(results: dict) -> str:
+    """事件模式对照（T66/D35）的 Markdown 汇总——D35 标定报告的素材。"""
+    meta = results.get("meta", {})
+    fmt_pct = lambda v: f"{float(v) * 100:.0f}%"  # noqa: E731
+    setups = results.get("setups", [])
+    setup_desc = "; ".join(
+        f"{s['symbol']} {s['timeframe']}（{s.get('bars_source', '?')}，"
+        f"{s['first']}..{s['last']}，{s['n_events']} 事件）" for s in setups)
+    lines = ["# 事件模式对照实验（event-power，T66/D35）", "",
+             f"- 序列：{setup_desc or '?'}",
+             f"- 种子：负对照 {meta.get('seeds', '?')}、正对照 "
+             f"{meta.get('seeds', '?')}；显著性 α={meta.get('alpha', '?')}"
+             f"（单侧）；自助 {meta.get('test_sims', '?')} 次",
+             f"- 生成：{meta.get('generated_utc', '?')}（gate_calibration.py "
+             "--phase event）", ""]
+    for block in results.get("arms", []):
+        key = f"{block['symbol']} {block['timeframe']} {block['kind']}"
+        obs = block.get("observed_diagnostic") or {}
+        lines += [f"## {key}", "",
+                  f"σ_w={block['sigma_window']:.5f}（{block['hold_bars']} 根/"
+                  f"事件窗）、均值成本={block['cost_mean']:.5f}"
+                  f"（相对价格；与 T62 预筛同口径）", ""]
+        if obs:
+            lines += [f"真实事件时间观测（诊断，非对照臂）：净收益均值 "
+                      f"{obs.get('net_mean', float('nan')):.5f}（毛 "
+                      f"{obs.get('gross_mean', float('nan')):.5f}）、"
+                      f"自助 p={obs.get('boot_p', float('nan')):.4f}、"
+                      f"随机化 p={obs.get('rand_p', float('nan')):.4f}——"
+                      "随机化检验拒绝=真实数据在事件窗存在系统性收益（真实"
+                      "效应检出，不是误报）。", ""]
+        lines += ["### 负对照误报率（零假设=事件时间随机化，观测也取随机"
+                  "化时刻，20 种子）", "",
+                  "| 统计量 | 误报率 |", "| --- | --- |"]
+        for name, k in (("年块自助均值>0（event_test）", "reject_boot"),
+                        ("随机化参照（randomization_test）", "reject_rand"),
+                        ("联合：自助 + 成本×1.5 净均值>0", "reject_joint"),
+                        ("联合：随机化 + 成本×1.5 净均值>0",
+                         "reject_joint_rand")):
+            lines.append(f"| {name} | {fmt_pct(block['false_positive_rates'][k])} |")
+        lines += ["", "### 正对照检出率（植入 δ = level×σ_w 于随机化基线事件，"
+                      "20 种子——真实月末窗的系统性收益不混入，检出归因 δ）",
+                  "",
+                  "| δ/σ_w | 自助 | 随机化 | 联合(自助+×1.5) | 联合(随机化+×1.5) |",
+                  "| --- | --- | --- | --- | --- |"]
+        for level in block["levels"]:
+            d = block["detection_rates"][str(level)]
+            lines.append(
+                f"| {level:g} | {fmt_pct(d['reject_boot'])} | "
+                f"{fmt_pct(d['reject_rand'])} | {fmt_pct(d['reject_joint'])} | "
+                f"{fmt_pct(d['reject_joint_rand'])} |")
+        lines += ["", "### 检验力曲线（事件数 × δ → 检出率；随机化基线事件，"
+                      "经验 20 种子 vs 解析）", "",
+                  "| 事件数 | δ/σ_w | 经验检验力 | 解析（Lo 事件口径） |",
+                  "| --- | --- | --- | --- |"]
+        for row in block["power_runs"]:
+            lines.append(
+                f"| {row['n_events']} | {row['level']:g} | "
+                f"{fmt_pct(row['empirical_power'])} | "
+                f"{fmt_pct(row['analytic_power'])} |")
+        ss = block["sample_size_rule"]
+        lines += ["", f"### 样本量规则（检验力 ≥50%/≥80% 所需事件数；"
+                      f"σ_w={ss['sigma_window']:.5f}、均值成本="
+                      f"{ss['cost_mean']:.5f}）", "",
+                  "| δ/σ_w | 毛效应 | 净效应（−成本） | n(≥50%) | n(≥80%) |",
+                  "| --- | --- | --- | --- | --- |"]
+        for row in ss["rows"]:
+            n50 = row["required_events_power50"]
+            n80 = row["required_events_power80"]
+            lines.append(
+                f"| {row['level']:g} | {row['delta_gross']:.5f} | "
+                f"{row['delta_net']:.5f} | {n50 if n50 else '—'} | "
+                f"{n80 if n80 else '—'} |")
+        lines += [f"\n可用事件数 {ss['n_events_available']}（{ss['method']}）", ""]
+    lines += ["## 口径备注", "",
+              "- 事件净收益的成本口径与 T62 预筛同一份语义（见 "
+              "mt5quant.validation.events docstring）；×1.5 否决是 G2 成本"
+              "放大的事件模式类比（×1.5 成本下净收益均值仍 > 0）。",
+              "- 负对照零假设 = 事件时间随机化（matched 不重叠抽样池，保持"
+              "星期分布与月内三分位），**观测也取随机化时刻**——真实数据"
+              "在真实月末窗存在系统性收益（见观测诊断），在真实事件上观测"
+              "的拒绝是正确检出而非误报；随机化参照检验对资产漂移稳健。",
+              "- 正对照/检验力曲线的 δ 植入在**随机化基线事件**上（净效应 = "
+              "δ − 均值成本）——真实月末效应不混入，检出率归因档位本身。"
+              "年块自助百分位检验的经验水平随年块数收敛（合成 iid 实测 "
+              "6 块约 9.5%、40 块约 5.05%，有效临界分布 ≈ t_{B−1}），长历史"
+              "才接近名义。与关卡 v3 主检验的对接（事件模式主统计量选择、"
+              "联合否决结构）留 T65。", ""]
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- 决策规则
 
 # 结构性通过检查：检验代码卫生 / 离群 / 适用性而非"有没有优势"，负对照上
@@ -1174,8 +1581,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="gate_calibration",
         description="T22+T39 关卡正负对照实验：负对照误报率（两种零假设）"
-                    "+ 正对照检出率 + G5 判别力 + 合并评估变体 → JSON+MD")
-    ap.add_argument("--phase", choices=("negative", "positive", "both"),
+                    "+ 正对照检出率 + G5 判别力 + 合并评估变体 → JSON+MD；"
+                    "--phase event 为 T66/D35 事件模式对照臂（event-power）")
+    ap.add_argument("--phase", choices=("negative", "positive", "both",
+                                        "event"),
                     default="both")
     ap.add_argument("--seeds-from", type=int, default=0,
                     help="种子起点（分片并行：各分片用不相交种子段，结果经 "
@@ -1214,7 +1623,28 @@ def build_parser() -> argparse.ArgumentParser:
                     help="实验用 G2 随机入场次数（正式关卡 200 不变）")
     ap.add_argument("--quick", action="store_true",
                     help="迭代模式：2 种子、只跑 1.0 档、随机入场 3 次、"
-                         "最多 20000 根、G5 自助 200 次")
+                    "最多 20000 根、G5 自助 200 次")
+    # ---- 事件模式对照臂（T66/D35，--phase event）
+    ap.add_argument("--event-symbols", default=",".join(EVENT_DEFAULT_SYMBOLS),
+                    help="事件臂 SYMBOL TF 列表（缺省 USTEC D1——fred ext "
+                         "39.8 年现成长序列；格式 'USTEC D1,EURUSD H1'）")
+    ap.add_argument("--event-kind", choices=("month_end", "london_fix"),
+                    default="month_end",
+                    help="事件机制：月末换月窗（D1）或伦敦定盘窗（H1，月末"
+                         "交易日 16:00 London 定盘前 lead 60 分钟）")
+    ap.add_argument("--event-ext-source", default="fred",
+                    help="已批准外部序列来源（fred/cdd；空串=只用研究库 "
+                         "bars）——ext 经 manifest fail-fast 装载")
+    ap.add_argument("--event-levels",
+                    default=",".join(str(v) for v in EVENT_DELTA_LEVELS),
+                    help="正对照 δ 档位（每事件毛效应 ÷ σ_w 的倍数）")
+    ap.add_argument("--event-seeds", type=int, default=DEFAULT_SEEDS,
+                    help="事件臂负/正对照各自的种子数（缺省 20）")
+    ap.add_argument("--event-test-sims", type=int, default=1000,
+                    help="年块自助次数（event_test）")
+    ap.add_argument("--event-rand-sims", type=int, default=199,
+                    help="随机化参照检验的随机化次数（正对照减半至 "
+                         "ceil/2——检出率粒度 20 种子已够）")
     return ap
 
 
@@ -1229,8 +1659,96 @@ def nulls_for(mode: str, baseline_default: str) -> list[str]:
     raise ValueError(f"未知零假设模式 {mode!r}")
 
 
+def run_event_phase(args, log) -> dict:
+    """--phase event（T66/D35）：事件模式对照臂——独立装配（ext/研究库
+    K 线 + 研究库成本 + specs 合约大小），产物 event-power.json/md。"""
+    from run_backtest import SESSIONS_PATH, build_costs, classify_store, \
+        resolve_contract_size, sessions_sha256
+
+    levels = [float(x) for x in str(args.event_levels).split(",") if x.strip()]
+    seeds = int(args.event_seeds)
+    test_sims, rand_sims = int(args.event_test_sims), int(args.event_rand_sims)
+    power_grid = list(EVENT_POWER_N_GRID)
+    if args.quick:
+        seeds, levels, test_sims = 2, [max(levels)], 200
+        rand_sims, power_grid = 49, [60]
+    keys = []
+    for item in str(args.event_symbols).split(","):
+        parts = item.split()
+        if len(parts) == 2:
+            keys.append((parts[0].upper(), parts[1].upper()))
+        elif parts:
+            raise SystemExit(f"--event-symbols 条目 {item!r} 须形如 'USTEC D1'")
+    research_store = classify_store(str(args.data_root)) == "research"
+    sess_sha = sessions_sha256(str(SESSIONS_PATH))
+    arms: list[dict] = []
+    setups: list[dict] = []
+    for symbol, timeframe in keys:
+        t0 = time.monotonic()
+        bars, source = load_event_bars(args.data_root, symbol, timeframe,
+                                       ext_source=args.event_ext_source or None,
+                                       max_bars=args.max_bars)
+        costs, cost_version = build_costs(
+            str(args.data_root), symbol, 0.1, 0.0, sessions_sha=sess_sha,
+            research_store=research_store)
+        contract_size = resolve_contract_size(str(args.data_root), symbol, None)
+        log(f"[event] {symbol} {timeframe}：{len(bars)} 根（{source}），"
+            f"成本 {cost_version}，合约 {contract_size} "
+            f"({time.monotonic() - t0:.1f}s)")
+        arm = event_mode_calibration(
+            bars, symbol=symbol, timeframe=timeframe, costs=costs,
+            contract_size=contract_size, kind=args.event_kind,
+            neg_seeds=seeds, levels=levels, pos_seeds=seeds,
+            test_sims=test_sims, neg_rand_sims=rand_sims,
+            pos_rand_sims=max(19, rand_sims // 2), power_n_grid=power_grid,
+            log=log)
+        arm["bars_source"] = source
+        arm["cost_version"] = str(cost_version)
+        arms.append(arm)
+        setups.append({"symbol": symbol, "timeframe": timeframe,
+                       "kind": arm["kind"], "bars_source": source,
+                       "n_events": arm["n_events"], "first": arm["first"],
+                       "last": arm["last"]})
+    fingerprint = _run_fingerprint({}, vgate.load_gates()[1])
+    for arm in arms:
+        arm["fingerprint_inputs"] = {
+            "bars_source": arm.pop("bars_source"),
+            "cost_version": arm.pop("cost_version"),
+        }
+    return {
+        "meta": {
+            "phase": "event", "seeds": seeds, "levels": levels,
+            "alpha": EVENT_ALPHA, "test_sims": test_sims,
+            "rand_sims": rand_sims, "kind": args.event_kind,
+            "ext_source": args.event_ext_source or None,
+            "data_root": str(args.data_root), "max_bars": args.max_bars,
+            "fingerprint": fingerprint,
+            "generated_utc": datetime.now(timezone.utc).isoformat(),
+            "design": ("负对照=事件时间随机化（matched 不重叠抽样池，保持"
+                       "星期分布与月内三分位）；正对照=事件窗植入 δ（σ_w "
+                       "倍数）；统计量分列年块自助/随机化参照/成本×1.5 联合"),
+        },
+        "setups": setups, "arms": arms,
+    }
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    log = lambda msg: print(msg, flush=True)      # noqa: E731
+
+    if args.phase == "event":          # T66/D35 事件模式对照臂（独立装配）
+        results = run_event_phase(args, log)
+        out_dir = Path(args.out)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        json_path = out_dir / "event-power.json"
+        md_path = out_dir / "event-power.md"
+        json_path.write_text(
+            json.dumps(results, ensure_ascii=False, indent=2,
+                       default=_json_default), encoding="utf-8")
+        md_path.write_text(render_event_report(results), encoding="utf-8")
+        print(f"— 产出：{json_path} 与 {md_path}", flush=True)
+        return 0
+
     seeds = list(range(args.seeds_from, args.seeds_from + args.seeds))
     levels = [float(x) for x in str(args.levels).split(",") if x.strip()]
     g2_sims = args.g2_random_sims
@@ -1246,7 +1764,6 @@ def main(argv=None) -> int:
     cfg = dataclasses.replace(cfg, random_entry_sims=int(g2_sims))
     g5_cfg = (dataclasses.replace(cfg, lockbox_bootstrap_sims=int(g5_sims))
               if g5_sims else cfg)
-    log = lambda msg: print(msg, flush=True)      # noqa: E731
 
     def _suite_inputs(entry: dict) -> dict:
         bars_by_symbol, costs_by_symbol = {}, {}
