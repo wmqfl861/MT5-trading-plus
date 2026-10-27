@@ -1247,3 +1247,45 @@ def test_gate_g4_reports_three_trial_counts(tmp_path, monkeypatch, capsys):
     assert "G4 试验计数" in out                       # 报告同列三种 N
 
 
+def test_gate_g4_round_n_when_card_in_round(tmp_path, monkeypatch, capsys):
+    """T64/D33（审核次要 3）直接测试：卡带轮次时 G4 的 n_trials_round 非
+    None（= 本轮去重试验数，基准运行已计入），报告"轮次 N"行同列。"""
+    from datetime import datetime, timezone
+
+    mod = load_bt()
+    root = make_data_root(tmp_path)
+    body = CARD_BODY.replace(
+        "[rules]", 'round = "R1"\ncandidate = "C001"\n\n[rules]')
+    cards_dir = write_card(tmp_path, body)
+    ledger_path = tmp_path / "ledger.sqlite"
+    with Ledger(ledger_path) as led:          # 直接铺轮次上下文（绕过 CLI
+        led.record_candidate_check(           # 前置：候选最新 decision=pass）
+            "C001", decision="pass", result={"candidate_id": "C001"})
+        led.record_round_open(
+            round_id="R1", candidates=("C001",), trial_budget=10,
+            lockbox_uses_max=1, dsr_trial_scope="family",
+            advance_rule="按 advance_rule", close_rule="按 close_rule",
+            approved_by="user", evaluation={},
+            toml_sha256="0" * 64, git_commit="0" * 40)
+    patch_card_git(monkeypatch, mod,
+                   committed=datetime(2026, 10, 27, tzinfo=timezone.utc))
+    rc = mod.main(
+        ["gate", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--volume-lots", "0.01",
+         "--gates", "G4", "--params", "{}"])
+    out = capsys.readouterr().out
+    assert "G4" in out
+    with Ledger(ledger_path) as led:
+        row = led.conn.execute(
+            "SELECT details_json FROM gates WHERE gate='G4'").fetchone()
+        rid = led.conn.execute(
+            "SELECT round_id FROM runs ORDER BY run_id DESC LIMIT 1"
+        ).fetchone()["round_id"]
+    assert rid == "R1"                        # 基准运行确实落在轮次内
+    details = json.loads(row["details_json"])
+    assert details["n_trials_round"] == 1     # 轮次 N = 本轮去重试验数
+    assert "轮次 N：1" in out                 # 报告行同列（非 None 分支）
+
+

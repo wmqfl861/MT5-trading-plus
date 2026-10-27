@@ -927,12 +927,12 @@ def cmd_candidate_check(args) -> int:
         except Exception as e:
             print(f"✗ 成本模型装配失败：{type(e).__name__}: {e}")
             return 1
-        # T80/G3：主段 + 已批准外部序列（fred/cdd，D36 白名单）逐段合并；
-        # 未批准来源（histdata）在场不计
+        # T80/G3：主段 + 已批准外部序列（fred/cdd，D36 白名单）逐段列出、
+        # 合并年数按**区间并集**（重叠不双计，审核修正）；未批准来源
+        # （histdata）在场不计
         segs = cand.coverage_segments(data_root, candidate.symbols,
                                       [candidate.holding])
-        years = {k: float(sum(s["years"] for s in v if s.get("counted")))
-                 for k, v in segs.items()}
+        years = {k: cand.merged_coverage_years(v) for k, v in segs.items()}
         active = _active_mechanism_classes(Path(candidate.path).parent,
                                            candidate.id)
     result = cand.precheck(candidate, data_root=data_root, cost_model=costs,

@@ -53,8 +53,8 @@ __all__ = [
     "CandidateError", "Candidate", "Literature", "Declared",
     "PrecheckResult", "MECHANISM_CLASSES", "RESEARCH_STATUSES",
     "BOOKKEEPING_STATUSES", "PRECHECK_DECISIONS", "load_candidate",
-    "coverage_years", "coverage_segments", "unconditional_volatility",
-    "precheck",
+    "coverage_years", "coverage_segments", "merged_coverage_years",
+    "unconditional_volatility", "precheck",
 ]
 
 # 附录 C：机制类别七分类（蓝图 v4 §6.2 预筛条件 5）
@@ -456,17 +456,41 @@ def coverage_segments(data_root, symbols, timeframes) -> dict[str, list[dict]]:
     return out
 
 
+def merged_coverage_years(segments: list[dict]) -> float:
+    """计入段的**日历区间并集**年数（T80/G3 审核修正：重叠不双计）。
+
+    独立审核发现：直接把各段年数相加会在段重叠时虚增覆盖（真实库
+    USTEC：fred 39.8 年完全包住 mt5 4.3 年 → 相加 44.1 年、并集 39.8
+    年；BTCUSD 部分重叠虚增 40%，足以把 waiting_data 翻成 pass）。按
+    计划 T80"按序列取最长连续覆盖"的意图，计入段按 [first, last] 做区间
+    并集：相接/重叠的段合成一段（取 min(first)..max(last) 的连续跨度），
+    不相接的分段各自计入、跨度累加——缺口段自然被排除在并集之外。
+    counted=False 的段（未批准来源）不参与。
+    """
+    intervals = sorted(
+        (pd.Timestamp(s["first"]), pd.Timestamp(s["last"]))
+        for s in segments if s.get("counted"))
+    merged: list[list[pd.Timestamp]] = []
+    for a, b in intervals:
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return float(sum((b - a).total_seconds() for a, b in merged)
+                 / (_DAYS_PER_YEAR * 86400.0))
+
+
 def coverage_years(data_root, symbols, timeframes) -> dict[str, float]:
     """研究库按 品种×周期 的实际覆盖年数（T80/G3：主段 + 已批准外部序列
-    各段年数之和；未批准来源不计——coverage_segments 逐段口径）。
+    的**日历区间并集**——重叠不双计；未批准来源不计；coverage_segments
+    逐段口径、merged_coverage_years 合并口径）。
 
     键为 "SYMBOL/TF"（precheck 的 research_years 口径）；与实测密度年化
     配套（report.observed_bars_per_year 同一思想）：年化夏普的分母年数
     取跨度，检验力（Lo 近似）才与台账里的夏普同口径。
     """
-    return {key: float(sum(s["years"] for s in segs if s.get("counted")))
-            for key, segs in coverage_segments(
-                data_root, symbols, timeframes).items()}
+    return {key: merged_coverage_years(segs) for key, segs in
+            coverage_segments(data_root, symbols, timeframes).items()}
 
 
 # ------------------------------------------------- 无条件收益波动（T80/G2）
@@ -724,9 +748,19 @@ def precheck(candidate: Candidate, *, data_root, cost_model,
             if years > 0.0 else None)}
     if research_coverage_segments is not None:
         # T80/G3：逐段列来源与年数（未批准来源 counted=False 如实列出）
+        # + 合并后总覆盖（区间并集，从逐段独立可复算）与口径注明
         checks["power"]["coverage_segments"] = {
             k: v for k, v in research_coverage_segments.items()
             if k in years_detail}
+        checks["power"]["coverage_merged_years"] = {
+            k: merged_coverage_years(v)
+            for k, v in research_coverage_segments.items()
+            if k in years_detail}
+        checks["power"]["coverage_merge_method"] = (
+            "计入段日历区间并集：相接/重叠的段合成连续跨度（min(first).."
+            "max(last)），不相接的分段各自计入——重叠不双计（T80/G3 审核"
+            "修正：相加会把完全包含/部分重叠的覆盖虚增，如 fred/USTEC "
+            "39.8 年包住 mt5 4.3 年 → 合并 39.8 而非 44.1）")
     if not power_ok:
         if missing:
             reasons.append(

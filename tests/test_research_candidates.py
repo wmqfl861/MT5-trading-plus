@@ -675,13 +675,14 @@ def _write_ext(root, source, symbol, tf, *, first, days):
 
 def test_coverage_years_merges_approved_ext_segments(tmp_path):
     """T80/G3 失败测试 2：批准 ext 序列（fred）计入研究年数、逐段列来源
-    与年数；未批准来源（histdata）在场也不计。"""
+    与年数；未批准来源（histdata）在场也不计。ext 段与主段**不相接**
+    （并集=分段相加，本用例）；重叠并集口径见下一个用例。"""
     root = make_data_root(tmp_path)
-    _write_ext(root, "fred", SYMBOL, "D1", first="2010-01-05", days=3650)
+    _write_ext(root, "fred", SYMBOL, "D1", first="2010-01-05", days=3500)
     _write_ext(root, "histdata", SYMBOL, "D1", first="1990-01-01", days=7300)
     key = f"{SYMBOL}/D1"
     cov = candidates.coverage_years(root, [SYMBOL], ["D1"])
-    ext_years = 3650 / 365.25
+    ext_years = 3499 / 365.25                 # 不相交接的 ext 段自身跨度
     assert cov[key] == pytest.approx(YEARS_D1 + ext_years, abs=0.05)
     segs = candidates.coverage_segments(root, [SYMBOL], ["D1"])
     by_src = {s["source"]: s for s in segs[key]}
@@ -704,14 +705,52 @@ def test_coverage_years_merges_approved_ext_segments(tmp_path):
         == ["mt5"]
 
 
+def test_coverage_years_unions_overlapping_segments(tmp_path):
+    """T80/G3 审核修正（Medium-High）失败测试：计入段做**日历区间并集**，
+    重叠不双计——直接相加会把完全包含/部分重叠的覆盖虚增（真实库
+    USTEC：fred 39.8 年完全包住 mt5 4.3 年 → 合并 39.8 而非 44.1；
+    BTCUSD 部分重叠虚增 40%，足以把 waiting_data 翻成 pass）。
+
+    - 场景 1：mt5 段完全落入 fred 段 → 合并年数 = fred 段年数；
+    - 场景 2：部分重叠 → 合并 = [min(first), max(last)] 的连续并集跨度。
+    """
+    key = f"{SYMBOL}/D1"
+    # 场景 1：fred 2015-01-01 起约 12 年（完全包住主段 ~2019-12..2026-01）
+    root = make_data_root(tmp_path)
+    _write_ext(root, "fred", SYMBOL, "D1", first="2015-01-01", days=4400)
+    segs = candidates.coverage_segments(root, [SYMBOL], ["D1"])
+    by_src = {s["source"]: s for s in segs[key]}
+    assert by_src["fred"]["counted"] and by_src["mt5"]["counted"]
+    # 主段确实完全落入 fred 段（夹具自检）
+    assert pd.Timestamp(by_src["fred"]["first"]) \
+        <= pd.Timestamp(by_src["mt5"]["first"])
+    assert pd.Timestamp(by_src["mt5"]["last"]) \
+        <= pd.Timestamp(by_src["fred"]["last"])
+    cov = candidates.coverage_years(root, [SYMBOL], ["D1"])
+    assert cov[key] == pytest.approx(by_src["fred"]["years"], abs=1e-9)
+    assert cov[key] < by_src["fred"]["years"] + by_src["mt5"]["years"] - 1.0
+    # 场景 2：fred 2010 年起约 12 年（止于 ~2022，与主段部分重叠）
+    root2 = make_data_root(tmp_path / "part")
+    _write_ext(root2, "fred", SYMBOL, "D1", first="2010-01-05", days=4383)
+    segs2 = candidates.coverage_segments(root2, [SYMBOL], ["D1"])
+    b2 = {s["source"]: s for s in segs2[key]}
+    union_span = ((pd.Timestamp(b2["mt5"]["last"])
+                   - pd.Timestamp(b2["fred"]["first"])).total_seconds()
+                  / 365.25 / 86400.0)
+    cov2 = candidates.coverage_years(root2, [SYMBOL], ["D1"])
+    assert cov2[key] == pytest.approx(union_span, abs=1e-9)
+    assert cov2[key] < b2["mt5"]["years"] + b2["fred"]["years"]  # 不双计
+
+
 def test_precheck_json_carries_coverage_segments(tmp_path):
-    """T80/G3：precheck JSON 的 power 检查逐段列出覆盖来源与年数
-    （研究年数=各段合计的同一来源），隐含夏普字段同在。"""
+    """T80/G3：precheck JSON 的 power 检查逐段列出覆盖来源与年数，另带
+    合并后总覆盖与合并口径说明（并集，重叠不双计）；隐含夏普字段同在。
+    本用例 ext 段与主段不相接（并集=分段相加）。"""
     root = make_volatile_data_root(tmp_path)
-    _write_ext(root, "fred", SYMBOL, "D1", first="2010-01-05", days=3650)
+    _write_ext(root, "fred", SYMBOL, "D1", first="2010-01-05", days=3500)
     segs = candidates.coverage_segments(root, [SYMBOL], ["D1"])
     years = {k: sum(s["years"] for s in v if s.get("counted"))
-             for k, v in segs.items()}
+             for k, v in segs.items()}       # 不相接 → 并集 = 分段相加
     c = load_candidate(write_candidate(tmp_path))
     res = precheck(c, data_root=root, cost_model=make_costs(),
                    research_years=years,
@@ -721,4 +760,8 @@ def test_precheck_json_carries_coverage_segments(tmp_path):
     srcs = {s["source"]: s["counted"]
             for s in pw["coverage_segments"][f"{SYMBOL}/D1"]}
     assert srcs == {"mt5": True, "fred": True}
+    # 合并后总覆盖（按并集口径从逐段重算，与 years 同一值）+ 口径注明
+    assert pw["coverage_merged_years"][f"{SYMBOL}/D1"] \
+        == pytest.approx(years[f"{SYMBOL}/D1"])
+    assert "并集" in pw["coverage_merge_method"]
     assert "implied_sharpe" in pw and "sigma_method" in pw
