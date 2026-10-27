@@ -445,6 +445,16 @@ trigger_delay_s = 5.0
     return str(cfg)
 
 
+def _gw_dummy_config(tmp_path) -> str:
+    """T60：dummy 网关配置（内容无关——from_config_file 已被替身接管）。
+    本机靠未跟踪的 gateway.json 免传参数，干净 CI/克隆上不传
+    --gateway-config 会 SystemExit"找不到网关配置"（仿
+    test_mt5live_integration.py:1402 既有模式）。"""
+    gw = tmp_path / "gw.json"
+    gw.write_text("{}", encoding="utf-8")
+    return str(gw)
+
+
 def _wire_fake_gateway(monkeypatch, mod, broker, now):
     """替身网关 + 冻结运行器时钟（复用 T34 集成测试的装配手法）。"""
     monkeypatch.setattr("mt5gw.MT5Gateway.from_config_file",
@@ -490,7 +500,8 @@ def test_gateway_reconnected_line_after_failure_recovery(tmp_path, monkeypatch,
 
     monkeypatch.setattr(mod.time, "sleep", sleep_or_exit)
     rc = mod.main(["--config", _runner_config(tmp_path), "--loop", "--dry-run",
-                   "--poll-interval", "0.1"])
+                   "--poll-interval", "0.1",
+                   "--gateway-config", _gw_dummy_config(tmp_path)])
     assert rc == 0
     assert calls["n"] == 2                         # 失败一次、成功一次
     out = capsys.readouterr().out
@@ -512,6 +523,7 @@ def test_gateway_reconnected_not_logged_without_failure(tmp_path, monkeypatch,
                     bars_from_df(grid_bars(boundary_open(now), last="up")))
     broker.quote_time = now
     _wire_fake_gateway(monkeypatch, mod, broker, now)
-    rc = mod.main(["--config", _runner_config(tmp_path), "--once", "--dry-run"])
+    rc = mod.main(["--config", _runner_config(tmp_path), "--once", "--dry-run",
+                   "--gateway-config", _gw_dummy_config(tmp_path)])
     assert rc == 0
     assert "gateway_reconnected" not in capsys.readouterr().out

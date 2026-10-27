@@ -219,8 +219,10 @@ def fuse_source() -> str:
 
 def _fuse_value_bytes() -> bytes:
     """here-string 的**值**（去掉 @' 后与 '@ 前各一个换行）的 UTF-8 字节
-    ——写临时 .py 文件时落盘的正是这些字节。"""
-    return fuse_source()[1:-1].encode("utf-8")
+    ——写临时 .py 文件时落盘的正是这些字节。T60：CRLF→LF 归一（幂等保险，
+    与 demo_run.ps1 赋值后归一互为镜像——read_text 通用换行本已不含 \r，
+    此处钉死口径，防后续改为按字节读取时回退）。"""
+    return fuse_source()[1:-1].replace("\r\n", "\n").encode("utf-8")
 
 
 @contextlib.contextmanager

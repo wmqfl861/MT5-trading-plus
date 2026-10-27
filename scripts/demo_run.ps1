@@ -515,12 +515,19 @@ except Exception as e:                   # GatewayError/连接失败 → fail-cl
     print(f"FAIL 网关预检未通过：{type(e).__name__}: {e}")
     sys.exit(1)
 '@
+        # T60：行尾归一（跨检出确定）。core.autocrlf=true 的全新克隆/CI 检出
+        # 为 CRLF 时，here-string 值保留 \r\n，后续字节拷贝路径（WriteAllText
+        # 写保险丝临时 .py 与 Invoke-PythonFile 写 $fuseCheckPy 临时 .py）会
+        # 原样落 CRLF，与测试侧（read_text 通用换行恒 LF）sha 不等——赋值后
+        # 立即归一为 LF（单一钉点，两条写盘路径全覆盖）。
+        $demoFusePy = $demoFusePy -replace "`r`n", "`n"
         $fuseCheckPy = @'
 import ast, hashlib, sys
 data = open(sys.argv[1], 'rb').read()
 ast.parse(data.decode('utf-8'))
 print('sha256=' + hashlib.sha256(data).hexdigest())
 '@
+        $fuseCheckPy = $fuseCheckPy -replace "`r`n", "`n"
         if ($SkipGatewayCheck) {
             # 只做保险丝源码语法/字节完整性检查（不连终端、不执行保险丝）
             Write-Host "== Demo 专项预检（-SkipGatewayCheck）：保险丝源码语法/字节检查，不连终端 =="
