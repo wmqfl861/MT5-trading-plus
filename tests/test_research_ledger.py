@@ -740,7 +740,8 @@ def test_forged_append_beyond_snapshot_detected(tmp_path):
                "data_last": None, "data_sha256": "a" * 64, "strategy_sha": "f" * 64,
                "engine_version": "e", "cost_model_version": "v",
                "gates_hash": "", "metrics_json": "{}",
-               "created_utc": "2026-10-01T00:00:00+00:00", "actor": "forger"}
+               "created_utc": "2026-10-01T00:00:00+00:00", "actor": "forger",
+               "round_id": None}          # T63：runs 内容列新增 round_id
     canon = json.dumps(content, sort_keys=True, ensure_ascii=False,
                        separators=(",", ":"))
     h = hashlib.sha256((canon + tail).encode("utf-8")).hexdigest()

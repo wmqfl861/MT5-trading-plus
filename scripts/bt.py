@@ -10,6 +10,19 @@
         --strategy mt5quant.strategies.library.buy_hold:BuyHold --gates G0,G1,G2,G3,G4
 
 约定：
+- 研究轮次预注册（T63/D32，铁律 16）：research/rounds/R#.toml（蓝图
+  附录 D：候选 ≤3、试验预算、锁箱用量、推进/结束规则、批准人、每候选
+  评估方式）**已提交且工作区干净**、候选全 screened_pass（台账
+  candidate_checks 最新 decision=pass）、lockbox_uses_max ≤ D16 剩余
+  预算（D16：本锁箱 3 次，写死常量待用户决策后可调）才可 bt round open
+  ——开启写台账 rounds 表（带哈希链，toml_sha256 绑定预注册内容）。
+  运行约束：screen/gate 只接受属于已开启轮次的卡（卡 round/candidate
+  字段对上台账轮次行且候选 screened_pass；轮次关闭后拒；台账一旦有
+  轮次，不带轮次字段的卡拒——轮次制之前的旧卡仅在 rounds 空的台账上
+  运行）；本轮去重试验数达 trial_budget 拒新试验；本轮 G5 次数达
+  lockbox_uses_max 拒（标定样品运行 actor=calibration 豁免——不进轮次
+  统计）。bt round close 生成 docs/research/round-R#-<日期>.md 骨架
+  （列全部运行含失败 + 按 advance_rule 的判定占位）并关闭轮次。
 - 候选预筛（T62/D31，铁律 17/18）：bt candidate check 读附录 C 候选登记
   → precheck 五条件（文献/持仓 ≥H1/事前成本倍数 ≥3/检验力 ≥50%/机制空缺）
   → 写 research/candidates/C###.precheck.json 并记入台账 candidate_checks
@@ -105,6 +118,7 @@ from mt5quant.backtest.report import (  # noqa: E402
 )
 from mt5quant.research import cards  # noqa: E402
 from mt5quant.research import candidates as cand  # noqa: E402
+from mt5quant.research import rounds as rnd  # noqa: E402
 from mt5quant.research.ledger import Ledger, LedgerTamperedError  # noqa: E402
 from mt5quant.validation import gates as vgate  # noqa: E402
 from mt5quant.validation import lookahead as vlook  # noqa: E402
@@ -260,6 +274,275 @@ def _check_card_lineage(card, source: str) -> str | None:
                 f"枚举 {sorted(_SELECTION_METRICS)} 内（附录 A v2；"
                 "bt gate --params auto 按该规则自动选参）")
     return None
+
+
+# ---------------------------------------------------------------- 轮次（T63）
+
+def _round_path(value: str, rounds_dir: Path) -> Path:
+    """--round 接受 id（R1）或轮次文件路径（.toml 结尾）。"""
+    if value.lower().endswith(".toml"):
+        return Path(value)
+    return rounds_dir / f"{value}.toml"
+
+
+def _round_context(ledger, card, *, actor: str, wanted_gates=()):
+    """T63/D32（铁律 16）：研究卡只能属于**已开启**轮次——运行约束的统一
+    入口（screen/gate 共用）。返回：
+
+    - dict：轮次上下文（round_id / trial_budget / lockbox_uses_max），
+      调用方把它随 record_run 落 runs.round_id 并执行预算约束；
+    - None：无轮次约束（actor=calibration 的标定样品运行——不进入研究
+      轮次统计，T61；或轮次制之前——卡不带 round 字段且台账 rounds 空，
+      runs.round_id 记 NULL）；
+    - False：拒绝（原因已打印，调用方退出 1，不产生任何 runs）。
+
+    与 T61 _enforce_candidate_status 协同：状态检查（withdrawn/specimen）
+    在前（无台账），轮次检查在后（需台账）——两者语义都保留：撤回卡
+    先被 T61 拒；轮次约束只在研究运行上生效。
+    """
+    if actor == "calibration":
+        return None                     # 标定样品：不进入研究轮次统计
+    if not card.round:
+        if ledger.rounds_any():
+            print(f"✗ 卡 {card.id} 未声明所属轮次（round/candidate 字段）"
+                  "——台账已有研究轮次，铁律 16：bt 拒绝运行不属于已提交"
+                  "轮次的卡；请在卡文件补 round/candidate 字段（该轮名单"
+                  "内候选）后提交再运行")
+            return False
+        return None                     # 轮次制之前：rounds 表为空
+    row = ledger.round(card.round)
+    if row is None:
+        print(f"✗ 卡 {card.id} 声明的轮次 {card.round} 未开启（rounds 表无"
+              f"此行）——先提交 research/rounds/{card.round}.toml 并跑 "
+              f"bt round open {card.round}（T63/D32：先定规则再开卡）")
+        return False
+    if row["status"] != "open":
+        print(f"✗ 轮次 {card.round} 已关闭（closed_utc={row['closed_utc']}）"
+              "——关闭后该轮不能再运行；后续试验须预注册新轮次"
+              "（research/rounds/R#.toml 提交后 bt round open）")
+        return False
+    candidates = json.loads(row["candidates_json"])
+    if card.candidate not in candidates:
+        print(f"✗ 卡 {card.id} 的候选 {card.candidate} 不在轮次 {card.round}"
+              f" 的候选名单 {candidates} 内（T63/D32：轮次预注册钉死候选"
+              "名单，名单外的卡不属于该轮）")
+        return False
+    if not rnd.candidate_screened_pass(ledger, card.candidate):
+        latest = ledger.candidate_checks(card.candidate)
+        what = (f"最新预筛结论为 {latest[-1]['decision']!r}"
+                if latest else "台账无预筛记录（candidate_checks 空）")
+        print(f"✗ 候选 {card.candidate} {what}——screened_pass（最新"
+              " decision=pass）是轮次内运行的持续前置（T62/D31+T63）")
+        return False
+    if "G5" in wanted_gates:
+        used = ledger.round_lockbox_uses(card.round)
+        if used >= int(row["lockbox_uses_max"]):
+            print(f"✗ 轮次 {card.round} 的 G5 次数已达上限（本轮 "
+                  f"{used}/{row['lockbox_uses_max']}，lockbox_uses_max；"
+                  "计数=该轮内跑过的卡的 lockbox_uses 行数）——拒绝运行")
+            return False
+    return {"round_id": card.round,
+            "trial_budget": int(row["trial_budget"]),
+            "lockbox_uses_max": int(row["lockbox_uses_max"])}
+
+
+def _round_budget_exceeded(ledger, ctx) -> bool:
+    """本轮累计去重试验数（round_n_dedup，七元组去重口径）已达
+    trial_budget → True（原因已打印；调用方退出 1，不产生任何 runs）。
+    保守口径：预算满后连同参重复运行一并拒绝——重复运行不增信息，
+    预算的目的是防在同轮反复挑选。"""
+    if ctx is None:
+        return False
+    used = ledger.round_n_dedup(ctx["round_id"])
+    if used >= ctx["trial_budget"]:
+        print(f"✗ 轮次 {ctx['round_id']} 的累计去重试验数已达预算上限"
+              f"（{used}/{ctx['trial_budget']}，trial_budget）——本轮不再"
+              "运行新试验（T63/D32：预算在预注册里钉死，用尽即结束；"
+              "下一轮须重新预注册）")
+        return True
+    return False
+
+
+def cmd_round_open(args) -> int:
+    """bt round open R#：前置条件全过 → 写台账 rounds 表（带哈希链）。
+
+    前置条件（T63/D32，铁律 16）：
+    - 轮次文件已提交且工作区干净（该文件无未提交改动）；
+    - 候选全部 screened_pass（台账 candidate_checks 最新 decision=pass）；
+    - lockbox_uses_max ≤ D16 剩余预算（D16：本锁箱 3 次，写死常量）。
+    """
+    path = _round_path(args.round, Path(args.rounds_dir))
+    try:
+        r = rnd.load_round(path)
+    except rnd.RoundError as e:
+        print(f"✗ {e}")
+        return 1
+    committed = cards.committed_at(path)
+    if committed is None:
+        print(f"✗ 轮次预注册 {path} 尚未提交到 git（铁律 16：先定规则再"
+              "开卡——预注册必须在看到任何结果之前提交）——先 git commit"
+              " 轮次文件，再 bt round open")
+        return 1
+    if not cards.worktree_clean(path):
+        print(f"✗ 轮次预注册 {path} 在工作区有未提交改动（git status "
+              "--porcelain 非空）——提交（或还原）后再开启；改预算/候选"
+              "须在开启前改完并提交，开启即绑定（toml_sha256 入台账）")
+        return 1
+    with Ledger(args.ledger) as ledger:
+        if ledger.round(r.id) is not None:
+            print(f"✗ 轮次 {r.id} 已开启过（rounds 表已有此行）——预注册"
+                  "是一次性动作，同 id 不得重开；后续轮次用新 R#")
+            return 1
+        not_pass = [c for c in r.candidates
+                    if not rnd.candidate_screened_pass(ledger, c)]
+        if not_pass:
+            detail = []
+            for c in not_pass:
+                latest = ledger.candidate_checks(c)
+                detail.append(
+                    f"{c}（{'最新 decision=' + latest[-1]['decision']
+                       if latest else '无预筛记录'}）")
+            print(f"✗ 候选 {', '.join(detail)} 不是 screened_pass——轮次的"
+                  "全部候选必须最新预筛 decision=pass（bt candidate check）"
+                  "才可开启（T62/D31 + T63/D32）")
+            return 1
+        used = int(ledger.conn.execute(
+            "SELECT COUNT(*) n FROM lockbox_uses").fetchone()["n"])
+        remaining = max(0, rnd.D16_LOCKBOX_USES_TOTAL - used)
+        if r.lockbox_uses_max > remaining:
+            print(f"✗ 轮次 {r.id} 申报 lockbox_uses_max={r.lockbox_uses_max}"
+                  f"，超过 D16 剩余预算（本锁箱总预算 "
+                  f"{rnd.D16_LOCKBOX_USES_TOTAL}，已用 {used}，剩余 "
+                  f"{remaining}；D16/D49：H 线与 P 线共用）——轮次的锁箱"
+                  "用量申报不得超总预算余额")
+            return 1
+        ledger.record_round_open(
+            round_id=r.id, candidates=r.candidates,
+            trial_budget=r.trial_budget,
+            lockbox_uses_max=r.lockbox_uses_max,
+            dsr_trial_scope=r.dsr_trial_scope, advance_rule=r.advance_rule,
+            close_rule=r.close_rule, approved_by=r.approved_by,
+            evaluation=r.evaluation, toml_sha256=r.content_sha256(),
+            git_commit=current_git_commit())
+    print(f"✓ 轮次 {r.id} 已开启（T63/D32）：候选 {list(r.candidates)}，"
+          f"试验预算 {r.trial_budget}，锁箱用量上限 {r.lockbox_uses_max}"
+          f"（D16 剩余 {remaining}），批准人 {r.approved_by}；台账 "
+          f"{args.ledger}（rounds 哈希链，toml_sha256="
+          f"{r.content_sha256()[:12]}…）")
+    print(f"— 该轮的卡须带 round = \"{r.id}\" 与 candidate 字段；"
+          f"bt round close {r.id} 关闭并生成报告骨架")
+    return 0
+
+
+def cmd_round_status(args) -> int:
+    """bt round status R#：轮次状态与预算用量（读台账，不动链）。"""
+    with Ledger(args.ledger) as ledger:
+        row = ledger.round(args.round)
+        if row is None:
+            print(f"✗ 轮次 {args.round} 未开启过（rounds 表无此行；先 "
+                  f"bt round open {args.round}）")
+            return 1
+        n_dedup = ledger.round_n_dedup(args.round)
+        g5_used = ledger.round_lockbox_uses(args.round)
+    print(f"轮次 {row['round_id']}：status={row['status']}")
+    print(f"  开启 {row['opened_utc']}（批准人 {row['approved_by']}，"
+          f"git {row['git_commit'][:12]}…，toml_sha256="
+          f"{row['toml_sha256'][:12]}…）")
+    if row["closed_utc"]:
+        print(f"  关闭 {row['closed_utc']}")
+    print(f"  候选 {json.loads(row['candidates_json'])}；评估 "
+          f"{json.loads(row['evaluation_json'])}")
+    print(f"  试验预算：{n_dedup}/{row['trial_budget']}（本轮去重试验数/"
+          f"trial_budget）；G5 用量：{g5_used}/{row['lockbox_uses_max']}"
+          "（lockbox_uses_max）")
+    print(f"  推进规则：{row['advance_rule']}")
+    print(f"  结束条件：{row['close_rule']}")
+    return 0
+
+
+def _round_report(ledger, row) -> str:
+    """round close 的报告骨架：本轮全部运行（含失败）+ 按 advance_rule
+    的判定占位。被运行约束拒绝的尝试不产生 runs 行（fail-closed，无迹
+    于台账——拒绝不是试验），如实注明。"""
+    rid = row["round_id"]
+    runs = ledger.conn.execute(
+        "SELECT run_id, card_id, symbol, timeframe, actor, metrics_json,"
+        " created_utc FROM runs WHERE round_id=? ORDER BY run_id",
+        (rid,)).fetchall()
+    n_dedup = ledger.round_n_dedup(rid)
+    g5_used = ledger.round_lockbox_uses(rid)
+    lines = [
+        f"# 研究轮次 {rid} 关闭报告（骨架，bt round close 自动生成）",
+        "",
+        f"- 开启：{row['opened_utc']}（批准人 {row['approved_by']}，"
+        f"预注册 toml_sha256={row['toml_sha256'][:12]}…）",
+        f"- 候选：{json.loads(row['candidates_json'])}",
+        f"- 试验预算：{n_dedup}/{row['trial_budget']}"
+        "（本轮去重试验数/trial_budget，七元组去重口径）",
+        f"- G5 用量：{g5_used}/{row['lockbox_uses_max']}"
+        "（lockbox_uses_max，受 D16 总预算约束）",
+        f"- 推进规则（advance_rule）：{row['advance_rule']}",
+        f"- 结束条件（close_rule）：{row['close_rule']}",
+        "",
+        "## 运行清单（本轮全部运行，含失败）",
+        "",
+        "| run# | 卡 | 品种/周期 | actor | 结果 | 时刻 |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for r in runs:
+        payload = json.loads(r["metrics_json"])
+        if payload.get("ok"):
+            m = payload.get("metrics") or {}
+            outcome = (f"✓ 净利 {m.get('net_profit')} / "
+                       f"交易 {m.get('trade_count')}")
+        else:
+            outcome = f"✗ 失败：{payload.get('error')}"
+        lines.append(
+            f"| {r['run_id']} | {r['card_id']} | {r['symbol']}/"
+            f"{r['timeframe']} | {r['actor']} | {outcome} |"
+            f" {r['created_utc']} |")
+    if not runs:
+        lines.append("| （无运行） | | | | | |")
+    lines += [
+        "",
+        "注：被运行约束（轮次未开启/预算满/锁箱上限/已关闭）拒绝的尝试"
+        "不产生 runs 行——fail-closed，台账无迹；拒绝不是试验。",
+        "",
+        "## 按 advance_rule 的判定（占位，关闭时人工填写）",
+        "",
+    ]
+    for cid in json.loads(row["candidates_json"]):
+        lines.append(
+            f"- {cid}：判定 = 待填写（按推进规则「{row['advance_rule']}」"
+            "对照运行清单与主统计量给出：通过 / 不通过 / 无结论）")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_round_close(args) -> int:
+    """bt round close R#：生成 docs/research/round-R#-<日期>.md 骨架并
+    关闭轮次（open→closed 归档改写入链）；关闭后该轮不能再运行。"""
+    with Ledger(args.ledger) as ledger:
+        row = ledger.round(args.round)
+        if row is None:
+            print(f"✗ 轮次 {args.round} 未开启过（rounds 表无此行），无从关闭")
+            return 1
+        if row["status"] != "open":
+            print(f"✗ 轮次 {args.round} 已是 {row['status']!r}——关闭是一次性"
+                  "动作，不得二改")
+            return 1
+        report = _round_report(ledger, row)
+        ledger.record_round_close(args.round)
+    out = Path(args.out) if args.out else (
+        REPO_ROOT / "docs" / "research"
+        / f"round-{args.round}-{datetime.now(timezone.utc).date().isoformat()}.md")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    tmp.write_text(report, encoding="utf-8")      # 原子写（铁律 15）
+    os.replace(tmp, out)
+    print(f"✓ 轮次 {args.round} 已关闭（T63/D32）：报告骨架 {out}；"
+          "该轮的卡不能再运行（screen/gate 拒），runs 已带 round_id 如实"
+          "留痕；后续试验须预注册新轮次")
+    return 0
 
 
 def _select_params_auto(ledger, card, *, symbol: str, data_sha256: str,
@@ -717,6 +1000,13 @@ def cmd_screen(args) -> int:
             return 1
         ledger.register_card(card.id, card.version, str(path),
                              current_git_commit(), committed)
+        # T63/D32（铁律 16）：研究卡只能属于已开启轮次（轮次上下文随
+        # record_run 落 runs.round_id；预算满拒绝新试验）
+        round_ctx = _round_context(ledger, card, actor=actor)
+        if round_ctx is False:
+            return 1
+        if _round_budget_exceeded(ledger, round_ctx):
+            return 1
 
         # 装配（setup 失败 = 尚无任何组合开跑，fail-fast 不记 runs）
         try:
@@ -768,6 +1058,16 @@ def cmd_screen(args) -> int:
             data_last = pd_iso(times.iloc[-1])
             for params in combos:
                 label = f"{sym} {card.timeframe} {params}"
+                # T63：本轮预算满 → 该组合被拒（不执行也不记 runs）
+                if (round_ctx is not None
+                        and ledger.round_n_dedup(round_ctx["round_id"])
+                        >= round_ctx["trial_budget"]):
+                    failed += 1
+                    print(f"✗ {label} -> 轮次 {round_ctx['round_id']} 试验"
+                          f"预算已满（trial_budget="
+                          f"{round_ctx['trial_budget']}，去重口径）——组合"
+                          "被拒（不记 runs）")
+                    continue
                 try:
                     if sizing is not None:
                         result = run_backtest(
@@ -802,7 +1102,8 @@ def cmd_screen(args) -> int:
                         engine_version=ENGINE_VERSION,
                         cost_model_version=cost_version, gates_hash=gates_hash,
                         metrics=summary, actor=actor,
-                        strategy_sha=strategy_sha)
+                        strategy_sha=strategy_sha,
+                        round_id=(round_ctx or {}).get("round_id"))
                     skipped = summary.get("skipped_zero_lots") or 0
                     print(f"✓ run#{rid} {label} -> "
                           f"净利 {summary['net_profit']:.2f} "
@@ -819,7 +1120,8 @@ def cmd_screen(args) -> int:
                         cost_model_version=cost_version,
                         gates_hash=gates_hash, metrics=None,
                         error=f"{type(e).__name__}: {e}", actor=actor,
-                        strategy_sha=strategy_sha)
+                        strategy_sha=strategy_sha,
+                        round_id=(round_ctx or {}).get("round_id"))
                     print(f"✗ run#{rid} {label} -> {type(e).__name__}: {e}")
 
         st = ledger.stats(card.id)
@@ -917,6 +1219,15 @@ def cmd_gate(args) -> int:
             return 1
         ledger.register_card(card.id, card.version, str(path),
                              current_git_commit(), committed)
+        # T63/D32（铁律 16）：研究卡只能属于已开启轮次；G5 另查本轮
+        # lockbox_uses_max（在 approve/一次性/预算检查之前——轮次上限
+        # 是预注册钉死的轮次级约束）
+        round_ctx = _round_context(ledger, card, actor=actor,
+                                   wanted_gates=wanted)
+        if round_ctx is False:
+            return 1
+        if _round_budget_exceeded(ledger, round_ctx):
+            return 1
         # G5 预检：未批准 / 已用过 → 拒绝（不烧一次性，也不跑任何运行）
         if "G5" in wanted and not args.approve:
             print("✗ 锁箱（G5）是一次性测试，必须显式 --approve"
@@ -1016,7 +1327,8 @@ def cmd_gate(args) -> int:
             timeframe=card.timeframe, data_first=data_first,
             data_last=data_last, data_sha256=dsha,
             engine_version=ENGINE_VERSION, cost_model_version=cost_version,
-            gates_hash=gsha, actor=actor, strategy_sha=strategy_sha)
+            gates_hash=gsha, actor=actor, strategy_sha=strategy_sha,
+            round_id=(round_ctx or {}).get("round_id"))
         try:
             base_kwargs = dict(symbol=symbol, params=dict(params),
                                contract_size=sizes[symbol],
@@ -1160,8 +1472,8 @@ def cmd_ledger_stats(args) -> int:
 # ---------------------------------------------------------------- ledger verify
 
 def cmd_ledger_verify(args) -> int:
-    """T37/M6/D27 + R6/C5：校验 runs/gates/lockbox_uses/candidate_checks
-    四条哈希链 + chain_meta 快照（断链/篡改/删尾/未登记写入）。"""
+    """T37/M6/D27 + R6/C5：校验 runs/gates/lockbox_uses/candidate_checks/
+    rounds 五条哈希链 + chain_meta 快照（断链/篡改/删尾/未登记写入）。"""
     ledger_path = Path(args.ledger) if args.ledger else \
         Path(args.data_root) / "research" / "ledger.sqlite"
     try:
@@ -1178,8 +1490,8 @@ def cmd_ledger_verify(args) -> int:
               "锚：scripts/ledger_anchor.py --verify），可定位改写发生的"
               "时间（D27）；台账不完整期间一切写入被拒（防洗链）")
         return 1
-    print("✓ 台账哈希链完好（runs/gates/lockbox_uses/candidate_checks 四链"
-          "逐行校验 + chain_meta 快照比对通过）")
+    print("✓ 台账哈希链完好（runs/gates/lockbox_uses/candidate_checks/"
+          "rounds 五链逐行校验 + chain_meta 快照比对通过）")
     return 0
 
 
@@ -1218,6 +1530,32 @@ def build_parser() -> argparse.ArgumentParser:
     pchk = card_sub.add_parser("check", help="校验卡模式并显示提交状态")
     pchk.add_argument("path", help="卡文件路径（research/cards/H012.toml）")
     pchk.set_defaults(func=cmd_card_check)
+
+    p_round = sub.add_parser("round", help="研究轮次操作（T63/D32，铁律 16）")
+    round_sub = p_round.add_subparsers(dest="round_command", required=True)
+    pro = round_sub.add_parser(
+        "open", help="开启轮次：前置条件全过 → rounds 表入哈希链")
+    pro.add_argument("round", help="轮次 id（R1）或 research/rounds/R1.toml 路径")
+    pro.add_argument("--rounds-dir",
+                     default=str(REPO_ROOT / "research" / "rounds"))
+    pro.add_argument("--ledger", default=str(Path("data") / "research"
+                                             / "ledger.sqlite"),
+                     help="台账路径；缺省 data/research/ledger.sqlite")
+    pro.set_defaults(func=cmd_round_open)
+    prs = round_sub.add_parser("status", help="轮次状态与预算用量")
+    prs.add_argument("round", help="轮次 id（R1）")
+    prs.add_argument("--ledger", default=str(Path("data") / "research"
+                                             / "ledger.sqlite"))
+    prs.set_defaults(func=cmd_round_status)
+    prc = round_sub.add_parser(
+        "close", help="关闭轮次并生成 docs/research/round-R#-<日期>.md 骨架")
+    prc.add_argument("round", help="轮次 id（R1）")
+    prc.add_argument("--ledger", default=str(Path("data") / "research"
+                                             / "ledger.sqlite"))
+    prc.add_argument("--out", default=None,
+                     help="报告骨架落盘路径；缺省 docs/research/"
+                          "round-R#-<日期>.md")
+    prc.set_defaults(func=cmd_round_close)
 
     p_screen = sub.add_parser("screen", help="在卡的网格上跑 A 层并记入台账")
     p_screen.add_argument("--card", required=True,

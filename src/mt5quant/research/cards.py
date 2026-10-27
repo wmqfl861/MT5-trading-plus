@@ -13,6 +13,12 @@
 - 旧卡（H001-H007）缺字段：family = family_of(id)（无后缀时 = id）、
   strategy = None（运行必须由 --strategy 给出，见 Card.migration_hint）。
 
+轮次归属（T63/D32，铁律 16）：卡可带 round / candidate 两个可选字段
+（成对出现：所属研究轮次 R# 与该轮名单内的候选 C###）。台账一旦有
+轮次（Ledger.rounds_any），不带这两个字段的卡拒绝运行——bt 拒绝运行
+不属于已提交轮次的卡；轮次制之前的旧卡（两字段都缺省）在 rounds 表
+为空的台账上照常运行（runs.round_id=NULL=轮次制之前）。
+
 committed_at 语义（钉死）：
 - `git log -1 --format=%cI -- <path>`，即**最后一次**改动该文件的提交时间
   （aware datetime，带作者本地时区偏移）；
@@ -49,9 +55,12 @@ MAX_GRID_POINTS = 100
 _RULES_KEYS = ("entry", "exit", "stop")
 _EXPECTED_KEYS = ("trades_per_year", "win_rate", "payoff_ratio")
 _TOP_KEYS = ("id", "family", "version", "parent", "strategy",
-             "selection_rule", "symbols", "timeframe", "session", "phenomenon",
-             "mechanism", "should_fail_when", "falsified_if",
-             "graveyard_checked")
+             "selection_rule", "round", "candidate", "symbols", "timeframe",
+             "session", "phenomenon", "mechanism", "should_fail_when",
+             "falsified_if", "graveyard_checked")
+
+_ROUND_ID_RE = re.compile(r"^R\d{1,4}$")
+_CANDIDATE_ID_RE = re.compile(r"^C\d{3,}$")
 
 _VERSION_SUFFIX = re.compile(r"-v(\d+)$")
 _LEGACY_MIGRATION_HINT = (
@@ -106,6 +115,8 @@ class Card:
     parent: str = ""
     strategy: str | None = None
     selection_rule: str = "max_net_profit"
+    round: str = ""                     # T63/D32：所属研究轮次（R#；空=未入轮）
+    candidate: str = ""                 # T63/D32：轮次名单内的候选（C###；空=未入轮）
     rules: dict = field(default_factory=dict)     # entry/exit/stop -> str
     params: dict = field(default_factory=dict)    # 名 -> 网格 tuple（标量）
     expected: dict = field(default_factory=dict)  # 三项预期 -> str
@@ -222,6 +233,40 @@ def _validate_lineage(data: dict, cid: str, version: int,
     return family, parent, strategy, selection_rule
 
 
+def _validate_round_membership(data: dict,
+                               source: str) -> tuple[str, str]:
+    """校验 round / candidate（T63/D32，铁律 16）：可选但**成对**出现。
+
+    - 两者都缺省 → ("", "")（轮次制之前的旧卡；能否运行由台账 rounds
+      表是否为空决定，见 bt 的运行约束）；
+    - 只写一个 → CardError（说了轮次不说候选，或反之，运行约束无从
+      校验）；
+    - round 必须形如 R1/R12，candidate 必须形如 C001（与候选登记同式）；
+      候选是否真的在该轮名单内由 bt 运行时对台账 rounds 行校验（装载
+      层不读台账）。
+    """
+    raw_round = data.get("round")
+    raw_cand = data.get("candidate")
+    if raw_round is None and raw_cand is None:
+        return "", ""
+    if raw_round is None or raw_cand is None:
+        missing = "round" if raw_round is None else "candidate"
+        raise CardError(
+            f"{source}：round 与 candidate 必须成对出现（缺 {missing!r}）——"
+            "轮次内的卡同时声明所属轮次与该轮名单内的候选；轮次制之前"
+            "的旧卡两者都不写")
+    for key, pattern in (("round", _ROUND_ID_RE),
+                         ("candidate", _CANDIDATE_ID_RE)):
+        v = data.get(key)
+        if not isinstance(v, str) or not pattern.match(v):
+            raise CardError(
+                f"{source}：字段 {key!r} 必须形如 "
+                + ("R1/R12（R+数字）" if key == "round"
+                   else "C001（C+至少三位数字）")
+                + f"，收到 {v!r}")
+    return raw_round, raw_cand
+
+
 def _validate_params(raw: object, source: str) -> dict:
     if not isinstance(raw, dict):
         raise CardError(f"{source}：[params] 必须是表（可为空表）")
@@ -285,6 +330,7 @@ def validate_card(data: dict, *, source: str) -> Card:
 
     family, parent, strategy, selection_rule = _validate_lineage(
         data, cid, version, source)
+    round_id, candidate_id = _validate_round_membership(data, source)
 
     symbols = data.get("symbols")
     if (not isinstance(symbols, list) or not symbols
@@ -320,6 +366,7 @@ def validate_card(data: dict, *, source: str) -> Card:
         graveyard_checked=tuple(graveyard),
         family=family, parent=parent, strategy=strategy,
         selection_rule=selection_rule,
+        round=round_id, candidate=candidate_id,
         rules=_validate_table(data.get("rules"), _RULES_KEYS, "rules", source),
         params=_validate_params(data.get("params", {}), source),
         expected=_validate_table(data.get("expected"), _EXPECTED_KEYS,
@@ -349,8 +396,10 @@ def load_card(path) -> Card:
         should_fail_when=card.should_fail_when, falsified_if=card.falsified_if,
         graveyard_checked=card.graveyard_checked, family=card.family,
         parent=card.parent, strategy=card.strategy,
-        selection_rule=card.selection_rule, rules=card.rules,
-        params=card.params, expected=card.expected, path=str(p))
+        selection_rule=card.selection_rule,
+        round=card.round, candidate=card.candidate,
+        rules=card.rules, params=card.params, expected=card.expected,
+        path=str(p))
 
 
 def committed_at(path, *, runner=None) -> datetime | None:

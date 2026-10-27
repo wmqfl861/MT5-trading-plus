@@ -32,16 +32,31 @@
   ——候选预筛结论（T62/D31：bt candidate check 的产出；决策枚举
   pass/fail/waiting_data，result_json 与 research/candidates/C###.precheck.json
   同一负载）。旧库打开时自动建表并入链（空表从链首开始）。
+- rounds(round_id PRIMARY KEY, opened_utc, toml_sha256, candidates_json,
+  trial_budget, lockbox_uses_max, dsr_trial_scope, advance_rule,
+  close_rule, approved_by, evaluation_json, git_commit, status,
+  closed_utc)——研究轮次预注册（T63/D32，铁律 16：bt round open 把
+  已提交的 research/rounds/R#.toml 内容绑定进台账；toml_sha256 锚预注册
+  文件内容，status ∈ {"open", "closed"}，关闭走 _update_chained 归档
+  改写——open→closed 的全过程可从 ledger_events 重放）。同一 round_id
+  只能开启一次（主键钉死：预注册是一次性动作，关闭后不得重开）。
+- runs.round_id（T63/D32）：运行所属轮次；NULL = 轮次制之前（旧库
+  迁移补列，旧行保持 NULL——历史如实保留，不回填）。旧库（已有 T37
+  哈希链）补列后 runs 链按新内容**整体重算一次**（与 T37 迁移同一信任
+  边界；链头变化会与 docs/ops/ledger-anchors.md 的锚定记录不符——
+  迁移后须重新锚定，scripts/ledger_anchor.py）。
 
-哈希链（T37/M6/D27；R6/C5 防洗链；T62 加 candidate_checks）：runs /
-gates / lockbox_uses / candidate_checks 各一条按 rowid 串联的链，
+哈希链（T37/M6/D27；R6/C5 防洗链；T62 加 candidate_checks；T63 加
+rounds）：runs / gates / lockbox_uses / candidate_checks / rounds 各一条
+按 rowid 串联的链，
 row_hash = sha256(规范化行 JSON + prev_hash)
 （规范化 = 全部内容列、键排序、紧凑分隔符；prev_hash/row_hash 自身不入
 哈希）。首行 prev_hash = GENESIS_HASH。R6/C5 起的写入纪律：
 
 - **写前验证**：所有写方法（record_run / record_gate /
   record_lockbox_use / record_lockbox_start / finish_lockbox_use /
-  lockbox_budget / register_card）写前先 verify_chain()，不完整 →
+  lockbox_budget / register_card / record_round_open /
+  record_round_close）写前先 verify_chain()，不完整 →
   抛 LedgerTamperedError（fail-closed，提示人工核查）——正常写入**绝不
   重算已有行**，因此篡改证据不可能被"正常 record_run 一次"洗掉；
 - **增量延伸**：合法追加只计算新行的 row_hash（prev = 当前链尾），
@@ -125,6 +140,7 @@ CREATE TABLE IF NOT EXISTS runs(
   metrics_json       TEXT NOT NULL,
   created_utc        TEXT NOT NULL,
   actor              TEXT NOT NULL,
+  round_id           TEXT,
   prev_hash          TEXT NOT NULL DEFAULT '',
   row_hash           TEXT NOT NULL DEFAULT ''
 );
@@ -155,6 +171,24 @@ CREATE TABLE IF NOT EXISTS candidate_checks(
   result_json   TEXT NOT NULL,
   prev_hash     TEXT NOT NULL DEFAULT '',
   row_hash      TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS rounds(
+  round_id         TEXT NOT NULL PRIMARY KEY,
+  opened_utc       TEXT NOT NULL,
+  toml_sha256      TEXT NOT NULL,
+  candidates_json  TEXT NOT NULL,
+  trial_budget     INTEGER NOT NULL,
+  lockbox_uses_max INTEGER NOT NULL,
+  dsr_trial_scope  TEXT NOT NULL,
+  advance_rule     TEXT NOT NULL,
+  close_rule       TEXT NOT NULL,
+  approved_by      TEXT NOT NULL,
+  evaluation_json  TEXT NOT NULL,
+  git_commit       TEXT NOT NULL,
+  status           TEXT NOT NULL DEFAULT 'open',
+  closed_utc       TEXT,
+  prev_hash        TEXT NOT NULL DEFAULT '',
+  row_hash         TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS lockbox_budget(
   cutoff      TEXT NOT NULL PRIMARY KEY,
@@ -190,7 +224,10 @@ DEFAULT_LOCKBOX_MAX_USES = 5
 # 但行数/rowid 进 chain_meta 快照——删审计行要能报出）。
 # T62/D31：candidate_checks（候选预筛结论）入链——预筛是开卡前的
 # 硬闸门，结论的事后改写必须像 runs 一样留痕。
-_CHAIN_TABLES = ("runs", "gates", "lockbox_uses", "candidate_checks")
+# T63/D32：rounds（轮次预注册开启/关闭）入链——试验预算与锁箱用量
+# 的申报值就锁在这条链上，改预算/抹轮次要能报出。
+_CHAIN_TABLES = ("runs", "gates", "lockbox_uses", "candidate_checks",
+                 "rounds")
 _SNAPSHOT_TABLES = _CHAIN_TABLES + ("ledger_events",)
 GENESIS_HASH = "0" * 64
 
@@ -285,13 +322,30 @@ class Ledger:
             with self._txn():
                 self.conn.execute(
                     "ALTER TABLE lockbox_uses ADD COLUMN cutoff TEXT")
+        # T63 迁移（D32/铁律 16）：runs 加 round_id（NULL = 轮次制之前，
+        # 旧行不回填）。列进哈希规范化内容，因此已有 T37 哈希链的旧库补列
+        # 后 runs 链按新内容**整体重算一次**（_rechain 仅此迁移路径重算
+        # 旧行；链头变化会与 git 锚定记录不符——迁移后须重新锚定）。
+        # 在 T37 迁移块**之前**执行：pre-T37 旧库随后的一次性重建直接
+        # 覆盖 round_id，无需二次重算（幂等：列已存在即跳过）。
+        runs_cols = {r["name"] for r in self.conn.execute(
+            "PRAGMA table_info(runs)")}
+        pre_migration = "strategy_sha" not in runs_cols
+        if "round_id" not in runs_cols:
+            with self._txn():
+                self.conn.execute(
+                    "ALTER TABLE runs ADD COLUMN round_id TEXT")
+            if not pre_migration:
+                n_runs = int(self.conn.execute(
+                    "SELECT COUNT(*) n FROM runs").fetchone()["n"])
+                if n_runs:
+                    with self._txn():
+                        self._rechain("runs")
+                        self._snapshot_refresh("runs")
         # T37 迁移（H3/M6，D23/D27）：runs 加 strategy_sha/prev_hash/
         # row_hash，gates 与 lockbox_uses 加 prev_hash/row_hash；旧行
         # strategy_sha='legacy'，三链自第一行重建，迁移记一行
         # actor=migration（幂等：迁移过再打开不会重复记）。
-        runs_cols = {r["name"] for r in self.conn.execute(
-            "PRAGMA table_info(runs)")}
-        pre_migration = "strategy_sha" not in runs_cols
         if pre_migration:
             with self._txn():
                 self.conn.execute(
@@ -572,7 +626,8 @@ class Ledger:
         for tbl, id_cols in (("runs", ("run_id",)),
                              ("gates", ("run_id", "gate")),
                              ("lockbox_uses", ("card_id",)),
-                             ("candidate_checks", ("candidate_id",))):
+                             ("candidate_checks", ("candidate_id",)),
+                             ("rounds", ("round_id",))):
             cols = [r["name"] for r in self.conn.execute(
                 f"PRAGMA table_info({tbl})")]
             if "row_hash" not in cols:
@@ -598,6 +653,8 @@ class Ledger:
                     label = f"gates run#{r['run_id']}/{r['gate']}"
                 elif tbl == "candidate_checks":
                     label = f"candidate_checks {r['candidate_id']}"
+                elif tbl == "rounds":
+                    label = f"rounds {r['round_id']}"
                 else:
                     label = f"lockbox_uses card={r['card_id']}"
                 if r["row_hash"] != expect:
@@ -701,13 +758,16 @@ class Ledger:
                    engine_version: str, cost_model_version: str,
                    gates_hash: str, metrics: dict | None,
                    error: str | None = None, actor: str = "bt",
-                   created_utc=None, strategy_sha: str = "legacy") -> int:
+                   created_utc=None, strategy_sha: str = "legacy",
+                   round_id: str | None = None) -> int:
         """记一行运行（成功的与抛异常的 alike）；返回 run_id。
 
         metrics 与 error 二选一（有 error 时 metrics 记 None）；
         created_utc 缺省取当前 UTC（测试可注入固定时间，须 aware）；
         strategy_sha（T37/D23）：策略代码指纹，缺省 'legacy'（调用方
-        未计算的旧路径/迁移前语义——研究路径 bt.py 必须传真实指纹）。
+        未计算的旧路径/迁移前语义——研究路径 bt.py 必须传真实指纹）；
+        round_id（T63/D32）：运行所属研究轮次；None = 轮次制之前/之外
+        （旧路径与标定样品运行不带轮次——它们不进入轮次统计）。
         R6/C5：写前验证链（不完整 → LedgerTamperedError，不洗链）；
         追加只延伸链（_append_chained，增量计算 row_hash）。
         R7/N-C3：验链、读链尾、写入、刷快照同一 BEGIN IMMEDIATE 事务
@@ -730,6 +790,7 @@ class Ledger:
                 "gates_hash": gates_hash,
                 "metrics_json": json.dumps(_san(payload), ensure_ascii=False),
                 "created_utc": _iso(created_utc), "actor": actor,
+                "round_id": round_id,
             })
 
     def record_gate(self, run_id: int, gate: str, passed: bool,
@@ -875,6 +936,108 @@ class Ledger:
                 " FROM candidate_checks WHERE candidate_id=? ORDER BY rowid",
                 (candidate_id,)).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------- 研究轮次（T63/D32，铁律 16）
+
+    def record_round_open(self, *, round_id: str, candidates, trial_budget,
+                          lockbox_uses_max, dsr_trial_scope: str,
+                          advance_rule: str, close_rule: str,
+                          approved_by: str, evaluation: dict,
+                          toml_sha256: str, git_commit: str) -> None:
+        """开启轮次：research/rounds/R#.toml 的内容绑定进 rounds 表
+        （带哈希链；toml_sha256 锚文件内容，git_commit 记开启时提交）。
+
+        同一 round_id 已存在 → sqlite3.IntegrityError（主键钉死：预注册
+        是一次性动作，关闭后同 id 不得重开）。调用方（bt round open）负责
+        前置条件：文件已提交且工作区干净、候选全 screened_pass、
+        lockbox_uses_max ≤ D16 剩余预算。
+        R6/C5：写前验证链；追加只延伸链。R7/N-C3：验链与追加同一写事务。
+        """
+        with self._txn():
+            self._verify_or_raise()
+            self._append_chained("rounds", {
+                "round_id": round_id,
+                "opened_utc": datetime.now(timezone.utc).isoformat(),
+                "toml_sha256": toml_sha256,
+                "candidates_json": json.dumps(list(candidates),
+                                              ensure_ascii=False),
+                "trial_budget": int(trial_budget),
+                "lockbox_uses_max": int(lockbox_uses_max),
+                "dsr_trial_scope": dsr_trial_scope,
+                "advance_rule": advance_rule,
+                "close_rule": close_rule,
+                "approved_by": approved_by,
+                "evaluation_json": json.dumps(_san(evaluation),
+                                              ensure_ascii=False),
+                "git_commit": git_commit,
+                "status": "open",
+                "closed_utc": None})
+
+    def record_round_close(self, round_id: str) -> None:
+        """关闭轮次：open → closed 是**归档式改写**——旧行内容先完整进
+        ledger_events（审计可重放"关闭前是什么"），row_hash 用
+        (prev_hash, 新内容) 重算、后继行联动，链保持可验证。
+
+        未开启过 → ValueError；已关闭 → ValueError（幂等拒绝，不二改）。
+        关闭后该轮不能再运行（bt screen/gate 据状态拒绝），报告骨架由
+        bt round close 另行生成。
+        R6/C5：写前验证链（rounds 行被删/链不完整 → LedgerTamperedError）。
+        """
+        with self._txn():
+            self._verify_or_raise()
+            row = self.conn.execute(
+                "SELECT rowid, status FROM rounds WHERE round_id=?",
+                (round_id,)).fetchone()
+            if row is None:
+                raise ValueError(
+                    f"轮次 {round_id} 未开启过（rounds 无此行）——无从关闭")
+            if row["status"] != "open":
+                raise ValueError(
+                    f"轮次 {round_id} 已是 {row['status']!r}（{round_id} 的"
+                    "关闭是一次性动作，不得二改）")
+            cols = self._table_cols("rounds")
+            names = ", ".join(f'"{c}"' for c in cols)
+            content = dict(self.conn.execute(
+                f"SELECT {names} FROM rounds WHERE rowid=?",
+                (row["rowid"],)).fetchone())
+            content["status"] = "closed"
+            content["closed_utc"] = datetime.now(timezone.utc).isoformat()
+            self._update_chained(
+                "rounds", int(row["rowid"]), content,
+                row_key=f"round_id={round_id}", action="open->closed")
+
+    def round(self, round_id: str) -> dict | None:
+        """轮次登记（rounds 表一行；不存在 → None）。candidates_json /
+        evaluation_json 由调用方解析。"""
+        row = self.conn.execute(
+            "SELECT * FROM rounds WHERE round_id=?", (round_id,)).fetchone()
+        return None if row is None else dict(row)
+
+    def rounds_any(self) -> bool:
+        """台账是否登记过任何轮次（铁律 16：一旦有轮次，研究卡必须属于
+        已开启轮次；False = 轮次制之前，旧卡照常运行）。"""
+        return self.conn.execute(
+            "SELECT 1 FROM rounds LIMIT 1").fetchone() is not None
+
+    def round_n_dedup(self, round_id: str) -> int:
+        """本轮累计去重试验数（trial_budget 的计数口径）：runs 中
+        round_id 匹配的成功运行按 (strategy, params, symbol, timeframe,
+        data_sha256, cost_model_version, strategy_sha) 七元组去重——与
+        stats 的 n_dedup 同键同口径（迁移行与失败运行不计）。"""
+        rows = self.conn.execute(
+            "SELECT strategy, params_json, symbol, timeframe, data_sha256,"
+            " cost_model_version, strategy_sha, actor, metrics_json"
+            " FROM runs WHERE round_id=?", (round_id,)).fetchall()
+        return self._dedup_n(rows)
+
+    def round_lockbox_uses(self, round_id: str) -> int:
+        """本轮已消耗的 G5 次数（lockbox_uses_max 的计数口径）：该轮内
+        跑过的卡（runs.round_id 匹配）在 lockbox_uses 中的行数——含
+        started（读了锁箱就算看过，T21a 同口径）。"""
+        return int(self.conn.execute(
+            "SELECT COUNT(*) n FROM lockbox_uses WHERE EXISTS ("
+            " SELECT 1 FROM runs r WHERE r.card_id = lockbox_uses.card_id"
+            " AND r.round_id = ?)", (round_id,)).fetchone()["n"])
 
     # ---------------------------------------------------------------- 读
 
