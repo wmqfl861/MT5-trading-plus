@@ -52,9 +52,21 @@ volume_lots = 0.02
 
 
 def run_ps1(*args: str, timeout: float = 120.0) -> subprocess.CompletedProcess:
-    """powershell -File 跑脚本（拒绝路径/PrecheckOnly，均无副作用）。"""
+    """powershell 跑脚本（拒绝路径/PrecheckOnly，均无副作用）。
+
+    经 -Command 包一层强制 [Console]::OutputEncoding=UTF-8：PS 5.1 管道
+    输出缺省取系统 OEM 代码页，CI（windows-latest）上中文断言会因转码
+    假红；-File 无法注入编码设置。注意 -Command 上下文里带引号的
+    '-Mode' 会被当作位置实参——参数名（-Xxx 形式）不加引号原样传递，
+    其余值单引号转义。"""
+    def _q(s: str) -> str:
+        if s.startswith("-") and all(c.isalnum() or c == "-" for c in s):
+            return s
+        return "'" + s.replace("'", "''") + "'"
+    inner = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; & " + \
+        _q(str(SCRIPT)) + " " + " ".join(_q(a) for a in args)
     cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-           "-File", str(SCRIPT), *args]
+           "-Command", inner]
     return subprocess.run(cmd, capture_output=True, timeout=timeout)
 
 
@@ -79,6 +91,21 @@ def _dead_pid() -> int:
         time.sleep(0.1)
     p.wait()
     return pid
+
+
+def precheck_artifact_args(tmp: Path) -> list[str]:
+    """-PrecheckOnly 断言 rc==0 的测试须自备三个数据工件（点差缓存/研究库
+    缓存/合约快照）并经参数显式指向——它们只存在于实机 data/（gitignore），
+    此前借开发机本地文件通过、干净克隆/CI 上预检 3 项未通过假红。"""
+    data = tmp / "precheck-data"
+    (data / "specs").mkdir(parents=True, exist_ok=True)
+    (data / "specs" / "latest.json").write_text("{}", encoding="utf-8")
+    spread = tmp / "precheck-spread.json"
+    spread.write_text("{}", encoding="utf-8")
+    research = tmp / "precheck-research.json"
+    research.write_text("{}", encoding="utf-8")
+    return ["-DataDir", str(data), "-SpreadModel", str(spread),
+            "-ResearchCache", str(research)]
 
 
 # ---------------------------------------------------------------- 模式边界
@@ -153,7 +180,8 @@ def test_precheck_only_lists_alive_runner_skip(tmp_path):
         "2026-10-27T00:00:00.0000000Z\n", encoding="utf-8")
     before = pids.read_bytes()
     proc = run_ps1("-Mode", "PaperSoak", "-ConfigDir", str(cfg_dir),
-                   "-LogDir", str(log_dir), "-PrecheckOnly")
+                   "-LogDir", str(log_dir), *precheck_artifact_args(tmp_path),
+                   "-PrecheckOnly")
     assert proc.returncode == 0, out_text(proc)
     assert f"runner/{MAGIC}" in out_text(proc)      # 将被跳过（绝不并行第二份）
     assert pids.read_bytes() == before              # -PrecheckOnly 不写 pids.txt
@@ -169,7 +197,8 @@ def test_precheck_only_parses_legacy_pid_lines(tmp_path):
     (log_dir / "pids.txt").write_text(
         f"{os.getpid()}\trunner\t{MAGIC}\tC:\\\\old.log\n", encoding="utf-8")
     proc = run_ps1("-Mode", "PaperSoak", "-ConfigDir", str(cfg_dir),
-                   "-LogDir", str(log_dir), "-PrecheckOnly")
+                   "-LogDir", str(log_dir), *precheck_artifact_args(tmp_path),
+                   "-PrecheckOnly")
     assert proc.returncode == 0, out_text(proc)
     assert f"runner/{MAGIC}" in out_text(proc)
 
@@ -186,6 +215,7 @@ def test_dead_pid_not_treated_as_alive(tmp_path):
         f"{dead}\trunner\t{MAGIC}\tC:\\\\old.log\tPaperSoak\t"
         "2026-10-27T00:00:00.0000000Z\n", encoding="utf-8")
     proc = run_ps1("-Mode", "PaperSoak", "-ConfigDir", str(cfg_dir),
-                   "-LogDir", str(log_dir), "-PrecheckOnly")
+                   "-LogDir", str(log_dir), *precheck_artifact_args(tmp_path),
+                   "-PrecheckOnly")
     assert proc.returncode == 0, out_text(proc)
     assert f"runner/{MAGIC}" not in out_text(proc)  # 不挡启动

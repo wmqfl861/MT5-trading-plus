@@ -503,13 +503,16 @@ def test_research_allowlist_workflow_no_expressions_in_run_script():
 
 
 def _bash_exe():
-    """CI（windows-latest）与本地都自带 Git Bash；找不到才跳过。"""
+    """Git Bash 优先于 PATH 查找：CI（windows-latest）System32 下的 WSL
+    bash.exe 会遮蔽 Git Bash（不同的路径/文件系统语义会让 R8-I1 回归在
+    CI 上假红）；显式路径命中即用，PATH 命中须含 "git" 才可信。"""
+    for cand in (r"C:/Program Files/Git/bin/bash.exe",
+                 r"C:/Program Files (x86)/Git/bin/bash.exe"):
+        if Path(cand).is_file():
+            return cand
     bash = shutil.which("bash")
-    if bash:
+    if bash and "git" in bash.lower():
         return bash
-    fallback = Path("C:/Program Files/Git/bin/bash.exe")
-    if fallback.is_file():
-        return str(fallback)
     pytest.skip("需要 Git Bash 执行 workflow 等价脚本（R8-I1 回归）")
 
 
