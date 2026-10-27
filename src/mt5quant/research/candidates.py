@@ -17,9 +17,15 @@ precheck 对其短路为 fail（理由写明），不进入预筛数值条件。
    快照隔夜费按保守计入——隔夜费率取 long/short 中更不利的一侧 ×声明
    计费夜数）；
 4. 检验力 ≥ 50%：在研究库实际覆盖年数（品种×周期，coverage_years 从
-   meta 水位/parquet 实测，不用常数）上按折算后预期夏普算单次检验
-   （mt5quant.research.power，与 round11 探针逐位一致）；不足 →
-   waiting_data（铁律 18"待数据"队列），不是 fail；
+   meta 水位/parquet 实测 + 已批准外部序列合并（T80/G3，data_research/
+   ext/ 白名单 fred/cdd，逐段列来源），不用常数）上算单次检验
+   （mt5quant.research.power，与 round11 探针逐位一致）；夏普取**声明
+   与隐含中较小者**（T80/G2：隐含夏普 =（声明每事件毛收益 − 事前来回
+   成本）÷ 品种在持仓长度上的无条件收益波动 σ × √每年事件数；σ 由工具
+   从研究库算——随机时点抽样的总体极限 = 持仓周期 bar 的相邻收盘相对
+   收益全体，品种性质、与候选信号无关）；σ=0 或序列不可用 → 隐含记
+   None、按声明夏普计；不足 → waiting_data（铁律 18"待数据"队列），
+   不是 fail；
 5. 机制空缺：组合里已有同类别活跃谱系 → **排后**（排序类理由，不阻塞
    ——决定只有 pass/fail/waiting_data 三值，本条件作为理由记录）。
 
@@ -36,6 +42,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from mt5data.store import TIMEFRAME_SECONDS, load_bars
@@ -46,7 +53,8 @@ __all__ = [
     "CandidateError", "Candidate", "Literature", "Declared",
     "PrecheckResult", "MECHANISM_CLASSES", "RESEARCH_STATUSES",
     "BOOKKEEPING_STATUSES", "PRECHECK_DECISIONS", "load_candidate",
-    "coverage_years", "precheck",
+    "coverage_years", "coverage_segments", "unconditional_volatility",
+    "precheck",
 ]
 
 # 附录 C：机制类别七分类（蓝图 v4 §6.2 预筛条件 5）
@@ -343,23 +351,36 @@ def load_candidate(path) -> Candidate:
 
 # ---------------------------------------------------------------- 覆盖年数
 
-def coverage_years(data_root, symbols, timeframes) -> dict[str, float]:
-    """研究库按 品种×周期 的实际覆盖年数（(last−first)/365.25 天）。
+def _span_years(first: pd.Timestamp, last: pd.Timestamp) -> float:
+    return ((last - first).total_seconds()
+            / (_DAYS_PER_YEAR * 86400.0))
 
-    键为 "SYMBOL/TF"（precheck 的 research_years 口径）；优先读序列
-    meta.json 水位（first_time / last_closed_time），缺 meta 时读 parquet
-    的 time 列。没有的序列不出现在结果里（调用方按缺失处理）。
 
-    与实测密度年化配套（report.observed_bars_per_year 同一思想）：年化
-    夏普的分母年数取跨度，检验力（Lo 近似）才与台账里的夏普同口径。
+def coverage_segments(data_root, symbols, timeframes) -> dict[str, list[dict]]:
+    """研究库按 品种×周期 的覆盖分段（T80/G3）——主段（bars/，MT5 导出）
+    + 已批准外部序列（{root}/ext/<来源>/<品种>/<周期>/）。
+
+    每段：{"source", "first", "last", "years", "counted"}。counted=False
+    的段**不计入**年数（未批准来源在场也如实列出——D36 白名单外的数据
+    不得进研究口径）。主段优先读序列 meta.json 水位（first_time /
+    last_closed_time），缺 meta 时读 parquet 的 time 列；ext 段经
+    mt5data.ext.load_ext_series 读取（manifest 完整性 fail-fast），来源
+    批准状态查 mt5data.ext.approvals.SOURCE_APPROVALS。没有数据的序列
+    不出现在结果里（调用方按缺失处理）。不同来源之间的口径差异只记录
+    （source 标识），不折算。
     """
+    from mt5data.ext.approvals import SOURCE_APPROVALS
+    from mt5data.ext.core import ExtDataError, load_ext_series
+
     root = Path(data_root)
-    out: dict[str, float] = {}
+    out: dict[str, list[dict]] = {}
     for sym in symbols:
         for tf in timeframes:
-            key = f"{sym}/{tf.upper()}"
+            tf_u = tf.upper()
+            key = f"{sym}/{tf_u}"
+            segs: list[dict] = []
             first = last = None
-            meta_p = root / "bars" / str(sym) / tf.upper() / "meta.json"
+            meta_p = root / "bars" / str(sym) / tf_u / "meta.json"
             if meta_p.is_file():
                 try:
                     wm = json.loads(meta_p.read_text(encoding="utf-8"))
@@ -368,15 +389,107 @@ def coverage_years(data_root, symbols, timeframes) -> dict[str, float]:
                 except (ValueError, KeyError, TypeError):
                     first = last = None
             if first is None or last is None or last <= first:
-                bars = load_bars(str(root), str(sym), tf.upper())
-                if bars is None or len(bars) < 2:
-                    continue
-                t = pd.to_datetime(bars["time"])
-                first, last = t.iloc[0], t.iloc[-1]
-            if last > first:
-                out[key] = ((last - first).total_seconds()
-                            / (_DAYS_PER_YEAR * 86400.0))
+                bars = load_bars(str(root), str(sym), tf_u)
+                if bars is not None and len(bars) >= 2:
+                    t = pd.to_datetime(bars["time"])
+                    first, last = t.iloc[0], t.iloc[-1]
+            if first is not None and last is not None and last > first:
+                segs.append({"source": "mt5",
+                             "first": first.isoformat(),
+                             "last": last.isoformat(),
+                             "years": _span_years(first, last),
+                             "counted": True})
+            ext_root = root / "ext"
+            if ext_root.is_dir():
+                for src_dir in sorted(ext_root.iterdir()):
+                    if not src_dir.is_dir():
+                        continue
+                    approved = bool(
+                        SOURCE_APPROVALS.get(src_dir.name, {})
+                        .get("approved"))
+                    seg_dir = src_dir / str(sym) / tf_u
+                    if not (seg_dir / "data.parquet").is_file():
+                        continue
+                    if approved:
+                        try:
+                            loaded = load_ext_series(
+                                str(ext_root), src_dir.name, str(sym), tf_u)
+                        except ExtDataError as e:
+                            segs.append({
+                                "source": src_dir.name, "counted": False,
+                                "years": 0.0,
+                                "note": f"序列不可读（{e}）——不计入"})
+                            continue
+                        if loaded is None:
+                            continue
+                        df, _manifest = loaded
+                        t = pd.to_datetime(df["time"])
+                        e_first, e_last = t.iloc[0], t.iloc[-1]
+                        if e_last > e_first:
+                            segs.append({
+                                "source": src_dir.name,
+                                "first": e_first.isoformat(),
+                                "last": e_last.isoformat(),
+                                "years": _span_years(e_first, e_last),
+                                "counted": True})
+                    else:
+                        # 未批准来源（如 histdata，D36"条款不明的不用"）：
+                        # 在场、如实列出，但不计入年数
+                        try:
+                            t = pd.to_datetime(pd.read_parquet(
+                                seg_dir / "data.parquet")["time"])
+                            segs.append({
+                                "source": src_dir.name,
+                                "first": t.iloc[0].isoformat(),
+                                "last": t.iloc[-1].isoformat(),
+                                "years": _span_years(t.iloc[0], t.iloc[-1]),
+                                "counted": False,
+                                "note": "未批准来源（D36 白名单外）——"
+                                        "不计入研究年数"})
+                        except Exception:
+                            segs.append({
+                                "source": src_dir.name, "counted": False,
+                                "years": 0.0,
+                                "note": "未批准来源且不可读——不计入"})
+            if segs:
+                out[key] = segs
     return out
+
+
+def coverage_years(data_root, symbols, timeframes) -> dict[str, float]:
+    """研究库按 品种×周期 的实际覆盖年数（T80/G3：主段 + 已批准外部序列
+    各段年数之和；未批准来源不计——coverage_segments 逐段口径）。
+
+    键为 "SYMBOL/TF"（precheck 的 research_years 口径）；与实测密度年化
+    配套（report.observed_bars_per_year 同一思想）：年化夏普的分母年数
+    取跨度，检验力（Lo 近似）才与台账里的夏普同口径。
+    """
+    return {key: float(sum(s["years"] for s in segs if s.get("counted")))
+            for key, segs in coverage_segments(
+                data_root, symbols, timeframes).items()}
+
+
+# ------------------------------------------------- 无条件收益波动（T80/G2）
+
+def unconditional_volatility(data_root, symbol: str,
+                             timeframe: str) -> float | None:
+    """品种在持仓长度上的无条件收益波动 σ（相对价格，随机时点口径）。
+
+    σ = 该品种**持仓周期** bar 的相邻收盘相对收益全体的样本标准差
+    （ddof=1）——随机时点抽样的总体极限：随机等权抽取入场时点、持有
+    一个周期长度的收益分布，即品种本身的性质（与候选信号无关、不是
+    策略样本内结果，第十二轮 G2）。用全体而非抽样的原因：确定性、无
+    种子，precheck 结果逐位可复算。
+
+    序列缺失 → None；数据不足（<3 根）→ None；恒价序列 → 0.0（隐含
+    夏普无从折算，调用方按声明夏普计并如实记录）。
+    """
+    bars = load_bars(str(data_root), str(symbol), timeframe.upper())
+    if bars is None or len(bars) < 3:
+        return None
+    closes = pd.to_numeric(bars["close"]).to_numpy(dtype="float64")
+    rets = closes[1:] / closes[:-1] - 1.0
+    return float(np.std(rets, ddof=1))
 
 
 # ---------------------------------------------------------------- 预筛
@@ -479,17 +592,21 @@ def _ex_ante_cost_per_symbol(candidate, symbol, *, data_root, cost_model,
 
 def precheck(candidate: Candidate, *, data_root, cost_model,
              research_years: dict[str, float],
-             active_mechanisms: set[str] | frozenset[str] | None = None
+             active_mechanisms: set[str] | frozenset[str] | None = None,
+             research_coverage_segments: dict[str, list[dict]] | None = None
              ) -> PrecheckResult:
     """预筛五条件（蓝图 §6.2）→ pass / fail / waiting_data 与理由。
 
     - data_root：数据根（合约大小与参考价取自 specs/K 线）；
     - cost_model：成本模型 v3（Costs 聚合体；预筛只信缓存文件模型）；
     - research_years：品种×周期覆盖年数（coverage_years 的产出，键
-      "SYMBOL/TF"）——检验力用它，不用常数；
+      "SYMBOL/TF"，T80/G3 起含已批准外部序列）——检验力用它，不用常数；
     - active_mechanisms：组合内已有活跃谱系的机制类别集合（可选；调用方
       扫候选登记 status∈{in_round, screened_pass} 得到）——机制空缺是
-      排序类理由，不阻塞（决定只有三值）。
+      排序类理由，不阻塞（决定只有三值）；
+    - research_coverage_segments：coverage_segments 的产出（可选；T80/G3
+      逐段来源与年数随 power 检查写进 precheck JSON——不同来源口径差异
+      只记录不折算）。
     """
     if candidate.status in BOOKKEEPING_STATUSES:
         what = ("撤回登记" if candidate.status == cards.WITHDRAWN
@@ -554,37 +671,79 @@ def precheck(candidate: Candidate, *, data_root, cost_model,
             f"{declared.gross_return_per_event:g} ÷ 来回成本 "
             f"{per_symbol[worst_symbol]['round_trip_cost']:g}，预筛条件 3）")
 
-    # 条件 4：检验力（单次检验；铁律 18——不足进"待数据"，不是 fail）
+    # 条件 4：检验力（单次检验；铁律 18——不足进"待数据"，不是 fail）。
+    # T80/G2：夏普取声明与隐含中较小者——隐含夏普 =（每事件毛收益 − 事前
+    # 来回成本）÷ σ × √每年事件数；σ 是品种性质（随机时点口径，与信号
+    # 无关），乐观的夏普声明过不了"毛收益−成本按波动折算"这一关。
     years_detail = {f"{s}/{candidate.holding}":
                     float(research_years.get(f"{s}/{candidate.holding}", 0.0))
                     for s in candidate.symbols}
     years = min(years_detail.values())
     missing = [k for k, v in years_detail.items() if v <= 0.0]
+    sigma_by_symbol: dict[str, float | None] = {}
+    implied_by_symbol: dict[str, float | None] = {}
+    for s in candidate.symbols:
+        sigma = unconditional_volatility(data_root, s, candidate.holding)
+        sigma_by_symbol[s] = sigma
+        if sigma is None or sigma <= 0.0:
+            implied_by_symbol[s] = None      # σ 缺失/恒价 → 无从折算
+        else:
+            net_per_event = (declared.gross_return_per_event
+                             - per_symbol[s]["round_trip_cost"])
+            implied_by_symbol[s] = (net_per_event / sigma
+                                    * math.sqrt(declared.events_per_year))
+    known = [v for v in implied_by_symbol.values() if v is not None]
+    implied_worst = min(known) if known else None
+    sharpe_used = (declared.expected_sharpe if implied_worst is None
+                   else min(declared.expected_sharpe, implied_worst))
     if years <= 0.0:
         pw = 0.0
     else:
-        pw = power.power_one_sided(declared.expected_sharpe, years,
+        pw = power.power_one_sided(sharpe_used, years,
                                    alpha=_POWER_ALPHA,
                                    n_tests=_POWER_N_TESTS)
     power_ok = pw >= _POWER_MIN
     checks["power"] = {
         "passed": power_ok, "power": float(pw), "min": _POWER_MIN,
         "years": years, "expected_sharpe": declared.expected_sharpe,
+        "implied_sharpe": (None if implied_worst is None
+                           else float(implied_worst)),
+        "sharpe_used": float(sharpe_used),
+        "implied_sharpe_by_symbol": implied_by_symbol,
+        "sigma_by_symbol": sigma_by_symbol,
+        "sigma_method": (
+            "无条件收益波动 σ：候选持仓周期 bar 的相邻收盘相对收益全体"
+            "（随机时点抽样的总体极限，ddof=1）——品种性质，与候选信号"
+            "无关、不取自本项目样本内（T80/G2）；隐含夏普 =（毛收益−事前"
+            "来回成本）÷σ×√每年事件数，检验力取 min(声明, 隐含)"),
         "alpha": _POWER_ALPHA, "n_tests": _POWER_N_TESTS,
         "years_detail": years_detail,
         "min_detectable_sharpe": (
             power.min_detectable_sharpe(years, alpha=_POWER_ALPHA,
                                         n_tests=_POWER_N_TESTS)
             if years > 0.0 else None)}
+    if research_coverage_segments is not None:
+        # T80/G3：逐段列来源与年数（未批准来源 counted=False 如实列出）
+        checks["power"]["coverage_segments"] = {
+            k: v for k, v in research_coverage_segments.items()
+            if k in years_detail}
     if not power_ok:
         if missing:
             reasons.append(
                 f"研究库无覆盖 {missing}——检验力无从计算 → 待数据"
                 "（铁律 18：延长研究段（T67）后重检）")
+        elif implied_worst is not None \
+                and implied_worst < declared.expected_sharpe:
+            reasons.append(
+                f"检验力 {pw:.0%} < {_POWER_MIN:.0%}（{years:.2f} 年、"
+                f"隐含夏普 {implied_worst:.2f} < 声明 "
+                f"{declared.expected_sharpe:g}——按较小者计，T80/G2："
+                "毛收益−成本按品种波动 σ 折算到不了声明的夏普）→ 待数据"
+                "（铁律 18：检验力不足不开卡）")
         else:
             reasons.append(
                 f"检验力 {pw:.0%} < {_POWER_MIN:.0%}（{years:.2f} 年、折算"
-                f"夏普 {declared.expected_sharpe:g}）→ 待数据（铁律 18："
+                f"夏普 {sharpe_used:g}）→ 待数据（铁律 18："
                 "检验力不足不开卡，延长研究段（T67）后重检）")
 
     # 条件 5：机制空缺（排序类理由，不阻塞）

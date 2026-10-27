@@ -988,3 +988,43 @@ def test_gate_cli_g5_orchestration_started_then_done(tmp_path, monkeypatch,
         det = json.loads(g5["details_json"])
         assert det["params_selection"]["selection"] == "manual"
         assert (1 if g5["passed"] else 0) == (1 if result["passed"] else 0)
+
+
+# ================================================ T64/D33：dsr_trial_scope 键
+
+def test_g4_dsr_trial_scope_absent_defaults_family():
+    """T64/D33 失败测试：现行 gates.toml 无 dsr_trial_scope 键 → 缺省
+    family（冻结语义：G4 取数逐位不变），且文件未动（sha 仍为冻结值）。"""
+    cfg, sha = vg.load_gates()
+    assert cfg.dsr_trial_scope == "family"
+    assert sha == vg.FROZEN_GATES_SHA256
+
+
+def test_g4_dsr_trial_scope_project_parses(tmp_path):
+    """[g4] 带 dsr_trial_scope = "project"（gates-v3 的形态）→ 可解析；
+    非法枚举值拒绝。"""
+    body = vg.DEFAULT_GATES_TOML.read_text(encoding="utf-8")
+    p = tmp_path / "gates-v3.toml"
+    p.write_text(body.replace(
+        "dsr_min_probability = 0.95",
+        'dsr_trial_scope = "project"\ndsr_min_probability = 0.95'),
+        encoding="utf-8")
+    cfg, _ = vg.load_gates(p, frozen_sha=vg.gates_sha256(p))
+    assert cfg.dsr_trial_scope == "project"
+    assert cfg.dsr_min_probability == 0.95
+    # family 也合法（显式写出的缺省值）
+    p2 = tmp_path / "gates-family.toml"
+    p2.write_text(body.replace(
+        "dsr_min_probability = 0.95",
+        'dsr_trial_scope = "family"\ndsr_min_probability = 0.95'),
+        encoding="utf-8")
+    assert vg.load_gates(p2, frozen_sha=vg.gates_sha256(p2))[0] \
+        .dsr_trial_scope == "family"
+    # 枚举外拒绝
+    p3 = tmp_path / "gates-bad.toml"
+    p3.write_text(body.replace(
+        "dsr_min_probability = 0.95",
+        'dsr_trial_scope = "global"\ndsr_min_probability = 0.95'),
+        encoding="utf-8")
+    with pytest.raises(vg.GatesConfigError, match="dsr_trial_scope"):
+        vg.load_gates(p3, frozen_sha=vg.gates_sha256(p3))

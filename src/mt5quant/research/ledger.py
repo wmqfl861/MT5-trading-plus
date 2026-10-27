@@ -6,11 +6,14 @@
 - runs(run_id, card_id, card_version, strategy, params_json, symbol,
   timeframe, data_first, data_last, data_sha256, strategy_sha,
   engine_version, cost_model_version, gates_hash, metrics_json,
-  created_utc, actor, prev_hash, row_hash)——
+  created_utc, actor, run_class, prev_hash, row_hash)——
   **失败的运行也记一行**（metrics_json 里 ok=false + error 摘要）；
   strategy_sha（T37/H3/D23）：策略代码指纹（cards.strategy_fingerprint）
   ——试验身份含代码，改代码重跑即不同的试验（N 不再被低估）；老库迁移
   前的旧行补 "legacy"（指纹未知，不参与卡版本绑定）；
+  run_class（T80/G4，D33）：运行类别 research|calibration|ops|migration
+  ——由 bt 按候选状态与轮次写入（不看 actor 文本，CLI 保留名拒绝）；
+  旧库迁移补列，旧行按 actor 推断并记一行迁移事件；
 - gates(run_id, gate, passed, details_json, prev_hash, row_hash)——
   关卡结果（T12 消费）；
 - lockbox_uses(card_id UNIQUE, used_at_utc, approved_by, result_json,
@@ -45,6 +48,10 @@
   哈希链）补列后 runs 链按新内容**整体重算一次**（与 T37 迁移同一信任
   边界；链头变化会与 docs/ops/ledger-anchors.md 的锚定记录不符——
   迁移后须重新锚定，scripts/ledger_anchor.py）。
+- runs.run_class（T80/G4，D33）：同上走 _rechain 迁移路径——生产台账
+  迁移后须用 scripts/ledger_anchor.py --accept-rechain 重锚（旧头取
+  锚文件最近条目，--dump-heads 取证；迁移由主会话执行，代码只提供
+  自动迁移路径）。
 
 哈希链（T37/M6/D27；R6/C5 防洗链；T62 加 candidate_checks；T63 加
 rounds）：runs / gates / lockbox_uses / candidate_checks / rounds 各一条
@@ -97,6 +104,11 @@ N 的口径（T21c/H4/M4；T37 加入 strategy_sha）：DSR 的试验次数 = �
 cost_model_version, strategy_sha) 去重后的成功运行数（stats 的 n_dedup /
 family_n_dedup），同时给出项目级 project_n_dedup——同参 screen+gate 只计
 1 次，v1/v2 新卡累计进同一谱系；改策略代码（指纹变）= 新试验。
+T64/D33 新增项目级研究口径 project_n_dedup_research：只计 run_class=
+research 的运行（排除 calibration/ops/migration——标定与运维不是研究
+试验；H 线与 P 线合并计算）。n_dedup / family_n_dedup / project_n_dedup
+的现行语义冻结不变（G4 缺省 family 口径逐位一致），研究口径只作为新增
+键与 dsr_trial_scope=project 时的取数来源。
 """
 from __future__ import annotations
 
@@ -141,6 +153,7 @@ CREATE TABLE IF NOT EXISTS runs(
   created_utc        TEXT NOT NULL,
   actor              TEXT NOT NULL,
   round_id           TEXT,
+  run_class          TEXT NOT NULL DEFAULT 'research',
   prev_hash          TEXT NOT NULL DEFAULT '',
   row_hash           TEXT NOT NULL DEFAULT ''
 );
@@ -218,6 +231,20 @@ CREATE TABLE IF NOT EXISTS ledger_events(
 # 蓝图 §8 的建议值是 5；用户对 D16 拍板前以此为硬编码默认，
 # lockbox_budget(cutoff, max_uses=N) 首次登记时可覆盖。
 DEFAULT_LOCKBOX_MAX_USES = 5
+
+# T80/G4（D33）：运行类别与保留 actor 名。run_class 由 bt 按候选状态与
+# 轮次写入（标定样品 → calibration；研究运行 → research；运维通道
+# actor=ops → ops；迁移行 → migration），N 的研究口径只看这个字段，
+# 不看 actor 文本——保留名在 CLI 层拒绝（防研究运行借 actor 逃出研究 N）。
+RUN_CLASSES = ("research", "calibration", "ops", "migration")
+RESERVED_ACTORS = ("calibration", "ops", "migration")
+
+
+def run_class_for_actor(actor: str) -> str:
+    """actor → run_class 推断（旧库迁移与 record_run 缺省口径）：
+    保留名同名映射，其余一律 research（第十二轮 G4：N 的口径不看 actor
+    文本，保留名之外 actor 只是自由文本标签）。"""
+    return actor if actor in RESERVED_ACTORS else "research"
 
 # T37/M6/D27：带哈希链的表；链首 prev_hash（常量，与"空串"的
 # 未迁移状态可区分）。R6/C5：ledger_events 为审计附表（不哈希链，
@@ -342,6 +369,58 @@ class Ledger:
                     with self._txn():
                         self._rechain("runs")
                         self._snapshot_refresh("runs")
+        # T80/G4 迁移（D33）：runs 加 run_class（research|calibration|ops|
+        # migration，由 bt 按候选状态与轮次写入；旧行按 actor 推断）。
+        # 列进哈希规范化内容，已有链的旧库补列后 runs 链按新内容整体重算
+        # 一次并记一行迁移事件（t80-run-class-migration）——与 round_id
+        # 迁移同一信任边界：链头变化会与 docs/ops/ledger-anchors.md 的
+        # 锚定记录不符，**生产台账迁移后须用 scripts/ledger_anchor.py
+        # --accept-rechain 重锚**（旧头取锚文件最近条目；--dump-heads 取
+        # 证）。迁移本身由主会话执行，这里只提供自动迁移路径。在 T37
+        # 迁移块之前执行：pre-T37 旧库旧行先推断好类别，随后的一次性
+        # 重建直接覆盖本列（事件行由 T37 迁移行承载，不重复记）。
+        if "run_class" not in runs_cols:
+            with self._txn():
+                self.conn.execute(
+                    "ALTER TABLE runs ADD COLUMN run_class TEXT"
+                    " NOT NULL DEFAULT 'research'")
+                n_runs = int(self.conn.execute(
+                    "SELECT COUNT(*) n FROM runs").fetchone()["n"])
+                if n_runs:
+                    # 旧行按 actor 推断（迁移前无独立字段，G4）
+                    for actor_name in RESERVED_ACTORS:
+                        self.conn.execute(
+                            "UPDATE runs SET run_class=? WHERE actor=?",
+                            (actor_name, actor_name))
+            if not pre_migration and n_runs:
+                with self._txn():
+                    payload = {"ok": True, "error": None,
+                               "metrics": {
+                                   "event": "t80-run-class-migration",
+                                   "runs": n_runs,
+                                   "note": "旧行 run_class 按 actor "
+                                           "推断（calibration/ops/"
+                                           "migration 同名映射，其余"
+                                           " research）；runs 链按新"
+                                           "内容整体重算——生产台账"
+                                           "须 --accept-rechain 重锚"}}
+                    self.conn.execute(
+                        "INSERT INTO runs(card_id, card_version,"
+                        " strategy, params_json, symbol, timeframe,"
+                        " data_first, data_last, data_sha256,"
+                        " strategy_sha, engine_version,"
+                        " cost_model_version, gates_hash,"
+                        " metrics_json, created_utc, actor,"
+                        " run_class)"
+                        " VALUES ('__migration__', 0,"
+                        " '__migration__', '{}', '-', '-', NULL,"
+                        " NULL, '-', 'legacy', 'ledger-v1',"
+                        " 'ledger-v1', '', ?, ?, 'migration',"
+                        " 'migration')",
+                        (json.dumps(payload, ensure_ascii=False),
+                         datetime.now(timezone.utc).isoformat()))
+                    self._rechain("runs")
+                    self._snapshot_refresh("runs")
         # T37 迁移（H3/M6，D23/D27）：runs 加 strategy_sha/prev_hash/
         # row_hash，gates 与 lockbox_uses 加 prev_hash/row_hash；旧行
         # strategy_sha='legacy'，三链自第一行重建，迁移记一行
@@ -376,10 +455,11 @@ class Ledger:
                         " params_json, symbol, timeframe, data_first,"
                         " data_last, data_sha256, strategy_sha,"
                         " engine_version, cost_model_version, gates_hash,"
-                        " metrics_json, created_utc, actor)"
+                        " metrics_json, created_utc, actor, run_class)"
                         " VALUES ('__migration__', 0, '__migration__',"
                         " '{}', '-', '-', NULL, NULL, '-', 'legacy',"
-                        " 'ledger-v1', 'ledger-v1', '', ?, ?, 'migration')",
+                        " 'ledger-v1', 'ledger-v1', '', ?, ?, 'migration',"
+                        " 'migration')",
                         (json.dumps(payload, ensure_ascii=False),
                          datetime.now(timezone.utc).isoformat()))
                 for tbl in _CHAIN_TABLES:
@@ -759,7 +839,8 @@ class Ledger:
                    gates_hash: str, metrics: dict | None,
                    error: str | None = None, actor: str = "bt",
                    created_utc=None, strategy_sha: str = "legacy",
-                   round_id: str | None = None) -> int:
+                   round_id: str | None = None,
+                   run_class: str | None = None) -> int:
         """记一行运行（成功的与抛异常的 alike）；返回 run_id。
 
         metrics 与 error 二选一（有 error 时 metrics 记 None）；
@@ -767,13 +848,25 @@ class Ledger:
         strategy_sha（T37/D23）：策略代码指纹，缺省 'legacy'（调用方
         未计算的旧路径/迁移前语义——研究路径 bt.py 必须传真实指纹）；
         round_id（T63/D32）：运行所属研究轮次；None = 轮次制之前/之外
-        （旧路径与标定样品运行不带轮次——它们不进入轮次统计）。
+        （旧路径与标定样品运行不带轮次——它们不进入轮次统计）；
+        run_class（T80/G4，D33）：运行类别 research|calibration|ops|
+        migration——bt 按候选状态与轮次写入（样品卡 calibration、研究
+        卡 research；运维通道 reconcile_ab 的 actor=ops 经缺省推断为 ops）；
+        缺省 None = 按 actor 推断（run_class_for_actor）；枚举外 →
+        ValueError。
         R6/C5：写前验证链（不完整 → LedgerTamperedError，不洗链）；
         追加只延伸链（_append_chained，增量计算 row_hash）。
         R7/N-C3：验链、读链尾、写入、刷快照同一 BEGIN IMMEDIATE 事务
         ——并发 record_run 受控交错后链必须完好（旧行为：验链与读链尾
         都在事务外，第三行接旧链尾）。
         """
+        if run_class is None:
+            run_class = run_class_for_actor(actor)
+        if run_class not in RUN_CLASSES:
+            raise ValueError(
+                f"runs.run_class 必须是 {list(RUN_CLASSES)}，收到 "
+                f"{run_class!r}（T80/G4：运行类别由 bt 按候选状态与轮次"
+                "写入，N 的研究口径只看这个字段）")
         payload = {"ok": error is None, "error": error, "metrics": metrics}
         with self._txn():
             self._verify_or_raise()
@@ -791,6 +884,7 @@ class Ledger:
                 "metrics_json": json.dumps(_san(payload), ensure_ascii=False),
                 "created_utc": _iso(created_utc), "actor": actor,
                 "round_id": round_id,
+                "run_class": run_class,
             })
 
     def record_gate(self, run_id: int, gate: str, passed: bool,
@@ -1026,8 +1120,9 @@ class Ledger:
         stats 的 n_dedup 同键同口径（迁移行与失败运行不计）。"""
         rows = self.conn.execute(
             "SELECT strategy, params_json, symbol, timeframe, data_sha256,"
-            " cost_model_version, strategy_sha, actor, metrics_json"
-            " FROM runs WHERE round_id=?", (round_id,)).fetchall()
+            " cost_model_version, strategy_sha, actor, run_class,"
+            " metrics_json FROM runs WHERE round_id=?",
+            (round_id,)).fetchall()
         return self._dedup_n(rows)
 
     def round_lockbox_uses(self, round_id: str) -> int:
@@ -1159,14 +1254,22 @@ class Ledger:
             " ORDER BY run_id LIMIT 1", (card_id, version)).fetchone()
         return None if row is None else str(row["strategy_sha"])
 
-    def _dedup_n(self, rows: list) -> int:
+    def _dedup_n(self, rows: list, *, only_research: bool = False) -> int:
         """按 (strategy, params, symbol, timeframe, data_sha256,
         cost_model_version, strategy_sha) 对成功运行去重计数（params 键序
-        无关；T37：指纹进键——改代码重跑即新试验；actor=migration 的
-        迁移行不是试验，不计入）。"""
+        无关；T37：指纹进键——改代码重跑即新试验；run_class=migration 的
+        迁移行不是试验，不计入——与旧行为 actor=migration 等价）。
+        only_research=True（T64/D33）：只计 run_class=research（排除
+        calibration/ops/migration——标定与运维不是研究试验）；行缺
+        run_class 键时按 actor 推断（迁移前旧数据）。"""
         keys = set()
         for r in rows:
-            if r["actor"] == "migration":
+            rc = r["run_class"] if "run_class" in r.keys() else None
+            if rc is None:
+                rc = run_class_for_actor(r["actor"])
+            if rc == "migration":
+                continue
+            if only_research and rc != "research":
                 continue
             if not json.loads(r["metrics_json"]).get("ok"):
                 continue
@@ -1188,13 +1291,18 @@ class Ledger:
           参数先 screen 后 gate 只计 1；改策略代码（指纹变）= 新试验；
         - family / family_total_runs / family_n_dedup：谱系口径
           （H012-v1 与 H012-v2 累计进同一谱系 H012）；
-        - project_n_dedup：项目级去重 N（两种调用都附带）。
-        迁移行（actor=migration）计入 total_runs（可审计）、不计入 N。
+        - project_n_dedup：项目级去重 N（两种调用都附带）；
+        - project_n_dedup_research（T64/D33）：项目级**研究**去重 N——
+          只计 run_class=research（排除 calibration/ops/migration；
+          H 线与 P 线合并计算），dsr_trial_scope=project 时 G4 的取数
+          来源。现行 n_dedup / family_n_dedup / project_n_dedup 的语义
+          冻结不变（缺省 family 口径逐位一致）。
+        迁移行（run_class=migration）计入 total_runs（可审计）、不计入 N。
         """
         all_rows = self.conn.execute(
             "SELECT card_id, metrics_json, strategy, params_json, symbol,"
             " timeframe, data_sha256, strategy_sha, cost_model_version,"
-            " created_utc, actor FROM runs").fetchall()
+            " created_utc, actor, run_class FROM runs").fetchall()
         sel = ([r for r in all_rows if r["card_id"] == card_id]
                if card_id else list(all_rows))
         by_card: dict = {}
@@ -1215,6 +1323,8 @@ class Ledger:
             "lockbox_uses": int(self.conn.execute(
                 "SELECT COUNT(*) n FROM lockbox_uses").fetchone()["n"]),
             "project_n_dedup": project_n,
+            "project_n_dedup_research": self._dedup_n(
+                all_rows, only_research=True),
         }
         if sel:
             times = sorted(r["created_utc"] for r in sel)

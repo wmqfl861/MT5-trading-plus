@@ -588,16 +588,26 @@ PROD_LEDGER = Path(__file__).resolve().parents[1] / "data" / "research" \
 @pytest.mark.skipif(not PROD_LEDGER.is_file(),
                     reason="本地生产台账存在时才跑（CI 克隆无 data/）")
 def test_migration_on_copy_of_production_ledger(tmp_path):
-    """迁移只发生在副本上；生产台账本体字节不变（生产迁移由主会话执行）。"""
+    """迁移只发生在副本上；生产台账本体字节不变（生产迁移由主会话执行）。
+    生产台账已带 T37 迁移行；T80 打开副本追加 run_class 迁移事件行并
+    整链重算（verify 自洽）——生产台账本体迁移+--accept-rechain 重锚由
+    主会话执行，不经本测试。"""
     import shutil
     copy = tmp_path / "ledger-copy.sqlite"
     shutil.copyfile(PROD_LEDGER, copy)
     prod_bytes = PROD_LEDGER.read_bytes()
     with Ledger(copy) as led:
         assert led.verify_chain() == []
+        events = {json.loads(r[0])["metrics"]["event"] for r in
+                  led.conn.execute(
+                      "SELECT metrics_json FROM runs"
+                      " WHERE actor='migration'").fetchall()}
+        assert events == {"t37-hash-chain-migration",
+                          "t80-run-class-migration"}
+        # 迁移后旧行 run_class 已按 actor 推断（G4：研究 N 的取数口径）
         assert led.conn.execute(
-            "SELECT COUNT(*) FROM runs WHERE actor='migration'"
-        ).fetchone()[0] == 1
+            "SELECT COUNT(*) FROM runs WHERE run_class IS NULL"
+        ).fetchone()[0] == 0
     assert PROD_LEDGER.read_bytes() == prod_bytes   # 本体未被触碰
 
 
@@ -741,7 +751,8 @@ def test_forged_append_beyond_snapshot_detected(tmp_path):
                "engine_version": "e", "cost_model_version": "v",
                "gates_hash": "", "metrics_json": "{}",
                "created_utc": "2026-10-01T00:00:00+00:00", "actor": "forger",
-               "round_id": None}          # T63：runs 内容列新增 round_id
+               "round_id": None,          # T63：runs 内容列新增 round_id
+               "run_class": "research"}   # T80：runs 内容列新增 run_class
     canon = json.dumps(content, sort_keys=True, ensure_ascii=False,
                        separators=(",", ":"))
     h = hashlib.sha256((canon + tail).encode("utf-8")).hexdigest()
@@ -1081,3 +1092,143 @@ def test_ledger_events_content_rewrite_detected(tmp_path):
         problems = led2.verify_chain()
         assert any("ledger_events" in q and ("内容" in q or "改写" in q)
                    for q in problems)
+
+
+# ================================================ T64/T80：run_class 与项目级研究 N
+
+def test_record_run_run_class_written_and_inferred_by_actor(tmp_path):
+    """T80/G4 失败测试：runs.run_class 由 bt 写入（research|calibration|ops|
+    migration）；不传时按 actor 推断（旧行为兼容）；枚举外拒绝。"""
+    with Ledger(tmp_path / "l.sqlite") as led:
+        rid = record(led, run_n=1)                    # actor=test → research
+        got = led.conn.execute(
+            "SELECT run_class FROM runs WHERE run_id=?",
+            (rid,)).fetchone()["run_class"]
+        assert got == "research"
+        base = dict(card_id="H001", card_version=1, strategy="s:C",
+                    params={"x": 1}, symbol="X", timeframe="H1",
+                    data_first=None, data_last=None, data_sha256="a" * 64,
+                    engine_version="A", cost_model_version="v",
+                    gates_hash="", metrics={"net": 1.0})
+        for actor, cls in (("calibration", "calibration"), ("ops", "ops"),
+                           ("migration", "migration"), ("bt-screen", "research")):
+            rid2 = led.record_run(actor=actor, **base)
+            got2 = led.conn.execute(
+                "SELECT run_class FROM runs WHERE run_id=?",
+                (rid2,)).fetchone()["run_class"]
+            assert got2 == cls, (actor, got2)
+        rid3 = led.record_run(actor="whatever", run_class="calibration",
+                              **base)
+        assert led.conn.execute(
+            "SELECT run_class FROM runs WHERE run_id=?",
+            (rid3,)).fetchone()["run_class"] == "calibration"
+        with pytest.raises(ValueError, match="run_class"):
+            led.record_run(actor="whatever", run_class="yolo", **base)
+
+
+def test_stats_project_n_dedup_research(tmp_path):
+    """T64/D33 失败测试 1+2：project_n_dedup_research 只计 run_class=
+    research——两个谱系各 10 次试验 → 项目（研究）N=20、谱系 N=10；标定/
+    运维/迁移运行不计；现行口径（project_n_dedup / family_n_dedup）保持
+    逐位不变（只排 migration——冻结语义）。"""
+    led = Ledger(tmp_path / "l.sqlite")
+    t = datetime(2026, 10, 20, tzinfo=timezone.utc)
+    for fam, sym in (("H201", "XAUUSD"), ("H202", "EURUSD")):
+        for i in range(1, 11):
+            record(led, run_n=i, card_id=fam, symbol=sym, created_utc=t)
+    # 标定（T61 样品）/运维（reconcile_ab）/迁移行：各一次，参数互不相同
+    led.record_run(card_id="H201", card_version=1,
+                   strategy="mt5quant.strategies.library.buy_hold:BuyHold",
+                   params={"run": 99}, symbol="XAUUSD", timeframe="H1",
+                   data_first=None, data_last=None, data_sha256="deadbeef" * 8,
+                   engine_version="A-1.1", cost_model_version="zero-v0",
+                   gates_hash="", metrics={"net": 1.0},
+                   actor="calibration", created_utc=t)
+    led.record_run(card_id="H202", card_version=1,
+                   strategy="mt5quant.strategies.library.buy_hold:BuyHold",
+                   params={"run": 98}, symbol="EURUSD", timeframe="H1",
+                   data_first=None, data_last=None, data_sha256="deadbeef" * 8,
+                   engine_version="A-1.1", cost_model_version="zero-v0",
+                   gates_hash="", metrics={"net": 1.0},
+                   actor="ops", created_utc=t)
+    led.record_run(card_id="H201", card_version=1,
+                   strategy="mt5quant.strategies.library.buy_hold:BuyHold",
+                   params={"run": 97}, symbol="XAUUSD", timeframe="H1",
+                   data_first=None, data_last=None, data_sha256="deadbeef" * 8,
+                   engine_version="A-1.1", cost_model_version="zero-v0",
+                   gates_hash="", metrics={"net": 1.0},
+                   actor="migration", created_utc=t)
+    st = led.stats()
+    assert st["project_n_dedup"] == 22            # 现行：只排 migration（冻结）
+    assert st["project_n_dedup_research"] == 20   # T64：只计 research 类
+    st1 = led.stats("H201")
+    assert st1["family_n_dedup"] == 11            # 现行谱系口径不变（含标定）
+    assert st1["n_dedup"] == 11
+    assert st1["project_n_dedup_research"] == 20
+    st2 = led.stats("H202")
+    assert st2["family_n_dedup"] == 11            # 10 研究 + 1 运维
+    assert st2["project_n_dedup_research"] == 20
+    led.close()
+
+
+_PRE_T80_RUNS = """
+CREATE TABLE runs(
+  run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  card_id TEXT NOT NULL, card_version INTEGER NOT NULL,
+  strategy TEXT NOT NULL, params_json TEXT NOT NULL,
+  symbol TEXT NOT NULL, timeframe TEXT NOT NULL,
+  data_first TEXT, data_last TEXT, data_sha256 TEXT NOT NULL,
+  strategy_sha TEXT NOT NULL DEFAULT 'legacy',
+  engine_version TEXT NOT NULL, cost_model_version TEXT NOT NULL,
+  gates_hash TEXT NOT NULL DEFAULT '', metrics_json TEXT NOT NULL,
+  created_utc TEXT NOT NULL, actor TEXT NOT NULL, round_id TEXT,
+  prev_hash TEXT NOT NULL DEFAULT '', row_hash TEXT NOT NULL DEFAULT ''
+);
+"""
+
+
+def test_pre_t80_ledger_migrates_run_class_by_actor(tmp_path):
+    """T80/G4 失败测试：旧库（有哈希链、无 run_class 列）打开即迁移——
+    旧行按 actor 推断 run_class、记一行迁移事件、runs 链按新内容整体
+    重算一次（verify 通过）；重开幂等（不再补事件行）。生产台账迁移后
+    须用 scripts/ledger_anchor.py --accept-rechain 重锚（提交说明预告，
+    主会话执行）。"""
+    p = tmp_path / "old.sqlite"
+    conn = sqlite3.connect(str(p))
+    conn.executescript(_PRE_T80_RUNS)
+    for i, actor in enumerate(("bt-screen", "calibration", "ops",
+                               "migration"), start=1):
+        conn.execute(
+            "INSERT INTO runs(card_id, card_version, strategy, params_json,"
+            " symbol, timeframe, data_sha256, strategy_sha, engine_version,"
+            " cost_model_version, gates_hash, metrics_json, created_utc,"
+            " actor, prev_hash, row_hash)"
+            " VALUES ('H001',1,'s:BuyHold',?,'XAUUSD','H1',?,'x','A-1.1',"
+            "'zero-v0','',?,'2026-10-01T00:00:00+00:00',?,'0','0')",
+            (json.dumps({"i": i}), "a" * 64,
+             json.dumps({"ok": True, "error": None, "metrics": {"n": i}}),
+             actor))
+    conn.commit()
+    conn.close()
+    with Ledger(p) as led:
+        cols = {r["name"] for r in led.conn.execute(
+            "PRAGMA table_info(runs)")}
+        assert "run_class" in cols
+        assert led.verify_chain() == []          # 迁移重算后链自洽
+        got = {r["actor"]: r["run_class"] for r in led.conn.execute(
+            "SELECT actor, run_class FROM runs WHERE card_id<>'__migration__'")}
+        assert got == {"bt-screen": "research", "calibration": "calibration",
+                       "ops": "ops", "migration": "migration"}
+        mig = led.conn.execute(
+            "SELECT metrics_json FROM runs WHERE card_id='__migration__'"
+            " AND actor='migration'").fetchall()
+        assert len(mig) == 1                     # 迁移事件行（记一行迁移）
+        assert "t80-run-class-migration" in mig[0]["metrics_json"]
+        st = led.stats()
+        assert st["project_n_dedup_research"] == 1   # 只剩 actor=bt-screen 那行
+        assert st["project_n_dedup"] == 3         # 现行口径：排 migration 两行
+    with Ledger(p, create=False) as led2:        # 幂等：不再补事件行
+        assert led2.verify_chain() == []
+        assert led2.conn.execute(
+            "SELECT COUNT(*) FROM runs WHERE card_id='__migration__'"
+        ).fetchone()[0] == 1

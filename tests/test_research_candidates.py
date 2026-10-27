@@ -566,3 +566,159 @@ def test_bt_candidate_check_repo_c900_specimen(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 1, out
     assert "specimen" in out
+
+
+# ================================================ T80/G2、G3：隐含夏普与外部年数
+
+def make_volatile_data_root(tmp_path, *, lo=2000.0, hi=2100.0):
+    """D1 收盘交替 lo/hi（研究年数不变、σ 可控>0）——隐含夏普的取数场景。"""
+    root = make_data_root(tmp_path)
+    p = root / "bars" / SYMBOL / "D1" / "data.parquet"
+    df = pd.read_parquet(p)
+    df["close"] = [lo if i % 2 == 0 else hi for i in range(len(df))]
+    df.to_parquet(p)
+    return root
+
+
+def test_unconditional_volatility_hand_computed(tmp_path):
+    """T80/G2 失败测试：σ = 候选持仓周期 bar 的相邻收盘相对收益全体
+    （随机时点抽样的总体极限，品种性质）——小序列手算闭式核对；恒价
+    序列 σ=0；缺序列 None。"""
+    import math as _math
+
+    root = tmp_path / "d"
+    d = root / "bars" / SYMBOL / "D1"
+    d.mkdir(parents=True)
+    n = 8                                    # 7 个收益：4×(+1/10)、3×(−1/11)
+    times = pd.date_range("2026-01-01", periods=n, freq="D")
+    closes = [100.0, 110.0] * 4
+    pd.DataFrame({"time": times, "open": closes, "high": closes,
+                  "low": closes, "close": closes, "tick_volume": 1,
+                  "spread": 0, "real_volume": 0}).to_parquet(
+        d / "data.parquet")
+    sigma = candidates.unconditional_volatility(root, SYMBOL, "D1")
+    # 手算：均值 1/55；样本方差 (4×(9/110)² + 3×(12/110)²)/6 = 756/72600
+    assert sigma == pytest.approx(_math.sqrt(756.0 / 72600.0))
+    # 恒价序列（现行夹具形态）→ σ=0（隐含夏普无从折算，按声明夏普计）
+    root2 = make_data_root(tmp_path, price=2000.0)
+    assert candidates.unconditional_volatility(root2, SYMBOL, "D1") == 0.0
+    assert candidates.unconditional_volatility(
+        tmp_path / "nope", SYMBOL, "D1") is None
+
+
+def test_precheck_power_uses_min_of_declared_and_implied_sharpe(tmp_path):
+    """T80/G2 失败测试 1：声明夏普 1.5、但（毛收益−事前来回成本）÷σ×
+    √事件数 折算的隐含夏普 ≈0.2 → 检验力按隐含（较小者）算（waiting_data）；
+    两个夏普与 σ 口径都写进 precheck JSON。"""
+    import math as _math
+
+    body = CANDIDATE_TOML.replace("expected_sharpe = 1.0",
+                                  "expected_sharpe = 1.5")
+    c = load_candidate(write_candidate(tmp_path, body))
+    root = make_volatile_data_root(tmp_path)
+    sigma = candidates.unconditional_volatility(root, SYMBOL, "D1")
+    assert sigma > 0.04
+    implied = (0.003 - EXPECTED_COST) / sigma * _math.sqrt(12.0)
+    assert implied < 0.5                        # 构造：隐含远低于声明 1.5
+    res = precheck(c, data_root=root, cost_model=make_costs(),
+                   research_years={f"{SYMBOL}/D1": YEARS_D1})
+    pw = res.checks["power"]
+    assert pw["expected_sharpe"] == pytest.approx(1.5)
+    assert pw["sigma_by_symbol"][SYMBOL] == pytest.approx(sigma)
+    assert pw["implied_sharpe_by_symbol"][SYMBOL] == pytest.approx(implied)
+    assert pw["implied_sharpe"] == pytest.approx(implied)
+    assert pw["sharpe_used"] == pytest.approx(implied)   # min(声明, 隐含)
+    assert pw["power"] == pytest.approx(
+        candidates.power.power_one_sided(implied, YEARS_D1))
+    assert res.decision == "waiting_data"
+    assert any("隐含" in r for r in res.reasons)
+    assert "随机时点" in pw["sigma_method"]
+
+
+def test_precheck_power_uses_declared_when_sigma_zero(tmp_path):
+    """T80/G2：σ=0（恒价序列/序列不可用）→ 隐含夏普记 None、按声明夏普
+    计算（现行结果逐位不变——test_precheck_pass 的语义由此钉住）。"""
+    c = load_candidate(write_candidate(tmp_path))
+    root = make_data_root(tmp_path)             # 恒价 → σ=0
+    res = precheck(c, data_root=root, cost_model=make_costs(),
+                   research_years={f"{SYMBOL}/D1": YEARS_D1})
+    pw = res.checks["power"]
+    assert pw["implied_sharpe"] is None
+    assert pw["sigma_by_symbol"][SYMBOL] == 0.0
+    assert pw["sharpe_used"] == pytest.approx(1.0)
+    assert pw["power"] == pytest.approx(
+        candidates.power.power_one_sided(1.0, YEARS_D1))
+    assert res.decision == "pass"
+
+
+def _write_ext(root, source, symbol, tf, *, first, days):
+    """研究库 ext 布局 {root}/ext/<来源>/<品种>/<周期>/ 的最小序列。"""
+    d = root / "ext" / source / symbol / tf
+    d.mkdir(parents=True)
+    times = pd.date_range(first, periods=days, freq="D")
+    df = pd.DataFrame({"time": times, "open": 100.0, "high": 100.0,
+                       "low": 100.0, "close": 100.0, "tick_volume": 1,
+                       "spread": 0, "real_volume": 0})
+    df.to_parquet(d / "data.parquet")
+    manifest = {
+        "source": source, "source_url": "https://example.test/x",
+        "symbol": symbol, "timeframe": tf, "price_side": "mid",
+        "original_timezone": "UTC", "dst_rule": "无", "terms_note": "测试",
+        "downloaded_at_utc": "2026-10-27T00:00:00+00:00",
+        "source_files": [{"name": "x.csv", "sha256": "0" * 64}],
+        "converter_version": 1, "rows": days,
+        "first_time": times[0].isoformat(),
+        "last_time": times[-1].isoformat()}
+    (d / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return d
+
+
+def test_coverage_years_merges_approved_ext_segments(tmp_path):
+    """T80/G3 失败测试 2：批准 ext 序列（fred）计入研究年数、逐段列来源
+    与年数；未批准来源（histdata）在场也不计。"""
+    root = make_data_root(tmp_path)
+    _write_ext(root, "fred", SYMBOL, "D1", first="2010-01-05", days=3650)
+    _write_ext(root, "histdata", SYMBOL, "D1", first="1990-01-01", days=7300)
+    key = f"{SYMBOL}/D1"
+    cov = candidates.coverage_years(root, [SYMBOL], ["D1"])
+    ext_years = 3650 / 365.25
+    assert cov[key] == pytest.approx(YEARS_D1 + ext_years, abs=0.05)
+    segs = candidates.coverage_segments(root, [SYMBOL], ["D1"])
+    by_src = {s["source"]: s for s in segs[key]}
+    assert {"mt5", "fred"} <= set(by_src)
+    assert by_src["mt5"]["counted"] is True
+    assert by_src["fred"]["counted"] is True
+    assert by_src["fred"]["years"] == pytest.approx(ext_years, abs=0.01)
+    assert "fred" == by_src["fred"]["source"]          # 逐段列来源
+    # 未批准来源：在场、可读，但不计入年数（D36 白名单外）
+    assert "histdata" in by_src
+    assert by_src["histdata"]["counted"] is False
+    assert by_src["histdata"]["years"] == pytest.approx(7300 / 365.25,
+                                                        abs=0.01)
+    # 没有外部序列时与现行一致（只有主段）
+    root2 = make_data_root(tmp_path / "plain")
+    cov2 = candidates.coverage_years(root2, [SYMBOL], ["D1"])
+    assert cov2[key] == pytest.approx(YEARS_D1, abs=0.02)
+    assert [s["source"] for s in
+            candidates.coverage_segments(root2, [SYMBOL], ["D1"])[key]] \
+        == ["mt5"]
+
+
+def test_precheck_json_carries_coverage_segments(tmp_path):
+    """T80/G3：precheck JSON 的 power 检查逐段列出覆盖来源与年数
+    （研究年数=各段合计的同一来源），隐含夏普字段同在。"""
+    root = make_volatile_data_root(tmp_path)
+    _write_ext(root, "fred", SYMBOL, "D1", first="2010-01-05", days=3650)
+    segs = candidates.coverage_segments(root, [SYMBOL], ["D1"])
+    years = {k: sum(s["years"] for s in v if s.get("counted"))
+             for k, v in segs.items()}
+    c = load_candidate(write_candidate(tmp_path))
+    res = precheck(c, data_root=root, cost_model=make_costs(),
+                   research_years=years,
+                   research_coverage_segments=segs)
+    pw = res.checks["power"]
+    assert pw["years"] == pytest.approx(years[f"{SYMBOL}/D1"])
+    srcs = {s["source"]: s["counted"]
+            for s in pw["coverage_segments"][f"{SYMBOL}/D1"]}
+    assert srcs == {"mt5": True, "fred": True}
+    assert "implied_sharpe" in pw and "sigma_method" in pw

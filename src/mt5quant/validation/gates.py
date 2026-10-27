@@ -102,6 +102,10 @@ class GatesConfig:
     lockbox_warn_percentile: float
     lockbox_min_trades_ratio: float
     lockbox_bootstrap_sims: int
+    # [g4] 可选（T64/D33）：G4 的 N 与试验夏普取数范围 family|project。
+    # 现行 config/gates.toml 无此键 → 缺省 family（冻结语义逐位不变）；
+    # gates-v3.toml（T65）写 project。只支持新键，不改现行文件。
+    dsr_trial_scope: str = "family"
 
 
 _SCHEMA: dict[str, dict[str, type]] = {
@@ -117,12 +121,19 @@ _SCHEMA: dict[str, dict[str, type]] = {
            "train_months_intraday": int, "test_months_intraday": int,
            "min_oos_ratio": float},
     "g4": {"dsr_min_probability": float, "mc_drawdown_sims": int,
-           "mc_drawdown_percentile_max": float},
+           "mc_drawdown_percentile_max": float,
+           "dsr_trial_scope": str},
     "g5": {"lockbox_sharpe_min_percentile": float,
            "lockbox_warn_percentile": float,
            "lockbox_min_trades_ratio": float,
            "lockbox_bootstrap_sims": int},
 }
+
+# 可选键及其缺省（T64/D33）：现行 gates.toml 不含 dsr_trial_scope——
+# 缺省 family 保持冻结语义（缺省口径结果与现行逐位一致）；显式给出时
+# 只接受 family|project。
+_OPTIONAL_DEFAULTS = {("g4", "dsr_trial_scope"): "family"}
+_TRIAL_SCOPES = ("family", "project")
 
 
 def gates_sha256(path) -> str:
@@ -159,12 +170,22 @@ def _parse(data: dict, source: str) -> GatesConfig:
                 f"合法键 {list(fields)}")
         for key, typ in fields.items():
             if key not in raw:
-                raise GatesConfigError(f"{source}：缺门槛键 [{section}].{key}")
-            v = raw[key]
+                default = _OPTIONAL_DEFAULTS.get((section, key))
+                if default is None:
+                    raise GatesConfigError(
+                        f"{source}：缺门槛键 [{section}].{key}")
+                v = default          # 可选键缺省（T64：现行文件无此键）
+            else:
+                v = raw[key]
             if isinstance(v, bool) or not isinstance(v, typ):
                 raise GatesConfigError(
                     f"{source}：[{section}].{key} 必须是 {typ.__name__}，"
                     f"收到 {v!r}")
+            if key == "dsr_trial_scope" and v not in _TRIAL_SCOPES:
+                raise GatesConfigError(
+                    f"{source}：[g4].dsr_trial_scope 只能是 "
+                    f"{list(_TRIAL_SCOPES)}，收到 {v!r}（T64/D33：G4 的 N 与"
+                    "试验夏普按谱系或项目（研究口径）取数）")
             # 各节键名全局唯一，直接作字段名（顶层 version 除外）
             by_field[key] = v
     return GatesConfig(**by_field)
@@ -263,6 +284,8 @@ def run_g4(returns, *, n_trials: int, trial_sharpes, actual_max_drawdown,
     block_len（T21c/H6）：蒙特卡洛回撤的块自助块长 = 一个交易日的 bar 数
     （保留日级波动聚集）；缺省 1 = iid 自助（回归兼容）。调用方（bt.py，
     T21e 接线）应按周期传 round(86400 / TIMEFRAME_SECONDS[tf])。
+    n_trials / trial_sharpes 的取数范围由 [g4].dsr_trial_scope 决定
+    （T64/D33，缺省 family——调用方按 cfg 取数，details 记 trial_scope）。
     """
     checks: dict[str, dict] = {}
     try:
@@ -276,6 +299,7 @@ def run_g4(returns, *, n_trials: int, trial_sharpes, actual_max_drawdown,
         "probability": float(probability),
         "min": float(cfg.dsr_min_probability),
         "n_trials": int(n_trials),
+        "trial_scope": str(cfg.dsr_trial_scope),
         **({"reason": reason} if reason else {})}
     try:
         dist = vstats.mc_drawdown_distribution(

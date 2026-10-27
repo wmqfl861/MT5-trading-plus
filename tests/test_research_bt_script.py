@@ -1070,3 +1070,180 @@ def test_repo_candidate_registrations_specimen_and_withdrawn():
         assert statuses.get(card) == "specimen", card
     for v2 in ("H002-v2", "H003-v2", "H006-v2"):
         assert statuses.get(v2) == "withdrawn", v2
+
+
+# ================================================ T64/T80：G4 取数口径与运行类别
+
+def test_g4_trials_default_family_scope_bitwise_unchanged(tmp_path):
+    """T64/D33 冻结失败测试：缺省（现行 gates.toml 无 dsr_trial_scope 键）
+    family 口径的 N 与试验夏普与现行**逐位一致**——calibration 运行仍计入
+    谱系 N（现行语义），migration 行不计；家系外不计。"""
+    import math as _math
+
+    mod = load_bt()
+    assert mod.vgate.load_gates()[0].dsr_trial_scope == "family"
+    with Ledger(tmp_path / "l.sqlite") as led:
+        common = dict(card_id="H700", card_version=1, strategy="s:SmaK",
+                      symbol="XAUUSD", timeframe="H1", data_first="",
+                      data_last="", data_sha256="a" * 64,
+                      engine_version="A-1.3", cost_model_version="zero-v0",
+                      gates_hash="")
+        led.record_run(params={"k": 1}, metrics={"sharpe": 1.0}, actor="s",
+                       **common)
+        led.record_run(params={"k": 1}, metrics={"sharpe": 1.0}, actor="g",
+                       **common)                    # 同参 gate 重复 → 只计 1
+        led.record_run(params={"k": 2}, metrics={"sharpe": 2.0}, actor="s",
+                       **common)
+        led.record_run(params={"k": 7}, metrics={"sharpe": 5.0},
+                       actor="calibration", **common)   # 冻结语义：谱系 N 仍计
+        other = dict(common, card_id="H999")        # 家族外不计
+        led.record_run(params={"k": 1}, metrics={"sharpe": 9.0}, actor="s",
+                       **other)
+        led.record_run(params={"k": 1}, metrics={"sharpe": 4.0},
+                       actor="migration", **common)     # 迁移行不计
+        n, sharpes = mod._dedup_trial_sharpes(led, "H700", 6_000.0)
+        assert n == 3          # k=1、k=2、k=7（calibration 冻结计入）
+        assert sorted(sharpes) == sorted([1.0 / _math.sqrt(6000.0),
+                                          2.0 / _math.sqrt(6000.0),
+                                          5.0 / _math.sqrt(6000.0)])
+
+
+def test_g4_trials_project_scope_counts_project_research_only(tmp_path):
+    """T64/D33 失败测试 1（G4 取数）：dsr_trial_scope=project——两谱系各
+    10 次试验 → 项目 N=20（family 口径 N 含标定为 11）；calibration 运行
+    不计（run_class=research 才计）。"""
+    mod = load_bt()
+    with Ledger(tmp_path / "l.sqlite") as led:
+        t = "mt5quant.strategies.library.buy_hold:BuyHold"
+        for fam, sym in (("H701", "XAUUSD"), ("H702", "EURUSD")):
+            for i in range(1, 11):
+                led.record_run(card_id=fam, card_version=1, strategy=t,
+                               params={"i": i}, symbol=sym, timeframe="H1",
+                               data_first="", data_last="",
+                               data_sha256="a" * 64, engine_version="A",
+                               cost_model_version="v", gates_hash="",
+                               metrics={"sharpe": 1.0}, actor="s")
+        led.record_run(card_id="H701", card_version=1, strategy=t,
+                       params={"i": 99}, symbol="XAUUSD", timeframe="H1",
+                       data_first="", data_last="", data_sha256="a" * 64,
+                       engine_version="A", cost_model_version="v",
+                       gates_hash="", metrics={"sharpe": 1.0},
+                       actor="calibration")
+        n_fam, _ = mod._dedup_trial_sharpes(led, "H701", 6_000.0)
+        n_proj, sharpes = mod._dedup_trial_sharpes(
+            led, "H701", 6_000.0, scope="project")
+        assert n_fam == 11                       # family 口径（冻结）含标定
+        assert n_proj == 20                      # 项目（research）口径：两谱系
+        assert len(sharpes) == 20
+        with pytest.raises(ValueError, match="scope"):
+            mod._dedup_trial_sharpes(led, "H701", 6_000.0, scope="global")
+
+
+@pytest.mark.parametrize("reserved", ["calibration", "ops", "migration"])
+def test_screen_rejects_reserved_actor_names(tmp_path, monkeypatch, capsys,
+                                             reserved):
+    """T80/G4 失败测试 3：--actor 保留名（calibration/ops/migration）拒绝
+    ——运行类别由 bt 按候选状态与轮次写 run_class 字段，不看 actor 文本。"""
+    mod = load_bt()
+    root = make_data_root(tmp_path)
+    cards_dir = write_card(tmp_path)
+    ledger_path = tmp_path / "ledger.sqlite"
+    patch_card_git(monkeypatch, mod)
+    rc = mod.main(
+        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--volume-lots", "0.01", "--actor", reserved])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "保留" in out and reserved in out
+    with Ledger(ledger_path) as led:
+        assert led.stats("H099")["total_runs"] == 0
+
+
+def test_gate_rejects_reserved_actor_names(tmp_path, monkeypatch, capsys):
+    """T80/G4：gate 路径同样拒绝保留 actor 名（不产生任何 runs）。"""
+    mod = load_bt()
+    root = make_data_root(tmp_path)
+    cards_dir = write_card(tmp_path)
+    ledger_path = tmp_path / "ledger.sqlite"
+    patch_card_git(monkeypatch, mod)
+    rc = mod.main(
+        ["gate", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--volume-lots", "0.01",
+         "--gates", "G0", "--params", "{}", "--actor", "ops"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "保留" in out
+    with Ledger(ledger_path) as led:
+        assert led.stats("H099")["total_runs"] == 0
+
+
+def test_screen_run_class_research_and_specimen_calibration(tmp_path,
+                                                            monkeypatch,
+                                                            capsys):
+    """T80/G4 失败测试 4：样品卡（--specimen）运行 run_class=calibration；
+    普通研究卡 run_class=research（按候选状态写入，不看 actor 文本）。"""
+    mod = load_bt()
+    root = make_data_root(tmp_path)
+    cards_dir = write_card(tmp_path)
+    write_candidate(tmp_path, "C900", "specimen", "H099")
+    ledger_path = tmp_path / "ledger.sqlite"
+    patch_card_git(monkeypatch, mod)
+    rc = mod.main(
+        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--volume-lots", "0.01", "--specimen"])
+    assert rc == 0, capsys.readouterr().out
+    with Ledger(ledger_path) as led:
+        r = led.conn.execute(
+            "SELECT actor, run_class FROM runs").fetchone()
+    assert r["actor"] == "calibration"
+    assert r["run_class"] == "calibration"
+    # 普通研究卡（独立目录、无候选登记）：run_class=research
+    (tmp_path / "plain").mkdir()
+    cards_dir2 = write_card(tmp_path / "plain")
+    ledger2 = tmp_path / "l2.sqlite"
+    rc2 = mod.main(
+        ["screen", "--card", "H099", "--cards-dir", str(cards_dir2),
+         "--data-root", str(root), "--ledger", str(ledger2),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--volume-lots", "0.01"])
+    assert rc2 == 0, capsys.readouterr().out
+    with Ledger(ledger2) as led2:
+        r2 = led2.conn.execute(
+            "SELECT actor, run_class FROM runs").fetchone()
+    assert r2["run_class"] == "research"
+
+
+def test_gate_g4_reports_three_trial_counts(tmp_path, monkeypatch, capsys):
+    """T64/D33 失败测试：G4 关卡结果同时列谱系/轮次/项目三种 N 与
+    dsr_trial_scope（现行 gates.toml 缺省 family）；报告 Markdown 同列。"""
+    mod = load_bt()
+    root = make_data_root(tmp_path)
+    cards_dir = write_card(tmp_path)
+    ledger_path = tmp_path / "ledger.sqlite"
+    patch_card_git(monkeypatch, mod)
+    rc = mod.main(
+        ["gate", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--volume-lots", "0.01",
+         "--gates", "G4", "--params", "{}"])
+    out = capsys.readouterr().out
+    assert "G4" in out
+    with Ledger(ledger_path) as led:
+        row = led.conn.execute(
+            "SELECT details_json FROM gates WHERE gate='G4'").fetchone()
+    assert row is not None
+    details = json.loads(row["details_json"])
+    assert details["trial_scope"] == "family"
+    assert details["n_trials_family"] >= 1
+    assert details["n_trials_round"] is None          # 轮次制之前
+    assert details["n_trials_project_research"] >= 1
+    assert "G4 试验计数" in out                       # 报告同列三种 N
+
+

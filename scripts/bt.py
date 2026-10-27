@@ -27,13 +27,23 @@
   → precheck 五条件（文献/持仓 ≥H1/事前成本倍数 ≥3/检验力 ≥50%/机制空缺）
   → 写 research/candidates/C###.precheck.json 并记入台账 candidate_checks
   表（带哈希链）；退出码 pass=0 / fail=1 / waiting_data=2。研究年数按
-  研究库品种×周期实际覆盖计算（不用常数），检验力函数与 round11 探针
-  逐位一致（Lo 2002 近似）。
+  研究库品种×周期实际覆盖计算（不用常数；T80/G3 起合并已批准外部序列
+  data_research/ext/（fred/cdd，D36 白名单），逐段列来源与年数，未批准
+  来源不计）；检验力函数与 round11 探针逐位一致（Lo 2002 近似），夏普
+  取声明与隐含中较小者（T80/G2：隐含夏普 =（每事件毛收益−事前来回成本）
+  ÷ 品种无条件收益波动 σ × √每年事件数，σ 与口径写进 precheck JSON）。
 - 撤回与标定样品（T61/D30）：research/candidates/ 候选登记里
   status=withdrawn 的卡（source_card 指向卡 id，如 H002-v2/H003-v2/
   H006-v2）拒绝 screen/gate；status=specimen 的标定样品卡（H001–H007）
-  必须显式 --specimen 运行且台账 actor=calibration（不进入研究轮次
-  统计），--specimen 用于非样品卡 → 拒绝（cards.candidate_statuses_by_card）。
+  必须显式 --specimen 运行且台账 actor=calibration、run_class=calibration
+  （不进入研究轮次与项目级研究 N 统计），--specimen 用于非样品卡 →
+  拒绝（cards.candidate_statuses_by_card）。
+- 运行类别（T80/G4，D33）：--actor 保留名（calibration/ops/migration）
+  拒绝——运行类别由 bt 按候选状态与轮次写台账 runs.run_class（research|
+  calibration|ops|migration）并入哈希链；N 的研究口径
+  （project_n_dedup_research）只看这个字段，不看 actor 文本。生产台账
+  加列走 _rechain 迁移（旧行按 actor 推断+记迁移事件），迁移后须用
+  scripts/ledger_anchor.py --accept-rechain 重锚（主会话执行）。
 - 先卡后测：卡文件必须已提交到 git、工作区干净（git status --porcelain 为空，
   探针 P6），且最后提交时间早于该卡（id+version，按卡文件判定）在台账中的
   首次运行（cards.ensure_card_precedes_run）；未提交/脏文件/事后改动 →
@@ -55,10 +65,14 @@
   只读研究段）→ begin_lockbox（读锁箱数据**之前**写 started）→
   load_lockbox_window（cutoff 前卡策略声明的 lookback_bars 根起步）→
   回测（交易与收益只计 cutoff 后）→ run_g5（单侧判定，写终态 done）。
-- G4（T21c 接线）：n_trials 与试验夏普按 (strategy, params, symbol,
-  timeframe, data_sha256, cost_model_version) 在谱系内去重
-  （_dedup_trial_sharpes，同参 screen+gate 只计 1）；蒙特卡洛回撤块长 =
-  一个交易日的 bar 数（block_len）。
+- G4（T21c 接线；T64/D33 取数口径）：n_trials 与试验夏普按
+  (strategy, params, symbol, timeframe, data_sha256, cost_model_version,
+  strategy_sha) 去重（_dedup_trial_sharpes，同参 screen+gate 只计 1），
+  取数范围按门槛键 [g4].dsr_trial_scope（family|project；现行 gates.toml
+  无此键 → 缺省 family，冻结语义逐位不变；project = 项目级研究口径
+  run_class=research，H 线与 P 线合并计算）；关卡结果与报告同时列
+  谱系/轮次/项目三种 N；蒙特卡洛回撤块长 = 一个交易日的 bar 数
+  （block_len）。
 - contract_size 只认 {data-root}/specs/latest.json（与 run_backtest 同规：
   缺则报错，绝不静默按 1 折算）。
 - 定手数（T23/M2）：--risk-per-trade 缺省 0.005（按风险定手数，与
@@ -120,7 +134,9 @@ from mt5quant.backtest.report import (  # noqa: E402
 from mt5quant.research import cards  # noqa: E402
 from mt5quant.research import candidates as cand  # noqa: E402
 from mt5quant.research import rounds as rnd  # noqa: E402
-from mt5quant.research.ledger import Ledger, LedgerTamperedError  # noqa: E402
+from mt5quant.research.ledger import (  # noqa: E402
+    Ledger, LedgerTamperedError, RESERVED_ACTORS, run_class_for_actor,
+)
 from mt5quant.validation import gates as vgate  # noqa: E402
 from mt5quant.validation import lookahead as vlook  # noqa: E402
 from mt5quant.validation import robustness as vrob  # noqa: E402
@@ -235,6 +251,9 @@ def _candidate_statuses(cards_dir: Path) -> dict[str, str]:
 def _enforce_candidate_status(args, card) -> str | None:
     """T61/D30：按候选登记约束卡的运行，返回本次运行的台账 actor。
 
+    - T80/G4：--actor 保留名（calibration/ops/migration）拒绝——运行类别
+      由 bt 按候选状态与轮次写入台账 run_class 字段，不看 actor 文本
+      （防研究运行借 actor 逃出研究 N，第十二轮 G4）；
     - status=withdrawn（撤回卡，如 H002-v2/H003-v2/H006-v2）→ 拒绝运行：
       打印原因（含 withdrawn）并返回 None——撤回的卡不再产生任何 runs；
     - status=specimen（标定样品卡，H001–H007）→ 必须 --specimen 才运行，
@@ -243,6 +262,12 @@ def _enforce_candidate_status(args, card) -> str | None:
     - --specimen 用于非样品卡 → 拒绝（标定通道不能给研究卡统计逃逸）；
     - 无登记（普通研究卡、不带 --specimen）→ 原样返回 --actor。
     """
+    if getattr(args, "actor", None) in RESERVED_ACTORS:
+        print(f"✗ --actor {args.actor!r} 是保留名（{list(RESERVED_ACTORS)}，"
+              "T80/G4）——运行类别（run_class）由 bt 按候选状态与轮次"
+              "写入台账，N 的口径只看 run_class 字段、不看 actor 文本；"
+              "请用非保留的 actor 名")
+        return None
     status = _candidate_statuses(Path(args.cards_dir)).get(card.id)
     if status == cards.WITHDRAWN:
         print(f"✗ 卡 {card.id} 已撤回（status=withdrawn，T61/D30）——候选"
@@ -266,6 +291,14 @@ def _enforce_candidate_status(args, card) -> str | None:
               "不进研究统计）不能用于研究卡")
         return None
     return args.actor
+
+
+def _run_class_for(actor: str) -> str:
+    """T80/G4：运行类别——标定样品（_enforce_candidate_status 已把 actor
+    强制为 calibration）→ calibration；研究运行（含轮次内）→ research。
+    运维通道（reconcile_ab，actor=ops）不经 bt，台账侧按 actor 缺省推断
+    为 ops；迁移行由台账迁移写入 migration。"""
+    return "calibration" if actor == "calibration" else "research"
 
 
 def _check_card_lineage(card, source: str) -> str | None:
@@ -588,26 +621,41 @@ def _select_params_auto(ledger, card, *, symbol: str, data_sha256: str,
             "selected_value": best[0], "params": best[2]}
 
 
-def _dedup_trial_sharpes(ledger, card_id: str,
-                         bars_per_year: float) -> tuple[int, list[float]]:
-    """T21c/M4：谱系（cards.family_of）内试验夏普按 (strategy, params,
-    symbol, timeframe, data_sha256, cost_model_version, strategy_sha)
-    去重——同一组参数先 screen 后 gate 只计 1 次，v1/v2 新卡累计进同一
-    谱系；T37：策略代码指纹进键（改代码重跑 = 新试验）；失败运行与
-    迁移行（actor=migration）不计。
+def _dedup_trial_sharpes(ledger, card_id: str, bars_per_year: float, *,
+                         scope: str = "family") -> tuple[int, list[float]]:
+    """T21c/M4：试验夏普按 (strategy, params, symbol, timeframe,
+    data_sha256, cost_model_version, strategy_sha) 去重——同一组参数先
+    screen 后 gate 只计 1 次；T37：策略代码指纹进键（改代码重跑 = 新
+    试验）；失败运行不计。
+
+    scope（T64/D33，[g4].dsr_trial_scope）：
+    - "family"（缺省，**冻结语义逐位不变**）：谱系（cards.family_of）内
+      去重，run_class=migration 不计（与旧 actor=migration 过滤等价）；
+      calibration 运行照现行语义计入；
+    - "project"：项目级、只计 run_class=research（H 线与 P 线合并；
+      calibration/ops/migration 不计——标定与运维不是研究试验）。
 
     返回 (去重后 N, 每根 bar 口径的试验夏普列表)；成功但无夏普的运行计入
     N、不进夏普列表（与 ledger.stats 的 n_dedup 同键口径）。
     """
+    if scope not in ("family", "project"):
+        raise ValueError(
+            f"scope 必须是 family|project（[g4].dsr_trial_scope，T64/D33），"
+            f"收到 {scope!r}")
     family = cards.family_of(card_id)
     rows = ledger.conn.execute(
         "SELECT card_id, strategy, params_json, symbol, timeframe,"
-        " data_sha256, strategy_sha, cost_model_version, actor, metrics_json"
-        " FROM runs").fetchall()
+        " data_sha256, strategy_sha, cost_model_version, actor, run_class,"
+        " metrics_json FROM runs").fetchall()
     by_key: dict[tuple, float | None] = {}
     for r in rows:
-        if r["actor"] == "migration" or cards.family_of(r["card_id"]) != family:
-            continue
+        rc = r["run_class"] or run_class_for_actor(r["actor"])
+        if scope == "family":
+            if rc == "migration" or cards.family_of(r["card_id"]) != family:
+                continue
+        else:                                   # project：只计研究类
+            if rc != "research":
+                continue
         payload = json.loads(r["metrics_json"])
         if not payload.get("ok"):
             continue
@@ -868,7 +916,8 @@ def cmd_candidate_check(args) -> int:
     if candidate.status in cand.BOOKKEEPING_STATUSES:
         # specimen/withdrawn 簿记：不是研究候选，precheck 短路为 fail，
         # 不装配成本、不算覆盖（其品种可能根本不在研究库）
-        costs, cost_version, years, active = None, "n/a（非研究候选）", {}, set()
+        costs, cost_version, years, segs, active = \
+            None, "n/a（非研究候选）", {}, None, set()
     else:
         try:
             costs, cost_version = _merged_costs(
@@ -878,12 +927,17 @@ def cmd_candidate_check(args) -> int:
         except Exception as e:
             print(f"✗ 成本模型装配失败：{type(e).__name__}: {e}")
             return 1
-        years = cand.coverage_years(data_root, candidate.symbols,
-                                    [candidate.holding])
+        # T80/G3：主段 + 已批准外部序列（fred/cdd，D36 白名单）逐段合并；
+        # 未批准来源（histdata）在场不计
+        segs = cand.coverage_segments(data_root, candidate.symbols,
+                                      [candidate.holding])
+        years = {k: float(sum(s["years"] for s in v if s.get("counted")))
+                 for k, v in segs.items()}
         active = _active_mechanism_classes(Path(candidate.path).parent,
                                            candidate.id)
     result = cand.precheck(candidate, data_root=data_root, cost_model=costs,
-                           research_years=years, active_mechanisms=active)
+                           research_years=years, active_mechanisms=active,
+                           research_coverage_segments=segs)
     payload = result.to_payload()
     payload["cost_model_version"] = cost_version
     payload["checked_at_utc"] = datetime.now(timezone.utc).isoformat()
@@ -968,6 +1022,8 @@ def cmd_screen(args) -> int:
     actor = _enforce_candidate_status(args, card)
     if actor is None:
         return 1
+    # T80/G4：运行类别按候选状态写入（样品 calibration / 研究 research）
+    run_class = _run_class_for(actor)
 
     # T38/D24：数据根解析 + 守卫（主库须显式 --main-store；缺省研究库须存在）
     try:
@@ -1103,7 +1159,7 @@ def cmd_screen(args) -> int:
                         engine_version=ENGINE_VERSION,
                         cost_model_version=cost_version, gates_hash=gates_hash,
                         metrics=summary, actor=actor,
-                        strategy_sha=strategy_sha,
+                        strategy_sha=strategy_sha, run_class=run_class,
                         round_id=(round_ctx or {}).get("round_id"))
                     skipped = summary.get("skipped_zero_lots") or 0
                     print(f"✓ run#{rid} {label} -> "
@@ -1121,7 +1177,7 @@ def cmd_screen(args) -> int:
                         cost_model_version=cost_version,
                         gates_hash=gates_hash, metrics=None,
                         error=f"{type(e).__name__}: {e}", actor=actor,
-                        strategy_sha=strategy_sha,
+                        strategy_sha=strategy_sha, run_class=run_class,
                         round_id=(round_ctx or {}).get("round_id"))
                     print(f"✗ run#{rid} {label} -> {type(e).__name__}: {e}")
 
@@ -1161,6 +1217,8 @@ def cmd_gate(args) -> int:
     actor = _enforce_candidate_status(args, card)
     if actor is None:
         return 1
+    # T80/G4：运行类别按候选状态写入（样品 calibration / 研究 research）
+    run_class = _run_class_for(actor)
     # 门槛冻结核对：sha256 与冻结值不符 → 拒绝运行（不产生任何 runs）
     try:
         cfg, gsha = vgate.load_gates()
@@ -1329,6 +1387,7 @@ def cmd_gate(args) -> int:
             data_last=data_last, data_sha256=dsha,
             engine_version=ENGINE_VERSION, cost_model_version=cost_version,
             gates_hash=gsha, actor=actor, strategy_sha=strategy_sha,
+            run_class=run_class,
             round_id=(round_ctx or {}).get("round_id"))
         try:
             base_kwargs = dict(symbol=symbol, params=dict(params),
@@ -1413,16 +1472,28 @@ def cmd_gate(args) -> int:
                 returns = base.equity.astype("float64").pct_change().dropna()
                 bpy = summary.get("annualization_bars_per_year") \
                     or bars_per_year(card.timeframe)
-                # T21c/M4：N 与试验夏普按谱系内去重（同参 screen+gate 只计 1）
+                # T21c/M4 + T64/D33：N 与试验夏普按 [g4].dsr_trial_scope
+                # 取数（现行 gates.toml 无此键 → family，冻结语义逐位不变；
+                # project = 项目级研究口径 run_class=research）
+                scope = cfg.dsr_trial_scope
                 n_dedup, trial_sharpes = _dedup_trial_sharpes(
-                    ledger, card.id, float(bpy))
+                    ledger, card.id, float(bpy), scope=scope)
                 out = vgate.run_g4(
                     returns, n_trials=n_dedup, trial_sharpes=trial_sharpes,
                     actual_max_drawdown=summary.get("max_drawdown", 0.0),
                     cfg=cfg, seed=seed,
                     block_len=_bars_per_day(card.timeframe))
-                out["project_n_trials"] = ledger.stats(card.id)[
-                    "project_n_dedup"]
+                # T64/D33：关卡结果同时列谱系/轮次/项目三种 N（可审计）
+                st = ledger.stats(card.id)
+                out["trial_scope"] = scope
+                out["n_trials_family"] = _dedup_trial_sharpes(
+                    ledger, card.id, float(bpy), scope="family")[0]
+                round_row = ledger.round(card.round) if card.round else None
+                out["n_trials_round"] = (ledger.round_n_dedup(card.round)
+                                         if round_row is not None else None)
+                out["project_n_trials"] = st["project_n_dedup"]
+                out["n_trials_project_research"] = st[
+                    "project_n_dedup_research"]
                 return out
             _run("G4", _g4)
         if "G5" in wanted:
@@ -1451,6 +1522,23 @@ def cmd_gate(args) -> int:
                 f"（{selection['metric']}={selection['selected_value']:.2f}）\n")
         else:
             report += "\n## 参数选择（manual）\n\n- 显式 --params 指定\n"
+        # T64/D33：G4 报告同时列谱系/轮次/项目三种 N 与取数口径
+        g4 = results.get("G4")
+        if g4 is not None and "n_trials_family" in g4:
+            n_round = g4.get("n_trials_round")
+            n_round_s = "—（无轮次：轮次制之前/之外）" if n_round is None \
+                else str(n_round)
+            report += (
+                "\n## G4 试验计数（T64/D33）\n\n"
+                f"- 取数口径 dsr_trial_scope = {g4.get('trial_scope')}"
+                "（[g4].dsr_trial_scope；缺省 family = 现行冻结语义）\n"
+                f"- 谱系 N：{g4['n_trials_family']}"
+                "（谱系去重口径，现行语义）\n"
+                f"- 轮次 N：{n_round_s}\n"
+                f"- 项目 N（research 口径）："
+                f"{g4.get('n_trials_project_research')}"
+                "（只计 run_class=research；dsr_trial_scope=project 时"
+                " G4 用这个）\n")
         print(report)
         if args.out:
             out = Path(args.out)
