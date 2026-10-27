@@ -26,6 +26,12 @@ docs/p6/permissions.md）；研究侧一切读取改走 data_research（--resear
 - `--include-ext` 才把 data/ext/**（外部源适配后的 K 线）导出为
   data_research/ext/<来源>/<品种>/<周期>/——研究库纳入外部数据须用户
   先确认数据源（docs/research/ext-data-*.md 的"来源清单"），因此缺省关；
+- **白名单硬校验（T81/D36）**：只有批准来源（mt5data.ext.approvals，
+  第十二轮审核批准 fred/cdd）可导出；未批准来源（histdata 等）逐条拒绝、
+  不进研究库——ext 库里只剩未批准序列时整体退出非零；
+- 批准来源的 manifest 必须带与批准表一致的使用限定
+  （usage_restriction，只研究用/不再分发/原始数据不入公开仓库），
+  缺限定或文本不一致 → 拒绝导出（fail-fast 整体失败）；
 - cutoff 纪律同样硬约束外部数据：只导出 time < 全局 cutoff 的行，
   导出后 verify_ext_research_store 复检研究库 ext 段（manifest 必须合法、
   last_time < cutoff，一条越界整体失败退出 2）；
@@ -143,40 +149,58 @@ def verify_research_store(dest: str, cutoff) -> list[str]:
 
 
 def export_ext_series(ext_root: str, dest: str, cutoff, *,
-                      now_iso: str) -> tuple[int, int]:
-    """把 data/ext/** 导出进研究库（只取 time < cutoff 的行；T67）。
+                      now_iso: str) -> tuple[int, int, int]:
+    """把 data/ext/** 导出进研究库（只取 time < cutoff 的行；T67/T81）。
 
     - manifest 在读取侧过 validate_manifest（缺字段 → ExtDataError，
       调用方整体失败）：来源与版本不明的数据不进研究库；
+    - **白名单（T81/D36）**：未批准来源逐条拒绝（打印原因、计入
+      rejected，不进研究库）；ext 库只有未批准序列时整体失败（返回
+      exported=0 且 rejected>0，调用方据此退出非零）；
+    - 批准来源的 manifest 缺使用限定/与批准表不一致 → ExtDataError
+      整体失败（研究数据必须带着批准时的使用限定入库）；
     - cutoff 之后的行**被裁掉**（铁律 19：外部数据同样只允许 cutoff
       之前部分进研究路径），开放段为空的序列跳过；
     - manifest 追加 research_cutoff / exported_at_utc 后随数据落盘。
-    返回 (导出序列数, 跳过数)。
+    返回 (导出序列数, 跳过数, 白名单拒绝数)。
     """
-    from mt5data.ext import (ExtDataError, ExtSeries, ext_inventory,
+    from mt5data.ext import (ExtDataError, ExtSeries, approved_sources,
+                             check_exportable, ext_inventory,
                              load_ext_series, save_ext_series,
                              slice_before_cutoff)
 
     inv = ext_inventory(ext_root)
     if not inv:
         print(f"· {ext_root} 无外部序列（ext manifest 一个都没有），跳过")
-        return 0, 0
-    exported = skipped = 0
+        return 0, 0, 0
+    exported = skipped = rejected = 0
     for m in inv:
+        key = f"{m['source']}/{m['symbol']}/{m['timeframe']}"
+        try:
+            check_exportable(m)
+        except ExtDataError as e:
+            # 未批准来源：数据留在主库侧（一致性核对可用），只拒入研究库；
+            # 批准来源缺/错使用限定同样在此抛出——属 manifest 与批准表
+            # 不一致的缺陷，fail-fast 整体失败
+            if m["source"] not in approved_sources():
+                print(f"✗ {key}: 白名单外来源，拒绝导出——{e}")
+                rejected += 1
+                continue
+            print(f"✗ {key}: {e}")
+            raise
         try:
             loaded = load_ext_series(ext_root, m["source"], m["symbol"],
                                      m["timeframe"])
         except ExtDataError as e:
-            print(f"✗ {m['source']}/{m['symbol']}/{m['timeframe']}: "
-                  f"manifest 校验失败——{e}")
+            print(f"✗ {key}: manifest 校验失败——{e}")
             raise
         if loaded is None:
             continue
         df, manifest = loaded
         seg = slice_before_cutoff(df, cutoff)
         if len(seg) == 0:
-            print(f"· {m['source']}/{m['symbol']}/{m['timeframe']} 开放段"
-                  "（time < cutoff）为空，跳过（整段都在锁箱期）")
+            print(f"· {key} 开放段（time < cutoff）为空，跳过"
+                  "（整段都在锁箱期）")
             skipped += 1
             continue
         out = dict(manifest)
@@ -187,11 +211,15 @@ def export_ext_series(ext_root: str, dest: str, cutoff, *,
         out["last_time"] = pd.Timestamp(seg["time"].iloc[-1]).isoformat()
         save_ext_series(os.path.join(str(dest), "ext"),
                         ExtSeries(df=seg, manifest=out))
-        print(f"✓ ext {m['source']}/{m['symbol']}/{m['timeframe']} 开放段 "
+        print(f"✓ ext {key} 开放段 "
               f"{len(seg):,} 根（time < {pd.Timestamp(cutoff).isoformat()}）",
               flush=True)
         exported += 1
-    return exported, skipped
+    if rejected and not exported:
+        raise ExtDataError(
+            f"--include-ext 白名单拒绝了全部 {rejected} 个序列（无任何批准"
+            f"来源可导出；批准来源：{list(approved_sources())}）")
+    return exported, skipped, rejected
 
 
 def verify_ext_research_store(dest: str, cutoff) -> list[str]:
@@ -360,15 +388,18 @@ def main(argv=None) -> int:
               "请重跑或排查写入路径")
         return 2
 
-    # 外部数据（T67）：--include-ext 才纳入；cutoff 硬校验同主库
-    ext_exported = ext_skipped = 0
+    # 外部数据（T67/T81）：--include-ext 才纳入；白名单与 cutoff 硬校验
+    ext_exported = ext_skipped = ext_rejected = 0
     if args.include_ext:
         try:
-            ext_exported, ext_skipped = export_ext_series(
+            ext_exported, ext_skipped, ext_rejected = export_ext_series(
                 args.ext_root, args.dest, global_cutoff, now_iso=now_iso)
         except ExtDataError as e:
             print(f"✗ 外部数据导出失败：{e}")
             return 1
+        if ext_rejected:
+            print(f"⚠ 白名单拒绝 {ext_rejected} 个未批准序列（不进研究库，"
+                  "数据保留主库侧 data/ext/ 作一致性核对）")
         if global_cutoff is not None:
             ext_violations = verify_ext_research_store(args.dest,
                                                        global_cutoff)
@@ -378,11 +409,12 @@ def main(argv=None) -> int:
                 print("研究库 ext 段自检失败——外部数据导出作废")
                 return 2
     else:
-        print("· 外部数据未纳入（默认不启用；确认数据源后用 --include-ext）")
+        print("· 外部数据未纳入（默认不启用；确认数据源后用 --include-ext，"
+              "只导出批准来源）")
 
     print(f"摘要：导出 {exported} 个序列（跳过 {skipped}）"
-          + (f"，外部数据 {ext_exported} 个序列（跳过 {ext_skipped}）"
-             if args.include_ext else "")
+          + (f"，外部数据 {ext_exported} 个序列（跳过 {ext_skipped}，"
+             f"白名单拒绝 {ext_rejected}）" if args.include_ext else "")
           + f"，成本缓存与 specs 已复制 → {args.dest}；自检通过"
             "（所有 last_time < cutoff）。tick 不导出：研究侧成本经 "
             "data_research/costs/spread_model.json 缓存提供；"

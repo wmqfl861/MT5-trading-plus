@@ -1,23 +1,33 @@
-"""T67：外部数据接入（src/mt5data/ext + fetch/check/export 脚本）。
+"""T67/T81：外部数据接入（src/mt5data/ext + fetch/export 脚本）。
 
-契约（蓝图 §6.5、铁律 19、D36）：
+契约（蓝图 §6.5、铁律 19、D36、第十二轮审核）：
 - 适配器统一输出仓库 K 线格式（naive UTC time + OHLCV），落
   data/ext/<来源>/<品种>/<周期>/data.parquet + manifest.json；
 - manifest 必填字段（来源/下载时间/原始文件 sha256/转换版本/口径说明）
   缺一即拒绝入库；
-- HistData 的 M1 时间戳是**不随夏令时变化的 EST（UTC-5 固定）**——
-  转换后 3 月/10 月底夏令时切换周的 bar 时刻必须仍正确；
+- HistData 的 M1 时间戳按**实测规则**（美东偏移 + 欧盟 DST 日历，
+  converter v3）转换——切换周的 bar 时刻必须正确；
 - 外部数据只允许 cutoff（lockbox global_cutoff）之前部分进任何研究
   路径：导出工具 --include-ext（默认关）对 cutoff 硬校验；
 - 一致性核对必须能检出"合成时区错位一小时"（部分月份差 1h 的
   夏令时处理错误）。
+
+T81 追加（D36 批准落地、第十二轮 G5）：
+- **--include-ext 白名单硬校验**：只有批准来源（fred/cdd，第十二轮
+  审核批准表）可导出；未批准来源（histdata）被拒；
+- **使用限定入 manifest**：批准来源的 manifest 必须带
+  usage_restriction 且与批准文本一致，缺/错 → 拒绝导出；
+- **逐年时间口径检测**（G5）：合成数据上能区分"固定美东（EST 不调
+  表）/美东墙钟/欧盟日历"三种标签规则，并识别口径不一致的年份。
 """
 import importlib.util
 import io
 import json
 import sys
 import zipfile
+from datetime import timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -77,6 +87,28 @@ def make_ext_series(mt, *, source="histdata", symbol="EURUSD", tf="H1",
         s = s.with_timeframe(tf, resample_bars(s.df, tf))
     if df is not None:
         s = s.replace(df=df)
+    for k, v in manifest_over.items():
+        s.manifest[k] = v
+    return s
+
+
+def make_fred_series(mt, *, df=None, drop_usage=False, **manifest_over):
+    """批准来源（fred/USTEC D1）的合法 ExtSeries，天然跨 cutoff。
+
+    日期 05-28→06-02：前 4 天 < CUTOFF(06-01)，后 2 天 ≥。适配器写入
+    批准的使用限定 usage_restriction；drop_usage=True 可模拟缺限定的
+    坏 manifest。
+    """
+    raw = ("observation_date,NASDAQ100\n"
+           "2026-05-28,100.0\n2026-05-29,101.0\n2026-05-30,102.0\n"
+           "2026-05-31,103.0\n2026-06-01,104.0\n2026-06-02,105.0\n")
+    s = mt.fred_daily_from_bytes(raw.encode(), symbol="USTEC",
+                                 downloaded_at_utc="2026-10-27T00:00:00+00:00",
+                                 source_name="NASDAQ100.csv")
+    if df is not None:
+        s = s.replace(df=df)
+    if drop_usage:
+        s.manifest.pop("usage_restriction", None)
     for k, v in manifest_over.items():
         s.manifest[k] = v
     return s
@@ -265,54 +297,53 @@ class TestManifest:
 
 # ================================================================ cutoff
 
+@pytest.fixture
+def main_store(tmp_path):
+    """可用主库（复用 T27 测试的最小拼装：bars+lockbox+tick+缓存+specs）。"""
+    from mt5data.lockbox import write_global_cutoff
+    from mt5data.store import save_bars
+    from mt5data.ticks import save_ticks
+    from mt5quant.costs import SpreadModel
+    from mt5data.ticks import tick_watermark
+
+    rb = load_script("run_backtest_script_ext", REPO_ROOT / "scripts"
+                     / "run_backtest.py")
+    root = tmp_path / "data"
+    times = list(pd.date_range("2026-05-31 10:00", periods=10, freq="h")) \
+        + list(pd.date_range("2026-06-01 00:00", periods=6, freq="h"))
+    save_bars(str(root), "XAUUSD", "H1", pd.DataFrame({
+        "time": times, "open": 100.0, "high": 100.5, "low": 99.5,
+        "close": 100.0, "tick_volume": 10, "spread": 5, "real_volume": 0}))
+    write_global_cutoff(str(root), CUTOFF, note="测试锁箱")
+    ticks = pd.DataFrame({
+        "time_msc": [pd.Timestamp(f"2026-10-19 {h:02d}:00:00").value // 10**6
+                     for h in range(24) for _ in range(2)],
+        "bid": [2400.0] * 48, "ask": [2400.3] * 48,
+        "last": [2400.15] * 48, "volume": [0.0] * 48, "flags": [2] * 48})
+    save_ticks(str(root), "XAUUSD", ticks)
+    tk = rb.load_ticks(str(root), "XAUUSD", columns=["time_msc", "bid", "ask"])
+    rb.save_spread_model_cache(
+        rb.spread_model_cache_path(str(root)),
+        SpreadModel.from_ticks("XAUUSD", tk, mode="relative"),
+        {"XAUUSD": tick_watermark(str(root), "XAUUSD")})
+    specs = root / "specs"
+    specs.mkdir(parents=True)
+    (specs / "latest.json").write_text(json.dumps(
+        {"XAUUSD": {"contract_size": 100.0, "volume_min": 0.01,
+                    "volume_step": 0.01, "volume_max": 200.0}}),
+        encoding="utf-8")
+    return root
+
+
 class TestCutoffDiscipline:
-    """失败测试先行 ②：cutoff 之后的数据不进研究库。"""
+    """失败测试先行 ②：cutoff 之后的数据不进研究库。
 
-    @pytest.fixture
-    def main_store(self, tmp_path):
-        """可用主库（复用 T27 测试的最小拼装：bars+lockbox+tick+缓存+specs）。"""
-        from mt5data.lockbox import write_global_cutoff
-        from mt5data.store import save_bars
-        from mt5data.ticks import save_ticks
-        from mt5quant.costs import SpreadModel
-        from mt5data.ticks import tick_watermark
-
-        rb = load_script("run_backtest_script_ext", REPO_ROOT / "scripts"
-                         / "run_backtest.py")
-        root = tmp_path / "data"
-        times = list(pd.date_range("2026-05-31 10:00", periods=10, freq="h")) \
-            + list(pd.date_range("2026-06-01 00:00", periods=6, freq="h"))
-        save_bars(str(root), "XAUUSD", "H1", pd.DataFrame({
-            "time": times, "open": 100.0, "high": 100.5, "low": 99.5,
-            "close": 100.0, "tick_volume": 10, "spread": 5, "real_volume": 0}))
-        write_global_cutoff(str(root), CUTOFF, note="测试锁箱")
-        ticks = pd.DataFrame({
-            "time_msc": [pd.Timestamp(f"2026-10-19 {h:02d}:00:00").value // 10**6
-                         for h in range(24) for _ in range(2)],
-            "bid": [2400.0] * 48, "ask": [2400.3] * 48,
-            "last": [2400.15] * 48, "volume": [0.0] * 48, "flags": [2] * 48})
-        save_ticks(str(root), "XAUUSD", ticks)
-        tk = rb.load_ticks(str(root), "XAUUSD", columns=["time_msc", "bid", "ask"])
-        rb.save_spread_model_cache(
-            rb.spread_model_cache_path(str(root)),
-            SpreadModel.from_ticks("XAUUSD", tk, mode="relative"),
-            {"XAUUSD": tick_watermark(str(root), "XAUUSD")})
-        specs = root / "specs"
-        specs.mkdir(parents=True)
-        (specs / "latest.json").write_text(json.dumps(
-            {"XAUUSD": {"contract_size": 100.0, "volume_min": 0.01,
-                        "volume_step": 0.01, "volume_max": 200.0}}),
-            encoding="utf-8")
-        return root
+    T81 起 --include-ext 有白名单，cutoff 行为用批准来源（fred）验证。
+    """
 
     def ext_store(self, path, ext_mod):
-        """外部库：一条 H1 序列跨 cutoff（前 5 根 <，后 3 根 ≥）。"""
-        times = list(pd.date_range("2026-05-31 20:00", periods=5, freq="h")) \
-            + list(pd.date_range("2026-06-01 02:00", periods=3, freq="h"))
-        df = pd.DataFrame({
-            "time": times, "open": 1.1, "high": 1.1, "low": 1.1,
-            "close": 1.1, "tick_volume": 1, "spread": 0, "real_volume": 0})
-        s = make_ext_series(ext_mod, df=df)
+        """外部库：一条 fred D1 序列跨 cutoff（前 4 天 <，后 2 天 ≥）。"""
+        s = make_fred_series(ext_mod)
         ext_mod.save_ext_series(str(path), s)
         return path
 
@@ -336,9 +367,10 @@ class TestCutoffDiscipline:
                        "--include-ext", "--ext-root",
                        str(tmp_path / "extroot")])
         assert rc == 0
-        df, manifest = ext.load_ext_series(str(dest / "ext"), "histdata",
-                                           "EURUSD", "H1")
+        df, manifest = ext.load_ext_series(str(dest / "ext"), "fred",
+                                           "USTEC", "D1")
         assert df["time"].max() < CUTOFF
+        assert len(df) == 4
         assert manifest["research_cutoff"] == CUTOFF.isoformat()
         assert mod.verify_ext_research_store(dest, CUTOFF) == []
 
@@ -363,7 +395,6 @@ class TestCutoffDiscipline:
                                                      main_store):
         """导出后自检：研究库 ext 段出现越界序列（伪造）→ 退出码 2。"""
         from mt5data import ext
-        from mt5data.store import save_bars
         mod = load_script("export_research_store_ext",
                           REPO_ROOT / "scripts" / "export_research_store.py")
         self.ext_store(tmp_path / "extroot", ext)
@@ -373,13 +404,226 @@ class TestCutoffDiscipline:
                          str(tmp_path / "extroot")]) == 0
         # 伪造越界：往研究库 ext 段写一根 cutoff 之后的 bar（带合法 manifest）
         bad = pd.DataFrame({
-            "time": [pd.Timestamp("2026-06-05 00:00")], "open": 1.1,
+            "time": [pd.Timestamp("2026-06-05")], "open": 1.1,
             "high": 1.1, "low": 1.1, "close": 1.1, "tick_volume": 1,
             "spread": 0, "real_volume": 0})
-        s = make_ext_series(ext, df=bad)
+        s = make_fred_series(ext, df=bad)
         ext.save_ext_series(str(dest / "ext"), s)
         v = mod.verify_ext_research_store(dest, CUTOFF)
-        assert v and "histdata" in v[0]
+        assert v and "fred" in v[0]
+
+
+# ================================================================ T81 白名单
+
+class TestIncludeExtWhitelist:
+    """失败测试先行 ⑤（T81/D36）：--include-ext 白名单硬校验。
+
+    第十二轮审核批准表：fred/cdd 批准（研究用途+使用限定入 manifest）；
+    histdata 暂不批准（条款不明）——样本只留主库侧作一致性核对。
+    """
+
+    def histdata_store(self, path, ext_mod):
+        s = make_ext_series(ext_mod)
+        ext_mod.save_ext_series(str(path), s)
+        return path
+
+    def test_unapproved_only_present_refuses_export(self, tmp_path,
+                                                    main_store, capsys):
+        """ext 库里只有未批准来源（histdata）→ --include-ext 下该序列被拒：
+        不进研究库；因没有任何批准序列可导出，整体退出非零。"""
+        from mt5data import ext
+        mod = load_script("export_research_store_ext",
+                          REPO_ROOT / "scripts" / "export_research_store.py")
+        self.histdata_store(tmp_path / "extroot", ext)
+        rc = mod.main(["--data-root", str(main_store), "--dest",
+                       str(tmp_path / "r"), "--include-ext", "--ext-root",
+                       str(tmp_path / "extroot")])
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "白名单" in out and "histdata" in out
+        # 研究库里绝不能出现未批准来源的数据
+        assert not (tmp_path / "r" / "ext" / "histdata").exists()
+
+    def test_unapproved_skipped_approved_exported(self, tmp_path, main_store,
+                                                  capsys):
+        """histdata（未批准）与 fred（批准）同库：histdata 被拒并逐条报告，
+        fred 正常导出——研究库只含批准来源。"""
+        from mt5data import ext
+        mod = load_script("export_research_store_ext",
+                          REPO_ROOT / "scripts" / "export_research_store.py")
+        root = tmp_path / "extroot"
+        self.histdata_store(root, ext)
+        ext.save_ext_series(str(root), make_fred_series(ext))
+        rc = mod.main(["--data-root", str(main_store), "--dest",
+                       str(tmp_path / "r"), "--include-ext", "--ext-root",
+                       str(root)])
+        assert rc == 0
+        df, _ = ext.load_ext_series(str(tmp_path / "r" / "ext"), "fred",
+                                    "USTEC", "D1")
+        assert len(df) == 4
+        assert not (tmp_path / "r" / "ext" / "histdata").exists()
+        out = capsys.readouterr().out
+        assert "白名单" in out and "histdata" in out
+
+    def test_approved_missing_usage_restriction_refuses(self, tmp_path,
+                                                        main_store, capsys):
+        """批准来源但 manifest 缺使用限定（usage_restriction）→ 拒绝导出
+        （研究数据不带使用限定入库违反 D36，fail-fast 整体失败）。"""
+        from mt5data import ext
+        mod = load_script("export_research_store_ext",
+                          REPO_ROOT / "scripts" / "export_research_store.py")
+        ext.save_ext_series(str(tmp_path / "extroot"),
+                            make_fred_series(ext, drop_usage=True))
+        rc = mod.main(["--data-root", str(main_store), "--dest",
+                       str(tmp_path / "r"), "--include-ext", "--ext-root",
+                       str(tmp_path / "extroot")])
+        assert rc == 1
+        assert "使用限定" in capsys.readouterr().out
+
+    def test_usage_restriction_text_mismatch_refuses(self, tmp_path,
+                                                     main_store, capsys):
+        """使用限定文本与批准表不一致（被改弱/改错）→ 拒绝导出。"""
+        from mt5data import ext
+        mod = load_script("export_research_store_ext",
+                          REPO_ROOT / "scripts" / "export_research_store.py")
+        ext.save_ext_series(str(tmp_path / "extroot"),
+                            make_fred_series(
+                                ext, usage_restriction="随意用，可再分发"))
+        rc = mod.main(["--data-root", str(main_store), "--dest",
+                       str(tmp_path / "r"), "--include-ext", "--ext-root",
+                       str(tmp_path / "extroot")])
+        assert rc == 1
+        assert "使用限定" in capsys.readouterr().out
+
+    def test_manifest_carries_canonical_usage_restriction(self):
+        """适配器产出的批准来源 manifest 自带与批准表一致的使用限定。"""
+        from mt5data import ext
+        from mt5data.ext.approvals import SOURCE_APPROVALS
+        s = make_fred_series(ext)
+        assert s.manifest["usage_restriction"] \
+            == SOURCE_APPROVALS["fred"]["usage_restriction"]
+        assert "只作研究用途" in s.manifest["usage_restriction"]
+        assert "不再分发" in s.manifest["usage_restriction"]
+
+
+# ================================================================ T81 逐年口径
+
+def _synth_weeks_utc(year: int) -> pd.DatetimeIndex:
+    """合成一年的分钟 bar（naive UTC）：周开盘=纽约周日 17:00，收周五，
+    每个交易日纽约 17:00–18:00 换日空档（周一至周五；周日 17:00 是开市
+    保留）。结构锚点即 G5 所述：周开盘与换日均锚在纽约 17:00 一侧。
+    用分钟条（与真实 HistData M1 同 cadence），30 分钟下限的换日空档
+    检测才有意义。
+    """
+    ny = "America/New_York"
+    sundays = pd.date_range(f"{year}-01-01", f"{year}-12-31", freq="W-SUN")
+    bars = []
+    for sun in sundays:
+        open_utc = pd.Timestamp(sun + pd.Timedelta(hours=17)) \
+            .tz_localize(ny, nonexistent="shift_forward").tz_convert("UTC") \
+            .tz_localize(None)
+        close_utc = pd.Timestamp(sun + pd.Timedelta(days=5, hours=15)) \
+            .tz_localize(ny, nonexistent="shift_forward").tz_convert("UTC") \
+            .tz_localize(None)
+        minutes = pd.date_range(open_utc, close_utc, freq="min")
+        local = minutes.tz_localize("UTC").tz_convert(ny)
+        # 换日空档：挖掉周一至周五的纽约 17:00 小时（周日 17:00 是开市）
+        keep = ~((local.hour == 17) & (local.dayofweek != 6))
+        bars.append(minutes[keep])
+    return bars[0].append(bars[1:]) if len(bars) > 1 else bars[0]
+
+
+def _labels_for_rule(utc_index: pd.DatetimeIndex, rule: str) -> pd.Series:
+    """把真 UTC bar 起点映成各候选标签规则下的原始标签（naive）：
+    - us_wall：美东墙钟（随美 DST 调表）；
+    - fixed_est：固定 EST（UTC−5，不调表）；
+    - eu_calendar：美东量级偏移、切换跟欧盟日历（按欧盟切换瞬间的
+      理想化规则——用于检测器判别，周日 17/16 点档模式与实测一致）；
+    - eu_calendar_histdata：converter v3 实测规则的逆（夏窗边界=标签
+      空间"最后一个周日 19:00"≡UTC"次日周一 00:00"）——用于往返测试。
+    """
+    if rule == "us_wall":
+        z = utc_index.tz_localize("UTC").tz_convert("America/New_York")
+        return pd.Series(z.tz_localize(None))
+    if rule == "fixed_est":
+        return pd.Series(utc_index - pd.Timedelta(hours=5))
+    if rule in ("eu_calendar", "eu_calendar_histdata"):
+        if rule == "eu_calendar":
+            berlin = ZoneInfo("Europe/Berlin")
+            off = [4 if t.to_pydatetime().replace(
+                        tzinfo=timezone.utc).astimezone(berlin).dst()
+                   else 5 for t in utc_index]
+        else:
+            year = int(pd.DatetimeIndex(utc_index).year[0])
+
+            def monday_after_last_sunday(month: int) -> pd.Timestamp:
+                import calendar
+                last = calendar.monthrange(year, month)[1]
+                wd = pd.Timestamp(year, month, last).dayofweek  # Mon=0
+                sunday = last - ((wd + 1) % 7)
+                return pd.Timestamp(year, month, sunday) \
+                    + pd.Timedelta(days=1)
+            lo = monday_after_last_sunday(3)
+            hi = monday_after_last_sunday(10)
+            off = [4 if lo <= t < hi else 5 for t in utc_index]
+        return pd.Series(utc_index) - pd.to_timedelta(off, unit="h")
+    raise ValueError(rule)
+
+
+class TestYearlyLabelCalendar:
+    """失败测试先行 ⑥（T81/G5）：合成数据上逐年口径检测区分三种规则，
+    并识别口径不一致的年份（不一致年份不得套用同一转换）。"""
+
+    def test_distinguishes_three_rules_on_synthetic_year(self):
+        from mt5data.ext import consistency as cons
+        utc = _synth_weeks_utc(2021)
+        for rule in ("us_wall", "fixed_est", "eu_calendar"):
+            rep = cons.yearly_label_calendar(_labels_for_rule(utc, rule))
+            assert rep[2021]["calendar"] == rule, \
+                (rule, rep[2021])
+            assert rep[2021]["anchor_hours"], rep[2021]
+
+    def test_mixed_rules_within_one_year_flagged_inconsistent(self):
+        """同一文件/年份内前半年欧盟日历、后半年固定 EST → 不一致
+        （任何单一规则偏差都超容差），必须单独登记。"""
+        from mt5data.ext import consistency as cons
+        utc = _synth_weeks_utc(2021)
+        first = utc[utc < pd.Timestamp("2021-07-01")]
+        second = utc[utc >= pd.Timestamp("2021-07-01")]
+        mixed = pd.concat([_labels_for_rule(first, "eu_calendar"),
+                           _labels_for_rule(second, "fixed_est")],
+                          ignore_index=True)
+        rep = cons.yearly_label_calendar(mixed)
+        assert rep[2021]["calendar"] == "inconsistent", rep[2021]
+        # 证据：三种规则的偏差数都超出容差
+        assert max(rep[2021]["deviations"].values()) \
+            > rep[2021]["tolerance"]
+
+    def test_years_classified_separately(self):
+        """多年文件逐年判定：2020 欧盟日历、2021 固定 EST → 两个年份各自
+        得出正确结论（不许整段套同一转换）。"""
+        from mt5data.ext import consistency as cons
+        labels = pd.concat([
+            _labels_for_rule(_synth_weeks_utc(2020), "eu_calendar"),
+            _labels_for_rule(_synth_weeks_utc(2021), "fixed_est")],
+            ignore_index=True)
+        rep = cons.yearly_label_calendar(labels)
+        assert set(rep) == {2020, 2021}
+        assert rep[2020]["calendar"] == "eu_calendar", rep[2020]
+        assert rep[2021]["calendar"] == "fixed_est", rep[2021]
+
+    def test_eu_labels_roundtrip_through_converter(self):
+        """converter v3 实测规则的逆标签 ↔ histdata_stamps_to_utc 互逆，
+        且检测器把它判为欧盟日历——检测器认可的规则与入库转换同源。"""
+        from mt5data.ext import consistency as cons
+        from mt5data.ext.core import histdata_stamps_to_utc
+        utc = _synth_weeks_utc(2021)
+        labels = _labels_for_rule(utc, "eu_calendar_histdata")
+        back = histdata_stamps_to_utc(labels)
+        assert list(pd.DatetimeIndex(back).sort_values()) == \
+            list(pd.DatetimeIndex(utc).sort_values())
+        rep = cons.yearly_label_calendar(labels)
+        assert rep[2021]["calendar"] == "eu_calendar", rep[2021]
 
 
 # ================================================================ 一致性核对

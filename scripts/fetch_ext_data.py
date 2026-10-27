@@ -1,15 +1,22 @@
-"""外部数据下载与入库（T67/D36）：data/ext/<来源>/<品种>/<周期>/。
+"""外部数据下载与入库（T67/T81/D36）：data/ext/<来源>/<品种>/<周期>/。
 
 用法（Git Bash；--help 看全量参数）：
-    # HistData 样本段（M1 bid，EST 固定时区；每年一个 zip）
+    # HistData 样本段（M1 bid，实测规则=美东偏移+欧盟 DST 日历；每年一个 zip）
     .venv/Scripts/python.exe scripts/fetch_ext_data.py histdata \
         --pairs EURUSD,XAUUSD --years 2020,2021
-    # BTC 现货日线（CryptoDataDownload/Bitstamp，全量一个 csv）
+    # BTC 现货日线（CryptoDataDownload/Bitstamp，全量一个 csv）【批准】
     .venv/Scripts/python.exe scripts/fetch_ext_data.py cdd
-    # 纳指 100 指数收盘价（FRED NASDAQ100，全量一个 csv）
+    # 纳指 100 指数收盘价（FRED NASDAQ100，全量一个 csv）【批准】
     .venv/Scripts/python.exe scripts/fetch_ext_data.py fred
     # Stooq（实测被拒也会如实记录并退出非零）
     .venv/Scripts/python.exe scripts/fetch_ext_data.py stooq
+
+批准状态（T81 落地 D36/第十二轮审核，详见 mt5data.ext.approvals）：
+- **fred/cdd 批准**入研究库（export_research_store --include-ext 白名单
+  只放行这两个来源；manifest 自带使用限定 usage_restriction）；
+- **histdata 暂不批准**（条款不明，查找记录存 data/ext/terms/）——下载
+  只为主库侧一致性核对，不进研究库；
+- **yahoo 不批准**，已从可选来源移除；Stooq 不用（拒服务）。
 
 行为：
 - 下载 → 原始文件存 data/ext/_raw/<来源>/（保留取证）→ 适配器转成
@@ -27,8 +34,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mt5data.ext import (  # noqa: E402
-    ExtDataError, ExtSeries, adapters, ext_inventory, load_ext_series,
-    save_ext_series, utc_now_iso)
+    ExtDataError, ExtSeries, adapters, approved_sources, ext_inventory,
+    load_ext_series, save_ext_series, utc_now_iso)
 from mt5data.resample import resample_bars  # noqa: E402
 
 
@@ -65,6 +72,9 @@ def _store(ext_root: str, series: ExtSeries, *, resample_to=()) -> None:
 
 def cmd_histdata(args) -> int:
     failures = 0
+    print("⚠ HistData 暂不批准入研究库（D36：条款不明的不用，查找记录见 "
+          "data/ext/terms/）——下载只作主库侧一致性核对，"
+          "--include-ext 白名单不放行该来源")
     for pair in args.pairs.split(","):
         pair = pair.strip().upper()
         for year in [int(y) for y in args.years.split(",")]:
@@ -139,7 +149,7 @@ def cmd_stooq(args) -> int:
     try:
         raw = adapters.fetch_stooq_csv(args.symbol)
     except adapters.ExtSourceUnreachable as e:
-        print(f"✗ Stooq 不可用（如实记录，改用 FRED/Yahoo 或用户网络手工下载）：{e}")
+        print(f"✗ Stooq 不可用（如实记录，改用 FRED 或用户网络手工下载）：{e}")
         return 1
     _save_raw(args.ext_root, "stooq", name, raw)
     s = adapters.stooq_daily_from_bytes(raw, symbol="USTEC",

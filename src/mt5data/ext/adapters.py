@@ -11,6 +11,11 @@
 实测不可达（如实记录）：Stooq 的 CSV 端点对数据中心 IP 一律
 "Access denied"（即便通过其浏览器质询）；Dukascopy datafeed TLS 无法建立。
 两者的解析器保留（格式公开），下载函数会给出明确错误。
+
+批准状态（T81 落地 D36/第十二轮审核，详见 mt5data.ext.approvals）：
+fred/cdd 批准入研究库（manifest 带使用限定 usage_restriction）；histdata
+暂不批准（条款不明，样本只作一致性核对）；Yahoo 不批准（已从可选来源
+移除，不再作备选）。
 """
 from __future__ import annotations
 
@@ -27,26 +32,33 @@ import zipfile
 import pandas as pd
 
 from mt5data.store import _COLUMNS
+from mt5data.ext.approvals import (USAGE_RESTRICTION_CDD,
+                                   USAGE_RESTRICTION_FRED)
 from mt5data.ext.core import (ExtDataError, ExtSeries, histdata_stamps_to_utc,
                               sha256_bytes)
 
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
 
-# 使用条款摘要（如实；是否可用交用户确认，见报告"来源清单"）
+# 使用条款摘要（批准结论见 mt5data.ext.approvals；第十二轮审核 D36）
 TERMS_HISTDATA = (
-    "histdata.com 自称免费外汇/黄金历史数据（个人使用）；网站无逐字条款页，"
-    "数据为聚合商报价、非交易所授权再分发。研究用途内部使用、不对外再分发；"
-    "待用户确认。")
+    "histdata.com 自称免费外汇/黄金历史数据；站内无使用条款页、未找到允许"
+    "个人研究使用的明文（D36：条款不明的不用）——暂不批准：样本只作一致性"
+    "核对、不进研究库、不对外再分发。查找记录存本地 data/ext/terms/"
+    "histdata-2026-10-27.txt；条款核实后交审核会话复核再启用。")
 TERMS_CDD = (
     "CryptoDataDownload 免费提供交易所公开行情的聚合 CSV；页面条款允许"
-    "个人下载使用、禁止批量转售。Bitstamp 数据为交易所公开成交；待用户确认。")
+    "个人下载使用、限非商业用途。Bitstamp 数据为交易所公开成交。"
+    "第十二轮审核批准用于研究（D36，2026-10-27），使用限定见 "
+    "usage_restriction 字段。")
 TERMS_FRED = (
-    "FRED（圣路易斯联储）允许免费下载与再分发其 CSV；NASDAQ100 指数值"
-    "版权归纳斯达克，FRED 页面标注按许可展示。研究内部使用；待用户确认。")
+    "FRED（圣路易斯联储）允许免费下载使用；NASDAQ100 指数值版权归纳斯达克"
+    "（FRED 页面标注 Copyrighted: Pre-Approval Required）。第十二轮审核批准"
+    "用于研究（D36，2026-10-27）：原始数据与逐日序列不入公开仓库、不再分发，"
+    "使用限定见 usage_restriction 字段。")
 TERMS_STOOQ = (
     "stooq.com 免费行情；条款注明数据仅供个人使用、不保证准确性。"
-    "实测其批量 CSV 端点对数据中心 IP 拒绝（Access denied）。")
+    "实测其批量 CSV 端点对数据中心 IP 拒绝（Access denied），不用。")
 
 
 class ExtSourceUnreachable(RuntimeError):
@@ -156,6 +168,27 @@ def histdata_m1_from_bytes(zip_bytes: bytes, *, symbol: str,
     return ExtSeries(df=out[_COLUMNS], manifest=manifest)
 
 
+def histdata_raw_stamps(zip_bytes: bytes) -> pd.Series:
+    """HistData 年度 zip → 原始 ASCII 时间标签（naive，未做任何换算）。
+
+    供逐年口径验证（consistency.yearly_label_calendar，T81/G5）用：
+    标签口径的规则只存在于原始标签空间，换算后的 UTC 序列无法反推。
+    """
+    z = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    frames = []
+    for name in z.namelist():
+        if not name.lower().endswith(".csv"):
+            continue
+        raw = z.read(name)
+        df = pd.read_csv(io.BytesIO(raw), sep=";", header=None,
+                         usecols=[0], names=["stamp"])
+        frames.append(pd.to_datetime(df["stamp"].astype(str).str.strip(),
+                                     format="%Y%m%d %H%M%S"))
+    if not frames:
+        raise ExtDataError(f"HistData zip 内无 csv：{z.namelist()}")
+    return pd.concat(frames, ignore_index=True)
+
+
 HISTDATA_TK_URL = ("https://www.histdata.com/download-free-forex-historical-data/"
                    "?/ascii/1-minute-bar-quotes/{pair_lower}/{year}")
 
@@ -229,6 +262,7 @@ def cdd_daily_from_bytes(raw: bytes, *, symbol: str = "BTCUSD",
         "original_timezone": "UTC（日线日期）",
         "dst_rule": "无（UTC）",
         "terms_note": TERMS_CDD,
+        "usage_restriction": USAGE_RESTRICTION_CDD,
         "downloaded_at_utc": downloaded_at_utc,
         "source_files": [{"name": source_name, "sha256": sha256_bytes(raw)}],
         "converter_version": 1,
@@ -277,6 +311,7 @@ def fred_daily_from_bytes(raw: bytes, *, symbol: str = "USTEC",
         "original_timezone": "交易日历日期（贴 UTC 00:00 标签）",
         "dst_rule": "不适用（日线）",
         "terms_note": TERMS_FRED,
+        "usage_restriction": USAGE_RESTRICTION_FRED,
         "downloaded_at_utc": downloaded_at_utc,
         "source_files": [{"name": source_name or f"{series_id}.csv",
                           "sha256": sha256_bytes(raw)}],
@@ -373,5 +408,5 @@ def fetch_stooq_csv(symbol: str = "^ndx") -> bytes:
     if text.startswith("Access denied") or "Date" not in text[:200]:
         raise ExtSourceUnreachable(
             f"Stooq {symbol} 拒绝批量下载（Access denied）——数据中心 IP "
-            "被限制；改用 FRED/Yahoo 或用户网络下手工下载")
+            "被限制；改用 FRED 或用户网络下手工下载")
     return raw

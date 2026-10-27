@@ -11,6 +11,9 @@ zoneinfo 处理 DST，切换周边界由测试钉死。
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 
 SERVER_TZ_DEFAULT = "UTC"
@@ -205,3 +208,142 @@ def weekend_structure(df: pd.DataFrame) -> dict:
     sat = float((t.dayofweek == 5).mean())
     sun = float((t.dayofweek == 6).mean())
     return {"sat_share": round(sat, 4), "sun_share": round(sun, 4)}
+
+
+# ---------------------------------------------------------------- 逐年口径（G5/T81）
+
+NY_TZ = "America/New_York"
+EU_TZ = "Europe/Berlin"
+
+
+def _hour_bucket(ts) -> int:
+    """标签时刻 → 最近整点小时（开市晚几分钟按四舍五入归档，如 17:06→17）。"""
+    return ((ts.hour * 60 + ts.minute) + 30) // 60 % 24
+
+
+def _dst_on(dates, tz: str):
+    """每个日期在该时区是否处于夏令时（正午判定，避开切换窗口的歧义）。
+
+    pandas 3 无 Series.dt.dst()，用 zoneinfo 的 datetime.dst() 逐个判定。
+    """
+    zi = ZoneInfo(tz)
+    flags = []
+    for d in pd.to_datetime(pd.Series(dates)):
+        noon = datetime(d.year, d.month, d.day, 12, tzinfo=zi)
+        flags.append(noon.dst() != timedelta(0))
+    return pd.Series(flags, dtype=bool).to_numpy()
+
+
+def yearly_label_calendar(stamps, *, winter_months=(1, 2, 12),
+                          gap_min=pd.Timedelta(minutes=30),
+                          gap_max=pd.Timedelta(hours=24),
+                          tol_rate: float = 0.05, tol_min: int = 2) -> dict:
+    """逐年时间口径检测（T81/第十二轮 G5）——为 HistData 早年文件准备。
+
+    输入**原始标签**（naive，未换算；HistData 用 adapters.histdata_raw_stamps
+    从年度 zip 取）。市场结构锚点（与品种无关的事实）：外汇每周开盘在纽约
+    周日 17:00（黄金 18:00），每日换日空档在纽约 17:00 一侧。锚点小时的
+    标签位置随"标签规则"变化：
+
+    - ``us_wall``     标签=美东墙钟（随美国 DST 调表）→ 锚点小时全年不变；
+    - ``fixed_est``   标签=固定 EST（UTC−5 不调表，官方 FAQ 口径）→
+      美国夏令时期间锚点比墙钟早 1 小时；
+    - ``eu_calendar`` 标签=美东量级偏移但切换跟**欧盟日历**（实测 2020–21
+      规则，converter v3）→ 仅美欧错位窗（3 月中下旬、10 月底）早 1 小时。
+
+    方法：对每个观测（周首 bar 时刻、换日空档后的恢复时刻）取标签小时
+    档；深冬（1/2/12 月，三种规则一致）取模态小时作该类观测的锚；再按
+    三种规则在观测日的期望小时逐条比对，偏差最小且 ≤ 容差的规则即该年
+    口径；任何规则都超容差 → ``inconsistent``（该年单独登记，不得套用
+    同一转换）。所有数字写进返回值，判定阈值效果留给报告复核。
+
+    输入应为**分钟级 cadence** 的原始标签（真实 HistData M1 即是）；换日
+    空档下限会自动抬高到 3× 模态步长，小时级 cadence 的喂入不会把常规
+    bar 间隔误当空档。
+
+    返回 {年: {calendar, anchor_hours{观测类: 锚小时}, observations,
+    hour_counts, mismatch_window_observations, deviations{规则: 偏差数},
+    tolerance, distinguishing_observations}}。
+    """
+    t = pd.DatetimeIndex(pd.to_datetime(stamps)).sort_values()
+    if len(t) == 0:
+        return {}
+
+    # 观测收集：(观测日, 观测类, 标签小时档)
+    obs_day: list = []
+    obs_kind: list = []
+    obs_bucket: list = []
+    sun = t[t.dayofweek == 6]
+    if len(sun):
+        firsts = pd.Series(sun).groupby(pd.Series(sun).dt.date).min()
+        for d, v in firsts.items():
+            obs_day.append(pd.Timestamp(d))
+            obs_kind.append("week_open")
+            obs_bucket.append(_hour_bucket(v))
+    if len(t) > 1:
+        diffs = t.to_series().diff().iloc[1:]
+        modal = diffs.mode().iloc[0] if len(diffs) else gap_min
+        gap_lo = max(gap_min, 3 * modal)
+        mask = (diffs >= gap_lo) & (diffs < gap_max)
+        for end in t[1:][mask.to_numpy()]:
+            obs_day.append(pd.Timestamp(end.date()))
+            obs_kind.append("daily_gap")
+            obs_bucket.append(_hour_bucket(end))
+    if not obs_day:
+        return {}
+    frame = pd.DataFrame({"day": obs_day, "kind": obs_kind,
+                          "bucket": obs_bucket})
+
+    rules = ("eu_calendar", "fixed_est", "us_wall")
+    out: dict[int, dict] = {}
+    for year, grp in frame.groupby(frame["day"].dt.year):
+        rep: dict = {"observations": {k: int(n) for k, n in
+                                      grp["kind"].value_counts().items()}}
+        anchor_hours: dict[str, int] = {}
+        winter = grp[grp["day"].dt.month.isin(winter_months)]
+        for kind in ("week_open", "daily_gap"):
+            wk = winter[winter["kind"] == kind]
+            if len(wk):
+                anchor_hours[kind] = int(wk["bucket"].mode().iloc[0])
+        rep["anchor_hours"] = anchor_hours
+        usable = grp[grp["kind"].isin(anchor_hours)]
+        if usable.empty:
+            rep.update({"calendar": "undetermined",
+                        "reason": "缺深冬（1/2/12 月）观测，锚点小时无法确定"})
+            out[int(year)] = rep
+            continue
+
+        us = _dst_on(usable["day"], NY_TZ)
+        eu = _dst_on(usable["day"], EU_TZ)
+        anchor = usable["kind"].map(anchor_hours).astype(int).to_numpy()
+        expected = {
+            "us_wall": anchor % 24,
+            "fixed_est": (anchor - us) % 24,
+            "eu_calendar": (anchor - (us & ~eu).astype(int)) % 24,
+        }
+        observed = usable["bucket"].to_numpy()
+        deviations = {r: int((observed != expected[r]).sum())
+                      for r in rules}
+        n = len(usable)
+        tol = max(tol_min, -(-int(tol_rate * n * 100) // 100))  # ceil(5%)
+        best = min(rules, key=lambda r: (deviations[r], rules.index(r)))
+        ties = [r for r in rules if deviations[r] == deviations[best]]
+        if deviations[best] > tol:
+            calendar = "inconsistent"
+        elif len(ties) > 1:
+            calendar = "undetermined"
+            rep["reason"] = (f"规则 {ties} 偏差同为 {deviations[best]}，"
+                             "观测缺区分度（缺美欧错位窗/夏令时窗观测？）")
+        else:
+            calendar = best
+        rep.update({
+            "calendar": calendar,
+            "hour_counts": {str(h): int(c) for h, c in
+                            grp["bucket"].value_counts().sort_index().items()},
+            "mismatch_window_observations": int((us & ~eu).sum()),
+            "us_dst_observations": int(us.sum()),
+            "deviations": deviations,
+            "tolerance": tol,
+        })
+        out[int(year)] = rep
+    return out
