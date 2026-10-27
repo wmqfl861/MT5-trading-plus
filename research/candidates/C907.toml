@@ -5,6 +5,17 @@
 id = "C907"
 title = "唐奇安通道突破 v2（H002-v2）撤回登记"
 status = "withdrawn"
+mechanism_class = "trend"            # 同谱系 H002（趋势延续）
+symbols = ["BTCUSD"]
+holding = "H1"
 source_card = "H002-v2"
 mechanism = "同谱系 H002（趋势延续）；本条目不是候选，只记录撤回"
 notes = "撤回理由：本卡的参数网格与预期笔数取自 v3 样本内（BTCUSD 腿 run#357-374 的实测组合收窄而来）——预期不得取自样本内（铁律 17；蓝图 v4 §6.1）。运行次数：0 次（台账 data/research/ledger.sqlite，2026-10-27 只读查证，bt ledger stats --card H002-v2 total_runs=0）——未运行过，不计入项目级 N。同谱系新版本如需重启，须按蓝图 v4 §6.2 作为新候选登记、过预筛并列入轮次。"
+
+[literature]
+original = ["不适用——撤回登记（T61/D30），本条目只记录撤回"]
+replications = []
+rebuttals = []
+search_log = "不适用——撤回登记非研究候选，无文献检索任务（蓝图 v4 §6.1）"
+published_effect = "不适用——样品/撤回登记不承载预期效应声明"
+expected_effect = "不适用——结果只作测量证据与撤回记录，不作为方向依据（蓝图 v4 §6.1）"

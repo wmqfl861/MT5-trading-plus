@@ -10,3 +10,11 @@ holding = "H1"
 source_card = "H007"
 mechanism = "波动聚集 + 杠杆约束：高波动期风险溢价不足以补偿尾部风险，降低高波动期敞口改善组合形状（Moreira & Muir 2017）"
 notes = "用于校准关卡/成本/引擎/实盘链路，不作研究候选（蓝图 v4 §6.1）。正期望属金价大牛市样本期，不作为方向证据；发表后证据偏负面（Cederburg et al. 2020）。运行须 bt --specimen（actor=calibration，不进入研究轮次统计）。台账运行次数（2026-10-27 只读查证）：65 次。"
+
+[literature]
+original = ["不适用——标定样品登记（T61/D30），非研究候选"]
+replications = []
+rebuttals = ["Cederburg et al. (2020)：波动率管理实时样本外一般不如原组合（蓝图 v4 §6.1 引为重定位依据）"]
+search_log = "不适用——标定样品非研究候选，无文献检索任务（蓝图 v4 §6.1）"
+published_effect = "不适用——样品/撤回登记不承载预期效应声明"
+expected_effect = "不适用——结果只作测量证据与撤回记录，不作为方向依据（蓝图 v4 §6.1）"

@@ -8,3 +8,11 @@ holding = "M15"
 source_card = "H005"
 mechanism = "做市商回摆收益（Nagel 2012 evaporating liquidity）：短期价格冲击后的流动性回补；趋势过滤对冲时间序列动量"
 notes = "用于校准关卡/成本/引擎/实盘链路，不作研究候选（蓝图 v4 §6.1）。运行须 bt --specimen（actor=calibration，不进入研究轮次统计）。台账运行次数（2026-10-27 只读查证）：142 次。"
+
+[literature]
+original = ["不适用——标定样品登记（T61/D30），非研究候选"]
+replications = []
+rebuttals = []
+search_log = "不适用——标定样品非研究候选，无文献检索任务（蓝图 v4 §6.1）"
+published_effect = "不适用——样品/撤回登记不承载预期效应声明"
+expected_effect = "不适用——结果只作测量证据与撤回记录，不作为方向依据（蓝图 v4 §6.1）"

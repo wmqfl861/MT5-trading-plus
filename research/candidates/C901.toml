@@ -10,3 +10,11 @@ holding = "H1"
 source_card = "H002"
 mechanism = "趋势后期才入场/离场的慢资金在通道边界被系统性触发，breakout 后订单流延续方向；同谱系 v2 卡（H002-v2）已撤回，见 C907"
 notes = "用于校准关卡/成本/引擎/实盘链路，不作研究候选（蓝图 v4 §6.1）。XAUUSD 腿正期望属金价大牛市样本期，不作为方向证据；发表后证据偏负面（Huang et al. 2020 时间序列动量逐资产几乎没有证据）。运行须 bt --specimen（actor=calibration，不进入研究轮次统计）。台账运行次数（2026-10-27 只读查证）：97 次。"
+
+[literature]
+original = ["不适用——标定样品登记（T61/D30），非研究候选"]
+replications = []
+rebuttals = ["Huang et al. (2020)：时间序列动量逐资产几乎没有证据（蓝图 v4 §6.1 引为重定位依据）"]
+search_log = "不适用——标定样品非研究候选，无文献检索任务（蓝图 v4 §6.1）"
+published_effect = "不适用——样品/撤回登记不承载预期效应声明"
+expected_effect = "不适用——结果只作测量证据与撤回记录，不作为方向依据（蓝图 v4 §6.1）"

@@ -2,6 +2,7 @@
 
 用法：
     .venv/Scripts/python.exe scripts/bt.py card check research/cards/H001.toml
+    .venv/Scripts/python.exe scripts/bt.py candidate check C001
     .venv/Scripts/python.exe scripts/bt.py screen --card H001 \
         --strategy mt5quant.strategies.library.buy_hold:BuyHold
     .venv/Scripts/python.exe scripts/bt.py ledger stats --card H001
@@ -9,6 +10,12 @@
         --strategy mt5quant.strategies.library.buy_hold:BuyHold --gates G0,G1,G2,G3,G4
 
 约定：
+- 候选预筛（T62/D31，铁律 17/18）：bt candidate check 读附录 C 候选登记
+  → precheck 五条件（文献/持仓 ≥H1/事前成本倍数 ≥3/检验力 ≥50%/机制空缺）
+  → 写 research/candidates/C###.precheck.json 并记入台账 candidate_checks
+  表（带哈希链）；退出码 pass=0 / fail=1 / waiting_data=2。研究年数按
+  研究库品种×周期实际覆盖计算（不用常数），检验力函数与 round11 探针
+  逐位一致（Lo 2002 近似）。
 - 撤回与标定样品（T61/D30）：research/candidates/ 候选登记里
   status=withdrawn 的卡（source_card 指向卡 id，如 H002-v2/H003-v2/
   H006-v2）拒绝 screen/gate；status=specimen 的标定样品卡（H001–H007）
@@ -82,6 +89,7 @@ import json
 import math
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -96,6 +104,7 @@ from mt5quant.backtest.report import (  # noqa: E402
     summarize,
 )
 from mt5quant.research import cards  # noqa: E402
+from mt5quant.research import candidates as cand  # noqa: E402
 from mt5quant.research.ledger import Ledger, LedgerTamperedError  # noqa: E402
 from mt5quant.validation import gates as vgate  # noqa: E402
 from mt5quant.validation import lookahead as vlook  # noqa: E402
@@ -482,6 +491,147 @@ def _g5_orchestrate(ledger, card, *, strategy, spec, params, base_summary,
                         reference_returns=reference,
                         expected_trades=expected_trades,
                         approved_by=approved_by, cfg=cfg, cutoff=lb_cutoff)
+
+
+# ------------------------------------------------------------ candidate check
+
+def _merged_costs(data_root, symbols, *, spread_fraction: float,
+                  commission: float, research_mode: bool):
+    """候选预筛用的成本模型 v3：逐品种 build_costs 后合并成一个聚合体。
+
+    预筛只信**缓存文件**的成本模型（与引擎同一缓存；tick 水位新鲜度由
+    导出/构建侧把关），因此按研究库语义加载（build_costs research_store
+    语义：缺缓存报错指路，不读 tick、不静默零成本）。合并：SpreadModel.
+    merge（多品种点差）、CommissionModel per_symbol、SwapModel per_symbol
+    规则、滑点按同一 spread_fraction 重建。返回 (Costs, cost_version)——
+    版本串取各品种版本的去重拼接（进 precheck.json 的成本身份）。
+    """
+    from mt5quant.costs import CommissionModel, Costs, SlippageModel, SwapModel
+
+    spread = None
+    comm_by_sym: dict[str, float] = {}
+    rules: dict[str, object] = {}
+    versions: list[str] = []
+    for sym in symbols:
+        costs_i, ver_i = build_costs(
+            data_root, sym, spread_fraction, commission,
+            research_store=True)
+        versions.append(ver_i)
+        spread = costs_i.spread if spread is None else spread.merge(costs_i.spread)
+        comm_by_sym[sym] = costs_i.commission_per_lot(sym)
+        rules[sym] = costs_i.swap.rule(sym)
+    merged = Costs(
+        spread=spread,
+        slippage_model=SlippageModel(spread, spread_fraction=spread_fraction),
+        commission=CommissionModel(default_per_lot=commission,
+                                   per_symbol=comm_by_sym),
+        swap=SwapModel(per_symbol=rules))
+    version = versions[0] if len(set(versions)) == 1 else "+".join(versions)
+    return merged, version
+
+
+def _active_mechanism_classes(candidates_dir: Path,
+                              exclude_id: str) -> set[str]:
+    """组合内已有活跃谱系的机制类别（蓝图 §6.2 条件 5 的"排后"依据）。
+
+    活跃 = 候选登记 status ∈ {in_round, screened_pass}。装载失败的登记
+    退回最小读取（status/mechanism_class 两键）；再失败 → 警告跳过（该
+    扫描只供排序类理由，不阻塞决定）。
+    """
+    import tomllib
+
+    active: set[str] = set()
+    if not candidates_dir.is_dir():
+        return active
+    for p in sorted(candidates_dir.glob("*.toml")):
+        try:
+            c = cand.load_candidate(p)
+            status, mclass = c.status, c.mechanism_class
+        except cand.CandidateError:
+            try:
+                with open(p, "rb") as f:
+                    raw = tomllib.load(f)
+                status, mclass = raw.get("status"), raw.get("mechanism_class")
+            except Exception:
+                print(f"⚠ 机制扫描跳过 {p.name}（不可读）")
+                continue
+        if status in ("in_round", "screened_pass") and mclass \
+                and p.stem != exclude_id:
+            active.add(str(mclass))
+    return active
+
+
+def cmd_candidate_check(args) -> int:
+    """T62/D31：候选预筛——读候选 → precheck → 写 json + 台账 → 打印结论。
+
+    退出码：pass=0、fail=1、waiting_data=2。预筛结果写
+    research/candidates/C###.precheck.json（工具生成、随候选提交）并记入
+    台账 candidate_checks 表（带哈希链）。
+    """
+    value = args.candidate
+    path = Path(value) if value.lower().endswith(".toml") \
+        else Path(args.candidates_dir) / f"{value}.toml"
+    try:
+        candidate = cand.load_candidate(path)
+    except cand.CandidateError as e:
+        print(f"✗ {e}")
+        return 1
+    try:
+        data_root, _store_kind = _resolve_store(args)
+    except ValueError as e:
+        print(f"✗ {e}")
+        return 1
+    if candidate.status in cand.BOOKKEEPING_STATUSES:
+        # specimen/withdrawn 簿记：不是研究候选，precheck 短路为 fail，
+        # 不装配成本、不算覆盖（其品种可能根本不在研究库）
+        costs, cost_version, years, active = None, "n/a（非研究候选）", {}, set()
+    else:
+        try:
+            costs, cost_version = _merged_costs(
+                data_root, candidate.symbols,
+                spread_fraction=args.spread_fraction,
+                commission=args.commission, research_mode=True)
+        except Exception as e:
+            print(f"✗ 成本模型装配失败：{type(e).__name__}: {e}")
+            return 1
+        years = cand.coverage_years(data_root, candidate.symbols,
+                                    [candidate.holding])
+        active = _active_mechanism_classes(Path(candidate.path).parent,
+                                           candidate.id)
+    result = cand.precheck(candidate, data_root=data_root, cost_model=costs,
+                           research_years=years, active_mechanisms=active)
+    payload = result.to_payload()
+    payload["cost_model_version"] = cost_version
+    payload["checked_at_utc"] = datetime.now(timezone.utc).isoformat()
+
+    # 结果落地：C###.precheck.json（原子写，铁律 15）+ 台账（哈希链）
+    out_path = Path(candidate.path).with_suffix("").with_name(
+        f"{candidate.id}.precheck.json")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                   encoding="utf-8")
+    os.replace(tmp, out_path)
+    ledger_path = _ledger_default(args)
+    with Ledger(ledger_path) as ledger:
+        ledger.record_candidate_check(candidate.id, decision=result.decision,
+                                      result=payload)
+
+    mark = {"pass": "✓", "fail": "✗", "waiting_data": "⏳"}[result.decision]
+    print(f"{mark} 候选 {candidate.id} 预筛结论：{result.decision}")
+    years_note = (f"研究段 {min(payload['checks'].get('power', {})
+                               .get('years_detail', {}).values() or [0]):.2f} 年"
+                  if payload["checks"] else "")
+    pw = payload["checks"].get("power", {}).get("power")
+    mult = payload["checks"].get("ex_ante_cost", {}).get("multiple")
+    if mult is not None:
+        print(f"  事前成本倍数 {mult:.2f}（门槛 ≥3）")
+    if pw is not None:
+        print(f"  单次检验力 {pw:.0%}（门槛 ≥50%，{years_note}）")
+    for r in result.reasons:
+        print(f"  - {r}")
+    print(f"预筛结果：{out_path}；台账 {ledger_path}（candidate_checks 哈希链）")
+    return {"pass": 0, "fail": 1, "waiting_data": 2}[result.decision]
 
 
 # ---------------------------------------------------------------- card check
@@ -1010,8 +1160,8 @@ def cmd_ledger_stats(args) -> int:
 # ---------------------------------------------------------------- ledger verify
 
 def cmd_ledger_verify(args) -> int:
-    """T37/M6/D27 + R6/C5：校验 runs/gates/lockbox_uses 三条哈希链 +
-    chain_meta 快照（断链/篡改/删尾/未登记写入）。"""
+    """T37/M6/D27 + R6/C5：校验 runs/gates/lockbox_uses/candidate_checks
+    四条哈希链 + chain_meta 快照（断链/篡改/删尾/未登记写入）。"""
     ledger_path = Path(args.ledger) if args.ledger else \
         Path(args.data_root) / "research" / "ledger.sqlite"
     try:
@@ -1028,8 +1178,8 @@ def cmd_ledger_verify(args) -> int:
               "锚：scripts/ledger_anchor.py --verify），可定位改写发生的"
               "时间（D27）；台账不完整期间一切写入被拒（防洗链）")
         return 1
-    print("✓ 台账哈希链完好（runs/gates/lockbox_uses 三链逐行校验 +"
-          " chain_meta 快照比对通过）")
+    print("✓ 台账哈希链完好（runs/gates/lockbox_uses/candidate_checks 四链"
+          "逐行校验 + chain_meta 快照比对通过）")
     return 0
 
 
@@ -1040,6 +1190,28 @@ def build_parser() -> argparse.ArgumentParser:
         prog="bt", description="研究命令行：假设卡检查、网格筛选进台账、台账统计")
 
     sub = ap.add_subparsers(dest="command", required=True)
+
+    p_cand = sub.add_parser("candidate", help="候选登记操作（T62/D31）")
+    cand_sub = p_cand.add_subparsers(dest="candidate_command", required=True)
+    pc = cand_sub.add_parser(
+        "check", help="候选预筛：五条件 → C###.precheck.json + 台账")
+    pc.add_argument("candidate",
+                    help="候选 id（C001）或 research/candidates/C001.toml 路径")
+    pc.add_argument("--candidates-dir",
+                    default=str(REPO_ROOT / "research" / "candidates"))
+    pc.add_argument("--data-root", default=None,
+                    help="数据根；缺省研究库 data_research（研究年数按实际"
+                         "覆盖、参考价与合约大小取自 specs）")
+    pc.add_argument("--research-store", action="store_true",
+                    help="（兼容别名）读研究库 data_research——T38 起缺省即研究库")
+    pc.add_argument("--main-store", action="store_true",
+                    help="读主库 data（含完整锁箱段，须显式本 flag 才读）")
+    pc.add_argument("--ledger", default=None,
+                    help="台账路径；缺省 data/research/ledger.sqlite"
+                         "（研究库模式）或 {data-root}/research/ledger.sqlite")
+    pc.add_argument("--spread-fraction", type=float, default=0.1)
+    pc.add_argument("--commission", type=float, default=0.0)
+    pc.set_defaults(func=cmd_candidate_check)
 
     p_check = sub.add_parser("card", help="假设卡操作")
     card_sub = p_check.add_subparsers(dest="card_command", required=True)

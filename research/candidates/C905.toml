@@ -9,3 +9,11 @@ holding = "M5"                      # 日内持仓——同受成本结论约束
 source_card = "H006"
 mechanism = "收盘前的 MOC/再平衡执行盘按当日已确立方向增减敞口，尾盘延续开盘方向（Gao et al. 2018 market intraday momentum）"
 notes = "用于校准关卡/成本/引擎/实盘链路，不作研究候选（蓝图 v4 §6.1）。运行须 bt --specimen（actor=calibration，不进入研究轮次统计）。台账运行次数（2026-10-27 只读查证）：25 次。"
+
+[literature]
+original = ["不适用——标定样品登记（T61/D30），非研究候选"]
+replications = []
+rebuttals = []
+search_log = "不适用——标定样品非研究候选，无文献检索任务（蓝图 v4 §6.1）"
+published_effect = "不适用——样品/撤回登记不承载预期效应声明"
+expected_effect = "不适用——结果只作测量证据与撤回记录，不作为方向依据（蓝图 v4 §6.1）"

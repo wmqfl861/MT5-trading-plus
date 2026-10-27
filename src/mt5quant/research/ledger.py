@@ -28,9 +28,14 @@
   lockbox_budget() 登记并返回状态；max_uses 首登记生效，缺省
   DEFAULT_LOCKBOX_MAX_USES=5（D16 待用户决定，未决定前硬编码默认 +
   参数可覆盖；调整预算是管理员改库动作，不改代码）。
+- candidate_checks(candidate_id, decision, checked_at_utc, result_json)
+  ——候选预筛结论（T62/D31：bt candidate check 的产出；决策枚举
+  pass/fail/waiting_data，result_json 与 research/candidates/C###.precheck.json
+  同一负载）。旧库打开时自动建表并入链（空表从链首开始）。
 
-哈希链（T37/M6/D27；R6/C5 防洗链）：runs / gates / lockbox_uses 三表
-各一条按 rowid 串联的链，row_hash = sha256(规范化行 JSON + prev_hash)
+哈希链（T37/M6/D27；R6/C5 防洗链；T62 加 candidate_checks）：runs /
+gates / lockbox_uses / candidate_checks 各一条按 rowid 串联的链，
+row_hash = sha256(规范化行 JSON + prev_hash)
 （规范化 = 全部内容列、键排序、紧凑分隔符；prev_hash/row_hash 自身不入
 哈希）。首行 prev_hash = GENESIS_HASH。R6/C5 起的写入纪律：
 
@@ -143,6 +148,14 @@ CREATE TABLE IF NOT EXISTS lockbox_uses(
   prev_hash   TEXT NOT NULL DEFAULT '',
   row_hash    TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS candidate_checks(
+  candidate_id  TEXT NOT NULL,
+  decision      TEXT NOT NULL,
+  checked_at_utc TEXT NOT NULL,
+  result_json   TEXT NOT NULL,
+  prev_hash     TEXT NOT NULL DEFAULT '',
+  row_hash      TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS lockbox_budget(
   cutoff      TEXT NOT NULL PRIMARY KEY,
   max_uses    INTEGER NOT NULL,
@@ -172,10 +185,12 @@ CREATE TABLE IF NOT EXISTS ledger_events(
 # lockbox_budget(cutoff, max_uses=N) 首次登记时可覆盖。
 DEFAULT_LOCKBOX_MAX_USES = 5
 
-# T37/M6/D27：带哈希链的三张表；链首 prev_hash（常量，与"空串"的
+# T37/M6/D27：带哈希链的表；链首 prev_hash（常量，与"空串"的
 # 未迁移状态可区分）。R6/C5：ledger_events 为审计附表（不哈希链，
 # 但行数/rowid 进 chain_meta 快照——删审计行要能报出）。
-_CHAIN_TABLES = ("runs", "gates", "lockbox_uses")
+# T62/D31：candidate_checks（候选预筛结论）入链——预筛是开卡前的
+# 硬闸门，结论的事后改写必须像 runs 一样留痕。
+_CHAIN_TABLES = ("runs", "gates", "lockbox_uses", "candidate_checks")
 _SNAPSHOT_TABLES = _CHAIN_TABLES + ("ledger_events",)
 GENESIS_HASH = "0" * 64
 
@@ -556,7 +571,8 @@ class Ledger:
         problems: list[str] = []
         for tbl, id_cols in (("runs", ("run_id",)),
                              ("gates", ("run_id", "gate")),
-                             ("lockbox_uses", ("card_id",))):
+                             ("lockbox_uses", ("card_id",)),
+                             ("candidate_checks", ("candidate_id",))):
             cols = [r["name"] for r in self.conn.execute(
                 f"PRAGMA table_info({tbl})")]
             if "row_hash" not in cols:
@@ -580,6 +596,8 @@ class Ledger:
                     label = f"runs run#{r['run_id']}"
                 elif tbl == "gates":
                     label = f"gates run#{r['run_id']}/{r['gate']}"
+                elif tbl == "candidate_checks":
+                    label = f"candidate_checks {r['candidate_id']}"
                 else:
                     label = f"lockbox_uses card={r['card_id']}"
                 if r["row_hash"] != expect:
@@ -822,6 +840,41 @@ class Ledger:
                 "used_at_utc": datetime.now(timezone.utc).isoformat(),
                 "approved_by": approved_by, "result_json": payload,
                 "status": "done", "cutoff": _cutoff_iso(cutoff)})
+
+    # ------------------------------------------- 候选预筛（T62/D31，铁律 17/18）
+
+    def record_candidate_check(self, candidate_id: str, *, decision: str,
+                               result: dict) -> int:
+        """候选预筛结论入链（bt candidate check 的台账侧；可重复登记——
+        每次预筛都是新行，历史结论如实保留，不覆盖）。
+
+        decision 枚举 pass/fail/waiting_data（枚举外 → ValueError）；
+        result 与 research/candidates/C###.precheck.json 同一负载。
+        R6/C5：写前验证链；追加只延伸链。R7/N-C3：验链与追加同一写事务。
+        """
+        if decision not in ("pass", "fail", "waiting_data"):
+            raise ValueError(
+                f"candidate_checks.decision 必须是 pass/fail/waiting_data，"
+                f"收到 {decision!r}")
+        with self._txn():
+            self._verify_or_raise()
+            return self._append_chained("candidate_checks", {
+                "candidate_id": candidate_id, "decision": decision,
+                "checked_at_utc": datetime.now(timezone.utc).isoformat(),
+                "result_json": json.dumps(_san(result), ensure_ascii=False)})
+
+    def candidate_checks(self, candidate_id: str | None = None) -> list[dict]:
+        """预筛结论（checked_at 升序；candidate_id 给定时只取该候选）。"""
+        if candidate_id is None:
+            rows = self.conn.execute(
+                "SELECT candidate_id, decision, checked_at_utc, result_json"
+                " FROM candidate_checks ORDER BY rowid").fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT candidate_id, decision, checked_at_utc, result_json"
+                " FROM candidate_checks WHERE candidate_id=? ORDER BY rowid",
+                (candidate_id,)).fetchall()
+        return [dict(r) for r in rows]
 
     # ---------------------------------------------------------------- 读
 
