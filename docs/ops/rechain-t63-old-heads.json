@@ -1,0 +1,14 @@
+{
+  "runs": {
+    "rows": 441,
+    "head": "72709d121229813edeac5db063d529d81fc8eeb37f7e5e9a53062f07ea782c0c"
+  },
+  "gates": {
+    "rows": 76,
+    "head": "68a1dd2f7939eca3f36a0e6b7954a56d84a5f0d7faaa29acdb8fd54de9066f12"
+  },
+  "lockbox_uses": {
+    "rows": 0,
+    "head": null
+  }
+}
