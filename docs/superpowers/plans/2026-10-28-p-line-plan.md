@@ -263,9 +263,8 @@ class BaseStrategy:
   - ExitRules：`stop_loss_atr = sl`、`take_profit_atr = tp`、`reentry = "after_signal_change"`；不声明 `time_stop_bars` 与 `week_close_exit`。
 - **每张卡绑定一个子类**：止损止盈、局面、动作、网格都写成类常量，同 H003-v2 的子类做法。
 - **回看声明**：`lookback_bars` ≥ max(2,000, 480 + M, 200) + K + 24。
-- [ ] 失败测试先行：
-  - 合成价格路径上，A1–A4 的触发与手算一致（阻力、支撑各一组）；
-  - 价格序列取反后，动作与方向镜像对应；
+- [x] **局面/动作/特征（不依赖 T73 拟合协议的部分）**：`situations.py`（Approach M/D/d + S1 网格/S2 前一交易日 17:00 NY 划界（DST 由 zoneinfo，EST 22:00/EDT 21:00 UTC 边界实测）/S3 B1 同法通道 shift(1)）+ `actions.py`（A1–A4 阻力支撑对称，b 与 m 取卡参数，A2 带 ±0.25 ATR）+ `features.py`（trend_sma200 / atr_pct_2000 有界窗口、未满窗 None）。测试 `test_strategies_prob_situations.py`（9）+ `test_strategies_prob_actions.py`（7）+ `test_strategies_prob_features.py`（4），共 20 个，先红后绿：A1–A4 触发与手算一致（阻力 `test_actions_hand_computed_resistance`、支撑 `test_support_actions_mirror_hand_case`）；镜像对称（价格围绕价位反射后 kind 互换、方向取反、bar 不变——`test_s1_support_touch_and_mirror`、`test_actions_mirror_symmetry`）。
+- [ ] **剩余项（依赖 T73 拟合协议，待 T63–T65 在 main 勾选后随 T73 一并落地）**：
   - 持有到第 K 根归零；止损后同一次触发不再重入（经引擎验证）；
   - G0：冻结模型下截断一致，窗口不变性 ≥ 100 个随机探针；
   - 没装模型 → ModelMissingError；模型哈希不符 → ModelIntegrityError；
