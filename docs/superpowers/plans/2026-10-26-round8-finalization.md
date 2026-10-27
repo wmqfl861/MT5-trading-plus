@@ -38,11 +38,16 @@
 
 reconciliation-v3 报告的 §5–§7 还是占位。本轮重跑并回填：
 
-- [ ] 四组对账：XAUUSD H1 + USTEC M5 各 immediate / after_signal_change，
-      MaCrossATR（10/30 或 5/15 参数），窗口取 tick 覆盖期（--ops-ack）。
-- [ ] 确认成本缓存为 stop_level 口径（ov[eca09e24]）， reconcile 的越幅分量用新表。
-- [ ] 回填 v3 报告：四组逐项结果表、按出场类型的分布、容差符合率、"其余"违规清单与归因。
-- [ ] 若结构差异超容差：分析原因（预期：换日窗点差建模差 vs 静默 tick），如实报告。
+- [x] 四组对账完成（run#442–445，--ops-ack×4 入账）：XAUUSD H1 + USTEC M5 各
+      immediate / after_signal_change，MaCrossATR，8,364 笔配对。
+- [x] 成本缓存 stop_level 口径确认（summary 记 ov[eca09e24] loaded）；
+      越幅分量使用已由 T48/R8-I3 修正为仅 stop↔stop 适用。
+- [x] v3 报告回填 + T48/R8-I3 修订节：分口径符合率（97.45%，修订前口径
+      98.13%）、违规 213 条四分类（TP 穿价/TP gap/原因分叉/跨 bar 配对）、
+      纯 stop↔stop 子集 2,119 行零违规。
+- [x] 结构差异归因如实报告：158→213 的增量来自 A-stop/B-nonstop 原因分叉
+      （旧口径误将路径差算作越幅），unmatched 1,329 与两模型存续期差异一致
+      （A 于 2026-07-17 首次权益 -36.56、B 于 2026-09-07 -5.66）。
 - [x] 蓝图 §2 P3 与路线图 E 行更新（T42 随本提交一并更新至 R8 终态）。
 
 ## T44：T34 影子盘一日双策略（真终端，阶段 D′ 验收）

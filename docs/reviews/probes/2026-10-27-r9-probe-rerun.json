@@ -1,0 +1,63 @@
+{
+ "_说明": "R9 修复后 P14-P19 复跑（2026-10-27）。P15 旧注入锚点行已从 workflow 移除（T46），行为面由 tests/test_p6_docs.py::test_research_allowlist_head_ref_is_data_not_code 覆盖；P17 合成反例经新签名(reason_key,reason_a,reason_b)重放；P16 改跑 --accept 严格档。P17 totals 含旧+新(r8i3-*)两套 diff 目录故为两倍样本。",
+ "p14_gate_artifacts": {
+  "missing_whole_g5": "merge_exit=1（分片0 缺整臂 g5——拒绝合并）",
+  "changed_unchecked_identity_fields": {
+   "max_bars": "拒绝",
+   "g5_cutoff": "拒绝",
+   "g5_window_source": "拒绝"
+  },
+  "all_fingerprints_missing_problems": "拒绝（提示 --allow-legacy 显式降级）",
+  "official_five_shard_equivalence": "T47 报告：negative/positive/g5/flags 四节与官方产物逐项一致，supplement 逐字一致"
+ },
+ "p15_ci_head_ref": {
+  "旧注入锚点已移除": true,
+  "env 接线存在": true,
+  "行为回归测试": "test_research_allowlist_head_ref_is_data_not_code"
+ },
+ "p16_demo_no_evidence": {
+  "--day exit": 0,
+  "--accept exit": 1,
+  "说明": "日常档宽松+汇总不再宣称全部通过；空证据在验收档 5 判据全不通过"
+ },
+ "p17_reconciliation": {
+  "synthetic_counterexample": {
+   "net_diff": 60.0,
+   "overshoot_comp": 0.0,
+   "overshoot_applied": false,
+   "rest": 60.0,
+   "tol": 1.0,
+   "ok": false
+  },
+  "totals_over_old_and_new_dirs": {
+   "paired": 16728,
+   "net_bad": 371,
+   "pure_stop_rows": 4238,
+   "pure_stop_net_bad": 0,
+   "stop_to_nonstop_rows": 122
+  },
+  "T43 重算（T48 报告）": {
+   "净利违规": "158→213",
+   "符合率": "98.13%→97.45%",
+   "撤销伪越幅合计": "+1,917.98 USD",
+   "纯 stop↔stop 子集": "2,119 行零违规（维持）"
+  }
+ },
+ "p18_paper_evidence": "按 T44 更正后口径复核（时间线已按 R8-M1 更正），见 docs/reports/live-paper-2026-10-26.md 修订说明",
+ "p19_cost_and_ledger": "ledger_verify_problems/anchor_verify_problems 见 _tmp_r8_p17_19.json 原始输出（本文件摘要）",
+ "p18_detail_keys": [
+  "902431",
+  "902432",
+  "risk",
+  "reconcile",
+  "flatten_archive",
+  "alert_counts",
+  "reject_counts"
+ ],
+ "p19_detail": {
+  "ledger_verify_problems": [],
+  "anchor_verify_problems": [],
+  "baseline_run_count": 67,
+  "baseline_with_ov": 67
+ }
+}
