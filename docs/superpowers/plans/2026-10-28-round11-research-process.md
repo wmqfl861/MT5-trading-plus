@@ -79,37 +79,34 @@
 **Files:** `docs/ops/demo-launch-proposal-2026-10-27.md`、`docs/reviews/*-codex.md`、`docs/reports/live-paper-2026-10-26.md`、`src/mt5quant/validation/stats.py`；新建 `tests/test_repo_hygiene.py` 与 `config/hygiene-allowlist.txt`。
 
 - [x] **F1**：Demo 启动提案里的模拟盘账号与服务器名已改为占位符 `<demo-login>@<server>`（审核侧随第十一轮文档提交处理；历史中仍有记录，是否改密码由用户决定）。
-- [ ] **F2**：codex 复审报告中的本机绝对路径（形如 `C:/Users/<用户名>/.zcode/workspace/<id>/`）改为仓库相对路径。
-- [ ] **CI 敏感信息扫描**：`test_repo_hygiene.py` 对 `git ls-files` 的文本文件扫描以下内容：
+- [x] **F2** 已完成（184bb73）：4 份 codex 报告 252 处/116 行替换（与审核 F2 计数吻合），独立成果审核 253 对链接逐字节比对行号语义不变；tests/test_repo_hygiene.py 账号/服务器名/本机路径三类零残留。
+- [x] **CI 敏感信息扫描** 已完成（184bb73+2df378e）：四模式扫描+allowlist 五条全带理由（成果审核逐条验证必要性与失效检测）；自指残留由 2df378e 清零，提交态全量 1748 passed 2 skipped（干净 worktree 复核），CI 绿。
   - `\d{7,}@`（账号@服务器）；
   - `Exness-MT5(Trial|Real)\d+`；
   - `C:[/\\]Users[/\\](?!<)`；
   - 非私有网段的 IPv4。
   - 已知例外写进 allowlist，每条附理由。
   - 失败测试先行：在临时目录构造含账号的文件 → 扫描报错；占位符 `<demo-login>` 不报。
-- [ ] **F4**：影子盘报告与相关文档把"1 个交易日"改为如实的时长（10:58–21:04 UTC，约 10 小时）。
-- [ ] **F6**：`mc_drawdown_distribution` 的起点改为逐批抽取，缺省 `block_len=1` 时的峰值内存也受控。
+- [x] **F4** 已完成（184bb73）：live-paper 报告两处措辞更正+与蓝图 §2/§5 对齐（成果审核核对一致）。
+- [x] **F6** 已完成（184bb73）：tracemalloc 实测峰值 2.98GB→296MB<500MB；成果审核复刻旧实现三组构造例逐位相等（随机流与分批无关）；tests/test_validation_stats.py::test_mc_drawdown_block_len1_memory_under_500mb。
   - 失败测试先行：37 万根 × 1000 次、`block_len=1` 峰值 < 500 MB（tracemalloc）；
   - 同一种子下，结果与旧实现的 `block_len=288` 路径逐位一致（只改抽取方式时须证明不改变分布；若随机流因此改变，写明并更新相关快照测试）。
-- [ ] **F7**：蓝图已由审核侧重写为 v4，本任务只核对 §2 的事实与代码一致，有出入就改蓝图并在提交说明里列出。
+- [x] **F7** 已完成（184bb73）：核对无出入（成果审核独立抽核 P4 0/160 与 gate-power-v2 §2(c)、1728+2skip 与 CI 记录一致）。
 - 暂不做 **F5**（对账自行解释出场）：涉及 `src/mt5live/`，放到阶段 F 结束后。
 
 ## T61：基线重新定位与 v2 卡撤回（D30）
 
 **Files:** 新建 `research/candidates/`；`scripts/bt.py`、`src/mt5quant/research/cards.py`；`docs/p6/research-agent.md`；测试。
 
-- [ ] **核对 v2 卡是否跑过**：用只读方式查台账（`bt ledger stats --card H002-v2` 等），把运行次数写进提交说明。
-- [ ] **标定样品登记**：为 H001–H007 写候选登记 `C900`–`C906`，`status = "specimen"`，并写明"用于校准，不作研究候选"。
-- [ ] **v2 卡撤回**：为三张 v2 卡写候选登记，`status = "withdrawn"`。
+- [x] 已完成（44d9a22）：三张 v2 卡 total_runs 均=0（成果审核 SQL 复核，台账 mtime 未动）；七基线卡次数写入 C900–C906 notes。
+- [x] 已完成（44d9a22）：research/candidates/C900–C906，成果审核逐张核对说明与引用。
+- [x] 已完成（44d9a22）：C907–C909，理由与蓝图 §6.1 逐条对应（H002-v2 样本内网格/预期、H003-v2/H006-v2 事前成本 1.41<3），0 次如实记录。
   - 理由逐条写清：H002-v2 的网格与预期笔数取自 v3 样本内；H003-v2、H006-v2 是日内持仓，事前成本不过。
   - 已跑过的，在登记里写明运行次数，这些次数计入项目级 N。
-- [ ] **`bt` 拒绝撤回的卡**：卡对应的候选为 `withdrawn` → 拒绝运行。
-- [ ] **样品卡运行受限**：只允许带 `--specimen` 运行，台账记 `actor=calibration`，且不进入任何研究轮次的统计。
-- [ ] **研究规则改写**：`docs/p6/research-agent.md` 删去"审查否决 → 同谱系新建 v2"的默认路径，改为"新版本须作为候选登记并列入轮次"。
-- [ ] 失败测试先行：
-  - 撤回卡被拒；
-  - 样品卡不带 `--specimen` 被拒；
-  - 带 `--specimen` 时台账 actor 为 calibration。
+- [x] 已完成（44d9a22）：_enforce_candidate_status 接线 screen/gate 两路；成果审核复跑 7 测试含撤回双路拒（消息含 withdrawn、ledger 0 runs）。
+- [x] 已完成（44d9a22）：不带 --specimen 拒；带时 actor=calibration 实测入账；--specimen 用于非样品卡拒（防统计逃逸）。
+- [x] 已完成（44d9a22）：旧默认路径删除（diff 逐行核实），新流程引用蓝图 v4 §6.2，守护测试 test_p6_docs.py 绿。
+- [x] 失败测试先行（44d9a22）：10 个测试先红后绿（撤回×2/样品×3/登记守护/装载器×2/规则守护），全量 1748+2skip 绿（提交态干净 worktree）。
 
 ## T62：候选登记与预筛工具（D31，铁律 17、18）
 
