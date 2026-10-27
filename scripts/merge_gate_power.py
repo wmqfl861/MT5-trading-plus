@@ -36,6 +36,20 @@ R7 修正（第七轮审核 N-I4）：
   （null_hypothesis + null_defaults）/positive_symbols/initial_capital/
   risk_per_trade/g2_random_entry_sims/g5_bootstrap_sims——任一不一致即
   拒绝（不同实验的 runs 不能拼成同一实验的汇总）。
+
+R8 修正（第八轮终审 R8-I2 + R8-I7 渲染部分）：
+- **整臂缺样拒绝**：应有实验臂也从实验设计推导（meta.phase + G5 配置键），
+  不再从"产物有什么区块"反推——P14 删除某分片整个 g5/negative/positive
+  区块时，旧口径让该臂从校验里消失、合并照常出产物；
+- **实验身份键补全 + fingerprint 必填**：max_bars/g5_cutoff/
+  g5_window_source 纳入逐分片比对；全部（而非部分）分片缺 fingerprint
+  → 拒绝合并，除非显式 --allow-legacy（产物 meta 记
+  legacy_no_fingerprint=true 降级标记）；
+- **结构性 flags 渲染标注**（R8-I7 渲染部分）：合并产物 md 的"门槛调整
+  建议"节中属结构性检查的条目（G1.trade_count）行内标注"结构性检查——
+  样本数性质，不构成门槛建议依据"。JSON 原始 flags 不动；
+  gate_calibration.py 字节不动（其哈希在分片运行指纹里，五分片产物
+  有效性依赖）——标注只发生在本合并器渲染层。
 """
 from __future__ import annotations
 
@@ -180,15 +194,24 @@ def recompute_flags(results: dict) -> list[dict]:
     return gc.compute_flags(results)
 
 
-# 实验身份键（N-I4/R7）：这些 meta 字段定义"这是哪个实验"——不一致的
-# 分片不能拼成同一份 gate-power（seeds/seeds_from/generated_utc 除外，
-# 前两者按设计各分片不同，后者只记时间）。
+# 实验身份键（N-I4/R7 + R8-I2）：这些 meta 字段定义"这是哪个实验"——
+# 不一致的分片不能拼成同一份 gate-power（seeds/seeds_from/generated_utc
+# 除外，前两者按设计各分片不同，后者只记时间）。R8-I2 补 max_bars
+# （输入截断范围）与 g5_cutoff/g5_window_source（G5 窗口截断日期与来源）。
 META_IDENTITY_KEYS = (
     "phase", "baselines", "null_hypothesis", "null_defaults", "levels",
     "positive_symbols", "initial_capital", "risk_per_trade",
     "g2_random_entry_sims", "g5_bootstrap_sims",
+    "max_bars", "g5_cutoff", "g5_window_source",
     "fingerprint",
 )
+
+
+def _all_shards_missing_fingerprint(docs: list[dict]) -> bool:
+    """R8-I2：**全部**（而非部分）分片缺 fingerprint——一致的历史无指纹
+    产物（--allow-legacy 的唯一适用对象）；部分缺部分有属身份不一致，
+    由 META_IDENTITY_KEYS 的逐键比对拒绝，--allow-legacy 不豁免。"""
+    return all("fingerprint" not in (s.get("meta") or {}) for s in docs)
 
 
 def _pct(values: list) -> str:
@@ -282,11 +305,56 @@ def render_supplement(results: dict) -> str:
     return "\n".join(lines)
 
 
-def _meta_identity_problems(docs: list[dict]) -> list[str]:
-    """N-I4/R7：分片 meta 实验身份一致性——除 baselines 外还要求 levels、
-    零假设配置（模式 + 各卡缺省 null）、正对照品种、资金/风险参数、G2/G5
-    模拟次数逐分片一致，不一致即拒绝合并。"""
+# R8-I7（渲染部分）：门槛调整建议里属结构性检查的条目行内标注。
+# G1.trade_count 是"按预期频率交易"的运维口径检查——负对照（打乱数据）
+# 上照常触发事件、高通过属预期，把它列为"误报 100% → 调整门槛"的建议
+# 与产物自己的口径备注矛盾。gate_calibration.STRUCTURAL_CHECKS 写的是
+# G5.trade_count（与本产物实际检查键 G1.trade_count 命名不一致），但
+# gate_calibration.py 字节被分片运行指纹锁定（五分片产物有效性依赖），
+# 修正只能在合并器渲染层做：JSON 原始 flags 不动，只在 Markdown 上
+# 给结构性条目加行内限定。
+STRUCTURAL_FLAG_CHECKS = frozenset(gc.STRUCTURAL_CHECKS) | {"G1.trade_count"}
+STRUCTURAL_FLAG_NOTE = "结构性检查——样本数性质，不构成门槛建议依据"
+
+
+def annotate_structural_flags(text: str, flags: list[dict]) -> str:
+    """R8-I7（渲染部分）：把"门槛调整建议"节中属结构性检查的条目行内
+    标注 STRUCTURAL_FLAG_NOTE。只改合并器渲染的 Markdown；JSON 原始
+    flags 与 gate_calibration.py（render_report/compute_flags）字节不动。"""
+    structural = sorted({f.get("check") for f in flags
+                         if f.get("check") in STRUCTURAL_FLAG_CHECKS})
+    if not structural:
+        return text
+    lines = text.split("\n")
+    in_flags = False
+    for i, line in enumerate(lines):
+        if line.startswith("## "):
+            in_flags = line.startswith("## 门槛调整建议")
+            continue
+        if not in_flags:
+            continue
+        for check in structural:
+            if line.startswith(f"- **{check}**："):
+                lines[i] = f"{line}（{STRUCTURAL_FLAG_NOTE}）"
+    return "\n".join(lines)
+
+
+def _meta_identity_problems(docs: list[dict],
+                            allow_legacy: bool = False) -> list[str]:
+    """N-I4/R7 + R8-I2：分片 meta 实验身份一致性——除 baselines 外还要求
+    levels、零假设配置（模式 + 各卡缺省 null）、正对照品种、资金/风险参数、
+    G2/G5 模拟次数、max_bars/G5 窗口来源与截断（R8-I2）逐分片一致，不一致
+    即拒绝合并。
+
+    fingerprint 必填（R8-I2）：全部（而非部分）分片缺指纹时旧的"相等"
+    校验对 None==None 恒过——现在拒绝合并，除非 allow_legacy（CLI
+    --allow-legacy；产物 meta 记 legacy_no_fingerprint=true 降级标记）。"""
     problems: list[str] = []
+    if _all_shards_missing_fingerprint(docs) and not allow_legacy:
+        problems.append(
+            "所有分片 meta 都缺 fingerprint——运行身份未封闭（R8-I2），"
+            "拒绝合并；确需合并历史无指纹诊断产物请显式传 --allow-legacy"
+            "（合并产物 meta 将记 legacy_no_fingerprint=true 降级）")
     ref = docs[0].get("meta") or {}
     for key in META_IDENTITY_KEYS:
         ref_val = ref.get(key)
@@ -299,8 +367,35 @@ def _meta_identity_problems(docs: list[dict]) -> list[str]:
     return problems
 
 
+def _required_arms(meta: dict, idx: int = 0) -> tuple[set[str], list[str]]:
+    """R8-I2：从实验设计推导**应有实验臂**——不再从"产物有什么区块"反推
+    （旧口径下删除整个 g5/negative/positive 区块会让该臂从校验里消失：
+    P14 删 shard8-0 的整个 g5 后 `_seed_problems()==[]`、合并 exit 0）。
+
+    gate_calibration.main 的编排：phase 含 negative → negative 臂；phase 含
+    positive → positive 臂；G5 段与 positive 同批生成（meta 携带 g5_cutoff/
+    g5_window_source/g5_bootstrap_sims 配置），因此 phase 含 positive 且
+    meta 带 G5 配置键时 g5 臂必须存在。phase 未知 → 无法从设计推导，
+    按问题上报（宁可拒绝也不静默放行）。返回 (应有臂集合, 问题清单)。"""
+    phase = meta.get("phase")
+    if phase not in ("negative", "positive", "both"):
+        return set(), [f"分片{idx} meta.phase={phase!r} 不是 "
+                       "negative/positive/both——无法从实验设计推导应有"
+                       "实验臂，拒绝合并"]
+    arms: set[str] = set()
+    if phase in ("negative", "both"):
+        arms.add("negative")
+    if phase in ("positive", "both"):
+        arms.add("positive")
+        if any(k in meta for k in ("g5_cutoff", "g5_window_source",
+                                   "g5_bootstrap_sims")):
+            arms.add("g5")
+    return arms, []
+
+
 def _expected_conditions(doc: dict, idx: int = 0) -> tuple[set[tuple], list[str]]:
-    """N-I4/R7：从实验设计（meta）生成该分片**应存在**的完整实验条件集合。
+    """N-I4/R7 + R8-I2：从实验设计（meta）生成该分片**应存在**的完整实验
+    条件集合。
 
     生成规则与 gate_calibration.main 的编排一致：
     - negative（分片含该段时）：baselines × nulls_for(模式, 卡缺省 null)
@@ -309,10 +404,21 @@ def _expected_conditions(doc: dict, idx: int = 0) -> tuple[set[tuple], list[str]
     - g5：positive_symbols × levels ×（detection + 误报臂 × 两种零假设——
       g5_power 恒跑 NULL_ORDER 全部）。
 
+    R8-I2：先从 meta.phase + G5 配置推导**应有实验臂**——应有臂整个区块
+    缺失时直接按"整臂缺样"拒绝（旧实现从产物有无区块反推应有条件，整臂
+    删除反而让检查器不再要求该臂存在）。
+
     条件键与 _seed_problems 的分组键同构。meta 缺生成所需字段（无法从设计
     推出清单）时返回问题而非静默放行。返回 (条件集合, 问题清单)。"""
     meta = doc.get("meta") or {}
     problems: list[str] = []
+    required, arm_problems = _required_arms(meta, idx)      # R8-I2
+    present = {arm for arm in ("negative", "positive", "g5") if doc.get(arm)}
+    for arm in sorted(required - present):
+        arm_problems.append(
+            f"分片{idx} 缺整臂 {arm}——实验设计（meta.phase="
+            f"{meta.get('phase')!r}）要求该实验臂，产物无此区块，拒绝合并")
+    problems.extend(arm_problems)
     mode = meta.get("null_hypothesis")
     defaults = dict(meta.get("null_defaults") or {})
     for b in getattr(gc, "BASELINES", ()):        # 兜底：仓库缺省 null
@@ -366,10 +472,12 @@ def _expected_conditions(doc: dict, idx: int = 0) -> tuple[set[tuple], list[str]
 
 
 def _seed_problems(docs: list[dict]) -> list[str]:
-    """分片种子校验（R6/C8 + R7/N-I4）：meta 声明段互不相交之外，再核
-    runs 里的实际种子——**先从实验设计生成应存在的完整条件清单**（旧实现
-    只遍历已出现的组，整组缺样检测不到），然后每个实验条件必须恰好覆盖
-    本分片声明的种子段（无重复、无缺样、无越界）。返回问题清单（空=通过）。"""
+    """分片种子校验（R6/C8 + R7/N-I4 + R8/I2）：meta 声明段互不相交之外，
+    再核 runs 里的实际种子——**先从实验设计生成应存在的完整条件清单**
+    （旧实现只遍历已出现的组，整组缺样检测不到；R8-I2 起应有实验臂也从
+    meta.phase + G5 配置推导，整臂缺样同样拒绝），然后每个实验条件必须
+    恰好覆盖本分片声明的种子段（无重复、无缺样、无越界）。
+    返回问题清单（空=通过）。"""
     problems: list[str] = []
     for idx, s in enumerate(docs):
         meta = s.get("meta") or {}
@@ -415,6 +523,10 @@ def main(argv=None) -> int:
     ap.add_argument("--shards", required=True,
                     help="逗号分隔的分片目录（各含 gate-power.json）")
     ap.add_argument("--out", default=str(REPO / "data" / "reports" / "gates"))
+    ap.add_argument("--allow-legacy", action="store_true",
+                    help="允许合并**全部**缺 fingerprint 的历史无指纹诊断"
+                         "分片（部分缺部分有仍拒）；产物 meta 记 "
+                         "legacy_no_fingerprint=true 降级标记（R8-I2）")
     args = ap.parse_args(argv)
 
     docs = []
@@ -424,12 +536,13 @@ def main(argv=None) -> int:
     if len({tuple(sorted(s["meta"]["baselines"])) for s in docs}) != 1:
         print("✗ 分片的 baselines 不一致，拒绝合并")
         return 1
-    identity = _meta_identity_problems(docs)          # N-I4/R7：实验身份
+    identity = _meta_identity_problems(docs,           # N-I4/R7 + R8-I2
+                                       allow_legacy=args.allow_legacy)
     if identity:
         for p in identity:
             print(f"✗ {p}")
-        print("✗ 分片实验身份（meta：levels/零假设配置/资金/风险/模拟次数等）"
-              "不一致，拒绝合并")
+        print("✗ 分片实验身份（meta：levels/零假设配置/资金/风险/模拟次数/"
+              "max_bars/G5 窗口/指纹等）不一致或不完整，拒绝合并")
         return 1
     seed_sets = [range(int(s["meta"].get("seeds_from", 0)),
                        int(s["meta"].get("seeds_from", 0))
@@ -449,6 +562,10 @@ def main(argv=None) -> int:
 
     try:
         results = {"meta": merge_meta(docs)}
+        if args.allow_legacy and _all_shards_missing_fingerprint(docs):
+            # R8-I2：--allow-legacy 只适用"全部缺指纹"的一致历史产物，
+            # 降级标记让下游读者看到该汇总没有运行身份证据
+            results["meta"]["legacy_no_fingerprint"] = True
         if "negative" in docs[0]:
             results["negative"] = merge_negative(docs)
         if "positive" in docs[0]:
@@ -467,9 +584,9 @@ def main(argv=None) -> int:
     (out / "gate-power.json").write_text(
         json.dumps(results, ensure_ascii=False, indent=2,
                    default=gc._json_default), encoding="utf-8")
-    (out / "gate-power.md").write_text(
-        gc.render_report(results) + render_supplement(results),
-        encoding="utf-8")
+    md = gc.render_report(results) + render_supplement(results)
+    md = annotate_structural_flags(md, results.get("flags") or [])  # R8-I7
+    (out / "gate-power.md").write_text(md, encoding="utf-8")
     n_runs = sum(len((results.get(k) or {}).get("runs", []))
                  for k in ("negative", "positive", "g5"))
     print(f"— 合并 {len(docs)} 分片 / {len(all_seeds)} 种子 / {n_runs} 条运行 "

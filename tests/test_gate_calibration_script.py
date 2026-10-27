@@ -624,7 +624,14 @@ def test_merge_shards_recomputes_rates_and_flags(tmp_path, monkeypatch):
                          "baselines": ["X"], "null_hypothesis": "day",
                          "null_defaults": {"X": "day"}, "levels": [],
                          "positive_symbols": [], "phase": "negative",
-                         "generated_utc": "2026-10-26T00:00:00+00:00"},
+                         "generated_utc": "2026-10-26T00:00:00+00:00",
+                         # R8-I2：fingerprint 必填（夹具补齐；无指纹历史
+                         # 产物走 --allow-legacy，另有专测）
+                         "fingerprint": {"git_commit": "a" * 40,
+                                         "git_dirty": False,
+                                         "gates_sha256": "b" * 64,
+                                         "cost_versions": {},
+                                         "script_sha256": "c" * 64}},
                 "negative": {"runs": runs, "by_null": {}, "merged": []},
                 "flags": []}
 
@@ -722,7 +729,16 @@ def _real_schema_shard(seeds, *, g5_det_pass, g5_fp_day, g5_fp_slot,
                  "risk_per_trade": 0.005, "max_bars": None,
                  "baselines": ["H009-Sample"], "positive_symbols": ["TST H1"],
                  "g5_bootstrap_sims": 200, "generated_utc":
-                     "2026-10-26T00:00:00+00:00"},
+                     "2026-10-26T00:00:00+00:00",
+                 # R8-I2 起 meta 身份键全集（含 g5_cutoff/g5_window_source/
+                 # fingerprint）——夹具与真实产物同构，缺指纹场景在测试里
+                 # 显式 pop 出来
+                 "g5_cutoff": "2025-10-24 00:00:00",
+                 "g5_window_source": "lockbox_cutoff",
+                 "fingerprint": {"git_commit": "a" * 40, "git_dirty": False,
+                                 "gates_sha256": "b" * 64,
+                                 "cost_versions": {"TST H1": "v1"},
+                                 "script_sha256": "c" * 64}},
         "negative": {"runs": neg,
                      "by_null": {"slot": {"G0": 1.0}, "day": {"G0": 1.0}},
                      "false_positive_rates": {"G0": 1.0},
@@ -1015,6 +1031,184 @@ def test_merge_rejects_fingerprint_mismatch(tmp_path, monkeypatch, capsys):
     d_ok = write("s2", same)
     assert mm.main(["--shards", f"{d1},{d_ok}", "--out", str(out)]) == 0
     assert (out / "gate-power.json").is_file()
+
+
+def test_merge_rejects_missing_whole_arm(tmp_path, monkeypatch, capsys):
+    """R8-I2（P14 反例）失败测试：删除某分片**整个实验臂**（g5/negative/
+    positive 区块）→ 拒绝合并。
+
+    旧实现从"产物有什么区块"反推应有条件——区块整个删掉后该臂从校验里
+    消失：P14 在正式五分片副本中删除 shard8-0 的整个 g5 区块，合并仍
+    exit 0、meta.seeds=20、G5 只剩 384 条 / 16 个种子。新实现从实验设计
+    （meta.phase + G5 配置键）推导应有臂：phase=both 时 negative/positive
+    必须存在；phase 含 positive 且 meta 带 G5 配置时 g5 必须存在。"""
+    mm = _load_merge_module(tmp_path, monkeypatch, name="merge_gate_power_r8i2")
+
+    def write(dirname, shard):
+        d = tmp_path / dirname
+        d.mkdir(exist_ok=True)
+        (d / "gate-power.json").write_text(json.dumps(shard, ensure_ascii=False),
+                                           encoding="utf-8")
+        return d
+
+    good = write("good", _real_schema_shard([0, 1], g5_det_pass=True,
+                                            g5_fp_day=False, g5_fp_slot=False))
+    out = tmp_path / "merged"
+
+    # 1) 整臂删除：g5 / negative / positive 任一区块整体消失 → 拒绝
+    for arm in ("g5", "negative", "positive"):
+        shard = _real_schema_shard([2, 3], g5_det_pass=True, g5_fp_day=False,
+                                   g5_fp_slot=False)
+        shard.pop(arm)                 # P14：整臂（整个区块）缺样
+        d = write(f"lost_{arm}", shard)
+        assert mm.main(["--shards", f"{good},{d}", "--out", str(out)]) == 1, arm
+        text = capsys.readouterr().out
+        assert "整臂" in text and arm in text, arm
+        assert not (out / "gate-power.json").exists(), arm
+
+    # 2) 两分片一致的未知 phase → 无法从设计推导应有臂，拒绝（不静默放行）
+    bogus_a = _real_schema_shard([0, 1], g5_det_pass=True, g5_fp_day=False,
+                                 g5_fp_slot=False)
+    bogus_a["meta"]["phase"] = "everything"
+    bogus_b = _real_schema_shard([2, 3], g5_det_pass=True, g5_fp_day=False,
+                                 g5_fp_slot=False)
+    bogus_b["meta"]["phase"] = "everything"
+    d_bogus = write("bogus_phase", bogus_b)
+    assert mm.main(["--shards", f"{write('good2', bogus_a)},{d_bogus}",
+                    "--out", str(out)]) == 1
+    assert "phase" in capsys.readouterr().out
+
+    # 3) 对照组：设计完整（phase=both 三臂齐全）仍正常合并
+    d_ok = write("ok", _real_schema_shard([2, 3], g5_det_pass=True,
+                                          g5_fp_day=False, g5_fp_slot=False))
+    assert mm.main(["--shards", f"{good},{d_ok}", "--out", str(out)]) == 0
+    assert (out / "gate-power.json").is_file()
+
+
+def test_merge_rejects_max_bars_and_g5_window_identity(tmp_path, monkeypatch,
+                                                       capsys):
+    """R8-I2（P14 反例）失败测试：实验身份键补全——max_bars（输入截断）、
+    g5_cutoff（G5 截断日期）、g5_window_source（G5 窗口来源）任一分片
+    不一致 → 拒绝合并。P14 改这些字段时旧实现均无身份错误（不同窗口/
+    截断/数据范围的 runs 不能拼成同一实验的汇总）。"""
+    mm = _load_merge_module(tmp_path, monkeypatch, name="merge_gate_power_r8i2b")
+
+    def write(dirname, shard):
+        d = tmp_path / dirname
+        d.mkdir(exist_ok=True)
+        (d / "gate-power.json").write_text(json.dumps(shard, ensure_ascii=False),
+                                           encoding="utf-8")
+        return d
+
+    d1 = write("s1", _real_schema_shard([0, 1], g5_det_pass=True,
+                                        g5_fp_day=False, g5_fp_slot=False))
+    out = tmp_path / "merged"
+    for key, bad_value in (
+            ("max_bars", 20000),
+            ("g5_cutoff", "2024-10-24 00:00:00"),
+            ("g5_window_source", "override")):
+        other = _real_schema_shard([2, 3], g5_det_pass=True, g5_fp_day=False,
+                                   g5_fp_slot=False)
+        other["meta"][key] = bad_value
+        d2 = write("s2", other)
+        assert mm.main(["--shards", f"{d1},{d2}", "--out", str(out)]) == 1, key
+        assert key in capsys.readouterr().out, key
+        assert not (out / "gate-power.json").exists(), key
+
+
+def test_merge_fingerprint_required_unless_allow_legacy(tmp_path, monkeypatch,
+                                                        capsys):
+    """R8-I2（P14 反例）失败测试：fingerprint 必填——**全部**（而非部分）
+    分片缺指纹 → 拒绝合并（旧"相等"校验对 None==None 恒过，P14 全删
+    fingerprint 无任何错误）；显式 --allow-legacy 才放行，产物 meta 记
+    legacy_no_fingerprint=true 降级标记。部分缺部分有属身份不一致，
+    --allow-legacy 不豁免。"""
+    mm = _load_merge_module(tmp_path, monkeypatch,
+                            name="merge_gate_power_r8i2c")
+
+    def write(dirname, shard):
+        d = tmp_path / dirname
+        d.mkdir(exist_ok=True)
+        (d / "gate-power.json").write_text(json.dumps(shard, ensure_ascii=False),
+                                           encoding="utf-8")
+        return d
+
+    legacy1 = _real_schema_shard([0, 1], g5_det_pass=True, g5_fp_day=False,
+                                 g5_fp_slot=False)
+    legacy1["meta"].pop("fingerprint")
+    legacy2 = _real_schema_shard([2, 3], g5_det_pass=True, g5_fp_day=False,
+                                 g5_fp_slot=False)
+    legacy2["meta"].pop("fingerprint")
+    d1, d2 = write("legacy1", legacy1), write("legacy2", legacy2)
+    out = tmp_path / "merged"
+
+    # 1) 全部缺指纹 → 拒绝，并指明 --allow-legacy 逃生口
+    assert mm.main(["--shards", f"{d1},{d2}", "--out", str(out)]) == 1
+    text = capsys.readouterr().out
+    assert "fingerprint" in text and "--allow-legacy" in text
+    assert not (out / "gate-power.json").exists()
+
+    # 2) 显式降级：--allow-legacy 放行，meta 记降级标记（诚实呈现证据等级）
+    assert mm.main(["--shards", f"{d1},{d2}", "--out", str(out),
+                    "--allow-legacy"]) == 0
+    m = json.loads((out / "gate-power.json").read_text(encoding="utf-8"))
+    assert m["meta"]["legacy_no_fingerprint"] is True
+    assert "fingerprint" not in m["meta"]
+
+    # 3) 部分缺部分有：身份不一致，--allow-legacy 不豁免（绝不混合证据等级）
+    mixed = write("mixed", _real_schema_shard([4, 5], g5_det_pass=True,
+                                              g5_fp_day=False,
+                                              g5_fp_slot=False))
+    assert mm.main(["--shards", f"{d1},{mixed}", "--out", str(out),
+                    "--allow-legacy"]) == 1
+    assert "fingerprint" in capsys.readouterr().out
+
+
+def test_merge_annotates_structural_flag_lines(tmp_path, monkeypatch):
+    """R8-I7（渲染部分）失败测试：合并产物 md 的"门槛调整建议"节中，属
+    结构性检查的条目（G1.trade_count——"按预期频率交易"的运维口径检查，
+    负对照高通过属预期）行内标注"结构性检查——样本数性质，不构成门槛建议
+    依据"；JSON 原始 flags 不动；gate_calibration.py 字节不动（其哈希在
+    分片运行指纹里）——标注只发生在合并器渲染层。"""
+    mm = _load_merge_module(tmp_path, monkeypatch,
+                            name="merge_gate_power_r8i7")
+
+    def write(dirname, shard):
+        d = tmp_path / dirname
+        d.mkdir(exist_ok=True)
+        (d / "gate-power.json").write_text(json.dumps(shard, ensure_ascii=False),
+                                           encoding="utf-8")
+        return d
+
+    def shard_with_trade_count_flag(seeds, *, day_fp):
+        s = _real_schema_shard(seeds, g5_det_pass=True, g5_fp_day=day_fp,
+                               g5_fp_slot=False)
+        for run in s["negative"]["runs"]:    # 结构性检查在负对照上通过属预期
+            run["checks"]["G1.trade_count"] = True
+        return s
+
+    d1 = write("s1", shard_with_trade_count_flag([0, 1], day_fp=True))
+    d2 = write("s2", shard_with_trade_count_flag([2, 3], day_fp=False))
+    out = tmp_path / "merged"
+    assert mm.main(["--shards", f"{d1},{d2}", "--out", str(out)]) == 0
+
+    m = json.loads((out / "gate-power.json").read_text(encoding="utf-8"))
+    flagged = {(f["check"], f["kind"]) for f in m["flags"]}
+    assert ("G1.trade_count", "high_false_positive") in flagged
+    assert ("G5.expectation_positive", "high_false_positive") in flagged
+    # JSON 原始 flags 保持原样（无任何标注/降级字段混入）
+    for f in m["flags"]:
+        assert set(f) == {"check", "kind", "value", "rule"}
+
+    md = (out / "gate-power.md").read_text(encoding="utf-8")
+    note = "结构性检查——样本数性质，不构成门槛建议依据"
+    tc_line = next(line for line in md.splitlines()
+                   if line.startswith("- **G1.trade_count**："))
+    assert note in tc_line
+    # 非结构性条目不加标注（只标结构性检查，不整节打折）
+    other = next(line for line in md.splitlines()
+                 if line.startswith("- **G5.expectation_positive**："))
+    assert note not in other
 
 
 def test_meta_records_run_fingerprint(gc, inputs, monkeypatch, tmp_path):
