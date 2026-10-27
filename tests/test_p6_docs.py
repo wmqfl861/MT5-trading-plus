@@ -15,6 +15,10 @@
    bt 拒绝其他策略。
 """
 import importlib.util
+import os
+import re
+import shutil
+import subprocess
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -434,6 +438,131 @@ def test_research_allowlist_workflow_loads_checker_from_main_baseline(tmp_path):
     assert any("scripts/bt.py" in v for v in viol)
     assert any("pre-commit-readonly-paths" in v for v in viol)
     assert not any("H012" in v for v in viol), "新增卡仍放行"
+
+
+# ---------------- R8-I1（T46）：head_ref 不得内插进 shell 文本 ----------------
+
+# P15 复现的注入分支名：git check-ref-format --branch 认可的合法名字，
+# 内插进 run 脚本后等效于 head="audit"; exit 0; #（提前绿色退出）。
+INJECTED_BRANCH = 'audit";exit${IFS}0;#'
+
+
+def _run_block_scalars(text):
+    """提取 YAML 里全部 run: | 块标量的原始行（零依赖的最小解析）。
+
+    块体 = 比 run: 键缩进更深的连续行；只用于 CI 守护测试（workflow 文件
+    结构简单且由下方断言锁定，不需要完整 YAML 解析器）。
+    """
+    lines = text.splitlines()
+    blocks = []
+    i = 0
+    while i < len(lines):
+        m = re.match(r"^(\s*)run:\s*\|\s*$", lines[i])
+        if not m:
+            i += 1
+            continue
+        key_indent = len(m.group(1))
+        body = []
+        i += 1
+        while i < len(lines):
+            line = lines[i]
+            if not line.strip():
+                body.append(line)
+                i += 1
+                continue
+            indent = len(line) - len(line.lstrip(" "))
+            if indent > key_indent:
+                body.append(line)
+                i += 1
+            else:
+                break
+        blocks.append("\n".join(body))
+    return blocks
+
+
+def test_research_allowlist_workflow_no_expressions_in_run_script():
+    """R8-I1（静态半）：GitHub 表达式在 shell 执行前做**纯文本替换**——
+    run 脚本里的 `${{ github.* }}` 意味着不可信分支名成为代码的一部分
+    （audit";exit${IFS}0;# 可使检查步骤提前 exit 0 绕过白名单）。
+    run 脚本块内不得出现任何 `${{ ... }}` 内插（步骤 env 块不经 shell
+    解析，是唯一放行通道：值由 Actions 注入环境变量）。"""
+    text = ALLOWLIST_YML.read_text(encoding="utf-8")
+    blocks = _run_block_scalars(text)
+    assert blocks, "research-allowlist.yml 缺 run: | 脚本块"
+    for script in blocks:
+        assert "${{ github." not in script, \
+            "run 脚本内插 github 上下文 = 不可信数据当代码执行（R8-I1）"
+        assert "${{" not in script, \
+            "run 脚本内插 GitHub 表达式（R8-I1）：任何值都应走步骤 env"
+    # 值仍要流入检查步骤：步骤级 env 用 head_ref 提供 HEAD_REF（env 块
+    # 的值由 Actions 直接设置环境变量，不拼进 shell 文本）
+    assert "HEAD_REF: ${{ github.head_ref }}" in text, \
+        "head_ref 应经步骤 env: HEAD_REF 传入（R8-I1）"
+    assert "HEAD_REF" in blocks[0], \
+        "run 脚本应引用 HEAD_REF 环境变量而非内插表达式（R8-I1）"
+
+
+def _bash_exe():
+    """CI（windows-latest）与本地都自带 Git Bash；找不到才跳过。"""
+    bash = shutil.which("bash")
+    if bash:
+        return bash
+    fallback = Path("C:/Program Files/Git/bin/bash.exe")
+    if fallback.is_file():
+        return str(fallback)
+    pytest.skip("需要 Git Bash 执行 workflow 等价脚本（R8-I1 回归）")
+
+
+@pytest.mark.parametrize("label,branch", [
+    ("ordinary", "audit-normal"),
+    ("injected", INJECTED_BRANCH),
+])
+def test_research_allowlist_head_ref_is_data_not_code(label, branch, tmp_path):
+    """R8-I1（行为半，真实 bash）：注入串只能被当作数据——脚本必须走到
+    检查器标记处，而不是提前退出。
+
+    做法与 P15 探针同构：取 workflow 的 run 脚本，截到 python 检查器
+    之前（赋值/echo/fail-closed 前置检查都在骨架里），先模拟 GitHub 的
+    表达式文本替换（把脚本内残留的 github 上下文表达式替换成攻击者
+    控制的分支名——修复后应为零处、替换是 no-op），再以 HEAD_REF 环境
+    变量携带同一分支名执行；骨架尾部补检查器标记 exit 42。
+    - 普通分支：到达标记、exit 42（对照组，验证骨架本身可运行）；
+    - 注入分支：同样到达标记、exit 42——内插式写法在此会提前 exit 0。
+    """
+    bash = _bash_exe()
+    text = ALLOWLIST_YML.read_text(encoding="utf-8")
+    blocks = _run_block_scalars(text)
+    assert blocks, "research-allowlist.yml 缺 run: | 脚本块"
+    script = blocks[0]
+    # 骨架 = run 脚本里 python 检查器 heredoc 之前的全部行（含 head 赋值、
+    # notice echo 与 fail-closed 的基准钩子存在性检查）
+    skeleton_lines = []
+    for raw in script.splitlines():
+        if raw.strip().startswith("python -"):
+            break
+        skeleton_lines.append(raw)
+    skeleton = "\n".join(skeleton_lines)
+    assert 'head=' in skeleton and "test -f baseline/" in skeleton, \
+        "骨架应覆盖 head 赋值与基准钩子前置检查（workflow 结构变化请同步本测试）"
+    # 模拟 GitHub Actions 对 run 脚本的表达式替换：bash 看到的是替换后的
+    # 纯文本。修复后脚本内无表达式，此替换必须是 no-op。
+    skeleton = re.sub(r"\$\{\{\s*github\.[^}]*\}\}", lambda _m: branch, skeleton)
+    skeleton += "\nprintf 'CHECKER_REACHED'\nexit 42\n"
+    # workflow 前置条件：baseline 基准钩子存在（test -f 需要它通过）
+    base_hook = tmp_path / "baseline" / "scripts" / "hooks" / "pre-commit-readonly-paths"
+    base_hook.parent.mkdir(parents=True)
+    base_hook.write_text("#!/bin/sh\n", encoding="utf-8")
+    env = dict(os.environ, HEAD_REF=branch)
+    run = subprocess.run(
+        [bash, "--noprofile", "--norc", "-eo", "pipefail", "-c", skeleton],
+        cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert "CHECKER_REACHED" in run.stdout, (
+        f"({label}) 分支名 {branch!r} 提前终止了检查步骤：注入串被当代码执行"
+        f"（R8-I1）——exit={run.returncode} stdout={run.stdout!r}"
+        f" stderr={run.stderr!r}")
+    assert run.returncode == 42, (
+        f"({label}) 应执行到检查器标记处 exit 42，实际 exit={run.returncode}"
+        f"（R8-I1 注入绕过）stdout={run.stdout!r} stderr={run.stderr!r}")
 
 
 def test_permissions_doc_t38_isolation_defaults():

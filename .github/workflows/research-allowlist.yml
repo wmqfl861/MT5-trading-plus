@@ -17,6 +17,10 @@ name: research-allowlist
 # main 分支保护的 required check 属用户操作（见 docs/p6/permissions.md 的
 # U0 清单，agent 不代办）；落地前，绕过面已从"改分支名"收窄为"改工作流
 # 文件本身"（后者在研究角色白名单中为只读路径）。
+# R8-I1（T46）：不可信 github 上下文（head_ref 等事件字段）一律**不内插
+# 进 run 脚本**——GitHub 表达式是 shell 执行前的纯文本替换，合法分支名
+# audit";exit${IFS}0;# 即可借此提前 exit 0 绕过检查。此类值只经步骤级
+# env 传入，shell 内只引用环境变量（env 值不重新解析，是数据不是代码）。
 # 本步骤用 bash + heredoc：windows runner 自带 Git Bash，heredoc 体经 YAML
 # 块标量去缩进后落在脚本列 0（pwsh here-string 的收尾标记必须列 0，与
 # YAML 块缩进冲突）。
@@ -49,12 +53,18 @@ jobs:
           python-version: "3.12"
       - name: Enforce research path allowlist (all PR head branches)
         shell: bash
+        # R8-I1：分支名等不可信值只经步骤 env 传入（Actions 直接设环境
+        # 变量，不拼 shell 文本）；run 脚本内不得出现任何表达式内插。
+        env:
+          HEAD_REF: ${{ github.head_ref }}
         run: |
           # R8/I4 收口：对所有 PR 头分支强制执行——research 代理改用非
           # research/* 分支名即可绕过的分支名逃逸口关闭。管理员/主会话的
           # 落库路径是直推 main（不触发 pull_request 事件），不经本检查；
           # 分支名不再承载任何信任。
-          head="${{ github.head_ref }}"
+          # R8/I1：分支名只作为数据引用（环境变量），绝不内插进 shell
+          # 文本；env 缺失即失败（fail-closed），不回退为空分支名。
+          head="${HEAD_REF:?research-allowlist: HEAD_REF env not set}"
           echo "::notice title=research-allowlist::enforcing research-role path rules on PR head '$head'"
           # fail-closed：基准钩子不在（checkout 布局变化）即失败，绝不回退到 PR 版
           test -f baseline/scripts/hooks/pre-commit-readonly-paths
