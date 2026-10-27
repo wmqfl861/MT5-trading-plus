@@ -311,7 +311,165 @@ def test_daily_break_same_local_hour_across_dst_not_split():
     kinds = [g.kind for g in rep.gaps]
     assert kinds.count("daily_break") == 8   # 周一至周四 × 2 周
     assert kinds.count("unexpected") == 0     # 关键：不被 DST 拆成 unexpected
-    assert kinds.count("weekend") == 3        # 两周五的收市窗 + 两周之间的大缺口
+    # T79：周五收市窗仍 weekend（2 处）；两周之间横跨两个周末的 9 天大缺口
+    # 不再静默归 weekend，改判 long_gap
+    assert kinds.count("weekend") == 2
+    assert kinds.count("long_gap") == 1
+
+
+# ---- T79/R12-G1：长缺口判定——weekend 须与周末窗"基本重合" ----
+
+
+def test_round12_probe_27day_hole_is_long_gap_not_weekend():
+    """复刻 docs/reviews/probes/2026-10-27-round12-gap-probe.py（先红后绿）：
+    工作日 H1 序列挖掉 2021-06-03 10:00 → 2021-07-01 08:00——修复前该 27 天
+    缺口整段归 weekend（探针红）；修复后须为 long_gap，横跨多周末不得
+    归 weekend。"""
+    idx = pd.date_range("2021-05-03", "2021-07-30 20:00", freq="h")
+    idx = idx[idx.dayofweek < 5]
+    hole = ((idx >= pd.Timestamp("2021-06-03 10:00"))
+            & (idx < pd.Timestamp("2021-07-01 08:00")))
+    df = pd.DataFrame({"time": idx[~hole], "open": 1.2, "high": 1.21,
+                       "low": 1.19, "close": 1.2, "tick_volume": 1,
+                       "spread": 1, "real_volume": 0})
+    rep = quality_report(df, "H1")
+    big = [g for g in rep.gaps if (g.end - g.start).days >= 3]
+    assert len(big) == 1
+    assert big[0].kind == "long_gap"
+    assert big[0].start == datetime(2021, 6, 3, 10, 0)
+    assert big[0].end == datetime(2021, 7, 1, 8, 0)
+    # 任何 ≥3 天的缺口都不再是 weekend
+    assert all(g.kind != "weekend" for g in rep.gaps
+               if (g.end - g.start).days >= 3)
+    # 探针的合成日历是"工作日 24 小时"：周五数据流到 23:00（越过收盘 2 小时）、
+    # 周一 00:00 才恢复（越过周日开盘 3 小时）——周缺口超出周末窗两端容差，
+    # 如实判 holiday（可见），周末窗本身没有吞掉它
+    kinds = [g.kind for g in rep.gaps]
+    assert kinds.count("long_gap") == 1
+    assert kinds.count("weekend") == 0
+    assert kinds.count("holiday") == 8
+    md = rep.render_markdown()
+    assert "long_gap=1" in md  # 计数行含新类别
+
+
+def test_real_shape_friday_early_close_and_sunday_late_open_still_weekend():
+    # 真实库形态（EDT 周，H1）：周五末根 20:00（提前 1 根收）→ 周日首根
+    # 22:00（晚开 1 根）——都在一根 bar 容差内，仍是 weekend（不误报）
+    times = ([datetime(2026, 7, 17, 18, 0) + timedelta(hours=i) for i in range(3)]
+             + [datetime(2026, 7, 19, 22, 0)])
+    rep = quality_report(make_bars(times), "H1")
+    assert [g.kind for g in rep.gaps] == ["weekend"]
+    assert rep.gaps[0].bars_missing == 49  # 20:00 → 22:00 = 50h 间隔 - 1 根
+
+
+def test_sunday_late_open_two_bars_is_holiday_not_silent_weekend():
+    # 晚开 2 根（首根 23:00）超出容差 → 不归 weekend；≥20h → holiday（可见）
+    times = ([datetime(2026, 7, 17, 18, 0) + timedelta(hours=i) for i in range(3)]
+             + [datetime(2026, 7, 19, 23, 0)])
+    rep = quality_report(make_bars(times), "H1")
+    assert [g.kind for g in rep.gaps] == ["holiday"]
+
+
+def test_friday_early_close_three_hours_is_holiday_not_silent_weekend():
+    # 提前 3 小时收盘（末根 17:00）超出 1 根容差 → holiday（可见），不静默
+    times = ([datetime(2026, 7, 17, 15, 0) + timedelta(hours=i) for i in range(3)]
+             + [datetime(2026, 7, 19, 21, 0)])
+    rep = quality_report(make_bars(times), "H1")
+    assert [g.kind for g in rep.gaps] == ["holiday"]
+
+
+def test_long_gap_listed_in_markdown_details():
+    # 构造最小 27 天洞：6/2 末根 → 7/1 首根（跨 Jun 4-6/11-13/18-20/25-27）
+    times = [datetime(2021, 6, 2, 20, 0), datetime(2021, 7, 1, 1, 0)]
+    rep = quality_report(make_bars(times), "H1", symbol="EURUSD")
+    assert [g.kind for g in rep.gaps] == ["long_gap"]
+    md = rep.render_markdown()
+    assert "long_gap 缺口" in md and "2021-06-02T21:00:00" in md
+
+
+# ---- T79：known_gaps 的登记与读取（meta.json） ----
+
+
+def test_weekend_adjacent_gaps_do_not_poison_daily_break_denominator():
+    """T79 回归：与周末窗相交但超出容差的缺口不得进入日间休市分桶——
+    否则其首末出现日会拉宽重现率分母，把真正的日维护窗挤出 daily_break
+    （真实案例：收紧判定首版把 USTEC H1 的 384 处维护窗挤成 micro_gap）。
+
+    构造：9-18 周五提前收盘 1 小时（周末相邻缺口 → holiday）；10-05 起
+    周一至周四 21:00 UTC（17:00 NY，全程 EDT）维护窗 ×16（≥ _MIN_RECUR，
+    走窗口分母）。若周末相邻缺口进了分桶，lo 被拉回 9-18，分母 19→30，
+    60% 重现率不成立，16 处维护窗全变 unexpected。"""
+    days = [date(2026, 9, 16) + timedelta(days=i) for i in range(45)]  # →10-30
+    times = []
+    for d in days:
+        wd = d.weekday()
+        if wd == 5:
+            continue                            # 周六无数据
+        if wd == 6:                             # 周日 21:00 开盘（EDT）
+            times += day_minutes(d, hours=range(21, 24))
+            continue
+        if wd == 4:                             # 周五 20:59 收
+            last_hour = 19 if d == date(2026, 9, 18) else 20
+            times += day_minutes(d, hours=range(0, last_hour + 1))
+            continue
+        skip = {21} if d >= date(2026, 10, 5) else frozenset()   # 维护窗
+        times += day_minutes(d, hours=range(24), skip_hours=skip)
+    rep = quality_report(make_bars(times), "M1")
+    kinds = [g.kind for g in rep.gaps]
+    assert kinds.count("daily_break") == 16     # 维护窗全部保住
+    assert kinds.count("unexpected") == 0       # 不被挤出成 unexpected
+    assert kinds.count("holiday") == 1          # 9-18 周末相邻缺口按长度归类
+    assert kinds.count("weekend") == 5          # 其余周末照旧（末周五是序列终点）
+
+
+# ---- T79：known_gaps 的登记与读取（meta.json） ----
+
+
+def test_known_gaps_roundtrip_and_validation(tmp_path):
+    from mt5data.quality import read_known_gaps, write_known_gaps
+    from mt5data.store import save_bars
+
+    t0 = datetime(2026, 10, 26, 0, 0)
+    save_bars(str(tmp_path), "EURUSD", "H1",
+              make_bars([t0 + timedelta(hours=i) for i in range(5)]))
+    assert read_known_gaps(str(tmp_path), "EURUSD", "H1") == []
+
+    write_known_gaps(str(tmp_path), "EURUSD", "H1", [
+        {"start": "2021-05-17T14:00:00", "end": "2021-06-14T11:00:00",
+         "reason": "终端无该段历史"}])
+    assert read_known_gaps(str(tmp_path), "EURUSD", "H1") == [
+        (datetime(2021, 5, 17, 14, 0), datetime(2021, 6, 14, 11, 0))]
+    # meta 其余键不被覆盖；条目带 reason/登记时间
+    meta = json.loads((tmp_path / "bars" / "EURUSD" / "H1" / "meta.json")
+                      .read_text(encoding="utf-8"))
+    assert meta["symbol"] == "EURUSD" and meta["rows"] == 5
+    assert meta["known_gaps"][0]["reason"] == "终端无该段历史"
+    assert "registered_utc" in meta["known_gaps"][0]
+    # 同 start 重复登记 → 去重替换
+    write_known_gaps(str(tmp_path), "EURUSD", "H1", [
+        {"start": "2021-05-17T14:00:00", "end": "2021-06-14T11:00:00",
+         "reason": "更新理由"}])
+    assert len(read_known_gaps(str(tmp_path), "EURUSD", "H1")) == 1
+    # 非法条目拒绝：缺 end、start ≥ end
+    with pytest.raises(ValueError):
+        write_known_gaps(str(tmp_path), "EURUSD", "H1",
+                         [{"start": "2021-05-17T14:00:00"}])
+    with pytest.raises(ValueError):
+        write_known_gaps(str(tmp_path), "EURUSD", "H1",
+                         [{"start": "2021-06-14T11:00:00",
+                           "end": "2021-05-17T14:00:00"}])
+    # meta 里被写坏（非数组）→ 读取拒绝而非静默
+    meta["known_gaps"] = {"start": "x"}
+    (tmp_path / "bars" / "EURUSD" / "H1" / "meta.json").write_text(
+        json.dumps(meta), encoding="utf-8")
+    with pytest.raises(ValueError):
+        read_known_gaps(str(tmp_path), "EURUSD", "H1")
+
+
+def test_read_known_gaps_tolerates_missing_meta(tmp_path):
+    from mt5data.quality import read_known_gaps
+
+    assert read_known_gaps(str(tmp_path), "NOSUCH", "H1") == []
 
 
 # ---- I4 回归：异常列表限量与 p99=0 防退化 ----

@@ -110,19 +110,61 @@ def weekend_window(around: datetime, tz_name: str = NY_TZ,
 
 
 def gap_is_weekend(t_prev: datetime, t_next: datetime,
-                   tz_name: str = NY_TZ) -> bool:
-    """缺口区间 (t_prev, t_next) 与任一邻近周末窗口相交 → True。
+                   tz_name: str = NY_TZ, *,
+                   bar: timedelta = timedelta(minutes=1)) -> bool:
+    """缺口 (t_prev, t_next) 是否**与周末窗口基本重合**（T79/R12-G1 收紧）。
 
-    对 t_prev、t_next 各自邻近（前/当/后一周）的窗口都检查，
-    覆盖"缺口一端恰在窗口边界之外"与"缺口跨过周末"的情形；
-    绝不做"恒 48 小时"的算术推断（DST 切换周窗口可为 49 小时）。
+    旧判定"与任一窗口相交即 weekend"会把跨多周末的长缺口整段吞掉（真实
+    案例：EURUSD 2021-05/06 的 27 天缺口因此从未报警）。现在为真须同时满足：
+    1. 恰覆盖一个周末窗口——覆盖 ≥2 个的是跨多周末长缺口（质检判
+       long_gap），一个都不覆盖的与周末无关（其余规则分类）；
+    2. 缺口起点不早于周五收盘前一根 bar：t_prev ≥ 收盘 − 2×bar
+       （t_prev 为缺口前末根现存 bar，首根缺失 bar = t_prev + bar）；
+    3. 缺口终点不晚于周日开盘后一根 bar：t_next ≤ 开盘 + bar。
+
+    容差按 bar=K 线周期换算，吸收"周五提前收盘/周日晚开"的常规偏差；
+    DST 由窗口函数逐周换算（切换周窗口可为 49 小时），绝不做"恒 48 小时"
+    的算术推断。
     """
-    windows: list[tuple[datetime, datetime]] = []
-    for anchor in (t_prev, t_next):
-        for w in _nearby_windows(anchor, tz_name, "17:00", "17:00"):
-            if w not in windows:
-                windows.append(w)
-    return any(t_prev < wo and t_next > wc for wc, wo in windows)
+    windows = overlapped_weekend_windows(t_prev, t_next, tz_name)
+    if len(windows) != 1:
+        return False
+    close_utc, open_utc = windows[0]
+    return t_prev >= close_utc - 2 * bar and t_next <= open_utc + bar
+
+
+def weekend_windows_between(t_prev: datetime, t_next: datetime,
+                            tz_name: str = NY_TZ, close: str = "17:00",
+                            open_: str = "17:00"
+                            ) -> list[tuple[datetime, datetime]]:
+    """[t_prev, t_next] 时段可能触及的全部周末窗口（按周五逐周枚举，naive-UTC）。
+
+    枚举范围从 t_prev 所在周的前一个周五到 t_next 所在周的后一个周五——
+    覆盖"缺口一端落在周六凌晨（窗口属上一周五）"与"缺口横跨多周"的情形。
+    """
+    if t_next <= t_prev:
+        return []
+    tz = ZoneInfo(tz_name)
+    d0 = t_prev.replace(tzinfo=timezone.utc).astimezone(tz).date()
+    d1 = t_next.replace(tzinfo=timezone.utc).astimezone(tz).date()
+    fri = _friday_of_week(d0) - timedelta(days=7)
+    last = _friday_of_week(d1) + timedelta(days=7)
+    out: list[tuple[datetime, datetime]] = []
+    while fri <= last:
+        out.append(_window_for_friday(fri, tz_name, close, open_))
+        fri += timedelta(days=7)
+    return out
+
+
+def overlapped_weekend_windows(t_prev: datetime, t_next: datetime,
+                               tz_name: str = NY_TZ
+                               ) -> list[tuple[datetime, datetime]]:
+    """缺口开区间 (t_prev, t_next) 实际覆盖到的周末窗口（相交即算）。
+
+    跨多周末的长缺口覆盖 ≥2 个窗口——质检据此判 long_gap（T79/R12-G1）。
+    """
+    return [w for w in weekend_windows_between(t_prev, t_next, tz_name)
+            if t_prev < w[1] and t_next > w[0]]
 
 
 # ------------------------------------------------ T20：换日禁入策略（共享定义源）

@@ -110,6 +110,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # 复用 run_backtest 的装配
 
+from mt5data.quality import read_known_gaps  # noqa: E402
 from mt5data.store import TIMEFRAME_SECONDS  # noqa: E402
 from mt5quant.backtest.engine_a import ENGINE_VERSION, run_backtest  # noqa: E402
 from mt5quant.backtest.report import (  # noqa: E402
@@ -1377,6 +1378,9 @@ def cmd_gate(args) -> int:
                                 volume_lots=lots,
                                 initial_capital=args.initial_capital)
         seed = vstats.rng_seed(card.id)
+        # T79：序列 meta.json 登记的已知缺口——G2 按年分段 / G3 walk-forward
+        # 读到时在关卡 details 里注明相关窗口样本不完整（只注记，不改判定）
+        known_gaps = read_known_gaps(data_root, symbol, card.timeframe)
         results: dict[str, dict] = {}
 
         def _run(name, fn):
@@ -1397,11 +1401,13 @@ def cmd_gate(args) -> int:
                 base_summary=summary, grid=card.params,
                 bars_by_symbol=bars_by_sym, costs_by_symbol=costs_by_sym,
                 sizes_by_symbol=sizes, cfg=cfg, seed=seed,
-                vols_by_symbol=vols_by_sym))    # T23：sizing 口径跨品种透传
+                vols_by_symbol=vols_by_sym,      # T23：sizing 口径跨品种透传
+                known_gaps=known_gaps))          # T79：样本不完整注记
         if "G3" in wanted:
             _run("G3", lambda: vwf.run_g3(
                 spec, bars, costs, grid=combos,
-                in_sample_sharpe=summary.get("sharpe"), cfg=cfg))
+                in_sample_sharpe=summary.get("sharpe"), cfg=cfg,
+                known_gaps=known_gaps))          # T79：样本不完整注记
         if "G4" in wanted:
             def _g4():
                 returns = base.equity.astype("float64").pct_change().dropna()

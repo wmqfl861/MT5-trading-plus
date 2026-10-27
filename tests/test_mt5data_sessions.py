@@ -149,10 +149,65 @@ def test_gap_inside_weekend_window_is_weekend():
                           datetime(2026, 10, 24, 6, 0))
 
 
-def test_gap_crossing_weekend_from_thursday_is_weekend():
-    # 巨大缺口跨过周末（周四→下周一）仍应识别出周末成分
-    assert gap_is_weekend(datetime(2026, 10, 22, 12, 0),
-                          datetime(2026, 10, 26, 12, 0))
+def test_gap_crossing_weekend_from_thursday_not_weekend():
+    # R12-G1/T79：周四→下周一的缺口只是"跨过"周末窗口，缺口本体远早于
+    # 周五收盘、远晚于周日开盘——不得整段归 weekend（超出部分由其余规则
+    # 分类；跨多周末的另报 long_gap）
+    assert not gap_is_weekend(datetime(2026, 10, 22, 12, 0),
+                              datetime(2026, 10, 26, 12, 0))
+
+
+# ---- T79：与周末窗"基本重合"的容差（按周期换算） ----
+
+
+def test_gap_friday_early_close_one_bar_tolerated():
+    # 周五提前收盘一根 bar（M1：末根 20:58，窗口 21:00 收）→ 仍 weekend；
+    # 提前两根（20:57）超出容差 → 不再归 weekend
+    assert gap_is_weekend(datetime(2026, 10, 23, 20, 58),
+                          datetime(2026, 10, 25, 21, 0),
+                          bar=timedelta(minutes=1))
+    assert not gap_is_weekend(datetime(2026, 10, 23, 20, 57),
+                              datetime(2026, 10, 25, 21, 0),
+                              bar=timedelta(minutes=1))
+
+
+def test_gap_sunday_late_open_one_bar_tolerated():
+    # 周日晚开一根 bar（首根 21:01，窗口 21:00 开）→ 仍 weekend；晚两根则否
+    assert gap_is_weekend(datetime(2026, 10, 23, 20, 59),
+                          datetime(2026, 10, 25, 21, 1),
+                          bar=timedelta(minutes=1))
+    assert not gap_is_weekend(datetime(2026, 10, 23, 20, 59),
+                              datetime(2026, 10, 25, 21, 2),
+                              bar=timedelta(minutes=1))
+
+
+def test_gap_tolerance_scales_with_bar_period():
+    # H1 容差按周期换算：提前 1 小时收盘（末根 19:00）在容差内；
+    # 提前 2 小时（18:00）不是"常规偏差"
+    assert gap_is_weekend(datetime(2026, 10, 23, 19, 0),
+                          datetime(2026, 10, 25, 21, 0), bar=timedelta(hours=1))
+    assert not gap_is_weekend(datetime(2026, 10, 23, 18, 0),
+                              datetime(2026, 10, 25, 21, 0), bar=timedelta(hours=1))
+
+
+def test_multiweekend_gap_overlaps_several_windows_and_is_not_weekend():
+    # R12-G1 探针场景（27 天缺口）：触及 ≥2 个周末窗口 → 绝不归 weekend，
+    # 质检侧判 long_gap（2021-06：Jun 4-6/11-13/18-20/25-27 四个窗口）
+    from mt5data.sessions import overlapped_weekend_windows
+    wins = overlapped_weekend_windows(datetime(2021, 6, 3, 9, 0),
+                                      datetime(2021, 7, 1, 8, 0))
+    assert len(wins) >= 2
+    assert not gap_is_weekend(datetime(2021, 6, 3, 9, 0),
+                              datetime(2021, 7, 1, 8, 0))
+
+
+def test_single_weekend_gap_overlaps_exactly_one_window():
+    from mt5data.sessions import overlapped_weekend_windows
+    wins = overlapped_weekend_windows(datetime(2026, 10, 23, 20, 59),
+                                      datetime(2026, 10, 25, 21, 0))
+    assert len(wins) == 1
+    assert wins[0] == (datetime(2026, 10, 23, 21, 0),
+                       datetime(2026, 10, 25, 21, 0))
 
 
 # ---- T20：SessionPolicy（禁入窗共享定义源，决策 D11 / 铁律 v3 第 11 条） ----

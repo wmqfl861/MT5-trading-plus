@@ -84,8 +84,15 @@ def _span_months(times) -> int:
     return _month_index(times.iloc[-1]) - _month_index(times.iloc[0]) + 1
 
 
-def run_g3(spec: BacktestSpec, bars, costs, *, grid, in_sample_sharpe, cfg) -> dict:
-    """grid：参数组合列表（卡网格的笛卡尔积，如 [{"k": 2}, {"k": 3}] 或 [{}]）。"""
+def run_g3(spec: BacktestSpec, bars, costs, *, grid, in_sample_sharpe, cfg,
+           known_gaps: list | None = None) -> dict:
+    """grid：参数组合列表（卡网格的笛卡尔积，如 [{"k": 2}, {"k": 3}] 或 [{}]）。
+
+    T79/R12-G1：known_gaps（序列 meta.json 登记、mt5data.quality.
+    read_known_gaps 读取的已知缺口）与某段训练∪测试窗相交 → 该段记
+    sample_incomplete 并在 known_gaps_note 注明"样本不完整"——只注记，
+    不改变段数与通过判定（事件研究 T66 建成后接第三个消费点）。
+    """
     strategy = spec.strategy
     lookback = max(int(getattr(strategy.required_data, "lookback_bars", 0) or 0), 0)
     n = len(bars)
@@ -118,7 +125,7 @@ def run_g3(spec: BacktestSpec, bars, costs, *, grid, in_sample_sharpe, cfg) -> d
                    if oos_trade_count else 0.0)
         tail = oos.equity.astype("float64").iloc[-(t2 - t1 + 1):]
         oos_returns.append(tail.pct_change().dropna())
-        segments.append({
+        segment = {
             "train_range": [t0, t1],
             "test_range": [t1, t2],
             "train_start": w["train_start"].isoformat(),
@@ -131,7 +138,15 @@ def run_g3(spec: BacktestSpec, bars, costs, *, grid, in_sample_sharpe, cfg) -> d
             "train_net": float(best_net),
             "oos_net": oos_net,
             "oos_trades": oos_trade_count,
-        })
+        }
+        if known_gaps:
+            hits = [f"{pd.Timestamp(s).isoformat()}→{pd.Timestamp(e).isoformat()}"
+                    for s, e in known_gaps
+                    if pd.Timestamp(s) < w["test_end"]
+                    and pd.Timestamp(e) > w["train_start"]]
+            if hits:
+                segment["sample_incomplete"] = hits
+        segments.append(segment)
 
     if not segments:
         return {"passed": False, "segments": [], "oos_sharpe": None,
@@ -152,7 +167,7 @@ def run_g3(spec: BacktestSpec, bars, costs, *, grid, in_sample_sharpe, cfg) -> d
     passed = bool(oos_sharpe is not None and oos_sharpe > 0
                   and is_sharpe is not None
                   and (is_sharpe <= 0 or oos_sharpe >= min_oos))
-    return {
+    result = {
         "passed": passed,
         "segments": segments,
         "oos_sharpe": oos_sharpe,
@@ -161,3 +176,11 @@ def run_g3(spec: BacktestSpec, bars, costs, *, grid, in_sample_sharpe, cfg) -> d
         "min_required_oos_sharpe": min_oos,
         "n_test_bars_total": int(sum(len(r) for r in oos_returns)),
     }
+    if known_gaps:
+        flagged = [s for s in segments if s.get("sample_incomplete")]
+        if flagged:
+            result["known_gaps_note"] = (
+                f"样本不完整：{len(flagged)}/{len(segments)} 个训练/测试窗与"
+                "已知缺口（meta.json known_gaps）相交，样本外统计按现存"
+                "数据计算")
+    return result

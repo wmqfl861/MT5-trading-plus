@@ -202,3 +202,35 @@ def test_walkforward_warmup_trades_excluded_from_oos(cfg_short):
         # 零回看：切片起点即测试窗起点 → 第一根可交易 bar 入场，计入
         assert seg["oos_trades"] == 1
         assert seg["oos_net"] > 0
+
+
+# ------------------------------------------- T79：known_gaps（样本不完整注记）
+
+def test_run_g3_flags_windows_overlapping_known_gaps(cfg_short):
+    """T79/R12-G1：walk-forward 读到 known_gaps（序列 meta.json 登记、
+    read_known_gaps 读取）时，训练/测试窗与缺口相交的段标 sample_incomplete
+    并在 known_gaps_note 注明样本不完整——只注记，不改变段数与判定。"""
+    from datetime import datetime as _dt
+
+    bars = make_bars([100 + 0.05 * i for i in range(24 * 120)])  # ≈5 个月
+    kwargs = dict(grid=[{}], in_sample_sharpe=1.0, cfg=cfg_short)
+    plain = wf.run_g3(spec_of(ImmediateLong()), bars, Zero(), **kwargs)
+    assert all("sample_incomplete" not in s for s in plain["segments"])
+    assert "known_gaps_note" not in plain
+
+    kg = [(_dt(2024, 3, 5), _dt(2024, 3, 20))]
+    out = wf.run_g3(spec_of(ImmediateLong()), bars, Zero(),
+                    known_gaps=kg, **kwargs)
+    assert len(out["segments"]) == len(plain["segments"])
+    assert out["passed"] == plain["passed"]
+    flagged = [s for s in out["segments"] if "sample_incomplete" in s]
+    assert flagged, "与已知缺口相交的窗口必须带 sample_incomplete 标记"
+    # 训练∪测试窗 [2024-03-01, 2024-05-01) 与缺口 [03-05, 03-20) 相交：
+    # 测试窗 3 月（train 02-01 起）与 4 月（train 03-01 起）两段被标记
+    assert {s["test_start"][:7] for s in flagged} == {"2024-03", "2024-04"}
+    assert "样本不完整" in out["known_gaps_note"]
+    # 不相交的缺口不产生注记
+    far = wf.run_g3(spec_of(ImmediateLong()), bars, Zero(),
+                    known_gaps=[(_dt(2020, 1, 1), _dt(2020, 2, 1))], **kwargs)
+    assert all("sample_incomplete" not in s for s in far["segments"])
+    assert "known_gaps_note" not in far

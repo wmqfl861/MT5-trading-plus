@@ -1,14 +1,26 @@
 """K 线质检：只读输入 DataFrame，只报告，绝不改数、不删数。
 
 缺口分类次序（前者优先）：
-1. weekend——与 sessions 判定的周末窗口相交（DST 感知，非"恒 48 小时"）；
-2. daily_break——缺失起始的交易所本地小时（DST 换算后聚合）在 ≥60% 的
+1. weekend——与周末窗口**基本重合**（T79/R12-G1 收紧）：恰覆盖一个窗口，
+   且缺口起点不早于周五收盘前一根 bar、终点不晚于周日开盘后一根 bar
+   （容差按周期换算；DST 感知，非"恒 48 小时"）；
+2. long_gap——覆盖 ≥2 个周末窗口的跨多周长缺口（T79 新类别；旧判定把
+   这类整段归 weekend 而从不报警——真实案例：EURUSD 2021-05/06 的
+   27 天缺口直到外部数据比对才被发现）；
+3. daily_break——缺失起始的交易所本地小时（DST 换算后聚合）在 ≥60% 的
    交易日重复出现（按本地小时分桶：固定的本地休市跨夏令时会落在不同
    UTC 标签小时，按标签分桶会被拆裂而漏判）；
-3. holiday——缺口 ≥20 小时且不跨周末；
-4. micro_gap——仅缺 ≤2 根的微型缺口（换日/静默时段散落的单分钟掉数据，
+4. holiday——缺口 ≥20 小时且不跨周末；
+5. micro_gap——仅缺 ≤2 根的微型缺口（换日/静默时段散落的单分钟掉数据，
    逐条排查无意义，计数即可；真实案例：Exness EURUSD M1 五年 1 万余处）；
-5. unexpected——其余，需人工排查。
+6. unexpected——其余，需人工排查。
+
+与周末窗相交但超出容差的缺口（如周五提前收盘 2 根以上、周日晚开 2 根
+以上、单边节假日并周末）走 3–6 分类——可见而非静默并入 weekend。
+
+known_gaps（T79）：终端补不了的长缺口登记进序列 meta.json（write_known_gaps），
+研究工具（按年分段、walk-forward；事件研究待 T66）经 read_known_gaps 读取，
+在报告里注明相关窗口样本不完整。
 
 注意：出现次数不足 _MIN_RECUR 的本地小时用全局交易日做分母（防单日样本
 1/1=100% 的假阳性）；达到 _MIN_RECUR 的用"首末出现日窗口"做分母——常规
@@ -18,6 +30,8 @@
 """
 from __future__ import annotations
 
+import json
+import os
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -26,8 +40,10 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-from mt5data.sessions import NY_TZ, gap_is_weekend
-from mt5data.store import TIMEFRAME_SECONDS
+from mt5data.sessions import (
+    NY_TZ, gap_is_weekend, overlapped_weekend_windows,
+)
+from mt5data.store import TIMEFRAME_SECONDS, read_watermark, series_dir
 
 _HOLIDAY_HOURS = 20.0
 _DAILY_BREAK_NUM, _DAILY_BREAK_DEN = 6, 10  # ≥60%，整数比较免浮点误差
@@ -45,7 +61,7 @@ _PRICE_FIELDS = ("open", "high", "low", "close")
 class Gap:
     """一处缺口。start=首根缺失 bar 的 time；end=缺口后首根现存 bar 的 time。"""
 
-    kind: str  # weekend / daily_break / holiday / unexpected
+    kind: str  # weekend / long_gap / daily_break / holiday / micro_gap / unexpected
     start: datetime
     end: datetime
     bars_missing: int
@@ -105,9 +121,10 @@ class QualityReport:
             lines.append(f"- 行数：{self.rows}（期望 {self.expected_rows}，"
                          f"覆盖率 {self.coverage_pct:.2f}%）")
         lines.append(f"- 重复时间戳：{self.duplicates}；乱序：{self.disorder}")
-        lines.append("- 缺口：weekend={0}，daily_break={1}，holiday={2}，"
-                     "micro_gap={3}，unexpected={4}".format(
-                         counts.get("weekend", 0), counts.get("daily_break", 0),
+        lines.append("- 缺口：weekend={0}，long_gap={1}，daily_break={2}，"
+                     "holiday={3}，micro_gap={4}，unexpected={5}".format(
+                         counts.get("weekend", 0), counts.get("long_gap", 0),
+                         counts.get("daily_break", 0),
                          counts.get("holiday", 0), counts.get("micro_gap", 0),
                          counts.get("unexpected", 0)))
         lines.append(f"- Spike：{len(self.spikes)}；点差异常：{self.spread_anomaly_count}")
@@ -117,8 +134,8 @@ class QualityReport:
             hist = "、".join(f"{h:02d}:00×{n}" for h, n in top)
             lines.append(f"- 点差异常小时分布（前3）：{hist}")
         for g in self.gaps:
-            if g.kind == "unexpected":
-                lines.append(f"  - unexpected 缺口：{g.start.isoformat()} → "
+            if g.kind in ("unexpected", "long_gap"):
+                lines.append(f"  - {g.kind} 缺口：{g.start.isoformat()} → "
                              f"{g.end.isoformat()}（缺 {g.bars_missing} 根）")
         for a in self.spikes:
             lines.append(f"  - spike：{a['time']} 幅度={a['range']:.6g}"
@@ -181,14 +198,26 @@ def quality_report(df: pd.DataFrame | None, timeframe: str, *,
     dt = np.diff(t)
     gap_pos = np.nonzero(dt > np.timedelta64(seconds, "s"))[0]
     weekend_gaps: list[Gap] = []
-    pending: list[tuple[datetime, datetime, int]] = []  # (start, end, missing)
+    long_gaps: list[Gap] = []   # T79：跨多周末的长缺口（覆盖 ≥2 个周末窗）
+    pending: list[tuple[datetime, datetime, int]] = []  # 与周末窗零相交
+    # 与周末窗相交但超出容差（周末+额外缺失）：按长度归类，**不进日间休市
+    # 分桶**——它们的首末出现日会拉宽重现率分母（T79 实测把 USTEC H1 的
+    # 384 处日维护窗从 daily_break 挤成 micro_gap），且周末相邻缺口本来
+    # 就不是纯日间休市形态
+    weekend_adjacent: list[tuple[datetime, datetime, int]] = []
     for i in gap_pos:
         t_prev = pd.Timestamp(t[i]).to_pydatetime()
         t_next = pd.Timestamp(t[i + 1]).to_pydatetime()
         missing = int((t_next - t_prev).total_seconds() // seconds) - 1
         start, end = t_prev + period, t_next
-        if gap_is_weekend(t_prev, t_next, tz_name=tz_name):
+        n_windows = len(overlapped_weekend_windows(t_prev, t_next, tz_name))
+        if n_windows >= 2:
+            long_gaps.append(Gap("long_gap", start, end, missing))
+        elif n_windows == 1 and gap_is_weekend(t_prev, t_next, tz_name,
+                                               bar=period):
             weekend_gaps.append(Gap("weekend", start, end, missing))
+        elif n_windows == 1:
+            weekend_adjacent.append((start, end, missing))
         else:
             pending.append((start, end, missing))
 
@@ -230,7 +259,17 @@ def quality_report(df: pd.DataFrame | None, timeframe: str, *,
         else:
             kind = "unexpected"
         other_gaps.append(Gap(kind, start, end, missing))
-    gaps = weekend_gaps + other_gaps
+    for start, end, missing in weekend_adjacent:
+        # 跳过 daily_break（理由见上方分桶注释）：≥20h 归 holiday（周末+
+        # 节假日提前收盘/晚开），≤2 根归 micro_gap，其余 unexpected
+        if (end - start) >= timedelta(hours=_HOLIDAY_HOURS):
+            kind = "holiday"
+        elif missing <= _MICRO_GAP_BARS:
+            kind = "micro_gap"
+        else:
+            kind = "unexpected"
+        other_gaps.append(Gap(kind, start, end, missing))
+    gaps = weekend_gaps + long_gaps + other_gaps
 
     # ---- spike：|close-open| > 20×前后各 20 根中位数，且下一根反向回撤过半 ----
     signed = (df["close"].astype("float64") - df["open"].astype("float64")).to_numpy()
@@ -291,3 +330,72 @@ def quality_report(df: pd.DataFrame | None, timeframe: str, *,
         spread_anomalies=spread_anomalies, spread_anomaly_count=spread_count,
         spread_anomaly_by_hour=spread_by_hour, notes=notes,
     )
+
+
+# ------------------------------------------------ T79：known_gaps 登记与读取
+
+def _known_gap_entry(raw) -> tuple[datetime, datetime]:
+    """校验一条 known_gaps 记录，返回 (start, end)。非法即 ValueError。"""
+    if not isinstance(raw, dict) or "start" not in raw or "end" not in raw:
+        raise ValueError(
+            f"known_gaps 条目须为含 start/end 的对象，收到 {raw!r}")
+    try:
+        s = datetime.fromisoformat(str(raw["start"]))
+        e = datetime.fromisoformat(str(raw["end"]))
+    except ValueError as exc:
+        raise ValueError(f"known_gaps start/end 须为 ISO 时间：{raw!r}") from exc
+    if not s < e:
+        raise ValueError(f"known_gaps 条目 start 须早于 end：{raw!r}")
+    return s, e
+
+
+def read_known_gaps(root, symbol: str,
+                    timeframe: str) -> list[tuple[datetime, datetime]]:
+    """读序列 meta.json 的 known_gaps（普查登记、终端补不了的已知缺口）。
+
+    返回 [(start, end), ...]（与 Gap 口径一致：start=首根缺失 bar、
+    end=缺口后首根现存 bar）；无文件/无键 → []。条目格式非法 → ValueError：
+    已知缺口是研究工具注记样本完整性的依据，宁可拒读也不静默丢弃。
+    """
+    meta = read_watermark(root, symbol, timeframe)
+    if not meta:
+        return []
+    raw = meta.get("known_gaps")
+    if not raw:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(f"known_gaps 须为数组，收到 {type(raw).__name__}")
+    return [_known_gap_entry(item) for item in raw]
+
+
+def write_known_gaps(root, symbol: str, timeframe: str,
+                     entries: list[dict]) -> None:
+    """把已知缺口登记进序列 meta.json（原子写；保留其余键；同 start 去重替换）。
+
+    entries 每条 {"start": iso, "end": iso, "reason": str}。整表先校验后
+    写入（一条非法全部拒绝，不留半截登记）。离线运维操作（scripts/scan_gaps
+    --register-known），不走跨进程序列锁——不与下载/导出并发运行。
+    """
+    if not entries:
+        raise ValueError("known_gaps 登记条目不能为空")
+    validated = [(_known_gap_entry(e), e) for e in entries]
+    d = series_dir(root, symbol, timeframe)
+    path = os.path.join(d, "meta.json")
+    meta: dict = {}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            meta = json.load(f)
+    by_start = {item["start"]: item
+                for item in meta.get("known_gaps", [])
+                if isinstance(item, dict) and "start" in item}
+    for (s, e), raw in validated:
+        by_start[raw["start"]] = {
+            "start": raw["start"], "end": raw["end"],
+            "reason": str(raw.get("reason", "")),
+            "registered_utc": datetime.now(timezone.utc).isoformat(),
+        }
+    meta["known_gaps"] = sorted(by_start.values(), key=lambda x: x["start"])
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)

@@ -277,6 +277,72 @@ def test_yearly_segments_nonpositive_total_fails(cfg):
     assert rob.yearly_segments(df, cfg)["passed"] is False
 
 
+# ---------------------------------------------------------------- T79：known_gaps
+
+def test_yearly_segments_notes_known_gaps_sample_incomplete(cfg):
+    """T79/R12-G1：按年分段读到 known_gaps（序列 meta.json 登记、
+    read_known_gaps 读取）时，与缺口相交的年份注明"样本不完整"——
+    只注记，不改判定。"""
+    from datetime import datetime as _dt
+
+    df = trades_df([tr_row(50.0, "2024-03-01 10:00"),
+                    tr_row(50.0, "2024-06-01 10:00"),
+                    tr_row(70.0, "2025-06-01 10:00"),
+                    tr_row(70.0, "2026-06-01 10:00")])
+    plain = rob.yearly_segments(df, cfg)
+    out = rob.yearly_segments(df, cfg,
+                              known_gaps=[(_dt(2025, 3, 1), _dt(2025, 4, 1))])
+    # 判定与分年数字逐位不变（缺口是数据事实，不是策略失败）
+    assert out["passed"] == plain["passed"]
+    assert out["by_year"] == plain["by_year"]
+    assert out["sample_incomplete_years"] == {
+        "2025": ["2025-03-01T00:00:00→2025-04-01T00:00:00"]}
+    assert "样本不完整" in out["known_gaps_note"]
+    # 不与任何交易年份相交的缺口不注记；不传 known_gaps 时无新键（向后兼容）
+    far = rob.yearly_segments(df, cfg,
+                              known_gaps=[(_dt(2027, 3, 1), _dt(2027, 4, 1))])
+    assert "sample_incomplete_years" not in far
+    assert "known_gaps_note" not in plain
+
+
+def test_yearly_segments_known_gaps_noted_even_when_check_fails(cfg):
+    # 总净利 ≤ 0 的失败路径同样带注记（读报告的人两件事都要看到）
+    from datetime import datetime as _dt
+
+    df = trades_df([tr_row(-30.0, "2025-06-01 10:00"),
+                    tr_row(10.0, "2026-06-01 10:00")])
+    out = rob.yearly_segments(df, cfg,
+                              known_gaps=[(_dt(2025, 1, 1), _dt(2025, 12, 1))])
+    assert out["passed"] is False
+    assert out["sample_incomplete_years"] == {"2025": [
+        "2025-01-01T00:00:00→2025-12-01T00:00:00"]}
+
+
+def test_run_g2_passes_known_gaps_through_to_yearly_segments(cfg):
+    """bt 装配层经 run_g2 传入的 known_gaps 必须落到 yearly_segments 注记。"""
+    from datetime import datetime as _dt
+
+    cfg_small = dataclasses.replace(cfg, random_entry_sims=8)
+    bars = uptrend()
+    costs = ConstCosts(spread=0.05)
+    spec = spec_of(KPicker())
+    base = run_backtest(KPicker(), bars, costs, symbol="TST", params={"k": 2},
+                        contract_size=1.0, timeframe="H1", volume_lots=1.0)
+    kwargs = dict(spec=spec, bars=bars, costs=costs, params={"k": 2},
+                  base_result=base, base_summary=summarize(base),
+                  grid={"k": (2,)}, bars_by_symbol={"TST": bars},
+                  costs_by_symbol={"TST": costs}, sizes_by_symbol={"TST": 1.0},
+                  cfg=cfg_small, seed=555)
+    out = rob.run_g2(**kwargs)
+    assert "sample_incomplete_years" not in out["checks"]["yearly_segments"]
+    out2 = rob.run_g2(known_gaps=[(_dt(2024, 1, 1), _dt(2024, 12, 31))],
+                      **kwargs)
+    ys = out2["checks"]["yearly_segments"]
+    assert ys.get("sample_incomplete_years") == {"2024": [
+        "2024-01-01T00:00:00→2024-12-31T00:00:00"]}
+    assert ys["passed"] == out["checks"]["yearly_segments"]["passed"]
+
+
 # ---------------------------------------------------------------- 去最好 5%
 
 def test_drop_best_passes_when_robust(cfg):

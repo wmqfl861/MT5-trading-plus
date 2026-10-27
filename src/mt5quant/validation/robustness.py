@@ -332,21 +332,50 @@ def param_plateau(spec, bars, costs, params, grid, cfg) -> dict:
     }
 
 
-def yearly_segments(trades: pd.DataFrame, cfg) -> dict:
-    """按（出场）年份分段：盈利年份占比 + 单年集中度。"""
+def yearly_segments(trades: pd.DataFrame, cfg, *,
+                    known_gaps: list | None = None) -> dict:
+    """按（出场）年份分段：盈利年份占比 + 单年集中度。
+
+    T79/R12-G1：known_gaps（序列 meta.json 登记、mt5data.quality.
+    read_known_gaps 读取的已知缺口）与某年相交 → 该年记入
+    sample_incomplete_years 并在 known_gaps_note 注明"样本不完整"——
+    只注记，不改变通过判定（缺口是数据事实，不是策略结果）。
+    """
     if not len(trades):
         return {"passed": False, "by_year": {}, "reason": "无交易"}
     years = pd.to_datetime(trades["exit_time"]).dt.year
     by_year = {str(y): float(g["net"].sum())
                for y, g in trades.groupby(years)}
+
+    def _with_known_gaps(out: dict) -> dict:
+        if not known_gaps:
+            return out
+        incomplete: dict[str, list[str]] = {}
+        for y in by_year:
+            y0 = pd.Timestamp(year=int(y), month=1, day=1)
+            y1 = pd.Timestamp(year=int(y) + 1, month=1, day=1)
+            hits = [f"{pd.Timestamp(s).isoformat()}→{pd.Timestamp(e).isoformat()}"
+                    for s, e in known_gaps
+                    if pd.Timestamp(s) < y1 and pd.Timestamp(e) > y0]
+            if hits:
+                incomplete[y] = hits
+        if incomplete:
+            out["sample_incomplete_years"] = incomplete
+            out["known_gaps_note"] = (
+                "样本不完整：下列年份与已知缺口（meta.json known_gaps）相交，"
+                "年度数字按现存数据计算——"
+                + "；".join(f"{y}：{'、'.join(v)}"
+                            for y, v in incomplete.items()))
+        return out
+
     total = float(sum(by_year.values()))
     if total <= 0:
-        return {"passed": False, "by_year": by_year,
-                "reason": f"总净利 {total:.2f} ≤ 0"}
+        return _with_known_gaps({"passed": False, "by_year": by_year,
+                                 "reason": f"总净利 {total:.2f} ≤ 0"})
     profitable = [v for v in by_year.values() if v > 0]
     fraction = float(len(profitable) / len(by_year))
     concentration = float(max(by_year.values()) / total)
-    return {
+    return _with_known_gaps({
         "passed": bool(fraction >= cfg.yearly_min_fraction
                        and concentration <= cfg.yearly_max_concentration),
         "by_year": by_year,
@@ -354,7 +383,7 @@ def yearly_segments(trades: pd.DataFrame, cfg) -> dict:
         "min_fraction": float(cfg.yearly_min_fraction),
         "max_concentration": concentration,
         "max_concentration_limit": float(cfg.yearly_max_concentration),
-    }
+    })
 
 
 def drop_best_check(trades: pd.DataFrame, cfg) -> dict:
@@ -573,17 +602,20 @@ def random_entry_check(spec, bars, costs, base_trades, base_sharpe, *,
 
 def run_g2(spec, bars, costs, params, *, base_result, base_summary, grid,
            bars_by_symbol, costs_by_symbol, sizes_by_symbol, cfg,
-           seed: int, vols_by_symbol: dict | None = None) -> dict:
+           seed: int, vols_by_symbol: dict | None = None,
+           known_gaps: list | None = None) -> dict:
     """G2 全部子检查（顺序执行，互不短路；details 全部落台账）。
 
     T23：spec 带 sizing 时全部复算（成本放大、参数邻域、随机入场、延迟、
     买入持有）经 run_engine 自动沿用同一按风险定手数口径；跨品种子检查
     需要 vols_by_symbol（各品种 vol 三元组，bt.py 装配时从快照读取）。
+    T79：known_gaps 透传给按年分段（相交年份注明样本不完整，不改判定）。
     """
     checks: dict[str, dict] = {}
     checks["cost_scaling"] = cost_scaling_check(spec, bars, costs, params, cfg)
     checks["param_plateau"] = param_plateau(spec, bars, costs, params, grid, cfg)
-    checks["yearly_segments"] = yearly_segments(base_result.trades, cfg)
+    checks["yearly_segments"] = yearly_segments(base_result.trades, cfg,
+                                                known_gaps=known_gaps)
     checks["cross_symbol"] = cross_symbol_check(
         spec.strategy, bars_by_symbol, costs_by_symbol, sizes_by_symbol,
         params, spec.timeframe, spec.volume_lots, spec.initial_capital, cfg,
