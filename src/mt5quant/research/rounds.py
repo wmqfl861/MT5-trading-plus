@@ -96,7 +96,9 @@ def _require_str(data: dict, key: str, source: str) -> str:
     return v
 
 
-def _require_int(data: dict, key: str, source: str, *, minimum: int) -> int:
+def _require_int(data: dict, key: str, source: str, *, minimum: int,
+                 maximum: int | None = None,
+                 maximum_msg: str | None = None) -> int:
     v = data.get(key)
     if isinstance(v, bool) or not isinstance(v, int):
         raise RoundError(
@@ -104,6 +106,9 @@ def _require_int(data: dict, key: str, source: str, *, minimum: int) -> int:
     if v < minimum:
         raise RoundError(
             f"{source}：字段 {key!r} 必须 ≥{minimum}，收到 {v!r}")
+    if maximum is not None and v > maximum:
+        raise RoundError(maximum_msg or (
+            f"{source}：字段 {key!r} 必须 ≤{maximum}，收到 {v!r}"))
     return v
 
 
@@ -203,8 +208,10 @@ def validate_round(data: dict, *, source: str) -> Round:
     return Round(
         id=rid, opened=opened, candidates=candidates,
         trial_budget=_require_int(data, "trial_budget", source, minimum=1),
-        lockbox_uses_max=_require_int(data, "lockbox_uses_max", source,
-                                      minimum=1),
+        lockbox_uses_max=_require_int(
+            data, "lockbox_uses_max", source, minimum=1, maximum=1,
+            maximum_msg=f"{source}：lockbox_uses_max 超过 1——D16 机器强制"
+            "（用户 2026-10-28 授权）：每个研究轮次最多 1 次 G5"),
         dsr_trial_scope=scope,
         advance_rule=_require_str(data, "advance_rule", source),
         close_rule=_require_str(data, "close_rule", source),

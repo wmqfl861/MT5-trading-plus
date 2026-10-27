@@ -729,3 +729,27 @@ def test_candidate_screened_pass_latest_decision_wins(tmp_path):
         record_check(led, "C002", "fail")
         assert rounds_mod.candidate_screened_pass(led, "C002") is False
         assert rounds_mod.candidate_screened_pass(led, "C003") is False
+
+
+def test_round_lockbox_uses_max_capped_at_one_per_round(tmp_path):
+    """D16 机器强制（用户 2026-10-28 授权"按推荐做"）：每个研究轮次最多
+    1 次 G5——此前靠 approved_by 把关（T63 审核观察 1），现装载层直接拒绝
+    lockbox_uses_max > 1 的轮次文件。"""
+    from mt5quant.research.rounds import RoundError, load_round
+
+    def write_round(lockbox: int):
+        p = tmp_path / "R9.toml"
+        p.write_text(
+            'id = "R9"\nopened = "2026-10-28"\ncandidates = ["C001"]\n'
+            f"trial_budget = 10\nlockbox_uses_max = {lockbox}\n"
+            'dsr_trial_scope = "project"\nadvance_rule = "x"\nclose_rule = "y"\n'
+            'approved_by = "user"\n'
+            '[evaluation]\nC001 = { mode = "event", primary = "p" }\n',
+            encoding="utf-8")
+        return p
+
+    import pytest
+    with pytest.raises(RoundError, match="每个研究轮次最多 1 次"):
+        load_round(write_round(2))
+    r = load_round(write_round(1))
+    assert r.lockbox_uses_max == 1
