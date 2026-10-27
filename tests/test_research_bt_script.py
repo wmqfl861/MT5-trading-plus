@@ -887,3 +887,186 @@ def test_run_backtest_manifest_carries_strategy_sha(tmp_path, monkeypatch):
     manifest = json.loads((run_dir / "manifest.json").read_text(
         encoding="utf-8"))
     assert manifest["strategy_sha"] == "c" * 64
+
+
+# ------------------------------------------------- T61（D30）：撤回与标定样品
+
+def write_candidate(tmp_path, cid, status, source_card, extra=""):
+    """T61：候选登记 research/candidates/C###.toml（cards 目录的兄弟目录；
+    最小字段集——id/status/source_card，T62 迁移到蓝图附录 C 完整装载器）。"""
+    d = tmp_path / "candidates"
+    d.mkdir(exist_ok=True)
+    (d / f"{cid}.toml").write_text(
+        f'id = "{cid}"\nstatus = "{status}"\nsource_card = "{source_card}"\n'
+        + extra, encoding="utf-8")
+    return d
+
+
+def test_screen_rejects_withdrawn_card(tmp_path, monkeypatch, capsys):
+    """T61/D30 失败测试 1：候选登记 status=withdrawn 的卡 → screen 拒绝
+    （消息含 withdrawn），不产生任何 runs。"""
+    mod = load_bt()
+    root = make_data_root(tmp_path)
+    cards_dir = write_card(tmp_path)
+    write_candidate(tmp_path, "C907", "withdrawn", "H099")
+    ledger_path = tmp_path / "ledger.sqlite"
+    patch_card_git(monkeypatch, mod)
+    rc = mod.main(
+        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--volume-lots", "0.01"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "withdrawn" in out and "撤回" in out
+    with Ledger(ledger_path) as led:
+        assert led.stats("H099")["total_runs"] == 0
+
+
+def test_gate_rejects_withdrawn_card(tmp_path, monkeypatch, capsys):
+    """T61/D30 失败测试 2：撤回卡同样拒绝 gate（关卡也是"运行"）。"""
+    mod = load_bt()
+    root = make_data_root(tmp_path)
+    cards_dir = write_card(tmp_path)
+    write_candidate(tmp_path, "C907", "withdrawn", "H099")
+    ledger_path = tmp_path / "ledger.sqlite"
+    patch_card_git(monkeypatch, mod)
+    rc = mod.main(
+        ["gate", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--volume-lots", "0.01",
+         "--gates", "G0", "--params", "{}"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "withdrawn" in out and "撤回" in out
+    with Ledger(ledger_path) as led:
+        assert led.stats("H099")["total_runs"] == 0
+
+
+def test_screen_specimen_card_requires_flag(tmp_path, monkeypatch, capsys):
+    """T61/D30 失败测试 3：标定样品卡（status=specimen）不带 --specimen →
+    拒绝运行（样品只用于校准，不作研究候选），不产生任何 runs。"""
+    mod = load_bt()
+    root = make_data_root(tmp_path)
+    cards_dir = write_card(tmp_path)
+    write_candidate(tmp_path, "C900", "specimen", "H099")
+    ledger_path = tmp_path / "ledger.sqlite"
+    patch_card_git(monkeypatch, mod)
+    rc = mod.main(
+        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--volume-lots", "0.01"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "--specimen" in out and "标定样品" in out
+    with Ledger(ledger_path) as led:
+        assert led.stats("H099")["total_runs"] == 0
+
+
+def test_screen_specimen_actor_calibration(tmp_path, monkeypatch, capsys):
+    """T61/D30 失败测试 4：标定样品卡带 --specimen → 正常运行入台账，
+    actor 强制为 calibration（不进入研究轮次统计）。"""
+    mod = load_bt()
+    root = make_data_root(tmp_path)
+    cards_dir = write_card(tmp_path)
+    write_candidate(tmp_path, "C900", "specimen", "H099")
+    ledger_path = tmp_path / "ledger.sqlite"
+    patch_card_git(monkeypatch, mod)
+    rc = mod.main(
+        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--volume-lots", "0.01",
+         "--specimen", "--actor", "bt-screen"])
+    assert rc == 0, capsys.readouterr().out
+    assert "actor=calibration" in capsys.readouterr().out
+    with Ledger(ledger_path) as led:
+        r = led.conn.execute("SELECT actor FROM runs").fetchone()
+    assert r["actor"] == "calibration"
+
+
+def test_gate_specimen_actor_calibration(tmp_path, monkeypatch, capsys):
+    """T61/D30 失败测试 5：gate 路径同样——样品卡带 --specimen 才跑，
+    基准运行 actor=calibration 入账。"""
+    mod = load_bt()
+    root = make_data_root(tmp_path)
+    cards_dir = write_card(tmp_path)
+    write_candidate(tmp_path, "C900", "specimen", "H099")
+    ledger_path = tmp_path / "ledger.sqlite"
+    patch_card_git(monkeypatch, mod)
+    rc = mod.main(
+        ["gate", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--volume-lots", "0.01",
+         "--gates", "G0", "--params", "{}", "--specimen"])
+    out = capsys.readouterr().out
+    assert "G0" in out                              # 基准运行 + 关卡跑完
+    with Ledger(ledger_path) as led:
+        r = led.conn.execute("SELECT actor FROM runs").fetchone()
+    assert r is not None and r["actor"] == "calibration"
+
+
+def test_screen_specimen_flag_on_ordinary_card_rejected(tmp_path, monkeypatch,
+                                                        capsys):
+    """T61/D30 失败测试 6：--specimen 用于非标定样品卡 → 拒绝（标定通道
+    不能给研究卡让统计逃逸），不产生任何 runs。"""
+    mod = load_bt()
+    root = make_data_root(tmp_path)
+    cards_dir = write_card(tmp_path)            # 无候选登记 → 普通研究卡
+    ledger_path = tmp_path / "ledger.sqlite"
+    patch_card_git(monkeypatch, mod)
+    rc = mod.main(
+        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--volume-lots", "0.01", "--specimen"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "标定样品" in out
+    with Ledger(ledger_path) as led:
+        assert led.stats("H099")["total_runs"] == 0
+
+
+def test_repo_candidate_registrations_specimen_and_withdrawn():
+    """T61/D30：仓库 research/candidates/ 登记守护——C900–C906 把 H001–H007
+    登记为 status=specimen（写明"不作研究候选"）；三张 v2 卡登记为
+    status=withdrawn，撤回理由逐条写明、运行次数如实（0 次，不计入 N）；
+    cards.candidate_statuses_by_card 缺省目录解析到同一结论。"""
+    import tomllib
+
+    from mt5quant.research import cards as cards_mod
+
+    cdir = REPO_ROOT / "research" / "candidates"
+    assert cdir.is_dir(), f"缺候选登记目录：{cdir}"
+    specs = {
+        f"C{900 + i}": card for i, card in enumerate(
+            ("H001", "H002", "H003", "H004", "H005", "H006", "H007"))}
+    for cid, card in specs.items():
+        p = cdir / f"{cid}.toml"
+        assert p.is_file(), f"缺标定样品登记：{p}"
+        data = tomllib.loads(p.read_text(encoding="utf-8"))
+        assert data.get("status") == "specimen", (cid, data.get("status"))
+        assert data.get("source_card") == card
+        assert "不作研究候选" in data.get("notes", "")
+    reasons = {
+        "C907": ("H002-v2", "样本内"),           # 网格/预期笔数取自 v3 样本内
+        "C908": ("H003-v2", "成本"),             # 日内持仓，事前成本不过
+        "C909": ("H006-v2", "成本"),
+    }
+    for cid, (card, kw) in reasons.items():
+        p = cdir / f"{cid}.toml"
+        assert p.is_file(), f"缺撤回登记：{p}"
+        data = tomllib.loads(p.read_text(encoding="utf-8"))
+        assert data.get("status") == "withdrawn", (cid, data.get("status"))
+        assert data.get("source_card") == card
+        assert kw in data.get("notes", ""), (cid, data.get("notes"))
+        assert "0 次" in data.get("notes", ""), cid   # 运行次数如实写明
+    # 缺省目录（仓库 research/candidates/）→ 卡状态映射与上面逐条一致
+    statuses = cards_mod.candidate_statuses_by_card()
+    for card in ("H001", "H002", "H003", "H004", "H005", "H006", "H007"):
+        assert statuses.get(card) == "specimen", card
+    for v2 in ("H002-v2", "H003-v2", "H006-v2"):
+        assert statuses.get(v2) == "withdrawn", v2

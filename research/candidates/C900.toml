@@ -1,0 +1,13 @@
+# C900（标本登记，T61/D30）：H001 买入持有基准重新定位为标定样品。
+# 蓝图 v4 §6.1：六张基线（H002–H007，本登记连 H001 一并覆盖）不是经过
+# 比较挑出的研究候选，只用于校准关卡、成本模型、引擎与实盘链路；
+# 其结果只作为测量证据，不作为选方向的依据。
+id = "C900"
+title = "买入持有基准（XAUUSD H1，标定样品）"
+mechanism_class = "risk_premium"   # trend | reversal | flow_calendar | risk_premium | volatility | cross_asset | event
+status = "specimen"                # 标定样品：用于校准，不作研究候选
+symbols = ["XAUUSD"]
+holding = "H1"
+source_card = "H001"
+mechanism = "持有者承担波动与隔夜风险，赚取风险溢价与长期通胀重定价；只作一切候选策略的对照线（G2 的'对比买入持有'），不追求 alpha"
+notes = "用于校准关卡/成本/引擎/实盘链路，不作研究候选（蓝图 v4 §6.1）。正期望来自 2019–2025 金价大牛市样本期，不作为方向证据。运行须 bt --specimen（台账 actor=calibration，不进入研究轮次统计）。台账运行次数（data/research/ledger.sqlite，2026-10-27 只读查证，bt ledger stats --card H001）：3 次。"

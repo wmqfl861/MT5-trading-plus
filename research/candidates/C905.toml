@@ -1,0 +1,11 @@
+# C905（标本登记，T61/D30）：H006 纳指日内动量重新定位为标定样品。
+# 同谱系 v2 卡（H006-v2）已撤回，见 C909。
+id = "C905"
+title = "纳指日内动量（USTEC M5，标定样品）"
+mechanism_class = "flow_calendar"
+status = "specimen"
+symbols = ["USTEC"]
+holding = "M5"                      # 日内持仓——同受成本结论约束
+source_card = "H006"
+mechanism = "收盘前的 MOC/再平衡执行盘按当日已确立方向增减敞口，尾盘延续开盘方向（Gao et al. 2018 market intraday momentum）"
+notes = "用于校准关卡/成本/引擎/实盘链路，不作研究候选（蓝图 v4 §6.1）。运行须 bt --specimen（actor=calibration，不进入研究轮次统计）。台账运行次数（2026-10-27 只读查证）：25 次。"

@@ -9,6 +9,11 @@
         --strategy mt5quant.strategies.library.buy_hold:BuyHold --gates G0,G1,G2,G3,G4
 
 约定：
+- 撤回与标定样品（T61/D30）：research/candidates/ 候选登记里
+  status=withdrawn 的卡（source_card 指向卡 id，如 H002-v2/H003-v2/
+  H006-v2）拒绝 screen/gate；status=specimen 的标定样品卡（H001–H007）
+  必须显式 --specimen 运行且台账 actor=calibration（不进入研究轮次
+  统计），--specimen 用于非样品卡 → 拒绝（cards.candidate_statuses_by_card）。
 - 先卡后测：卡文件必须已提交到 git、工作区干净（git status --porcelain 为空，
   探针 P6），且最后提交时间早于该卡（id+version，按卡文件判定）在台账中的
   首次运行（cards.ensure_card_precedes_run）；未提交/脏文件/事后改动 →
@@ -196,6 +201,47 @@ def _card_path(value: str, cards_dir: Path) -> Path:
     if value.lower().endswith(".toml"):
         return Path(value)
     return cards_dir / f"{value}.toml"
+
+
+def _candidate_statuses(cards_dir: Path) -> dict[str, str]:
+    """T61/D30：候选登记表（research/candidates/，--cards-dir 的兄弟目录）。"""
+    return cards.candidate_statuses_by_card(Path(cards_dir).parent / "candidates")
+
+
+def _enforce_candidate_status(args, card) -> str | None:
+    """T61/D30：按候选登记约束卡的运行，返回本次运行的台账 actor。
+
+    - status=withdrawn（撤回卡，如 H002-v2/H003-v2/H006-v2）→ 拒绝运行：
+      打印原因（含 withdrawn）并返回 None——撤回的卡不再产生任何 runs；
+    - status=specimen（标定样品卡，H001–H007）→ 必须 --specimen 才运行，
+      且 actor 强制 calibration（蓝图 v4 §6.1：样品只用于校准关卡/成本/
+      引擎/实盘链路，不作研究候选，不进入研究轮次统计）；
+    - --specimen 用于非样品卡 → 拒绝（标定通道不能给研究卡统计逃逸）；
+    - 无登记（普通研究卡、不带 --specimen）→ 原样返回 --actor。
+    """
+    status = _candidate_statuses(Path(args.cards_dir)).get(card.id)
+    if status == cards.WITHDRAWN:
+        print(f"✗ 卡 {card.id} 已撤回（status=withdrawn，T61/D30）——候选"
+              f"登记 research/candidates/ 记录了撤回理由，撤回的卡不再"
+              "运行；同谱系新版本须作为新候选登记、过预筛并列入轮次"
+              "（蓝图 v4 §6.2）")
+        return None
+    if status == cards.SPECIMEN:
+        if not args.specimen:
+            print(f"✗ 卡 {card.id} 是标定样品（status=specimen，T61/D30）"
+                  "——用于校准关卡/成本/引擎/实盘链路，不作研究候选；"
+                  "运行必须显式 --specimen（台账记 actor=calibration，"
+                  "不进入研究轮次统计）")
+            return None
+        print(f"— 标定样品运行（T61/D30）：{card.id}，台账 actor=calibration，"
+              "不进入研究轮次统计")
+        return "calibration"
+    if args.specimen:
+        print(f"✗ --specimen 只用于 status=specimen 的标定样品卡（T61/D30）"
+              f"；卡 {card.id} 不是标定样品——标定通道（actor=calibration，"
+              "不进研究统计）不能用于研究卡")
+        return None
+    return args.actor
 
 
 def _check_card_lineage(card, source: str) -> str | None:
@@ -484,6 +530,10 @@ def cmd_screen(args) -> int:
         return 1
     if card.migration_hint:
         print(f"⚠ 迁移提示：{card.migration_hint}")
+    # T61/D30：撤回卡拒绝运行；标定样品卡须 --specimen 且 actor=calibration
+    actor = _enforce_candidate_status(args, card)
+    if actor is None:
+        return 1
 
     # T38/D24：数据根解析 + 守卫（主库须显式 --main-store；缺省研究库须存在）
     try:
@@ -496,7 +546,8 @@ def cmd_screen(args) -> int:
     if research_mode:
         print(f"— 研究库模式（T27/H3；T38/D24 起为缺省）：data_root={data_root}"
               f"（无 tick，成本经缓存文件；台账 {ledger_path}）")
-    actor = args.actor    # R6/C6：--ops-ack 已在入口拒绝，研究命令 actor 恒为原值
+    # R6/C6：--ops-ack 已在入口拒绝，研究命令 actor 恒为原值
+    # （T61：标定样品卡例外——actor 已在候选状态守卫里定为 calibration）
     with Ledger(ledger_path) as ledger:
         # 先卡后测：未提交 / 工作区脏（P6）/ 提交晚于该卡文件首次运行 →
         # 拒绝（不产生任何 runs）
@@ -653,6 +704,10 @@ def cmd_gate(args) -> int:
         return 1
     if card.migration_hint:
         print(f"⚠ 迁移提示：{card.migration_hint}")
+    # T61/D30：撤回卡拒绝运行；标定样品卡须 --specimen 且 actor=calibration
+    actor = _enforce_candidate_status(args, card)
+    if actor is None:
+        return 1
     # 门槛冻结核对：sha256 与冻结值不符 → 拒绝运行（不产生任何 runs）
     try:
         cfg, gsha = vgate.load_gates()
@@ -693,7 +748,8 @@ def cmd_gate(args) -> int:
               "主库授权与锁箱批准协议下管理，据此登记的 G5 结果不可信）；"
               "须 --main-store（缺省 data）+ --approve 运行")
         return 1
-    actor = args.actor    # R6/C6：--ops-ack 已在入口拒绝，研究命令 actor 恒为原值
+    # R6/C6：--ops-ack 已在入口拒绝，研究命令 actor 恒为原值
+    # （T61：标定样品卡例外——actor 已在候选状态守卫里定为 calibration）
     with Ledger(ledger_path) as ledger:
         committed = cards.committed_at(path)
         try:
@@ -1028,6 +1084,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_screen.add_argument("--spread-fraction", type=float, default=0.1)
     p_screen.add_argument("--commission", type=float, default=0.0)
     p_screen.add_argument("--actor", default="bt-screen", help="台账 actor 字段")
+    p_screen.add_argument("--specimen", action="store_true",
+                          help="标定样品卡（status=specimen，T61/D30）的运行"
+                               "开关：样品卡必须显式给出（否则拒绝），台账记"
+                               " actor=calibration，不进入研究轮次统计；"
+                               "非样品卡给出则拒绝")
     p_screen.set_defaults(func=cmd_screen)
 
     p_gate = sub.add_parser("gate", help="关卡 G0–G5：跑关卡并写 gates 表")
@@ -1076,6 +1137,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_gate.add_argument("--spread-fraction", type=float, default=0.1)
     p_gate.add_argument("--commission", type=float, default=0.0)
     p_gate.add_argument("--actor", default="bt-gate", help="台账 actor 字段")
+    p_gate.add_argument("--specimen", action="store_true",
+                        help="标定样品卡（status=specimen，T61/D30）的运行"
+                             "开关：样品卡必须显式给出（否则拒绝），台账记"
+                             " actor=calibration，不进入研究轮次统计；"
+                             "非样品卡给出则拒绝")
     p_gate.add_argument("--out", default=None, help="关卡报告 Markdown 落盘路径")
     p_gate.set_defaults(func=cmd_gate)
 

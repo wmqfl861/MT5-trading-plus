@@ -1,0 +1,12 @@
+# C901（标本登记，T61/D30）：H002 唐奇安通道突破重新定位为标定样品。
+# 蓝图 v4 §6.1：样本期含金价大牛市，正期望不算候选证据；时间序列动量的
+# 发表后证据偏负面（Huang et al. 2020：逐资产几乎没有证据）。
+id = "C901"
+title = "唐奇安通道突破（XAUUSD+BTCUSD H1，标定样品）"
+mechanism_class = "trend"
+status = "specimen"
+symbols = ["XAUUSD", "BTCUSD"]
+holding = "H1"
+source_card = "H002"
+mechanism = "趋势后期才入场/离场的慢资金在通道边界被系统性触发，breakout 后订单流延续方向；同谱系 v2 卡（H002-v2）已撤回，见 C907"
+notes = "用于校准关卡/成本/引擎/实盘链路，不作研究候选（蓝图 v4 §6.1）。XAUUSD 腿正期望属金价大牛市样本期，不作为方向证据；发表后证据偏负面（Huang et al. 2020 时间序列动量逐资产几乎没有证据）。运行须 bt --specimen（actor=calibration，不进入研究轮次统计）。台账运行次数（2026-10-27 只读查证）：97 次。"

@@ -585,3 +585,18 @@ def test_readme_t38_default_research_store():
     assert "--ops-ack" in text, "README 缺锁箱期运维豁免说明"
     assert "缺省" in text and "data_research" in text, \
         "README 缺'缺省即研究库'的说明"
+
+
+# ---------------- T61（D30）：新版本路径改写（候选登记 → 轮次） ----------------
+
+
+def test_research_rules_new_version_requires_candidate_registration():
+    """T61/D30：研究规则删去"审查否决 → 同谱系新建 v2 回到第 2 步"的默认
+    路径——新版本须作为候选登记并列入研究轮次（蓝图 v4 §6.2）。"""
+    text = RESEARCH_RULES.read_text(encoding="utf-8")
+    # 旧默认路径（否决后直接回到写卡步骤）必须已删
+    assert "回到第 2 步" not in text, \
+        "研究规则仍保留'否决 → 新建 v2 → 回到写卡'的旧默认路径（T61/D30 应删）"
+    # 新路径：候选登记 + 预筛 + 轮次，引用蓝图 v4 §6.2
+    for kw in ("候选登记", "轮次", "蓝图 v4 §6.2"):
+        assert kw in text, f"研究规则缺新版本路径条款：{kw}"

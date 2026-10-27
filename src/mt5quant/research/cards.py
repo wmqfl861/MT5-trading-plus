@@ -464,6 +464,65 @@ def ensure_strategy_matches(card: Card, strategy_ref: str) -> None:
             "试验；旧卡请在迁移到 v2 时补 strategy 字段）")
 
 
+# ------------------------------------------- 候选登记（T61/D30；T62 迁移附录 C）
+
+# 附录 C 的 status 枚举 + T61 的 specimen（标定样品：用于校准关卡/成本/
+# 引擎/实盘链路，不作研究候选，蓝图 v4 §6.1）
+CANDIDATE_STATUSES = ("registered", "screened_pass", "screened_fail",
+                      "waiting_data", "withdrawn", "in_round", "specimen")
+
+# 撤回登记（status=withdrawn）约束的卡：bt screen/gate 一律拒绝
+WITHDRAWN = "withdrawn"
+# 标定样品登记（status=specimen）约束的卡：须 --specimen 且 actor=calibration
+SPECIMEN = "specimen"
+
+
+def candidate_statuses_by_card(candidates_dir=None) -> dict[str, str]:
+    """扫 research/candidates/*.toml，返回 source_card -> status 映射。
+
+    T61/D30 的**最小实现**（只认 id/status/source_card 三个字段；T62 迁移
+    到蓝图附录 C 的完整装载器——mechanism_class/literature 等届时再校验）：
+
+    - 目录不存在 → 空映射（未登记任何候选的仓库/测试 tmp 不受影响）；
+    - 无 source_card 的登记（普通研究候选，如 C001 月末效应）不参与映射、
+      不报错——它们不约束任何已有卡；
+    - status 不在 CANDIDATE_STATUSES 枚举内 → CardError（fail-fast：登记
+      表是撤回/样品运行约束的数据源，坏文件不能静默跳过）；
+    - 同一 source_card 出现不同 status → CardError（状态冲突须人工裁决，
+      不能随机取一个）。
+    """
+    if candidates_dir is None:
+        candidates_dir = (Path(__file__).resolve().parents[3]
+                          / "research" / "candidates")
+    d = Path(candidates_dir)
+    if not d.is_dir():
+        return {}
+    out: dict[str, str] = {}
+    for p in sorted(d.glob("*.toml")):
+        try:
+            with open(p, "rb") as f:
+                data = tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            raise CardError(f"{p}：TOML 解析失败：{e}") from e
+        if not isinstance(data, dict):
+            raise CardError(f"{p}：候选登记必须是 TOML 表")
+        card = data.get("source_card")
+        if not isinstance(card, str) or not card.strip():
+            continue                    # 普通研究候选：不约束已有卡
+        status = data.get("status")
+        if status not in CANDIDATE_STATUSES:
+            raise CardError(
+                f"{p}：status {status!r} 不在枚举 {list(CANDIDATE_STATUSES)} "
+                "内（登记表是撤回/样品运行约束的数据源，坏文件不能静默跳过）")
+        known = out.get(card)
+        if known is not None and known != status:
+            raise CardError(
+                f"{p}：卡 {card} 的登记状态冲突——已是 {known!r}，本文件写 "
+                f"{status!r}；须人工裁决后改登记，不能随机取一个")
+        out[card] = status
+    return out
+
+
 # ------------------------------------------------------- 代码指纹（T37/H3/D23）
 
 _LIBRARY_PKG = "mt5quant.strategies.library"

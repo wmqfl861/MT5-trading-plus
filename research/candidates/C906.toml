@@ -1,0 +1,12 @@
+# C906（标本登记，T61/D30）：H007 波动率目标多头重新定位为标定样品。
+# 蓝图 v4 §6.1：正期望不算候选证据——金价大牛市样本期；波动率管理的
+# 发表后证据偏负面（Cederburg et al. 2020：实时样本外一般不如原组合）。
+id = "C906"
+title = "波动率目标多头（XAUUSD H1，标定样品）"
+mechanism_class = "volatility"
+status = "specimen"
+symbols = ["XAUUSD"]
+holding = "H1"
+source_card = "H007"
+mechanism = "波动聚集 + 杠杆约束：高波动期风险溢价不足以补偿尾部风险，降低高波动期敞口改善组合形状（Moreira & Muir 2017）"
+notes = "用于校准关卡/成本/引擎/实盘链路，不作研究候选（蓝图 v4 §6.1）。正期望属金价大牛市样本期，不作为方向证据；发表后证据偏负面（Cederburg et al. 2020）。运行须 bt --specimen（actor=calibration，不进入研究轮次统计）。台账运行次数（2026-10-27 只读查证）：65 次。"

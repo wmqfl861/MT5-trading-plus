@@ -601,3 +601,51 @@ def test_ensure_strategy_clean_fail_closed_on_git_error(tmp_path):
 def test_ensure_strategy_clean_real_repo_library_strategy():
     """只读探测：本仓策略库文件已提交且干净 → 通过（bt/回测运行的前提）。"""
     cards.ensure_strategy_clean(f"{_LIB}.buy_hold:BuyHold", _repo_root())
+
+
+# ------------------------------------------------- T61（D30）：候选登记最小装载
+
+def test_candidate_statuses_by_card_minimal_loader(tmp_path):
+    """T61/D30：candidate_statuses_by_card（T62 迁移到蓝图附录 C 完整装载器
+    前的最小实现）——source_card -> status 映射；目录缺失 → 空；非法 status
+    或同卡状态冲突 → CardError；无 source_card 的登记（普通研究候选）不参与
+    映射、不报错。"""
+    cdir = tmp_path / "candidates"
+    cdir.mkdir()
+    # 目录缺失 → 空映射（未登记候选的仓库/测试 tmp 仍可用）
+    assert cards.candidate_statuses_by_card(tmp_path / "nope") == {}
+    (cdir / "C900.toml").write_text(
+        'id = "C900"\nstatus = "specimen"\nsource_card = "H001"\n',
+        encoding="utf-8")
+    (cdir / "C907.toml").write_text(
+        'id = "C907"\nstatus = "withdrawn"\nsource_card = "H002-v2"\n',
+        encoding="utf-8")
+    # 普通研究候选（无 source_card）：不参与映射、不报错
+    (cdir / "C001.toml").write_text(
+        'id = "C001"\nstatus = "registered"\n', encoding="utf-8")
+    m = cards.candidate_statuses_by_card(cdir)
+    assert m == {"H001": "specimen", "H002-v2": "withdrawn"}
+    # 同卡同状态（重复登记）→ 幂等；同卡不同状态 → 冲突报错
+    (cdir / "C908.toml").write_text(
+        'id = "C908"\nstatus = "withdrawn"\nsource_card = "H002-v2"\n',
+        encoding="utf-8")
+    assert cards.candidate_statuses_by_card(cdir) == m
+    (cdir / "C910.toml").write_text(
+        'id = "C910"\nstatus = "specimen"\nsource_card = "H002-v2"\n',
+        encoding="utf-8")
+    with pytest.raises(cards.CardError, match="冲突"):
+        cards.candidate_statuses_by_card(cdir)
+    # 非法 status → fail-fast（登记表是撤回/样品约束的数据源）
+    (cdir / "C911.toml").write_text(
+        'id = "C911"\nstatus = "zombie"\nsource_card = "H003"\n',
+        encoding="utf-8")
+    with pytest.raises(cards.CardError, match="status"):
+        cards.candidate_statuses_by_card(cdir)
+
+
+def test_candidate_statuses_by_card_default_repo_dir():
+    """缺省目录 = 仓库 research/candidates/（T61 登记 C900–C909 后非空，
+    H001–H007 为 specimen、三张 v2 卡为 withdrawn）。"""
+    m = cards.candidate_statuses_by_card()
+    assert m.get("H001") == "specimen"
+    assert m.get("H002-v2") == "withdrawn"

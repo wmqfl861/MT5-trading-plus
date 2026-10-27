@@ -1,0 +1,10 @@
+# C903（标本登记，T61/D30）：H004 伦敦时段突破亚盘区间重新定位为标定样品。
+id = "C903"
+title = "伦敦时段突破亚盘区间（EURUSD+XAUUSD M15，标定样品）"
+mechanism_class = "flow_calendar"
+status = "specimen"
+symbols = ["EURUSD", "XAUUSD"]
+holding = "M15"                     # 日内持仓——同受成本结论约束
+source_card = "H004"
+mechanism = "伦敦定盘/企业对冲与欧洲基金在开盘集中执行，薄流动性亚盘区间内的止损单与期权障碍位成为大额指令流的目标价位"
+notes = "用于校准关卡/成本/引擎/实盘链路，不作研究候选（蓝图 v4 §6.1）。运行须 bt --specimen（actor=calibration，不进入研究轮次统计）。台账运行次数（2026-10-27 只读查证）：65 次。"
