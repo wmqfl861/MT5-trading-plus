@@ -161,12 +161,8 @@ def precheck(candidate, *, data_root, cost_model, research_years: dict[str, floa
 - **关闭轮次**：`bt round close R1` 生成 `docs/research/round-R1-<日期>.md` 骨架：
   - 列出本轮全部运行（含失败与被拒），以及按 `advance_rule` 的判定；
   - 关闭后该轮不能再运行。
-- [ ] 失败测试先行：
-  - 未提交的轮次文件不能开启；
-  - 卡不在轮次内被拒；
-  - 超预算被拒；
-  - 关闭后再运行被拒；
-  - 轮次记录在台账哈希链内。
+- [x] 全部完成（b758eed→0c9799f）：独立成果审核 60 项端到端检查全过（真实 CLI+临时 git 仓库：未提交拒/候选非 pass 拒/三变体轮次拒/超预算拒/超锁箱拒/关闭后拒/rounds 链篡改检出）；与 T61 协同（withdrawn 先拒、specimen actor=calibration 不入轮次统计）；d96c523 锚定重放纪律沿用；全量 1903 绿 CI 绿。生产台账已迁移+重锚（T63b 准入路径，acd3aa4 注记审计链）。
+  - 追加（审核观察 1）：D16"每轮≤1 次"目前靠 approved_by 把关非机器强制——待用户口径表态。
 
 ## T67：外部数据接入（D36，铁律 19）
 
@@ -321,10 +317,7 @@ def randomize_event_times(events, trading_days, *, seed: int) -> list[EventWindo
 - **Yahoo**：从适配器的可选来源里移除。
 - **Dukascopy**（可选）：在用户网络下测试接通；接通后先做条款核对与一致性核对，再交审核会话。
 - **USTEC 口径**：报告写明 FRED 指数收盘（纽约 16:00）与券商差价合约日线（纽约 17:00 结算）的差异。事件窗口用指数收盘定义时，实盘执行按差价合约在 16:00 前后成交，并在候选登记里写清。
-- [ ] 失败测试先行：
-  - 未批准来源在 `--include-ext` 下被拒；
-  - manifest 缺使用限定 → 拒绝导出；
-  - 合成数据上，逐年口径检测能识别"固定美东"与"欧盟日历"两种规则。
+- [x] 全部完成（84b5c9a+P3/P4 修正 c1623b2）：独立成果审核通过（白名单实测拒 6 个 histdata 序列、cutoff 纪律核对、条款核查独立抽查印证无 Terms 页、合成未测年份 2019/2022 攻击测试判别真实、9 失败测试红→绿）；实际导出 fred USTEC 39.8 年+cdd BTCUSD 10.9 年入研究库；HistData 维持不批准（原文存 data/ext/terms）。
 
 ---
 
