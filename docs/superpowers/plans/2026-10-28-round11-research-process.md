@@ -59,6 +59,16 @@
 | 9 | T68 首轮候选登记与 R1 预注册草案 | M | T62、T63、T65、T66、T67 | 首轮选题 |
 | 10 | T69 规则文档与权限 | S | 每阶段 | P6 规则对齐 |
 
+**第十二轮审核增补**（2026-10-27，见 `docs/reviews/2026-10-27-review-round12.md`）：剩余 H 线任务按下面的顺序做。P 线计划的"总执行顺序"里，把 T79、T81 插在 T63 之前，T80 与 T64 同批。
+
+| 顺序 | 任务 | 规模 | 依赖 | 解决的问题 |
+| --- | --- | --- | --- | --- |
+| a | T79 质检长缺口修复与主库缺口普查 | M | — | 第十二轮 G1（两条线的数据都受影响） |
+| b | T81 外部数据来源结论落地 | S | — | D36 结论、G5 |
+| c | T63 研究轮次预注册 | M | T62 | D32、G6 |
+| d | T64 + T80 项目级 N 与预筛加固 | M | T63 | D33、G2、G3、G4 |
+| e | T66 → T65 → T68 | — | 见上表 | 批准点不变 |
+
 规模按以往节奏估计，仅供排序：S ≈ 半个工作日，M ≈ 1 个工作日，L ≈ 2 个工作日及以上。
 
 ---
@@ -70,7 +80,7 @@
 - [x] **阶段 F 启动窗口**：已决定——按提案建议，2026-10-28 开盘后启动，连续 10 个交易日（约至 11-10），每天最多一项演练（蓝图 v4 §8）。
 - [x] **D16 锁箱预算**：已决定——本锁箱最多 3 次 G5，每个研究轮次最多 1 次，H 线与 P 线共用（蓝图 v4 §8）。
 - [x] **D33–D35 原则同意**：已同意（蓝图 v4 §8）。最终批准在 T65、T66 的标定报告出来之后，由审核会话按报告中预先写定的选择规则确认。
-- [x] **外部数据源规则**：已决定——只用免费、条款允许个人研究使用的来源，不买付费数据，条款不明的不用，原始数据不进公开仓库（蓝图 v4 §8 D36）。T67 的来源清单交审核会话确认。
+- [x] **外部数据源规则**：已决定——只用免费、条款允许个人研究使用的来源，不买付费数据，条款不明的不用，原始数据不进公开仓库（蓝图 v4 §8 D36）。T67 的来源清单交审核会话确认。**审核结论（第十二轮）**：FRED、Bitstamp 批准；HistData 暂不批准（待条款核实）；Yahoo 不批准；Dukascopy 原则可用、当前不可达——落地见 T81。
 - [ ] **账户隔夜费状态**：在 Exness 个人区确认模拟盘账户是否为 swap-free；将来实盘打算用的账户类型。
 - [ ] **沿用的用户事项**：S1 清单、ACL 与分支保护、MT5 策略测试器对账。
 
@@ -182,7 +192,7 @@ def precheck(candidate, *, data_root, cost_model, research_years: dict[str, floa
 
 **Files:** `src/mt5quant/research/ledger.py`、`scripts/bt.py`、`src/mt5quant/validation/gates.py`；测试。
 
-- **新增口径**：`stats()` 新增 `project_n_dedup_research`，只计研究轮次内的运行，排除 `actor=calibration/ops`。
+- **新增口径**：`stats()` 新增 `project_n_dedup_research`，只计研究轮次内的运行，H 线与 P 线合并计算（D16/P 线 D38 共用）；排除标定与运维运行。排除依据是 `bt` 写入台账的运行类别字段，不看 `--actor` 文本（第十二轮 G4，见 T80）。
 - **G4 取数**：G4 的 N 与试验夏普取自 `dsr_trial_scope` 指定的范围（`family` | `project`）。
 - **缺省不变**：现行 `gates.toml` 无此键，缺省仍按 `family`，保持冻结语义；`gates-v3.toml` 里写 `project`。
 - **报告**：关卡报告同时列出谱系、轮次、项目三种 N。
@@ -262,6 +272,59 @@ def randomize_event_times(events, trading_days, *, seed: int) -> list[EventWindo
   - 守护测试覆盖以上三种情形。
 - [ ] **README**：指向本计划，更新当前禁止事项。
 - [ ] **阶段结束**：每完成一个阶段，更新蓝图 §2（四级证据如实），并重跑 `2026-10-25-round5-probes.py` 与 `2026-10-27-round11-power.py`，把输出贴进提交说明。
+- [ ] **管理员路径**（第十二轮 G7）：在 `docs/p6/permissions.md` 写明管理员与审核会话的文档如何进入 main，避免 `research-allowlist` 红灯常态化。可选做法：管理员文档直推 main，或用经用户批准的 PR 标签豁免。
+
+## T79：质检长缺口修复与主库缺口普查（第十二轮 G1）
+
+**Files:** `src/mt5data/sessions.py`（`gap_is_weekend`）、`src/mt5data/quality.py`；新建 `scripts/scan_gaps.py`；测试；报告 `docs/research/data-gaps-<日期>.md`。
+
+- **改判定**：缺口只有在"与周末窗口基本重合"时才算 `weekend`。具体条件：缺口起点不早于周五收盘前一根 bar，终点不晚于周日开盘后一根 bar（按周期换算，夏令时由现有窗口函数处理）。超出的部分按其余规则分类；跨越多个周末的长缺口报为 `unexpected`，或新增 `long_gap` 类别。
+- **普查**：对主库与研究库全部 品种 × 周期 跑一遍，列出所有 `unexpected` 与 `long_gap`，并写明处理方式：
+  - 能从终端补的：用现有下载脚本补齐，补后复跑质检；
+  - 补不了的：写进序列 `meta.json` 的 `known_gaps`。研究工具（按年分段、walk-forward、事件研究）读到已知缺口时，在报告里注明该窗口样本不完整。
+- **EURUSD 2021-06**：优先处理这段 27 天缺口，写明是补齐了还是登记为已知缺口。
+- [ ] 失败测试先行：
+  - 探针 `docs/reviews/probes/2026-10-27-round12-gap-probe.py` 的场景——27 天缺口不得归为 `weekend`；
+  - 正常周末（含夏令时切换周 49 小时）仍归为 `weekend`；
+  - 周五提前收盘与周日晚开的常规偏差不误报；
+  - `known_gaps` 能被按年分段与事件研究读到。
+
+## T80：预筛加固与运行类别（第十二轮 G2、G3、G4；与 T64 同批）
+
+**Files:** `src/mt5quant/research/candidates.py`、`src/mt5quant/research/ledger.py`、`scripts/bt.py`；测试。
+
+- **隐含夏普（G2）**：
+  - 工具从研究库计算该品种在持仓长度上的无条件收益波动 σ（随机时点抽样，与候选的信号无关，属于品种性质）；
+  - 隐含夏普 =（声明每事件毛收益 − 事前来回成本）÷ σ × √（每年事件数）；
+  - 检验力取声明夏普与隐含夏普中较小的那个；两者与 σ 的计算口径都写进 `C###.precheck.json`。
+- **外部数据年数（G3）**：`coverage_years` 合并研究库里已批准的外部序列（`data_research/ext/<来源>/<品种>/<周期>/`），按序列取最长连续覆盖；precheck JSON 逐段列出来源与年数。未批准来源（如 HistData）不计入。
+- **运行类别（G4）**：
+  - `bt` 拒绝 CLI 传入保留的 actor 名（`calibration`、`ops`、`migration`）；
+  - 台账 `runs` 新增 `run_class`（`research` | `calibration` | `ops` | `migration`），由 `bt` 按候选状态与轮次写入，进入哈希链；
+  - T64 的研究 N 只按 `run_class = research` 计数。
+- [ ] 失败测试先行：
+  - 声明夏普 1.5、但毛收益与成本隐含夏普 0.3 → 检验力按 0.3 算；
+  - 已批准外部序列使研究年数增加，未批准来源不计入；
+  - `--actor calibration` 被拒；
+  - 样品卡运行的 `run_class = calibration`；
+  - 旧台账迁移后 `run_class` 按 actor 推断，并记一行迁移。
+
+## T81：外部数据来源结论落地（D36、第十二轮 G5）
+
+**Files:** `scripts/fetch_ext_data.py`、`scripts/export_research_store.py`、`src/mt5data/ext/`；`docs/research/ext-data-2026-10-27.md`（增补节）；测试。
+
+- **批准的来源**：FRED NASDAQ100 与 Bitstamp（CryptoDataDownload）日线导入研究库（`--include-ext` 只对这两个来源开启）。manifest 写明使用限定：只作研究用途、不再分发。
+- **HistData**：在 histdata.com 查找明确的使用条款（下载页、FAQ、页脚）。原文与查阅日期存到本地 `data/ext/terms/`（不入库），报告里引用。
+  - 找到允许个人研究使用的明文 → 交审核会话复核后才启用；
+  - 找不到 → 不进研究库，已下载样本只保留作一致性核对。
+- **逐年时间口径验证**（为 HistData 早年文件准备，G5）：用市场结构锚点逐年核对标签口径，规则写进 `consistency.py`。锚点是外汇每周开盘在纽约周日 17:00、每日换日在纽约 17:00。口径与 2020–2021 实测规则不一致的年份，单独登记，不得套用同一转换。
+- **Yahoo**：从适配器的可选来源里移除。
+- **Dukascopy**（可选）：在用户网络下测试接通；接通后先做条款核对与一致性核对，再交审核会话。
+- **USTEC 口径**：报告写明 FRED 指数收盘（纽约 16:00）与券商差价合约日线（纽约 17:00 结算）的差异。事件窗口用指数收盘定义时，实盘执行按差价合约在 16:00 前后成交，并在候选登记里写清。
+- [ ] 失败测试先行：
+  - 未批准来源在 `--include-ext` 下被拒；
+  - manifest 缺使用限定 → 拒绝导出；
+  - 合成数据上，逐年口径检测能识别"固定美东"与"欧盟日历"两种规则。
 
 ---
 
