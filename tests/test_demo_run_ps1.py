@@ -54,17 +54,20 @@ volume_lots = 0.02
 def run_ps1(*args: str, timeout: float = 120.0) -> subprocess.CompletedProcess:
     """powershell 跑脚本（拒绝路径/PrecheckOnly，均无副作用）。
 
-    经 -Command 包一层强制 [Console]::OutputEncoding=UTF-8：PS 5.1 管道
-    输出缺省取系统 OEM 代码页，CI（windows-latest）上中文断言会因转码
-    假红；-File 无法注入编码设置。注意 -Command 上下文里带引号的
-    '-Mode' 会被当作位置实参——参数名（-Xxx 形式）不加引号原样传递，
-    其余值单引号转义。"""
+    经 -Command 包一层设置 [Console]::OutputEncoding=UTF-8：PS 5.1 管道
+    输出缺省取系统 OEM 代码页，会把中文输出转码。**try/catch 包裹**——
+    CI 运行器是无控制台会话，[Console] 句柄无效时赋值会抛异常导致整个
+    -Command 失败（stdout 全空）；此时回退默认编码，断言用的都是 ASCII
+    标记（PaperSoak/Demo/-Mode/runner/<magic>/risk_fraction 等），任何
+    代码页下都可读。参数名（-Xxx 形式）不加引号（-Command 上下文里带
+    引号的 '-Mode' 会被当作位置实参）。"""
     def _q(s: str) -> str:
         if s.startswith("-") and all(c.isalnum() or c == "-" for c in s):
             return s
         return "'" + s.replace("'", "''") + "'"
-    inner = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; & " + \
-        _q(str(SCRIPT)) + " " + " ".join(_q(a) for a in args)
+    inner = ("try { [Console]::OutputEncoding=[Text.Encoding]::UTF8 } "
+             "catch { }; & " + _q(str(SCRIPT)) + " "
+             + " ".join(_q(a) for a in args))
     cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
            "-Command", inner]
     return subprocess.run(cmd, capture_output=True, timeout=timeout)
@@ -72,6 +75,14 @@ def run_ps1(*args: str, timeout: float = 120.0) -> subprocess.CompletedProcess:
 
 def out_text(proc: subprocess.CompletedProcess) -> str:
     return (proc.stdout or b"").decode("utf-8", errors="replace")
+
+
+def _diag(proc: subprocess.CompletedProcess) -> str:
+    """断言失败时的诊断文本：stdout + stderr 尾部（CI 无控制台/路径差异
+    的报错只在 stderr，否则注解里只剩 'AssertionError:'）。"""
+    err = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+    tail = ("\n[stderr] " + err[-600:]) if err else ""
+    return f"rc={proc.returncode}\n{out_text(proc)}{tail}"
 
 
 @pytest.fixture(autouse=True)
@@ -182,7 +193,7 @@ def test_precheck_only_lists_alive_runner_skip(tmp_path):
     proc = run_ps1("-Mode", "PaperSoak", "-ConfigDir", str(cfg_dir),
                    "-LogDir", str(log_dir), *precheck_artifact_args(tmp_path),
                    "-PrecheckOnly")
-    assert proc.returncode == 0, out_text(proc)
+    assert proc.returncode == 0, _diag(proc)
     assert f"runner/{MAGIC}" in out_text(proc)      # 将被跳过（绝不并行第二份）
     assert pids.read_bytes() == before              # -PrecheckOnly 不写 pids.txt
 
@@ -199,7 +210,7 @@ def test_precheck_only_parses_legacy_pid_lines(tmp_path):
     proc = run_ps1("-Mode", "PaperSoak", "-ConfigDir", str(cfg_dir),
                    "-LogDir", str(log_dir), *precheck_artifact_args(tmp_path),
                    "-PrecheckOnly")
-    assert proc.returncode == 0, out_text(proc)
+    assert proc.returncode == 0, _diag(proc)
     assert f"runner/{MAGIC}" in out_text(proc)
 
 
@@ -217,5 +228,5 @@ def test_dead_pid_not_treated_as_alive(tmp_path):
     proc = run_ps1("-Mode", "PaperSoak", "-ConfigDir", str(cfg_dir),
                    "-LogDir", str(log_dir), *precheck_artifact_args(tmp_path),
                    "-PrecheckOnly")
-    assert proc.returncode == 0, out_text(proc)
+    assert proc.returncode == 0, _diag(proc)
     assert f"runner/{MAGIC}" not in out_text(proc)  # 不挡启动
