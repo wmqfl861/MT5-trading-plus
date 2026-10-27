@@ -1,6 +1,8 @@
 """SignalRunner：收盘触发网格、只读已收盘 bar、窗口=lookback、SL/TP 与心跳。"""
 import json
+import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -393,3 +395,123 @@ class _ConstSignal(BaseStrategy):
 
     def generate_signals(self, bars, params):
         return pd.Series(self.signal, index=bars.index, dtype="int64")
+
+
+# ================================================================ R10/T58（C-4）
+# scripts/live_runner.py：网关调用失败后的下一次成功调用记一行
+# ``gateway_reconnected prev_failure=<kind>``（kind=失败类型）。判定只在
+# live_runner.py 内（包 gw.market 外层），不改 src/mt5live/runner.py 与 mt5gw。
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_live_runner():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "live_runner_script", REPO_ROOT / "scripts" / "live_runner.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _FakeGW:
+    """最小网关替身：market/account/trading 都指向 FakeBroker。"""
+
+    def __init__(self, broker):
+        self.market = broker
+        self.account = broker
+        self.trading = broker
+
+    def connect(self):
+        pass
+
+    def shutdown(self):
+        pass
+
+
+def _runner_config(tmp_path, *, magic: int = 777) -> str:
+    cfg = tmp_path / "live.toml"
+    cfg.write_text(f"""
+symbol = "XAUUSD"
+timeframe = "M15"
+strategy = "mt5quant.strategies.library.buy_hold:BuyHold"
+magic = {magic}
+lookback_bars = 30
+volume_lots = 0.1
+data_root = "{(tmp_path / 'data').as_posix()}"
+trigger_delay_s = 5.0
+""", encoding="utf-8")
+    return str(cfg)
+
+
+def _wire_fake_gateway(monkeypatch, mod, broker, now):
+    """替身网关 + 冻结运行器时钟（复用 T34 集成测试的装配手法）。"""
+    monkeypatch.setattr("mt5gw.MT5Gateway.from_config_file",
+                        staticmethod(lambda p: _FakeGW(broker)))
+    monkeypatch.setattr(mod, "now_utc", lambda: now)
+
+
+def test_gateway_reconnected_line_after_failure_recovery(tmp_path, monkeypatch,
+                                                         capsys):
+    """网关失败-恢复序列：第 1 轮 bars() 抛 ConnectionError（决策异常日志、
+    记失败类型）→ 第 2 轮成功 → 恰一行 ``gateway_reconnected
+    prev_failure=ConnectionError``。"""
+    from tests.fakes_live import FakeBroker, bars_from_df, boundary_open, \
+        grid_bars
+
+    mod = load_live_runner()
+    now = datetime(2026, 10, 28, 10, 0, 7)
+    broker = FakeBroker("XAUUSD")
+    broker.set_bars("XAUUSD", "M15",
+                    bars_from_df(grid_bars(boundary_open(now), last="up")))
+    broker.quote_time = now                       # 行情新鲜（非休市）
+
+    calls = {"n": 0}
+    orig_bars = broker.bars
+
+    def flaky_bars(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ConnectionError("终端 IPC 断开")   # 第 1 轮：网关调用失败
+        return orig_bars(*a, **kw)
+
+    broker.bars = flaky_bars
+    _wire_fake_gateway(monkeypatch, mod, broker, now)
+
+    sleeps = {"n": 0}
+    real_sleep = time.sleep
+
+    def sleep_or_exit(s):
+        sleeps["n"] += 1
+        if sleeps["n"] >= 2:                       # 两轮后经中断退出主循环
+            raise KeyboardInterrupt
+        real_sleep(0)
+
+    monkeypatch.setattr(mod.time, "sleep", sleep_or_exit)
+    rc = mod.main(["--config", _runner_config(tmp_path), "--loop", "--dry-run",
+                   "--poll-interval", "0.1"])
+    assert rc == 0
+    assert calls["n"] == 2                         # 失败一次、成功一次
+    out = capsys.readouterr().out
+    assert "决策异常" in out and "ConnectionError" in out   # 失败轮如实留痕
+    assert "gateway_reconnected prev_failure=ConnectionError" in out
+    assert out.count("gateway_reconnected") == 1   # 恢复只记一行
+
+
+def test_gateway_reconnected_not_logged_without_failure(tmp_path, monkeypatch,
+                                                        capsys):
+    """无失败 → 不出现重连行（同轮成功调用不打标）。"""
+    from tests.fakes_live import FakeBroker, bars_from_df, boundary_open, \
+        grid_bars
+
+    mod = load_live_runner()
+    now = datetime(2026, 10, 28, 10, 0, 7)
+    broker = FakeBroker("XAUUSD")
+    broker.set_bars("XAUUSD", "M15",
+                    bars_from_df(grid_bars(boundary_open(now), last="up")))
+    broker.quote_time = now
+    _wire_fake_gateway(monkeypatch, mod, broker, now)
+    rc = mod.main(["--config", _runner_config(tmp_path), "--once", "--dry-run"])
+    assert rc == 0
+    assert "gateway_reconnected" not in capsys.readouterr().out

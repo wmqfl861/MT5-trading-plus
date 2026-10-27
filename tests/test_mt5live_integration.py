@@ -379,6 +379,7 @@ def test_scenario_3_daily_loss_flatten_chain(tmp_path):
     assert res.daily_loss_breached and res.flatten_written and res.halt_written
     flatten_path = os.path.join(stack.live_dir, "commands", "flatten.json")
     assert read_json(flatten_path)["command"] == "flatten_all"
+    cmd_id = read_json(flatten_path)["id"]
     assert read_json(os.path.join(stack.live_dir, "halt.json"))[
         "reason"] == "daily_loss_cap"
 
@@ -397,6 +398,12 @@ def test_scenario_3_daily_loss_flatten_chain(tmp_path):
     archived = list((Path(stack.live_dir) / "commands" / "archive").glob(
         "flatten-*.json"))
     assert archived, "flatten.json 应被归档而不是留在原地"
+    # R10/T58 C-3：自动归档删除前，指令与 ack 副本已保全在
+    # drill-archive/<command_id>/（演练证据只增不删）
+    drill_dir = Path(stack.live_dir) / "drill-archive" / cmd_id
+    assert read_json(drill_dir / "flatten.json")["id"] == cmd_id
+    drill_ack = read_json(drill_dir / f"flatten.ack-{MAGIC}")
+    assert drill_ack["id"] == cmd_id and drill_ack["magic"] == MAGIC
 
     # 停机后不再开仓
     n_orders = len(stack.broker.market_orders)
@@ -1009,6 +1016,10 @@ def test_t32_second_flatten_command_executes_after_archive(tmp_path):
     assert res2.flatten_archived
     assert not res2.flatten_written                  # 指令 1 未被重写
     assert not (cmds / f"flatten.ack-{MAGIC}").exists()   # ack 已清理（D21）
+    # R10/T58 C-3：归档删除前指令 1 + ack 副本已保全（drill-archive/<id1>/）
+    drill1 = Path(stack.live_dir) / "drill-archive" / id1
+    assert read_json(drill1 / "flatten.json")["id"] == id1
+    assert read_json(drill1 / f"flatten.ack-{MAGIC}")["id"] == id1
 
     # 运维解除停机 → 重新开仓 → 第二次日亏 → 新编号指令（P10 核心）
     os.remove(os.path.join(stack.live_dir, "halt.json"))

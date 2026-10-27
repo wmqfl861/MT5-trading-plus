@@ -14,6 +14,10 @@
 - ``archive/flatten-<id 前 8 位>-<时间戳>.json``——所有登记 magic 的
   ``ack.id == 当前指令 id`` → 归档指令并**删除这些 ack**；旧编号的 ack
   不算数（防 C3），ack 缺失/读不出按"未确认"处理（fail-closed）。
+- ``drill-archive/<command_id>/``（R10/T58 契约 C-3）——自动归档**删除**
+  指令与 ack 之前，command 与全部 ack 先复制到此处（只增不删）：演练
+  证据（指令-编号-magic 三点关联）不随归档清理丢失；复制失败 → 不归档
+  并告警（ALERT_DRILL_ARCHIVE_ERROR），下一轮重试。
 
 并发（R6/I1）：原子写经 fileio（临时文件名带 pid+uuid 唯一后缀，多写者
 不争用）；指令的"先读、再创建"（write_flatten）与"编号核对、归档挪档、
@@ -31,12 +35,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
 from mt5live.fileio import atomic_replace, file_lock, write_json_atomic
-from mt5live.monitor import iso_utc, naive_utc, parse_iso
+from mt5live.monitor import append_alert, iso_utc, naive_utc, parse_iso
 
 COMMANDS_SUBDIR = "commands"
 FLATTEN_FILE = "flatten.json"
@@ -44,9 +49,13 @@ FLATTEN_ACK_FMT = "flatten.ack-{magic}"     # 执行器确认文件（引用指�
 FLATTEN_ARCHIVE_SUBDIR = "archive"          # 全员确认后指令归档处
 FLATTEN_COMMAND = "flatten_all"
 FLATTEN_LOCK_FILE = ".flatten.lock"         # 指令创建/归档的跨进程写锁（R6/I1）
+DRILL_ARCHIVE_SUBDIR = "drill-archive"      # R10/T58（C-3）：自动归档删除前的
+#   演练证据保全处（<live_dir>/drill-archive/<command_id>/，只增不删）
 
 # 告警类别（T32；monitor 未定义的新类别，常量放本层——同 executor 先例）
 ALERT_COMMAND_UNREADABLE = "COMMAND_UNREADABLE"   # 指令文件读不出：按有指令处理
+ALERT_DRILL_ARCHIVE_ERROR = "DRILL_ARCHIVE_ERROR"  # R10/T58（C-3）：演练证据
+#   复制失败——不归档（指令与 ack 原地保留），下一轮重试
 
 
 class CommandUnreadableError(RuntimeError):
@@ -168,6 +177,23 @@ def read_ack(live_dir: str, magic: int) -> FlattenAck | None:
         return None
 
 
+def _copy_drill_evidence(live_dir: str, command_id: str) -> None:
+    """R10/T58（C-3）：把当前指令与 commands/ 下**全部** ack 复制到
+    ``<live_dir>/drill-archive/<command_id>/``（只增不删——含未登记 magic
+    的孤儿 ack 也如实保全，验收只按 command_id+magic 三点关联采信）。
+
+    live_dir 即 ``<DataDir>/live``（与既有归档路径同一推导：commands/archive
+    也在其下），不新增参数。复制失败抛 OSError（调用方决定是否归档）。"""
+    drill_dir = os.path.join(live_dir, DRILL_ARCHIVE_SUBDIR, command_id)
+    os.makedirs(drill_dir, exist_ok=True)
+    shutil.copyfile(flatten_path(live_dir),
+                    os.path.join(drill_dir, FLATTEN_FILE))
+    for name in sorted(os.listdir(_commands_dir(live_dir))):
+        if name.startswith("flatten.ack-"):
+            shutil.copyfile(os.path.join(_commands_dir(live_dir), name),
+                            os.path.join(drill_dir, name))
+
+
 def archive_if_all_acked(live_dir: str, magics: set[int],
                          now: datetime) -> bool:
     """所有登记 magic 的 ack.id == 当前指令 id → 归档指令并删除这些 ack。
@@ -175,6 +201,12 @@ def archive_if_all_acked(live_dir: str, magics: set[int],
     ack 只认**完成 ack**（R6/C1）：执行器仅在重查确认本 magic 持仓与挂单
     均清零后才写 ack，部分成交残仓轮不写——所以本函数返回 True 即"全员
     真完成全平"；残仓未平时该 magic 无 ack（或编号不匹配）→ False。
+
+    R10/T58（C-3）：归档**删除**指令与 ack 之前，先把 command 与全部 ack
+    复制到 ``drill-archive/<command_id>/``（只增不删）——演练证据（双全平
+    验收的"指令-编号-magic"三点关联）不随归档清理丢失。复制失败 → 不
+    归档（fail-closed：删除前证据必须已在）、写告警，指令与 ack 原地保留
+    供下一轮重试。
 
     任一 magic 无 ack、ack 编号不匹配（旧 id）或 ack 读不出 → False（指令
     原地保留，等执行器消费）。无登记 magic（空集）→ False（无从确认）。
@@ -189,6 +221,15 @@ def archive_if_all_acked(live_dir: str, magics: set[int],
             ack = read_ack(live_dir, magic)
             if ack is None or ack.id != cmd.id:
                 return False
+        try:
+            _copy_drill_evidence(live_dir, cmd.id)
+        except OSError as e:
+            append_alert(
+                live_dir, ALERT_DRILL_ARCHIVE_ERROR,
+                f"全平指令 {cmd.id[:8]} 演练证据复制失败"
+                f"（{type(e).__name__}: {e}）——暂不归档（指令与 ack 原地"
+                "保留），下一轮重试；请核对磁盘/权限", naive_utc(now))
+            return False
         archive_dir = os.path.join(_commands_dir(live_dir),
                                    FLATTEN_ARCHIVE_SUBDIR)
         os.makedirs(archive_dir, exist_ok=True)

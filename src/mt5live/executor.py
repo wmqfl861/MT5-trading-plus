@@ -362,8 +362,18 @@ class ExecutionAdapter:
 # - 本地下单日志 data/live/orders-<magic>.jsonl（每笔市价单一行；T33/M8
 #   起每策略各写各的、经 fileio.append_jsonl 追加——RiskGate 读全部
 #   orders-*.jsonl 作为频率滑窗数据源，兼容旧 orders.jsonl）。
+# - 成交证据流 data/live/deals-<magic>.jsonl（R10/T58 契约 C-2，同目录）：
+#   主动成交（fill_open/fill_close）与外部/保护性出场解释
+#   （external_exit，reason∈SL/TP/SO）各一行——price=成交价、
+#   decision_bar=当轮决策 bar（外部出场=检测当轮 bar 或 null）；写入
+#   失败记告警不阻断交易（fail-open 仅限此证据流）。
 
 STATE_FILE_FMT = "state-{magic}.json"
+# 成交证据流（R10/T58 契约 C-2）：deals-<magic>.jsonl 与 orders-<magic>.jsonl
+# 同目录并存——orders 仍是**请求**日志（风控频率滑窗数据源），deals 记
+# **成交**证据（主动成交 fill_open/fill_close + 外部/保护性出场解释
+# external_exit，reason/price 如实），供验收（demo_check）读取。
+DEALS_LOG_FMT = "deals-{magic}.jsonl"
 # 全平指令/确认文件（flatten.json、flatten.ack-<magic>）的读写一律经
 # mt5live.commands（T32/D21 编号协议），本层不再自带路径拼装。
 
@@ -375,9 +385,14 @@ ALERT_UNEXPECTED_RESIZE = "UNEXPECTED_RESIZE"   # 持仓期间出现加/减仓�
 #   加/减腿时兜底告警，须人工核对）
 ALERT_FLATTEN_RESIDUAL = "FLATTEN_RESIDUAL"     # C1/R6：全平部分成交残仓——
 #   不写完成 ack，下一轮继续平仓直到清零，归档在此之前不发生
+ALERT_DEALS_LOG_ERROR = "DEALS_LOG_ERROR"       # R10/T58（C-2）：deals 证据
+#   写入失败——fail-open 记告警不阻断交易（唯一允许 fail-open 的证据流）
 
 # 已解释的外部出场（服务器端保护性出场/强平）：意图可改为实际净持仓
 _EXPLAINED_REASONS = frozenset({DEAL_REASON_SL, DEAL_REASON_TP, DEAL_REASON_SO})
+# deal.reason 原值 → deals 证据行的 reason 字符串（契约 C-2："SL|TP|SO|null"）
+_DEAL_REASON_NAMES = {DEAL_REASON_SL: "SL", DEAL_REASON_TP: "TP",
+                      DEAL_REASON_SO: "SO"}
 # 平仓腿的 deal.entry（mt5gw.models.Deal；"in" 是开仓腿）
 _CLOSING_ENTRIES = frozenset({"out", "inout", "out_by"})
 
@@ -439,6 +454,9 @@ class LiveExecutor:
             live_dir, INTENT_FILE_FMT.format(magic=magic))
         self._order_log_path = os.path.join(
             live_dir, ORDER_LOG_MAGIC_FMT.format(magic=magic))
+        self._deals_log_path = os.path.join(
+            live_dir, DEALS_LOG_FMT.format(magic=magic))
+        self._decision_bar: str | None = None   # 本轮决策 bar（deals 行用）
         self._state = self._load_state()
 
     # ---- 主入口 ----
@@ -447,6 +465,11 @@ class LiveExecutor:
         """一轮：先消费 flatten 指令（每轮必查），再按决策差分下单。"""
         n = naive_utc(now if now is not None
                       else datetime.now(timezone.utc).replace(tzinfo=None))
+        # R10/T58（C-2）：deals 证据行的 decision_bar——当轮决策的信号 bar
+        # 收盘时刻（与 decision_id 后缀同源）；无决策轮（休市轮询/flatten）
+        # 为 None（external_exit 语义："检测当轮 bar 或 null"）
+        self._decision_bar = (iso_utc(decision.bar_close_time)
+                              if decision is not None else None)
 
         # 1) flatten 指令（T32/D21 编号协议）：读不出 → 按"有指令"处理并告警
         try:
@@ -933,12 +956,14 @@ class LiveExecutor:
             if hit is not None:
                 del pending[ticket]
                 explained_deals.append(str(hit.ticket))
+                self._log_external_exit_deal(hit, n)   # R10/T58 C-2
         # 2) 本轮新消失的持仓
         gone = sorted(set(known) - set(current))
         for ticket in gone:
             hit, why = self._explain_exit(ticket)
             if hit is not None:
                 explained_deals.append(str(hit.ticket))
+                self._log_external_exit_deal(hit, n)   # R10/T58 C-2
                 continue
             pending[ticket] = {
                 "dir": int(known[ticket]["dir"]),
@@ -994,3 +1019,45 @@ class LiveExecutor:
                                                else o.requested_volume),
                 "decision_id": decision_id or "-",
             })
+            # R10/T58（C-2）：主动成交证据行（price=成交价 res.deal_price、
+            # volume=成交量、decision_bar=当轮决策 bar）——与请求日志并存
+            self._log_deal(
+                n, ticket=o.ticket,
+                event="fill_open" if o.kind == "open" else "fill_close",
+                reason=None, price=o.price,
+                volume=(o.filled_volume if o.filled_volume is not None
+                        else o.requested_volume),
+                side=o.side or "")
+
+    def _log_external_exit_deal(self, deal, n: datetime) -> None:
+        """R10/T58（C-2）：外部/保护性出场解释的成交证据行——_explain_exit
+        的 deal 带 reason/price/volume/side，如实入 deals-<magic>.jsonl
+        （decision_bar=检测当轮 bar 或 null）。"""
+        self._log_deal(
+            n, ticket=deal.ticket, event="external_exit",
+            reason=_DEAL_REASON_NAMES.get(deal.reason), price=deal.price,
+            volume=deal.volume, side=deal.side)
+
+    def _log_deal(self, n: datetime, *, ticket, event: str, reason,
+                  price, volume, side) -> None:
+        """deals-<magic>.jsonl 追加一行成交证据（契约 C-2 字段逐字）。
+
+        写入一律经 fileio.append_jsonl（data/live 跨进程文件唯一写入口）。
+        失败 → 记告警（ALERT_DEALS_LOG_ERROR）后继续：fail-open 仅限此
+        证据流，交易路径不变（证据缺失可由告警发现，交易中断不可接受）。
+        """
+        try:
+            append_jsonl(self._deals_log_path, {
+                "ts": iso_utc(n), "magic": self._magic, "ticket": ticket,
+                "event": event, "reason": reason, "price": price,
+                "volume": volume, "side": side,
+                "decision_bar": self._decision_bar})
+        except Exception as exc:
+            try:
+                append_alert(
+                    self._live_dir, ALERT_DEALS_LOG_ERROR,
+                    f"magic {self._magic} deals 成交证据写入失败"
+                    f"（{type(exc).__name__}: {exc}）——fail-open 不阻断交易，"
+                    "证据缺失需人工核对", n)
+            except Exception:
+                pass    # 告警通道同坏：证据流失败绝不波及交易路径

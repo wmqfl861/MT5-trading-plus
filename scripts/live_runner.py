@@ -46,6 +46,9 @@
   文件 → 拒绝启动（不再静默关闸）；确要关闭须显式 --no-spread-gate（启动
   日志标红）。影子模式缺点差模型只标红警告（模拟成交无真实风险，全链路
   演练建议重建模型）。
+- 重连标记（R10/T58 契约 C-4）：网关调用失败后的下一次成功调用记一行
+  ``gateway_reconnected prev_failure=<kind>``（kind=失败类型）；幂等不设
+  标记——验收由 deals/orders 与决策日志推导。离线模式无网关、不记。
 """
 from __future__ import annotations
 
@@ -217,6 +220,64 @@ def paper_state_file(live_dir: str, magic: int) -> str:
     return state_file
 
 
+# ---- R10/T58（契约 C-4）：网关重连标记 ----
+
+class GatewayReconnectWatch:
+    """网关调用失败后的下一次成功调用记一行
+    ``gateway_reconnected prev_failure=<kind>``（kind=失败类型，异常类名）。
+
+    - 判定只在 live_runner.py 内：包在 ``gw.market`` 外层（quote/bars 是
+      运行器每轮必经的网关调用），不改 src/mt5live/runner.py 与 mt5gw；
+    - 只在"失败 → 成功"的跳变时打标（每次故障段恰一行）；幂等不设标记
+      ——验收（demo_check）由 deals/orders 与决策日志推导（同 bar 同
+      magic 无重复开仓请求）；
+    - 离线模式（--offline）无网关，不装配本表。
+    """
+
+    def __init__(self):
+        self.prev_failure: str | None = None
+
+    def note_failure(self, exc: BaseException) -> None:
+        self.prev_failure = type(exc).__name__
+
+    def note_success(self) -> None:
+        if self.prev_failure is None:
+            return
+        kind, self.prev_failure = self.prev_failure, None
+        print(f"[{now_utc().isoformat()}] gateway_reconnected "
+              f"prev_failure={kind}", flush=True)
+
+    def wrap_market(self, market):
+        """返回包了重连记账的行情服务替身（quote/bars 逐调用记账，
+        其余属性透传原对象）。"""
+        watch = self
+
+        class _TrackedMarket:
+            def quote(self, symbol):
+                try:
+                    q = market.quote(symbol)
+                except Exception as exc:
+                    watch.note_failure(exc)
+                    raise
+                watch.note_success()
+                return q
+
+            def bars(self, symbol, timeframe, count, *, end_pos=0):
+                try:
+                    rows = market.bars(symbol, timeframe, count,
+                                       end_pos=end_pos)
+                except Exception as exc:
+                    watch.note_failure(exc)
+                    raise
+                watch.note_success()
+                return rows
+
+            def __getattr__(self, name):
+                return getattr(market, name)
+
+        return _TrackedMarket()
+
+
 def build_executor_stack(trading, account, market, *, cfg: LiveConfig,
                          strategy, args, live_dir: str, specs_path: str,
                          gw, gate_account=None) -> LiveExecutor | None:
@@ -377,14 +438,17 @@ def main(argv=None) -> int:
         gw = MT5Gateway.from_config_file(
             find_gateway_config(args.gateway_config))
         gw.connect()
-        market = gw.market
+        # R10/T58（C-4）：行情服务包重连记账——quote/bars 每轮必经的网关
+        # 调用失败后，下一次成功调用记 gateway_reconnected 日志行
+        reconnect = GatewayReconnectWatch()
+        market = reconnect.wrap_market(gw.market)
 
         def quote_fn(symbol):            # noqa: F811 — 装配后的行情源
-            q = gw.market.quote(symbol)
+            q = market.quote(symbol)
             return q.bid, q.ask
 
         source = TerminalBarsSource(
-            gw.market, stale_quote_s=args.stale_quote_s,
+            market, stale_quote_s=args.stale_quote_s,
             max_wait_s=args.max_wait_s, clock=now_utc)
         runner = SignalRunner(
             cfg, strategy,
@@ -431,8 +495,10 @@ def main(argv=None) -> int:
             return 2
     elif not args.dry_run:
         # 实跑：执行器 + 风控闸门 + 定手数（C1/M2/M10 全套接线）
+        #（market 用包了 C-4 重连记账的替身——闸门点差检查/执行器参考价
+        #  的 quote 调用同样计入网关健康判定）
         executor = build_executor_stack(
-            gw.trading, gw.account, gw.market, cfg=cfg, strategy=strategy,
+            gw.trading, gw.account, market, cfg=cfg, strategy=strategy,
             args=args, live_dir=live_dir, specs_path=specs_path, gw=gw)
         if executor is None:
             return 2

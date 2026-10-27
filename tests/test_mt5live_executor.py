@@ -8,6 +8,7 @@ T32（D21）：全平指令编号协议的执行器消费侧——ack 引用指�
 编号则 flatten_acked 不再平仓、新编号指令再次全平。
 """
 import json
+import os
 from datetime import datetime
 
 import pytest
@@ -764,3 +765,127 @@ def test_r7_ack_without_event_binding_does_not_release(tmp_path):
     assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
                                decision_id="XAUUSD|M15|d4"),
                    NOW.replace(minute=31)).action == "open"
+
+
+# ================================================================ R10/T58（C-2）
+# deals-<magic>.jsonl 成交证据流：主动成交 fill_open/fill_close、外部/保护性
+# 出场解释 external_exit（reason/price 如实入行；写入失败不阻断交易）。
+# 契约见 docs/superpowers/plans/2026-10-27-round10-review-fixes.md §0 C-2。
+
+def _deals_lines(tmp_path) -> list[dict]:
+    """读 deals-<magic>.jsonl 全部行（文件不存在即断言失败）。"""
+    p = tmp_path / f"deals-{MAGIC}.jsonl"
+    assert p.exists(), "deals-<magic>.jsonl 证据文件应存在"
+    text = p.read_text(encoding="utf-8")
+    return [json.loads(ln) for ln in text.splitlines() if ln]
+
+
+def test_t58_fill_open_and_close_written_with_decision_bar(tmp_path):
+    """主动成交两处：开仓 fill_open（price=成交价、decision_bar=决策 bar
+    收盘时刻、reason=null）、平仓 fill_close（side=成交方向）。"""
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    d1 = mk_decision(signal=1, volume_lots=0.02,
+                     decision_id="XAUUSD|M15|d1",
+                     bar_close_time=datetime(2026, 10, 20, 18, 0))
+    assert ex.poll(d1, NOW).action == "open"
+    lines = _deals_lines(tmp_path)
+    assert len(lines) == 1                          # 只有开仓成交一行
+    rec = lines[0]
+    assert set(rec) == {"ts", "magic", "ticket", "event", "reason", "price",
+                        "volume", "side", "decision_bar"}
+    assert rec["event"] == "fill_open" and rec["reason"] is None
+    assert rec["magic"] == MAGIC
+    assert rec["price"] == pytest.approx(100.2)     # buy 按 Ask 成交
+    assert rec["volume"] == pytest.approx(0.02)
+    assert rec["side"] == "buy"
+    assert rec["ticket"] == b.positions()[0].ticket
+    assert rec["decision_bar"] == "2026-10-20T18:00:00+00:00"
+    assert rec["ts"] == "2026-10-20T18:00:00+00:00"  # 本轮时刻（iso_utc）
+
+    d2 = mk_decision(signal=0, volume_lots=None, decision_id="XAUUSD|M15|d2",
+                     bar_close_time=datetime(2026, 10, 20, 18, 15))
+    assert ex.poll(d2, NOW.replace(minute=15)).action == "close"
+    rec2 = _deals_lines(tmp_path)[1]
+    assert rec2["event"] == "fill_close" and rec2["reason"] is None
+    assert rec2["side"] == "sell"                   # 平多头 → 成交方向 sell
+    assert rec2["price"] == pytest.approx(100.0)    # buy 平仓按 Bid
+    assert rec2["volume"] == pytest.approx(0.02)
+    assert rec2["decision_bar"] == "2026-10-20T18:15:00+00:00"
+
+
+def test_t58_external_exit_written_with_reason_and_price(tmp_path):
+    """外部/保护性出场解释（_explain_exit 的 deal）：external_exit 行带
+    reason=SL、price=成交价、volume/side 如实；decision_bar=检测当轮决策 bar。"""
+    from mt5gw.models import DEAL_REASON_SL
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d1"), NOW).action == "open"
+    ticket = b.positions()[0].ticket
+    b.close_external(ticket, profit=-30.0, comment="[sl]",
+                     reason=DEAL_REASON_SL)
+
+    rr = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                             decision_id="XAUUSD|M15|d2",
+                             bar_close_time=datetime(2026, 10, 20, 18, 15)),
+                 NOW.replace(minute=15))
+    assert rr.action in ("open", "blocked_reentry")  # immediate 默认 → open
+    lines = _deals_lines(tmp_path)
+    ext = [r for r in lines if r["event"] == "external_exit"]
+    assert len(ext) == 1
+    rec = ext[0]
+    assert rec["reason"] == "SL"
+    assert rec["price"] == pytest.approx(100.2)    # close_external 记 price_current
+    assert rec["volume"] == pytest.approx(0.02)
+    assert rec["side"] == "sell"                    # 平多头的成交方向
+    assert rec["magic"] == MAGIC and rec["ticket"]  # deal ticket 如实
+    assert rec["decision_bar"] == "2026-10-20T18:15:00+00:00"  # 检测当轮 bar
+    assert any(r["event"] == "fill_open" for r in lines)       # 开仓行仍在
+
+
+def test_t58_external_exit_decision_bar_null_without_decision(tmp_path):
+    """检测轮无决策（decision=None，如休市轮询）→ external_exit 行的
+    decision_bar=null（当轮没有 bar 可引用）。"""
+    from mt5gw.models import DEAL_REASON_TP
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d1"), NOW).action == "open"
+    ticket = b.positions()[0].ticket
+    b.close_external(ticket, profit=30.0, comment="[tp]",
+                     reason=DEAL_REASON_TP)
+    rr = ex.poll(None, NOW.replace(minute=15))      # 无决策轮：外部出场照常检测
+    assert rr.action == "none"
+    ext = [r for r in _deals_lines(tmp_path) if r["event"] == "external_exit"]
+    assert len(ext) == 1 and ext[0]["reason"] == "TP"
+    assert ext[0]["decision_bar"] is None
+
+
+def test_t58_deals_write_failure_alerts_but_does_not_block(tmp_path,
+                                                           monkeypatch):
+    """C-2 fail-open 边界：deals 证据写入失败 → 记告警、交易照常（仓位真实
+    开出）；orders-<magic>.jsonl 等其他证据流不受牵连。"""
+    from mt5live import executor as executor_mod
+    from mt5live.fileio import append_jsonl as real_append
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+
+    def selective_boom(path, obj):
+        if os.path.basename(path).startswith("deals-"):
+            raise PermissionError(5, "拒绝访问")
+        return real_append(path, obj)
+
+    monkeypatch.setattr(executor_mod, "append_jsonl", selective_boom)
+    rr = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                             decision_id="XAUUSD|M15|d1"), NOW)
+    assert rr.action == "open"                      # 交易路径不被证据流失败阻断
+    assert len(b.positions()) == 1                  # 仓位真实开出
+    assert "DEALS_LOG_ERROR" in (tmp_path / "alerts.log").read_text(
+        encoding="utf-8")
+    orders_log = (tmp_path / f"orders-{MAGIC}.jsonl").read_text(
+        encoding="utf-8")
+    assert "fill" not in orders_log and '"kind": "open"' in orders_log

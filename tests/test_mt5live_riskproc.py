@@ -645,6 +645,8 @@ def test_archive_requires_all_acks_to_match_current_id(tmp_path):
     write_ack(str(live), M1, cmd.id, closed=0, now=NOW)
     assert archive_if_all_acked(str(live), {M1, M2}, NOW) is False
     assert (live / "commands" / "flatten.json").exists()
+    # 未真归档前不动 drill-archive（R10/T58 C-3：只在归档删除前保全一次）
+    assert not (live / "drill-archive").exists()
     # 全部 ack 当前 id → 归档并删除 ack
     write_ack(str(live), M2, cmd.id, closed=1, now=NOW)
     assert archive_if_all_acked(str(live), {M1, M2}, NOW) is True
@@ -653,6 +655,32 @@ def test_archive_requires_all_acks_to_match_current_id(tmp_path):
     assert not (live / "commands" / f"flatten.ack-{M2}").exists()
     archived = list((live / "commands" / "archive").glob("flatten-*.json"))
     assert archived and cmd.id[:8] in archived[0].name
+    # R10/T58 C-3：归档删除前，command 与全部 ack 已复制进
+    # drill-archive/<command_id>/（只增不删——指令与 ack 三点关联保全）
+    drill = live / "drill-archive" / cmd.id
+    assert (drill / "flatten.json").exists()
+    saved_cmd = read_json(drill / "flatten.json")
+    assert saved_cmd["command"] == "flatten_all" and saved_cmd["id"] == cmd.id
+    for magic, closed in ((M1, 0), (M2, 1)):
+        saved_ack = read_json(drill / f"flatten.ack-{magic}")
+        assert saved_ack["id"] == cmd.id and saved_ack["magic"] == magic
+        assert saved_ack["closed"] == closed
+
+
+def test_archive_drill_copy_failure_keeps_command_and_acks(tmp_path):
+    """R10/T58 C-3 fail-closed：演练证据复制失败 → 不归档（指令与 ack 原地
+    保留，删除前证据必须已在 drill-archive），写告警供下一轮重试。"""
+    live = tmp_path / "live"
+    live.mkdir()
+    cmd = write_flatten(str(live), reason="r", now=NOW)
+    write_ack(str(live), M1, cmd.id, closed=1, now=NOW)
+    # drill-archive 路径被同名文件占用 → 复制必失败（makedirs OSError）
+    (live / "drill-archive").write_text("occupied", encoding="utf-8")
+    assert archive_if_all_acked(str(live), {M1}, NOW) is False
+    assert (live / "commands" / "flatten.json").exists()
+    assert (live / "commands" / f"flatten.ack-{M1}").exists()
+    assert "DRILL_ARCHIVE_ERROR" in (live / "alerts.log").read_text(
+        encoding="utf-8")
 
 
 def test_riskproc_unreadable_flatten_not_archived_with_alert(tmp_path):
