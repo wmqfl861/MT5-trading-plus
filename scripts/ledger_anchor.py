@@ -198,11 +198,17 @@ def _replay_head_at(conn: sqlite3.Connection, table: str, n_rows: int,
                     as_of_ts) -> str | None:
     """按 rowid 序重放**前 n_rows 行**的哈希链，返回该位置的链头。
 
-    行内容取**锚定时刻**的状态（R7/N-I3）：该行若有晚于锚定时刻的归档
+    行内容取**锚定时刻**的状态（R7/N-I3）：该行若有不早于锚定时刻的归档
     改写事件（合法状态更新：gates 重录 / lockbox started→done），用首笔
-    晚于锚定的事件的 old_content——即锚定当时的行内容；否则用当前内容。
+    这样的事件的 old_content——即锚定当时的行内容；否则用当前内容。
     合法改写不误报；重写历史后重封链（无归档可依，或归档也对不上）则
     前缀链头必与锚记录不符——锚定位置的链头是 sha256 原像，造不出来。
+
+    比较用 ≥（含同刻度）：CI 虚拟机的时钟粒度可使 write_anchor 的锚定
+    ts 与紧随其后的归档事件 recorded_utc 相同（run#80/#82 实测误报），
+    严格 > 会漏掉归档、按改写后的内容重放。错向只在"同刻度且事件实际
+    早于锚定读取"的罕见竞态下产生误报（可复核），不放松篡改检出——
+    伪造归档让重放对上锚头仍是 sha256 原像问题。
     """
     cols = _content_cols(conn, table)
     sel = ", ".join(f'"{c}"' for c in cols)
@@ -220,7 +226,7 @@ def _replay_head_at(conn: sqlite3.Connection, table: str, n_rows: int,
         later = [e for e in timeline.get(tuple(content.get(k)
                                                for k in pk), [])
                  if anchor_dt is not None and e[0] is not None
-                 and e[0] > anchor_dt]
+                 and e[0] >= anchor_dt]
         if later:
             content = later[0][1]          # 锚定当时的行内容（归档 old）
         prev = hashlib.sha256(

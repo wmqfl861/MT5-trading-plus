@@ -213,3 +213,40 @@ def test_anchor_prefix_check_tolerates_legit_inplace_update(tmp_path):
     assert mod.verify_anchor(out, p) == []     # 不误报（按归档旧内容重放）
     assert mod.write_anchor(out, p) is True    # 可继续锚定
     assert mod.verify_anchor(out, p) == []
+
+
+def test_same_tick_rewrite_does_not_false_alarm(tmp_path, monkeypatch):
+    """锚定 ts 与归档事件 recorded_utc 同刻度（CI VM 时钟粒度）不误报。
+
+    run#80/#82 实测：write_anchor 的 now() 与紧随的 record_gate 的 now()
+    在 CI 虚拟机上可返回相同值，严格 > 比较漏掉归档、按改写后内容重放，
+    误报"gates：行数与锚定相同但链头不符"。冻结时钟确定性复现（本地
+    物理机时钟精确、真实时序永不相同，故必须冻结才能测到）。
+    """
+    from datetime import datetime, timezone
+
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 27, 12, 0, 0, 0, tzinfo=timezone.utc)
+
+    mod = load_anchor()
+    import mt5quant.research.ledger as ledger_mod
+    monkeypatch.setattr(mod, "datetime", Frozen)
+    monkeypatch.setattr(ledger_mod, "datetime", Frozen)
+
+    from mt5quant.research.ledger import Ledger
+    p = tmp_path / "ledger.sqlite"
+    with Ledger(p) as led:
+        rid = led.record_run(
+            card_id="H001", card_version=1, strategy="s:C", params={},
+            symbol="X", timeframe="H1", data_first=None, data_last=None,
+            data_sha256="a" * 64, engine_version="e",
+            cost_model_version="v", gates_hash="", metrics={"n": 1},
+            actor="t")
+        led.record_gate(rid, "G0", False, {"attempt": 1})
+    out = tmp_path / "anchors.md"
+    assert mod.write_anchor(out, p) is True
+    with Ledger(p) as led:
+        led.record_gate(rid, "G0", True, {"attempt": 2})   # 同刻度改写 + 归档
+    assert mod.verify_anchor(out, p) == []
