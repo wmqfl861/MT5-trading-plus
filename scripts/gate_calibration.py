@@ -9,6 +9,17 @@
         --baselines H002,H003 --null-hypothesis slot --seeds 5 --max-bars 60000
     .venv/Scripts/python.exe scripts/gate_calibration.py --phase event \
         --event-symbols "USTEC D1" --out data/reports/gates/   # T66/D35
+    .venv/Scripts/python.exe scripts/gate_calibration.py --phase v3 \
+        --seeds 20 --out data/reports/gates/                    # T65/D34
+
+关卡 v3 对照臂（--phase v3，蓝图 v4 附录 B 提案框架）：G0 数据卫生否决 +
+主检验（甲=WF 拼接 OOS 收益的 PSR/DSR、乙=同序列年块自助单侧 p——两方案
+逐条都算并标定）+ 三稳健性否决（成本 ×1.5 / 延迟一根 / 多头相对买入持有
+超额）+ 诊断（只报告）。正对照=LONG 植入（多头让 buyhold 否决真实参与
+判定），档位=扣成本后年化夏普；负对照=day/slot 双零假设。报告**联合**
+通过率（主检验+全部否决项，由逐条记录重算）。产物 gate-power-v3.json/md；
+--v3-ext-source fred 给延长后（外部数据）对照。事件模式分支引用 T66 标定
+（主检验乙 = event_test 同一实现），不在此重标。
 
 事件模式对照臂（--phase event，蓝图 v4 §6.4）：评估单位=事件（月末换月
 窗 / 伦敦定盘窗），主统计量=事件净收益均值的单侧检验。零假设=事件时间
@@ -88,6 +99,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import hashlib
+import inspect
 import itertools
 import json
 import math
@@ -459,7 +471,7 @@ def calibrate_drift(symbol, timeframe, *, target_sharpe, period_days=1,
                     seed=0, max_iter=6, tol=0.15, initial_capital=100_000.0,
                     risk_fraction=0.005, bars_by_symbol, costs_by_symbol,
                     sizes_by_symbol, vols_by_symbol, session_policy=None,
-                    log=None) -> dict:
+                    log=None, signal_sign: int = -1) -> dict:
     """把植入漂移 d 校准到"扣成本后年化夏普 ≈ target"。
 
     方法（先验公式 + 割线迭代）：
@@ -471,22 +483,35 @@ def calibrate_drift(symbol, timeframe, *, target_sharpe, period_days=1,
        每笔毛利线性 +d），用最近两点 (d,S) 外推到 target；|S−target| ≤ tol
        即停；返回历史里 |S−target| 最小的点（best effort，如实记录）。
     cfg 参数保留以统一调用口径（校准只用基准回测，不涉关卡）。
+    signal_sign（T65/D34）：-1 = 原空头植入（缺省，行为逐位不变）；
+    +1 = 多头植入（压价 −d + 信号 +1，LongPlantedEdgeStrategy）——d 恒为
+    正强度，植入值 = signal_sign×d，history 记 d（强度）。
     """
     bars = bars_by_symbol[symbol]
     costs = costs_by_symbol[symbol]
     vols = vols_by_symbol[symbol]
     contract_size = sizes_by_symbol[symbol]
     phase_hours, day_phase = seed_phases(seed, interval_hours, period_days)
-    strategy = PlantedEdgeStrategy(period_days=period_days,
-                                   interval_hours=interval_hours,
-                                   phase_hours=phase_hours,
-                                   day_phase=day_phase)
+    if int(signal_sign) >= 0:
+        strategy = LongPlantedEdgeStrategy(period_days=period_days,
+                                           interval_hours=interval_hours,
+                                           phase_hours=phase_hours,
+                                           day_phase=day_phase)
+    else:
+        strategy = PlantedEdgeStrategy(period_days=period_days,
+                                       interval_hours=interval_hours,
+                                       phase_hours=phase_hours,
+                                       day_phase=day_phase)
     params = {"hold_bars": int(hold_bars)}
 
     def plant(drift: float) -> pd.DataFrame:
+        # 空头（signal_sign=-1）：价格抬 +d，做空次根开盘卖出、信号归零后
+        # 次根回补到未抬价水平 → 每笔毛利 ≈ +d；多头（+1）：价格压 −d，
+        # 买入低、卖回未压价水平。植入偏移 = −signal_sign×d，d 恒为正强度。
         return plant_edge(bars, period_days=period_days,
                           interval_hours=interval_hours,
-                          hold_bars=hold_bars, drift=drift,
+                          hold_bars=hold_bars,
+                          drift=-float(signal_sign) * drift,
                           phase_hours=phase_hours, day_phase=day_phase)
 
     def measure(drift: float) -> float:
@@ -534,6 +559,7 @@ def calibrate_drift(symbol, timeframe, *, target_sharpe, period_days=1,
            "target_sharpe": float(target_sharpe),
            "tol": float(tol), "max_iter": int(max_iter),
            "converged": bool(abs(best["sharpe"] - target_sharpe) <= tol),
+           "signal_sign": int(signal_sign),
            "prior": {"sigma_open_to_open": sigma,
                      "events_per_year": events_per_year,
                      "bars_per_year": float(bpy),
@@ -1254,6 +1280,618 @@ def render_event_report(results: dict) -> str:
     return "\n".join(lines)
 
 
+# ------------------------------------------------- 关卡 v3 对照（T65/D34）
+# 蓝图 v4 附录 B"关卡 v3 提案框架"的对照标定臂（--phase v3）：数据卫生否决
+# （G0）+ 主检验（否决；甲=DSR、乙=年块自助，两方案都算）+ 稳健性否决
+# （成本 ×1.5 / 延迟一根 / 多头相对买入持有超额）+ 诊断（只报告，不否决）。
+# 设计：正对照 = LONG 植入（事件后价格压低 d、信号 +1——多头控制让
+# buyhold 否决真实参与判定）按"扣成本后年化夏普 ≈ 档位"校准 × 每档多种子；
+# 负对照 = 两种零假设（day/slot）打乱同一研究段子窗 × 多种子。报告**联合**
+# 通过率（主检验+全部否决项一起，由逐条记录重算），不再只报单项。
+# 事件模式分支不在此重标（T66 已标）：gates-v3 的主检验乙即事件模式的
+# event_test 同一实现，结论引用 event-mode-calibration-2026-10-28。
+
+V3_DEFAULT_SETUPS = ("XAUUSD:H1", "XAUUSD:H4", "XAUUSD+USTEC:H1")
+V3_DEFAULT_LEVELS = (0.5, 1.0, 1.5)       # 校准后年化夏普档位（扣成本）
+V3_BONFERRONI_SENSITIVITY_N = 40          # 方案乙 Bonferroni 敏感性档
+# （R1 草案的轮次预算量级；正式取数按台账 project_n_dedup）
+V3_PRIMARY_CHECKS = {"dsr": "primary.dsr",
+                     "year_block": "primary.year_block",
+                     f"year_block@N{V3_BONFERRONI_SENSITIVITY_N}":
+                         f"primary.year_block@N{V3_BONFERRONI_SENSITIVITY_N}"}
+V3_VETO_CHECKS = ("G0", "veto.cost_x15", "veto.delay_1_bar",
+                  "veto.buyhold_excess")
+
+# v3 植入节奏按周期分档：日事件（每 24h）在 H1/H4 上每 24/6 根一个事件、
+# 事件间有空档（植入可被持有期捕获）；D1 上 24h 事件=每根 bar 都是事件、
+# 信号连续覆盖全史——植入的压价被入场/出场同幅抵消（事件策略退化为
+# 买入持有），故 D1 用周节奏（每 7 根日 bar 一个事件，hold 4 → 3 根空档）。
+V3_PLANTED_RHYTHM = {"D1": (7, 24)}
+
+
+def v3_rhythm(timeframe: str) -> tuple[int, int]:
+    """v3 植入事件节奏：(period_days, interval_hours)，缺省 (1, 24)。"""
+    return V3_PLANTED_RHYTHM.get(str(timeframe).upper(), (1, 24))
+
+
+
+class LongPlantedEdgeStrategy(PlantedEdgeStrategy):
+    """多头版植入策略（事件后压价、信号 +1）：让 buyhold 否决（纯多头
+    策略须跑赢买入持有）在 v3 对照里真实参与判定。与 plant_edge(drift<0)
+    配套：入场次根开盘价已被压低、信号归零后次根回补到未压价水平。"""
+
+    def generate_signals(self, bars: pd.DataFrame, params: dict) -> pd.Series:
+        from mt5quant.validation.synthetic import _expand_events
+        events = event_bars(
+            bars, period_days=self._period_days,
+            interval_hours=self._interval_hours,
+            phase_hours=self._phase_hours, day_phase=self._day_phase)
+        hold = int(params["hold_bars"])
+        return pd.Series(_expand_events(events, hold, 1),
+                         index=bars.index, dtype="int64")
+
+
+def walk_forward_oos(spec, bars, costs, grid, cfg) -> tuple[pd.Series, int]:
+    """walk-forward 拼接样本外收益（**带测试窗时间索引**——方案乙按自然年
+    分块）。窗口计划 / 训练窗网格内重选 / 测试窗尾部收益拼接 = vwf.run_g3
+    同一语义的代码镜像（run_g3 只回聚合 oos_sharpe，不带时间戳）。"""
+    strategy = spec.strategy
+    lookback = max(int(getattr(strategy.required_data, "lookback_bars", 0)
+                       or 0), 0)
+    train_m, test_m = vwf.month_window_spec(spec.timeframe, cfg)
+    windows = vwf.plan_windows(bars["time"], train_months=train_m,
+                               test_months=test_m)
+    times = pd.to_datetime(bars["time"]).reset_index(drop=True)
+    combos = [dict(zip(grid, values))
+              for values in itertools.product(*(grid.values() or [()]))] or [{}]
+    rets_parts, time_parts, n_seg = [], [], 0
+    for w in windows:
+        t0 = int(times.searchsorted(w["train_start"], side="left"))
+        t1 = int(times.searchsorted(w["test_start"], side="left"))
+        t2 = int(times.searchsorted(w["test_end"], side="left"))
+        if t1 <= t0 or t2 <= t1:
+            continue
+        train = bars.iloc[max(0, t0 - lookback): t1]
+        best_params, best_net = None, -math.inf
+        for combo in combos:
+            trades = vrob.run_engine(spec, train, costs, combo).trades
+            net = float(trades["net"].sum()) if len(trades) else 0.0
+            if net > best_net:
+                best_net, best_params = net, dict(combo)
+        test = bars.iloc[max(0, t1 - lookback): t2]
+        oos = vrob.run_engine(spec, test, costs, best_params)
+        tail = oos.equity.astype("float64").iloc[-(t2 - t1 + 1):]
+        rets = tail.pct_change().dropna().reset_index(drop=True)
+        seg_times = times.iloc[t1:t2].iloc[-len(rets):].reset_index(drop=True)
+        rets_parts.append(rets)
+        time_parts.append(seg_times)
+        n_seg += 1
+    if not rets_parts:
+        return pd.Series(dtype="float64"), 0
+    oos_returns = pd.Series(
+        pd.concat(rets_parts, ignore_index=True).to_numpy(),
+        index=pd.DatetimeIndex(pd.concat(time_parts, ignore_index=True)
+                               .to_numpy()))
+    return oos_returns, n_seg
+
+
+def run_v3_gate_suite(strategy, params, *, timeframe, bars, costs,
+                      contract_size, vols, cfg, seed, grid=None,
+                      symbol: str = "TST", session_policy=None,
+                      initial_capital=100_000.0, risk_fraction=0.005,
+                      n_trials: int = 1, log=None) -> dict:
+    """关卡 v3 套件（suite="v3" 实验镜像）：G0 + 主检验（甲/乙 + Bonferroni
+    敏感性都算）+ 三否决 + 诊断 → 逐检查布尔 + vgate.evaluate_v3 判定。
+
+    n_trials：实验不经 screen/台账的网格选择 → 1（DSR 退化为 PSR(0)、
+    Bonferroni 阈值 = alpha，与现行 gate_calibration 口径一致；正式路径
+    由 bt 接线按台账 project dedup 取数）。诊断集 = G1 样本内线 + 参数
+    邻域 + 按年分段 + 去最好 5%（全部只报告）；随机入场蒙特卡洛 / 跨品种 /
+    回撤分位不在实验臂复算（不进判定，计算量控制——批准后正式路径照跑）。
+    """
+    sizing = RiskSizing(risk_fraction=float(risk_fraction))
+    spec = vrob.BacktestSpec(
+        strategy=strategy, symbol=symbol, timeframe=timeframe,
+        contract_size=contract_size, volume_lots=None,
+        initial_capital=initial_capital, sizing=sizing,
+        vol_min=vols[0], vol_step=vols[1], vol_max=vols[2])
+    base = run_backtest(
+        strategy, bars, costs, symbol=symbol, params=dict(params),
+        contract_size=contract_size, volume_lots=None, sizing=sizing,
+        vol_min=vols[0], vol_step=vols[1], vol_max=vols[2],
+        initial_capital=initial_capital, timeframe=timeframe,
+        session_policy=session_policy)
+    summary = summarize(base)
+    base_sharpe = summary.get("sharpe")
+    oos_returns, n_seg = walk_forward_oos(spec, bars, costs,
+                                          dict(grid or {}), cfg)
+    primary = {
+        "dsr": vgate.v3_primary_dsr(oos_returns, n_trials=n_trials,
+                                    trial_sharpes=None, cfg=cfg),
+        "year_block": vgate.v3_primary_year_block(
+            oos_returns, n_trials=n_trials, cfg=cfg, seed=seed),
+        f"year_block@N{V3_BONFERRONI_SENSITIVITY_N}":
+            vgate.v3_primary_year_block(
+                oos_returns, n_trials=V3_BONFERRONI_SENSITIVITY_N,
+                cfg=cfg, seed=seed),
+    }
+    veto_cost = vgate.v3_veto_cost_scale(spec, bars, costs, params, cfg)
+    veto_delay = vgate.v3_veto_delay(spec, bars, costs, params, cfg)
+    veto_buyhold = vgate.v3_veto_buyhold(spec, bars, costs, base.trades,
+                                         base_sharpe, cfg)
+    g1 = vgate.run_g1(base.trades, timeframe=timeframe, cfg=cfg)
+    diag = {
+        "param_plateau": vrob.param_plateau(spec, bars, costs, params,
+                                            dict(grid or {}), cfg),
+        "yearly_segments": vrob.yearly_segments(base.trades, cfg),
+        "drop_best_5pct": vrob.drop_best_check(base.trades, cfg),
+        **{f"g1.{k}": c for k, c in g1["checks"].items()},
+    }
+    g0 = vlook.run_g0(strategy, bars, params,
+                      # 静态扫描只扫策略类体：LongPlantedEdgeStrategy 定义在
+                      # 本脚本内，缺省会扫整个标定脚本（aggregate_rates 的
+                      # np.mean 全是"全样本统计"误报——扫类体才是 G0 语义）
+                      source=inspect.getsource(type(strategy)))
+    verdict = vgate.evaluate_v3(
+        g0=g0, primary=primary["dsr"], cost_scale=veto_cost,
+        delay=veto_delay, buyhold=veto_buyhold,
+        diagnostics=diag)
+    checks = {
+        "G0": bool(g0["passed"]),
+        **{f"primary.{scheme}": bool(c["passed"])
+           for scheme, c in primary.items()},
+        "veto.cost_x15": bool(veto_cost["passed"]),
+        "veto.delay_1_bar": bool(veto_delay["passed"]),
+        "veto.buyhold_excess": bool(veto_buyhold["passed"]),
+        **{f"diag.{name}": bool(c.get("passed", False))
+           for name, c in diag.items()},
+    }
+    return {
+        "checks": checks,
+        "verdict": verdict,
+        "primary": primary,
+        "vetoes": {"cost_scale_x15": veto_cost, "delay_1_bar": veto_delay,
+                   "buyhold_excess": veto_buyhold},
+        "diagnostics": diag,
+        "g0": g0,
+        "oos_returns": oos_returns,
+        "wf_segments": int(n_seg),
+        "summary": {"net_profit": summary["net_profit"],
+                    "sharpe": summary.get("sharpe"),
+                    "trade_count": summary.get("trade_count")},
+    }
+
+
+def v3_joint_pass(checks: dict, scheme: str) -> bool:
+    """联合通过（主检验 scheme + 全部否决项）——**由逐条记录的检查布尔
+    重算**（分片/合并器共用；记录里的任何自报 joint 字段不参与）。"""
+    key = V3_PRIMARY_CHECKS[scheme]
+    if key not in checks:
+        raise KeyError(f"v3 记录缺 {key}（两方案都必须逐条记录）")
+    return bool(checks[key]) and all(bool(checks.get(k)) for k in
+                                     V3_VETO_CHECKS)
+
+
+def v3_joint_rates(runs: list[dict]) -> dict[str, float]:
+    """联合通过率 + 分检查通过率（对 runs 的 checks 逐条重算；合并器与
+    单进程共用同一函数——联合口径只有这一处定义）。"""
+    rates = aggregate_rates(runs)
+    for scheme in V3_PRIMARY_CHECKS:
+        rates[f"joint.{scheme}"] = (
+            float(np.mean([v3_joint_pass(r["checks"], scheme)
+                           for r in runs])) if runs else 0.0)
+    return rates
+
+
+def _v3_suite_for_symbols(symbols, timeframe, packs, cfg, seed, *,
+                          planted: float | None = None,
+                          shuffle_null: str | None = None,
+                          initial_capital, risk_fraction,
+                          session_policy=None, log=None) -> dict:
+    """一套（可多品种）v3 检查记录：单品种 = 该品种套件；多品种（合并
+    变体）= 主检验按**拼接 OOS 收益**（同年内跨品种折叠进同一年块）、
+    否决/G0 按品种合取（每个品种都必须过）。planted>0 = 多头植入强度 d
+    （压价 −d）；shuffle_null = 零假设打乱（同种子逐品种独立打乱）。"""
+    per_symbol: dict[str, dict] = {}
+    oos_parts = []
+    bpd = bars_per_day_of(timeframe)
+    period_days, interval_hours = v3_rhythm(timeframe)
+    for symbol in symbols:
+        pack = packs[symbol]
+        bars = pack["bars"].iloc[(int(seed) % 10) * bpd:].reset_index(
+            drop=True)
+        phase_hours, day_phase = seed_phases(seed, interval_hours,
+                                             period_days)
+        if shuffle_null is not None:
+            bars = NULL_SHUFFLERS[shuffle_null](bars, seed=seed)
+        elif planted:
+            bars = plant_edge(
+                bars, period_days=period_days, interval_hours=interval_hours,
+                hold_bars=PLANTED_HOLD_BARS, drift=-float(planted),
+                phase_hours=phase_hours, day_phase=day_phase)
+        strategy = LongPlantedEdgeStrategy(
+            period_days=period_days, interval_hours=interval_hours,
+            phase_hours=phase_hours, day_phase=day_phase)
+        per_symbol[symbol] = run_v3_gate_suite(
+            strategy, {"hold_bars": PLANTED_HOLD_BARS}, timeframe=timeframe,
+            bars=bars, costs=pack["costs"], contract_size=pack["sizes"],
+            vols=pack["vols"], cfg=cfg, seed=seed,
+            grid=dict(PLANTED_GRID), symbol=symbol,
+            session_policy=pack.get("session_policy"),
+            initial_capital=initial_capital, risk_fraction=risk_fraction,
+            log=log)
+        oos_parts.append(per_symbol[symbol]["oos_returns"])
+        if log:
+            log(f"[v3] {symbol} {timeframe} seed={seed} "
+                f"sharpe={per_symbol[symbol]['summary']['sharpe']} "
+                f"segs={per_symbol[symbol]['wf_segments']}")
+    if len(symbols) == 1:
+        only = per_symbol[symbols[0]]
+        return {"checks": only["checks"], "verdict": only["verdict"],
+                "summary": only["summary"],
+                "sharpe_by_symbol": {symbols[0]: only["summary"]["sharpe"]},
+                "wf_segments": only["wf_segments"]}
+    pooled = pd.concat(oos_parts)
+    primary = {
+        "dsr": vgate.v3_primary_dsr(pooled, n_trials=1, trial_sharpes=None,
+                                    cfg=cfg),
+        "year_block": vgate.v3_primary_year_block(pooled, n_trials=1,
+                                                  cfg=cfg, seed=seed),
+        f"year_block@N{V3_BONFERRONI_SENSITIVITY_N}":
+            vgate.v3_primary_year_block(
+                pooled, n_trials=V3_BONFERRONI_SENSITIVITY_N, cfg=cfg,
+                seed=seed),
+    }
+    veto_all = {
+        "G0": all(s["checks"]["G0"] for s in per_symbol.values()),
+        **{f"veto.{k}": all(s["checks"][f"veto.{k}"]
+                            for s in per_symbol.values())
+           for k in ("cost_x15", "delay_1_bar", "buyhold_excess")},
+    }
+    checks = {
+        **veto_all,
+        **{f"primary.{scheme}": bool(c["passed"])
+           for scheme, c in primary.items()},
+        **{f"diag.merged_{sym}_{k}": s["checks"][f"diag.{k}"]
+           for sym, s in per_symbol.items()
+           for k in ("param_plateau", "yearly_segments", "drop_best_5pct")},
+    }
+    verdict = vgate.evaluate_v3(
+        g0={"passed": veto_all["G0"]}, primary=primary["dsr"],
+        cost_scale={"passed": veto_all["veto.cost_x15"]},
+        delay={"passed": veto_all["veto.delay_1_bar"]},
+        buyhold={"passed": veto_all["veto.buyhold_excess"]},
+        diagnostics={k: {"passed": v} for k, v in checks.items()
+                     if k.startswith("diag.")})
+    return {"checks": checks, "verdict": verdict, "primary": primary,
+            "sharpe_by_symbol": {sym: s["summary"]["sharpe"]
+                                 for sym, s in per_symbol.items()},
+            "wf_segments": sum(s["wf_segments"] for s in
+                               per_symbol.values())}
+
+
+def _v3_setup_key(symbols: list[str], timeframe: str) -> str:
+    return ("MERGED:" + "+".join(symbols) if len(symbols) > 1
+            else symbols[0]) + f" {timeframe}"
+
+
+def parse_v3_setups(spec: str) -> list[tuple[list[str], str]]:
+    """--v3-setups："SYM:TF,SYM+SYM:TF" → [(["SYM"], "TF"), …]。"""
+    out: list[tuple[list[str], str]] = []
+    for item in str(spec).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        body, _, tf = item.partition(":")
+        tf = (tf or "H1").strip().upper()
+        syms = [s.strip().upper() for s in body.split("+") if s.strip()]
+        if not syms:
+            raise SystemExit(f"--v3-setups 条目 {item!r} 缺品种")
+        out.append((syms, tf))
+    if not out:
+        raise SystemExit("--v3-setups 为空")
+    return out
+
+
+def v3_calibrate_level(symbol, timeframe, packs, cfg, level, *,
+                       initial_capital, risk_fraction, log=None) -> dict:
+    """多头植入校准到"扣成本后年化夏普 ≈ level"（calibrate_drift 的
+    signal_sign=+1 变体：d 为压价强度，植入值 = −d）。"""
+    pack = packs[symbol]
+    period_days, interval_hours = v3_rhythm(timeframe)
+    return calibrate_drift(
+        symbol, timeframe, target_sharpe=level, period_days=period_days,
+        interval_hours=interval_hours, hold_bars=PLANTED_HOLD_BARS, cfg=cfg,
+        seed=0,
+        initial_capital=initial_capital, risk_fraction=risk_fraction,
+        bars_by_symbol={symbol: pack["bars"]},
+        costs_by_symbol={symbol: pack["costs"]},
+        sizes_by_symbol={symbol: pack["sizes"]},
+        vols_by_symbol={symbol: pack["vols"]},
+        session_policy=pack.get("session_policy"), log=log,
+        signal_sign=1)
+
+
+def run_v3_phase(args, log) -> dict:
+    """--phase v3（T65/D34）：v3 提案套件的正负对照——负对照 = 两种零假设
+    打乱 × 种子（drift=0），正对照 = 多头植入校准档位 × 种子；记录逐检查
+    布尔（两方案 + 否决 + 诊断），联合通过率由 v3_joint_rates 重算。"""
+    setups = parse_v3_setups(args.v3_setups)
+    levels = [float(x) for x in str(args.v3_levels).split(",") if x.strip()]
+    seeds = list(range(args.seeds_from, args.seeds_from + args.seeds))
+    test_sims = int(args.v3_test_sims)
+    nulls = list(NULL_ORDER)
+    if args.quick:
+        seeds = seeds[:2]
+        levels = [max(levels)]
+        test_sims = min(test_sims, 200)
+    cfg, gates_v3_sha = vgate.load_gates(suite="v3")
+    cfg = dataclasses.replace(cfg, bootstrap_sims=test_sims)
+    needed = sorted({f"{sym} {tf}" for symbols, tf in setups for sym in symbols})
+    print(f"— [v3] 装配 {len(needed)} 个序列：{needed}", flush=True)
+    inputs_by_key = assemble_experiment(args.data_root, needed,
+                                        max_bars=args.max_bars)
+    ext_source = (args.v3_ext_source or "").strip()
+    bars_source: dict[str, str] = {}
+    if ext_source:
+        # 延长前/后对照（T67/T81 外部数据）：ext 优先装载（与 T66
+        # load_event_bars 同一装载器，manifest fail-fast + research_cutoff
+        # 防御性再截），成本/合约/手数仍取研究库缓存
+        for key in needed:
+            sym, tf = key.split()
+            bars, src = load_event_bars(args.data_root, sym, tf,
+                                        ext_source=ext_source,
+                                        max_bars=args.max_bars)
+            inputs_by_key[key]["bars"] = bars
+            bars_source[key] = src
+            print(f"— [v3] {key}：ext 装载 {src}，{len(bars)} 根", flush=True)
+    # 按 (品种, 周期) 取包——XAUUSD H1 与 H4 同时在场，只按品种键会互相覆盖
+    packs_by_key = {tuple(key.split()): pack
+                    for key, pack in inputs_by_key.items()}
+    fingerprint = _run_fingerprint(inputs_by_key, gates_v3_sha)
+
+    negative_runs: list[dict] = []
+    positive_runs: list[dict] = []
+    calibration: dict[str, dict] = {}
+    for symbols, timeframe in setups:
+        key = _v3_setup_key(symbols, timeframe)
+        packs = {sym: packs_by_key[(sym, timeframe)] for sym in symbols}
+        # ---- 负对照：两种零假设 × 种子（与正对照同一研究段子窗，配对）
+        for null in nulls:
+            for seed in seeds:
+                t0 = time.monotonic()
+                out = _v3_suite_for_symbols(
+                    symbols, timeframe, packs, cfg, seed,
+                    shuffle_null=null, initial_capital=args.initial_capital,
+                    risk_fraction=args.risk_per_trade, log=log)
+                negative_runs.append({
+                    "setup": key, "null": null, "seed": int(seed),
+                    "sharpe_by_symbol": out["sharpe_by_symbol"],
+                    "wf_segments": out["wf_segments"],
+                    "checks": out["checks"]})
+                if log:
+                    log(f"[v3/neg] {key} {null} seed={seed} "
+                        f"({time.monotonic() - t0:.1f}s)")
+        # ---- 正对照：档位校准（逐品种）+ 植入 × 种子
+        level_cal: dict[str, dict[float, dict]] = {sym: {} for sym in symbols}
+        for sym in symbols:
+            for level in levels:
+                level_cal[sym][level] = dict(v3_calibrate_level(
+                    sym, timeframe, packs, cfg, level,
+                    initial_capital=args.initial_capital,
+                    risk_fraction=args.risk_per_trade, log=log))
+        calibration[key] = {sym: {str(level): cal
+                                  for level, cal in by_level.items()}
+                            for sym, by_level in level_cal.items()}
+        for level in levels:
+            for seed in seeds:
+                t0 = time.monotonic()
+                # 逐品种用各自校准出的压价强度（同档位可比：都校准到
+                # "扣成本后年化夏普 ≈ level"）
+                out_by_symbol: dict[str, dict] = {}
+                oos_parts = []
+                bpd = bars_per_day_of(timeframe)
+                period_days, interval_hours = v3_rhythm(timeframe)
+                for sym in symbols:
+                    pack = packs[sym]
+                    drift = float(level_cal[sym][level]["drift"])
+                    phase_hours, day_phase = seed_phases(seed, interval_hours,
+                                                         period_days)
+                    segment = pack["bars"].iloc[
+                        (int(seed) % 10) * bpd:].reset_index(drop=True)
+                    planted_bars = plant_edge(
+                        segment, period_days=period_days,
+                        interval_hours=interval_hours,
+                        hold_bars=PLANTED_HOLD_BARS, drift=-drift,
+                        phase_hours=phase_hours, day_phase=day_phase)
+                    strategy = LongPlantedEdgeStrategy(
+                        period_days=period_days, interval_hours=interval_hours,
+                        phase_hours=phase_hours, day_phase=day_phase)
+                    out_by_symbol[sym] = run_v3_gate_suite(
+                        strategy, {"hold_bars": PLANTED_HOLD_BARS},
+                        timeframe=timeframe, bars=planted_bars,
+                        costs=pack["costs"], contract_size=pack["sizes"],
+                        vols=pack["vols"], cfg=cfg, seed=seed,
+                        grid=dict(PLANTED_GRID), symbol=sym,
+                        session_policy=pack.get("session_policy"),
+                        initial_capital=args.initial_capital,
+                        risk_fraction=args.risk_per_trade)
+                    oos_parts.append(out_by_symbol[sym]["oos_returns"])
+                if len(symbols) == 1:
+                    only = out_by_symbol[symbols[0]]
+                    checks, verdict = only["checks"], only["verdict"]
+                else:
+                    pooled = pd.concat(oos_parts)
+                    primary = {
+                        "dsr": vgate.v3_primary_dsr(
+                            pooled, n_trials=1, trial_sharpes=None, cfg=cfg),
+                        "year_block": vgate.v3_primary_year_block(
+                            pooled, n_trials=1, cfg=cfg, seed=seed),
+                        f"year_block@N{V3_BONFERRONI_SENSITIVITY_N}":
+                            vgate.v3_primary_year_block(
+                                pooled, n_trials=V3_BONFERRONI_SENSITIVITY_N,
+                                cfg=cfg, seed=seed)}
+                    veto_all = {
+                        "G0": all(s["checks"]["G0"] for s in
+                                  out_by_symbol.values()),
+                        **{f"veto.{k}": all(s["checks"][f"veto.{k}"] for s
+                                            in out_by_symbol.values())
+                           for k in ("cost_x15", "delay_1_bar",
+                                     "buyhold_excess")}}
+                    checks = {**veto_all,
+                              **{f"primary.{sc}": bool(c["passed"])
+                                 for sc, c in primary.items()},
+                              **{f"diag.merged_{sym}_{k}":
+                                 s["checks"][f"diag.{k}"]
+                                 for sym, s in out_by_symbol.items()
+                                 for k in ("param_plateau", "yearly_segments",
+                                           "drop_best_5pct")}}
+                    verdict = vgate.evaluate_v3(
+                        g0={"passed": veto_all["G0"]},
+                        primary=primary["dsr"],
+                        cost_scale={"passed": veto_all["veto.cost_x15"]},
+                        delay={"passed": veto_all["veto.delay_1_bar"]},
+                        buyhold={"passed": veto_all["veto.buyhold_excess"]},
+                        diagnostics={k: {"passed": v} for k, v in
+                                     checks.items() if k.startswith("diag.")})
+                positive_runs.append({
+                    "setup": key, "level": float(level), "seed": int(seed),
+                    "drift_by_symbol": {sym: float(level_cal[sym][level]
+                                                   ["drift"])
+                                        for sym in symbols},
+                    "sharpe_by_symbol": {sym: s["summary"]["sharpe"] for
+                                         sym, s in out_by_symbol.items()},
+                    "checks": checks})
+                if log:
+                    log(f"[v3/pos] {key} level={level} seed={seed} "
+                        f"({time.monotonic() - t0:.1f}s)")
+
+    fp_rates: dict[str, dict[str, float]] = {}
+    for setup in {r["setup"] for r in negative_runs}:
+        for null in nulls:
+            bucket = [r for r in negative_runs
+                      if r["setup"] == setup and r["null"] == null]
+            if bucket:
+                fp_rates[f"{setup}|{null}"] = v3_joint_rates(bucket)
+    detection: dict[str, dict[str, dict[str, float]]] = {}
+    for setup in {r["setup"] for r in positive_runs}:
+        detection[setup] = {}
+        for level in levels:
+            bucket = [r for r in positive_runs
+                      if r["setup"] == setup and r["level"] == level]
+            if bucket:
+                detection[setup][str(level)] = v3_joint_rates(bucket)
+    return {
+        "meta": {
+            "phase": "v3", "seeds": len(seeds),
+            "seeds_from": int(args.seeds_from),
+            "levels": levels, "setups": [_v3_setup_key(s, tf)
+                                         for s, tf in setups],
+            "nulls": nulls, "primary_schemes": ["dsr", "year_block"],
+            "bonferroni_sensitivity_n": V3_BONFERRONI_SENSITIVITY_N,
+            "n_trials": 1,
+            "test_sims": int(test_sims),
+            "gates_v3_sha256": gates_v3_sha,
+            "initial_capital": float(args.initial_capital),
+            "risk_per_trade": float(args.risk_per_trade),
+            "max_bars": args.max_bars, "data_root": str(args.data_root),
+            "ext_source": ext_source or None,
+            "bars_source": bars_source,
+            "fingerprint": fingerprint,
+            "generated_utc": datetime.now(timezone.utc).isoformat(),
+            "design": (
+                "正对照=LONG 植入（事件后压价 d、信号 +1，buyhold 否决真实"
+                "参与判定），d 校准到扣成本后年化夏普≈档位（逐品种）；负对照"
+                "=day/slot 两种零假设打乱同一研究段子窗（与正对照配对）；"
+                "主检验两方案（甲 DSR / 乙 年块自助）逐条都算，乙另报 "
+                f"Bonferroni N={V3_BONFERRONI_SENSITIVITY_N} 敏感性；联合"
+                "通过率=主检验+全部否决项（G0/成本×1.5/延迟一根/多头超额），"
+                "由逐条记录重算；诊断（G1/参数邻域/按年分段/去最好 5%）只"
+                "报告不否决。事件模式分支引用 T66 标定，不在此重标。"),
+        },
+        "negative": {"runs": negative_runs,
+                     "joint_false_positive_rates": fp_rates},
+        "positive": {"runs": positive_runs,
+                     "joint_detection_rates": detection,
+                     "calibration": calibration},
+    }
+
+
+def render_v3_report(results: dict) -> str:
+    """--phase v3 产物（gate-power-v3.md）：联合误报/检出表（两方案 +
+    Bonferroni 敏感性）+ 分检查率 + 校准 + 口径。"""
+    meta = results.get("meta", {})
+    fmt = lambda v: "—" if v is None else f"{float(v) * 100:.0f}%"  # noqa: E731
+    cols = ["joint.dsr", "joint.year_block",
+            f"joint.year_block@N{V3_BONFERRONI_SENSITIVITY_N}",
+            "primary.dsr", "primary.year_block", "G0", "veto.cost_x15",
+            "veto.delay_1_bar", "veto.buyhold_excess"]
+
+    def table(rows: list[tuple[str, dict[str, float]]], first_header: str
+              ) -> list[str]:
+        lines = [f"| {first_header} | " + " | ".join(cols) + " |",
+                 "| --- " * (len(cols) + 1) + "|"]
+        for label, rates in rows:
+            lines.append(f"| {label} | "
+                         + " | ".join(fmt(rates.get(c)) for c in cols) + " |")
+        return lines
+
+    lines = ["# 关卡 v3 对照实验（gate-power-v3，T65/D34 提案标定）", "",
+             f"- 序列/设置：{'; '.join(meta.get('setups', []))}",
+             f"- 档位（校准后年化夏普）：{meta.get('levels')}；"
+             f"种子 {meta.get('seeds')}；零假设 {meta.get('nulls')}",
+             f"- 主检验两方案：甲 DSR（N={meta.get('n_trials')}，实验不经"
+             "台账选择）/ 乙 年块自助（Bonferroni 同 N；另报 "
+             f"N={meta.get('bonferroni_sensitivity_n')} 敏感性档）；自助 "
+             f"{meta.get('test_sims')} 次",
+             f"- gates-v3 sha256：{str(meta.get('gates_v3_sha256', ''))[:12]}"
+             f"；生成：{meta.get('generated_utc', '?')}", "",
+             "联合通过率 = 主检验 + 全部否决项（G0 / 成本 ×1.5 / 延迟一根 /"
+             " 多头相对买入持有超额）——由逐条记录重算；诊断项（G1/参数邻域/"
+             "按年分段/去最好 5%）只报告，不进判定。", "",
+             "## 负对照联合误报率（零假设 × 设置）", ""]
+    fp = results.get("negative", {}).get("joint_false_positive_rates") or {}
+    lines += table(sorted(fp.items()), "设置 \\ 零假设")
+    lines += ["", "## 正对照联合检出率（档位 × 设置）", ""]
+    det = results.get("positive", {}).get("joint_detection_rates") or {}
+    pos_rows: list[tuple[str, dict[str, float]]] = []
+    for setup in sorted(det):
+        for level in sorted(det[setup], key=float):
+            pos_rows.append((f"{setup} 夏普≈{level}", det[setup][level]))
+    lines += table(pos_rows, "设置 × 档位")
+    cal = results.get("positive", {}).get("calibration") or {}
+    if cal:
+        lines += ["", "## 校准（多头压价强度 d → 扣成本后年化夏普）", ""]
+        for setup, by_symbol in sorted(cal.items()):
+            for symbol, by_level in sorted(by_symbol.items()):
+                parts = []
+                for level, info in sorted(by_level.items(),
+                                          key=lambda kv: float(kv[0])):
+                    mark = "" if info.get("converged", True) else "，未收敛"
+                    parts.append(f"≈{level} → d={info['drift']:.6g}"
+                                 f"（实测 {info['achieved_sharpe']:.2f}"
+                                 f"{mark}）")
+                lines.append(f"- {setup} / {symbol}：" + "；".join(parts))
+    lines += ["", "## 口径备注", "",
+              "- 正对照为 LONG 植入（事件后压价、信号 +1）：多头让 buyhold "
+              "否决（纯多头须跑赢买入持有）真实参与判定；负对照与正对照用"
+              "同一研究段子窗（同种子偏移），配对可比。",
+              "- 主检验甲（DSR）实验 N=1（退化为 PSR(0)）：实验不经 screen/"
+              "台账的网格选择；正式路径按 [g4].dsr_trial_scope=project 从"
+              "台账 dedup 取数。方案乙 Bonferroni 同理，敏感性档 N="
+              f"{V3_BONFERRONI_SENSITIVITY_N}（R1 草案轮次预算量级）。",
+              "- 年块自助的年块数为研究段 OOS 覆盖年数（XAUUSD 约 2016 起 "
+              "≈10 块）：T66 标定指出块数 <40 时经验水平偏高（有效临界分布"
+              "≈t_{B−1}），本表按联合口径如实呈现。",
+              "- 多品种合并变体：主检验按拼接 OOS 收益（同年内跨品种折叠进"
+              "同一年块）、否决/G0 按品种合取；诊断只报参数邻域/按年分段/"
+              "去最好 5% 三项（计算量控制；正式路径全量诊断照跑）。",
+              "- 事件模式分支不在此重标：主检验乙 = T66 event_test 同一"
+              "实现，误报/检出见 docs/research/event-mode-calibration-"
+              "2026-10-28.md。", ""]
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- 决策规则
 
 # 结构性通过检查：检验代码卫生 / 离群 / 适用性而非"有没有优势"，负对照上
@@ -1585,7 +2223,7 @@ def build_parser() -> argparse.ArgumentParser:
                     "+ 正对照检出率 + G5 判别力 + 合并评估变体 → JSON+MD；"
                     "--phase event 为 T66/D35 事件模式对照臂（event-power）")
     ap.add_argument("--phase", choices=("negative", "positive", "both",
-                                        "event"),
+                                        "event", "v3"),
                     default="both")
     ap.add_argument("--seeds-from", type=int, default=0,
                     help="种子起点（分片并行：各分片用不相交种子段，结果经 "
@@ -1646,6 +2284,21 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--event-rand-sims", type=int, default=199,
                     help="随机化参照检验的随机化次数（正对照减半至 "
                          "ceil/2——检出率粒度 20 种子已够）")
+    # ---- 关卡 v3 对照臂（T65/D34，--phase v3）
+    ap.add_argument("--v3-setups",
+                    default=",".join(V3_DEFAULT_SETUPS),
+                    help="v3 臂设置（缺省 XAUUSD:H1,XAUUSD:H4,XAUUSD+USTEC"
+                         ":H1；SYM+SYM:TF = 多品种合并变体——主检验按拼接"
+                         "OOS 收益、否决按品种合取）")
+    ap.add_argument("--v3-levels",
+                    default=",".join(str(v) for v in V3_DEFAULT_LEVELS),
+                    help="v3 正对照夏普档位（逗号分隔，缺省 0.5,1.0,1.5）")
+    ap.add_argument("--v3-test-sims", type=int, default=1000,
+                    help="方案乙年块自助次数（--quick 降至 200）")
+    ap.add_argument("--v3-ext-source", default="",
+                    help="v3 臂外部数据来源（fred/cdd；空串=只用研究库 bars）"
+                         "——延长前/后对照用：ext 优先装载（T66 同一装载器），"
+                         "成本/合约仍取研究库缓存")
     return ap
 
 
@@ -1748,6 +2401,25 @@ def main(argv=None) -> int:
                        default=_json_default), encoding="utf-8")
         md_path.write_text(render_event_report(results), encoding="utf-8")
         print(f"— 产出：{json_path} 与 {md_path}", flush=True)
+        return 0
+
+    if args.phase == "v3":             # T65/D34 关卡 v3 对照臂
+        results = run_v3_phase(args, log)
+        out_dir = Path(args.out)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        json_path = out_dir / "gate-power-v3.json"
+        md_path = out_dir / "gate-power-v3.md"
+        json_path.write_text(
+            json.dumps(results, ensure_ascii=False, indent=2,
+                       default=_json_default), encoding="utf-8")
+        md_path.write_text(render_v3_report(results), encoding="utf-8")
+        print(f"— 产出：{json_path} 与 {md_path}", flush=True)
+        fp = (results.get("negative", {})
+              .get("joint_false_positive_rates") or {})
+        worst = max((rates.get("joint.dsr", 0.0) for rates in fp.values()),
+                    default=0.0)
+        print(f"— 负对照联合误报率（甲）最差 {worst:.0%}（详见 "
+              "gate-power-v3.md）", flush=True)
         return 0
 
     seeds = list(range(args.seeds_from, args.seeds_from + args.seeds))

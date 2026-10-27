@@ -4,6 +4,7 @@
 - G5 第二次请求直接拒绝（test_run_g5_second_use_refused）；
 - 改动 config/gates.toml 后拒绝运行（test_tampered_gates_toml_refuses）。
 """
+import dataclasses
 import importlib.util
 import json
 from datetime import datetime, timezone
@@ -1028,3 +1029,183 @@ def test_g4_dsr_trial_scope_project_parses(tmp_path):
         encoding="utf-8")
     with pytest.raises(vg.GatesConfigError, match="dsr_trial_scope"):
         vg.load_gates(p3, frozen_sha=vg.gates_sha256(p3))
+
+
+# ================================================ T65/D34：关卡 v3（suite="v3"）
+
+def test_v3_path_leaves_frozen_v2_bit_for_bit(tmp_path):
+    """T65 失败测试 1：v3 路径不影响现行 gates.toml 冻结校验。
+
+    - v2 缺省加载（文件、sha、类型、解析）逐位不变，gates.toml 仍是
+      FROZEN_GATES_SHA256 的冻结对象；
+    - gates-v3.toml 只在显式 suite="v3" 时读，有自己的冻结 sha；
+    - v3 加载前后 v2 结果一致（不留任何状态）；两份文件被篡改各自在
+      自己的 suite 里拒。
+    """
+    cfg, sha = vg.load_gates()                        # v2 缺省
+    assert vg.DEFAULT_GATES_TOML.name == "gates.toml"
+    assert sha == vg.FROZEN_GATES_SHA256
+    assert type(cfg) is vg.GatesConfig and cfg.version == 2
+    assert cfg.dsr_trial_scope == "family"            # 现行文件无此键 → 缺省
+    v3cfg, v3sha = vg.load_gates(suite="v3")
+    assert vg.DEFAULT_GATES_V3_TOML.name == "gates-v3.toml"
+    assert v3sha == vg.FROZEN_GATES_V3_SHA256 == vg.gates_sha256(
+        vg.DEFAULT_GATES_V3_TOML)
+    assert v3sha != sha                               # 两个独立冻结对象
+    assert isinstance(v3cfg, vg.GatesV3Config) and v3cfg.version == 3
+    assert v3cfg.dsr_trial_scope == "project"         # 蓝图附录 B：N 项目级
+    assert v3cfg.primary_test in ("dsr", "year_block")
+    assert vg.load_gates() == (cfg, sha)              # v3 不留状态
+    assert vg.load_gates(suite="v2")[1] == sha        # 显式 v2 同缺省
+    # 篡改各自拒绝（v3 的损坏不污染 v2 的守护，反之亦然）
+    bad = tmp_path / "gates.toml"
+    bad.write_bytes(vg.DEFAULT_GATES_TOML.read_bytes() + b"\n# x\n")
+    with pytest.raises(vg.GatesConfigError, match="sha256"):
+        vg.load_gates(bad)
+    bad3 = tmp_path / "gates-v3.toml"
+    bad3.write_bytes(vg.DEFAULT_GATES_V3_TOML.read_bytes() + b"\n# x\n")
+    with pytest.raises(vg.GatesConfigError, match="sha256"):
+        vg.load_gates(bad3, suite="v3")
+    assert vg.load_gates()[1] == sha                  # v2 守护原样
+
+
+def test_v3_toml_schema_validation(tmp_path):
+    """gates-v3.toml 的 [v3] 节与 version 校验：非法枚举/范围/类型/未知键
+    拒绝；v2 路径读到 [v3] 节按未知顶层键拒绝（v3 键不进 v2 语义）。"""
+    body = vg.DEFAULT_GATES_V3_TOML.read_text(encoding="utf-8")
+
+    def variant(*repl: tuple[str, str]) -> Path:
+        t = body
+        for old, new in repl:
+            assert old in t, old
+            t = t.replace(old, new)
+        p = tmp_path / "gates-v3.toml"
+        p.write_text(t, encoding="utf-8")
+        return p
+
+    def load(p: Path):
+        return vg.load_gates(p, frozen_sha=vg.gates_sha256(p), suite="v3")
+
+    with pytest.raises(vg.GatesConfigError, match="primary_test"):
+        load(variant(('primary_test = "dsr"', 'primary_test = "crystal"')))
+    with pytest.raises(vg.GatesConfigError, match="alpha"):
+        load(variant(("alpha = 0.05", "alpha = 1.5")))
+    with pytest.raises(vg.GatesConfigError, match="bootstrap_sims"):
+        load(variant(("bootstrap_sims = 1000", "bootstrap_sims = 1")))
+    with pytest.raises(vg.GatesConfigError, match="未知"):
+        load(variant(("[g1]", "stray = 1\n\n[g1]")))
+    with pytest.raises(vg.GatesConfigError, match="未知"):
+        load(variant(("cost_scale_veto = 1.5", "cost_scale_veto = 1.5\n"
+                                             "oracle = true")))
+    with pytest.raises(vg.GatesConfigError, match="version"):
+        load(variant(("version = 3", "version = 2")))
+    # v2 路径读 v3 文件（带 [v3] 节）→ 未知顶层键 v3 拒绝
+    with pytest.raises(vg.GatesConfigError, match="v3"):
+        vg.load_gates(variant())
+
+
+def test_v3_diagnostic_failures_do_not_change_verdict():
+    """T65 失败测试 2：诊断项失败不改变通过结论——否决层全过即通过，
+    诊断层（参数邻域/按年分段/去最好 5%/G1 样本内线）只报告。"""
+    ok = {"passed": True}
+    out = vg.evaluate_v3(
+        g0=ok, primary={"passed": True}, cost_scale=ok, delay=ok, buyhold=ok,
+        diagnostics={"param_plateau": {"passed": False, "fraction": 0.2},
+                     "yearly_segments": {"passed": False},
+                     "drop_best_5pct": {"passed": False},
+                     "g1_trade_count": {"passed": False}})
+    assert out["passed"] is True
+    assert out["failed_vetoes"] == []
+    assert out["diagnostics"] == {"param_plateau": False,
+                                  "yearly_segments": False,
+                                  "drop_best_5pct": False,
+                                  "g1_trade_count": False}
+
+
+def test_v3_any_veto_failure_fails_the_suite():
+    """T65 失败测试 3：否决项失败即不通过——G0 / 主检验 / 成本 ×1.5 /
+    延迟一根 / 多头相对买入持有超额，任一失败整 suites 不通过。"""
+    ok = {"passed": True}
+    bad = {"passed": False}
+    cases = {
+        "G0": dict(g0=bad, primary=ok, cost_scale=ok, delay=ok, buyhold=ok),
+        "primary": dict(g0=ok, primary=bad, cost_scale=ok, delay=ok,
+                        buyhold=ok),
+        "cost_scale_x15": dict(g0=ok, primary=ok, cost_scale=bad, delay=ok,
+                               buyhold=ok),
+        "delay_1_bar": dict(g0=ok, primary=ok, cost_scale=ok, delay=bad,
+                            buyhold=ok),
+        "buyhold_excess": dict(g0=ok, primary=ok, cost_scale=ok, delay=ok,
+                               buyhold=bad),
+    }
+    for name, kw in cases.items():
+        out = vg.evaluate_v3(**kw, diagnostics={"param_plateau": ok})
+        assert out["passed"] is False, name
+        assert out["failed_vetoes"] == [name]
+    # 全过 → 通过
+    assert vg.evaluate_v3(g0=ok, primary=ok, cost_scale=ok, delay=ok,
+                          buyhold=ok)["passed"] is True
+
+
+def test_v3_primary_tests_dsr_and_year_block():
+    """主检验两个备选（蓝图附录 B v3）：
+    - 方案甲：WF 拼接 OOS 收益的 PSR/DSR（N=项目级，实验 n_trials=1）；
+    - 方案乙：同一收益序列按年块自助的单侧 p（Bonferroni 按项目级 N）。
+    """
+    cfg = vg.load_gates(suite="v3")[0]
+    rng = np.random.default_rng(7)
+    good = pd.Series(0.0012 + rng.normal(0.0, 0.0008, 6000))
+    noise = pd.Series(rng.normal(0.0, 0.004, 6000))
+    a_good = vg.v3_primary_dsr(good, n_trials=1, trial_sharpes=None, cfg=cfg)
+    a_noise = vg.v3_primary_dsr(noise, n_trials=1, trial_sharpes=None,
+                                cfg=cfg)
+    assert a_good["passed"] is True and a_good["probability"] >= 0.95
+    assert a_noise["passed"] is False and a_noise["probability"] < 0.95
+    assert a_noise["trial_scope"] == "project" and a_noise["test"] == "dsr"
+    # OOS 无方差（常数）→ fail-closed 概率 0
+    flat = vg.v3_primary_dsr(pd.Series([0.0] * 50), n_trials=1,
+                             trial_sharpes=None, cfg=cfg)
+    assert flat["passed"] is False and flat["probability"] == 0.0
+
+    # 方案乙：多年正漂移（每年均值>0）→ p 小过；零漂移 → 不过的概率语义
+    hours = pd.date_range("2016-01-01", periods=6000, freq="6h")
+    b_good = pd.Series(0.0004 + rng.normal(0.0, 0.004, 6000),
+                       index=pd.DatetimeIndex(hours))
+    b_zero = pd.Series(rng.normal(0.0, 0.004, 6000),
+                       index=pd.DatetimeIndex(hours))
+    out_good = vg.v3_primary_year_block(b_good, n_trials=1, cfg=cfg, seed=11)
+    out_zero = vg.v3_primary_year_block(b_zero, n_trials=1, cfg=cfg, seed=11)
+    assert out_good["test"] == "year_block"
+    assert out_good["threshold"] == pytest.approx(cfg.alpha)
+    assert out_good["n_blocks"] >= 2
+    assert out_good["passed"] is True
+    assert out_zero["passed"] is False
+    # Bonferroni：N=40 → 阈值收紧 40 倍（项目级试验数的口径）
+    n40 = vg.v3_primary_year_block(b_good, n_trials=40, cfg=cfg, seed=11)
+    assert n40["threshold"] == pytest.approx(cfg.alpha / 40)
+    assert n40["bonferroni_n"] == 40
+    # 年块 <2 → fail-closed（不炸、passed=False 带 reason）
+    one_year = pd.Series(0.001 + rng.normal(0.0, 0.004, 500),
+                         index=pd.DatetimeIndex(
+                             pd.date_range("2016-01-01", periods=500,
+                                           freq="h")))
+    few = vg.v3_primary_year_block(one_year, n_trials=1, cfg=cfg, seed=11)
+    assert few["passed"] is False and "年块" in few["reason"]
+
+
+def test_v3_run_primary_test_dispatch():
+    """run_primary_test 按 [v3].primary_test 分派；未知值（不可达，schema
+    已挡）fail-closed。"""
+    cfg = vg.load_gates(suite="v3")[0]
+    rng = np.random.default_rng(3)
+    rets = pd.Series(0.001 + rng.normal(0.0, 0.001, 4000),
+                     index=pd.DatetimeIndex(
+                         pd.date_range("2016-01-01", periods=4000,
+                                       freq="6h")))
+    via_dsr = vg.run_primary_test(rets, n_trials=1, cfg=cfg, seed=5)
+    assert via_dsr["test"] == "dsr"
+    cfg_b = dataclasses.replace(cfg, primary_test="year_block")
+    via_yb = vg.run_primary_test(rets, n_trials=1, cfg=cfg_b, seed=5)
+    assert via_yb["test"] == "year_block"
+    direct = vg.v3_primary_year_block(rets, n_trials=1, cfg=cfg_b, seed=5)
+    assert via_yb["p_value"] == direct["p_value"]

@@ -1385,3 +1385,193 @@ def test_merge_md_includes_r7_supplement_sections(tmp_path, monkeypatch):
     assert "分品种 G5 误报率" in md
     # 分布行至少给出 TST H1 档位 1.0 的 n=4（两分片各 2 种子合并）
     assert "n=4" in md
+
+
+# ================================================ T65/D34：关卡 v3 对照臂
+
+def _v3_cfg(gc):
+    """v3 提案配置的小样本替身（窗口/自助次数缩到测试可跑；正式标定用
+    仓库 config/gates-v3.toml 原值）。"""
+    c, _ = gc.vgate.load_gates(suite="v3")
+    return dataclasses.replace(c, train_months_hourly=12, test_months_hourly=3,
+                               train_months_intraday=12,
+                               test_months_intraday=3,
+                               bootstrap_sims=200)
+
+
+def test_v3_gate_suite_structure_and_layers(gc):
+    """T65：run_v3_gate_suite 产出 v3 层级检查（否决/诊断分列），
+    evaluate_v3 判定 = 否决层合取；诊断失败不翻转联合结论。"""
+    cfg = _v3_cfg(gc)
+    bars = random_walk_bars(n_days=900, bars_per_day=8)   # 30 个月 → 6 段 WF
+    strat = gc.LongPlantedEdgeStrategy(period_days=1, interval_hours=24)
+    out = gc.run_v3_gate_suite(
+        strat, {"hold_bars": 4}, timeframe="H1", bars=bars,
+        costs=ConstCosts(), contract_size=1.0, vols=(0.01, 0.01, 100.0),
+        cfg=cfg, seed=7, grid={"hold_bars": [4, 8]})
+    assert isinstance(out["verdict"]["passed"], bool)
+    for key in gc.V3_VETO_CHECKS:
+        assert key in out["checks"], key
+    for key in ("primary.dsr", "primary.year_block", "primary.year_block@N40"):
+        assert key in out["checks"], key
+    for key in ("diag.param_plateau", "diag.yearly_segments",
+                "diag.drop_best_5pct", "diag.g1.trade_count"):
+        assert key in out["checks"], key
+    # OOS 收益带时间索引（年块自助按年分块）；walk-forward 段数 > 1
+    assert isinstance(out["oos_returns"].index, pd.DatetimeIndex)
+    assert out["wf_segments"] >= 2
+    # 主检验两方案 + Bonferroni 敏感性判定与明细都在
+    assert "probability" in out["primary"]["dsr"]
+    assert "p_value" in out["primary"]["year_block"]
+    assert out["primary"]["year_block@N40"]["bonferroni_n"] \
+        == gc.V3_BONFERRONI_SENSITIVITY_N
+    # 诊断失败不改结论：手工把全部诊断置 False 重判，passed 不变
+    flipped = dict(out["checks"])
+    for k in flipped:
+        if k.startswith("diag."):
+            flipped[k] = False
+    veto = {k: out["checks"][k] for k in
+            ("G0", "veto.cost_x15", "veto.delay_1_bar", "veto.buyhold_excess")}
+    again = gc.vgate.evaluate_v3(
+        g0={"passed": veto["G0"]}, primary={"passed": flipped["primary.dsr"]},
+        cost_scale={"passed": veto["veto.cost_x15"]},
+        delay={"passed": veto["veto.delay_1_bar"]},
+        buyhold={"passed": veto["veto.buyhold_excess"]},
+        diagnostics={k: {"passed": v} for k, v in flipped.items()
+                     if k.startswith("diag.")})
+    assert again["passed"] == out["verdict"]["passed"]
+
+
+def test_v3_gate_suite_cost_veto_binds(gc):
+    """成本 ×1.5 否决真实起作用：成本大到吃掉全部毛利 → veto.cost_x15
+    False、联合不通过（换 zero 成本同一策略通过与否决无关）。"""
+    cfg = _v3_cfg(gc)
+    bars = random_walk_bars(n_days=300, bars_per_day=8, seed=9)
+    strat = gc.LongPlantedEdgeStrategy(period_days=1, interval_hours=24)
+    kw = dict(timeframe="H1", cfg=cfg, seed=7, grid={"hold_bars": [4, 8]},
+              contract_size=1.0, vols=(0.01, 0.01, 100.0))
+    huge = gc.run_v3_gate_suite(
+        strat, {"hold_bars": 4}, bars=bars, costs=ConstCosts(spread=500.0),
+        **kw)
+    assert huge["checks"]["veto.cost_x15"] is False
+    assert huge["verdict"]["passed"] is False
+    # failed_vetoes 用关卡层名（cost_scale_x15），与扁平检查键
+    # veto.cost_x15 同指一项
+    assert "cost_scale_x15" in huge["verdict"]["failed_vetoes"]
+
+
+def test_v3_joint_pass_recomputed_from_checks(gc):
+    """T65：联合通过率由逐条记录的检查布尔重算——joint.* 绝不是运行时
+    自报字段（合并器同函数重算，见 merge 专测）。"""
+    def rec(dsr, yb, cost, delay):
+        return {"checks": {"G0": True, "primary.dsr": dsr,
+                           "primary.year_block": yb,
+                           "primary.year_block@N40": yb,
+                           "veto.cost_x15": cost, "veto.delay_1_bar": delay,
+                           "veto.buyhold_excess": True}}
+    runs = [rec(True, True, True, True), rec(True, False, True, True),
+            rec(False, True, True, False), rec(True, True, False, True)]
+    rates = gc.v3_joint_rates(runs)
+    assert rates["joint.dsr"] == pytest.approx(0.5)   # 第 3/4 条否决失败
+    assert rates["joint.year_block"] == pytest.approx(0.25)  # 第 2/3/4 条
+    assert rates["primary.dsr"] == pytest.approx(0.75)
+    # 记录里若混入伪造的 joint 自报字段 → 不参与重算（被忽略）
+    tampered = [dict(r, checks={**r["checks"], "joint.dsr": True})
+                for r in runs]
+    assert gc.v3_joint_rates(tampered)["joint.dsr"] == pytest.approx(0.5)
+
+
+def test_merge_v3_recomputes_joint_from_records(tmp_path, monkeypatch):
+    """T65 失败测试 4：v3 联合通过率在合并器里由逐条记录重算——分片只存
+    逐检查布尔；分片自报的 joint 字段被忽略，合并产物 joint.* 对拼接后
+    的 runs 重算（种子里换一条否决失败，联合率随之变）。"""
+    mm = _load_merge_module(tmp_path, monkeypatch, name="merge_v3")
+
+    def checks(dsr=True, yb=True, cost=True):
+        return {"G0": True, "primary.dsr": dsr, "primary.year_block": yb,
+                "primary.year_block@N40": yb, "veto.cost_x15": cost,
+                "veto.delay_1_bar": True, "veto.buyhold_excess": True,
+                "diag.param_plateau": True}
+
+    def shard(dirname, seeds_from, seeds, joint_lied, cost_last):
+        runs = [{"setup": "TST H1", "null": "day", "seed": s,
+                 "checks": checks(), "joint": {"dsr": joint_lied}}
+                for s in seeds[:-1]]
+        runs.append({"setup": "TST H1", "null": "day", "seed": seeds[-1],
+                     "checks": checks(cost=cost_last), "joint": {}})
+        pos = [{"setup": "TST H1", "level": 1.0, "seed": s,
+                "drift": 0.001, "sharpe": 1.0,
+                "checks": checks(dsr=s % 2 == 0, yb=True)}
+               for s in seeds]
+        d = tmp_path / dirname
+        d.mkdir()
+        (d / "gate-power.json").write_text(json.dumps({
+            "meta": {"phase": "v3", "seeds": len(seeds),
+                     "seeds_from": seeds_from, "levels": [1.0],
+                     "setups": ["TST H1"], "nulls": ["day"],
+                     "primary_schemes": ["dsr", "year_block"],
+                     "n_trials": 1,
+                     "bonferroni_sensitivity_n": 40,
+                     "fingerprint": {"git_commit": "a" * 40,
+                                     "git_dirty": False,
+                                     "gates_sha256": "b" * 64,
+                                     "cost_versions": {"TST H1": "const-v0"},
+                                     "script_sha256": "c" * 64}},
+            "negative": {"runs": runs},
+            "positive": {"runs": pos, "calibration": {
+                "TST H1": {"TST": {"1.0": {
+                    "drift": 0.001, "achieved_sharpe": 1.0}}}}},
+        }, ensure_ascii=False), encoding="utf-8")
+        return d
+
+    d1 = shard("v3s1", 0, [0, 1], joint_lied=True, cost_last=True)
+    d2 = shard("v3s2", 2, [2, 3], joint_lied=True, cost_last=False)
+    out = tmp_path / "merged-v3"
+    assert mm.main(["--shards", f"{d1},{d2}", "--out", str(out)]) == 0
+    m = json.loads((out / "gate-power-v3.json").read_text(encoding="utf-8"))
+    neg = m["negative"]["joint_false_positive_rates"]["TST H1|day"]
+    # 4 条负对照里恰 1 条 veto.cost_x15=False → 联合误报 3/4（自报全 True
+    # 被忽略）；主检验甲单检 4/4
+    assert neg["joint.dsr"] == pytest.approx(0.75)
+    assert neg["primary.dsr"] == pytest.approx(1.0)
+    assert neg["veto.cost_x15"] == pytest.approx(0.75)
+    pos = m["positive"]["joint_detection_rates"]["TST H1"]["1.0"]
+    # 正对照：dsr 过 2/4（种子 0、2）→ joint.dsr 2/4
+    assert pos["joint.dsr"] == pytest.approx(0.5)
+    assert pos["primary.dsr"] == pytest.approx(0.5)
+    assert pos["joint.year_block"] == pytest.approx(1.0)
+    assert m["meta"]["seeds"] == 4 and m["meta"]["merged_from_shards"] is True
+    md = (out / "gate-power-v3.md").read_text(encoding="utf-8")
+    assert "联合" in md and "负对照" in md and "正对照" in md
+    # 分片自报 joint 字段不应渗进合并产物
+    assert all("joint" not in r for r in m["negative"]["runs"])
+
+
+def test_cli_v3_quick_end_to_end(gc, monkeypatch, tmp_path):
+    """--phase v3 --quick 端到端：装配注入小样本 → gate-power-v3.json/md
+    落盘、退出码 0、meta 带两方案与联合口径。"""
+    bars = random_walk_bars(n_days=300, bars_per_day=8)
+    monkeypatch.setattr(
+        gc, "assemble_experiment",
+        lambda data_root, symbols, max_bars: {
+            "TST H1": {"bars": bars, "costs": ConstCosts(), "sizes": 1.0,
+                       "vols": (0.01, 0.01, 100.0), "timeframe": "H1",
+                       "session_policy": None}})
+    out_dir = tmp_path / "gates-v3"
+    rc = gc.main(["--phase", "v3", "--quick", "--v3-setups", "TST:H1",
+                  "--v3-levels", "1.0", "--out", str(out_dir),
+                  "--data-root", "data_research"])
+    assert rc == 0
+    payload = json.loads((out_dir / "gate-power-v3.json").read_text(
+        encoding="utf-8"))
+    assert payload["meta"]["phase"] == "v3"
+    assert payload["meta"]["primary_schemes"] == ["dsr", "year_block"]
+    assert "negative" in payload and "positive" in payload
+    assert payload["negative"]["runs"], "quick 负对照应有记录"
+    assert payload["positive"]["runs"], "quick 正对照应有记录"
+    for run in payload["negative"]["runs"] + payload["positive"]["runs"]:
+        assert {"G0", "primary.dsr", "primary.year_block",
+                "veto.cost_x15", "veto.delay_1_bar",
+                "veto.buyhold_excess"} <= set(run["checks"])
+    md = (out_dir / "gate-power-v3.md").read_text(encoding="utf-8")
+    assert "联合" in md

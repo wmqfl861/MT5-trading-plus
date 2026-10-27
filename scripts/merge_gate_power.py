@@ -60,6 +60,12 @@ R10 修正（第九轮复审 R9-I6 / T56）：
   → 拒绝合并，且 **--allow-legacy 不豁免**（legacy 仅适用于键**整体不
   存在**的历史无指纹产物；键在而不合法是伪造/截断/损坏）。分片间相等
   比较维持不变（校验在前，比较照旧）。
+
+T65/D34（关卡 v3 对照臂）：分片 meta.phase == "v3" 时走 v3 合并路径
+（merge_v3_main）——拼接 runs、按 setup×null / setup×level 校验种子覆盖、
+**联合通过率由逐条记录重算**（gc.v3_joint_rates——与单进程同一函数），
+产物 gate-power-v3.{json,md}。v3 记录里任何自报的 joint 字段在合并时
+剥离（联合口径只有"逐检查布尔重算"这一处定义）。
 """
 from __future__ import annotations
 
@@ -203,6 +209,181 @@ def recompute_flags(results: dict) -> list[dict]:
     """R6/C8：与单进程主流程共用 gc.compute_flags（正对照 + G5 检出率双源
     遍历、G5 误报按 null 取最差）。"""
     return gc.compute_flags(results)
+
+
+# ------------------------------------------------------- T65/D34：v3 分片合并
+
+# v3 分片的实验身份键（与 gate_calibration.run_v3_phase 的 meta 对齐）。
+V3_META_IDENTITY_KEYS = (
+    "phase", "levels", "setups", "nulls", "primary_schemes",
+    "bonferroni_sensitivity_n", "n_trials", "test_sims",
+    "gates_v3_sha256", "initial_capital", "risk_per_trade",
+    "max_bars", "ext_source", "bars_source", "fingerprint",
+)
+
+
+def _v3_seed_problems(docs: list[dict]) -> list[str]:
+    """v3 分片种子校验：meta 声明段互不相交之外，逐条件核对实际种子——
+    负对照 setup×null、正对照 setup×level 每个条件必须恰好覆盖本分片声明
+    的种子段（重复/缺样/越界都拒绝），条件整组缺样同样拒绝。"""
+    problems: list[str] = []
+    for idx, s in enumerate(docs):
+        meta = s.get("meta") or {}
+        start = int(meta.get("seeds_from", 0))
+        count = int(meta.get("seeds", 0))
+        declared = set(range(start, start + count))
+        groups: dict[tuple, list[int]] = {}
+
+        def _add(kind: tuple, run: dict) -> None:
+            groups.setdefault(kind, []).append(int(run["seed"]))
+
+        for run in (s.get("negative") or {}).get("runs", []):
+            _add(("negative", run.get("setup"), run.get("null")), run)
+        for run in (s.get("positive") or {}).get("runs", []):
+            _add(("positive", run.get("setup"), str(run.get("level"))), run)
+        expected: set[tuple] = set()
+        for setup in meta.get("setups") or []:
+            for null in meta.get("nulls") or []:
+                expected.add(("negative", setup, null))
+            for level in [str(float(lv)) for lv in meta.get("levels") or []]:
+                expected.add(("positive", setup, level))
+        if not expected:
+            problems.append(f"分片{idx} meta 缺 setups/nulls/levels——无法"
+                            "生成 v3 应有条件清单，拒绝合并")
+        for kind in sorted(expected - set(groups), key=repr):
+            problems.append(
+                f"分片{idx} {kind}: 整组缺样——缺种子 {sorted(declared)}"
+                "（v3 实验设计要求本分片在该条件下跑满声明种子段）")
+        for kind, seeds in sorted(groups.items(), key=repr):
+            got = set(seeds)
+            dup = sorted(x for x in got if seeds.count(x) > 1)
+            if dup:
+                problems.append(f"分片{idx} {kind}: 种子重复 {dup}")
+            missing = sorted(declared - got)
+            if missing:
+                problems.append(f"分片{idx} {kind}: 缺种子 {missing}")
+            extra = sorted(got - declared)
+            if extra:
+                problems.append(f"分片{idx} {kind}: 声明段外种子 {extra}")
+    return problems
+
+
+def merge_v3(docs: list[dict]) -> dict:
+    """v3 分片合并：拼接 runs（剥离自报 joint 字段），联合误报/检出率由
+    gc.v3_joint_rates 对合并后样本**重算**；校准逐分片应逐位一致（校准恒用
+    seed=0 的同数据），不一致即拒绝。"""
+    neg_runs = []
+    for s in docs:
+        neg_runs.extend((s.get("negative") or {}).get("runs", []))
+    pos_runs = []
+    for s in docs:
+        pos_runs.extend((s.get("positive") or {}).get("runs", []))
+    # 自报 joint 字段一律剥离——联合通过率只有"逐检查布尔重算"一个定义
+    for run in neg_runs + pos_runs:
+        run.pop("joint", None)
+        run.pop("joint_by_scheme", None)
+    nulls = list((docs[0].get("meta") or {}).get("nulls") or gc.NULL_ORDER)
+    levels = [str(float(lv)) for lv in
+              (docs[0].get("meta") or {}).get("levels") or []]
+    fp_rates: dict[str, dict[str, float]] = {}
+    for setup in {r["setup"] for r in neg_runs}:
+        for null in nulls:
+            bucket = [r for r in neg_runs
+                      if r["setup"] == setup and r["null"] == null]
+            if bucket:
+                fp_rates[f"{setup}|{null}"] = gc.v3_joint_rates(bucket)
+    detection: dict[str, dict[str, dict[str, float]]] = {}
+    for setup in {r["setup"] for r in pos_runs}:
+        detection[setup] = {}
+        for level in levels:
+            bucket = [r for r in pos_runs
+                      if r["setup"] == setup and str(r["level"]) == level]
+            if bucket:
+                detection[setup][level] = gc.v3_joint_rates(bucket)
+    calibration: dict[str, dict] = {}
+    for s in docs:
+        c = (s.get("positive") or {}).get("calibration")
+        if not isinstance(c, dict):
+            continue
+        for key, by_symbol in c.items():
+            if key in calibration and calibration[key] != by_symbol:
+                raise ValueError(
+                    f"分片 v3 calibration 不一致（setup {key}）——校准恒用 "
+                    "seed=0 同数据，不一致说明数据/成本不同源，拒绝合并")
+            calibration.setdefault(key, by_symbol)
+    return {
+        "negative": {"runs": neg_runs,
+                     "joint_false_positive_rates": fp_rates},
+        "positive": {"runs": pos_runs,
+                     "joint_detection_rates": detection,
+                     "calibration": calibration},
+    }
+
+
+def merge_v3_main(docs: list[dict], out: Path, *, allow_legacy: bool) -> int:
+    """v3 合并入口：身份/指纹/种子校验 → merge_v3 → gate-power-v3 产物。"""
+    identity = _fingerprint_problems(docs)
+    if _all_shards_missing_fingerprint(docs) and not allow_legacy:
+        identity.append(
+            "所有分片 meta 都缺 fingerprint——运行身份未封闭（R8-I2），"
+            "拒绝合并；确需合并历史无指纹诊断产物请显式传 --allow-legacy")
+    ref = docs[0].get("meta") or {}
+    for key in V3_META_IDENTITY_KEYS:
+        ref_val = ref.get(key)
+        for idx, s in enumerate(docs[1:], start=1):
+            other = (s.get("meta") or {}).get(key)
+            if other != ref_val:
+                identity.append(
+                    f"分片 meta.{key} 不一致（分片0={ref_val!r}，"
+                    f"分片{idx}={other!r}）——v3 实验身份不同，拒绝合并")
+    if identity:
+        for p in identity:
+            print(f"✗ {p}")
+        print("✗ v3 分片实验身份不一致或不完整，拒绝合并")
+        return 1
+    seed_sets = [range(int(s["meta"].get("seeds_from", 0)),
+                       int(s["meta"].get("seeds_from", 0))
+                       + int(s["meta"].get("seeds", 0)))
+                 for s in docs]
+    all_seeds = [x for r in seed_sets for x in r]
+    if len(all_seeds) != len(set(all_seeds)):
+        print("✗ 分片种子重叠，拒绝合并")
+        return 1
+    problems = _v3_seed_problems(docs)
+    if problems:
+        for p in problems:
+            print(f"✗ {p}")
+        print("✗ v3 分片实际运行与实验设计不符（条件整组缺样/种子重复/"
+              "缺样/越界），拒绝合并")
+        return 1
+    try:
+        merged = merge_v3(docs)
+    except (KeyError, ValueError) as e:
+        print(f"✗ v3 分片产物结构与合并器不兼容：{type(e).__name__}: {e}")
+        return 1
+    meta = dict(ref)
+    meta["seeds"] = sum(int(s["meta"].get("seeds", 0)) for s in docs)
+    meta["shards"] = sorted(
+        ({"from": int(s["meta"].get("seeds_from", 0)),
+          "n": int(s["meta"].get("seeds", 0))} for s in docs),
+        key=lambda d: d["from"])
+    meta.pop("seeds_from", None)
+    meta["merged_from_shards"] = True
+    meta["generated_utc"] = docs[-1]["meta"].get("generated_utc")
+    if allow_legacy and _all_shards_missing_fingerprint(docs):
+        meta["legacy_no_fingerprint"] = True
+    results = {"meta": meta, **merged}
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "gate-power-v3.json").write_text(
+        json.dumps(results, ensure_ascii=False, indent=2,
+                   default=gc._json_default), encoding="utf-8")
+    (out / "gate-power-v3.md").write_text(
+        gc.render_v3_report(results), encoding="utf-8")
+    n_runs = len(merged["negative"]["runs"]) + len(
+        merged["positive"]["runs"])
+    print(f"— v3 合并 {len(docs)} 分片 / {len(all_seeds)} 种子 / "
+          f"{n_runs} 条运行 → {out / 'gate-power-v3.md'}")
+    return 0
 
 
 # 实验身份键（N-I4/R7 + R8-I2）：这些 meta 字段定义"这是哪个实验"——
@@ -611,8 +792,18 @@ def main(argv=None) -> int:
 
     docs = []
     for d in args.shards.split(","):
-        p = Path(d.strip()) / "gate-power.json"
+        base = Path(d.strip())
+        # v3 分片产物名是 gate-power-v3.json（T65），先查它再回退旧名
+        p = base / "gate-power-v3.json"
+        if not p.is_file():
+            p = base / "gate-power.json"
         docs.append(json.loads(p.read_text(encoding="utf-8")))
+    # T65/D34：关卡 v3 对照分片走独立合并路径（联合率由逐条记录重算）
+    if (docs[0].get("meta") or {}).get("phase") == "v3":
+        if len({(s.get("meta") or {}).get("phase") for s in docs}) != 1:
+            print("✗ 分片 phase 不一致（v3 与非 v3 混拼），拒绝合并")
+            return 1
+        return merge_v3_main(docs, Path(args.out), allow_legacy=args.allow_legacy)
     if len({tuple(sorted(s["meta"]["baselines"])) for s in docs}) != 1:
         print("✗ 分片的 baselines 不一致，拒绝合并")
         return 1

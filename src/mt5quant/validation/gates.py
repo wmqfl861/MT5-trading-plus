@@ -27,6 +27,17 @@ DEFAULT_GATES_TOML = Path(__file__).resolve().parents[3] / "config" / "gates.tom
 # [g5] 改单侧判定（C3）；键名随蓝图 v3 附录 B 变更）
 FROZEN_GATES_SHA256 = "68f49237d1b56df62691ab8516804349fce245e1dc3cdb8896bf03716f594357"
 
+# ------------------------------------------------------- T65/D34：关卡 v3
+# gates-v3.toml 是**提案文件，不生效**：load_gates 只在显式 suite="v3" 时
+# 读它；缺省（suite="v2"）路径与 FROZEN_GATES_SHA256 的冻结校验逐位不变。
+# 批准后：gates-v3.toml 内容替换 gates.toml，同一提交更新
+# FROZEN_GATES_SHA256（与 FROZEN_GATES_V3_SHA256 合一），蓝图追加 D34。
+DEFAULT_GATES_V3_TOML = (Path(__file__).resolve().parents[3] / "config"
+                         / "gates-v3.toml")
+# 冻结指纹（2026-10-28，T65 提案冻结：[v3] 主检验两方案 + 三否决 +
+# [g4].dsr_trial_scope = "project"）
+FROZEN_GATES_V3_SHA256 = "6de391d57abe461d42db03972c9440fa43a02469be6046a3daaa74ba49d5f017"
+
 GATE_ORDER = ("G0", "G1", "G2", "G3", "G4", "G5")
 
 
@@ -108,6 +119,22 @@ class GatesConfig:
     dsr_trial_scope: str = "family"
 
 
+@dataclass(frozen=True)
+class GatesV3Config(GatesConfig):
+    """关卡 v3 提案配置（config/gates-v3.toml，T65/D34——**不生效**，只在
+    load_gates(suite="v3") 时加载）。[g1]–[g5] 字段沿用 GatesConfig（[g1]
+    与 [g3].min_oos_ratio、[g4].mc_drawdown_* 在 v3 归诊断层；[g5] 不变；
+    [g3] 窗口是主检验的数据源），新增 [v3] 节四个主检验/否决键。"""
+
+    # [v3]（蓝图 v4 附录 B"关卡 v3 提案框架"）
+    primary_test: str = "dsr"        # 方案甲 dsr | 方案乙 year_block
+    alpha: float = 0.05              # 方案乙名义单侧显著性（Bonferroni 前）
+    bootstrap_sims: int = 1000       # 方案乙年块自助次数
+    cost_scale_veto: float = 1.5     # 否决：成本 ×1.5 期望仍 > 0
+    delay_bars: int = 1              # 否决：延迟一根 bar 净利仍 > 0
+    buyhold_excess_veto: bool = True  # 否决：纯多头策略超额（vs 买入持有）> 0
+
+
 _SCHEMA: dict[str, dict[str, type]] = {
     "": {"version": int},
     "g1": {"trade_count_min_intraday": int, "trade_count_min_hourly": int,
@@ -134,6 +161,14 @@ _SCHEMA: dict[str, dict[str, type]] = {
 # 只接受 family|project。
 _OPTIONAL_DEFAULTS = {("g4", "dsr_trial_scope"): "family"}
 _TRIAL_SCOPES = ("family", "project")
+
+# [v3] 节（T65/D34）：只在 suite="v3" 的解析路径出现；v2 的 _parse 把 v3
+# 当未知顶层键拒绝（现行 gates.toml 不含它）。
+_V3_SCHEMA: dict[str, dict[str, type]] = {
+    "v3": {"primary_test": str, "alpha": float, "bootstrap_sims": int,
+           "cost_scale_veto": float, "delay_bars": int,
+           "buyhold_excess_veto": bool}}
+V3_PRIMARY_TESTS = ("dsr", "year_block")
 
 
 def gates_sha256(path) -> str:
@@ -191,17 +226,81 @@ def _parse(data: dict, source: str) -> GatesConfig:
     return GatesConfig(**by_field)
 
 
-def load_gates(path=None, *, frozen_sha: str | None = None
-               ) -> tuple[GatesConfig, str]:
+def _parse_v3(data: dict, source: str) -> GatesV3Config:
+    """suite="v3" 的解析：[g1]–[g5] 复用 _parse（[v3] 节先剥离），再校验
+    [v3] 节与 version=3。"""
+    if data.get("version") != 3:
+        raise GatesConfigError(
+            f"{source}：version 必须是 3（关卡 v3 提案文件），收到 "
+            f"{data.get('version')!r}")
+    raw = data.get("v3")
+    if not isinstance(raw, dict):
+        raise GatesConfigError(f"{source}：[v3] 必须是表（主检验/否决键）")
+    fields = _V3_SCHEMA["v3"]
+    unknown = sorted(set(raw) - set(fields))
+    if unknown:
+        raise GatesConfigError(
+            f"{source}：[v3] 有未知键 {unknown}，合法键 {list(fields)}")
+    base = _parse({k: v for k, v in data.items() if k != "v3"}, source)
+    v3: dict = {}
+    for key, typ in fields.items():
+        if key not in raw:
+            raise GatesConfigError(f"{source}：[v3] 缺键 {key}")
+        v = raw[key]
+        if isinstance(v, bool) is not (typ is bool) \
+                or (typ is not bool and (isinstance(v, bool)
+                                         or not isinstance(v, typ))):
+            raise GatesConfigError(
+                f"{source}：[v3].{key} 必须是 {typ.__name__}，收到 {v!r}")
+        v3[key] = v
+    if v3["primary_test"] not in V3_PRIMARY_TESTS:
+        raise GatesConfigError(
+            f"{source}：[v3].primary_test 只能是 {list(V3_PRIMARY_TESTS)}"
+            f"（方案甲 DSR / 方案乙 年块自助），收到 {v3['primary_test']!r}")
+    if not 0.0 < v3["alpha"] < 1.0:
+        raise GatesConfigError(
+            f"{source}：[v3].alpha 必须在 (0,1) 开区间，收到 {v3['alpha']!r}")
+    if int(v3["bootstrap_sims"]) < 2:
+        raise GatesConfigError(
+            f"{source}：[v3].bootstrap_sims 须 ≥2（年块自助），收到 "
+            f"{v3['bootstrap_sims']!r}")
+    if float(v3["cost_scale_veto"]) < 1.0:
+        raise GatesConfigError(
+            f"{source}：[v3].cost_scale_veto 须 ≥1（成本放大倍数），收到 "
+            f"{v3['cost_scale_veto']!r}")
+    if int(v3["delay_bars"]) < 1:
+        raise GatesConfigError(
+            f"{source}：[v3].delay_bars 须 ≥1（蓝图：延迟一根），收到 "
+            f"{v3['delay_bars']!r}")
+    return GatesV3Config(
+        **{f: getattr(base, f) for f in base.__dataclass_fields__}, **v3)
+
+
+def load_gates(path=None, *, frozen_sha: str | None = None,
+               suite: str = "v2") -> tuple[GatesConfig, str]:
     """加载并核对门槛文件；返回 (配置, 文件 sha256)。
 
-    frozen_sha 为注入点（测试用）；缺省与 FROZEN_GATES_SHA256 比对。
+    frozen_sha 为注入点（测试用）；缺省与冻结值比对。suite（T65/D34）：
+    - "v2"（缺省）：config/gates.toml + FROZEN_GATES_SHA256——现行冻结
+      校验逐位不变；
+    - "v3"（提案，不生效）：config/gates-v3.toml + FROZEN_GATES_V3_SHA256，
+      返回 GatesV3Config。
     """
-    p = Path(path) if path is not None else DEFAULT_GATES_TOML
+    if suite == "v3":
+        p = DEFAULT_GATES_V3_TOML if path is None else Path(path)
+        default_sha = FROZEN_GATES_V3_SHA256
+    elif suite == "v2":
+        p = DEFAULT_GATES_TOML if path is None else Path(path)
+        default_sha = FROZEN_GATES_SHA256
+    else:
+        raise GatesConfigError(
+            f"suite 只能是 v2|v3（v3 为 T65 提案路径），收到 {suite!r}")
     if not p.is_file():
-        raise GatesConfigError(f"门槛文件不存在：{p}（config/gates.toml 必须入库）")
+        raise GatesConfigError(
+            f"门槛文件不存在：{p}（config/gates.toml 必须入库；v3 提案为 "
+            "config/gates-v3.toml，只在 suite=\"v3\" 时读取）")
     sha = gates_sha256(p)
-    expected = FROZEN_GATES_SHA256 if frozen_sha is None else frozen_sha
+    expected = default_sha if frozen_sha is None else frozen_sha
     if sha != expected:
         raise GatesConfigError(
             f"{p} 的 sha256({sha[:12]}…) 与冻结值({expected[:12]}…)不符——"
@@ -212,6 +311,8 @@ def load_gates(path=None, *, frozen_sha: str | None = None
             data = tomllib.load(f)
     except tomllib.TOMLDecodeError as e:
         raise GatesConfigError(f"{p}：TOML 解析失败：{e}") from e
+    if suite == "v3":
+        return _parse_v3(data, str(p)), sha
     return _parse(data, str(p)), sha
 
 
@@ -316,6 +417,162 @@ def run_g4(returns, *, n_trials: int, trial_sharpes, actual_max_drawdown,
         checks["mc_drawdown"] = {"passed": False, "reason": str(e)}
     return {"passed": bool(all(c["passed"] for c in checks.values())),
             "checks": checks, "seed": int(seed)}
+
+
+# ------------------------------------------------- 关卡 v3（T65/D34，提案）
+# 蓝图 v4 附录 B"关卡 v3 提案框架"：数据卫生否决（G0）+ 一个主检验（否决）
+# + 稳健性否决（成本 ×1.5 / 延迟一根 / 多头相对买入持有超额为正）+ 其余
+# 诊断（只报告）+ G5 不变。主检验的两个备选（都要实现与标定）：
+# - 方案甲：walk-forward 拼接样本外收益的 PSR/DSR（N 取项目级
+#   [g4].dsr_trial_scope="project"）；
+# - 方案乙：同一 OOS 收益序列按年块自助的单侧 p 值（Bonferroni 按项目级 N）。
+
+def v3_primary_dsr(oos_returns, *, n_trials: int, trial_sharpes,
+                   cfg: GatesV3Config) -> dict:
+    """主检验方案甲：walk-forward 拼接样本外收益的 PSR/DSR（否决）。
+
+    n_trials / trial_sharpes 按项目级计数由调用方从台账 dedup 取数后传入
+    （[g4].dsr_trial_scope="project"；标定臂不经台账，n_trials=1——DSR
+    退化为 PSR(0)，与 gate_calibration 现行实验口径一致）。
+    OOS 无方差/观测不足 → fail-closed（概率 0 + reason）。
+    """
+    try:
+        probability = vstats.deflated_sharpe_probability(
+            oos_returns, n_trials=n_trials, trial_sharpes=trial_sharpes)
+        reason = None
+    except ValueError as e:
+        probability, reason = 0.0, str(e)
+    return {
+        "passed": bool(probability >= cfg.dsr_min_probability),
+        "probability": float(probability),
+        "min": float(cfg.dsr_min_probability),
+        "n_trials": int(n_trials),
+        "trial_scope": str(cfg.dsr_trial_scope),
+        "test": "dsr",
+        **({"reason": reason} if reason else {}),
+    }
+
+
+def v3_primary_year_block(oos_returns, *, n_trials: int,
+                          cfg: GatesV3Config, seed: int) -> dict:
+    """主检验方案乙：同一 OOS 收益序列按年块自助的单侧 p 值（否决）。
+
+    Bonferroni：p ≤ alpha / N（N = 项目级试验数，与方案甲同一 [g4].
+    dsr_trial_scope 取数）。序列须带时间索引（年块按自然年分块；块内
+    结构保留、年内相关折叠）；事件模式传 event_returns DataFrame
+    （entry_time 列）——同一实现（events.event_test，T66 已单独标定）。
+    年块 <2 → fail-closed（不通过 + reason，绝不猜）。
+    """
+    from mt5quant.validation import events as vevents
+    n = max(1, int(n_trials))
+    threshold = float(cfg.alpha) / n
+    try:
+        test = vevents.event_test(oos_returns, sims=int(cfg.bootstrap_sims),
+                                  seed=int(seed))
+    except ValueError as e:
+        return {"passed": False, "p_value": None, "reason": str(e),
+                "threshold": threshold, "alpha": float(cfg.alpha),
+                "bonferroni_n": n, "test": "year_block"}
+    return {
+        "passed": bool(test["p_value"] <= threshold),
+        "p_value": float(test["p_value"]),
+        "threshold": threshold,
+        "alpha": float(cfg.alpha),
+        "bonferroni_n": n,
+        "n_blocks": int(test["n_blocks"]),
+        "mean": float(test["mean"]),
+        "test": "year_block",
+    }
+
+
+def run_primary_test(oos_returns, *, n_trials: int, cfg: GatesV3Config,
+                     seed: int, trial_sharpes=None) -> dict:
+    """按 [v3].primary_test 分派主检验（批准后 bt 接线用；标定臂两方案
+    都算）。"""
+    if cfg.primary_test == "dsr":
+        return v3_primary_dsr(oos_returns, n_trials=n_trials,
+                              trial_sharpes=trial_sharpes, cfg=cfg)
+    if cfg.primary_test == "year_block":
+        return v3_primary_year_block(oos_returns, n_trials=n_trials,
+                                     cfg=cfg, seed=seed)
+    raise GatesConfigError(
+        f"[v3].primary_test 只能是 {list(V3_PRIMARY_TESTS)}，收到 "
+        f"{cfg.primary_test!r}（schema 已挡——此处 fail-closed 兜底）")
+
+
+def v3_veto_cost_scale(spec, bars, costs, params, cfg: GatesV3Config) -> dict:
+    """v3 稳健性否决 1：成本 ×[v3].cost_scale_veto 期望（每笔净利均值）
+    仍 > 0。G2 cost_scaling 的 v3 精简版（×2 备查与越幅/早年点差敏感性
+    归诊断报告，不在此复算）。"""
+    from mt5quant.validation import robustness as vrob
+    scaled = vrob.run_engine(
+        spec, bars, vrob.ScaledCosts(costs, float(cfg.cost_scale_veto)),
+        params)
+    exp = (float(scaled.trades["net"].mean())
+           if len(scaled.trades) else None)
+    return {"passed": bool(exp is not None and exp > 0),
+            "expectancy_scaled": exp,
+            "scale": float(cfg.cost_scale_veto)}
+
+
+def v3_veto_delay(spec, bars, costs, params, cfg: GatesV3Config) -> dict:
+    """v3 稳健性否决 2：全部信号延迟 [v3].delay_bars 根 bar 执行（缺省 1，
+    蓝图"延迟一根"）净利仍 > 0。"""
+    import numpy as _np
+    from mt5quant.validation import robustness as vrob
+    k = int(cfg.delay_bars)
+    strategy = spec.strategy
+    values = strategy.generate_signals(bars, params).to_numpy()
+    delayed = _np.concatenate((_np.zeros(k, dtype="int64"),
+                               values[:-k])).astype("int64")
+    fixed = vrob.FixedSignals(delayed, exit_rules=strategy.exit_rules)
+    delayed_run = vrob.run_engine(spec, bars, costs, {}, strategy=fixed)
+    original_run = vrob.run_engine(spec, bars, costs, params)
+    net_delayed = (float(delayed_run.trades["net"].sum())
+                   if len(delayed_run.trades) else 0.0)
+    net_original = (float(original_run.trades["net"].sum())
+                    if len(original_run.trades) else 0.0)
+    return {"passed": bool(net_delayed > 0), "delay_bars": k,
+            "net_original": net_original, "net_delayed": net_delayed}
+
+
+def v3_veto_buyhold(spec, bars, costs, trades, base_sharpe,
+                    cfg: GatesV3Config) -> dict:
+    """v3 稳健性否决 3：纯多头策略夏普须高于同期买入持有（超额为正）；
+    非纯多头不适用（passed=True，不否决）。复用 vrob.buy_hold_check。"""
+    from mt5quant.validation import robustness as vrob
+    if not cfg.buyhold_excess_veto:
+        return {"passed": True, "applicable": False,
+                "note": "[v3].buyhold_excess_veto = false——否决关闭"}
+    return vrob.buy_hold_check(spec, bars, costs, trades, base_sharpe, cfg)
+
+
+V3_VETO_LAYERS = ("G0", "primary", "cost_scale_x15", "delay_1_bar",
+                  "buyhold_excess")
+
+
+def evaluate_v3(*, g0: dict, primary: dict, cost_scale: dict, delay: dict,
+                buyhold: dict, diagnostics: dict | None = None) -> dict:
+    """关卡 v3 判定（蓝图附录 B 提案框架）：**否决层全过才通过**——
+    G0 ∧ 主检验 ∧ 成本 ×1.5 ∧ 延迟一根 ∧ 多头超额；诊断层（参数邻域、
+    按年分段、去最好 5%、G1 样本内线、回撤分位等）只报告，失败不改变
+    通过结论（异常时人工复核）。G5 不变，仍是独立的一次性关卡。
+    """
+    veto = {
+        "G0": bool(g0["passed"]),
+        "primary": bool(primary["passed"]),
+        "cost_scale_x15": bool(cost_scale["passed"]),
+        "delay_1_bar": bool(delay["passed"]),
+        "buyhold_excess": bool(buyhold["passed"]),
+    }
+    diags = {name: bool(check.get("passed", False))
+             for name, check in (diagnostics or {}).items()}
+    return {
+        "passed": bool(all(veto.values())),
+        "veto": veto,
+        "diagnostics": diags,
+        "failed_vetoes": [k for k in V3_VETO_LAYERS if not veto[k]],
+    }
 
 
 # ---------------------------------------------------------------- G5（T21a/C3 重写）
