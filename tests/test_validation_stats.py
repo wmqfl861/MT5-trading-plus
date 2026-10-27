@@ -272,3 +272,57 @@ def test_mc_drawdown_batched_memory_under_500mb():
     assert len(dist.drawdowns) == 1000
     assert peak > 50_000_000        # ≈ 每批 2×60 MB 的矩阵确实被追踪
     assert peak < 500_000_000       # H6 验收线
+
+
+def test_mc_drawdown_block_len1_memory_under_500mb():
+    """T70/F6：缺省 block_len=1（iid）时**起点矩阵**也须逐批抽取。
+
+    旧实现把 (sims, n_blocks) 起点一次性抽完：block_len=288 时 n_blocks 只有
+    ~1285 尚可，但缺省 block_len=1 时 n_blocks = n，37 万根 × 1000 sims 的
+    int64 起点矩阵约 3 GB——F6 指出的内存陷阱。逐批抽取后峰值须 < 500 MB。
+    """
+    import tracemalloc
+    rng = np.random.default_rng(1)
+    r = pd.Series(rng.normal(0.0002, 0.004, 370_000))
+    tracemalloc.start()
+    try:
+        dist = vstats.mc_drawdown_distribution(r, sims=1000, seed=3)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert len(dist.drawdowns) == 1000
+    assert peak > 50_000_000        # 批矩阵确实被追踪（防空断言）
+    assert peak < 500_000_000       # F6 验收线
+
+
+def test_mc_drawdown_batched_starts_match_oneshot_block_stream():
+    """T70/F6：起点改逐批抽取后，与旧实现（一次性抽完 sims×n_blocks 起点、
+    再分批 gather）同种子**逐位一致**。
+
+    rng.integers 按行主序填充且 numpy Generator 的每次调用共享同一条随机流
+    （同一 bounds/dtype 下分批拼接与一次抽完逐值相同），故分批只改变分配
+    时机、不改变随机流——这是不更新任何快照的依据。
+    """
+    r = trending_returns(n=5000, seed=6)
+    seed = vstats.rng_seed("H003")
+    sims, bl = 100, 288
+    dist = vstats.mc_drawdown_distribution(r, sims=sims, seed=seed,
+                                           block_len=bl)
+    # 旧实现复算：一次性抽 (sims, n_blocks) 起点，再按同批大小 gather + 就地回撤
+    arr = np.asarray(r, dtype="float64")
+    n = len(arr)
+    n_blocks = -(-n // bl)
+    rng = np.random.default_rng(seed)
+    starts = rng.integers(0, n - bl + 1, size=(sims, n_blocks))
+    mdds = []
+    for b0 in range(0, sims, vstats._MC_SIMS_PER_BATCH):
+        b1 = min(b0 + vstats._MC_SIMS_PER_BATCH, sims)
+        sampled = vstats._gather_blocks(arr, starts[b0:b1], bl)[:, :n]
+        np.add(sampled, 1.0, out=sampled)
+        np.cumprod(sampled, axis=1, out=sampled)
+        peaks = np.maximum.accumulate(sampled, axis=1)
+        np.maximum(peaks, 1.0, out=peaks)
+        np.divide(sampled, peaks, out=sampled)
+        sampled -= 1.0
+        mdds.extend(float(x) for x in sampled.min(axis=1))
+    assert list(dist.drawdowns) == mdds

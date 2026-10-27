@@ -15,10 +15,11 @@ Journal of Portfolio Management 40(5)：
 - V[SR_trials] 取各次试验 Sharpe 的样本方差（同一 bar 频率口径）；
   trial_sharpes 缺省或不足 2 个 → V=0 → SR₀=0（如实：没有可用选择效应估计）。
 
-蒙特卡洛回撤分布（T21c/H6 修订）：**块**自助重采样（block_len = 一个交易日
-的 bar 数，保留日级波动聚集；缺省 1 = 旧 iid 自助，且随机流与旧实现逐位
-一致）+ **分批**模拟（每批 ≤ _MC_SIMS_PER_BATCH 条路径；37 万根的 M5 序列
-每个批矩阵约 60 MB，一次性物化 sims×n 会到数 GB）。逐条路径算最大回撤
+蒙特卡洛回撤分布（T21c/H6 + T70/F6 修订）：**块**自助重采样（block_len =
+一个交易日的 bar 数，保留日级波动聚集；缺省 1 = 旧 iid 自助，且随机流与
+旧实现逐位一致）+ **分批**模拟（起点逐批抽取、每批 ≤ _MC_SIMS_PER_BATCH
+条路径；缺省 block_len=1 时 n_blocks = n，一次性抽 sims×n 个起点会在
+37 万根 × 1000 sims 下物化约 3 GB 的起点矩阵）。逐条路径算最大回撤
 （相对历史峰值，负比例），得到 [p1, p5, p50, p95, p99] 分布；策略实际回撤
 落在分布的百分位过高（差于几乎所有重采样路径）→ 报警。
 
@@ -41,7 +42,8 @@ import pandas as pd
 
 EULER_GAMMA = 0.5772156649015329
 
-# H6/探针 P4：M5 全史（约 37 万根）单矩阵约 3 GB——分批后每批 ≤20 条路径
+# H6/探针 P4 + T70/F6：M5 全史（约 37 万根）块路径单矩阵约 3 GB——起点与
+# 路径都逐批物化，每批 ≤20 条路径（起点、批矩阵、峰值行合计约 180 MB）
 _MC_SIMS_PER_BATCH = 20
 # 块自助夏普的分块规模（窗口 × 2000 sims 在长窗时会到数百 MB）
 _BOOTSTRAP_CHUNK = 256
@@ -257,10 +259,13 @@ def mc_drawdown_distribution(returns, *, sims: int, seed: int,
                              block_len: int = 1) -> DrawdownDistribution:
     """块自助重采样 bar 收益 → 最大回撤分布（同 seed 逐位可复现）。
 
-    T21c/H6：分批物化路径（每批 ≤ _MC_SIMS_PER_BATCH 条，就地运算控峰值
-    内存），重采样改按块（block_len = 一个交易日的 bar 数；缺省 1 = 旧 iid
-    自助，随机流与旧实现完全一致——块起点一次抽完，block_len=1 时形状与
-    旧 idx 相同）。
+    T21c/H6 + T70/F6：起点**逐批**抽取（每批 ≤ _MC_SIMS_PER_BATCH 条路径，
+    就地运算控峰值内存——缺省 block_len=1 时 n_blocks = n，一次性抽
+    sims×n 个起点在 37 万根 × 1000 sims 下是约 3 GB 的 int64 矩阵）；
+    重采样按块（block_len = 一个交易日的 bar 数；缺省 1 = 旧 iid 自助）。
+    numpy Generator 的随机流与调用切分无关（同一 bounds/dtype 下，
+    rng.integers 行主序逐值填充，分批拼接与一次抽完逐位相同），故逐批
+    抽取不改变任何 seed 的结果——与旧实现（一次性抽完起点）逐位一致。
     """
     arr = _as_float_array(returns)
     if sims < 2:
@@ -275,11 +280,12 @@ def mc_drawdown_distribution(returns, *, sims: int, seed: int,
     n = len(arr)
     n_blocks = -(-n // int(block_len))
     rng = np.random.default_rng(seed)
-    starts = _sample_block_starts(rng, n, block_len, (int(sims), n_blocks))
     mdds = np.empty(int(sims), dtype="float64")
     for b0 in range(0, int(sims), _MC_SIMS_PER_BATCH):
         b1 = min(b0 + _MC_SIMS_PER_BATCH, int(sims))
-        sampled = _gather_blocks(arr, starts[b0:b1], block_len)[:, :n]
+        starts = _sample_block_starts(rng, n, block_len,
+                                      (b1 - b0, n_blocks))
+        sampled = _gather_blocks(arr, starts, block_len)[:, :n]
         # 就地算回撤：sampled ← 权益 ← 回撤（峰值内存 ≈ 2×批矩阵）
         np.add(sampled, 1.0, out=sampled)
         np.cumprod(sampled, axis=1, out=sampled)

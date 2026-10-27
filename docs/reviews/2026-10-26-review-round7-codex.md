@@ -11,25 +11,25 @@
 
 | 编号 | 判定 | 复核证据 |
 |---|---|---|
-| **C1 全平部分成交** | **部分** | 单向残仓重试、撤挂单已补。但 [executor.py:705](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/src/mt5live/executor.py:705) 仍以**净额为零**判完成。复现多空各残留 **0.08 手**：`ack=True`、下一轮 `flatten_acked`、归档成功。原报告明确要求检查持仓明细，这一要求仍未落实。 |
-| **C2 外部出场状态机** | **部分** | 未决事件持久化、历史延迟重查、执行器先于对账时阻止重开均已补。但 [executor.py:833](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/src/mt5live/executor.py:833) 只凭 `confirmed + cause=ack_external` 清空未决事件，旧人工确认可放行后续新事件，已复现自动重开。 |
-| **C3 多运行器影子账户** | **部分** | 分策略文件、票号隔离、查询刷新和无成交轮浮盈落盘已修。剩余问题包括：运行器内闸门仍使用本策略账户；聚合查询没有一致快照；读失败直接跳过策略。见 [live_runner.py:409](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/scripts/live_runner.py:409)、[paper.py:536](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/src/mt5live/paper.py:536)。 |
-| **C4 越幅接线与最小样本** | **部分** | 有效新格式越幅表的注入、回测和实盘 `min_days_per_hour` 检查已实现并有测试。但当前主库、研究库仍是旧版越幅表，加载后四品种均无 `overshoot_model`；修订报告引用的 **67/67 条 run#279–345 均为 `no-overshoot`**。见 [run_backtest.py:390](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/scripts/run_backtest.py:390)。 |
-| **C5 台账完整性** | **部分** | 写前验链、普通追加不再重封历史、快照检测直接删尾已补。但验证与追加不在同一写事务内；合法并发可断链；状态更新存在中途提交；审计事件内容未哈希；外部锚未核验历史前缀。见 [ledger.py:380](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/src/mt5quant/research/ledger.py:380)。 |
-| **C6 运维豁免进入研究/G5 自定义根** | **已修** | `screen/gate` 入口直接拒绝 `--ops-ack`，研究加载不再透传；G5 要求主库类型，主库访问另有显式 `--main-store` 守卫。相关拒绝测试通过。见 [bt.py:158](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/scripts/bt.py:158)、[bt.py:690](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/scripts/bt.py:690)。 |
-| **C7 日内零假设** | **部分** | [synthetic.py:202](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/src/mt5quant/validation/synthetic.py:202) 已联合置换收益和 OHLC 相对形状，原“开收比逐位不变”缺陷已修。但槽位无条件漂移仍保留，测试只证明条件漂移由约 `d` 降至 `d/2`，不能据此认定所有日内优势消失；正式分片也没有采用修复后实现的可核验证据。 |
-| **C8 分片合并与 flags** | **部分** | `setup`、字典型 calibration、G5 按 null 分桶、正对照与 G5 双源 flags 均已修。本批五分片重算结果与正式 JSON 完全一致。但删除某分片的**整个实验条件**仍可通过种子校验；数据、成本、关卡和实验配置未完整核验。见 [merge_gate_power.py:171](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/scripts/merge_gate_power.py:171)。 |
-| **I1 多写者原子文件协议** | **部分** | 唯一临时文件、正常创建/归档互斥、读取 `OSError` 转换已补。但新锁的超龄接管存在“读旧 mtime、删除新锁”竞态，已复现两个调用同时进入临界区。见 [fileio.py:76](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/src/mt5live/fileio.py:76)。 |
-| **I2 成本身份** | **部分** | 点差内容哈希、sampling、越幅哈希已入版本串；**swap 实际费率仍未纳入**。内存复现把每夜费率从 −1 改成 −10，实际费用随之变化，版本字符串完全相同。见 [run_backtest.py:548](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/scripts/run_backtest.py:548)。 |
-| **I3 越幅统计口径** | **已修** | 新主口径使用前一分钟触发侧极值作为预定价位，回放首次触发并保留零越幅；旧 `adjacent_jump` 单独标识，且明确承认新口径也是一种价位代理。实现和分块一致性等测试通过。见 [overshoot.py:204](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/src/mt5quant/costs/overshoot.py:204)。实际缓存尚未重建的问题归 C4。 |
-| **I4 CI 白名单信任边界** | **部分** | 检查器改从 main 的第二份 checkout 加载，修复了检查器自改自过。但非 `research/*` 分支仍直接成功退出，工作流自身也仍由 PR 版本提供；没有完成可信身份/受保护执行入口这一层。见 [research-allowlist.yml:49](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/.github/workflows/research-allowlist.yml:49)。 |
-| **I5 实盘点差缓存加载** | **已修** | 新加载器识别 v1/v2 包装并核对内容哈希。本轮直接用当前默认文件加载四品种均成功，sampling 为 `bar_open_m1`；入口接线测试通过。见 [live_runner.py:137](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/scripts/live_runner.py:137)。 |
-| **I6 同毫秒 tick 身份** | **未修** | 修复区间未修改该逻辑。给正确止损样例增加同毫秒后续报价后，B 仍正确成交，对账却报 `no_trigger_at_fill`。仍取该毫秒最后一笔，并跳过入场毫秒所有 tick。见 [reconcile_ab.py:378](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/scripts/reconcile_ab.py:378)。 |
-| **I7 EURUSD 禁入窗依据** | **已修，限已观测范围** | 已补分钟首笔、工作日/周日、冬夏和 3 月错位窗证据，并明确撤回“已覆盖 10 月欧洲先切窗口”的声明。维持删除旧六小时窗有较充分支持，全年外推仍保留边界。见 [rollover-dst 报告:137](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/docs/research/rollover-dst-2026-10-25.md:137)。本轮未重新执行 tick 测量。 |
-| **I8 测试场景过于理想化** | **部分** | 新增部分成交、历史延迟/失败恢复、重启、真实三实验臂 schema、不等种子数测试，有实质改善。但仍漏掉本轮复现的净零残仓、旧确认重用、台账事务交错、影子账户一致性；影子双运行器测试主要仍是同进程顺序调用。见 [test_mt5live_paper.py:640](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/tests/test_mt5live_paper.py:640)。 |
-| **M1 P8 暂停文件探针** | **已修** | 已分别读取全局和各 magic 暂停文件，并运行执行器先/对账先两种顺序。本轮实跑输出与恢复逻辑相符。见 [round5-probes.py:34](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/docs/reviews/probes/2026-10-25-round5-probes.py:34)。 |
-| **M2 合并脚本绝对路径** | **已修** | 正常从同目录定位，复制场景要求显式 `MT5QUANT_REPO`；个人工作区硬编码兜底已删除，相关测试通过。见 [merge_gate_power.py:40](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/scripts/merge_gate_power.py:40)。 |
-| **M3 蓝图与证据索引** | **部分** | 已同步到第六轮报告状态，并正确保留 T34/T39/T40 未验收。但仍写“截至 f3c7e93、1549 passed”，若干已经完成的代码修复仍标“在修”，与新报告也存在冲突。见 [blueprint.md:22](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/docs/blueprint.md:22)。 |
+| **C1 全平部分成交** | **部分** | 单向残仓重试、撤挂单已补。但 [executor.py:705](src/mt5live/executor.py:705) 仍以**净额为零**判完成。复现多空各残留 **0.08 手**：`ack=True`、下一轮 `flatten_acked`、归档成功。原报告明确要求检查持仓明细，这一要求仍未落实。 |
+| **C2 外部出场状态机** | **部分** | 未决事件持久化、历史延迟重查、执行器先于对账时阻止重开均已补。但 [executor.py:833](src/mt5live/executor.py:833) 只凭 `confirmed + cause=ack_external` 清空未决事件，旧人工确认可放行后续新事件，已复现自动重开。 |
+| **C3 多运行器影子账户** | **部分** | 分策略文件、票号隔离、查询刷新和无成交轮浮盈落盘已修。剩余问题包括：运行器内闸门仍使用本策略账户；聚合查询没有一致快照；读失败直接跳过策略。见 [live_runner.py:409](scripts/live_runner.py:409)、[paper.py:536](src/mt5live/paper.py:536)。 |
+| **C4 越幅接线与最小样本** | **部分** | 有效新格式越幅表的注入、回测和实盘 `min_days_per_hour` 检查已实现并有测试。但当前主库、研究库仍是旧版越幅表，加载后四品种均无 `overshoot_model`；修订报告引用的 **67/67 条 run#279–345 均为 `no-overshoot`**。见 [run_backtest.py:390](scripts/run_backtest.py:390)。 |
+| **C5 台账完整性** | **部分** | 写前验链、普通追加不再重封历史、快照检测直接删尾已补。但验证与追加不在同一写事务内；合法并发可断链；状态更新存在中途提交；审计事件内容未哈希；外部锚未核验历史前缀。见 [ledger.py:380](src/mt5quant/research/ledger.py:380)。 |
+| **C6 运维豁免进入研究/G5 自定义根** | **已修** | `screen/gate` 入口直接拒绝 `--ops-ack`，研究加载不再透传；G5 要求主库类型，主库访问另有显式 `--main-store` 守卫。相关拒绝测试通过。见 [bt.py:158](scripts/bt.py:158)、[bt.py:690](scripts/bt.py:690)。 |
+| **C7 日内零假设** | **部分** | [synthetic.py:202](src/mt5quant/validation/synthetic.py:202) 已联合置换收益和 OHLC 相对形状，原“开收比逐位不变”缺陷已修。但槽位无条件漂移仍保留，测试只证明条件漂移由约 `d` 降至 `d/2`，不能据此认定所有日内优势消失；正式分片也没有采用修复后实现的可核验证据。 |
+| **C8 分片合并与 flags** | **部分** | `setup`、字典型 calibration、G5 按 null 分桶、正对照与 G5 双源 flags 均已修。本批五分片重算结果与正式 JSON 完全一致。但删除某分片的**整个实验条件**仍可通过种子校验；数据、成本、关卡和实验配置未完整核验。见 [merge_gate_power.py:171](scripts/merge_gate_power.py:171)。 |
+| **I1 多写者原子文件协议** | **部分** | 唯一临时文件、正常创建/归档互斥、读取 `OSError` 转换已补。但新锁的超龄接管存在“读旧 mtime、删除新锁”竞态，已复现两个调用同时进入临界区。见 [fileio.py:76](src/mt5live/fileio.py:76)。 |
+| **I2 成本身份** | **部分** | 点差内容哈希、sampling、越幅哈希已入版本串；**swap 实际费率仍未纳入**。内存复现把每夜费率从 −1 改成 −10，实际费用随之变化，版本字符串完全相同。见 [run_backtest.py:548](scripts/run_backtest.py:548)。 |
+| **I3 越幅统计口径** | **已修** | 新主口径使用前一分钟触发侧极值作为预定价位，回放首次触发并保留零越幅；旧 `adjacent_jump` 单独标识，且明确承认新口径也是一种价位代理。实现和分块一致性等测试通过。见 [overshoot.py:204](src/mt5quant/costs/overshoot.py:204)。实际缓存尚未重建的问题归 C4。 |
+| **I4 CI 白名单信任边界** | **部分** | 检查器改从 main 的第二份 checkout 加载，修复了检查器自改自过。但非 `research/*` 分支仍直接成功退出，工作流自身也仍由 PR 版本提供；没有完成可信身份/受保护执行入口这一层。见 [research-allowlist.yml:49](.github/workflows/research-allowlist.yml:49)。 |
+| **I5 实盘点差缓存加载** | **已修** | 新加载器识别 v1/v2 包装并核对内容哈希。本轮直接用当前默认文件加载四品种均成功，sampling 为 `bar_open_m1`；入口接线测试通过。见 [live_runner.py:137](scripts/live_runner.py:137)。 |
+| **I6 同毫秒 tick 身份** | **未修** | 修复区间未修改该逻辑。给正确止损样例增加同毫秒后续报价后，B 仍正确成交，对账却报 `no_trigger_at_fill`。仍取该毫秒最后一笔，并跳过入场毫秒所有 tick。见 [reconcile_ab.py:378](scripts/reconcile_ab.py:378)。 |
+| **I7 EURUSD 禁入窗依据** | **已修，限已观测范围** | 已补分钟首笔、工作日/周日、冬夏和 3 月错位窗证据，并明确撤回“已覆盖 10 月欧洲先切窗口”的声明。维持删除旧六小时窗有较充分支持，全年外推仍保留边界。见 [rollover-dst 报告:137](docs/research/rollover-dst-2026-10-25.md:137)。本轮未重新执行 tick 测量。 |
+| **I8 测试场景过于理想化** | **部分** | 新增部分成交、历史延迟/失败恢复、重启、真实三实验臂 schema、不等种子数测试，有实质改善。但仍漏掉本轮复现的净零残仓、旧确认重用、台账事务交错、影子账户一致性；影子双运行器测试主要仍是同进程顺序调用。见 [test_mt5live_paper.py:640](tests/test_mt5live_paper.py:640)。 |
+| **M1 P8 暂停文件探针** | **已修** | 已分别读取全局和各 magic 暂停文件，并运行执行器先/对账先两种顺序。本轮实跑输出与恢复逻辑相符。见 [round5-probes.py:34](docs/reviews/probes/2026-10-25-round5-probes.py:34)。 |
+| **M2 合并脚本绝对路径** | **已修** | 正常从同目录定位，复制场景要求显式 `MT5QUANT_REPO`；个人工作区硬编码兜底已删除，相关测试通过。见 [merge_gate_power.py:40](scripts/merge_gate_power.py:40)。 |
+| **M3 蓝图与证据索引** | **部分** | 已同步到第六轮报告状态，并正确保留 T34/T39/T40 未验收。但仍写“截至 f3c7e93、1549 passed”，若干已经完成的代码修复仍标“在修”，与新报告也存在冲突。见 [blueprint.md:22](docs/blueprint.md:22)。 |
 
 ### 新发现问题（Critical/Important/Minor）
 
@@ -60,13 +60,13 @@ runs run#3: 行内容与 row_hash 不符
 runs run#3: prev_hash 与上一行的 row_hash 不符
 ```
 
-另一个复现中，`_update_chained()` 调用 `_snapshot_refresh("ledger_events")` 时，其内部连接上下文已经提交了外层修改；在更新 gates 快照前发生异常，关卡内容已经变更，快照仍旧，后续验链失败。相关位置为 [ledger.py:320](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/src/mt5quant/research/ledger.py:320)。
+另一个复现中，`_update_chained()` 调用 `_snapshot_refresh("ledger_events")` 时，其内部连接上下文已经提交了外层修改；在更新 gates 快照前发生异常，关卡内容已经变更，快照仍旧，后续验链失败。相关位置为 [ledger.py:320](src/mt5quant/research/ledger.py:320)。
 
 应在取得写事务后完成验链、读取链尾、写内容、写审计记录和更新快照，最后统一提交；辅助函数不能隐式提交调用方的事务。SQLite 对单次写操作的串行化不足以保证这组操作的原子性。
 
 **Critical N-C4：v3 修订节把未启用越幅的运行描述为已计入越幅。**
 
-[修订节第 39 行](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/docs/research/gates-calibration-v3-2026-10-26.md:39) 声称 run#279–345 的成本版本包含 `ov[...]`。实际查询结果：
+[修订节第 39 行](docs/research/gates-calibration-v3-2026-10-26.md:39) 声称 run#279–345 的成本版本包含 `ov[...]`。实际查询结果：
 
 ```text
 记录总数：67
@@ -80,7 +80,7 @@ runs run#3: prev_hash 与上一行的 row_hash 不符
 
 **Important N-I1：正式 gate-power 仍来自修复前启动的分片，重合并没有补上运行证据。**
 
-五分片的运行起始元数据均为 **2026-10-26 01:51 UTC 左右**，早于第六轮报告提交和 `82f9917` 修复提交。分片日志中的成本加载输出也仍是旧格式，没有新 sampling/内容指纹标记，例如 [shard-0.log](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/data/reports/gates/shard-0.log)。
+五分片的运行起始元数据均为 **2026-10-26 01:51 UTC 左右**，早于第六轮报告提交和 `82f9917` 修复提交。分片日志中的成本加载输出也仍是旧格式，没有新 sampling/内容指纹标记，例如 [shard-0.log](data/reports/gates/shard-0.log)。
 
 产物没有记录运行代码、数据、成本和关卡的完整指纹，无法证明 slot 负对照使用了 R6 修复后的实现。当前合并器可以修复 schema、分桶和 flags，不能改变已经完成的回测输入及置换算法。至少应撤销其“修复后正式验收”地位，再确定哪些旧运行可保留、哪些必须重做。
 
@@ -93,7 +93,7 @@ runs run#3: prev_hash 与上一行的 row_hash 不符
 **Important N-I3：台账“可重放审计”和外部锚仍有缺口。**
 
 - `ledger_events` 只校验行数和最大 rowid，不校验内容。直接改写 `old_content_json` 后，`verify_chain()` 仍返回空列表，历史状态可以被修改而不报警。
-- [ledger_anchor.py:212](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/scripts/ledger_anchor.py:212) 仅在行数减少、或行数相同而链头不同时报警。行数增长时不检查原锚定位置的前缀哈希，因此不能识别“重写历史并重封链后再追加”。
+- [ledger_anchor.py:212](scripts/ledger_anchor.py:212) 仅在行数减少、或行数相同而链头不同时报警。行数增长时不检查原锚定位置的前缀哈希，因此不能识别“重写历史并重封链后再追加”。
 - `write_anchor()` 追加新锚前也没有完成上述历史前缀核验。
 
 本次生产库两项 verify 通过，说明当前库通过现有检查器；不能据此宣称上述篡改路径已经被封住。
@@ -111,7 +111,7 @@ _seed_problems(...) == []
 
 **Minor N-M1：报告承诺的校准历史没有写入产物。**
 
-报告让读者查看 JSON 的 `calibration.history`，但 [gate_calibration.py:1339](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/scripts/gate_calibration.py:1339) 只保留 `drift` 和 `achieved_sharpe`，丢弃了迭代历史、目标、收敛情况等字段。应保存完整校准记录，或修正文档描述；当前无法通过正式 JSON 复核校准过程。
+报告让读者查看 JSON 的 `calibration.history`，但 [gate_calibration.py:1339](scripts/gate_calibration.py:1339) 只保留 `drift` 和 `achieved_sharpe`，丢弃了迭代历史、目标、收敛情况等字段。应保存完整校准记录，或修正文档描述；当前无法通过正式 JSON 复核校准过程。
 
 ### 产物审查
 
@@ -139,7 +139,7 @@ _seed_problems(...) == []
 
 USTEC 的 seed=0 校准结果本身已经超出代码默认的 ±0.15 容差，仍被接受为 best effort 并标作“约 1.0”。其他种子又改变事件相位及数据起点，优势强度和成本条件随之变化。应报告校准收敛状态及全部评估种子的分布，并使用独立校准依据；不能把低检出率完全归因于门槛。
 
-G5 部分还有更根本的可比性限制。[报告中的参照设计](C:/Users/Administrator/.zcode/workspace/664d5945-068c-46aa-ba82-7141f134aa13/docs/research/gate-power-2026-10-26.md:94) 使用“无植入策略的全研究段收益”，没有模拟已经通过前置关卡的 G3 样本外参照。本批参考 p5 约为：
+G5 部分还有更根本的可比性限制。[报告中的参照设计](docs/research/gate-power-2026-10-26.md:94) 使用“无植入策略的全研究段收益”，没有模拟已经通过前置关卡的 G3 样本外参照。本批参考 p5 约为：
 
 - XAUUSD：**−1.34～−0.93**；
 - USTEC：**−2.99～−1.69**。

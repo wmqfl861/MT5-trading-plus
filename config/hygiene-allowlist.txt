@@ -1,0 +1,13 @@
+# 敏感信息扫描例外（tests/test_repo_hygiene.py 加载；T70）
+# 格式：每行"路径"或"路径:模式名" + " # 一行理由"（理由必填）。
+# 失效条目（对应残留已修好）会被 test_allowlist_has_no_stale_entries 报红，
+# 修好后请连同本行一起删除。
+#
+# 全部现存例外都是 IPv4 模式对"非地址/非真实地址"文本的命中；
+# 账号@服务器、服务器名、本机路径三类当前零例外（保持零例外）。
+
+docs/ops/mcp-remote-access.md:ipv4  # 0.0.0.0=绑定通配地址（非真实服务器 IP）；0.0.1.0 是 Windows 能力名 OpenSSH.Server~~~~0.0.1.0 的版本号误报
+docs/reviews/2026-10-22-review-round1.md:ipv4  # 历史审核记录陈述 mcp.json host=0.0.0.0（绑定通配地址），非服务器地址
+docs/reviews/2026-10-23-review-round2.md:ipv4  # 同上：复审记录 host=0.0.0.0 通配绑定的事实陈述
+tests/test_mt5mcp_auth.py:ipv4  # 夹具用 0.0.0.0（bind-all 通配）测试"明文公网监听 fail-closed"，非真实地址
+tests/test_mt5mcp_config.py:ipv4  # 夹具：0.0.0.0 通配 + 203.0.113.7（RFC 5737 TEST-NET-3 文档示例段，非路由地址）
