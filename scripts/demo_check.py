@@ -12,8 +12,8 @@
   任一"无样本/未覆盖"= 未验收，退出码非 0：
   0. C-1 manifest 证据源：``<data>/live/run-manifest.json`` 存在且
      mode=="Demo"、magics 与证据一致；运行窗=当前 mode 最早 started_utc
-     ..now（重启不清窗）；manifest 缺失/mode 不符/存在 paper 状态文件/
-     日志含 ``[paper`` 行 = "证据来源可疑"拒绝；
+     ..now（重启不清窗）；manifest 缺失/mode 不符/schema_version 缺失或
+     ≠1/存在 paper 状态文件/日志含 ``[paper`` 行 = "证据来源可疑"拒绝；
   1. 持仓状态可核（T53 持仓判据源的选择）：state-<magic>.json 的
      **known_positions**（executor 每轮 ``_finish`` 已持久化——不连 MT5、
      不读 paper）逐 magic 存在，且与 confirmed 意图净手数一致；
@@ -332,6 +332,20 @@ def _parse_any_ts(value) -> datetime | None:
         return None
 
 
+def _bar_close_key(value) -> datetime | None:
+    """滑点/归因关联键（T59/P2，C-2 契约）：decision_id（``SYMBOL|TF|bar``）
+    的后缀或裸 bar ISO → 归一 naive UTC bar 收盘时刻；坏值 None。
+
+    生产端两侧形态不同：runner 的 decision_id 后缀是 naive isoformat
+    （无时区，runner.py:267-268）、executor 的 deals decision_bar 是
+    iso_utc（带 +00:00，executor.py:471）——**字符串相等比较会以同样
+    方式断链**，关联一律经 ``_parse_any_ts`` 归一为 naive UTC datetime
+    再作 dict 键比较。"""
+    if not isinstance(value, str) or not value:
+        return None
+    return _parse_any_ts(value.rsplit("|", 1)[-1])
+
+
 def load_run_manifest(live_dir: str) -> tuple[dict | None, str | None]:
     """读 C-1 run-manifest.json。返回 (文档, 错误说明)——文件缺失 →
     (None, None)；存在但读不出/不是对象 → (None, 原因)。"""
@@ -372,7 +386,9 @@ def load_deals_log(live_dir: str) -> tuple[list[dict], int]:
     统一成交形状与 paper 影子账本兼容（§7 日常检查复用同一形状）：
     - ``event``/``decision_bar``/``price``/``_t`` 原样保留；
     - ``entry``：fill_open→"in"、fill_close/external_exit→"out"；
-    - ``comment``：fill_open→decision_bar（开仓归因键=决策 bar）、
+    - ``comment``：fill_open→decision_bar（开仓归因键=决策 bar 收盘时刻，
+      消费侧经 ``_bar_close_key`` 归一 naive UTC 比较——T59/P2，两侧
+      ISO 形态不同不得字符串相等）、
       fill_close→"close"（主动平仓，须 orders 台账 close 记录支撑）、
       external_exit→""（保护性出场已由 reason 解释）；
     - ``reason``：字符串名称按 mt5gw 语义数值化（SL→4/TP→5/SO→6，null→None）；
@@ -435,8 +451,10 @@ def load_drill_rounds(live_dir: str) -> dict[str, dict]:
     - 命令：``command=="flatten_all"`` 且有 id（drill-archive 目录内任意
       *.json、commands/flatten.json 当前指令、commands/archive/flatten-*
       人工归档指令）；
-    - ack：含 magic/id/closed/ts 四字段（drill-archive 目录内任意 *.json、
-      commands/flatten.ack-<magic> 未删 ack）。
+    - ack：含 magic/id/closed/ts 四字段（drill-archive 目录内任意 *.json
+      与 ``flatten.ack-*``——**T59/P1：生产端归档副本保留原名
+      flatten.ack-<magic>，无 .json 扩展名（commands.py:48/191-194），
+      两种模式都匹配**；commands/flatten.ack-<magic> 未删 ack）。
     三点关联（编号+magic+时间窗）由 accept_double_flatten 判定，这里只收集。
     """
     rounds: dict[str, dict] = {}
@@ -467,11 +485,15 @@ def load_drill_rounds(live_dir: str) -> dict[str, dict]:
             d = os.path.join(root, cid)
             if not os.path.isdir(d):
                 continue
-            for path in sorted(glob.glob(os.path.join(d, "*.json"))):
-                try:
-                    _feed(_read_json(path))
-                except (OSError, ValueError):
-                    continue
+            # T59/P1：生产端（commands._copy_drill_evidence）把 ack 按原名
+            # flatten.ack-<magic> 复制进来（无扩展名）——只 glob *.json 会
+            # 漏掉全部 ack（消费端-生产端断链）
+            for pattern in ("*.json", "flatten.ack-*"):
+                for path in sorted(glob.glob(os.path.join(d, pattern))):
+                    try:
+                        _feed(_read_json(path))
+                    except (OSError, ValueError):
+                        continue
     cmds = os.path.join(live_dir, "commands")
     for path in [os.path.join(cmds, "flatten.json")]:
         if os.path.exists(path):
@@ -701,15 +723,23 @@ def check_unexplained_diffs(ctx, day: date) -> Check:
 
 
 def check_deal_attribution(ctx, day: date) -> Check:
-    """§7-2 后半：每笔成交可在台账或日志中找到对应决策。"""
+    """§7-2 后半：每笔成交可在台账或日志中找到对应决策。
+
+    开仓成交的归因键 = **解析后的 bar 收盘时刻**（T59/P2）：comment/
+    decision_id（含 paper 旧夹具的全 id comment）取 ``|`` 后缀经
+    ``_bar_close_key`` 归一为 naive UTC datetime 再比较——decision_id
+    后缀（naive）与 C-2 decision_bar（iso_utc 带 +00:00）字符串形态
+    不同，禁止字符串相等比较（会断链）。"""
     name = "每笔成交可归因（台账/日志有对应决策）"
-    decisions = {r["decision_id"] for r in ctx["orders"]
-                 if r.get("kind") == "open" and r.get("decision_id", "-") != "-"}
+    decision_ids = {r["decision_id"] for r in ctx["orders"]
+                    if r.get("kind") == "open" and r.get("decision_id", "-") != "-"}
     for lf in ctx["logs"]:
         for ln in lf.lines:
             m = re.search(r"决策 (\S+?)：", ln)
             if m:
-                decisions.add(m.group(1))
+                decision_ids.add(m.group(1))
+    decision_keys = {k for k in map(_bar_close_key, decision_ids)
+                     if k is not None}
     closes_available: dict[int, int] = {}
     for r in ctx["orders"]:
         if r.get("kind") == "close":
@@ -720,7 +750,8 @@ def check_deal_attribution(ctx, day: date) -> Check:
         if d["_t"].date() != day or d.get("entry") not in TRADE_ENTRIES:
             continue
         if d["entry"] == "in":
-            if str(d.get("comment", "")) not in decisions:
+            key = _bar_close_key(d.get("comment", ""))
+            if key is None or key not in decision_keys:
                 bad_in.append(f"#{d.get('ticket')} comment={d.get('comment')!r}")
         else:
             if d.get("reason") in PROTECTIVE_REASONS:
@@ -916,9 +947,12 @@ def accept_evidence_source(ctx) -> Check:
     problems = []
     if str(doc.get("mode")) != "Demo":
         problems.append(f"manifest mode={doc.get('mode')!r} ≠ Demo")
+    # T59/P3：schema_version 缺失同样拒绝（fail-closed，与生产端写入器对齐
+    # ——demo_run.ps1 恒写该字段；缺字段=契约不符，不得静默按 1 处理）
     version = doc.get("schema_version")
-    if version is not None and version != 1:
-        problems.append(f"schema_version={version!r} 不受支持（当前 1）")
+    if version != 1:
+        problems.append(f"schema_version={version!r} 不受支持（当前 1；"
+                        "缺失同样拒绝——fail-closed）")
     magics = set(ctx["manifest_magics"])
     if not magics:
         problems.append("manifest magics 为空")
@@ -1333,26 +1367,35 @@ def accept_slippage(ctx) -> Check:
     """判据 8（T53）：滑点样本——C-2 fill_open 成交价 vs 决策参考价
     （buy=ask / sell=bid，取自运行器决策行的 bid=/ask=）的差值分布：
     运行窗内有样本 + min/p50/p95/max 分位数入报告（无阈值判定，如实呈现
-    分布；PaperSoak 影子盘按决策价成交、不产生经纪商滑点——无样本=未验收）。"""
+    分布；PaperSoak 影子盘按决策价成交、不产生经纪商滑点——无样本=未验收）。
+
+    关联键 = **解析后的 bar 收盘时刻**（T59/P2）：决策行 decision_id 后缀
+    （naive isoformat）与 C-2 decision_bar（iso_utc 带 +00:00）经
+    ``_bar_close_key`` 归一为 naive UTC datetime——字符串相等比较在两种
+    真实形态之间恒 miss（C-2 断链根因）。"""
     name = "滑点样本（deals 成交价 vs 决策参考价）"
     if ctx["run_window"][0] is None:
         return Check(name, False, "运行窗不可定（C-1 manifest 缺失/无 runs）")
-    refs: dict[str, tuple[float, float]] = {}
+    refs: dict[datetime, tuple[float, float]] = {}
     for lf in ctx["logs"]:
         if lf.kind != "runner":
             continue
         for ln in lf.lines:
             m = DECISION_QUOTE_RE.search(ln)
             if m:
+                key = _bar_close_key(m.group(1))
+                if key is None:
+                    continue
                 try:
-                    refs[m.group(1)] = (float(m.group(2)), float(m.group(3)))
+                    refs[key] = (float(m.group(2)), float(m.group(3)))
                 except ValueError:
                     continue
     samples: list[float] = []
     for d in ctx["deals_log"]:
         if d.get("event") != "fill_open" or not _in_window(ctx, d["_t"]):
             continue
-        ref = refs.get(str(d.get("decision_bar") or ""))
+        bar_key = _bar_close_key(d.get("decision_bar"))
+        ref = refs.get(bar_key) if bar_key is not None else None
         if ref is None or not isinstance(d.get("price"), (int, float)):
             continue
         bid, ask = ref
@@ -1445,6 +1488,15 @@ def build_ctx(args) -> dict:
     manifest, manifest_error = load_run_manifest(live_dir)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     win_start = manifest_run_start(manifest)
+    # T59/P4：activity_days 的四个消费点（连续覆盖 accept_day_coverage、
+    # 逐日存活 accept_process_liveness、点差样本覆盖 accept_spread_samples、
+    # --accept 逐日严格复核 sweep）在此统一按 C-1 运行窗裁剪——窗外旧证据
+    # （D′ 演练期遗留的告警/日志/日报）既不得撑长覆盖跨度，也不得反过来
+    # 被要求补齐窗内才需要的证据。窗不可得（无 manifest/无合法 runs）保持
+    # 原样；--day/--summary 宽松档消费 all_days，本就不受影响。
+    if win_start is not None:
+        lo_day, hi_day = win_start.date(), now.date()
+        activity_days = {d for d in activity_days if lo_day <= d <= hi_day}
     deals_log, deals_log_bad = load_deals_log(live_dir)
     paper_state_files = sorted(glob.glob(
         os.path.join(live_dir, "paper", "state-*.json")))

@@ -28,6 +28,19 @@ T54（R9-I4）：双全平验收读 C-3 drill-archive（或 commands 目录）�
 R9 审核三反例（probes/2026-10-27-round9-audit.py build_full_evidence 变体）
 回归：纯 paper 证据/标题日报/仅两条 paper 保护性出场日志 --accept 必须失败。
 
+T59（R10 成果审核 P1-P4，2026-10-27）：跨组契约联测——消费端夹具不再
+手写"两侧恰好同字符串"的掩蔽形态，改用生产端真实产物/真实格式：
+- C-3 联测：真实调 mt5live.commands 的 write_flatten+write_ack+
+  archive_if_all_acked 产两轮归档（ack 副本保留原名 flatten.ack-<magic>
+  **无扩展名**）→ load_drill_rounds 必须读出（P1 修复前 acks=[]）；
+- C-2 联测：deals 的 decision_bar 用真实裸 bar ISO（iso_utc 带 +00:00）、
+  决策行/台账 decision_id 用真实 runner 格式（SYMBOL|TF|bar，naive 无
+  时区）——两侧形态不同，关联键必须归一为解析后的 bar 收盘时刻
+  （P2 修复前字符串相等比较恒 miss）；
+- P3：manifest 缺 schema_version 即拒绝（fail-closed，与存在且 ≠1 同）；
+- P4：activity_days 四个消费点按 C-1 运行窗裁剪——窗外旧证据
+  （D′ 演练期遗留）不得撑长覆盖/被要求补齐。
+
 绝不连真实 MT5、绝不下真实单：全部证据在临时目录构造（只读检查器）。
 """
 from __future__ import annotations
@@ -60,6 +73,15 @@ DEC_SL = f"{SYMBOL}|M15|2026-10-12T10:45:00"
 DEC_TP = f"{SYMBOL}|M15|2026-10-13T10:45:00"
 DEC_IN3 = f"{SYMBOL}|M15|2026-10-15T10:45:00"
 DEC_IN4 = f"{SYMBOL}|M15|2026-10-19T10:45:00"
+# 生产端真实格式（T59/C-2 契约联测修正）：executor deals 行的 decision_bar
+# = iso_utc(decision.bar_close_time)——裸 bar ISO、**带 +00:00**
+# （executor.py:471）；runner 决策行/下单台账的 decision_id 后缀 =
+# close_time.isoformat()——**naive 无时区**（runner.py:267-268）。两侧
+# 字符串形态不同（这正是 P2 断链根因），关联键=解析归一后的 bar 收盘时刻。
+BAR_SL = "2026-10-12T10:45:00+00:00"
+BAR_TP = "2026-10-13T10:45:00+00:00"
+BAR_IN3 = "2026-10-15T10:45:00+00:00"
+BAR_IN4 = "2026-10-19T10:45:00+00:00"
 
 DRILL1_CID = "a" * 31 + "1"
 DRILL2_CID = "b" * 31 + "2"
@@ -179,23 +201,25 @@ def build_full_evidence(root: Path) -> dict:
         "magic": MAGIC, "paused": False, "reason": None,
         "ts": "2026-10-15T13:35:00+00:00", "diffs": []}), encoding="utf-8")
 
-    # C-2 deals-<magic>.jsonl：开仓/保护性出场（SL+TP）/两轮全平的主动平仓
+    # C-2 deals-<magic>.jsonl：开仓/保护性出场（SL+TP）/两轮全平的主动平仓。
+    # fill_open 的 decision_bar 用生产端真实格式（executor.py:471 iso_utc——
+    # 裸 bar 带 +00:00；T59 契约联测修正，旧夹具写全 decision_id 属掩蔽形态）
     deals = [
         c2_deal("2026-10-12T10:45:06+00:00", 101, "fill_open",
-                price=4000.4, side="buy", decision_bar=DEC_SL),
+                price=4000.4, side="buy", decision_bar=BAR_SL),
         c2_deal("2026-10-12T16:20:11+00:00", 101, "external_exit",
                 reason="SL", price=3995.0, side="sell",
                 decision_bar="2026-10-12T16:15:00Z"),
         c2_deal("2026-10-13T10:45:07+00:00", 102, "fill_open",
-                price=4001.2, side="buy", decision_bar=DEC_TP),
+                price=4001.2, side="buy", decision_bar=BAR_TP),
         c2_deal("2026-10-13T15:30:05+00:00", 102, "external_exit",
                 reason="TP", price=4006.8, side="sell", decision_bar=None),
         c2_deal("2026-10-15T10:45:06+00:00", 103, "fill_open",
-                price=4002.0, side="buy", decision_bar=DEC_IN3),
+                price=4002.0, side="buy", decision_bar=BAR_IN3),
         c2_deal("2026-10-15T13:00:30+00:00", 103, "fill_close",
                 price=4001.5, side="sell", decision_bar=None),
         c2_deal("2026-10-19T10:45:06+00:00", 104, "fill_open",
-                price=4003.0, side="buy", decision_bar=DEC_IN4),
+                price=4003.0, side="buy", decision_bar=BAR_IN4),
         c2_deal("2026-10-22T09:30:30+00:00", 104, "fill_close",
                 price=4005.0, side="sell", decision_bar=None),
     ]
@@ -932,3 +956,124 @@ def test_day_lenient_flags_real_anomaly(tmp_path):
     doc_path.write_text(json.dumps(doc), encoding="utf-8")
     code, out = run_cli(mod, tmp_path, "--day", TRADING_DAYS[-1].isoformat())
     assert code == 1, out
+
+
+# ------------------------------------------------ T59 跨组契约联测（R10 审核阻断）
+
+def test_drill_archive_contract_real_producer(tmp_path):
+    """C-3 联测：真实生产端（mt5live.commands）write_flatten+write_ack+
+    archive_if_all_acked 产两轮归档（副本保留原名 flatten.ack-<magic>——
+    **无 .json 扩展名**，commands.py:48/191-194）→ load_drill_rounds 必须
+    读出两轮指令与全 magic ack，--accept 双全平判据必须通过。
+    修复前（P1 断链）：drill-archive 只 glob *.json → acks=[] 恒失败
+    （消费端旧夹具手写 ack-<magic>.json 恰好带扩展名，掩蔽了断链）。"""
+    import shutil
+    from datetime import timedelta
+
+    from mt5live.commands import (
+        archive_if_all_acked,
+        write_ack,
+        write_flatten,
+    )
+    from mt5live.monitor import parse_iso
+
+    mod = load_demo_check()
+    paths = build_full_evidence(tmp_path)
+    add_extra_magic(paths, MAGIC_B)      # manifest 两 magic：全 magic ack 关联
+    shutil.rmtree(paths["live"] / "drill-archive")   # 删手写夹具，只用真实产物
+    live = str(paths["live"])
+    magics = {MAGIC, MAGIC_B}
+    cids = []
+    for cmd_ts in (parse_iso(DRILL1_TS), parse_iso(DRILL2_TS)):
+        cmd = write_flatten(live, reason="daily_loss_cap", now=cmd_ts)
+        ack_ts = cmd_ts + timedelta(seconds=30)
+        for m in sorted(magics):
+            write_ack(live, m, cmd.id, closed=1, now=ack_ts)
+        assert archive_if_all_acked(live, magics, now=ack_ts)
+        cids.append(cmd.id)
+    # 生产端真实产物形状钉死：ack 副本无扩展名（这是 P1 断链根因）
+    drill1 = paths["live"] / "drill-archive" / cids[0]
+    assert (drill1 / "flatten.json").exists()
+    for m in sorted(magics):
+        assert (drill1 / f"flatten.ack-{m}").exists()
+        assert not (drill1 / f"flatten.ack-{m}.json").exists()
+    rounds = mod.load_drill_rounds(live)
+    assert sorted(rounds) == sorted(cids)
+    for cid in cids:
+        assert rounds[cid]["command"] is not None
+        assert rounds[cid]["command_ts"] is not None
+        assert {a["magic"] for a in rounds[cid]["acks"]} == magics
+        assert all(a["id"] == cid for a in rounds[cid]["acks"])
+    code, out = run_cli(mod, tmp_path, "--accept")
+    assert code == 0, out
+    assert "验收通过" in out
+
+
+def test_deals_decision_bar_contract_real_format(tmp_path):
+    """C-2 联测：deals 的 decision_bar 用生产端真实裸 bar 格式
+    （iso_utc 带 +00:00，executor.py:471）、决策行/台账 decision_id 用真实
+    runner 格式（SYMBOL|TF|bar naive 无时区，runner.py:267-268）——两侧
+    字符串不相等（P2 断链根因），--accept 滑点样本与逐日归因必须仍命中
+    （修复前：无滑点样本 + N 笔无对应决策，恒失败）。"""
+    mod = load_demo_check()
+    paths = build_full_evidence(tmp_path)
+    # 夹具形状钉死（防再漂回"两侧同字符串"的掩蔽形态）
+    first_fill = json.loads(
+        paths["deals_log"].read_text(encoding="utf-8").splitlines()[0])
+    assert first_fill["event"] == "fill_open"
+    assert first_fill["decision_bar"] == BAR_SL          # 裸 bar，带 +00:00
+    assert "|" not in first_fill["decision_bar"]
+    runner_ln = next(ln for ln in paths["runner_a"].read_text(
+        encoding="utf-8").splitlines() if "决策 " in ln and "bid=" in ln)
+    did = runner_ln.split("决策 ", 1)[1].split("：", 1)[0]
+    assert did == DEC_SL                                 # naive 无时区后缀
+    assert first_fill["decision_bar"] != did             # 正是断链差异
+    code, out = run_cli(mod, tmp_path, "--accept")
+    assert code == 0, out
+    assert "验收通过" in out
+    assert "无滑点样本" not in out
+    assert "无对应决策" not in out
+    assert "4 样本：min" in out                          # 4 笔 fill_open 全命中
+
+
+def test_accept_rejects_manifest_missing_schema_version(tmp_path):
+    """P3：manifest 缺 schema_version 即拒绝（fail-closed——生产端写入器
+    恒写该字段，读不到=契约不符；与存在且 ≠1 同样拒绝）。夹具形状钉死：
+    C-1 恒写全部字段 schema_version/mode/magics/runs/account_hint。"""
+    mod = load_demo_check()
+    paths = build_full_evidence(tmp_path)
+    doc = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+    for key in ("schema_version", "mode", "magics", "runs", "account_hint"):
+        assert key in doc, key + " 缺失（生产端恒写，夹具不得削弱）"
+    del doc["schema_version"]
+    paths["manifest"].write_text(json.dumps(doc), encoding="utf-8")
+    code, out = run_cli(mod, tmp_path, "--accept")
+    assert code == 1, out
+    assert "schema_version" in out
+    assert "验收通过" not in out
+
+
+def test_accept_ignores_out_of_window_stale_evidence(tmp_path):
+    """P4：窗外旧证据（D′ 演练期遗留）不得计入 --accept 覆盖——活动日按
+    C-1 运行窗（WIN_START=2026-10-12 起）统一裁剪后，连续覆盖/逐日存活/
+    点差样本覆盖/逐日严格 sweep 四个消费点都不得被窗外旧证据撑长，也不
+    得反过来要求为窗外旧日补齐证据（2026-10-08 故意不补日报/全天心跳）。
+    任一消费点泄漏（修复前：覆盖缺 10-09、10-08 缺逐小时心跳/日报）→
+    --accept 误不通过。"""
+    mod = load_demo_check()
+    paths = build_full_evidence(tmp_path)
+    stale = date(2026, 10, 8)            # 周四，窗起点 2026-10-12 之前
+    with open(paths["alerts"], "a", encoding="utf-8") as f:
+        f.write(f"2026-10-08T10:00:00+00:00\tRISK_REJECT\t"
+                f"magic {MAGIC} {SYMBOL}|M15|2026-10-08T22:00:00："
+                "forbidden_session: D′ 旧演练期遗留\n")
+    with open(paths["risk_log"], "a", encoding="utf-8") as f:
+        f.write(risk_line(stale, 10))
+    with open(paths["recon_log"], "a", encoding="utf-8") as f:
+        f.write(f"· 2026-10-08 10:00:41 UTC 对账一致（0 个持仓）\n")
+    with open(paths["runner_b"], "a", encoding="utf-8") as f:
+        f.write(decision_line(stale, 10, 45))
+    code, out = run_cli(mod, tmp_path, "--accept")
+    assert code == 0, out
+    assert "验收通过" in out
+    assert "2026-10-08" not in out       # 数据范围/逐日复核都不得再含窗外旧日
