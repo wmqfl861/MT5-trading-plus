@@ -22,9 +22,20 @@ docs/p6/permissions.md）；研究侧一切读取改走 data_research（--resear
   都必须早于 cutoff，一条越界即整体失败退出（退出码 2）；--verify-only
   可对既有研究库单独复检。
 
+外部数据（T67/D36/铁律 19，**默认不启用**）：
+- `--include-ext` 才把 data/ext/**（外部源适配后的 K 线）导出为
+  data_research/ext/<来源>/<品种>/<周期>/——研究库纳入外部数据须用户
+  先确认数据源（docs/research/ext-data-*.md 的"来源清单"），因此缺省关；
+- cutoff 纪律同样硬约束外部数据：只导出 time < 全局 cutoff 的行，
+  导出后 verify_ext_research_store 复检研究库 ext 段（manifest 必须合法、
+  last_time < cutoff，一条越界整体失败退出 2）；
+- ext 序列的 manifest 在读取与导出两侧都过 validate_manifest（缺字段
+  拒绝入库/拒绝导出），并追加 research_cutoff 与 exported_at_utc。
+
 用法（Git Bash，管理员）：
     .venv/Scripts/python.exe scripts/export_research_store.py
     .venv/Scripts/python.exe scripts/export_research_store.py --verify-only
+    .venv/Scripts/python.exe scripts/export_research_store.py --include-ext
 """
 from __future__ import annotations
 
@@ -40,6 +51,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import pandas as pd  # noqa: E402
 
+from mt5data.ext import ExtDataError  # noqa: E402
 from mt5data.lockbox import cutoff_for, load_config  # noqa: E402
 from mt5data.schedule import series_inventory  # noqa: E402
 from mt5data.store import load_bars, read_watermark, save_bars  # noqa: E402
@@ -130,6 +142,87 @@ def verify_research_store(dest: str, cutoff) -> list[str]:
     return violations
 
 
+def export_ext_series(ext_root: str, dest: str, cutoff, *,
+                      now_iso: str) -> tuple[int, int]:
+    """把 data/ext/** 导出进研究库（只取 time < cutoff 的行；T67）。
+
+    - manifest 在读取侧过 validate_manifest（缺字段 → ExtDataError，
+      调用方整体失败）：来源与版本不明的数据不进研究库；
+    - cutoff 之后的行**被裁掉**（铁律 19：外部数据同样只允许 cutoff
+      之前部分进研究路径），开放段为空的序列跳过；
+    - manifest 追加 research_cutoff / exported_at_utc 后随数据落盘。
+    返回 (导出序列数, 跳过数)。
+    """
+    from mt5data.ext import (ExtDataError, ExtSeries, ext_inventory,
+                             load_ext_series, save_ext_series,
+                             slice_before_cutoff)
+
+    inv = ext_inventory(ext_root)
+    if not inv:
+        print(f"· {ext_root} 无外部序列（ext manifest 一个都没有），跳过")
+        return 0, 0
+    exported = skipped = 0
+    for m in inv:
+        try:
+            loaded = load_ext_series(ext_root, m["source"], m["symbol"],
+                                     m["timeframe"])
+        except ExtDataError as e:
+            print(f"✗ {m['source']}/{m['symbol']}/{m['timeframe']}: "
+                  f"manifest 校验失败——{e}")
+            raise
+        if loaded is None:
+            continue
+        df, manifest = loaded
+        seg = slice_before_cutoff(df, cutoff)
+        if len(seg) == 0:
+            print(f"· {m['source']}/{m['symbol']}/{m['timeframe']} 开放段"
+                  "（time < cutoff）为空，跳过（整段都在锁箱期）")
+            skipped += 1
+            continue
+        out = dict(manifest)
+        out["research_cutoff"] = pd.Timestamp(cutoff).isoformat()
+        out["exported_at_utc"] = now_iso
+        out["rows"] = int(len(seg))
+        out["first_time"] = pd.Timestamp(seg["time"].iloc[0]).isoformat()
+        out["last_time"] = pd.Timestamp(seg["time"].iloc[-1]).isoformat()
+        save_ext_series(os.path.join(str(dest), "ext"),
+                        ExtSeries(df=seg, manifest=out))
+        print(f"✓ ext {m['source']}/{m['symbol']}/{m['timeframe']} 开放段 "
+              f"{len(seg):,} 根（time < {pd.Timestamp(cutoff).isoformat()}）",
+              flush=True)
+        exported += 1
+    return exported, skipped
+
+
+def verify_ext_research_store(dest: str, cutoff) -> list[str]:
+    """研究库 ext 段自检（T67）：manifest 合法 + last_time < cutoff。
+
+    与 verify_research_store 同语义：一条越界/一个坏 manifest 即记越界，
+    整体失败退出；读回不经写路径的内存副本。
+    """
+    from mt5data.ext import ExtDataError, ext_inventory
+
+    ext_root = os.path.join(str(dest), "ext")
+    if not os.path.isdir(ext_root):
+        return []
+    cut = pd.Timestamp(cutoff)
+    violations: list[str] = []
+    try:
+        inv = ext_inventory(ext_root)
+    except ExtDataError as e:
+        return [f"ext manifest 校验失败：{e}"]
+    for m in inv:
+        df = pd.read_parquet(os.path.join(
+            ext_root, m["source"], m["symbol"], m["timeframe"],
+            "data.parquet"))
+        if len(df) and pd.Timestamp(df["time"].max()) >= cut:
+            violations.append(
+                f"ext {m['source']}/{m['symbol']}/{m['timeframe']}: "
+                f"last_time={pd.Timestamp(df['time'].max()).isoformat()}"
+                f" ≥ cutoff={cut.isoformat()}（外部数据混入锁箱段）")
+    return violations
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="导出研究库（time < cutoff 的 K 线 + 成本缓存；T27/H3）")
@@ -138,6 +231,11 @@ def main(argv=None) -> int:
                     help="研究库根目录（默认 data_research）")
     ap.add_argument("--verify-only", action="store_true",
                     help="不导出，只对既有研究库跑导出自检")
+    ap.add_argument("--include-ext", action="store_true",
+                    help="纳入外部数据 data/ext/**（T67；默认不启用——"
+                         "研究库纳入须用户先确认数据源）")
+    ap.add_argument("--ext-root", default="data/ext",
+                    help="外部数据根目录（默认 data/ext）")
     args = ap.parse_args(argv)
 
     lockbox = load_config(args.data_root)
@@ -163,6 +261,8 @@ def main(argv=None) -> int:
                         "序列必须全部在锁箱约束下导出）")
                 else:
                     violations.extend(verify_research_store(args.dest, cut))
+        if global_cutoff is not None:
+            violations += verify_ext_research_store(args.dest, global_cutoff)
         for v in violations:
             print(f"✗ 越界：{v}")
         if violations:
@@ -260,10 +360,33 @@ def main(argv=None) -> int:
               "请重跑或排查写入路径")
         return 2
 
-    print(f"摘要：导出 {exported} 个序列（跳过 {skipped}），成本缓存与"
-          f" specs 已复制 → {args.dest}；自检通过（所有 last_time < cutoff）。"
-          "tick 不导出：研究侧成本经 data_research/costs/spread_model.json"
-          " 缓存提供；lockbox.json 不复制（研究库无锁箱段）。")
+    # 外部数据（T67）：--include-ext 才纳入；cutoff 硬校验同主库
+    ext_exported = ext_skipped = 0
+    if args.include_ext:
+        try:
+            ext_exported, ext_skipped = export_ext_series(
+                args.ext_root, args.dest, global_cutoff, now_iso=now_iso)
+        except ExtDataError as e:
+            print(f"✗ 外部数据导出失败：{e}")
+            return 1
+        if global_cutoff is not None:
+            ext_violations = verify_ext_research_store(args.dest,
+                                                       global_cutoff)
+            if ext_violations:
+                for v in ext_violations:
+                    print(f"✗ 越界：{v}")
+                print("研究库 ext 段自检失败——外部数据导出作废")
+                return 2
+    else:
+        print("· 外部数据未纳入（默认不启用；确认数据源后用 --include-ext）")
+
+    print(f"摘要：导出 {exported} 个序列（跳过 {skipped}）"
+          + (f"，外部数据 {ext_exported} 个序列（跳过 {ext_skipped}）"
+             if args.include_ext else "")
+          + f"，成本缓存与 specs 已复制 → {args.dest}；自检通过"
+            "（所有 last_time < cutoff）。tick 不导出：研究侧成本经 "
+            "data_research/costs/spread_model.json 缓存提供；"
+            "lockbox.json 不复制（研究库无锁箱段）。")
     return 0
 
 
