@@ -189,14 +189,14 @@ def load_model(path, *, expected_sha256: str) -> dict               # 哈希不�
   - 门槛为 threshold_mult × 平均来回成本；
   - 并列时按 A1 < A2 < A3 < A4 的顺序取第一个（确定性）。
 - **模型文件**：规范化 JSON（键排序、UTF-8、无多余空白）取 sha256；字段见蓝图 P 线附录 B。
-- [ ] 失败测试先行：
-  - 合成数据上随机抽 200 个**随机时点**（不是局面触发）：标签与引擎 A 单笔结果逐笔一致（出场原因映射、`net_r` 与 `r_multiple` 差 < 1e-12）；
-  - 同一根 bar 同时触及止损和止盈 → loss；开盘跳空穿过止损 → loss（stop_gap）；禁入窗推迟入场与引擎一致；手数为 0 → skipped；
-  - purge：标签窗口越过 `train_end` 的触发被剔除；
-  - 收缩：n = 0 的格等于基准，n 很大时趋近经验频率；不足 `min_cell` 的格退回上一级；
-  - `ev_lower` 随 z 单调不增；全部低于门槛 → None；并列时取序最前者；
-  - 模型文件往返一致，同一输入两次生成的哈希相同，哈希不符 → ModelIntegrityError。
-- [ ] **真数据对账证据**（本机运行，不进 CI）：XAUUSD H1 研究库上随机时点 200 个，逐笔一致，日志路径写进复选框。随机时点不是研究结论，不违反禁止事项。
+- [x] 失败测试先行（tests/test_prob_labels.py、test_prob_tables.py、test_prob_decision.py、test_prob_artifact.py，共 35 个测试，先红后绿）：
+  - 合成数据上随机抽 200 个**随机时点**（不是局面触发）：标签与引擎 A 单笔结果逐笔一致（出场原因映射、`net_r` 与 `r_multiple` 差 < 1e-12）——`test_labels_match_engine_200_random_times`；
+  - 同一根 bar 同时触及止损和止盈 → loss；开盘跳空穿过止损 → loss（stop_gap）；禁入窗推迟入场与引擎一致；手数为 0 → skipped——`test_same_bar_sl_tp_stop_priority_is_loss`、`test_gap_through_stop_is_loss`、`test_blocked_entry_delayed_matches_engine`、`test_zero_lots_is_skipped`；
+  - purge：标签窗口越过 `train_end` 的触发被剔除——`test_purge_drops_triggers_crossing_train_end`；
+  - 收缩：n = 0 的格等于基准，n 很大时趋近经验频率；不足 `min_cell` 的格退回上一级——`test_empty_cell_falls_back_to_base`、`test_large_n_approaches_empirical`、`test_thin_cell_falls_back_to_situation_action_parent`；
+  - `ev_lower` 随 z 单调不增；全部低于门槛 → None；并列时取序最前者——`test_ev_lower_monotone_non_increasing_in_z`、`test_choose_none_when_all_below_threshold`、`test_choose_tie_takes_first_in_action_order`；
+  - 模型文件往返一致，同一输入两次生成的哈希相同，哈希不符 → ModelIntegrityError——`test_to_dict_from_dict_roundtrip`、`test_same_input_same_hash`、`test_load_model_tampered_content_raises`。
+- [x] **真数据对账证据**（本机运行，不进 CI）：XAUUSD H1 研究库（52,146 根，成本 rel@NY p90 快照 + swap 快照）随机时点 200 个（seed=20261027），结局 loss 90 / win 85 / time 25，逐笔对照不一致 0 处、max|net_r−r_multiple|=0.000e+00；日志 `data/prob/t72-evidence-2026-10-27.log`（本机 worktree，结论存档于本提交说明）。随机时点不是研究结论，不违反禁止事项。
 
 ## T73：拟合钩子、分段与模型身份（L）
 
