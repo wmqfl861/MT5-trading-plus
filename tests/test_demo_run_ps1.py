@@ -68,7 +68,7 @@ def run_ps1(*args: str, timeout: float = 120.0) -> subprocess.CompletedProcess:
     inner = ("try { [Console]::OutputEncoding=[Text.Encoding]::UTF8 } "
              "catch { }; & " + _q(str(SCRIPT)) + " "
              + " ".join(_q(a) for a in args)
-             + " 6>&1 2>&1; exit $LASTEXITCODE")
+             + " 6>&1 2>&1")
     cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
            "-Command", inner]
     return subprocess.run(cmd, capture_output=True, timeout=timeout)
@@ -238,3 +238,23 @@ def test_dead_pid_not_treated_as_alive(tmp_path):
                    "-PrecheckOnly")
     assert proc.returncode == 0, _diag(proc)
     assert f"runner/{MAGIC}" not in out_text(proc)  # 不挡启动
+
+
+def test_ci_powershell_behavior_probe():
+    """临时诊断探针（CI 红灯定位用，绿后删除）：直接探测 CI 上
+    powershell 子进程的流行为——stdout/stderr 长度与内容、Write-Host 与
+    Write-Output 的去向、脚本调用的退出码传播。断言恒假，把全部信息
+    写进失败消息首行（注解按行截断）。"""
+    inner = ("try { [Console]::OutputEncoding=[Text.Encoding]::UTF8 } "
+             "catch { }; Write-Output 'PROBE-OUT'; "
+             "try { Write-Host 'PROBE-HOST' } catch { }; "
+             "& " + "'" + str(SCRIPT).replace("'", "''") + "' -BogusMode")
+    proc = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+         "-Command", inner], capture_output=True, timeout=90)
+    out = (proc.stdout or b"").decode("utf-8", errors="replace")
+    err = (proc.stderr or b"").decode("utf-8", errors="replace")
+    first = (f"PROBE rc={proc.returncode} stdout[{len(out)}]="
+             + out[:180].replace("\n", "⏎")
+             + f" stderr[{len(err)}]=" + err[:180].replace("\n", "⏎"))
+    assert False, first + "\n---full stdout---\n" + out + "\n---full stderr---\n" + err
