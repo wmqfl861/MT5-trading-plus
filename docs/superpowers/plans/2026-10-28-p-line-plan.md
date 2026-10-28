@@ -401,7 +401,7 @@ def n_needed_proportion(p0: float, dp: float, *, alpha: float = 0.05, power: flo
   - `candidates.py`：`MECHANISM_CLASSES` 增 `price_levels`；`[prob]` 段装载校验（ProbDeclared：situations/hypotheses≤4/bracket/level_grid 全品种/approach/breakout_atr/retest_window_bars/expected_delta_p∈(0,0.5)；price_levels 研究候选必带 [prob] 且不带 [declared]）；`precheck_prob` 五条件（成本口径 ΔEV_R=Δp×(tp_R+1) ≥ 3×触发小时均值成本(R)；检验力按假设（局面×动作，跨品种/方向合并）发现段最小触发数 vs 解析样本量，**t75_rule_pending=True——T75 实测样本量规则批准后取两者更严，届时接线**）；`propose_split`（各品种计入段并集→共同覆盖最长段中点→取整月初）；
   - `bt.py`：`bt candidate check` 概率模式分支（逐品种×局面计数→发现段子集→precheck_prob；`--split` 可显式指定月初，缺省自动提案）+ `bt segment propose` 子命令（真实库冒烟：XAUUSD H1 → 2019-12-01）——tests/test_prob_precheck.py 15 例。
   - 计划测试行对应：复现表 `test_n_needed_reproduces_blueprint_table`（九格参数化）+ `test_review_examples`；成本 fail `test_precheck_prob_cost_fail`、触发不足 waiting `test_precheck_prob_insufficient_triggers_waiting`；分界确定 `test_propose_split_deterministic_and_month_floored`；计数无结果列 `test_count_output_has_no_outcome_columns`、不 import 标签 `test_count_module_does_not_import_labels`（AST）。
-- [ ] **审核二修正（现在做，`docs/reviews/2026-10-28-review-pline-02.md`）**：
+- [x] **审核二修正（`docs/reviews/2026-10-28-review-pline-02.md`；提交 0d92448，tests run_number 105 success；全量 2034 passed, 1 skipped；探针四项全 PASS——P1 r_win=1.950/EV=+0.2100R、P2 周五触发剔除、P3 117 事件/0.89 ATR、P4 成本逐品种 FAIL→PASS）**：
   - Q1 事前成本逐品种：每个品种都要满足 ΔEV ≥ 3 倍成本（等价于取成本最高的品种）；保留 `checks["ex_ante_cost_prob"]["passed"]` 这个键；补两品种测试（一便宜一贵，贵的不满足 → fail）；
   - Q2 佣金换算：`commission_per_lot / cs`（价格单位），再除以 `sl_atr × ATR` 换成 R；补一条非零佣金的手算测试；
   - Q3 检验力的多重校正：`n_tests` 取候选登记的假设条数（4）；给开轮复核提供同一函数的全轮口径（T77 用）；测试复现蓝图 P 线 §3.4 的 D52 表（4 个假设：3,014 / 1,340 / 483；12 个假设：4,176 / 1,856 / 669）；
