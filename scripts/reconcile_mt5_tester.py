@@ -327,7 +327,8 @@ def main(argv=None) -> int:
             start=pd.Timestamp(args.start) if args.start else None,
             end=pd.Timestamp(args.end) if args.end else None)
         if args.costs == "auto":
-            costs, cost_version = build_costs(
+            costs, cost_version = # T83：对账路径刻意不传 swap_ref_price——与 MT5 策略测试器的绝对计费同口径（守护测试钉住）
+    build_costs(
                 args.data_root, args.symbol, args.spread_fraction,
                 args.commission, allow_zero_swap=args.allow_zero_swap,
                 spread_mode=args.spread_mode)

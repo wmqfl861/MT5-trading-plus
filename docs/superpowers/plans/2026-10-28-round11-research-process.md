@@ -327,20 +327,20 @@ def randomize_event_times(events, trading_days, *, seed: int) -> list[EventWindo
 
 **Files:** `scripts/bt.py`、`scripts/gate_calibration.py`、`scripts/run_backtest.py`（`build_costs`）、`scripts/calibrate_costs.py`；新建 `config/account-profile.toml`；测试。
 
-- [ ] **参考价接线**：
+- [x] **参考价接线** 完成（8259aa4+598a5c1，审核通过：7 处接线无遗漏/1986 反例 ruined 翻转/C001 逐位不变/对账绝对口径守护测试）：
   - `bt screen/gate` 与 `gate_calibration` 调 `build_costs` 时传 `swap_ref_price`，取研究库该品种最后收盘，与 CLI 主路径同一约定；`cost_version` 带 relref。
   - 对账路径保持绝对口径（与 MT5 策略测试器同口径），代码里写明原因。
   - 失败测试先行：
     - 经 `bt gate` 的 1986 反例不再爆仓；
     - C001、C002 的 precheck 数字逐位不变（预筛本来就按参考价折算）。
-- [ ] **模拟盘实测不进研究成本**：
+- [x] **模拟盘实测不进研究成本** 完成（account_kind 映射+demo 不作数+版本串标记；real 保留；夹具补 real 合理性经审核认定）：
   - `calibrated.json` 增加 `account_kind`（demo | real），由 `calibrate_costs` 从网关读出的账户交易模式写入。
   - 研究库与 bt 路径只接受 real 账户的隔夜费实测；demo 实测只写进报告，`cost_version` 注明"demo 实测未采用"。
   - 失败测试先行：demo 的 `free_of_swap=true` 不改变研究成本。
-- [ ] **账户隔夜费配置** `config/account-profile.toml`：
+- [x] **账户隔夜费配置** 完成（config/account-profile.toml 模板全 unknown 无敏感信息；缺文件全 charged；确认才生效）：
   - 内容（不含账号与服务器名）：将来实盘的账户类型；各品种隔夜费状态（charged | swap_free | unknown）；确认人；确认日期；证据说明。
   - 只有用户确认过的条目才生效，缺省按 charged。
-- [ ] **预筛双口径**：
+- [x] **预筛双口径** 完成（swap_basis 块/决策按 profile 翻转/全品种确认才 swap_free/swap_dependent 标记；e2e 翻转实证）：
   - 持仓过夜的候选，在 precheck JSON 里同时给出 charged 与 swap_free 两种口径的成本倍数与检验力；
   - 决定按 account-profile 的状态取；
   - swap_free 口径通过而 charged 口径不通过的，登记 `swap_dependent = true`。
@@ -349,27 +349,27 @@ def randomize_event_times(events, trading_days, *, seed: int) -> list[EventWindo
 
 **Files:** `src/mt5quant/research/candidates.py`、`src/mt5quant/validation/events.py`（共用 σ 函数）、蓝图附录 C、`research/candidates/C001.toml`、`C002.toml`、`docs/research/event-mode-calibration-2026-10-28.md`、`docs/p6/research-agent.md`；测试。
 
-- [ ] **σ 按事件窗取**：
+- [x] **σ 按事件窗取**：
   - 候选登记 `[declared]` 新增 `window_bars`：从入场到出场的持仓周期 bar 数。
   - σ = 同长度窗口收益的标准差；日内周期按 `entry_hour_ny` 取同一时段起点。与 T66 的 σ_w 共用一个函数。
   - 缺 `window_bars` 的登记，装载时报错。
   - 失败测试先行：4 日窗的 σ 约为单日的 2 倍（独立同分布合成数据）；定盘小时的 σ 高于全天平均（合成的时段异方差数据）。
-- [ ] **样本量规则按 α/N**：
+- [x] **样本量规则按 α/N**：
   - 事件模式样本量规则改为 z_{α/N}（`events.required_events` 增加 `n_tests` 参数）；
   - 预筛仍按单次检验判定（蓝图 §6.2 条件 4）；
   - `bt round open` 按本轮 N 复核每个候选的检验力，写进轮次报告骨架（只报告）。
-- [ ] **C001 更正**（第十三轮 §4.3）：
+- [x] **C001 更正**（第十三轮 §4.3）：
   - status 保持 screened_fail，理由改为"目标市场发表后证据（Han、Han 与 Tian 2025）显示效应在 2001 年后消失"；
   - 补 `window_bars`，事件窗按 K8 写清（第 −2 日纽约 16:00 收盘 → 第 +3 日 16:00 收盘）；
   - 加 `observed_in_sample = "T66 §3.2"`；
   - 重跑预筛（台账留痕）。
-- [ ] **样本内观察入账**（K3）：
+- [x] **样本内观察入账**（K3）：
   - 把 T66 报告 §3.2 与 §1.5 对 USTEC、BTCUSD 月末窗的两次真实事件时间观察，作为 run_class=research 的试验记入台账，注明来源；
   - 报告 §5 的"0.4–0.6%"删除，或改为引用 C001 的登记值；
   - §7 与 §4.2 的随机化时刻净均值统一为实测值。
-- [ ] **规则**：`docs/p6/research-agent.md` 写明——标定与演示只用随机化时刻或植入效应；候选机制在真实事件时间上的统计量，只能在已开启轮次内计算。守护测试检查关键词。
-- [ ] **还原成本判定**（K10）：H 线 `precheck` 的判定块恢复 0d92448 之前的写法——`not cost_ok` 判 fail，`elif not power_ok` 判 waiting_data（只改 H 线的 `precheck`）。失败测试先行：成本条件返回 numpy 布尔值 False 或 None 时，判为 fail。
-- [ ] **C002**：补 `window_bars = 1`；等 T87 数据延长后重检。
+- [x] **规则**：`docs/p6/research-agent.md` 写明——标定与演示只用随机化时刻或植入效应；候选机制在真实事件时间上的统计量，只能在已开启轮次内计算。守护测试检查关键词。（598a5c1 完成；σ/αN/C001 重跑 fail 17%/run447·448 入账/守护测试/K10 还原/window_bars=1——详见提交与 T84 汇报）
+- [x] **还原成本判定**（K10）：H 线 `precheck` 的判定块恢复 0d92448 之前的写法——`not cost_ok` 判 fail，`elif not power_ok` 判 waiting_data（只改 H 线的 `precheck`）。失败测试先行：成本条件返回 numpy 布尔值 False 或 None 时，判为 fail。（598a5c1 完成；σ/αN/C001 重跑 fail 17%/run447·448 入账/守护测试/K10 还原/window_bars=1——详见提交与 T84 汇报）
+- [x] **C002**：补 `window_bars = 1`；等 T87 数据延长后重检。（598a5c1 完成；σ/αN/C001 重跑 fail 17%/run447·448 入账/守护测试/K10 还原/window_bars=1——详见提交与 T84 汇报）
 
 ## T85：关卡 v3 工作点补充标定（第十三轮 K1、K2；D34 冻结前置，批准点）
 
