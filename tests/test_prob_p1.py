@@ -155,8 +155,24 @@ C101 = {hyps}
 
 
 class _LedgerStub:
-    def __init__(self, used=0):
+    """S2 后前置检查走 _round_context：桩齐轮次行与预筛记录。"""
+
+    def __init__(self, used=0, *, round_row=None):
+        import json as _j
         self.used = used
+        self._row = round_row or {
+            "round_id": "R2", "status": "open",
+            "candidates_json": _j.dumps(["C101"]),
+            "trial_budget": 12, "lockbox_uses_max": 0}
+
+    def round(self, rid):
+        return self._row
+
+    def candidate_checks(self, cid):
+        return [{"decision": "pass"}]
+
+    def round_lockbox_uses(self, rid):
+        return 0
 
     def round_n_dedup(self, rid):
         return self.used
@@ -170,8 +186,14 @@ def test_preconditions_reject_each_failure(tmp_path):
     card_path.mkdir(exist_ok=True)
     # 用假的卡文件路径（前置检查只用 path.parent.parent 找轮次）
     fake_path = card_path / "P001-v1.toml"
-    led = _LedgerStub()
-    assert BT._prob_preconditions(led, card, fake_path, actor="bt") is not None
+    import hashlib as _h
+    led = _LedgerStub(round_row={
+        "round_id": "R2", "status": "open",
+        "candidates_json": '["C101"]', "trial_budget": 12,
+        "lockbox_uses_max": 0,
+        "toml_sha256": _h.sha256(ok_round.read_bytes()).hexdigest()})
+    pre = BT._prob_preconditions(led, card, fake_path, actor="bt")
+    assert pre is not None and pre[0].id == "R2"
     # 1) validation 卡
     v = fake_card(); v.segment = "validation"
     assert BT._prob_preconditions(led, v, fake_path, actor="bt") is None
@@ -181,9 +203,14 @@ def test_preconditions_reject_each_failure(tmp_path):
     # 3) 假设表不一致
     _write_round_file(tmp_path, hyps=["S1:A1:follow>base"])
     assert BT._prob_preconditions(led, card, fake_path, actor="bt") is None
-    # 4) 预算不足
+    # 4) 预算不足（轮次已开启、sha 一致，预算 12 已用满）
     _write_round_file(tmp_path)
-    led2 = _LedgerStub(used=12)
+    led2 = _LedgerStub(used=12, round_row={
+        "round_id": "R2", "status": "open",
+        "candidates_json": '["C101"]', "trial_budget": 12,
+        "lockbox_uses_max": 0,
+        "toml_sha256": _h.sha256(
+            (tmp_path / "rounds" / "R2.toml").read_bytes()).hexdigest()})
     assert BT._prob_preconditions(led2, card, fake_path, actor="bt") is None
 
 

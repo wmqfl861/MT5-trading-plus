@@ -270,6 +270,10 @@ def validate_round(data: dict, *, source: str) -> Round:
                     raise RoundError(
                         f"{source}：[hypotheses].{cid} 的条目 {h!r} 必须形如 "
                         "'S1:A3:fade>base'（局面:动作:方向）")
+            if len(set(listed)) != len(listed):
+                raise RoundError(
+                    f"{source}：[hypotheses].{cid} 有重复条目 {listed!r}"
+                    "（Holm 家族里每条假设只出现一次）")
             hypotheses[cid] = tuple(listed)
         elif listed:
             raise RoundError(

@@ -440,6 +440,26 @@ def cmd_round_open(args) -> int:
                   "全部候选必须最新预筛 decision=pass（bt candidate check）"
                   "才可开启（T62/D31 + T63/D32）")
             return 1
+        # P 线小改（审核三）：[hypotheses] 与候选登记的假设交叉校验——
+        # 轮次列出的每条假设都必须在候选登记的假设里（预筛/候选侧的
+        # 预先声明是假设族的上界；先卡后测，轮次不得引入候选没登记的
+        # 假设）
+        for cid, hyps in r.hypotheses.items():
+            cpath = Path(args.rounds_dir).parent / "candidates" / f"{cid}.toml"
+            try:
+                registered = cand.load_candidate(cpath)
+            except cand.CandidateError as e:
+                print(f"✗ 候选 {cid} 登记不可装载（{e}）——[hypotheses] 的"
+                      "交叉校验需要候选登记")
+                return 1
+            declared = set(getattr(registered.prob_declared, "hypotheses",
+                                   ()) or ())
+            extra = [h for h in hyps if h not in declared]
+            if extra:
+                print(f"✗ [hypotheses].{cid} 列出了候选登记之外的假设 "
+                      f"{extra}——候选登记（{cid}.toml [prob].hypotheses）"
+                      "是假设族上界，轮次不得加新假设（先卡后测）")
+                return 1
         used = int(ledger.conn.execute(
             "SELECT COUNT(*) n FROM lockbox_uses").fetchone()["n"])
         remaining = max(0, rnd.D16_LOCKBOX_USES_TOTAL - used)
@@ -1240,6 +1260,23 @@ def _prob_preconditions(ledger, card, path, *, actor: str) -> tuple | None:
         print(f"✗ 轮次 {card.round} 的 approved_by 为空——轮次未获批"
               "（P 线审核会话批准时填写；执行会话不得代填）")
         return None
+    # S2：走与 screen/gate 同一 _round_context（轮次已开启、候选在名单、
+    # 最新预筛 pass），再核对轮次文件 sha256 与开启时入账的一致——
+    # 开启后改文件（分界/假设族）会被发现
+    import hashlib as _hl
+    ctx = _round_context(ledger, card, actor=actor)
+    if ctx is False or ctx is None:
+        print(f"✗ 轮次约束未过（bt prob test 与 screen/gate 同一铁律 16 "
+              "口径）")
+        return None
+    opened = ledger.round(card.round) or {}
+    file_sha = _hl.sha256(Path(rnd_path).read_bytes()).hexdigest()
+    if opened.get("toml_sha256") != file_sha:
+        print(f"✗ 轮次文件 {rnd_path.name} 与开启时入账的内容不一致"
+              f"（sha256 {file_sha[:12]}… vs 台账 "
+              f"{str(opened.get('toml_sha256'))[:12]}…）——开启后改预注册"
+              "（分界/假设族/预算）无效；改动作为新轮次登记")
+        return None
     ev = round_obj.evaluation.get(card.candidate) or {}
     if ev.get("mode") != "probability":
         print(f"✗ 轮次 {card.round} 中候选 {card.candidate} 的评估模式是 "
@@ -1259,7 +1296,7 @@ def _prob_preconditions(ledger, card, path, *, actor: str) -> tuple | None:
         print(f"✗ 轮次预算不足：已用 {used}/{round_obj.trial_budget}，"
               f"本卡还需 {len(listed)} 条假设各一行")
         return None
-    return round_obj
+    return round_obj, ctx
 
 
 def cmd_prob_test(args) -> int:
@@ -1302,7 +1339,7 @@ def cmd_prob_test(args) -> int:
         pre = _prob_preconditions(ledger, card, path, actor=actor)
         if pre is None:
             return 1
-        round_obj = pre
+        round_obj, _round_ctx = pre
         split = pd.Timestamp(round_obj.segments["split"])
         try:
             strategy_cls = load_strategy(args.strategy)
@@ -1321,14 +1358,23 @@ def cmd_prob_test(args) -> int:
                 bars_by_sym[sym] = below.reset_index(drop=True)
             from mt5data.sessions import load_session_policy
             sess_policy = load_session_policy(str(SESSIONS_PATH))
-            sess_sha = sessions_sha256(str(_SP))
+            sess_sha = sessions_sha256(str(SESSIONS_PATH))
             costs_by_sym = {}
+            policy_by_sym = {}
             for sym in card.symbols:
                 costs_by_sym[sym], cost_version = build_costs(
                     data_root, sym, args.spread_fraction, args.commission,
                     sessions_sha=sess_sha, research_store=store_kind == "research")
+                policy_by_sym[sym] = entry_policy_for(
+                    costs_by_sym[sym], sym, sess_policy)
+            for sym in card.symbols:      # S8：合约大小必填，不默认 1.0
+                if sym not in sizes:
+                    print(f"✗ {sym} 的合约大小未知（specs 缺失）——标签"
+                          "引擎需与评估同口径，不默认 1.0")
+                    return 1
             results = p1mod.run_p1_card(card, round_obj, bars_by_sym,
                                         costs_by_sym, sizes=sizes,
+                                        policy_by_symbol=policy_by_sym,
                                         sims=args.sims)
         except Exception as e:
             print(f"✗ P1 运行失败：{type(e).__name__}: {e}")
@@ -1338,7 +1384,8 @@ def cmd_prob_test(args) -> int:
                       "prob": {"segment": card.segment,
                                "split": round_obj.segments["split"],
                                "bracket": dict(card.prob["bracket"]),
-                               "seed": r["seed"]}}
+                               "seed": r["seed"],
+                               "prob_version": r["prob_version"]}}
             metrics = {"prob": {"prob_version": r["prob_version"],
                                 "n_triggers": r["n_triggers"],
                                 "n_trigger_days": r["n_trigger_days"],
@@ -1369,16 +1416,21 @@ def cmd_prob_test(args) -> int:
 
 
 def cmd_prob_round_report(args) -> int:
-    """T90：bt prob round-report <R#>——本轮全部假设 Holm + 推进判定。"""
+    """T90：bt prob round-report <R#>——本轮全部假设 Holm + 推进判定。
+
+    推进 = Holm 校正后 p < 0.05 **且** Δp 点估计满足事前成本要求
+    （成本取候选预筛 research/candidates/<C###>.precheck.json 的
+    ex_ante_cost_prob.cost_r_by_symbol 最大值；判定式与预筛同一公式：
+    ΔEV = Δp̂ × (tp_R + 1) ≥ 3 × 成本，tp_R 取该运行 params.prob.bracket）。
+    一条假设有多条成功运行 → 拒绝出报告（不允许重跑挑结果）；运行按
+    （候选、假设）过滤，不只按假设字符串。
+    """
     try:
         data_root, _store_kind = _resolve_store(args)
     except ValueError as e:
         print(f"✗ {e}")
         return 1
-    rnd_path = Path(data_root).parent / "research" / "rounds" / \
-        f"{args.round}.toml"
-    if not rnd_path.is_file():
-        rnd_path = Path("research/rounds") / f"{args.round}.toml"
+    rnd_path = Path(args.rounds_dir) / f"{args.round}.toml"
     try:
         round_obj = rnd.load_round(rnd_path)
     except rnd.RoundError as e:
@@ -1387,25 +1439,52 @@ def cmd_prob_round_report(args) -> int:
     ledger_path = _ledger_default(args)
     from mt5quant.validation.prob_mode import holm
     with Ledger(ledger_path) as ledger:
+        all_runs = ledger.runs_of_round(round_obj.id)
         pvals: dict[str, float] = {}
         rows = []
-        all_runs = ledger.runs_of_round(round_obj.id)
         for cid, hyps in round_obj.hypotheses.items():
+            # 候选预筛成本（R 口径，逐品种取最大）
+            pre_json = Path(args.candidates_dir) / f"{cid}.precheck.json"
+            if not pre_json.is_file():
+                print(f"✗ 候选 {cid} 的预筛结果缺失（{pre_json.name}）——"
+                      "成本条件无从判定；先跑 bt candidate check")
+                return 1
+            try:
+                pre = json.loads(pre_json.read_text(encoding="utf-8"))
+                cost_r = max((pre["checks"]["ex_ante_cost_prob"]
+                              ["cost_r_by_symbol"] or {"X": 0.0}).values())
+            except (ValueError, KeyError, TypeError) as e:
+                print(f"✗ {pre_json.name} 无法解析成本（{e}）")
+                return 1
             for h in hyps:
                 key = f"{cid}:{h}"
                 runs = [r for r in all_runs
                         if (r["params"] or {}).get("hypothesis") == h
-                        and r.get("ok")]
+                        and r.get("ok")
+                        and _card_of(r).startswith("P")]
                 if not runs:
                     print(f"✗ 假设 {h} 没有运行记录——全部卡跑完才能出报告")
                     return 1
-                last = runs[-1]
-                m = (last.get("metrics") or {}).get("prob") or {}
-                pvals[key] = float(m.get("p_value", 1.0))
+                if len(runs) > 1:
+                    print(f"✗ 假设 {h} 有 {len(runs)} 条成功运行"
+                          f"（run#{[r['run_id'] for r in runs]}）——不允许"
+                          "重跑挑结果；须先在轮次报告里说明取舍或作废多余运行")
+                    return 1
+                run = runs[0]
+                m = (run.get("metrics") or {}).get("prob") or {}
+                p_raw = float(m.get("p_value", 1.0))
+                delta = float(m.get("delta_p", 0.0))
+                bracket = (run["params"].get("prob") or {}).get("bracket") or {}
+                tp_r = (float(bracket.get("tp_atr", 0.0))
+                        / float(bracket.get("sl_atr", 1.0)))
+                edge = delta * (tp_r + 1.0)
+                cost_ok = edge >= 3.0 * cost_r
+                pvals[key] = p_raw
                 rows.append({"candidate": cid, "hypothesis": h,
-                             "p_value": pvals[key],
-                             "delta_p": m.get("delta_p"),
-                             "n_trigger_days": m.get("n_trigger_days")})
+                             "p_value": p_raw, "delta_p": delta,
+                             "n_trigger_days": m.get("n_trigger_days"),
+                             "cost_r": cost_r, "edge_ev_r": edge,
+                             "cost_ok": cost_ok})
         adjusted = holm(pvals)
         out_dir = Path("docs/research")
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1414,16 +1493,29 @@ def cmd_prob_round_report(args) -> int:
         js = out_dir / f"round-{round_obj.id}-p1-{stamp}.json"
         lines = [f"# P1 轮次报告 {round_obj.id}（{stamp}）", "",
                  "状态：待审核", "",
-                 "推进规则（预写）：Holm 校正后 p < 0.05 且 Δp 点估计满足"
-                 "事前成本要求（轮次文件 advance_rule）。", "",
-                 "| 候选 | 假设 | 触发日数 | Δp | 原始 p | Holm p | 结论 |",
-                 "| --- | --- | --- | --- | --- | --- | --- |"]
+                 "推进规则（预写，轮次文件 advance_rule）：Holm 校正后 "
+                 "p < 0.05 **且** ΔEV = Δp̂×(tp_R+1) ≥ 3×预筛成本"
+                 "（成本取候选预筛 cost_r_by_symbol 最大值）。", "",
+                 "| 候选 | 假设 | 触发日数 | Δp | 原始 p | Holm p | Holm 显著 |"
+                 " ΔEV(R) | 3×成本(R) | 成本条件 | 结论 |",
+                 "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+        verdicts = []
         for r in rows:
-            adj = adjusted[f"{r['candidate']}:{r['hypothesis']}"]
-            concl = "推进" if adj < 0.05 else "进墓地"
-            lines.append(f"| {r['candidate']} | {r['hypothesis']} | "
-                         f"{r['n_trigger_days']} | {r['delta_p']:+.4f} | "
-                         f"{r['p_value']:.4f} | {adj:.4f} | {concl} |")
+            key = f"{r['candidate']}:{r['hypothesis']}"
+            adj = adjusted[key]
+            holm_ok = adj < 0.05
+            advance = holm_ok and r["cost_ok"]
+            concl = "推进" if advance else "不推进"
+            verdicts.append(advance)
+            lines.append(
+                f"| {r['candidate']} | {r['hypothesis']} | "
+                f"{r['n_trigger_days']} | {r['delta_p']:+.4f} | "
+                f"{r['p_value']:.4f} | {adj:.4f} | {'✓' if holm_ok else '✗'} | "
+                f"{r['edge_ev_r']:+.4f} | {3 * r['cost_r']:.4f} | "
+                f"{'✓' if r['cost_ok'] else '✗'} | {concl} |")
+        lines += ["", f"推进 {sum(verdicts)} / {len(verdicts)} 条假设。",
+                  "", "（本报告由 bt prob round-report 生成；方法变更与对照"
+                  "见 T75 标定报告。）"]
         md.write_text("\n".join(lines) + "\n", encoding="utf-8")
         js.write_text(json.dumps({"round": round_obj.id,
                                   "status": "待审核",
@@ -1432,6 +1524,11 @@ def cmd_prob_round_report(args) -> int:
                       encoding="utf-8")
         print(f"✓ 报告：{md}（同 JSON）——交 P 线审核会话")
         return 0
+
+
+def _card_of(run: dict) -> str:
+    """运行行的卡号（runs 行缺 card_id 键时返回空串）。"""
+    return str(run.get("card_id") or "")
 
 
 def cmd_fit(args) -> int:
@@ -2179,11 +2276,16 @@ def build_parser() -> argparse.ArgumentParser:
                       help="月内置换次数（p 值分辨率）")
     ptst.add_argument("--specimen", action="store_true")
     ptst.add_argument("--ops-ack", action="store_true")
+    ptst.add_argument("--actor", default="bt", help="台账 actor 字段")
+    ptst.add_argument("--ledger", default=None,
+                      help="台账路径（缺省按数据根解析）")
     ptst.set_defaults(func=cmd_prob_test)
     prpt = prob_sub.add_parser("round-report", help="本轮全部假设 Holm + "
                                "推进判定，产出待审核报告")
     prpt.add_argument("round", help="轮次 id（R#）")
     prpt.add_argument("--rounds-dir", default="research/rounds")
+    prpt.add_argument("--candidates-dir", default="research/candidates",
+                      help="候选预筛 JSON 所在目录（成本条件取数）")
     prpt.add_argument("--data-root", default=None)
     prpt.add_argument("--ledger", default=None)
     prpt.set_defaults(func=cmd_prob_round_report)
