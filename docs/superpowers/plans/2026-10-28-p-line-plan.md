@@ -239,6 +239,7 @@ def load_model(path, *, expected_sha256: str) -> dict               # 哈希不�
 - `src/mt5quant/research/rounds.py`：
   - 新增 `[segments] split`（格式 `YYYY-MM-01`，必须是月初）；
   - `lockbox_uses_max = 0` 只在全部候选的 `[evaluation]` 都是 `mode = "probability"` 时允许；上限 1 不变（D16）；
+  - 新增 `[hypotheses]`：概率模式的候选必填，列出本轮要检验的假设（即 Holm 的假设族），每条都必须在候选登记的假设里；非概率候选不得出现；格式见蓝图 P 线附录 A；
   - H 线现有轮次文件的装载结果逐字段不变；
 - 台账（`src/mt5quant/research/ledger.py` 只读或只加辅助函数）：**不改 runs 表结构，不触发生产台账迁移**。两个会话共用一份台账，改表结构要按 T80 的流程重锚。P 线字段这样放：
   - 决定试验身份的（`segment`、`split`、假设、止损止盈）放进 `params_json`；
@@ -284,7 +285,7 @@ class BaseStrategy:
   - 拟合不读 `train_end` 之后的数据，最后 K 根的触发被 purge；
   - 冻结模型的拟合策略能过 G0；故意在 `generate_signals` 里现场统计全部历史的坏策略被 G0 查出；
   - discovery 卡读 `>= split` 被拒；validation 卡在 `< split` 上评估被拒；
-  - 轮次文件：`[segments] split` 非月初或格式错 → 拒；概率模式轮次 `lockbox_uses_max = 0` → 过；含非概率候选的轮次为 0 → 拒；> 1 仍拒；H 线现有轮次文件装载结果不变；
+  - 轮次文件：`[segments] split` 非月初或格式错 → 拒；概率模式轮次 `lockbox_uses_max = 0` → 过；含非概率候选的轮次为 0 → 拒；> 1 仍拒；概率模式候选缺 `[hypotheses]`、或列出候选没登记的假设 → 拒；H 线现有轮次文件装载结果不变；
   - P 线字段写入 `params_json`、`metrics_json` 后 `bt ledger verify` 通过，runs 表结构不变。
 - [ ] T73B 失败测试先行：
   - 合成的非平稳数据上，各训练窗的模型哈希不同；每个训练窗末尾 K 根内的触发被 purge；
@@ -428,7 +429,7 @@ def n_needed_proportion(p0: float, dp: float, *, alpha: float = 0.05, power: flo
   - 候选 ≤ 3；`[evaluation]` 每个候选 `{ mode = "probability", primary = "delta_p_one_sided" }`；
   - `[segments] split` 写入前重跑 `bt segment propose --symbols XAUUSD --timeframe H1` 确认（审核时为 2019-12-01）；
   - 试验预算 = 本轮假设条数（≤ 12 次去重试验）；`lockbox_uses_max = 0`（P1 不用锁箱，需 T73A）；`dsr_trial_scope` 按 T64 的项目级口径；
-  - 本轮假设表 = 各候选预筛通过的假设；再按全轮条数做一次检验力复核（D52，只做一遍），不足的假设判 waiting_data 移出；最终假设表写进草案，作为 Holm 的假设族；
+  - 本轮假设表 = 各候选预筛通过的假设；再按全轮条数做一次检验力复核（D52，只做一遍），不足的假设判 waiting_data 移出；最终假设表写进轮次文件的 `[hypotheses]`，作为 Holm 的假设族；
   - 推进规则：Holm 校正后显著，且 Δp 点估计满足事前成本要求；
   - 结束条件：全部假设有结论，或预算用尽；
   - `approved_by` 留空，由 P 线审核会话批准时填写。
@@ -469,7 +470,7 @@ def n_needed_proportion(p0: float, dp: float, *, alpha: float = 0.05, power: flo
     - 卡已提交并登记（先卡后测）；
     - 卡的 `evaluation_mode = "probability"`、`segment = "discovery"`；
     - 所属轮次能装载（`approved_by` 非空），且该候选的 `[evaluation].mode = "probability"`；
-    - 卡的假设表与轮次草案写定的假设族一致；
+    - 卡的假设表与轮次文件 `[hypotheses]` 里该候选的条目一致；
     - 本轮剩余试验预算够用；
   - 数据：只读 `time < split` 的 bar；标签取 `train_end = split`，越过分界的触发按 bar 下标剔除；
   - 每条假设：
@@ -484,11 +485,11 @@ def n_needed_proportion(p0: float, dp: float, *, alpha: float = 0.05, power: flo
     - 相同输入重跑按现有去重规则不增加 N。
 - **`bt prob round-report <R#>`**：
   - 本轮全部卡都跑完才能出；
-  - 在本轮假设族上做 Holm，按轮次文件的推进规则判定；
+  - 在 `[hypotheses]` 列出的全部假设上做 Holm，按轮次文件的推进规则判定；
   - 输出 `docs/research/round-<R#>-p1-<日期>.md`（报告头"状态：待审核"）与同名 JSON。
 - [ ] 失败测试先行（只用合成数据）：
   - 植入 Δp = 0.05、触发日数 2,000 → 检出；未植入 → 不检出（固定种子）；
-  - 前置检查逐条：未批准的轮次、validation 卡、读到 `>= split` 的数据、假设表与草案不一致、预算不足 → 拒绝；
+  - 前置检查逐条：未批准的轮次、validation 卡、读到 `>= split` 的数据、假设表与 `[hypotheses]` 不一致、预算不足 → 拒绝；
   - 越过分界的触发被剔除；
   - 同一输入两次运行结果逐位一致，台账去重 N 不变；
   - 有卡未跑时 round-report 拒绝；Holm 与手算一致。
@@ -499,7 +500,7 @@ def n_needed_proportion(p0: float, dp: float, *, alpha: float = 0.05, power: flo
 
 - [ ] **开卡**：
   - 每个进入本轮的候选一张 P 卡（`P001-v1` 起，按蓝图 P 线附录 A），绑定 T74 的局面与动作；
-  - 假设表与草案写定的假设族一致；卡里不出现任何结果；
+  - 假设表与轮次文件 `[hypotheses]` 一致；卡里不出现任何结果；
   - 先提交卡，再运行。
 - [ ] **运行**：逐卡 `bt prob test`，然后 `bt prob round-report`。
 - [ ] **轮次报告**：

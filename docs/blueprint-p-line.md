@@ -334,16 +334,21 @@ delta_p = "<折算后的预期 Δp 与依据（文献或发现段），不得取
 triggers_per_year = "<只数触发次数得到，不看结果>"
 ```
 
-P 线轮次文件在蓝图 v4 附录 D 的基础上增加两点（T73A 实现）：`lockbox_uses_max` 允许为 0、新增 `[segments]` 表。`[evaluation]` 是附录 D 已有的表，这里示范 P 线的写法。
+P 线轮次文件在蓝图 v4 附录 D 的基础上增加三点（T73A 实现）：`lockbox_uses_max` 允许为 0；新增 `[segments]` 表；新增 `[hypotheses]` 表。`[evaluation]` 是附录 D 已有的表，这里示范 P 线的写法。
 
 ```toml
 lockbox_uses_max = 0                 # 只在全部候选都是概率模式的轮次（P1）允许为 0；上限仍为 1（D16）
 approved_by = ""                     # 由 P 线审核会话批准时填写（§8），执行会话留空
+
 [segments]
 split = "2019-12-01"                 # 发现段/验证段分界，取自 bt segment propose；写死后不改
 
 [evaluation]
 C101 = { mode = "probability", primary = "delta_p_one_sided" }
+
+[hypotheses]                         # 概率模式候选必填：通过预筛与开轮复核的假设，即本轮 Holm 的假设族
+C101 = ["S1:A1:follow>base", "S1:A2:follow>base",
+        "S1:A3:fade>base", "S1:A4:fade>base"]   # 每条都必须在候选登记的假设里
 ```
 
 ## 附录 B：模型文件格式（`data_research/models/<卡>/<sha256>.json`；实盘复制到 `data/live/models/<magic>-<sha256>.json`）
