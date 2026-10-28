@@ -428,3 +428,160 @@ def test_from_snapshot_interest_mode_raises_for_whole_model():
             "USTEC": _snap_entry(name="USTEC", swap_mode=SWAP_MODE_INTEREST_CURRENT)}
     with pytest.raises(NotImplementedError, match="USTEC"):
         SwapModel.from_snapshot(snap, ["EURUSD", "USTEC"])
+
+
+# ---- T82：点数模式相对价格基准（引擎 A 隔夜费 1986 反例修复，2026-10-28） ----
+#
+# 背景（T65 §5.4 / 计划 2026-10-28-t82）：点数模式费率换算的绝对 USD/手/夜
+# 校准于快照时代价格（USTEC≈25097 → −2.5bp/夜）；套到 1986 年 131 价位同一
+# 绝对额 = −4.8%/夜（实测 FRED 段 6 笔后权益爆掉）。修复镜像 T66 事件路径
+# （event-mode-calibration §1.2）：rel = |per_lot_per_night| ÷ (ref_price ×
+# contract)，计费 fee = rel × price × contract（price=出场侧 bar 价）。
+
+# USTEC 快照条目（与 data/specs/latest.json 实测同构）：点数模式，
+# -633.8 点 × point 0.01 × contract 1 = -6.338 USD/手/夜
+USTEC_SNAP = {
+    "name": "USTEC", "point": 0.01, "contract_size": 1.0,
+    "swap_long": -633.8, "swap_short": 0.0,
+    "swap_mode": SWAP_MODE_POINTS, "swap_rollover3days": 5,   # MT5 周五 → py 周五
+    "currency_profit": "USD", "currency_margin": "USD",
+}
+USTEC_REF = 25097.0   # 快照时代参考价（费率校准价位；rel 分母）
+EARLY_1986 = 131.0    # 1986 年 USTEC（fred 纳指 100）价位
+PER_LOT_NIGHT = 633.8 * 0.01 * 1.0   # |per_lot_per_night| = 6.338 USD/手/夜
+
+
+def _ustec_model(ref=USTEC_REF):
+    return SwapModel.from_snapshot(
+        {"USTEC": dict(USTEC_SNAP)}, ["USTEC"],
+        ref_prices={"USTEC": ref} if ref is not None else None)
+
+
+def test_t82_1986_counterexample_relative_fee():
+    """1986 反例：131 价位 5 夜（周三 20:00→周一 20:00，跨周五三倍 = 5 夜），
+    新口径每夜 ≈ −2.5bp 的名义额；旧口径同窗口是 −4.8%/夜（金额差约
+    ref/price ≈ 190 倍——T65 实测爆仓的量级）。"""
+    m = _ustec_model()
+    fee = m.overnight_fee("USTEC", "long",
+                          D(2026, 10, 21, 20, 0), D(2026, 10, 26, 20, 0),
+                          price=EARLY_1986)
+    assert fee == pytest.approx(
+        -PER_LOT_NIGHT * (EARLY_1986 / USTEC_REF) * 5.0, rel=1e-9)
+    per_night = fee / 5.0
+    # 相对口径：每夜占名义价值 6.338/25097 ≈ 2.53bp（≈−2.5bp/夜）
+    assert abs(per_night) / (EARLY_1986 * 1.0) == pytest.approx(
+        PER_LOT_NIGHT / USTEC_REF, rel=1e-9)
+    # 金额差实证：旧绝对口径每夜 6.338 → 差约 190 倍（25097/131 ≈ 191.6）
+    ratio = PER_LOT_NIGHT / abs(per_night)
+    assert 185.0 < ratio < 200.0
+
+
+def test_t82_recent_price_matches_old_absolute_within_5pct():
+    """近期价位回归：price=25,000 与 ref=25,097 只差费率缩放 25000/25097
+    ≈ 0.996——新旧口径每夜金额比值 ≈1（容差 5%，快照时代自洽）。"""
+    m = _ustec_model()
+    fee_new = m.overnight_fee("USTEC", "long",
+                              D(2026, 10, 21, 20, 0), D(2026, 10, 26, 20, 0),
+                              price=25_000.0)
+    fee_old = PER_LOT_NIGHT * 5.0            # 旧绝对口径 5 夜
+    assert abs(fee_new) / fee_old == pytest.approx(25_000.0 / USTEC_REF, rel=1e-9)
+    assert abs(abs(fee_new) / fee_old - 1.0) < 0.05
+
+
+def test_t82_fee_scales_linearly_with_price():
+    """同一持仓窗口，fee ∝ price（相对口径的定义性质）。"""
+    m = _ustec_model()
+    f1 = m.overnight_fee("USTEC", "long",
+                         D(2026, 10, 21, 20, 0), D(2026, 10, 26, 20, 0),
+                         price=100.0)
+    f2 = m.overnight_fee("USTEC", "long",
+                         D(2026, 10, 21, 20, 0), D(2026, 10, 26, 20, 0),
+                         price=200.0)
+    assert f2 == pytest.approx(2.0 * f1, rel=1e-12)
+
+
+def test_t82_currency_mode_ignores_price():
+    """货币模式（2/3/4）费率本身是绝对金额语义——带 ref 构造也不相对化，
+    price 传入被忽略（换算假设不变）。"""
+    snap = {"XAUUSD": _snap_entry(
+        name="XAUUSD", swap_mode=SWAP_MODE_CURRENCY_DEPOSIT,
+        swap_long=-4.0, swap_short=-1.0, swap_rollover3days=3)}
+    m = SwapModel.from_snapshot(snap, ["XAUUSD"],
+                                ref_prices={"XAUUSD": 2400.0})
+    r = m.rule("XAUUSD")
+    assert r.ref_price is None and r.contract_size is None   # 未相对化
+    w = (D(2026, 10, 21, 20, 0), D(2026, 10, 22, 20, 59))    # 周三 ×3
+    assert m.overnight_fee("XAUUSD", "long", *w) == pytest.approx(-12.0)
+    assert m.overnight_fee("XAUUSD", "long", *w, price=131.0) == pytest.approx(-12.0)
+
+
+def test_t82_disabled_mode_zero_with_or_without_price():
+    snap = {"XAUUSD": _snap_entry(name="XAUUSD", swap_mode=SWAP_MODE_DISABLED,
+                                  swap_rollover3days=3)}
+    m = SwapModel.from_snapshot(snap, ["XAUUSD"], ref_prices={"XAUUSD": 2400.0})
+    w = (D(2026, 10, 21, 20, 0), D(2026, 10, 26, 20, 0))
+    assert m.overnight_fee("XAUUSD", "long", *w) == 0.0
+    assert m.overnight_fee("XAUUSD", "long", *w, price=131.0) == 0.0
+
+
+def test_t82_points_mode_missing_price_fails_fast():
+    """缺 price 的点数模式（相对口径）→ fail-fast（不静默按绝对额计费——
+    防旧口径复活）。"""
+    m = _ustec_model()
+    with pytest.raises(ValueError, match="price"):
+        m.overnight_fee("USTEC", "long",
+                        D(2026, 10, 21, 20, 0), D(2026, 10, 26, 20, 0))
+
+
+def test_t82_points_mode_invalid_price_rejected():
+    m = _ustec_model()
+    w = (D(2026, 10, 21, 20, 0), D(2026, 10, 26, 20, 0))
+    with pytest.raises(ValueError, match="有限正数"):
+        m.overnight_fee("USTEC", "long", *w, price=0.0)
+    with pytest.raises(ValueError, match="有限正数"):
+        m.overnight_fee("USTEC", "long", *w, price=-131.0)
+    with pytest.raises(ValueError, match="有限正数"):
+        m.overnight_fee("USTEC", "long", *w, price=float("nan"))
+
+
+def test_t82_swap_rule_ref_validation():
+    """ref_price 与 contract_size 成对、有限正数；只给其一 → 拒绝。"""
+    with pytest.raises(ValueError, match="成对"):
+        SwapRule(-7.0, -2.0, ref_price=25097.0)
+    with pytest.raises(ValueError, match="成对"):
+        SwapRule(-7.0, -2.0, contract_size=1.0)
+    with pytest.raises(ValueError, match="ref_price"):
+        SwapRule(-7.0, -2.0, ref_price=0.0, contract_size=1.0)
+    with pytest.raises(ValueError, match="contract_size"):
+        SwapRule(-7.0, -2.0, ref_price=25097.0, contract_size=-1.0)
+    # 成对且正 → 合法（相对口径标记 = ref_price 非 None）
+    r = SwapRule(-7.0, -2.0, ref_price=25097.0, contract_size=1.0)
+    assert r.ref_price == 25097.0 and r.contract_size == 1.0
+
+
+def test_t82_from_snapshot_bad_ref_rejected():
+    with pytest.raises(ValueError, match="有限正数"):
+        _ustec_model(ref=0.0)
+    with pytest.raises(ValueError, match="有限正数"):
+        _ustec_model(ref=float("inf"))
+
+
+def test_t82_from_snapshot_without_ref_keeps_absolute_legacy():
+    """不给 ref_prices：点数模式保持旧绝对口径（预筛/关卡装配路径的现状，
+    引擎 CLI 主路径恒传参考价——见 run_backtest.build_costs 的 T82 注记）。"""
+    m = _ustec_model(ref=None)
+    r = m.rule("USTEC")
+    assert r.ref_price is None and r.contract_size is None
+    # 旧口径：131 价位 5 夜仍是绝对额 6.338×5（不带 price 也不抛）
+    assert m.overnight_fee("USTEC", "long",
+                           D(2026, 10, 21, 20, 0), D(2026, 10, 26, 20, 0)
+                           ) == pytest.approx(-PER_LOT_NIGHT * 5.0)
+
+
+def test_t82_relative_rule_holds_ref_for_identity():
+    """规则持有 ref_price/contract_size（版本串 relref 与计费同一来源）。"""
+    m = _ustec_model()
+    r = m.rule("USTEC")
+    assert r.ref_price == USTEC_REF
+    assert r.contract_size == 1.0
+    assert r.long_per_day == pytest.approx(-PER_LOT_NIGHT)   # 绝对额原值保留

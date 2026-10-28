@@ -99,6 +99,8 @@ class ScaledCosts:
 
     T36：base 带 stop_overshoot（可选第五方法）时同样 ×factor；base 未
     提供该方法 → 返回 0（与 base 行为一致，不凭空造出越幅）。
+    T82：overnight_fee 透传 keyword-only price（出场侧 bar 价——点数模式
+    相对口径的缩放基准；不透传会让引擎带 price 的调用直接 TypeError）。
     """
 
     def __init__(self, base, factor: float):
@@ -115,8 +117,9 @@ class ScaledCosts:
     def commission_per_lot(self, symbol):
         return self._base.commission_per_lot(symbol) * self._factor
 
-    def overnight_fee(self, symbol, side, from_ts, to_ts):
-        return self._base.overnight_fee(symbol, side, from_ts, to_ts) * self._factor
+    def overnight_fee(self, symbol, side, from_ts, to_ts, *, price=None):
+        return self._base.overnight_fee(symbol, side, from_ts, to_ts,
+                                        price=price) * self._factor
 
     def stop_overshoot(self, symbol, hour_utc, *, price=None, level="p50"):
         fn = getattr(self._base, "stop_overshoot", None)

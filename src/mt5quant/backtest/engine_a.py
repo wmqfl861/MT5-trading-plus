@@ -77,7 +77,11 @@
   收盘，D1/H4 会提前一整根平仓（D1 在周四收盘强平），更高周期运行前抛
   ValueError。
 - 隔夜费：整段 (entry_time, exit_fill_time] 交给 overnight_fee 按计费时刻数夜
-  （三倍日由成本模型内部计算），结果 × 手数。
+  （三倍日由成本模型内部计算），结果 × 手数。T82（A-1.7）：调用带
+  keyword-only price=出场侧成交基准价（该笔平仓的 bid 基准——signal=下根
+  开盘、close 类=当根收盘、SL/TP=价位）——点数模式费率按参考价折相对口径
+  随 price 缩放（早年价格不再被按快照时代绝对额放大），缺 price 的相对
+  模型 fail-fast；绝对费率模型忽略 price。
 - 爆仓标记（R16，A-1.3）：不模拟逐笔保证金。逐 bar 收盘权益 ≤ 0 时引擎停止
   开新仓（已有持仓的各类出场照常执行），BacktestResult.ruined=True 且
   ruined_at 记首次发生 bar 的时间（标记粘滞，权益回升不清除）。equity 序列
@@ -107,7 +111,12 @@ from mt5quant.strategies.base import REENTRY_MODES, ExitRules
 
 NY_TZ = "America/New_York"   # 周五当地收盘（17:00）换算与点差分桶共用的时区
 _WEEK_CLOSE_LOCAL = dtime(17, 0)
-ENGINE_VERSION = "A-1.6"     # 2026-10-26 T36：stop 出场成交价加止损越幅 p50
+ENGINE_VERSION = "A-1.7"     # 2026-10-28 T82：隔夜费相对价格基准——
+                             # overnight_fee 增 keyword-only price=（出场侧
+                             # 成交基准价）：点数模式费率按参考价折相对口径随
+                             # price 缩放（缺 price 的相对模型 fail-fast）；货币
+                             # 模式忽略 price（绝对额语义不变）。
+                             # A-1.6 = T36 stop 出场成交价加止损越幅 p50
                              # （H2；stop_gap 按开盘价成交已含真实越幅，不重复加；
                              # 越幅模型缺失＝不加，行为同 A-1.5）。
                              # A-1.5 = T23 RiskSizing 按风险定手数（M2；
@@ -148,8 +157,13 @@ class Costs(Protocol):
         ...
 
     def overnight_fee(self, symbol: str, side: str,
-                      from_ts: datetime, to_ts: datetime) -> float:
-        """持仓 [from_ts, to_ts] 的隔夜费（计价货币/手，恒 ≤0）。"""
+                      from_ts: datetime, to_ts: datetime,
+                      *, price: float | None = None) -> float:
+        """持仓 [from_ts, to_ts] 的隔夜费（计价货币/手，恒 ≤0）。
+
+        price=出场侧成交基准价（T82/A-1.7）：点数模式（相对口径）模型必需
+        ——缺失抛 ValueError；绝对费率模型忽略。
+        """
         ...
 
     def stop_overshoot(self, symbol: str, hour_ny: int, *,
@@ -442,11 +456,13 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
         commission = costs.commission_per_lot(symbol) * lots
         # 成交时刻（R9）：按收盘价出场 = bar 收盘（bar 时间+周期），其余 = bar
         # 时间。隔夜费按 (entry_time, exit_fill_time] 计——恰跨计费时刻的那根
-        # bar 的收盘也计入；overnight_fee 是"每手"口径，必须 × 手数
+        # bar 的收盘也计入；overnight_fee 是"每手"口径，必须 × 手数。
+        # T82/A-1.7：price=出场侧成交基准价（base_price 即本笔平仓的 bid 基准）
         exit_fill = (times[j] + tf_delta if reason in CLOSE_PRICE_REASONS
                      else times[j])
         swap = costs.overnight_fee(
-            symbol, state["side"], state["entry_time"], exit_fill) * lots
+            symbol, state["side"], state["entry_time"], exit_fill,
+            price=base_price) * lots
         net = gross - commission + swap
         spread_charged = state["spread_charged"]
         if spread_charged is None:        # 空头：价差计在出场腿

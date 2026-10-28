@@ -42,7 +42,8 @@ class ConstCosts:
     def commission_per_lot(self, symbol):
         return self._commission
 
-    def overnight_fee(self, symbol, side, from_ts, to_ts):
+    def overnight_fee(self, symbol, side, from_ts, to_ts, *, price=None):
+        # T82：price 形参保持成本接口兼容（绝对假成本忽略）
         days = ((pd.Timestamp(to_ts).normalize()
                  - pd.Timestamp(from_ts).normalize()).days)
         return -abs(self._swap_per_night) * max(0, days)

@@ -7,6 +7,12 @@
 T36（H2）：新增可选第五方法 stop_overshoot（止损越幅，A-1.6 的 stop 出场
 成交口径）。Costs 聚合体带 overshoot_model=None 时返回 0（越幅表缺失＝
 不加，保持 A-1.5 行为；构建侧 scripts/build_cost_model.py --overshoot）。
+
+T82（2026-10-28）：overnight_fee 同样带 keyword-only price（出场侧 bar 价）
+——点数模式费率在 SwapModel 构造处按参考价折相对口径（from_snapshot 的
+ref_prices / SwapRule 的 ref_price+contract_size，注入点与计费同源单点），
+计费必须拿到 price（缺失由 SwapModel fail-fast）；绝对费率模型忽略 price。
+门面只做转发——相对化与 relref 身份都在 SwapModel/SwapRule 内。
 """
 from __future__ import annotations
 
@@ -62,8 +68,15 @@ class Costs:
         return self.commission.commission_per_lot(symbol)
 
     def overnight_fee(self, symbol: str, side: str,
-                      from_ts: datetime, to_ts: datetime) -> float:
-        return self.swap.overnight_fee(symbol, side, from_ts, to_ts)
+                      from_ts: datetime, to_ts: datetime,
+                      *, price: float | None = None) -> float:
+        """持仓 [from_ts, to_ts] 的隔夜费（每手，账户货币，恒 ≤0）。
+
+        price=出场侧 bar 价（T82）：点数模式（相对口径）规则必需——缺失由
+        SwapModel fail-fast；绝对费率规则忽略。
+        """
+        return self.swap.overnight_fee(symbol, side, from_ts, to_ts,
+                                       price=price)
 
     def stop_overshoot(self, symbol: str, hour_ny: int, *,
                        price: float | None = None,

@@ -16,12 +16,25 @@ T5（R4）：SwapModel.from_snapshot 从品种快照（scripts/snapshot_specs.py
 构造规则——swap_mode 决定换算，swap_rollover3days（MT5 星期枚举，经
 mt5_to_py_weekday）决定三倍日。T20 起三倍日一律取快照值，实测校准路径同源
 （不再出现 triple_weekdays=frozenset() 的"摊薄"口径）。
+
+T82（2026-10-28，镜像 T66 事件路径 event-mode-calibration §1.2）：点数模式
+费率换算的绝对 USD/手/夜校准于**快照时代价格**（USTEC≈25097 → −2.5bp/夜），
+跨数十年价格水平差百倍的序列上按同一绝对额计费会把早年隔夜费放大成每夜
+百分之几（T65 实测 1986 段 6 笔后权益爆掉）。修复：规则带 ref_price /
+contract_size（点数模式 + 调用方给出参考价，与佣金/事件路径"最后收盘"同一
+约定）即**相对价格口径**——rel = |per_lot_per_night| ÷ (ref_price ×
+contract_size)，计费 fee = rel × price × contract（price=出场侧 bar 价，
+keyword-only、缺失即 fail-fast，防旧绝对口径静默复活）。货币模式（2/3/4）
+费率本身是绝对金额语义，一律不相对化；禁用模式不变。不给参考价时点数模式
+保持旧绝对口径（预筛/关卡装配路径的现状，见 run_backtest.build_costs 的
+T82 注记——引擎 CLI 主路径恒传参考价）。
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Iterable
+from typing import Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -66,14 +79,21 @@ class SwapRule:
 
     charge_local/charge_tz 定义计费时刻的**本地墙上时间**（DST 感知）；
     charge_weekdays 上的计费时刻才计费（默认工作日——周末不计，Exness 全品种组）。
+
+    T82 相对价格基准：ref_price 与 contract_size **成对**给出（均有限正数）
+    即点数模式相对口径——long/short_per_day 是校准于 ref_price 价位的绝对
+    USD/手/夜，计费按 price/ref_price 缩放（见 SwapModel.overnight_fee）；
+    两者都缺省即绝对口径（货币模式/实测绝对额/零，price 被忽略）。
     """
 
     long_per_day: float
     short_per_day: float
     triple_weekdays: frozenset = frozenset({2})  # 周三
-    charge_weekdays: frozenset = frozenset({0, 1, 2, 3, 4})  # 周末不计（Exness 全部品种组）
+    charge_weekdays: frozenset = frozenset({0, 1, 2, 3, 4})  # 周末不计（Exness 全品种组）
     charge_local: str = "17:00"                   # 计费时刻：交易所本地（Exness 换日）
     charge_tz: str = "America/New_York"           # 夏令时 21:00 GMT / 冬令时 22:00 GMT
+    ref_price: float | None = None                # T82：相对口径参考价（费率校准价位）
+    contract_size: float | None = None            # T82：每手合约乘数（rel 分母），与 ref 成对
 
     def __post_init__(self):
         try:
@@ -83,13 +103,23 @@ class SwapRule:
         try:
             ZoneInfo(self.charge_tz)
         except Exception as e:
-            raise ValueError(f"charge_tz 未知时区：{self.charge_tz!r}") from e
+            raise ValueError(f"charge_tz 未知时区：{e}") from e
         object.__setattr__(self, "triple_weekdays", frozenset(self.triple_weekdays))
         object.__setattr__(self, "charge_weekdays", frozenset(self.charge_weekdays))
         for name in ("triple_weekdays", "charge_weekdays"):
             for wd in getattr(self, name):
                 if not 0 <= wd <= 6:
                     raise ValueError(f"{name} 须 0..6（Monday=0），收到 {wd}")
+        # T82：相对口径字段成对出现、有限正数（只给其一或非正 = 口径二义）
+        if (self.ref_price is None) != (self.contract_size is None):
+            raise ValueError(
+                "ref_price 与 contract_size 必须成对给出（点数模式相对口径）"
+                "或都缺省（绝对口径）："
+                f"ref_price={self.ref_price!r}, contract_size={self.contract_size!r}")
+        for v, name in ((self.ref_price, "ref_price"),
+                        (self.contract_size, "contract_size")):
+            if v is not None and (not math.isfinite(v) or v <= 0):
+                raise ValueError(f"{name} 须为有限正数，收到 {v!r}")
 
 
 def _as_naive_utc(ts) -> pd.Timestamp:
@@ -193,7 +223,8 @@ class SwapModel:
 
     @classmethod
     def from_snapshot(cls, snap: dict, symbols: Iterable[str], *,
-                      account_currency: str = "USD") -> "SwapModel":
+                      account_currency: str = "USD",
+                      ref_prices: Mapping[str, float] | None = None) -> "SwapModel":
         """从品种快照（load_snapshot 的 dict）为指定品种构建规则。
 
         每手每夜金额换算见 per_lot_per_night；三倍日由 swap_rollover3days
@@ -201,7 +232,16 @@ class SwapModel:
         计费时刻用 SwapRule 默认（17:00 America/New_York，DST 感知）。
         旧快照缺字段或遇到未实现的 swap_mode 时如实抛错
         （KeyError / NotImplementedError）。
+
+        T82：ref_prices（{symbol: 参考价}，序列最后收盘——与佣金/事件路径
+        同一约定）覆盖点数模式品种时，规则折**相对口径**（带
+        ref_price/contract_size，计费按 price/ref_price 缩放，见
+        overnight_fee）；货币模式（2/3/4）费率本身是绝对金额语义，一律不
+        相对化。ref_prices 未覆盖点数模式品种时保持旧绝对口径（预筛/关卡
+        装配路径的现状，引擎 CLI 主路径恒传参考价——run_backtest.build_costs
+        的 T82 注记）。参考价非有限正数 → ValueError（fail-fast，不猜）。
         """
+        refs = dict(ref_prices or {})
         rules: dict[str, SwapRule] = {}
         for name in symbols:
             try:
@@ -212,9 +252,22 @@ class SwapModel:
             long_pd, short_pd = per_lot_per_night(
                 entry, account_currency=account_currency)
             triple_py = mt5_to_py_weekday(entry["swap_rollover3days"])
+            rel_kwargs: dict = {}
+            if entry["swap_mode"] == SWAP_MODE_POINTS:
+                ref = refs.get(name)
+                if ref is not None:
+                    r = float(ref)
+                    if not math.isfinite(r) or r <= 0:
+                        raise ValueError(
+                            f"{name} 点数模式参考价须为有限正数，收到 {ref!r}"
+                            "（rel 分母 ref_price×contract_size 不能为 0/负）")
+                    rel_kwargs = {
+                        "ref_price": r,
+                        "contract_size": float(entry["contract_size"]),
+                    }
             rules[name] = SwapRule(
                 long_per_day=long_pd, short_per_day=short_pd,
-                triple_weekdays=frozenset({triple_py}),
+                triple_weekdays=frozenset({triple_py}), **rel_kwargs,
             )
         return cls(rules)
 
@@ -226,8 +279,17 @@ class SwapModel:
                 f"{symbol} 未配置 SwapRule（已配置：{sorted(self._per_symbol)}）") from None
 
     def overnight_fee(self, symbol: str, side: str,
-                      from_ts: datetime, to_ts: datetime) -> float:
-        """结构化接口：计价货币/手，恒 ≤ 0（正费率也按成本方向取负）。"""
+                      from_ts: datetime, to_ts: datetime,
+                      *, price: float | None = None) -> float:
+        """结构化接口：计价货币/手，恒 ≤ 0（正费率也按成本方向取负）。
+
+        T82 相对价格基准：规则带 ref_price（点数模式折相对口径）时
+        rel = |per_lot_per_night| ÷ (ref_price × contract_size)，计费
+        fee = rel × price × contract_size × 夜数——price 为**出场侧 bar 价**
+        （keyword-only，沿用成本接口 v2 的 price 惯例），缺失或非有限正数
+        即 ValueError（fail-fast，不静默按绝对额计费——防旧口径复活）。
+        绝对口径规则（货币模式/实测绝对额/零）忽略 price。
+        """
         rule_ = self.rule(symbol)
         if side not in ("long", "short"):
             raise ValueError(f"side 须为 'long'/'short'，收到 {side!r}")
@@ -237,4 +299,15 @@ class SwapModel:
             raise ValueError(f"to_ts({to_ts}) 早于 from_ts({from_ts})")
         per_day = rule_.long_per_day if side == "long" else rule_.short_per_day
         nights = charge_nights(f, t, rule_)
+        if rule_.ref_price is not None:
+            if price is None:
+                raise ValueError(
+                    f"{symbol}：点数模式隔夜费为相对价格口径（T82），必须传 "
+                    "price=（出场侧 bar 价）——缺失即拒绝，不静默按绝对额计费")
+            p = float(price)
+            if not math.isfinite(p) or p <= 0:
+                raise ValueError(
+                    f"{symbol}：price 须为有限正数，收到 {price!r}")
+            rel = abs(per_day) / (rule_.ref_price * rule_.contract_size)
+            return -abs(nights * rel * p * rule_.contract_size)
         return -abs(nights * per_day)

@@ -38,7 +38,8 @@ class FakeCosts:
     def commission_per_lot(self, symbol):
         return self.commission
 
-    def overnight_fee(self, symbol, side, from_ts, to_ts):
+    def overnight_fee(self, symbol, side, from_ts, to_ts, *, price=None):
+        # T82：price 形参保持成本接口兼容（绝对假成本忽略）
         f, t = pd.Timestamp(from_ts), pd.Timestamp(to_ts)
         if t <= f:
             return 0.0
@@ -1085,3 +1086,36 @@ def test_ab_alignment_time_stop_chain(reentry):
         assert ra.trades.iloc[1]["entry_time"] == ts("2026-01-05 19:00:00")
     else:
         assert reasons == ["time_stop"]
+
+
+# --------------------------------------------- T82：隔夜费 price 传参
+
+class SwapPriceRecordingCosts(FakeCosts):
+    """记录 overnight_fee 的 price 传参（T82 出场 tick bid 断言用）。"""
+
+    def __init__(self):
+        super().__init__()
+        self.swap_calls: list[float | None] = []
+
+    def overnight_fee(self, symbol, side, from_ts, to_ts, *, price=None):
+        self.swap_calls.append(price)
+        return super().overnight_fee(symbol, side, from_ts, to_ts)
+
+
+def test_t82_engine_passes_exit_tick_bid_to_swap():
+    """T82 失败测试：B 层接线——overnight_fee 带 price=出场 tick 的 bid
+    （与 A 层 bid 基准同口径；end_of_data 出场 = 末根收盘前最后一笔 tick）。"""
+    bars = bars_at(["2026-01-31 22:00", "2026-01-31 23:00",
+                    "2026-02-01 00:00", "2026-02-01 01:00"])
+    bars.loc[3, "close"] = 103.0
+    ticks = [
+        tick("2026-01-31 23:00:00.001", 100.0, 100.5),
+        tick("2026-02-01 00:00:00.001", 100.0, 100.5),
+        tick("2026-02-01 01:59:59.999", 103.0, 103.2),
+    ]
+    costs = SwapPriceRecordingCosts()
+    one_trade(run_backtest_ticks(BuyHold(), bars, make_loader(ticks), costs,
+                                 symbol="XAUUSD", params={},
+                                 contract_size=1.0, timeframe="H1",
+                                 volume_lots=1.0))
+    assert costs.swap_calls == [103.0]   # 出场 tick（末根收盘前最后一笔）bid

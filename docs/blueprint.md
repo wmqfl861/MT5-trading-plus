@@ -50,11 +50,16 @@ v3.1 → v4 的主要变化：
 - **实盘**：阶段 F 只允许 `-Mode Demo`、0.01 手；真实账户下单仍禁止。
 - **P 线**：T75 标定报告与 T77 轮次草案经审核批准之前，不在真实局面触发上计算任何标签、拟合或 Δp；标定只用随机化触发与植入效应。T71–T77 不修改回测引擎与实盘链路（D44）。
 
-- **待办（T65 审核登记，2026-10-28）**：引擎 A 隔夜费按绝对额计费与早年
-  价格水平不兼容（实测 1986 年 FRED 段 6 笔后权益爆掉，每笔 swap −1.9万~
-  −4.1万）——外部数据延长后对照标定（gates-v3 延长前后对比）的前置条件；
-  修复属引擎域（src/mt5quant/backtest/engine_a.py 或 costs/swap 计费路径），
-  参照 T66 事件路径的参考价折算修法（event-mode-calibration §1.2）。
+- **已修（T65 审核登记 → T82 落地，2026-10-28）**：引擎 A/B 隔夜费相对
+  价格基准——点数模式费率按参考价（序列最后收盘，与佣金/事件路径同一
+  约定）折相对口径 rel=|per_lot_per_night|÷(ref×contract)、计费随出场侧
+  bar 价缩放（A-1.7：overnight_fee 增 keyword-only price，缺 price 的相对
+  模型 fail-fast；货币模式保留绝对）；calibrated 与快照两路径同修，
+  cost_version 追加 relref[ref_price sha8] 区分新旧口径；预筛/关卡装配
+  路径未传参考价前保持旧绝对口径（引擎 CLI 主路径恒传）。早年价格不再
+  被按快照时代绝对额放大（1986 段 131 价位每夜 ≈−2.5bp 而非 −4.8%），
+  gates-v3 延长后对照（gates_calibration 装配）补跑时其 build_costs 接线
+  传 swap_ref_price 即可复现口径。
 
 ## 3. 架构（目标形态）
 

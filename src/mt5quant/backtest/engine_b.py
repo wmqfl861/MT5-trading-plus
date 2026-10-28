@@ -50,7 +50,9 @@
 - 金额口径与 A 层（C1 修复后）完全一致：contract_size 必填；
   gross = 价格差 × 手数 × contract_size（账户货币）；
   commission = 每手来回佣金 × 手数；swap = costs.overnight_fee(
-  symbol, side, entry_time, exit_time) × 手数；net = gross − commission + swap。
+  symbol, side, entry_time, exit_time, price=出场 tick 的 bid) × 手数
+  （T82：与 A 层 bid 基准同口径——点数模式相对费率随 price 缩放，缺
+  price 的相对模型 fail-fast；绝对费率忽略）；net = gross − commission + swap。
   spread_cost 拆分 = 非Bid 腿那笔 tick 的 (ask − bid) × 手数 × contract_size
   （多头入场腿、空头出场腿，对应 A 层"价差挂非Bid腿"的拆分口径）；
   slippage_cost = 两腿 slippage_price × 手数 × contract_size。
@@ -127,8 +129,13 @@ class CostsTick(Protocol):
         ...
 
     def overnight_fee(self, symbol: str, side: str,
-                      from_ts: pd.Timestamp, to_ts: pd.Timestamp) -> float:
-        """持仓 [from_ts, to_ts] 的隔夜费（每手，账户货币，恒 ≤0）。"""
+                      from_ts: pd.Timestamp, to_ts: pd.Timestamp,
+                      *, price: float | None = None) -> float:
+        """持仓 [from_ts, to_ts] 的隔夜费（每手，账户货币，恒 ≤0）。
+
+        price=出场 tick 的 bid（T82，与 A 层 bid 基准同口径）：点数模式
+        （相对口径）模型必需——缺失抛 ValueError；绝对费率模型忽略。
+        """
         ...
 
 
@@ -407,9 +414,11 @@ def run_backtest_ticks(strategy, bars: pd.DataFrame, ticks_loader, costs, *,
         gross = (exit_price - state["entry_price"]) * state["dir"] * lots * cs
         commission = costs.commission_per_lot(symbol) * lots
         # 隔夜费口径与 A 层一致：整段 (entry, exit] 交给模型按计费时刻数夜，
-        # 每手口径必须 × 手数
+        # 每手口径必须 × 手数。T82：price=出场 tick 的 bid（与 A 层 bid 基准
+        # 同口径——点数模式相对费率随 price 缩放）
         swap = costs.overnight_fee(
-            symbol, state["side"], state["entry_time"], ts_) * lots
+            symbol, state["side"], state["entry_time"], ts_,
+            price=bid) * lots
         net = gross - commission + swap
         kwargs = dict(
             entry_time=state["entry_time"], exit_time=ts_,

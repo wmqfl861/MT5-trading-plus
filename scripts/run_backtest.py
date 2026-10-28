@@ -156,8 +156,8 @@ class ZeroCosts:
     def commission_per_lot(self, symbol):
         return 0.0
 
-    def overnight_fee(self, symbol, side, from_ts, to_ts):
-        return 0.0
+    def overnight_fee(self, symbol, side, from_ts, to_ts, *, price=None):
+        return 0.0    # T82：price 形参保持 Protocol 兼容（零成本恒忽略）
 
 
 def resolve_contract_size(data_root: str, symbol: str, override: float | None) -> float:
@@ -428,7 +428,8 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
                 spread_mode: str = "relative",
                 sessions_sha: str | None = None,
                 cache: bool = True,
-                research_store: bool = False) -> tuple:
+                research_store: bool = False,
+                swap_ref_price: float | None = None) -> tuple:
     """tick 实测点差 + 佣金/隔夜费（calibrated.json > 品种快照 > 报错）。
 
     T28/M8：优先加载点差模型缓存 {data-root}/costs/spread_model.json（按
@@ -471,6 +472,17 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
     返回 (costs, cost_version)。佣金优先 calibrated 实测，其次 CLI 显式值；
     隔夜费优先 calibrated 实测费率（free_of_swap=true 属合法实测零费），其次
     快照推算；两者都没有且未 --allow-zero-swap → ValueError（禁止静默按 0）。
+
+    swap_ref_price（T82，2026-10-28，镜像 T66 事件路径 §1.2）：点数模式隔夜
+    费率的**相对价格基准**——CLI 主路径恒传序列最后收盘（与佣金/事件路径
+    "最后收盘"同一约定）。给出时 calibrated 与快照两条路径的点数模式费率都
+    折相对口径（SwapRule 带 ref_price/contract_size，计费 fee = rel × 出场
+    bar 价 × contract；早年价格不再被按快照时代绝对额放大——T65 实测 1986
+    段 6 笔后权益爆掉的根因），cost_version 追加 relref[ref_price sha 前 8
+    位]（哈希运行时规则实际持有的 ref_price，与计费同源单点——台账可区分
+    新旧口径）；货币模式（2/3/4）费率是绝对金额语义，一律保留绝对。未给
+    swap_ref_price 时点数模式保持旧绝对口径（预筛/关卡/对账装配路径的现状，
+    引擎 CLI 主路径之外不在本函数强行改动）。
     """
     from mt5quant.costs import (
         CommissionModel, Costs, SlippageModel, SpreadModel, SwapModel,
@@ -545,9 +557,18 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
         # 快照缺品种/字段 → 如实报错，不静默按无三倍日。
         snap_entry = _snapshot_swap_entry(data_root, symbol)
         triple_py = mt5_to_py_weekday(snap_entry["swap_rollover3days"])
+        # T82：实测 per_lot_per_night 同为"绝对 USD/手/夜、校准于近期价格"
+        # ——快照 swap_mode==点数时按同一 ref 相对化（calibrated 自带的
+        # snapshot 上下文优先，缺则退 specs 快照）；货币模式保留绝对；无豁免。
+        cal_snap_mode = (cal_sw.get("snapshot", {}).get("swap_mode")
+                         if isinstance(cal_sw, dict) else None)
+        swap_mode = (cal_snap_mode if cal_snap_mode is not None
+                     else snap_entry.get("swap_mode"))
         swap = SwapModel(per_symbol={symbol: SwapRule(
             long_per_day=cal_rate[0], short_per_day=cal_rate[1],
-            triple_weekdays=frozenset({triple_py}))})
+            triple_weekdays=frozenset({triple_py}),
+            **_swap_relative_kwargs(symbol, swap_mode, snap_entry,
+                                    swap_ref_price))})
         swap_tag = f"swap-cal(tri{triple_py})"
     elif cal_sw and cal_sw.get("free_of_swap") is True:
         swap = SwapModel(per_symbol={symbol: SwapRule(
@@ -558,7 +579,12 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
         try:
             with open(snap_path, encoding="utf-8") as f:
                 snap = json.load(f)
-            swap = SwapModel.from_snapshot(snap, [symbol])
+            # T82：点数模式 + swap_ref_price 给出 → 折相对口径（from_snapshot
+            # 内做校验与注入）；货币模式不相对化；不给 ref 保持旧绝对口径
+            swap = SwapModel.from_snapshot(
+                snap, [symbol],
+                ref_prices=(None if swap_ref_price is None
+                            else {symbol: float(swap_ref_price)}))
             swap_tag = "swap-snapshot"
         except (OSError, KeyError, NotImplementedError, ValueError) as e:
             if allow_zero_swap:
@@ -597,6 +623,11 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
                                            for d in _rule.triple_weekdays)},
     })[:8]
     swap_tag = f"{swap_tag}[{swap_digest8}]"
+    # T82：相对价格基准身份——哈希**运行时规则实际持有的 ref_price**（与计费
+    # 同源单点取值，不从 bars/缓存另取一遍）；绝对口径规则无此标记。
+    if _rule.ref_price is not None:
+        swap_tag += (f"-relref[{canonical_json_sha256(
+            {'ref_price': float(_rule.ref_price)})[:8]}]")
 
     # ---- T36/R6（C4）：缓存命中时装载越幅表并注入 Costs ----
     overshoot_model = None
@@ -628,6 +659,33 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
             f"tick-spread-p90[{mode_tag}@NY/{spread.sampling}#{model_sha8}]"
             f"+slip{spread_fraction}-{comm_tag}-{swap_tag}{ov_tag}"
             f"{miss_tag}{sess_tag}")
+
+
+def _swap_relative_kwargs(symbol: str, swap_mode, snap_entry: dict,
+                          swap_ref_price: float | None) -> dict:
+    """T82：swap_mode==点数 且给了 swap_ref_price → 相对口径 SwapRule 额外字段。
+
+    返回 {}（绝对口径：货币模式 / 未给 ref 的点数模式——预筛、关卡、对账
+    装配路径的现状）或 {"ref_price", "contract_size"}（contract 取 specs
+    快照——rel 分母 ref×contract 需要；缺字段如实报错，不猜 1）。
+    """
+    from mt5quant.costs.swap import SWAP_MODE_POINTS
+
+    if swap_mode != SWAP_MODE_POINTS or swap_ref_price is None:
+        return {}
+    ref = float(swap_ref_price)
+    if not math.isfinite(ref) or ref <= 0:
+        raise ValueError(
+            f"{symbol} swap_ref_price 须为有限正数，收到 {swap_ref_price!r}"
+            "（点数模式相对口径的分母）")
+    try:
+        contract = float(snap_entry["contract_size"])
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError(
+            f"{symbol} 点数模式相对口径需要快照 contract_size（rel 分母 "
+            f"ref_price×contract_size），读取失败：{e}——重跑 "
+            "scripts/snapshot_specs.py") from e
+    return {"ref_price": ref, "contract_size": contract}
 
 
 def _snapshot_swap_entry(data_root: str, symbol: str) -> dict:
@@ -867,7 +925,10 @@ def main() -> int:
                 data_root, args.symbol, args.spread_fraction,
                 args.commission, allow_zero_swap=args.allow_zero_swap,
                 spread_mode=args.spread_mode, sessions_sha=sess_sha,
-                research_store=research_mode)
+                research_store=research_mode,
+                # T82：点数模式隔夜费的相对价格基准 = 序列最后收盘（与佣金/
+                # 事件路径同一约定；研究库取研究库最后收盘，导出方已核水位）
+                swap_ref_price=float(bars["close"].iloc[-1]))
         else:
             costs, cost_version = ZeroCosts(), "zero-v0"
         entry_policy = entry_policy_for(costs, args.symbol, sess_policy)

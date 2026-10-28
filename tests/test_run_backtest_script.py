@@ -1056,3 +1056,101 @@ def test_cost_version_binds_actual_swap_rates_snapshot(tmp_path):
     root2 = _snapshot_root(-10.0)
     _, ver2 = mod.build_costs(str(root2), "XAUUSD", 0.0, allow_zero_swap=True)
     assert ver2 != ver1
+
+
+# ----------------------------------------------- T82：隔夜费相对价格基准
+
+def _write_points_snapshot(root, *, swap_long=-633.8, point=0.01,
+                           contract=1.0, symbol="USTEC"):
+    """点数模式快照（swap_mode=1，与 data/specs 实测同构）+ 全小时 tick。"""
+    import os
+
+    root = _full_hour_ticks(root, symbol)
+    specs = os.path.join(str(root), "specs")
+    os.makedirs(specs, exist_ok=True)
+    Path(specs, "latest.json").write_text(json.dumps({
+        symbol: {"swap_mode": 1, "swap_long": swap_long, "swap_short": 0.0,
+                 "point": point, "contract_size": contract,
+                 "swap_rollover3days": 5,
+                 "currency_profit": "USD", "currency_margin": "USD"}}),
+        encoding="utf-8")
+    return root
+
+
+def test_t82_snapshot_path_relref_version_identity(tmp_path):
+    """T82 失败测试：点数模式 swap_ref_price 给出 → 规则折相对口径、版本串
+    追加 relref[8 位]（哈希运行时规则实际持有的 ref_price）；不同 ref →
+    relref 变（基准身份区分新旧口径）；不给 ref → 旧绝对口径、无 relref
+    （版本串与带 ref 的不同——台账去重可区分）。"""
+    mod = _load_script()
+    root = _write_points_snapshot(tmp_path / "d1" / "data")
+    _, ver_abs = mod.build_costs(str(root), "USTEC", 0.0,
+                                 allow_zero_swap=True)
+    assert "relref" not in ver_abs            # 旧绝对口径：无基准标记
+    _, ver_rel = mod.build_costs(str(root), "USTEC", 0.0,
+                                 allow_zero_swap=True,
+                                 swap_ref_price=25097.0)
+    assert "relref[" in ver_rel and ver_rel != ver_abs
+    _, ver_rel2 = mod.build_costs(str(root), "USTEC", 0.0,
+                                  allow_zero_swap=True,
+                                  swap_ref_price=25100.0)
+    assert ver_rel2 != ver_rel                # ref 变 → relref 变（费率同值）
+    # 相对口径：缺 price 的隔夜费 fail-fast（防旧口径复活）
+    costs, _ = mod.build_costs(str(root), "USTEC", 0.0, allow_zero_swap=True,
+                               swap_ref_price=25097.0)
+    from datetime import datetime
+    with pytest.raises(ValueError, match="price"):
+        costs.overnight_fee("USTEC", "long",
+                            datetime(2026, 10, 21, 20, 0),
+                            datetime(2026, 10, 26, 20, 0))
+    # 131 价位 5 夜：每夜 ≈ −2.5bp 的名义额（6.338×131/25097×5）
+    fee = costs.overnight_fee("USTEC", "long",
+                              datetime(2026, 10, 21, 20, 0),
+                              datetime(2026, 10, 26, 20, 0), price=131.0)
+    assert fee == pytest.approx(-6.338 * (131.0 / 25097.0) * 5.0, rel=1e-9)
+
+
+def test_t82_calibrated_path_same_relative_basis(tmp_path):
+    """T82 失败测试（计划审核 R1：calibrated 路径同修）：calibrated 实测费率
+    优先路径在快照 swap_mode==点数时按同一 ref 相对化、relref 入串——
+    合成 calibrated 费率在早年价（131）不再爆：每夜 ≈ −2.5bp 名义额而非
+    绝对额（旧口径 1986 段权益爆掉的根因，T65 §5.4）。"""
+    import os
+    from datetime import datetime
+
+    mod = _load_script()
+    root = _write_points_snapshot(tmp_path / "d2" / "data")
+    costs_dir = os.path.join(str(root), "costs")
+    os.makedirs(costs_dir, exist_ok=True)
+    Path(costs_dir, "calibrated.json").write_text(json.dumps({
+        "version": 1, "symbols": {"USTEC": {
+            "swap": {"free_of_swap": None,
+                     "long": {"per_lot_per_night": -6.338},
+                     "short": {"per_lot_per_night": 0.0}}}}}),
+        encoding="utf-8")
+    costs, ver = mod.build_costs(str(root), "USTEC", 0.0,
+                                 allow_zero_swap=True,
+                                 swap_ref_price=25097.0)
+    assert "swap-cal" in ver and "relref[" in ver
+    rule = costs.swap.rule("USTEC")
+    assert rule.ref_price == 25097.0 and rule.contract_size == 1.0
+    w = (datetime(2026, 10, 21, 20, 0), datetime(2026, 10, 26, 20, 0))
+    with pytest.raises(ValueError, match="price"):
+        costs.overnight_fee("USTEC", "long", *w)
+    fee = costs.overnight_fee("USTEC", "long", *w, price=131.0)
+    assert fee == pytest.approx(-6.338 * (131.0 / 25097.0) * 5.0, rel=1e-9)
+    # 货币模式（2）的 calibrated 费率不相对化：relref 不入串
+    Path(os.path.join(str(root), "specs"), "latest.json").write_text(json.dumps({
+        "USTEC": {"swap_mode": 2, "swap_long": -3.0, "swap_short": 0.0,
+                  "point": 0.01, "contract_size": 1.0,
+                  "swap_rollover3days": 5,
+                  "currency_profit": "USD", "currency_margin": "USD"}}),
+        encoding="utf-8")
+    costs2, ver2 = mod.build_costs(str(root), "USTEC", 0.0,
+                                   allow_zero_swap=True,
+                                   swap_ref_price=25097.0)
+    assert "relref" not in ver2
+    # 货币模式：calibrated 实测费率（-6.338 绝对额，优先于快照）不相对化，
+    # 不带 price 也不抛
+    assert costs2.swap.rule("USTEC").ref_price is None
+    assert costs2.overnight_fee("USTEC", "long", *w) == pytest.approx(-6.338 * 5.0)

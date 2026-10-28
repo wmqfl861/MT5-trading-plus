@@ -39,7 +39,8 @@ class FlatCosts:
     def commission_per_lot(self, symbol):
         return self.commission
 
-    def overnight_fee(self, symbol, side, from_ts, to_ts):
+    def overnight_fee(self, symbol, side, from_ts, to_ts, *, price=None):
+        # T82：price 形参保持成本接口兼容（绝对假成本忽略）
         f, t = pd.Timestamp(from_ts), pd.Timestamp(to_ts)
         if t <= f:
             return 0.0
@@ -50,7 +51,7 @@ class FlatCosts:
 class ChargeHourCosts(FlatCosts):
     """按 21:00 计费时刻数夜（I2 回归）：每夜 −3.0。"""
 
-    def overnight_fee(self, symbol, side, from_ts, to_ts):
+    def overnight_fee(self, symbol, side, from_ts, to_ts, *, price=None):
         f, t = pd.Timestamp(from_ts), pd.Timestamp(to_ts)
         nights = 0
         day = f.normalize()
@@ -697,11 +698,13 @@ def test_equity_marks_short_at_ask():
 
 # ------------------------------------------------- 成本接口 v2（R1 / 计划 T3）
 
-def test_engine_version_bumped_for_t36_stop_overshoot():
-    # A-1.5 → A-1.6（T36/H2）：stop 出场成交价加该小时止损越幅 p50
-    # （stop_gap 按开盘价成交已含真实越幅，不重复加）；A-1.5 = T23
-    # RiskSizing 按风险定手数；A-1.4 = T20 禁入窗推迟开仓
-    assert ENGINE_VERSION == "A-1.6"
+def test_engine_version_bumped_for_t82_swap_price_basis():
+    # A-1.6 → A-1.7（T82）：overnight_fee 增 keyword-only price=（出场侧
+    # 成交基准价）——点数模式费率按参考价折相对口径随 price 缩放，缺 price
+    # 的相对模型 fail-fast；货币模式忽略 price（绝对额语义不变）。
+    # A-1.6 = T36 stop 出场成交价加止损越幅 p50；A-1.5 = T23 RiskSizing
+    # 按风险定手数；A-1.4 = T20 禁入窗推迟开仓
+    assert ENGINE_VERSION == "A-1.7"
 
 
 def test_engine_passes_price_to_cost_models_long_fills():
@@ -1091,3 +1094,73 @@ def test_sizing_skips_entry_when_atr_unavailable():
     assert res.skipped_zero_lots == 13       # sig_bar 0..12 的 13 次尝试
     assert len(res.trades) == 1
     assert res.trades.iloc[0]["entry_time"] == pd.Timestamp("2026-01-06 00:00")
+
+
+# --------------------------------------------- T82：隔夜费相对价格基准
+
+class SwapRecordingCosts(FlatCosts):
+    """记录 overnight_fee 的 price 传参（T82 出场侧 bar 价断言用）。"""
+
+    def __init__(self):
+        super().__init__()
+        self.swap_calls: list[float | None] = []
+
+    def overnight_fee(self, symbol, side, from_ts, to_ts, *, price=None):
+        self.swap_calls.append(price)
+        return super().overnight_fee(symbol, side, from_ts, to_ts)
+
+
+def test_t82_engine_passes_exit_side_price_to_swap():
+    """T82 失败测试：引擎调 overnight_fee 必须带 price=出场侧成交基准价
+    （end_of_data 出场 = 末根收盘 103；相对口径模型缺 price 即 fail-fast，
+    引擎接线是 price 的唯一供给了）。"""
+    rec = SwapRecordingCosts()
+    run_backtest(ScriptStrategy([1], fill=1), base4(), rec,
+                 symbol="XAUUSD", contract_size=1.0, params={},
+                 timeframe="H1", volume_lots=1.0)
+    assert rec.swap_calls == [103.0]   # 出场侧基准价（末根收盘强平）
+
+
+class EarlyPriceSwapCosts(FlatCosts):
+    """T82：点数模式相对口径隔夜费（USTEC 快照费率 -6.338/手/夜、ref=25097）。"""
+
+    def __init__(self):
+        super().__init__(commission=0.0)
+        from mt5quant.costs.swap import SwapModel, SwapRule
+        self._swap = SwapModel(per_symbol={"USTEC": SwapRule(
+            long_per_day=-633.8 * 0.01 * 1.0, short_per_day=0.0,
+            triple_weekdays=frozenset({4}),          # USTEC 三倍日=周五
+            ref_price=25097.0, contract_size=1.0)})
+
+    def overnight_fee(self, symbol, side, from_ts, to_ts, *, price=None):
+        return self._swap.overnight_fee(symbol, side, from_ts, to_ts,
+                                        price=price)
+
+
+def test_t82_early_1986_prices_equity_not_ruined():
+    """T82 失败测试（T65 §5.4 场景复算）：131 价位（1986 年 USTEC）21 根 D1
+    持仓、100 手——旧绝对口径 swap = 6.338×20 夜×100 ≈ −1.27 万（1 万本金
+    权益爆掉）；相对口径每夜 ≈ −2.5bp 名义额，权益不再爆炸。"""
+    from mt5quant.costs.swap import charge_nights
+
+    df = flat_bars(pd.Timestamp("2026-01-05"), 21, tf="D1",
+                   openc=131.0, high=131.5, low=130.5, close=131.0)
+    costs = EarlyPriceSwapCosts()
+    res = run_backtest(ScriptStrategy([1], fill=1), df, costs,
+                       symbol="USTEC", contract_size=1.0, params={},
+                       timeframe="D1", volume_lots=100.0,
+                       initial_capital=10_000.0)
+    assert not res.ruined
+    t = one_trade(res)
+    entry = df["time"].iloc[1]
+    exit_fill = df["time"].iloc[20] + pd.Timedelta(days=1)   # D1 收盘时刻
+    nights = charge_nights(entry, exit_fill, costs._swap.rule("USTEC"))
+    # 相对口径：swap = 6.338 × (131/25097) × 夜数 × 100 手（每夜 ≈ −2.5bp）
+    assert t["swap"] == pytest.approx(
+        -6.338 * (131.0 / 25097.0) * nights * 100.0, rel=1e-9)
+    # 量级对照：旧绝对口径同窗口是 6.338×夜数×100——约为新口径的
+    # 25097/131 ≈ 192 倍（T65 实测 6 笔爆仓的根因）
+    old_abs = 6.338 * nights * 100.0
+    assert old_abs / abs(t["swap"]) == pytest.approx(25097.0 / 131.0, rel=1e-9)
+    assert old_abs > 10_000.0            # 旧口径足以爆掉 1 万本金
+    assert res.equity.min() > 9_000.0    # 新口径权益不爆

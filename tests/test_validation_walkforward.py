@@ -39,7 +39,7 @@ class Zero:
     def commission_per_lot(self, symbol):
         return 0.0
 
-    def overnight_fee(self, symbol, side, from_ts, to_ts):
+    def overnight_fee(self, symbol, side, from_ts, to_ts, *, price=None):   # T82 形参透传
         return 0.0
 
 

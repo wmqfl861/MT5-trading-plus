@@ -36,7 +36,7 @@ class FlatCosts:
     def commission_per_lot(self, symbol):
         return self.commission
 
-    def overnight_fee(self, symbol, side, from_ts, to_ts):
+    def overnight_fee(self, symbol, side, from_ts, to_ts, *, price=None):   # T82 形参透传
         f, t = pd.Timestamp(from_ts), pd.Timestamp(to_ts)
         if t <= f:
             return 0.0
