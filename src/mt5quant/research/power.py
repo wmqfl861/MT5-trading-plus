@@ -23,9 +23,10 @@ docs/reviews/probes/2026-10-27-round11-power.py 的库化，全网格（真实�
 from __future__ import annotations
 
 import math
-from math import erf, sqrt
+from math import ceil, erf, sqrt
 
-__all__ = ["sharpe_se", "power_one_sided", "min_detectable_sharpe"]
+__all__ = ["sharpe_se", "power_one_sided", "min_detectable_sharpe",
+           "power_proportion_one_sided", "n_needed_proportion"]
 
 
 def _phi(x: float) -> float:
@@ -106,3 +107,59 @@ def min_detectable_sharpe(years: float, *, alpha: float = 0.05,
         else:
             hi = mid
     return hi
+
+
+# --------------------------------------------------------------- 比例检验（T76）
+# P 线 Δp 检验（蓝图 P 线 §3.4）：单侧 H0: p = p0（已知基准赢率）对
+# H1: p = p0 + dp。正态近似（分子按 H0 方差、分母按 H1 方差，与蓝图
+# §3.4 解析表逐格一致——tests/test_research_power.py 全九格复现）：
+#   power(n) = Φ((dp·√n − z_a·√(p0q0)) / √(p1q1))
+#   n_needed = ceil(((z_a·√(p0q0) + z_p·√(p1q1)) / dp)²)
+# z_a 复用 _z_alpha（千分位，Bonferroni alpha/n_tests）、z_p 万分位，
+# 与本模块夏普口径同一取位约定。触发会重叠聚集，有效样本更少——按月
+# 块自助的方差折算属 T75 标定，此处是解析下界。
+
+def _validate_proportion_args(p0: float, dp: float) -> tuple[float, float]:
+    if not (math.isfinite(p0) and 0.0 < p0 < 1.0):
+        raise ValueError(f"p0 必须在开区间 (0,1)，收到 {p0!r}")
+    if not (math.isfinite(dp) and dp > 0.0):
+        raise ValueError(f"dp 必须为正（单侧增量），收到 {dp!r}")
+    if p0 + dp >= 1.0:
+        raise ValueError(f"p0+dp 必须 < 1，收到 {p0 + dp!r}")
+    return float(p0), float(dp)
+
+
+def power_proportion_one_sided(p0: float, dp: float, n: int, *,
+                               alpha: float = 0.05,
+                               n_tests: int = 1) -> float:
+    """n 个独立触发上单侧 Δp 检验的检验力（正态近似，Bonferroni）。
+
+    以已知基准赢率 p0 为对照：拒绝域 P̂ ≥ p0 + z_a·√(p0q0/n)，真实赢率
+    p1 = p0+dp 时的检出概率。n 必须是 ≥1 整数。
+    """
+    p0, dp = _validate_proportion_args(p0, dp)
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise ValueError(f"n 必须是 ≥1 整数，收到 {n!r}")
+    z_a = _z_alpha(alpha, n_tests)
+    p1 = p0 + dp
+    return _phi((dp * sqrt(n) - z_a * sqrt(p0 * (1.0 - p0)))
+                / sqrt(p1 * (1.0 - p1)))
+
+
+def n_needed_proportion(p0: float, dp: float, *, alpha: float = 0.05,
+                        power: float = 0.8, n_tests: int = 1) -> int:
+    """达到目标检验力所需的独立触发数（解析式取整向上）。
+
+    复现蓝图 P 线 §3.4 全表（p0=0.40；如 dp=0.03/power=0.8 → 1661、
+    n_tests=6 → 2808、dp=0.05/power=0.5 → 260）。触发重叠/聚集时有效
+    样本少于名义数，实测要求以 T75 标定的样本量规则为准（更严者胜）。
+    """
+    p0, dp = _validate_proportion_args(p0, dp)
+    if not math.isfinite(power) or not 0.0 < power < 1.0:
+        raise ValueError(f"power 必须在开区间 (0,1)，收到 {power!r}")
+    z_a = _z_alpha(alpha, n_tests)
+    z_p = round(_norm_ppf(power), 4)
+    p1 = p0 + dp
+    raw = ((z_a * sqrt(p0 * (1.0 - p0)) + z_p * sqrt(p1 * (1.0 - p1)))
+           / dp) ** 2
+    return ceil(raw - 1e-9)

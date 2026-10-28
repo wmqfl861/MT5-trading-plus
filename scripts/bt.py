@@ -893,6 +893,67 @@ def _active_mechanism_classes(candidates_dir: Path,
     return active
 
 
+def cmd_segment_propose(args) -> int:
+    """T76/D50：发现段/验证段分界提案（各品种共同覆盖中点 → 月初）。"""
+    symbols = [x.strip() for x in args.symbols.split(",") if x.strip()]
+    if not symbols:
+        print("✗ --symbols 为空")
+        return 1
+    try:
+        data_root, _store_kind = _resolve_store(args)
+    except ValueError as e:
+        print(f"✗ {e}")
+        return 1
+    try:
+        split = cand.propose_split(data_root, symbols, args.timeframe)
+    except ValueError as e:
+        print(f"✗ {e}")
+        return 1
+    print(f"分界提案（{','.join(symbols)} {args.timeframe.upper()} 共同覆盖"
+          f"中点，取整到月初）：{split.date().isoformat()}")
+    print("写入第一个 P 线轮次预注册的 [segments].split（T77）后生效"
+          "（D50：写死不再改）")
+    return 0
+
+
+def _candidate_check_prob(args, candidate, data_root, costs, active):
+    """T76：概率模式候选预筛——逐品种×局面计数（不看结果）→ 发现段子集
+    → precheck_prob。分界：--split 显式给出，否则 propose_split 自动提案。"""
+    from mt5quant.prob import counting as prob_counting
+    from mt5quant.strategies.library.prob.actions import ActionParams
+    from mt5quant.strategies.library.prob.situations import Approach
+
+    pdecl = candidate.prob_declared
+    split_raw = getattr(args, "split", None)
+    if split_raw:
+        split = pd.Timestamp(str(split_raw))
+        if split.day != 1:
+            print(f"✗ --split 必须是月初（收到 {split.date()}；"
+                  "用 bt segment propose 生成提案）")
+            raise SystemExit(1)
+    else:
+        split = cand.propose_split(data_root, candidate.symbols,
+                                   candidate.holding)
+    approach = Approach(**pdecl.approach)
+    aparams = ActionParams(breakout_atr=pdecl.breakout_atr,
+                           retest_window_bars=pdecl.retest_window_bars)
+    parts = []
+    for sym in candidate.symbols:
+        bars = load_series(data_root, sym, candidate.holding, None)
+        for sit in pdecl.situations:
+            grid = pdecl.level_grid.get(sym) if sit == "S1" else None
+            parts.append(prob_counting.count_triggers(
+                bars, symbol=sym, situation=sit, approach=approach,
+                action_params=aparams, grid_step=grid))
+    nonempty = [p for p in parts if len(p)]
+    counted = pd.concat(nonempty, ignore_index=True) if nonempty else None
+    disc = (None if counted is None
+            else prob_counting.triggers_before(counted, split))
+    return cand.precheck_prob(candidate, data_root=data_root,
+                              cost_model=costs, counted=disc, split=split,
+                              active_mechanisms=active)
+
+
 def cmd_candidate_check(args) -> int:
     """T62/D31：候选预筛——读候选 → precheck → 写 json + 台账 → 打印结论。
 
@@ -918,6 +979,10 @@ def cmd_candidate_check(args) -> int:
         # 不装配成本、不算覆盖（其品种可能根本不在研究库）
         costs, cost_version, years, segs, active = \
             None, "n/a（非研究候选）", {}, None, set()
+        result = cand.precheck(candidate, data_root=data_root,
+                               cost_model=costs, research_years=years,
+                               active_mechanisms=active,
+                               research_coverage_segments=segs)
     else:
         try:
             costs, cost_version = _merged_costs(
@@ -927,17 +992,25 @@ def cmd_candidate_check(args) -> int:
         except Exception as e:
             print(f"✗ 成本模型装配失败：{type(e).__name__}: {e}")
             return 1
-        # T80/G3：主段 + 已批准外部序列（fred/cdd，D36 白名单）逐段列出、
-        # 合并年数按**区间并集**（重叠不双计，审核修正）；未批准来源
-        # （histdata）在场不计
-        segs = cand.coverage_segments(data_root, candidate.symbols,
-                                      [candidate.holding])
-        years = {k: cand.merged_coverage_years(v) for k, v in segs.items()}
         active = _active_mechanism_classes(Path(candidate.path).parent,
                                            candidate.id)
-    result = cand.precheck(candidate, data_root=data_root, cost_model=costs,
-                           research_years=years, active_mechanisms=active,
-                           research_coverage_segments=segs)
+        if candidate.prob_declared is not None:
+            # T76：概率模式（price_levels）——计数（只数触发不看结果）+
+            # 分界提案，走 precheck_prob；覆盖年数/事件模式条件不适用
+            result = _candidate_check_prob(args, candidate, data_root,
+                                           costs, active)
+            segs, years = None, {}
+        else:
+            # T80/G3：主段 + 已批准外部序列（fred/cdd，D36 白名单）逐段列出、
+            # 合并年数按**区间并集**（重叠不双计，审核修正）；未批准来源
+            # （histdata）在场不计
+            segs = cand.coverage_segments(data_root, candidate.symbols,
+                                          [candidate.holding])
+            years = {k: cand.merged_coverage_years(v) for k, v in segs.items()}
+            result = cand.precheck(candidate, data_root=data_root,
+                                   cost_model=costs, research_years=years,
+                                   active_mechanisms=active,
+                                   research_coverage_segments=segs)
     payload = result.to_payload()
     payload["cost_model_version"] = cost_version
     payload["checked_at_utc"] = datetime.now(timezone.utc).isoformat()
@@ -966,6 +1039,16 @@ def cmd_candidate_check(args) -> int:
         print(f"  事前成本倍数 {mult:.2f}（门槛 ≥3）")
     if pw is not None:
         print(f"  单次检验力 {pw:.0%}（门槛 ≥50%，{years_note}）")
+    pp = payload["checks"].get("power_prob")
+    if pp is not None:
+        print(f"  发现段最小触发数 {pp['n_available_min']} / 解析样本量 "
+              f"{pp['n_required_analytic']}（分界 {pp['split']}；"
+              "T75 实测规则批准前按解析表）")
+        ec = payload["checks"].get("ex_ante_cost_prob", {})
+        if ec.get("cost_r_by_symbol"):
+            worst = min(ec["cost_r_by_symbol"].values())
+            print(f"  ΔEV {ec['edge_ev_r']:.4f}R vs 3×成本 "
+                  f"{3 * worst:.4f}R（最紧品种 {min(ec['cost_r_by_symbol'], key=ec['cost_r_by_symbol'].get)}）")
     for r in result.reasons:
         print(f"  - {r}")
     print(f"预筛结果：{out_path}；台账 {ledger_path}（candidate_checks 哈希链）")
@@ -1617,7 +1700,21 @@ def build_parser() -> argparse.ArgumentParser:
                          "（研究库模式）或 {data-root}/research/ledger.sqlite")
     pc.add_argument("--spread-fraction", type=float, default=0.1)
     pc.add_argument("--commission", type=float, default=0.0)
+    pc.add_argument("--split", default=None,
+                    help="概率模式预筛的分界日期（月初；缺省自动 "
+                         "propose_split 提案，T76/D50）")
     pc.set_defaults(func=cmd_candidate_check)
+
+    p_seg = sub.add_parser("segment", help="P 线发现段/验证段分界（T76/D50）")
+    seg_sub = p_seg.add_subparsers(dest="segment_cmd", required=True)
+    segp = seg_sub.add_parser(
+        "propose", help="各品种共同覆盖中点，取整到月初（确定性提案）")
+    segp.add_argument("--symbols", required=True,
+                      help="逗号分隔，如 XAUUSD,EURUSD")
+    segp.add_argument("--timeframe", default="H1")
+    segp.add_argument("--data-root", default=None,
+                      help="数据根（缺省研究库 data_research）")
+    segp.set_defaults(func=cmd_segment_propose)
 
     p_check = sub.add_parser("card", help="假设卡操作")
     card_sub = p_check.add_subparsers(dest="card_command", required=True)

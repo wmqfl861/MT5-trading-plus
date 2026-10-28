@@ -50,16 +50,16 @@ from mt5quant.research import cards
 from mt5quant.research import power
 
 __all__ = [
-    "CandidateError", "Candidate", "Literature", "Declared",
+    "CandidateError", "Candidate", "Literature", "Declared", "ProbDeclared",
     "PrecheckResult", "MECHANISM_CLASSES", "RESEARCH_STATUSES",
     "BOOKKEEPING_STATUSES", "PRECHECK_DECISIONS", "load_candidate",
     "coverage_years", "coverage_segments", "merged_coverage_years",
-    "unconditional_volatility", "precheck",
+    "unconditional_volatility", "precheck", "precheck_prob", "propose_split",
 ]
 
-# 附录 C：机制类别七分类（蓝图 v4 §6.2 预筛条件 5）
+# 附录 C：机制类别七分类（蓝图 v4 §6.2 预筛条件 5）+ P 线价位类（D45/T76）
 MECHANISM_CLASSES = ("trend", "reversal", "flow_calendar", "risk_premium",
-                     "volatility", "cross_asset", "event")
+                     "volatility", "cross_asset", "event", "price_levels")
 
 # 研究候选状态（附录 C status 枚举去掉 T61 的簿记两态）
 RESEARCH_STATUSES = ("registered", "screened_pass", "screened_fail",
@@ -119,6 +119,128 @@ class Declared:
     expected_sharpe: float          # 折算后预期年化夏普（检验力用）
 
 
+# ------------------------------------------------------------------ P 线（T76）
+# [prob] 段：概率模式候选（mechanism_class="price_levels"）的事前声明。
+# 与 H 线 [declared] 平行：全部事前量（文献折算），不得取自样本内。
+
+_PROB_SITUATIONS = ("S1", "S2", "S3")
+_HYPOTHESIS_PATTERN = re.compile(r"^S[123]:A[1-4]:[A-Za-z][A-Za-z0-9_>]*$")
+
+
+@dataclass(frozen=True)
+class ProbDeclared:
+    """[prob]：概率模式候选的检验配置与折算后预期 Δp（蓝图 P 线附录 A 的
+    候选侧子集；P1 只用发现段——D50）。"""
+
+    situations: tuple[str, ...]     # ⊆ {S1,S2,S3}
+    hypotheses: tuple[str, ...]     # "S1:A3:fade>base"（≤4，蓝图 P 线 §7）
+    bracket: dict                   # {sl_atr, tp_atr, horizon_bars}（全动作共用，D44）
+    level_grid: dict                # 品种 → 网格间距（S1 必填；蓝图 §2.1）
+    approach: dict                  # {lookback_bars, min_distance_atr, touch_atr}
+    breakout_atr: float             # b（A1 突破幅度，ATR 倍数）
+    retest_window_bars: int         # m（A2/A4 窗口）
+    expected_delta_p: float         # 折算后预期 Δp（单侧赢率增量，文献折算）
+
+
+def _validate_prob(raw: object, source: str, symbols: tuple[str, ...]
+                   ) -> ProbDeclared:
+    """[prob] 段校验（fail-fast，与 [declared] 同风格）。"""
+    if not isinstance(raw, dict):
+        raise CandidateError(
+            f"{source}：[prob] 必须是 TOML 表，收到 {type(raw).__name__}")
+    unknown = sorted(set(raw) - {"situations", "hypotheses", "bracket",
+                                 "level_grid", "approach", "breakout_atr",
+                                 "retest_window_bars", "expected_delta_p"})
+    if unknown:
+        raise CandidateError(f"{source}：[prob] 未知字段 {unknown}")
+
+    def _pos(name: str, v) -> float:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not math.isfinite(v) or v <= 0:
+            raise CandidateError(
+                f"{source}：[prob].{name} 必须是有限正数，收到 {v!r}")
+        return float(v)
+
+    def _int(name: str, v) -> int:
+        if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+            raise CandidateError(
+                f"{source}：[prob].{name} 必须是 ≥1 整数，收到 {v!r}")
+        return int(v)
+
+    situations = raw.get("situations")
+    if (not isinstance(situations, list) or not situations
+            or not all(s in _PROB_SITUATIONS for s in situations)):
+        raise CandidateError(
+            f"{source}：[prob].situations 必须是 {_PROB_SITUATIONS} 的"
+            f"非空子集，收到 {situations!r}")
+    hypotheses = raw.get("hypotheses")
+    if (not isinstance(hypotheses, list) or not hypotheses
+            or len(hypotheses) > 4
+            or not all(isinstance(h, str) and _HYPOTHESIS_PATTERN.match(h)
+                       for h in hypotheses)):
+        raise CandidateError(
+            f"{source}：[prob].hypotheses 必须形如 'S1:A3:fade>base'，"
+            f"每候选 ≤4 条（蓝图 P 线 §7），收到 {hypotheses!r}")
+    for h in hypotheses:
+        if h.split(":")[0] not in situations:
+            raise CandidateError(
+                f"{source}：假设 {h!r} 引用了 situations 之外的局面")
+    bracket = raw.get("bracket")
+    if not isinstance(bracket, dict) \
+            or set(bracket) != {"sl_atr", "tp_atr", "horizon_bars"}:
+        raise CandidateError(
+            f"{source}：[prob].bracket 必须含且只含 "
+            "{sl_atr, tp_atr, horizon_bars}（D44：全动作共用）")
+    b = {"sl_atr": _pos("bracket.sl_atr", bracket["sl_atr"]),
+         "tp_atr": _pos("bracket.tp_atr", bracket["tp_atr"]),
+         "horizon_bars": _int("bracket.horizon_bars", bracket["horizon_bars"])}
+    level_grid = raw.get("level_grid", {})
+    if not isinstance(level_grid, dict):
+        raise CandidateError(
+            f"{source}：[prob].level_grid 必须是 品种→间距 表，收到 "
+            f"{level_grid!r}")
+    for sym, step in level_grid.items():
+        if sym not in symbols:
+            raise CandidateError(
+                f"{source}：[prob].level_grid 含候选外品种 {sym!r}")
+        _pos(f"level_grid.{sym}", step)
+    if "S1" in situations:
+        if not level_grid:
+            raise CandidateError(
+                f"{source}：S1 整数关口需要 [prob].level_grid（品种→网格间距，"
+                "蓝图 P 线 §2.1）")
+        miss = [s for s in symbols if s not in level_grid]
+        if miss:
+            raise CandidateError(
+                f"{source}：S1 候选的每个品种都要在 [prob].level_grid 里"
+                f"（缺 {miss}——计数按品种取网格间距）")
+    approach = raw.get("approach")
+    if not isinstance(approach, dict) \
+            or set(approach) != {"lookback_bars", "min_distance_atr",
+                                 "touch_atr"}:
+        raise CandidateError(
+            f"{source}：[prob].approach 必须含且只含 "
+            "{lookback_bars, min_distance_atr, touch_atr}")
+    ap = {"lookback_bars": _int("approach.lookback_bars",
+                                approach["lookback_bars"]),
+          "min_distance_atr": _pos("approach.min_distance_atr",
+                                   approach["min_distance_atr"]),
+          "touch_atr": _pos("approach.touch_atr", approach["touch_atr"])}
+    dp = raw.get("expected_delta_p")
+    if isinstance(dp, bool) or not isinstance(dp, (int, float)) \
+            or not math.isfinite(dp) or not 0.0 < dp < 0.5:
+        raise CandidateError(
+            f"{source}：[prob].expected_delta_p 必须在开区间 (0, 0.5)"
+            f"（文献折算的预期赢率增量），收到 {dp!r}")
+    return ProbDeclared(
+        situations=tuple(situations), hypotheses=tuple(hypotheses),
+        bracket=b, level_grid=dict(level_grid), approach=ap,
+        breakout_atr=_pos("breakout_atr", raw.get("breakout_atr")),
+        retest_window_bars=_int("retest_window_bars",
+                                raw.get("retest_window_bars")),
+        expected_delta_p=float(dp))
+
+
 @dataclass(frozen=True)
 class Candidate:
     """一张已通过附录 C 模式校验的候选登记。"""
@@ -133,6 +255,7 @@ class Candidate:
     source_card: str = ""           # T61 簿记登记指向的卡（研究候选为空）
     notes: str = ""
     declared: Declared | None = None
+    prob_declared: ProbDeclared | None = None   # T76：[prob]（price_lines 候选）
     path: str = ""
 
 
@@ -259,7 +382,8 @@ def validate_candidate(data: dict, *, source: str) -> Candidate:
     """附录 C 模式校验（fail-fast）。"""
     if not isinstance(data, dict):
         raise CandidateError(f"{source}：候选登记必须是 TOML 表")
-    unknown = sorted(set(data) - set(_TOP_KEYS) - {"literature", "declared"})
+    unknown = sorted(set(data) - set(_TOP_KEYS)
+                     - {"literature", "declared", "prob"})
     if "precheck" in data:
         raise CandidateError(
             f"{source}：[precheck] 段不允许手填——预筛结果由 bt candidate "
@@ -313,17 +437,31 @@ def validate_candidate(data: dict, *, source: str) -> Candidate:
     declared = None
     if data.get("declared") is not None:
         declared = _validate_declared(data["declared"], source)
-    if status in RESEARCH_STATUSES and declared is None:
+    prob_declared = None
+    if data.get("prob") is not None:
+        prob_declared = _validate_prob(data["prob"], source, tuple(symbols))
+    if status in RESEARCH_STATUSES and declared is None             and mechanism_class != "price_levels":
         raise CandidateError(
             f"{source}：status={status} 的研究候选必须带 [declared] 数值声明"
             "（每年事件/交易数、每笔折算后毛收益、入出场小时、计费夜数、"
             "折算后预期夏普——预筛的计算输入；折算依据写在 "
             "[literature].expected_effect，不得取自本项目样本内，铁律 17）")
+    if mechanism_class == "price_levels" and status in RESEARCH_STATUSES:
+        if declared is not None:
+            raise CandidateError(
+                f"{source}：price_levels 候选不带 [declared]（H 线口径），"
+                "概率模式的事前声明在 [prob]（T76/蓝图 P 线附录 A）")
+        if prob_declared is None:
+            raise CandidateError(
+                f"{source}：price_levels 候选必须带 [prob] 段"
+                "（situations/hypotheses/bracket/level_grid/approach/"
+                "breakout_atr/retest_window_bars/expected_delta_p——"
+                "T76/蓝图 P 线附录 A）")
     return Candidate(
         id=cid, title=title, mechanism_class=mechanism_class, status=status,
         symbols=tuple(symbols), holding=holding, mechanism=mechanism,
         literature=literature, source_card=source_card, notes=notes,
-        declared=declared)
+        declared=declared, prob_declared=prob_declared)
 
 
 def load_candidate(path) -> Candidate:
@@ -346,7 +484,8 @@ def load_candidate(path) -> Candidate:
         status=cand.status, symbols=cand.symbols, holding=cand.holding,
         mechanism=cand.mechanism, literature=cand.literature,
         source_card=cand.source_card, notes=cand.notes,
-        declared=cand.declared, path=str(p))
+        declared=cand.declared, prob_declared=cand.prob_declared,
+        path=str(p))
 
 
 # ---------------------------------------------------------------- 覆盖年数
@@ -803,3 +942,228 @@ def precheck(candidate: Candidate, *, data_root, cost_model,
         candidate_id=candidate.id, decision=decision,
         reasons=tuple(reasons), checks=checks,
         events_per_year=declared.events_per_year)
+
+
+
+
+# ------------------------------------------------------- P 线预筛（T76/D45）
+
+_PROB_BASE_RATE = 0.40        # 蓝图 P 线 §3.4：基准赢率口径（止盈 2R/止损 1R）
+
+
+def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
+                  split, active_mechanisms=None) -> PrecheckResult:
+    """概率模式预筛五条件（计划 T76；蓝图 v4 §6.2 在概率模式上的具体化）。
+
+    输入：
+    - counted：计数工具（mt5quant.prob.counting）的发现段子集（时间 <
+      split），列含 symbol/situation/action/side/time/ny_hour/atr/close；
+      None = 无计数（检验力无从算 → waiting_data）；
+    - split：发现段/验证段分界（bt segment propose 的产出，D50）。
+
+    条件（与 H 线 precheck 平行；只做事前计算，不看任何结局）：
+    1. 文献：同 H 线；
+    2. 决策周期 ≥ H1（candidate.holding）；
+    3. 事前成本：Δp×(tp_R+1) ≥ 3 × 来回成本(R)——ΔEV 为折算预期 Δp 的
+       边际期望毛收益（赢一注替掉输一注，毛收益差 = tp_R+1 个 R；与 G1/
+       蓝图 P 线 §3.4 的"毛利 ≥ 3 倍成本"同型）。成本 = 触发纽约小时的
+       （点差 + 双腿滑点 + 佣金）÷ (sl_atr×ATR)，按品种取均值、取最紧
+       品种；触发小时分布来自计数（不看结果）；
+    4. 检验力：发现段内每个假设（局面×动作，跨品种、跨方向合并——蓝图
+       P 线 §3.2 的假设单位）的触发数 ≥ n_needed_proportion(0.40, Δp,
+       power=0.5)（解析表；T75 实测样本量规则落地后取两者更严——本接线
+       待 T75，见 checks["power_prob"]["t75_rule_pending"]）；不足 →
+       waiting_data（铁律 18）；
+    5. 机制空缺：price_levels 是新类别（D45）——排序类理由，不阻塞。
+    """
+    if candidate.status in BOOKKEEPING_STATUSES:
+        return PrecheckResult(
+            candidate_id=candidate.id, decision="fail",
+            reasons=(f"status={candidate.status}：簿记登记不是研究候选，"
+                     "不进入预筛与轮次",),
+            checks={}, events_per_year=None)
+    pdecl = candidate.prob_declared
+    assert pdecl is not None        # price_levels 装载层已保证带 [prob]
+
+    checks: dict[str, dict] = {}
+    reasons: list[str] = []
+
+    # 条件 1：文献（与 H 线同一判据）
+    lit = candidate.literature
+    lit_ok = bool(lit.original) and bool(lit.search_log.strip()) \
+        and bool(lit.expected_effect.strip())
+    checks["literature"] = {
+        "passed": lit_ok, "original_n": len(lit.original),
+        "replications_n": len(lit.replications),
+        "rebuttals_n": len(lit.rebuttals)}
+    if not lit_ok:
+        reasons.append("文献条件不满足：original/search_log/expected_effect "
+                       "有缺（预筛条件 1）")
+
+    # 条件 2：决策周期 ≥ H1
+    h_seconds = TIMEFRAME_SECONDS[candidate.holding]
+    holding_ok = h_seconds >= TIMEFRAME_SECONDS[_HOLDING_MIN]
+    checks["holding"] = {"passed": holding_ok, "holding": candidate.holding,
+                         "min": _HOLDING_MIN}
+    if not holding_ok:
+        reasons.append(f"决策周期 {candidate.holding} < {_HOLDING_MIN}"
+                       "（预筛条件 2）")
+
+    tp_r = pdecl.bracket["tp_atr"] / pdecl.bracket["sl_atr"]
+    edge_ev_r = pdecl.expected_delta_p * (tp_r + 1.0)
+
+    # 条件 3：事前成本（R 口径，按品种均值取最紧）
+    per_symbol: dict[str, dict] = {}
+    for sym in candidate.symbols:
+        rows = None
+        if counted is not None:
+            rows = counted[counted["symbol"] == sym]
+        if rows is None or len(rows) == 0:
+            per_symbol[sym] = {"n": 0, "cost_r": None}
+            continue
+        cs = _contract_size(data_root, sym)
+        costs_r = []
+        for r in rows.itertuples(index=False):
+            hour, price = int(r.ny_hour), float(r.close)
+            spr = cost_model.spread_p90(sym, hour, price=price)
+            slip = cost_model.slippage(sym, hour, price=price)
+            comm = cost_model.commission_per_lot(sym) / (cs * price)
+            r_price = pdecl.bracket["sl_atr"] * float(r.atr)
+            costs_r.append((spr + 2.0 * slip + comm) / r_price)
+        per_symbol[sym] = {"n": int(len(rows)),
+                           "cost_r": float(np.mean(costs_r))}
+    known = {s: d["cost_r"] for s, d in per_symbol.items()
+             if d["cost_r"] is not None}
+    if len(known) == len(candidate.symbols):
+        worst_symbol = min(known, key=lambda s: known[s])
+        worst_cost_r = known[worst_symbol]
+        cost_ok = edge_ev_r >= _COST_MULTIPLE_MIN * worst_cost_r
+        checks["ex_ante_cost_prob"] = {
+            "passed": cost_ok, "edge_ev_r": edge_ev_r,
+            "expected_delta_p": pdecl.expected_delta_p, "tp_r": tp_r,
+            "worst_symbol": worst_symbol,
+            "cost_r_by_symbol": {s: float(v) for s, v in known.items()},
+            "min": _COST_MULTIPLE_MIN,
+            "formula": "ΔEV_R = Δp×(tp_R+1) ≥ 3×来回成本(R)；成本 = 触发纽约"
+                       "小时（点差+双腿滑点+佣金）÷ (sl_atr×ATR) 的均值"}
+        if not cost_ok:
+            reasons.append(
+                f"事前成本：ΔEV {edge_ev_r:.4f}R < "
+                f"{_COST_MULTIPLE_MIN:g}×{worst_cost_r:.4f}R（{worst_symbol}，"
+                "预筛条件 3——折算 Δp 覆盖不了 3 倍成本）")
+    else:
+        cost_ok = True      # 无计数时成本无从按小时分布算——由检验力条件挡
+        checks["ex_ante_cost_prob"] = {
+            "passed": None, "edge_ev_r": edge_ev_r,
+            "note": "无触发计数——成本无从按小时分布计算（与检验力同因）"}
+
+    # 条件 4：检验力（发现段触发数 vs 解析样本量；T75 实测规则待接线）
+    n_required = power.n_needed_proportion(
+        _PROB_BASE_RATE, pdecl.expected_delta_p,
+        alpha=_POWER_ALPHA, power=_POWER_MIN, n_tests=_POWER_N_TESTS)
+    groups: dict[tuple[str, str], int] = {}
+    available_min = None
+    if counted is not None and len(counted) > 0:
+        groups = {k: int(v) for k, v in
+                  counted.groupby(["situation", "action"]).size().items()}
+        available_min = min(
+            (groups.get((h.split(":")[0], h.split(":")[1]), 0)
+             for h in pdecl.hypotheses), default=0)
+    power_ok = available_min is not None and available_min >= n_required
+    checks["power_prob"] = {
+        "passed": power_ok,
+        "n_required_analytic": int(n_required),
+        "n_available_min": (None if available_min is None
+                            else int(available_min)),
+        "counts_by_situation_action": {f"{s}|{a}": n
+                                       for (s, a), n in sorted(
+                                           groups.items())},
+        "split": str(split),
+        "base_rate": _PROB_BASE_RATE,
+        "alpha": _POWER_ALPHA, "n_tests": _POWER_N_TESTS,
+        "t75_rule_pending": True,
+        "note": ("无触发计数" if available_min is None else
+                 "发现段（time < split）内假设（局面×动作，跨品种/方向合并）"
+                 "的最小触发数 vs 解析样本量；T75 实测样本量规则批准后取"
+                 "两者更严——t75_rule_pending 届时改接实测")}
+    if not power_ok:
+        detail = ("无触发计数" if available_min is None else
+                  f"发现段可用触发 {available_min} < 解析样本量 {n_required}")
+        reasons.append(
+            f"检验力：{detail} → 待数据（铁律 18：延长研究段（T67）/合并"
+            "品种后重检；T75 实测规则批准前按解析表）")
+
+    # 条件 5：机制空缺（排序类，不阻塞）
+    active = set(active_mechanisms or ())
+    if candidate.mechanism_class in active:
+        gap_note = (f"机制类别 {candidate.mechanism_class} 已有活跃谱系——排后"
+                    "（蓝图 §6.2 条件 5）")
+    else:
+        gap_note = (f"机制空缺：{candidate.mechanism_class} 是组合里还没有的"
+                    "类别（蓝图 §6.2 条件 5；D45 新类别）")
+    checks["mechanism_gap"] = {"blocking": False, "note": gap_note,
+                               "mechanism_class": candidate.mechanism_class,
+                               "active_mechanisms": sorted(active)}
+    reasons.append(gap_note)
+
+    if not lit_ok or not holding_ok or not cost_ok:
+        decision = "fail"
+    elif not power_ok:
+        decision = "waiting_data"
+    else:
+        decision = "pass"
+    return PrecheckResult(
+        candidate_id=candidate.id, decision=decision, reasons=tuple(reasons),
+        checks=checks, events_per_year=None)
+
+
+def propose_split(data_root, symbols, timeframe) -> pd.Timestamp:
+    """发现段/验证段分界提案（T76，D50）：各品种计入段合并（区间并集）后
+    的**共同覆盖**里最长一段的中点，取整到月初。确定性：同一库同一结果。
+
+    P1 与一切设计选择只用发现段（< split），P2 只在验证段（≥ split）评估
+    （蓝图 P 线 §3.1）；分界在第一个 P 线轮次预注册时写死（T77）。
+    """
+    segs = coverage_segments(data_root, symbols, [timeframe])
+    merged_by_symbol: list[list[list[pd.Timestamp]]] = []
+    for sym in symbols:
+        key = f"{sym}/{timeframe.upper()}"
+        if key not in segs:
+            raise ValueError(
+                f"研究库无 {key} 覆盖——分界提案需要全部品种的共同覆盖")
+        intervals = sorted(
+            (pd.Timestamp(s["first"]), pd.Timestamp(s["last"]))
+            for s in segs[key] if s.get("counted"))
+        if not intervals:
+            raise ValueError(f"{key} 没有计入段（未批准来源不算覆盖）")
+        merged: list[list[pd.Timestamp]] = []
+        for a, b in intervals:
+            if merged and a <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        merged_by_symbol.append(merged)
+
+    def _intersect(a: list[list[pd.Timestamp]],
+                   b: list[list[pd.Timestamp]]) -> list[list[pd.Timestamp]]:
+        out, i, j = [], 0, 0
+        while i < len(a) and j < len(b):
+            lo = max(a[i][0], b[j][0])
+            hi = min(a[i][1], b[j][1])
+            if lo < hi:
+                out.append([lo, hi])
+            if a[i][1] <= b[j][1]:
+                i += 1
+            else:
+                j += 1
+        return out
+
+    common = merged_by_symbol[0]
+    for merged in merged_by_symbol[1:]:
+        common = _intersect(common, merged)
+        if not common:
+            raise ValueError(
+                f"{symbols} 在 {timeframe} 上没有共同覆盖段——分界无从提案")
+    longest = max(common, key=lambda ab: (ab[1] - ab[0]).total_seconds())
+    mid = longest[0] + (longest[1] - longest[0]) / 2
+    return mid.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
