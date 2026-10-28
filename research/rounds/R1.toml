@@ -17,7 +17,10 @@ opened = "2026-10-28"
 candidates = ["C001", "C002"]        # 拟议组成（≤3，附录 D）；开启前置：全部 screened_pass
 trial_budget = 24                    # 2 候选 × 事件模式参数网格 ≤10 组（T66 建议）+ 少量迭代余量
 lockbox_uses_max = 1                 # D16 机器强制：每研究轮次最多 1 次 G5（总预算 3 次，H/P 线共用）
-dsr_trial_scope = "project"          # T64/D33：G4 试验计数按项目级（gates-v3 待批口径）
+dsr_trial_scope = "rounds_lineage"   # T96 对齐 T85/D34 冻结口径（[g4].dsr_trial_scope=
+                                     # rounds_lineage = ledger.primary_test_n 的门槛部分：
+                                     # 轮次内全项目累计 + 候选延续谱系的轮次外历史；
+                                     # T64/D33 原 project 语义已被冻结版取代）
 advance_rule = "推进（本轮算过）= 候选的主检验通过且全部否决项通过：事件模式候选按 T66 事件收益均值单侧检验（年块自助、显著性按项目级 N 校正——D35 批准后的口径）；如走关卡 v3 标准路径则按方案甲（DSR 项目级 N ≥ 0.95）+ G0 与三稳健性否决（成本 ×1.5、延迟一根、多头相对买入持有超额——D34 批准后的口径）。任一候选判定'过'后，本轮不再为其挑选参数或开新变体（过了不再同轮挑选）；判定依据全部为轮次文件与关卡配置预写规则，不按结果临时调整。"
 close_rule = "结束条件（先到即止）：(a) 试验预算 24 次去重研究试验用尽；或 (b) 全部候选均有结论——通过者最多 1 次 G5（lockbox_uses_max）后关闭，未通过者登记结论关闭。关闭后 bt round close R1 生成轮次报告（含全部运行与按 advance_rule 的判定），本轮不能再运行。"
 approved_by = ""                     # 草案留空：交 H 线审核会话复核、用户批准后填写（批准点）

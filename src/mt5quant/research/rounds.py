@@ -9,7 +9,8 @@
 装载（附录 D 模式，fail-fast）：
 - 必填字段齐全且类型正确：id（R#）/ opened（ISO 日期）/ candidates
   （1..3 个 C###，去重）/ trial_budget（≥1）/ lockbox_uses_max（≥1）/
-  dsr_trial_scope（family | project）/ advance_rule / close_rule /
+  dsr_trial_scope（family | project | rounds_lineage——T85/D34 冻结后
+  gates.toml 的口径）/ advance_rule / close_rule /
   approved_by（非空）；
 - [evaluation] 每个候选一条（mode + primary 非空），键与 candidates
   一一对应——评估方式是预注册内容的一部分，缺了就不可信；
@@ -43,8 +44,9 @@ __all__ = [
 
 # 附录 D：每轮最多 3 个新谱系（蓝图 §6.2：迭代在轮次内登记并计入预算）
 MAX_ROUND_CANDIDATES = 3
-# T64/D33 的试验计数口径（G4 的 N 取数范围；缺省 family，gates-v3 写 project）
-DSR_TRIAL_SCOPES = ("family", "project")
+# T64/D33 的试验计数口径（G4 的 N 取数范围；缺省 family。T85/D34 冻结后
+# config/gates.toml 显式写 rounds_lineage——T96/R14：枚举与冻结口径对齐）
+DSR_TRIAL_SCOPES = ("family", "project", "rounds_lineage")
 
 # D16（D49，2026-10-27）：本锁箱最多 3 次 G5（H 线与 P 线共用）。
 # 任务口径：当前建议值写死 3，待用户决策后可调（管理员改常量 + 重开新
@@ -72,7 +74,9 @@ class Round:
     candidates: tuple[str, ...]
     trial_budget: int                  # 本轮最多去重试验次数
     lockbox_uses_max: int              # 本轮最多 G5 次数（受 D16 总预算约束）
-    dsr_trial_scope: str               # family | project（T64/D33）
+    dsr_trial_scope: str               # family | project | rounds_lineage
+                                        # （T64/D33；T85/D34 冻结 =
+                                        # rounds_lineage）
     advance_rule: str                  # 哪些结果算过；过了不再在本轮挑选
     close_rule: str                    # 结束条件
     approved_by: str

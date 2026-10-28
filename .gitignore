@@ -15,3 +15,4 @@ scripts/task_*.cmd
 config.json
 gateway.json
 *.local.json
+full-suite.log

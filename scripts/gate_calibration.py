@@ -1983,7 +1983,8 @@ def render_v3_report(results: dict) -> str:
              f"- T85 工作点键：甲 DSR(N,V₀=1/(n−1)) 与丙 PSR(0)≥1−α/N 逐 "
              f"N∈{meta.get('t85_n_grid', list(V3_N_GRID))} 记录（同一 OOS "
              "收益；joint.dsr_v0@N* / joint.psr0_bonf@N* 两列）",
-             f"- gates-v3 sha256：{str(meta.get('gates_v3_sha256', ''))[:12]}"
+             f"- 门槛文件 sha256：{str(meta.get('gates_v3_sha256', ''))[:12]}"
+             f"（T85/D34 冻结后 = config/gates.toml，v3 单文件）"
              f"；生成：{meta.get('generated_utc', '?')}", "",
              "联合通过率 = 主检验 + 全部否决项（G0 / 成本 ×1.5 / 延迟一根 /"
              " 多头相对买入持有超额）——由逐条记录重算；诊断项（G1/参数邻域/"

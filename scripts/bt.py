@@ -73,6 +73,15 @@
   门槛部分——T85 冻结 L1；family/project 语义不变）；关卡结果与报告
   同时列谱系/轮次/项目三种 N；蒙特卡洛回撤块长 = 一个交易日的 bar 数
   （block_len）。
+- V3（T86，T85/D34 冻结后的关卡 v3 生产接线；--gates V3 显式选择，G1–G4
+  现行路径不变）：bar 级卡 = 主检验（[v3].primary_test，冻结 dsr_v0，
+  OOS 取 G3 拼接样本外——本次运行 segments 或台账最近通过记录）+ 三项
+  否决 + 诊断只报告；轮次 [evaluation] mode="event" 的卡走事件分支
+  （随机化参照 p ≤ α/N、随机化次数 ≥ max(1999,⌈20N/α⌉)——低于下限在
+  基准运行前拒绝、成本 ×1.5 否决、buyhold/延迟不适用、四项诊断）。
+  N = ledger.primary_test_n(候选声明的 continues_family) 的门槛部分
+  （rounds_lineage；报告列轮次内/延续谱系/其余历史三行）。事件窗类别
+  --event-kind month_end|london_fix 必须显式声明（按预注册机制锚定）。
 - contract_size 只认 {data-root}/specs/latest.json（与 run_backtest 同规：
   缺则报错，绝不静默按 1 折算）。
 - 定手数（T23/M2）：--risk-per-trade 缺省 0.005（按风险定手数，与
@@ -115,6 +124,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -827,6 +837,32 @@ def _bind_strategy_sha(ledger, card, strategy_ref: str) -> str | None:
     return sha
 
 
+def _stitch_oos_from_segments(spec, bars, costs, segments) -> pd.Series:
+    """按 walkforward.run_g3 的同一切片/拼接口径重放各测试窗（G3 记录的
+    segments：test_range + 段内选中 params），返回拼接的样本外收益。
+
+    T21a（G5 参照分布）与 T86（关卡 v3 bar 级主检验的 OOS）共用同一
+    重放实现：测试窗权益收益（含测试窗首根，去预热段）。"""
+    lookback = max(int(getattr(spec.strategy.required_data,
+                               "lookback_bars", 0) or 0), 0)
+    rets = []
+    for seg in segments:
+        t1, t2 = (seg.get("test_range") or [0, 0])[:2]
+        t1, t2 = int(t1), int(t2)
+        if t2 <= t1:
+            continue
+        test = bars.iloc[max(0, t1 - lookback): t2]
+        if not len(test):
+            continue
+        oos = vrob.run_engine(spec, test, costs, seg.get("params") or {})
+        # 与 run_g3 同口径：测试窗权益收益（含测试窗首根，去预热段）
+        rets.append(oos.equity.astype("float64")
+                    .iloc[-(t2 - t1 + 1):].pct_change().dropna())
+    if not rets:
+        raise ValueError("segments 没有可用的测试窗——样本外收益无从拼接")
+    return pd.concat(rets, ignore_index=True)
+
+
 def _g3_reference_returns(ledger, card, spec, bars, costs, *,
                           data_sha: str) -> pd.Series:
     """重建 G3 拼接的样本外收益（run_g5 的参照分布，T21a）。
@@ -851,25 +887,243 @@ def _g3_reference_returns(ledger, card, spec, bars, costs, *,
             f"与当前数据 {data_sha[:12]}… 不符——参照分布已过期，先在新数据"
             "上重跑 G3")
     segments = (json.loads(row["dj"]) or {}).get("segments") or []
-    lookback = max(int(getattr(spec.strategy.required_data,
-                               "lookback_bars", 0) or 0), 0)
-    rets = []
-    for seg in segments:
-        t1, t2 = (seg.get("test_range") or [0, 0])[:2]
-        t1, t2 = int(t1), int(t2)
-        if t2 <= t1:
-            continue
-        test = bars.iloc[max(0, t1 - lookback): t2]
-        if not len(test):
-            continue
-        oos = vrob.run_engine(spec, test, costs, seg.get("params") or {})
-        # 与 run_g3 同口径：测试窗权益收益（含测试窗首根，去预热段）
-        rets.append(oos.equity.astype("float64")
-                    .iloc[-(t2 - t1 + 1):].pct_change().dropna())
-    if not rets:
+    try:
+        return _stitch_oos_from_segments(spec, bars, costs, segments)
+    except ValueError as e:
         raise ValueError(
-            f"卡 {card.id} 的 G3 记录没有可用的 segments——参照分布无从重建")
-    return pd.concat(rets, ignore_index=True)
+            f"卡 {card.id} 的 G3 记录没有可用的 segments——参照分布无从重建"
+            f"（{e}）") from e
+
+
+# ------------------------------------------------ 关卡 v3（T86 bt 接线）
+
+# 谱系 id（与 mt5quant.research.candidates._FAMILY_PATTERN 同式：字母前缀
+# + 数字，不带 -v 版本后缀——那是卡 id 不是谱系）
+_FAMILY_ID_RE = re.compile(r"^[A-Z]+\d{2,}$")
+
+
+def _round_eval_mode(card) -> str:
+    """轮次预注册 [evaluation] 里该卡候选的评估 mode（T86 事件分支判定：
+    mode="event" → 关卡 V3 走 [v3.event] 事件分支；其余/无轮次 → bar 级
+    标准分支）。评估方式是预注册内容（附录 D），bt 只读不改。"""
+    if not card.round or not card.candidate:
+        return ""
+    rnd_path = Path(card.path).parent.parent / "rounds" / f"{card.round}.toml"
+    try:
+        round_obj = rnd.load_round(rnd_path)
+    except rnd.RoundError:
+        return ""
+    ev = (round_obj.evaluation or {}).get(card.candidate) or {}
+    return str(ev.get("mode", "") or "")
+
+
+def _declared_continues_family(card, cards_dir) -> tuple[str, str]:
+    """候选登记声明的 continues_family（T85/K1；R14 §3 语义提示：候选
+    声明的延续谱系与卡自身 family 不同时，**按候选声明取**——lineage
+    N 是候选延续的历史谱系，不是卡自己的谱系）。返回 (family, 来源)；无
+    候选/候选登记缺失/未声明 → ("", 说明)。声明值非法 → ValueError。"""
+    if not card.candidate:
+        return "", "卡不带 candidate（轮次制之前）——lineage 按全新机制计"
+    p = Path(cards_dir).parent / "candidates" / f"{card.candidate}.toml"
+    if not p.is_file():
+        return "", f"候选登记缺失（{p}）——lineage 按全新机制计"
+    import tomllib
+    with open(p, "rb") as f:
+        data = tomllib.load(f)
+    fam = str(data.get("continues_family", "") or "").strip()
+    if fam and not _FAMILY_ID_RE.match(fam):
+        raise ValueError(
+            f"{p}：continues_family {fam!r} 必须是谱系 id（形如 H012——不带"
+            "-v 版本后缀，那是卡 id 不是谱系；T85/K1）")
+    return fam, f"按候选登记 {p.name} 声明（≠卡自身谱系时以声明为准）"
+
+
+def _v3_n_composition(ledger, card, cards_dir) -> dict:
+    """关卡 v3 主检验 N 的组成（T85 冻结 L1：rounds_lineage =
+    ledger.primary_test_n 的门槛部分）。轮次内 + 候选声明谱系的轮次外
+    历史；其余历史只报告。来源注记随组成一并落关卡 details。"""
+    fam, source = _declared_continues_family(card, cards_dir)
+    comp = dict(ledger.primary_test_n(fam))
+    comp["continues_family_source"] = source
+    return comp
+
+
+def _v3_gate_evaluate(ledger, card, *, cfg, ctx, cards_dir, strategy, spec,
+                      bars, costs, params, base, summary, contract_size,
+                      symbol, combos, g0_result, g3_result, data_sha, seed,
+                      known_gaps) -> dict:
+    """关卡 V3 的评估体（T86 接线；bt gate 的 --gates V3 生产入口）。
+
+    bar 级分支（缺省）：主检验按 [v3].primary_test 分派（冻结 = dsr_v0，
+    run_primary_test 取 N_eff = max(N, n_min)）+ 三项否决（成本 ×1.5 /
+    延迟一根 / 纯多头相对买入持有超额）+ 诊断只报告（含台账试验夏普的
+    经验方差 DSR——冻结后只进诊断）。OOS = G3 拼接的样本外收益（本次
+    运行里有 G3 用其 segments，否则读台账最近一次通过的 G3 记录——
+    与 G5 参照分布同一重放实现；两处都无 → 主检验 fail-closed）。
+
+    事件分支（轮次 [evaluation] mode="event"，[v3.event]/D35）：主检验 =
+    随机化参照 p ≤ α/N（N 不吃 n_min——随机化检验 N=1 也精确）；否决只
+    有成本 ×1.5（净均值 > 0）；买入持有超额与延迟一根**不适用不运行**；
+    四项诊断只报告（vevents.v3_event_diagnostics）。随机化次数下限已在
+    入口预检（低于下限拒绝运行），此处按已定次数执行。
+    """
+    comp = _v3_n_composition(ledger, card, cards_dir)
+    n_raw = int(comp["n"])
+    g0 = g0_result if g0_result is not None else vlook.run_g0(
+        strategy, bars, params)
+    if ctx.get("mode") == "event":
+        from mt5quant.validation import events as vevents
+        kind = ctx["kind"]
+        side = ctx["side"]
+        draws = int(ctx["sims"])
+        draws_min = int(ctx["draws_min"])
+        days = pd.DatetimeIndex(sorted(set(
+            pd.to_datetime(bars["time"]).dt.normalize())))
+        if kind == "month_end":
+            events = vevents.month_end_events(days)
+        else:                      # london_fix：月末定盘锚（与 T66 同构）
+            anchors = vevents.month_end_events(days, last_n=1, first_n=1)
+            events = vevents.london_fix_events(
+                pd.DatetimeIndex([e.entry_time for e in anchors]))
+        side_fn = (lambda event: side)          # noqa: E731
+        threshold = float(cfg.alpha) / max(1, n_raw)
+        rat = vevents.randomization_test(
+            bars, events, side_fn=side_fn, costs=costs, symbol=symbol,
+            trading_days=days, sims=draws, seed=seed,
+            contract_size=contract_size)
+        primary = {
+            "passed": bool(float(rat["p_value"]) <= threshold),
+            "test": "randomization", "p_value": float(rat["p_value"]),
+            "threshold": threshold, "alpha": float(cfg.alpha),
+            "n_tests": n_raw, "sims": draws, "draws_min": draws_min,
+            "n_events": int(rat["n_events"]),
+            "observed_mean": float(rat["observed_mean"]),
+            "null_mean": float(rat["null_mean"]),
+            "event_kind": kind, "event_side": side,
+            "note": "随机化参照（D35 修改 1）；N 口径同 [v3] 主检验"
+                    "（rounds_lineage），不吃 n_min",
+        }
+        frame15 = vevents.event_returns(
+            bars, events, side_fn=side_fn,
+            costs=vrob.ScaledCosts(costs, float(cfg.cost_scale_veto)),
+            symbol=symbol, contract_size=contract_size)
+        cost_scale = {
+            "passed": bool(len(frame15)
+                           and float(pd.to_numeric(frame15["net"]).mean()) > 0),
+            "net_mean_scaled": (float(pd.to_numeric(frame15["net"]).mean())
+                                if len(frame15) else None),
+            "scale": float(cfg.cost_scale_veto), "n_events": int(len(frame15)),
+            "note": "事件模式否决=成本 ×1.5 后净均值 > 0（D35 修改 2）"}
+        not_applicable = ("事件模式不适用（D35 修改 2：[v3.event]."
+                          "{0}_veto = false——按时钟定义的事件窗上"
+                          "'{1}'会误杀）")
+        if cfg.event.delay_bars_veto:
+            delay = vgate.v3_veto_delay(spec, bars, costs, params, cfg)
+        else:
+            delay = {"passed": True, "applicable": False,
+                     "note": not_applicable.format(
+                         "delay_bars", "延迟一根落到定盘后反转段")}
+        if cfg.event.buyhold_excess_veto:
+            buyhold = vgate.v3_veto_buyhold(
+                spec, bars, costs, base.trades, summary.get("sharpe"), cfg)
+        else:
+            buyhold = {"passed": True, "applicable": False,
+                       "note": not_applicable.format(
+                           "buyhold_excess", "真实月末效应夏普通常低于全程"
+                           "持有")}
+        diagnostics = vevents.v3_event_diagnostics(
+            bars, events, side_fn=side_fn, costs=costs, symbol=symbol,
+            contract_size=contract_size, known_gaps=known_gaps,
+            sims=int(cfg.bootstrap_sims), seed=seed)
+        verdict = vgate.evaluate_v3(
+            g0=g0, primary=primary, cost_scale=cost_scale, delay=delay,
+            buyhold=buyhold, diagnostics=diagnostics)
+        return {
+            "passed": bool(verdict["passed"]),
+            "mode": "event",
+            "primary": primary,
+            "vetoes": {"cost_scale_x15": cost_scale, "delay_1_bar": delay,
+                       "buyhold_excess": buyhold},
+            "n_composition": comp, "veto": verdict["veto"],
+            "failed_vetoes": verdict["failed_vetoes"],
+            "diagnostics": diagnostics,
+            "checks": {"G0": {"passed": bool(g0["passed"])},
+                       "primary": {"passed": bool(primary["passed"])},
+                       "cost_scale_x15": {"passed": bool(cost_scale["passed"])},
+                       "delay_1_bar": {"passed": bool(delay["passed"])},
+                       "buyhold_excess": {"passed": bool(buyhold["passed"])}},
+        }
+
+    # ---- bar 级分支（[v3].primary_test，冻结 = dsr_v0）
+    oos, oos_source, oos_reason = None, None, None
+    if g3_result is not None and g3_result.get("segments"):
+        try:
+            oos = _stitch_oos_from_segments(
+                spec, bars, costs, g3_result["segments"])
+            oos_source = "G3（本次运行的 segments，内存重放）"
+        except ValueError as e:
+            oos_reason = str(e)
+    else:
+        try:
+            oos = _g3_reference_returns(ledger, card, spec, bars, costs,
+                                        data_sha=data_sha)
+            oos_source = "台账最近一次通过的 G3 记录（与 G5 参照同源）"
+        except ValueError:
+            oos_reason = (
+                f"卡 {card.id} 无（数据哈希相符且通过的）G3 关卡记录——"
+                "关卡 v3 bar 级主检验的数据源 = G3 拼接的样本外收益；"
+                "请在同一数据上以 --gates G3,V3 重跑")
+    if oos is None:
+        primary = {"passed": False, "test": str(cfg.primary_test),
+                   "probability": None, "reason": f"OOS 无从取得：{oos_reason}"
+                   "（关卡 v3 bar 级主检验的数据源 = G3 拼接的样本外收益——"
+                   "先在同数据上跑 G3）"}
+    else:
+        primary = vgate.run_primary_test(oos, n_trials=n_raw, cfg=cfg,
+                                         seed=seed)
+    cost_scale = vgate.v3_veto_cost_scale(spec, bars, costs, params, cfg)
+    delay = vgate.v3_veto_delay(spec, bars, costs, params, cfg)
+    buyhold = vgate.v3_veto_buyhold(spec, bars, costs, base.trades,
+                                    summary.get("sharpe"), cfg)
+    diagnostics: dict = {}
+    if oos is not None:
+        bpy = summary.get("annualization_bars_per_year") \
+            or bars_per_year(card.timeframe)
+        _, diag_sharpes = _dedup_trial_sharpes(
+            ledger, card.id, float(bpy), scope="rounds_lineage")
+        # T85 冻结 L1：台账试验夏普的经验方差只进诊断（对照锚点语义）
+        diagnostics["dsr_empirical_variance"] = vgate.v3_primary_dsr(
+            oos, n_trials=vgate.v3_n_eff(n_raw, cfg),
+            trial_sharpes=diag_sharpes, cfg=cfg)
+    diagnostics["g1_sample_line"] = vgate.run_g1(
+        base.trades, timeframe=card.timeframe, cfg=cfg)
+    if combos:                     # 卡网格非空才算参数邻域诊断
+        diagnostics["param_plateau"] = vrob.param_plateau(
+            spec, bars, costs, params, {k: list(v)
+                                       for k, v in card.params.items()}, cfg)
+    diagnostics["yearly_segments"] = vrob.yearly_segments(base.trades, cfg)
+    diagnostics["drop_best_5pct"] = vrob.drop_best_check(base.trades, cfg)
+    diagnostics = {k: v for k, v in diagnostics.items() if v is not None}
+    verdict = vgate.evaluate_v3(
+        g0=g0, primary=primary, cost_scale=cost_scale, delay=delay,
+        buyhold=buyhold, diagnostics=diagnostics)
+    return {
+        "passed": bool(verdict["passed"]),
+        "mode": "bar",
+        "primary": primary,
+        "oos_source": oos_source,
+        "n_eff": int(vgate.v3_n_eff(n_raw, cfg)),
+        "vetoes": {"cost_scale_x15": cost_scale, "delay_1_bar": delay,
+                   "buyhold_excess": buyhold},
+        "n_composition": comp, "veto": verdict["veto"],
+        "failed_vetoes": verdict["failed_vetoes"],
+        "diagnostics": diagnostics,
+        "checks": {"G0": {"passed": bool(g0["passed"])},
+                   "primary": {"passed": bool(primary["passed"])},
+                   "cost_scale_x15": {"passed": bool(cost_scale["passed"])},
+                   "delay_1_bar": {"passed": bool(delay["passed"])},
+                   "buyhold_excess": {"passed": bool(buyhold["passed"])}},
+    }
 
 
 def _g5_orchestrate(ledger, card, *, strategy, spec, params, base_summary,
@@ -2413,6 +2667,50 @@ def cmd_gate(args) -> int:
                           "）——G5 拒绝运行；预算与退役规则见蓝图 D16")
                     return 1
 
+        # T86：关卡 V3 的事件分支预检（在装配/基准运行**之前**——拒绝不
+        # 产生任何 runs）：mode 判定（轮次 [evaluation]）、事件窗类别声明、
+        # 随机化次数下限 max(draws_min_base, ⌈coeff×N/α⌉)。N 取运行入口
+        # 时点的 rounds_lineage 门槛 + 1（本次基准运行即将入账——按含本
+        # 次的 N 定下限，宁可多跑不少跑；评估与报告的 N 在 V3 块内按
+        # 入账后的台账重算，与 G4 同一取数时点）。
+        v3_ctx = None
+        if "V3" in wanted:
+            try:
+                if _round_eval_mode(card) == "event":
+                    if not args.event_kind:
+                        print("✗ 事件模式卡（轮次 [evaluation] mode=\"event\"）"
+                              "跑关卡 V3 必须显式声明事件窗类别 --event-kind"
+                              " month_end|london_fix（事件窗按预注册机制锚定，"
+                              "不静默取缺省）")
+                        return 1
+                    comp_pre = _v3_n_composition(
+                        ledger, card, Path(args.cards_dir))
+                    n_pre = int(comp_pre["n"]) + 1
+                    draws_min = vgate.v3_event_draws_min(n_pre, cfg)
+                    if (args.event_sims is not None
+                            and int(args.event_sims) < draws_min):
+                        print(f"✗ 随机化次数 {args.event_sims} 低于下限 "
+                              f"{draws_min} = max(1999, ⌈20N/α⌉)"
+                              f"（N={n_pre}（含本次运行），α={cfg.alpha}——"
+                              "[v3.event] 主检验 p ≤ α/N 需要 p 值分辨率"
+                              " 1/次数 ≤ α/N，D35 修改 1）——拒绝运行")
+                        return 1
+                    v3_ctx = {
+                        "mode": "event", "kind": args.event_kind,
+                        "side": args.event_side,
+                        "sims": (int(args.event_sims)
+                                 if args.event_sims is not None
+                                 else draws_min),
+                        "draws_min": draws_min}
+                    print(f"— 关卡 V3 事件分支（T86）：kind={args.event_kind}"
+                          f"，side={args.event_side}，随机化次数 "
+                          f"{v3_ctx['sims']}（下限 {draws_min}，N={n_pre}）")
+                else:
+                    v3_ctx = {"mode": "bar"}
+            except ValueError as e:
+                print(f"✗ {e}")
+                return 1
+
         # 装配（失败 = 未开跑，fail-fast 不记 runs）
         try:
             strategy = load_strategy(args.strategy)()
@@ -2470,7 +2768,12 @@ def cmd_gate(args) -> int:
         # （_ZeroedBeforeSplit 只包实例，不作拟合工厂）。
         _strategy_cls = type(strategy)
         fit_ctx = None
-        _g3_msg = _reject_fittable_walkforward(_strategy_cls, wanted)
+        # T86：bar 级 V3 的主检验同样取自 walk-forward 拼接的 OOS——拟合
+        # 策略与 G3 同拒（事件分支不经 walk-forward，不受限）
+        _wf_wanted = list(wanted)
+        if "V3" in wanted and (v3_ctx or {}).get("mode") != "event":
+            _wf_wanted.append("G3")
+        _g3_msg = _reject_fittable_walkforward(_strategy_cls, _wf_wanted)
         if _g3_msg:
             print(f"✗ {_g3_msg}")
             return 1
@@ -2678,6 +2981,17 @@ def cmd_gate(args) -> int:
                 out["project_n_dedup_rounds"] = st["project_n_dedup_rounds"]
                 return out
             _run("G4", _g4)
+        if "V3" in wanted:
+            # T86 接线（T85 冻结后）：G0/G3 结果可复用（同一次运行里跑过
+            # 就不再重算）；combos 供诊断的参数邻域复用
+            _run("V3", lambda: _v3_gate_evaluate(
+                ledger, card, cfg=cfg, ctx=v3_ctx,
+                cards_dir=Path(args.cards_dir), strategy=strategy, spec=spec,
+                bars=bars, costs=costs, params=params, base=base,
+                summary=summary, contract_size=sizes[symbol], symbol=symbol,
+                combos=combos, g0_result=results.get("G0"),
+                g3_result=results.get("G3"), data_sha=dsha, seed=seed,
+                known_gaps=known_gaps))
         if "G5" in wanted:
             _run("G5", lambda: _g5_orchestrate(
                 ledger, card, strategy=strategy, spec=spec, params=params,
@@ -2726,6 +3040,67 @@ def cmd_gate(args) -> int:
                 "（run_class=research 且 round_id 非空——关卡 v3 主检验 N 的"
                 "第一成分；N = 它 + 候选延续谱系的 lineage_n_dedup，"
                 "见 ledger.primary_test_n）\n")
+        # T86：关卡 v3 报告——模式/主检验/否决 + N 的组成三行（与台账
+        # primary_test_n 逐项一致，可端到端对账）
+        v3 = results.get("V3")
+        if v3 is not None and "n_composition" not in v3:
+            report += (f"\n## 关卡 v3（T86 接线）\n\n"
+                       f"- 评估失败（fail-closed，不通过）："
+                       f"{v3.get('error', '未知错误')}\n")
+        elif v3 is not None:
+            comp = v3["n_composition"]
+            fam = comp.get("continues_family") or ""
+            mode_line = (
+                "事件模式（轮次 [evaluation] mode=\"event\"→[v3.event]："
+                "随机化参照主检验 p ≤ α/N，成本 ×1.5 否决，买入持有超额与"
+                "延迟一根不适用，四项诊断只报告）"
+                if v3["mode"] == "event" else
+                f"bar 级（[v3].primary_test={cfg.primary_test} 主检验 + "
+                "三项否决：成本 ×1.5 / 延迟一根 / 纯多头相对买入持有超额；"
+                "诊断只报告）")
+            vetoes = v3["vetoes"]
+            def _veto_s(name, key):
+                v = vetoes[name]
+                if v.get("applicable") is False:
+                    return f"{key}：不适用（事件模式，D35 修改 2）"
+                return f"{key}：{'✓' if v['passed'] else '✗'}"
+            primary = v3["primary"]
+            primary_s = (
+                f"{primary['test']} → "
+                + ("✓" if primary["passed"] else "✗")
+                + (f"（p={primary['p_value']:.4f} ≤ α/N="
+                   f"{primary['threshold']:.5f}，N={primary['n_tests']}，"
+                   f"随机化 {primary['sims']} 次（下限 "
+                   f"{primary['draws_min']}），事件 {primary['n_events']} 个）"
+                   if primary["test"] == "randomization"
+                   else (f"（probability={primary.get('probability')}，"
+                         f"N_eff={v3.get('n_eff')}）"
+                         if primary.get("probability") is not None else ""))
+                + (f"——fail-closed：{primary['reason']}"
+                   if primary.get("reason") else ""))
+            report += (
+                "\n## 关卡 v3（T86 接线）\n\n"
+                f"- 模式：{mode_line}\n"
+                f"- 主检验：{primary_s}\n"
+                f"- G0：{'✓' if v3['checks']['G0']['passed'] else '✗'}；"
+                + _veto_s("cost_scale_x15", "成本 ×1.5") + "；"
+                + _veto_s("delay_1_bar", "延迟一根") + "；"
+                + _veto_s("buyhold_excess", "买入持有超额") + "\n"
+                + (f"- 样本外收益来源：{v3['oos_source']}\n"
+                   if v3.get("oos_source") else "")
+                + "\n### N 的组成（[g4].dsr_trial_scope = rounds_lineage，"
+                "T85 冻结 L1）\n\n"
+                f"- 轮次内（project_n_dedup_rounds）："
+                f"{comp['project_n_dedup_rounds']}\n"
+                f"- 延续谱系（lineage_n_dedup，continues_family="
+                f"{fam or '—（全新机制）'}）：{comp['lineage_n_dedup']}"
+                f"（{comp.get('continues_family_source', '')}）\n"
+                f"- 其余历史（pre_round_other_n_dedup，只报告不进门槛）："
+                f"{comp['pre_round_other_n_dedup']}\n"
+                f"- N = 轮次内 + 延续谱系 = {comp['n']}"
+                + (f"（N_eff = max(N, n_min) = {v3.get('n_eff')}）"
+                   if v3.get("n_eff") is not None else "（事件分支不吃 n_min）")
+                + "\n")
         print(report)
         if args.out:
             out = Path(args.out)
@@ -2989,6 +3364,18 @@ def build_parser() -> argparse.ArgumentParser:
                              " actor=calibration，不进入研究轮次统计；"
                              "非样品卡给出则拒绝")
     p_gate.add_argument("--out", default=None, help="关卡报告 Markdown 落盘路径")
+    p_gate.add_argument("--event-kind", choices=("month_end", "london_fix"),
+                        default=None,
+                        help="T86：关卡 V3 事件分支的事件窗类别（轮次 "
+                             "[evaluation] mode=\"event\" 的卡必填——事件窗"
+                             "按预注册机制锚定，不静默取缺省）")
+    p_gate.add_argument("--event-side", choices=("long", "short"),
+                        default="long",
+                        help="T86：事件分支的方向（静态方向；信号驱动的"
+                             "动态方向由候选机制另行声明）")
+    p_gate.add_argument("--event-sims", type=int, default=None,
+                        help="T86：事件分支随机化次数（缺省 = 下限 "
+                             "max(1999, ⌈20N/α⌉)；低于下限拒绝运行）")
     p_gate.set_defaults(func=cmd_gate)
 
     p_ledger = sub.add_parser("ledger", help="台账操作")

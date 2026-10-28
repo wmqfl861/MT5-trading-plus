@@ -32,7 +32,10 @@ DEFAULT_GATES_TOML = Path(__file__).resolve().parents[3] / "config" / "gates.tom
 # 初值；2026-10-26 T21 第二次冻结（v2，68f49237…）。）
 FROZEN_GATES_SHA256 = "d0a8b2f3105366e4173adcf15fb6dc650a032e277425ca7277abdc92086bb17b"
 
-GATE_ORDER = ("G0", "G1", "G2", "G3", "G4", "G5")
+# G0–G5 = v2 关卡路径（顺序冻结不变，T86 守护测试锁定前六位）；V3 =
+# 关卡 v3 套件（T86 bt 接线：主检验 + 三否决 + 诊断，bar 级 / 事件模式
+# 两分支，--gates V3 显式选择——G1–G4 现行路径不受影响）。
+GATE_ORDER = ("G0", "G1", "G2", "G3", "G4", "G5", "V3")
 
 
 class GatesConfigError(RuntimeError):

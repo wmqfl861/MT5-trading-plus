@@ -733,3 +733,64 @@ def test_cli_event_phase_end_to_end(tmp_path, monkeypatch):
     assert "负对照误报率" in md and "样本量规则" in md
     # event 臂不写 gate-power.json（与既有产物互不覆盖）
     assert not (out_dir / "gate-power.json").exists()
+
+
+# ================================================ T86：关卡 v3 事件分支诊断助手
+
+def test_shift_events_by_bars_moves_window_exactly_one_bar():
+    """T86 失败测试：shift_events_by_bars（[v3.event] 诊断
+    window_shift_1_bar 的构造器）——事件窗整体前后移 n 根 bar（bar 时长
+    取序列最小正间隔），kind/label 原样保留。"""
+    days = synthetic_trading_days("2024-01-01", 120)
+    bars = daily_bars(days)
+    evs = ev.month_end_events(days, last_n=1, first_n=2)
+    assert len(evs) >= 3
+    shifted = ev.shift_events_by_bars(evs, bars, n_bars=1)
+    assert len(shifted) == len(evs)
+    one_bar = pd.Timedelta(days=1)             # D1 序列：一根 bar = 1 天
+    for s, e in zip(shifted, evs):
+        assert s.entry_time == e.entry_time + one_bar
+        assert s.exit_time == e.exit_time + one_bar
+        assert s.kind == e.kind and s.label == e.label
+
+
+def test_segmented_means_splits_by_fixed_year_blocks():
+    """T86 失败测试：segmented_means（[v3.event] 诊断 segmented_means）——
+    按 years 年一块分段算均值，块键 "YYYY-YYYY"，空段如实缺席。"""
+    idx = pd.date_range("2000-01-01", periods=25, freq="YS")
+    values = [float(i) for i in range(25)]
+    seg = ev.segmented_means(pd.Series(values, index=idx), years=10)
+    assert set(seg) == {"2000-2009", "2010-2019", "2020-2029"}
+    assert seg["2000-2009"] == pytest.approx(sum(values[0:10]) / 10.0)
+    assert seg["2010-2019"] == pytest.approx(sum(values[10:20]) / 10.0)
+    assert seg["2020-2029"] == pytest.approx(sum(values[20:25]) / 5.0)
+
+
+def test_v3_event_diagnostics_reports_four_items():
+    """T86 失败测试：v3_event_diagnostics——四项诊断齐全（D35 修改 3：
+    year_block_vs_zero / window_shift_1_bar / segmented_means / known_gaps），
+    全部只报告（带 note，不抛异常、不含否决语义）；known_gaps 与事件窗
+    相交时如实列出。"""
+    days = synthetic_trading_days("2020-01-01", 365 * 4)
+    bars = daily_bars(days, vol=0.002)
+    evs = ev.month_end_events(days)
+    assert len(evs) >= 40
+    gap = (pd.Timestamp("2021-03-01"), pd.Timestamp("2021-03-20"))
+    diags = ev.v3_event_diagnostics(
+        bars, evs, side_fn=always_long, costs=ConstCosts(), symbol="TST",
+        contract_size=100.0, known_gaps=[gap], sims=50, seed=3)
+    assert set(diags) == {"year_block_vs_zero", "window_shift_1_bar",
+                          "segmented_means", "known_gaps"}
+    # 年块自助对 0：p 值与块数
+    assert "p_value" in diags["year_block_vs_zero"]
+    assert diags["year_block_vs_zero"]["n_blocks"] >= 3
+    # 窗口前后移一根：净均值与事件数（末事件平移出数据尾被剔除——
+    # dropped 如实计数，两侧相加守恒）
+    assert "net_mean" in diags["window_shift_1_bar"]
+    assert (diags["window_shift_1_bar"]["n_events"]
+            + diags["window_shift_1_bar"]["dropped"]) == len(evs)
+    # 分段均值：4 年数据一块（10 年分段）
+    assert diags["segmented_means"]["segments"]
+    # 已知缺口注记：与 2021-03 事件窗相交 → 命中 ≥1
+    assert len(diags["known_gaps"]["hits"]) >= 1
+    assert diags["known_gaps"]["passed"] is True   # 注记只报告，恒不否决

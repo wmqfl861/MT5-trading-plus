@@ -1350,3 +1350,241 @@ def test_gate_g4_round_n_when_card_in_round(tmp_path, monkeypatch, capsys):
     assert "轮次 N：1" in out                 # 报告行同列（非 None 分支）
 
 
+# ================================== T86：关卡 v3 的 bt 接线（T85 冻结之后）
+
+_ROUND_R1_EVENT = """\
+id = "R1"
+opened = "2026-10-27"
+candidates = ["C003"]
+trial_budget = 40
+lockbox_uses_max = 1
+dsr_trial_scope = "rounds_lineage"
+advance_rule = "事件模式候选按 [v3.event] 随机化参照 p<=alpha/N 且成本x1.5 净均值为正"
+close_rule = "预算用尽或全部候选有结论即结束"
+approved_by = "用户A"
+
+[evaluation]
+C003 = { mode = "event", primary = "event_mean_return_one_sided" }
+"""
+
+_ROUND_R1_STANDARD = _ROUND_R1_EVENT.replace(
+    'C003 = { mode = "event", primary = "event_mean_return_one_sided" }',
+    'C003 = { mode = "standard", primary = "dsr_v0" }')
+
+_CARD_H703 = """\
+id = "H703"
+version = 1
+symbols = ["XAUUSD"]
+timeframe = "H1"
+session = "全时段"
+phenomenon = "月末资金流"
+mechanism = "固定日历资金流"
+should_fail_when = "月末效应消失"
+falsified_if = "样本内净利为负"
+graveyard_checked = []
+round = "R1"
+candidate = "C003"
+
+[rules]
+entry = "月末最后一根 bar 收盘买入"
+exit = "月初第三根 bar 收盘卖出"
+stop = "无"
+
+[params]
+
+[expected]
+trades_per_year = "12"
+win_rate = "50%+"
+payoff_ratio = "1.0+"
+"""
+
+
+def make_daily_data_root(tmp_path, *, start="2024-01-01", days=800):
+    """事件模式数据根：逐日一根 bar（合成日历，月末事件可构造）。"""
+    root = tmp_path / "data"
+    sdir = root / "bars" / "XAUUSD" / "H1"
+    sdir.mkdir(parents=True)
+    times = pd.date_range(start, periods=days, freq="D")
+    closes = 100.0 + (pd.Series(range(days)) * 0.01)
+    df = pd.DataFrame({
+        "time": times, "open": closes.tolist(), "high": closes.tolist(),
+        "low": closes.tolist(), "close": closes.tolist(),
+        "tick_volume": 1, "spread": 0, "real_volume": 0,
+    })[_COLUMNS]
+    df.to_parquet(sdir / "data.parquet")
+    specs = root / "specs"
+    specs.mkdir(parents=True)
+    (specs / "latest.json").write_text(
+        json.dumps({"XAUUSD": {"contract_size": 100.0, "volume_min": 0.01,
+                               "volume_step": 0.01, "volume_max": 200.0}}),
+        encoding="utf-8")
+    return root
+
+
+def _setup_t86_round(tmp_path, monkeypatch, mod, *, mode="event",
+                     continues_family="", pre_runs=0):
+    """装 T86 用具：数据根 + 轮次（开启）+ 卡 + 候选登记（declared
+    continues_family）+ git 注入；pre_runs 为轮内预置研究运行数。"""
+    root = make_daily_data_root(tmp_path)
+    cards_dir = tmp_path / "cards"
+    cards_dir.mkdir(exist_ok=True)
+    (cards_dir / "H703.toml").write_text(_CARD_H703, encoding="utf-8")
+    cdir = tmp_path / "candidates"
+    cdir.mkdir(exist_ok=True)
+    body = 'id = "C003"\n'
+    if continues_family:
+        body += f'continues_family = "{continues_family}"\n'
+    (cdir / "C003.toml").write_text(body, encoding="utf-8")
+    rdir = tmp_path / "rounds"
+    rdir.mkdir(exist_ok=True)
+    (rdir / "R1.toml").write_text(
+        _ROUND_R1_EVENT if mode == "event" else _ROUND_R1_STANDARD,
+        encoding="utf-8")
+    ledger_path = tmp_path / "ledger.sqlite"
+    with Ledger(ledger_path) as led:
+        led.record_candidate_check("C003", decision="pass",
+                                   result={"candidate_id": "C003",
+                                           "decision": "pass"})
+    patch_card_git(monkeypatch, mod)
+    monkeypatch.setattr(mod.cards, "ensure_strategy_clean",
+                        lambda ref, root_dir, **kw: None)
+    monkeypatch.setattr(mod.cards, "strategy_fingerprint",
+                        lambda ref, root_dir, **kw: "f" * 64)
+    rc = mod.main(["round", "open", "R1", "--rounds-dir", str(rdir),
+                   "--ledger", str(ledger_path)])
+    assert rc == 0, "轮次开启前置未过（用具故障，非被测行为）"
+    if pre_runs:
+        with Ledger(ledger_path) as led:
+            for i in range(pre_runs):
+                led.record_run(
+                    card_id="H703", card_version=1,
+                    strategy="mt5quant.strategies.library.buy_hold:BuyHold",
+                    params={"seed": i}, symbol="XAUUSD", timeframe="H1",
+                    data_first="", data_last="", data_sha256="a" * 64,
+                    engine_version="A", cost_model_version="v",
+                    gates_hash="", metrics={"sharpe": 1.0}, actor="s",
+                    round_id="R1")
+    return root, cards_dir, ledger_path
+
+
+def test_gate_v3_event_card_skips_buyhold_and_delay_vetoes(
+        tmp_path, monkeypatch, capsys):
+    """T86 失败测试 1：轮次 [evaluation] mode="event" 的卡，关卡 V3 走
+    事件分支——随机化参照主检验（p ≤ alpha/N，阈值随 N 收紧）+ 成本 ×1.5
+    否决；**买入持有超额与延迟一根两项否决不运行**（D35 修改 2：标记
+    不适用，绝不调用对应实现）。"""
+    mod = load_bt()
+    root, cards_dir, ledger_path = _setup_t86_round(
+        tmp_path, monkeypatch, mod, mode="event")
+
+    def _must_not_run(*a, **k):        # 事件分支调用即失败
+        raise AssertionError("事件模式不得运行 bar 级否决")
+
+    monkeypatch.setattr(mod.vgate, "v3_veto_buyhold", _must_not_run)
+    monkeypatch.setattr(mod.vgate, "v3_veto_delay", _must_not_run)
+    rc = mod.main(
+        ["gate", "--card", "H703", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--gates", "V3", "--params", "{}",
+         "--event-kind", "month_end", "--event-side", "long"])
+    out = capsys.readouterr().out
+    assert "V3" in out and "事件模式" in out
+    with Ledger(ledger_path) as led:
+        row = led.conn.execute(
+            "SELECT details_json FROM gates WHERE gate='V3'").fetchone()
+    assert row is not None, out
+    det = json.loads(row["details_json"])
+    assert det["mode"] == "event"
+    assert det["primary"]["test"] == "randomization"
+    assert det["primary"]["threshold"] == pytest.approx(0.05 / 1)  # N=1（本次运行）
+    assert det["vetoes"]["buyhold_excess"]["applicable"] is False
+    assert det["vetoes"]["delay_1_bar"]["applicable"] is False
+    assert "error" not in det and "AssertionError" not in json.dumps(det)
+    assert set(det["diagnostics"]) == {
+        "year_block_vs_zero", "window_shift_1_bar", "segmented_means",
+        "known_gaps"}
+
+
+def test_gate_v3_event_draws_below_floor_refuses_run(
+        tmp_path, monkeypatch, capsys):
+    """T86 失败测试 2：事件分支随机化次数下限 max(1999, ceil(20N/alpha))
+    ——预置 5 条轮内研究运行（本次运行为第 6 条，N=6 → 下限 2400），
+    --event-sims 2000 低于下限 → **拒绝运行**（不产生任何 runs）。"""
+    mod = load_bt()
+    root, cards_dir, ledger_path = _setup_t86_round(
+        tmp_path, monkeypatch, mod, mode="event", pre_runs=5)
+    rc = mod.main(
+        ["gate", "--card", "H703", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--gates", "V3", "--params", "{}",
+         "--event-kind", "month_end", "--event-sims", "2000"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "随机化次数" in out and "2400" in out and "拒绝" in out
+    with Ledger(ledger_path) as led:
+        n = led.conn.execute(
+            "SELECT COUNT(*) FROM runs WHERE card_id='H703'").fetchone()[0]
+    assert n == 5      # 只有预置的 5 条——拒绝发生在基准运行之前
+
+
+def test_gate_v3_bar_card_n_composition_matches_ledger_declared_lineage(
+        tmp_path, monkeypatch, capsys):
+    """T86 失败测试 3：bar 级 V3 的 N 组成与台账 primary_test_n 一致——
+    轮次内（含本次运行）+ 候选**声明**的 continues_family 谱系（H401，≠
+    卡自身谱系 H703——审核 §3 语义提示：按候选声明取）+ 其余历史只报告；
+    三行进关卡报告与 gates 表 details。"""
+    mod = load_bt()
+    root, cards_dir, ledger_path = _setup_t86_round(
+        tmp_path, monkeypatch, mod, mode="standard",
+        continues_family="H401", pre_runs=2)
+    common = dict(card_version=1,
+                  strategy="mt5quant.strategies.library.buy_hold:BuyHold",
+                  symbol="XAUUSD", timeframe="H1", data_first="",
+                  data_last="", data_sha256="b" * 64, engine_version="A",
+                  cost_model_version="v", gates_hash="",
+                  metrics={"sharpe": 1.0}, actor="s")
+    with Ledger(ledger_path) as led:
+        for i in range(3):                     # H401 谱系轮次外历史（lineage）
+            led.record_run(card_id=f"H401-v{i + 1}", params={"h": i},
+                           round_id=None, **common)
+        for i in range(5):                     # 其余谱系轮次外（只报告）
+            led.record_run(card_id=f"H999-v{i + 1}", params={"x": i},
+                           round_id=None, **common)
+    rc = mod.main(
+        ["gate", "--card", "H703", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--gates", "V3", "--params", "{}"])
+    out = capsys.readouterr().out
+    with Ledger(ledger_path) as led:
+        expect = led.primary_test_n("H401")    # 按候选声明的谱系
+        wrong = led.primary_test_n("H703")     # 按卡自身谱系（不得采用）
+    assert expect["n"] == 6 and wrong["n"] == 3   # 3 轮内(2预置+本次)+3 lineage
+    assert "轮次内" in out and "延续谱系" in out and "其余历史" in out
+    assert "N 的组成" in out
+    assert str(expect["project_n_dedup_rounds"]) in out
+    assert str(expect["lineage_n_dedup"]) in out
+    assert str(expect["pre_round_other_n_dedup"]) in out
+    with Ledger(ledger_path) as led:
+        row = led.conn.execute(
+            "SELECT details_json FROM gates WHERE gate='V3'").fetchone()
+    det = json.loads(row["details_json"])
+    comp = det["n_composition"]
+    assert comp["n"] == expect["n"]
+    assert comp["continues_family"] == "H401"
+    assert comp["project_n_dedup_rounds"] == expect["project_n_dedup_rounds"]
+    assert comp["lineage_n_dedup"] == expect["lineage_n_dedup"]
+    assert comp["pre_round_other_n_dedup"] == expect["pre_round_other_n_dedup"]
+    assert det["mode"] == "bar"
+
+
+def test_gate_v3_keeps_v2_gate_order_untouched():
+    """T86 守护：V2 的 G0–G5 关卡顺序不变（V3 追加，不插入/改名）——
+    现行 G1–G4 路径与守护测试不受接线影响。"""
+    mod = load_bt()
+    order = mod.vgate.GATE_ORDER
+    assert order[:6] == ("G0", "G1", "G2", "G3", "G4", "G5")
+    assert "V3" in order
+

@@ -48,7 +48,11 @@
 - **预期不取自样本内**：候选与卡的"预期效应""预期笔数"不得取自本项目数据的样本内结果；只能来自文献折算或事前计算（铁律 17）。
 - **依赖**：不新增第三方依赖（下载用标准库 `urllib`；确需新增先问用户）。
 - **脱敏**：报告、日志、复审文档不得含账号、服务器名、IP、令牌、本机绝对路径（铁律 9；T70 会加 CI 扫描）。
-- **测试命令**（Git Bash）：`./.venv/Scripts/python.exe -m pytest -q -p no:cacheprovider`
+- **测试命令**（Git Bash，T96/R14-L7：退出码显式检查，不得让管道吞掉）：
+  `./scripts/run_full_suite.sh`（封装：pytest 全量 → 日志落 `full-suite.log` →
+  RC 显式打印并按 RC 退出）；等价手写：
+  `./.venv/Scripts/python.exe -m pytest -q -p no:cacheprovider > full-suite.log 2>&1; RC=$?; tail -20 full-suite.log; echo RC=$RC`
+  ——RC≠0 一律不得推送，汇报里写 RC。
 - **提交**：消息格式 `<type>(T##): 摘要`；不改写 git 历史、不强推、不改仓库可见性。
 
 ## 执行顺序
@@ -348,7 +352,7 @@ def randomize_event_times(events, trading_days, *, seed: int) -> list[EventWindo
 
 **Files:** `scripts/bt.py`、`scripts/gate_calibration.py`、`scripts/run_backtest.py`（`build_costs`）、`scripts/calibrate_costs.py`；新建 `config/account-profile.toml`；测试。
 
-- [x] **参考价接线** 完成（8259aa4+598a5c1，审核通过：7 处接线无遗漏/1986 反例 ruined 翻转/C001 逐位不变/对账绝对口径守护测试）：
+- [x] **参考价接线** 完成（5d39dbe+52e3335——T96 修正：变基前本地提交号 8259aa4/598a5c1 在 main 上不存在；CI 首绿 run#125（4228926，"全量 2174 绿 RC=0 显式"）——批内 heads f46fd9e（run#123）/d991411（run#124）因 K9 语法事故连带红（L7）。审核通过：7 处接线无遗漏/1986 反例 ruined 翻转/C001 逐位不变/对账绝对口径守护测试）：
   - `bt screen/gate` 与 `gate_calibration` 调 `build_costs` 时传 `swap_ref_price`，取研究库该品种最后收盘，与 CLI 主路径同一约定；`cost_version` 带 relref。
   - 对账路径保持绝对口径（与 MT5 策略测试器同口径），代码里写明原因。
   - 失败测试先行：
@@ -388,9 +392,9 @@ def randomize_event_times(events, trading_days, *, seed: int) -> list[EventWindo
   - 把 T66 报告 §3.2 与 §1.5 对 USTEC、BTCUSD 月末窗的两次真实事件时间观察，作为 run_class=research 的试验记入台账，注明来源；
   - 报告 §5 的"0.4–0.6%"删除，或改为引用 C001 的登记值；
   - §7 与 §4.2 的随机化时刻净均值统一为实测值。
-- [x] **规则**：`docs/p6/research-agent.md` 写明——标定与演示只用随机化时刻或植入效应；候选机制在真实事件时间上的统计量，只能在已开启轮次内计算。守护测试检查关键词。（598a5c1 完成；σ/αN/C001 重跑 fail 17%/run447·448 入账/守护测试/K10 还原/window_bars=1——详见提交与 T84 汇报）
-- [x] **还原成本判定**（K10）：H 线 `precheck` 的判定块恢复 0d92448 之前的写法——`not cost_ok` 判 fail，`elif not power_ok` 判 waiting_data（只改 H 线的 `precheck`）。失败测试先行：成本条件返回 numpy 布尔值 False 或 None 时，判为 fail。（598a5c1 完成；σ/αN/C001 重跑 fail 17%/run447·448 入账/守护测试/K10 还原/window_bars=1——详见提交与 T84 汇报）
-- [x] **C002**：补 `window_bars = 1`；等 T87 数据延长后重检。（598a5c1 完成；σ/αN/C001 重跑 fail 17%/run447·448 入账/守护测试/K10 还原/window_bars=1——详见提交与 T84 汇报）
+- [x] **规则**：`docs/p6/research-agent.md` 写明——标定与演示只用随机化时刻或植入效应；候选机制在真实事件时间上的统计量，只能在已开启轮次内计算。守护测试检查关键词。（52e3335 完成，CI 首绿 run#125——T96 修正：598a5c1 为变基前本地号；σ/αN/C001 重跑 fail 17%/run447·448 入账/守护测试/K10 还原/window_bars=1——详见提交与 T84 汇报）
+- [x] **还原成本判定**（K10）：H 线 `precheck` 的判定块恢复 0d92448 之前的写法——`not cost_ok` 判 fail，`elif not power_ok` 判 waiting_data（只改 H 线的 `precheck`）。失败测试先行：成本条件返回 numpy 布尔值 False 或 None 时，判为 fail。（52e3335 完成，CI 首绿 run#125——T96 修正：598a5c1 为变基前本地号；σ/αN/C001 重跑 fail 17%/run447·448 入账/守护测试/K10 还原/window_bars=1——详见提交与 T84 汇报）
+- [x] **C002**：补 `window_bars = 1`；等 T87 数据延长后重检。（52e3335 完成，CI 首绿 run#125——T96 修正：598a5c1 为变基前本地号；σ/αN/C001 重跑 fail 17%/run447·448 入账/守护测试/K10 还原/window_bars=1——详见提交与 T84 汇报）
 
 ## T85：关卡 v3 工作点补充标定（第十三轮 K1、K2；D34 冻结前置，批准点）
 
@@ -426,12 +430,12 @@ def randomize_event_times(events, trading_days, *, seed: int) -> list[EventWindo
 
 **Files:** `scripts/bt.py`、`src/mt5quant/validation/gates.py`、`src/mt5quant/validation/events.py`；测试。
 
-- [ ] **bar 级卡**：`bt gate` 按 `[v3].primary_test` 走主检验 + 三项否决 + 诊断，N 按 T85 口径取数。关卡报告列出 N 的组成：轮次内、所延续谱系的历史、其余历史（只报告）。
-- [ ] **事件模式卡**：轮次 `[evaluation]` 中 mode="event" 的卡走事件分支（随机化参照、α/N、成本 ×1.5 否决、诊断）。
-- [ ] **失败测试先行**：
-  - 事件卡不跑买入持有与延迟否决；
-  - 随机化次数低于下限时拒绝运行；
-  - 报告中 N 的组成与台账一致。
+- [x] **bar 级卡**：`bt gate --gates V3` 按 `[v3].primary_test`（冻结 = dsr_v0，run_primary_test 分派、N_eff = max(N, n_min)）走主检验 + 三项否决（成本 ×1.5/延迟一根/多头相对买入持有超额）+ 诊断只报告（含台账试验夏普经验方差 DSR——冻结后只进诊断）；OOS = G3 拼接样本外收益（本次运行 segments 或台账最近通过记录，与 G5 参照同一重放实现）。N 按 T85 口径取数（ledger.primary_test_n，**按候选声明的 continues_family**——与卡自身谱系不同时以声明为准，R14 §3 语义提示）。关卡报告列 N 组成三行：轮次内/延续谱系/其余历史（只报告）。（证据：test_gate_v3_bar_card_n_composition_matches_ledger_declared_lineage——三行与台账 primary_test_n 逐项一致、声明 H401 ≠ 卡谱系 H703；test_gate_v3_keeps_v2_gate_order_untouched——G0–G5 顺序不动）
+- [x] **事件模式卡**：轮次 `[evaluation]` 中 mode="event" 的卡走事件分支（随机化参照主检验 p ≤ α/N（N 不吃 n_min）、随机化次数 ≥ max(1999, ⌈20N/α⌉)、成本 ×1.5 否决（净均值 > 0）、买入持有/延迟两项否决**不适用不运行**、四项诊断只报告——[v3.event]/D35 三条修改生效；事件窗 --event-kind month_end|london_fix 显式声明；随机化次数低于下限的拒绝发生在基准运行之前，不产生 runs）。（证据：test_gate_v3_event_card_skips_buyhold_and_delay_vetoes、test_gate_v3_event_draws_below_floor_refuses_run；tests/test_validation_events.py T86 节三项助手测试）
+- [x] **失败测试先行**（三条全红后实现转绿）：
+  - 事件卡不跑买入持有与延迟否决；（monkeypatch 两否决实现为必炸——事件分支不触、details 标不适用）
+  - 随机化次数低于下限时拒绝运行；（N=6 → 下限 2400，--event-sims 2000 → 拒绝且 runs 不新增）
+  - 报告中 N 的组成与台账一致。（轮次内 3 + 延续谱系 3 + 其余 5 只报告，N=6 = primary_test_n("H401")）
 
 ## T87：HistData 启用（D36 第十三轮补充结论）
 
@@ -516,8 +520,8 @@ def randomize_event_times(events, trading_days, *, seed: int) -> list[EventWindo
 
 ## T96：流程修正与参考价（第十四轮 L7、L8）
 
-- [ ] **证据行**：把 T83、T84 复选框里引用的 `8259aa4`、`598a5c1`、`330e826` 改为 main 上实际的提交号（5d39dbe、52e3335、bcdb204），并附 CI 运行号。
-- [ ] **回归命令**：计划开头的测试命令加上退出码检查（`set -o pipefail`，或单独保存 RC 后再判断），汇报里写 RC。
+- [x] **证据行**：T83、T84 复选框里引用的 `8259aa4`、`598a5c1` 已改为 main 上实际的提交号（5d39dbe、52e3335）并附 CI 运行号（批内首绿 run#125 = 4228926"全量 2174 绿 RC=0 显式"；heads f46fd9e（run#123）/d991411（run#124）因 K9 语法事故连带红，见 L7）。`330e826` 在计划文件的复选框里**未出现**（全文 grep 只命中本行与审核件本身）——T88 的证据行本就引用 main 号 bcdb204，无需改；如实记录。
+- [x] **回归命令**：计划开头的测试命令已加退出码检查（新建 `scripts/run_full_suite.sh`：pytest 全量 → 日志落 `full-suite.log` → `RC=$?` 显式打印并按 RC 退出；`set -o pipefail` + 不经 tee 管道），汇报里写 RC。
 - [ ] **并行代理**：每个并行代理各用一个 `git worktree`，或者改为顺序执行；每个提交在自己的树上全量回归通过后再推送。规则写进 `docs/p6/research-agent.md` 的流程一节。
 - [ ] **可选（L8）**：`snapshot_specs.py` 记录快照时点的买卖价，隔夜费参考价改用它；cost_version 注明。
 

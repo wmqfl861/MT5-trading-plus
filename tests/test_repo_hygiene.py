@@ -255,3 +255,24 @@ def test_allowlist_has_no_stale_entries():
         elif not hits.get(path):
             stale.append(path)
     assert stale == [], f"allowlist 失效条目（对应残留已修，应删除）: {stale}"
+
+
+# ------------------------------------------------- T96/R14-L7：回归命令 RC 检查
+
+def test_full_suite_script_checks_exit_code_explicitly():
+    """T96 失败测试（L7：本地回归退出码被管道吞掉 → 语法错误推送）：
+    scripts/run_full_suite.sh 必须存在，且显式捕获退出码——
+    - `set -o pipefail`；
+    - `RC=$?` 显式保存并打印；pytest 输出直接重定向落日志
+      （不经管道转发——退出码不可能被吞）；
+    - 按 RC 退出（exit "$RC"）；日志 full-suite.log。"""
+    script = REPO_ROOT / "scripts" / "run_full_suite.sh"
+    assert script.is_file(), "scripts/run_full_suite.sh 缺失（T96/R14-L7）"
+    text = script.read_text(encoding="utf-8")
+    assert "set -o pipefail" in text
+    assert "RC=$?" in text
+    assert 'exit "$RC"' in text
+    assert "full-suite.log" in text
+    # pytest 的 stdout/stderr 直接重定向落日志（不经任何管道转发）
+    assert '"$@" > "$LOG" 2>&1' in text
+    assert "| tee" not in text

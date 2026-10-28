@@ -673,3 +673,120 @@ def _check_effect(effect: float, sigma: float) -> float:
     if not math.isfinite(float(sigma)) or float(sigma) <= 0.0:
         raise ValueError(f"sigma_window 须为有限正数，收到 {sigma!r}")
     return float(effect) / float(sigma)
+
+
+# ------------------------------------- T86：关卡 v3 事件分支的诊断助手
+
+def shift_events_by_bars(events, bars, *, n_bars: int = 1) -> list[EventWindow]:
+    """事件窗整体平移 n 根 bar（[v3.event] 诊断 window_shift_1_bar 的
+    构造器，D35 修改 3）。
+
+    bar 时长取序列最小正间隔（等间隔序列的 bar 步长；D1 序列 = 1 天）；
+    kind/label 原样保留（同一事件的平移副本，不是新事件机制）。
+    """
+    if not isinstance(n_bars, int) or n_bars < 1:
+        raise ValueError(f"n_bars 须为 ≥1 的整数，收到 {n_bars!r}")
+    times = pd.to_datetime(bars["time"])
+    diffs = np.diff(pd.DatetimeIndex(times).to_numpy()
+                    ).astype("timedelta64[s]").astype("int64")
+    pos = diffs[diffs > 0]
+    if len(pos) == 0:
+        raise ValueError("时间列无正间隔——bar 时长无从推断，平移无定义")
+    step = pd.Timedelta(seconds=int(np.min(pos))) * int(n_bars)
+    return [EventWindow(kind=e.kind, label=e.label,
+                        entry_time=e.entry_time + step,
+                        exit_time=e.exit_time + step) for e in events]
+
+
+def segmented_means(returns, *, years: int = 10) -> dict[str, float]:
+    """按固定 years 年块分段均值（[v3.event] 诊断 segmented_means——按
+    10 年或文献制度变化点分段；本实现按固定年块，制度点由报告层并列）。
+
+    输入：event_returns 的产出 DataFrame（entry_time + net）或带
+    DatetimeIndex 的收益序列。块键 "YYYY-YYYY"（块首年-块末年），空块
+    如实缺席；不足 2 个观测的块照常给出均值（诊断不筛选）。
+    """
+    if isinstance(years, bool) or not isinstance(years, int) or years < 1:
+        raise ValueError(f"years 须为 ≥1 的整数，收到 {years!r}")
+    if isinstance(returns, pd.DataFrame):
+        if "net" not in returns.columns:
+            raise ValueError(f"returns DataFrame 缺 'net' 列，收到列 "
+                             f"{list(returns.columns)}")
+        if "entry_time" not in returns.columns:
+            raise ValueError("returns DataFrame 缺 'entry_time' 列——"
+                             "分段诊断需要事件时间")
+        keys = pd.DatetimeIndex(pd.to_datetime(returns["entry_time"]))
+        values = pd.to_numeric(returns["net"]).to_numpy(dtype="float64")
+    else:
+        s = pd.Series(returns).astype("float64")
+        keys = pd.DatetimeIndex(pd.to_datetime(s.index))
+        values = s.to_numpy(dtype="float64")
+    if len(values) == 0:
+        raise ValueError("收益序列为空——分段均值无定义")
+    buckets: dict[str, list[float]] = {}
+    for ts, v in zip(keys, values):
+        y = int(ts.year)
+        start = y - y % int(years)
+        buckets.setdefault(f"{start}-{start + int(years) - 1}", []).append(
+            float(v))
+    return {k: float(np.mean(v)) for k, v in sorted(buckets.items())}
+
+
+def v3_event_diagnostics(bars, events, *, side_fn, costs, symbol: str,
+                         contract_size: float | None = None,
+                         known_gaps=None, sims: int = 1000,
+                         seed: int = 0) -> dict:
+    """关卡 v3 事件分支的四项诊断（D35 修改 3/[v3.event].diagnostics，
+    T86 接线）——**全部只报告，不参与否决**：
+
+    - year_block_vs_zero：年块自助对 0 的单侧检验（主检验是随机化参照，
+      年块对 0 会把资产漂移当作效应——D35 修改 1 的理由，故只作诊断）；
+    - window_shift_1_bar：事件窗前后移一根 bar 后的净均值（机制对窗的
+      精确位置是否敏感）；
+    - segmented_means：10 年分段的净收益均值（制度变化的粗看）；
+    - known_gaps：与事件窗相交的已知缺口（meta.json known_gaps）注记。
+
+    passed 恒 True（报告层语义：诊断失败不改变关卡结论）。
+    """
+    obs = event_returns(bars, events, side_fn=side_fn, costs=costs,
+                        symbol=symbol, contract_size=contract_size)
+    if len(obs) == 0:
+        raise ValueError("事件全部不可解析——事件分支诊断无定义")
+    out: dict = {}
+    try:
+        boot = event_test(obs, sims=int(sims), seed=int(seed))
+        out["year_block_vs_zero"] = {
+            "passed": True, "p_value": float(boot["p_value"]),
+            "mean": float(boot["mean"]), "n_blocks": int(boot["n_blocks"]),
+            "note": "年块自助对 0 只作诊断（漂移会把对 0 检验变松——"
+                    "主检验用随机化参照，D35 修改 1）"}
+    except ValueError as e:
+        out["year_block_vs_zero"] = {"passed": True, "reason": str(e),
+                                     "note": "年块自助对 0 只作诊断"}
+    shifted = shift_events_by_bars(events, bars, n_bars=1)
+    frame = event_returns(bars, shifted, side_fn=side_fn, costs=costs,
+                          symbol=symbol, contract_size=contract_size)
+    out["window_shift_1_bar"] = {
+        "passed": True,
+        "net_mean": (float(pd.to_numeric(frame["net"]).mean())
+                     if len(frame) else None),
+        "n_events": int(len(frame)), "dropped": int(frame.attrs["dropped"]),
+        "note": "事件窗整体移一根 bar 的净均值（只报告）"}
+    out["segmented_means"] = {
+        "passed": True, "segments": segmented_means(obs, years=10),
+        "note": "10 年分段均值（只报告；制度变化点由报告层并列）"}
+    hits = []
+    for g in (known_gaps or []):
+        try:
+            gs, ge = pd.Timestamp(g[0]), pd.Timestamp(g[1])
+        except (TypeError, ValueError):
+            continue
+        for e in events:
+            if e.entry_time < ge and e.exit_time > gs:
+                hits.append(f"{e.label}∩"
+                            f"{gs.date().isoformat()}→{ge.date().isoformat()}")
+                break
+    out["known_gaps"] = {
+        "passed": True, "hits": hits,
+        "note": "与事件窗相交的已知缺口（只注记样本不完整，不改判定）"}
+    return out

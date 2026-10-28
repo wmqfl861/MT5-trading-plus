@@ -44,8 +44,8 @@
    `engine_*.py`）、`src/mt5quant/validation/`、`src/mt5quant/costs/`
    （成本模型）、`src/mt5quant/research/`（台账）、`src/mt5data/`（数据
    与锁箱加载器）、`src/mt5live/`、`scripts/`（含 `bt.py`、
-   `run_backtest.py` 与钩子自身）、`config/`（含 `gates.toml`、
-   `gates-v3.toml`、`risk.toml`、`sessions.toml`）、`data/`、CI
+   `run_backtest.py` 与钩子自身）、`config/`（含 `gates.toml`（T85/D34
+   冻结后即 v3 单文件）、`risk.toml`、`sessions.toml`）、`data/`、CI
    （`.github/`）与 `docs/p6/` 规则文件——研究角色不能改自己的规则。
    发现引擎/关卡疑似 bug：写进研究报告（复现命令 + 期望 vs 实际），
    交主会话修；绝不自己改，也绝不 `--no-verify` 绕过 pre-commit 钩子
@@ -139,12 +139,14 @@
    这张卡；参数 ≤4、网格 ≤100、`expected` 先写且不取自样本内）→
    `bt card check` 校验 → `git commit` → `bt screen` 在卡的网格上跑
    A 层（逐组合入台账，含失败组合）→ `bt gate --card H### --gates G0,G1`
-   （前视/窗口不变性 + 样本内资格线）。低频事件类候选按轮次注册的
-   `evaluation_mode="event"` 走事件模式（T66，标定待批准）。
-6. **关卡 v3 与轮次报告**：关卡 v3 提案（`config/gates-v3.toml`，主检验
-   + 稳健性否决 + 诊断，联合误报/检出率已标定）**现不生效，待用户
-   批准**；批准后替换 `gates.toml` 并重新冻结，`suite="v3"` 路径成为
-   关卡缺省，审查角色按新否决集复核（`docs/p6/review-agent.md` 流程）。
+   （前视/窗口不变性 + 样本内资格线）。低频事件类候选按轮次
+   `[evaluation]` 的 `mode="event"` 走关卡 v3 事件分支（`--gates V3`，
+   T66 标定 + D35 批准 + T86 接线）。
+6. **关卡 v3 与轮次报告**：关卡 v3（`config/gates.toml`——T85/D34
+   冻结（2026-10-29）后即 v3 单文件，`gates-v3.toml` 随替换退役；主检验
+   `dsr_v0` + 稳健性否决 + 诊断，联合误报/检出率已标定，`suite="v3"`
+   路径即关卡缺省；`--gates V3` 走 v3 套件（bar 级 / 事件模式两分支）），
+   审查角色按新否决集复核（`docs/p6/review-agent.md` 流程）。
    轮次结束由管理员 `bt round close` 生成 `docs/research/round-R#-<日期>.md`
    骨架（本轮全部运行 + 按 `advance_rule` 的判定），你负责补全报告
    （铁律 6：一个不落）。审查否决 → 读否决理由，或弃卡进墓地——
