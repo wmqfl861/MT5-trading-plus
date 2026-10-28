@@ -146,3 +146,84 @@ def test_brier_skill_positive_only_with_information():
     assert brier_skill(np.where(y, 0.1, 0.9), y, 0.4) < 0
     # 有信息 → 正
     assert brier_skill(np.where(y, 0.8, 0.2), y, 0.4) > 0.5
+
+
+# ------------------------------------------------- 审核三（S3/S7/S9）
+
+def test_s3_randomize_matches_atr_quantile():
+    """S3：随机时点的 atr_pct_2000 档与原触发一致（桶键含分位档）。"""
+    from mt5quant.backtest.engine_a import atr_series
+    from mt5quant.strategies.library.prob.features import atr_pct_2000
+    n = 9000
+    vol = np.where((np.arange(n) // 1500) % 2 == 0, 0.15, 0.60)
+    bars = synth_bars(n, seed=5)
+    # 高低波动交替（同探针 R2 构造：改用分段 sigma）
+    rng2 = np.random.default_rng(9)
+    close = 100 + np.cumsum(rng2.normal(0, 1, n) * vol)
+    bars = bars.assign(close=close)
+    pct = atr_pct_2000(atr_series(bars)).to_numpy()
+    hi = np.flatnonzero(pct == "high")
+    assert len(hi) > 500
+    pick = np.sort(np.random.default_rng(3).choice(hi, size=200,
+                                                   replace=False))
+    trig = pd.DataFrame({"time": bars["time"].iloc[pick].to_numpy(),
+                         "situation": "S1", "action": "A3", "side": 1,
+                         "level": 100.0})
+    out = randomize_triggers(trig, bars, seed=11)
+    idx = pd.Index(bars["time"]).get_indexer(pd.to_datetime(out["time"]))
+    share = float(np.mean(pct[idx] == "high"))
+    assert share >= 0.99, share
+
+
+def test_s3_empty_bucket_rejects():
+    # 100 根 bar（周四起 ~4.2 天）：周二 12:00 的桶（12, 周二, None）
+    # 在池中不存在 → 拒（不退化全域抽样）
+    bars = synth_bars(100, seed=2)
+    trig = pd.DataFrame({"time": [pd.Timestamp("2020-01-07 12:00")],
+                         "situation": "S1", "action": "A3", "side": 1,
+                         "level": 100.0})
+    with pytest.raises(ValueError, match="无候选"):
+        randomize_triggers(trig, bars, seed=1)
+
+
+def test_s7_skipped_excluded_from_winrate():
+    days = pd.bdate_range("2016-01-04", periods=200)
+    real = pd.DataFrame({"time": days + pd.Timedelta(hours=10),
+                         "outcome": ["win", "skipped"] * 100})
+    null = pd.DataFrame({"time": days + pd.Timedelta(hours=11),
+                         "outcome": ["win", "loss"] * 100})
+    res = delta_p_test(real, null, sims=200, seed=1)
+    assert abs(res["delta_p"] - 0.5) < 0.02     # 只按成交计：1.0 − 0.5
+
+
+def test_s9_p_value_has_plus_one_correction():
+    a = labels_df(120, p_win=0.50, seed=1)
+    b = labels_df(120, p_win=0.40, seed=2)
+    res = delta_p_test(a, b, sims=200, seed=3)
+    assert res["p_value"] >= 1.0 / 201           # (1+k)/(1+B) 下界
+
+
+def test_t75_missing_false_positive_1000_sims():
+    """计划缺测：同分布 1,000 次置换的误报率接近名义 5%。
+
+    以 20 组独立重复 × sims=50 的月内置换近似（总抽样 1,000 次）：
+    每组 p < 0.05 的比例 ≤ 3/20（名义 5% 下二项 95% 上界）。"""
+    hits = 0
+    for rep in range(20):
+        a = labels_df(120, p_win=0.40, seed=1000 + rep)
+        b = labels_df(120, p_win=0.40, seed=2000 + rep)
+        if delta_p_test(a, b, sims=50, seed=rep)["p_value"] < 0.05:
+            hits += 1
+    assert hits <= 3, hits
+
+
+def test_t75_missing_detection_rate_90pct():
+    """计划缺测：Δp=0.05、触发日数 2,000 → 检出率 > 90%。"""
+    det = 0
+    reps = 10
+    for rep in range(reps):
+        a = labels_df(2000, p_win=0.45, seed=3000 + rep)
+        b = labels_df(2000, p_win=0.40, seed=4000 + rep)
+        if delta_p_test(a, b, sims=400, seed=rep)["p_value"] < 0.05:
+            det += 1
+    assert det / reps > 0.9, det

@@ -23,44 +23,52 @@ def randomize_triggers(triggers: pd.DataFrame, bars: pd.DataFrame, *,
                        seed: int,
                        match=("ny_hour", "weekday", "atr_quantile")
                        ) -> pd.DataFrame:
-    """零假设触发：随机时刻，保持纽约小时 / 星期 / ATR 分位的分布。
+    """零假设触发：随机时刻，桶键 =（纽约小时、星期、ATR 分位档）。
 
-    做法：把候选 bar 池按（小时、星期）分桶，桶内均匀随机抽时刻替换每
-    个原触发（桶内任何 bar 等概率——分布与原触发的桶分布一致，桶内
-    时刻均匀是零假设）。ATR 分位作为第三个匹配维：桶键加入触发 ATR
-    分位档（高/低，按池中位分档）。确定性：同一 seed 同一结果。
+    ATR 分位档用卡的特征口径 ``atr_pct_2000``（ATR14 在最近 2,000 根中
+    的滚动分位，≥ 0.5 为 high——与 LevelDecisionV1 的特征同一实现）。
+    桶内均匀随机抽时刻替换每个原触发（分布与原触发的桶分布一致，桶内
+    时刻均匀是零假设）。**同桶没有候选 → ValueError**（审核三 S3：退化为
+    全域均匀会让匹配悄悄失效，宁可拒绝也不静默偏差）。确定性：同一
+    seed 同一结果。
     """
+    from mt5quant.strategies.library.prob.features import atr_pct_2000
     rng = np.random.default_rng(seed)
     times = pd.to_datetime(bars["time"])
     ny = times.dt.tz_localize("UTC").dt.tz_convert(NY_TZ)
     hour = ny.dt.hour.to_numpy()
     weekday = ny.dt.weekday.to_numpy()
-    from mt5quant.backtest.engine_a import atr_series
-    atr = atr_series(bars).to_numpy()
-    q = np.full(len(bars), np.nan)
-    finite = np.isfinite(atr)
-    if finite.any():
-        med = float(np.median(atr[finite]))
-        q[finite] = np.where(atr[finite] >= med, 1.0, 0.0)
+    q = atr_pct_2000(atr_series_for(bars)).to_numpy()
     pool = {}
     for i in range(len(bars)):
-        if not np.isfinite(q[i]):
-            continue
-        pool.setdefault((int(hour[i]), int(weekday[i])), []).append(i)
+        # q ∈ {"high","low",None}（None=分位窗口未满）——None 桶只配
+        # None 触发，不跨档匹配
+        pool.setdefault((int(hour[i]), int(weekday[i]), q[i]), []).append(i)
     trig_times = pd.to_datetime(triggers["time"])
     t_ny = trig_times.dt.tz_localize("UTC").dt.tz_convert(NY_TZ)
+    pos = pd.Index(times).get_indexer(trig_times)
     out_idx = []
-    for k, t in enumerate(trig_times):
-        key = (int(t_ny.iloc[k].hour), int(t_ny.iloc[k].weekday()))
+    for k in range(len(trig_times)):
+        q_k = q[pos[k]] if 0 <= pos[k] < len(q) else None
+        key = (int(t_ny.iloc[k].hour), int(t_ny.iloc[k].weekday()), q_k)
         cands = pool.get(key)
         if not cands:
-            # 无同桶候选（罕见：触发在池外时刻）——退化为全域均匀抽样
-            cands = [i for i in range(len(bars)) if np.isfinite(q[i])]
+            raise ValueError(
+                "随机化零假设无法匹配触发 "
+                f"{trig_times.iloc[k]}（桶 {key[:2]} + ATR 档 {key[2]} 无候选"
+                " bar）——匹配维（小时/星期/ATR 分位）缺一不可，不退化为"
+                "全域均匀抽样（审核三 S3）")
         out_idx.append(int(cands[rng.integers(0, len(cands))]))
     out = triggers.copy()
     out["time"] = times.iloc[out_idx].to_numpy()
     out["bar"] = out_idx
     return out
+
+
+def atr_series_for(bars):
+    """bars 的 ATR14（与引擎同口径；本模块不 import 引擎运行路径）。"""
+    from mt5quant.backtest.engine_a import atr_series
+    return atr_series(bars)
 
 
 # ---------------------------------------------------------------- Δp 检验
@@ -82,13 +90,22 @@ def delta_p_test(real_labels: pd.DataFrame, null_labels: pd.DataFrame, *,
     """
     rng = np.random.default_rng(seed)
 
+    usable = {"win", "loss", "time"}   # S7：skipped（未成交/截尾）只计数不进概率
+
     def _day_winrates(df: pd.DataFrame) -> pd.Series:
-        t = pd.to_datetime(df["time"])
-        win = (df["outcome"] == "win").astype(float)
+        d = df[df["outcome"].isin(usable)]
+        if len(d) == 0:
+            return pd.Series(dtype=float)
+        t = pd.to_datetime(d["time"])
+        win = (d["outcome"] == "win").astype(float)
         return win.groupby(t.dt.date).mean()
 
     r = _day_winrates(real_labels)
     nul = _day_winrates(null_labels)
+    if len(r) == 0 or len(nul) == 0:
+        return {"delta_p": float("nan"), "p_value": 1.0,
+                "n_days_real": int(len(r)), "n_days_null": int(len(nul)),
+                "block": block, "sims": int(sims)}
     obs = float(r.mean() - nul.mean())
     r_months = pd.PeriodIndex(pd.to_datetime(
         [d for d in r.index]), freq="M")
@@ -108,7 +125,9 @@ def delta_p_test(real_labels: pd.DataFrame, null_labels: pd.DataFrame, *,
         a = np.concatenate(d_r) if d_r else np.array([0.0])
         b = np.concatenate(d_n) if d_n else np.array([0.0])
         counts[s_i] = a.mean() - b.mean()
-    p = float((counts >= obs).mean()) if sims else 1.0
+    # S9：+1 修正（p 不为 0；分辨率 1/(1+B)）
+    k = int((counts >= obs).sum()) if sims else 1
+    p = float((1 + k) / (1 + sims)) if sims else 1.0
     return {"delta_p": obs, "p_value": p,
             "n_days_real": int(len(r)), "n_days_null": int(len(nul)),
             "block": block, "sims": int(sims)}
