@@ -1,0 +1,36 @@
+# C103：S3 20 日高低点通道（XAUUSD；蓝图 P 线 §7）
+# 登记时间：2026-10-29（T77 前半——文献功课与预期 Δp；计数在预期提交后另做）
+id = "C103"
+title = "XAUUSD 20 日高低点（Donchian 通道极值）处的条件概率"
+mechanism_class = "price_levels"
+status = "registered"
+symbols = ["XAUUSD"]
+holding = "H1"
+mechanism = "锚定效应（George & Hwang 2004）：投资者把近期极值当作锚，接近通道高点的股票/资产继续上涨的概率更高（动量延续而非逆转）；与 H002（标定样品）同一类价位，但这里只检验价位处的条件概率，不重复趋势跟随本身。送钱方是在通道极值逆势接刀/摸顶的均值回归者。"
+
+[literature]
+original = [
+  "George, T. J. & Hwang, C.-Y. (2004). The 52-Week High and Momentum Investing. Journal of Finance 59(5)——接近 52 周高点预测继续上涨（锚定；美股）",
+  "Moskowitz, T., Ooi, S. Y. & Pedersen, L. H. (2012). Time Series Momentum. JFE 104(2)——58 个期货市场 N 日高低点后的延续（含 FX）",
+]
+replications = [
+  "Huang, Y., Song, X., Xiang, H. (2020). The 52-Week High in the Cross-Section of Cryptocurrency Returns——跨资产锚定复现（加密资产）",
+]
+rebuttals = [
+  "文献证据方向集中在**延续**（A1/A2 follow>base）：A3/A4（fade）与通道极值的锚定证据相反——D51 要求四个动作全部登记、方向由动作定义决定，fade 假设可能被证伪，属正常",
+  "时间序列动量在一年以上反转（Moskowitz et al. 2012）；趋势规则样本外失效的通用警告（Sullivan/Timmermann/White 1999；Hsu & Kuan 2005）",
+  "无 20 日 Donchian 极值处**条件概率**的直接研究（检索未找到）——通道极值口径与 52 周高点/月度动量窗口不同",
+]
+search_log = "检索 2026-10-29：'Donchian channel breakout conditional probability reversal academic'；'52-week high anchoring replication'；'time series momentum reversal trend following'（Google Scholar/web）。通道极值条件概率的直接研究未找到；锚定与动量延续的同行评审证据充分但为跨市场/跨窗口口径。"
+published_effect = "George & Hwang (2004)：接近高点组的收益显著高于远离组（美股月度口径）；Moskowitz et al. (2012)：N 日高点的延续在 FX 显著。均非固定止损止盈的赢率差口径。"
+expected_effect = "预期 Δp 0.02（锚：锚定/动量延续证据跨市场存在但无同口径复现——保守锚 0.05 × (1−0.58) ≈ 0.021，取 0.02。与 H002 的结果无关（标定样品结论不外推，蓝图 §7）。）"
+
+[prob]
+situations = ["S3"]
+hypotheses = ["S3:A1:follow>base", "S3:A2:follow>base", "S3:A3:fade>base", "S3:A4:fade>base"]
+bracket = { sl_atr = 1.0, tp_atr = 2.0, horizon_bars = 24 }
+level_grid = {}
+approach = { lookback_bars = 24, min_distance_atr = 1.0, touch_atr = 0.25 }
+breakout_atr = 0.25
+retest_window_bars = 6
+expected_delta_p = 0.02

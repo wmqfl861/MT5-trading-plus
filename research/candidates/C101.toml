@@ -1,0 +1,37 @@
+# C101：S1 整数关口（XAUUSD；蓝图 P 线 §7 首批候选）
+# 登记时间：2026-10-29（T77 前半——文献功课与预期 Δp；计数在预期提交后另做）
+id = "C101"
+title = "XAUUSD 整数关口的条件概率（50 美元网格）"
+mechanism_class = "price_levels"
+status = "registered"
+symbols = ["XAUUSD"]
+holding = "H1"
+mechanism = "止盈单与止损单在整数位聚集（Osler 2003）：到整数关口容易掉头（止盈单挂单被吃），穿过之后走势容易加速（止损单串级）。送钱方是在整数位追单的散户与不设保护单的趋势追随者。"
+
+[literature]
+original = [
+  "Osler, C. L. (2003). Currency Orders and Exchange Rate Dynamics: An Explanation for the Predictive Success of Technical Analysis. Journal of Finance 58(5)（纽约联储 Staff Report 125 为前身）",
+  "Osler, C. L. (2000). Support for Resistance: Technical Analysis and Intraday Exchange Rates. FRBNY Economic Policy Review 6(2)",
+]
+replications = [
+  "Lallouache, M. & Vandeweyer, P. (2014). Tick Size Reduction and Price Clustering in a FX Order Book——EBS 高频数据确认限价单/撤单在 00/50 整数位聚集（机制复现，非策略收益复现）",
+  "Osler, C. L. (2005). Stop-Loss Orders and Price Cascades in Currency Markets. JIMF 24(2)——穿位后串级的机制证据",
+]
+rebuttals = [
+  "Neely, C. & Weller, P. (2011). Technical Analysis in the Foreign Exchange Market——过滤规则等 FX 技术规则收益自 1990 年代中期后衰减",
+  "Sullivan, R., Timmermann, A., White, H. (1999). Data-Snooping, Technical Trading Rule Performance, and the Bootstrap. Journal of Finance 54(5)——技术规则的选择性报告偏差；Hsu & Kuan (2005) 显示样本外不复现",
+  "Bloomfield, Chin & Craig (2024, Georgetown CRI WP)——在整数位附近交易更多的投资者收益更差（对整数位策略收益的反向证据）",
+]
+search_log = "检索 2026-10-29：'Osler round number stop-loss clustering replication'（Google Scholar/web）；'round number effect exchange rates gold support resistance profitability'；'technical trading rules FX post-publication decline'。EBS 机制复现（Lallouache & Vandeweyer 2014）有；策略级收益复现（含成本的可交易规则样本外赢率差）未找到。"
+published_effect = "Osler (2000/2003)：汇率在整数位（00/50 结尾）的逆转（bounce）频率显著高于随机时点； Staff Report 125 形式化检验了'接近 0.01% 内即反弹'的定义。未发表以固定止损止盈口径的赢率差数值。"
+expected_effect = "预期 Δp 0.02（锚：Osler 现象级证据支持整数位逆转频率更高，但无策略级复现与固定 bracket 口径的赢率差——按保守锚 0.05 赢率差 × (1−0.58)（McLean & Pontiff 2016 无复现折算）≈ 0.021，取 0.02。不得取自本项目数据。）"
+
+[prob]
+situations = ["S1"]
+hypotheses = ["S1:A1:follow>base", "S1:A2:follow>base", "S1:A3:fade>base", "S1:A4:fade>base"]
+bracket = { sl_atr = 1.0, tp_atr = 2.0, horizon_bars = 24 }
+level_grid = { XAUUSD = 50.0 }
+approach = { lookback_bars = 24, min_distance_atr = 1.0, touch_atr = 0.25 }
+breakout_atr = 0.25
+retest_window_bars = 6
+expected_delta_p = 0.02
