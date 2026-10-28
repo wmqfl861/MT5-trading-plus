@@ -202,6 +202,8 @@ def test_hook_blocks_staged_engine_a(hook, capsys):
     "research/cards/H003.toml",                # 裸路径按 M 算：修改已提交的卡
     "research/cards/notes.md",                 # cards 下只放行 *.toml
     "research/cards/sub/H100.toml",            # 卡目录不嵌套子目录
+    "research/candidates/C001.toml",           # 裸路径按 M 算：候选只放行新增 A
+    "research/rounds/R1.toml",                 # 轮次预注册：管理员专属（T69）
     "tests/test_p6_docs.py",                   # 本守护测试不在白名单
     "tests/test_validation.py",
     "docs/p6/research-agent.md",               # 研究角色不能改自己的规则
@@ -257,6 +259,66 @@ def test_hook_whitelist_hook_itself_rejected(hook):
     """情形 5：改钩子自身拒——否则白名单可被研究角色拆掉。"""
     assert hook.main(RESEARCH + ["M\tscripts/hooks/pre-commit-readonly-paths"],
                      env={}) != 0
+
+
+# ---- T69（R11 阶段收尾）：候选登记/轮次预注册的路径白名单 ----
+
+
+def test_hook_whitelist_new_candidate_toml_allowed(hook):
+    """T69 情形 1：研究角色新增候选登记 research/candidates/C###.toml
+    （git 状态 A）放行——候选只写材料、不跑数据，是研究角色的合法产出。"""
+    assert hook.main(RESEARCH + ["A\tresearch/candidates/C001.toml"],
+                     env={}) == 0
+
+
+def test_hook_whitelist_new_candidate_precheck_json_allowed(hook):
+    """T69 情形 2：研究角色新增候选预筛产物 research/candidates/C###.precheck.json
+    （工具 bt candidate check 生成、随候选提交，状态 A）放行。"""
+    assert hook.main(RESEARCH + ["A\tresearch/candidates/C001.precheck.json"],
+                     env={}) == 0
+
+
+def test_hook_whitelist_candidate_add_only(hook):
+    """T69：候选登记与卡同样只放行新增（A）——已提交的候选/precheck 不得
+    修改（改预期=改预注册材料，须走管理员）；目录规则同 cards：不嵌套
+    子目录、只认 *.toml 与 *.precheck.json。"""
+    for status in ("M", "D", "R"):
+        assert hook.main(RESEARCH + [f"{status}\tresearch/candidates/C001.toml"],
+                         env={}) != 0, f"候选 {status} 应拒绝"
+        assert hook.main(
+            RESEARCH + [f"{status}\tresearch/candidates/C001.precheck.json"],
+            env={}) != 0, f"precheck {status} 应拒绝"
+    assert hook.main(RESEARCH + ["A\tresearch/candidates/notes.md"],
+                     env={}) != 0, "candidates 下只认 *.toml / *.precheck.json"
+    assert hook.main(RESEARCH + ["A\tresearch/candidates/sub/C001.toml"],
+                     env={}) != 0, "candidates 不嵌套子目录"
+
+
+def test_hook_whitelist_rounds_admin_only(hook):
+    """T69 情形 3：research/rounds/R#.toml 含试验预算与锁箱用量，须经
+    用户批准——研究角色写它一律拒绝（任何状态，含新增 A）；管理员放行
+    （T69 情形 4）。"""
+    for status in ("A", "M", "D"):
+        assert hook.main(RESEARCH + [f"{status}\tresearch/rounds/R1.toml"],
+                         env={}) != 0, f"研究角色 {status} 轮次文件应拒绝"
+    # 审查角色同样不得写轮次；轮次目录下的其他文件同样拒
+    assert hook.main(["--role", "review", "A\tresearch/rounds/R1.toml"],
+                     env={}) != 0
+    assert hook.main(RESEARCH + ["A\tresearch/rounds/notes.md"],
+                     env={}) != 0
+    # 管理员：新增/修改轮次文件放行
+    assert hook.main(["--role", "admin", "A\tresearch/rounds/R1.toml",
+                      "M\tresearch/rounds/R2.toml"], env={}) == 0
+
+
+def test_hook_rounds_rejection_names_the_reason(hook, capsys):
+    """T69：研究角色写轮次的拒绝文案须指明'管理员/用户批准'——轮次是
+    预注册材料（铁律 16），不是普通白名单外路径。"""
+    rc = hook.main(RESEARCH + ["A\tresearch/rounds/R1.toml"], env={})
+    assert rc != 0
+    out = capsys.readouterr().out
+    assert "research/rounds/R1.toml" in out
+    assert "管理员" in out and "批准" in out
 
 
 # ---- 角色参数化：admin 全放行；缺省/未知角色拒绝 ----

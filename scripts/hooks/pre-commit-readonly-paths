@@ -16,13 +16,19 @@
 白名单（research/review；新增与修改用 git diff --cached --name-status 区分）：
     A     research/cards/*.toml                    新增卡（只放行状态 A——
           已提交的卡不得修改；版本迭代=同谱系新建 H###-v2.toml）
+    A     research/candidates/*.toml               新增候选登记（T69，只放行
+          状态 A）；*.precheck.json 同（bt candidate check 工具生成、随候选
+          提交；重跑预筛的更新由管理员提交）
     A/M   src/mt5quant/strategies/library/**       策略库
     A/M   tests/test_strategies_*.py               策略测试
     A/M   docs/research/**                         研究报告
     其余路径与其余状态（D/R/C/T，含删除白名单文件、改名）一律拒绝；
-    白名单之外没有例外——钩子自身、scripts/（bt.py 等）、CI（.github/）、
-    src/mt5quant/costs/、src/mt5quant/research/、src/mt5data/、src/mt5live/、
-    data/、config/、docs/p6/ 规则文件全部只读。
+    research/rounds/*.toml（轮次预注册）**只允许管理员写**——轮次文件含
+    试验预算与锁箱用量，须经用户批准（蓝图 v4 铁律 16"先定规则再开卡"），
+    研究/审查角色提交它=越权预注册。白名单之外没有例外——钩子自身、
+    scripts/（bt.py 等）、CI（.github/）、src/mt5quant/costs/、
+    src/mt5quant/research/、src/mt5data/、src/mt5live/、data/、config/、
+    docs/p6/ 规则文件全部只读。
 
 安装（入库但不自动安装；研究/审查角色不装也受 ACL 与台账约束）：
     printf '#!/bin/sh\nexec .venv/Scripts/python.exe \
@@ -44,6 +50,8 @@ ROLE_ADMIN = "admin"
 WHITELIST_ROLES = frozenset({"research", "review"})
 
 _CARD_DIR = "research/cards/"
+_CANDIDATE_DIR = "research/candidates/"
+_ROUNDS_DIR = "research/rounds/"
 _LIB_PREFIX = "src/mt5quant/strategies/library/"
 _TEST_PREFIX = "tests/"
 _DOC_PREFIX = "docs/research/"
@@ -60,6 +68,22 @@ def _is_new_card(p: str) -> bool:
         return False
     name = p[len(_CARD_DIR):]
     return bool(name) and "/" not in name
+
+
+def _is_candidate_file(p: str) -> bool:
+    """research/candidates/ 下（不嵌套子目录）的候选登记 *.toml 与工具
+    生成的预筛产物 *.precheck.json（T69；两者都只放行新增 A）。"""
+    if not p.startswith(_CANDIDATE_DIR):
+        return False
+    name = p[len(_CANDIDATE_DIR):]
+    if not name or "/" in name:
+        return False
+    return name.endswith(".toml") or name.endswith(".precheck.json")
+
+
+def _is_round_file(p: str) -> bool:
+    """research/rounds/ 下的任何文件（T69：轮次预注册管理员专属）。"""
+    return p.startswith(_ROUNDS_DIR)
 
 
 def _is_strategy_lib(p: str) -> bool:
@@ -91,18 +115,25 @@ def violation_reason(role: str | None, status: str, path: str) -> str | None:
         who = f"未知角色 {role!r}" if role else "角色未指定"
         return (f"{label} -> {who}：缺省拒绝（admin 全放行；research/review "
                 f"走白名单；用环境变量 {ENV_ROLE} 或 --role 指定）")
-    if _is_new_card(p):
+    if _is_round_file(p):
+        # T69：轮次预注册含试验预算与锁箱用量，须经用户批准（铁律 16），
+        # 研究/审查角色写它 = 越权预注册，任何状态（含新增 A）都拒绝。
+        return (f"{label} -> 轮次预注册只允许管理员写（R#.toml 含试验预算"
+                f"与锁箱用量，须经用户批准；先定规则再开卡——铁律 16）")
+    if _is_new_card(p) or _is_candidate_file(p):
         if code == "A":
             return None
-        return (f"{label} -> 卡文件只放行新增（A）：已提交的卡不得修改，"
-                f"版本迭代=同谱系新建 H###-v2.toml")
+        return (f"{label} -> 卡/候选文件只放行新增（A）：已提交的卡与候选"
+                f"登记不得修改，卡版本迭代=同谱系新建 H###-v2.toml，候选"
+                f"重登记=新 C###（重跑预筛的 precheck.json 更新走管理员）")
     if _is_strategy_lib(p) or _is_strategy_test(p) or _is_research_doc(p):
         if code in ("A", "M"):
             return None
         return (f"{label} -> 白名单路径但状态 {code} 不允许（只放行 A/M；"
                 f"删除/改名需管理员）")
     return (f"{label} -> 不在研究/审查白名单内（只允许：新增卡 "
-            f"research/cards/*.toml、{_LIB_PREFIX}**、"
+            f"research/cards/*.toml、新增候选 research/candidates/*.toml "
+            f"与 *.precheck.json、{_LIB_PREFIX}**、"
             f"tests/test_strategies_*.py、{_DOC_PREFIX}**）")
 
 
@@ -197,9 +228,12 @@ def main(argv=None, env=None) -> int:
           f"研究/审查角色按白名单放行，白名单之外一律只读")
     for v in violations:
         print(f"  - {v}")
-    print("  白名单：新增卡 research/cards/*.toml（仅状态 A）、"
-          "src/mt5quant/strategies/library/**、")
-    print("  tests/test_strategies_*.py、docs/research/**（后三类仅 A/M）。")
+    print("  白名单：新增卡 research/cards/*.toml、新增候选 "
+          "research/candidates/*.toml 与 *.precheck.json（均仅状态 A）、")
+    print("  src/mt5quant/strategies/library/**、")
+    print("  tests/test_strategies_*.py、docs/research/**（后三类仅 A/M）；")
+    print("  research/rounds/*.toml 只允许管理员（轮次预算与锁箱用量须"
+          "用户批准）。")
     print(f"  管理员提交设 {ENV_ROLE}=admin 或传 --role admin；")
     print("  发现 bug 请写进研究报告交主会话，不要 --no-verify 绕过。")
     return 1
