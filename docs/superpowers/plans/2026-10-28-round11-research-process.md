@@ -10,6 +10,8 @@
 > 7. 勾选复选框，并**在同一行写上证据**（测试名、报告路径或日志路径）。
 >
 > 没有证据的复选框一律不勾。
+>
+> 第十三轮 K9 补充：每次变基或合并上游之后，先在本地重跑全量回归，绿了再推送。
 
 **Goal:** 把研究循环的入口从"直接开卡"改为一套有据可查的选题与评估体系：
 - 基线重新定位（标定样品）、v2 卡撤回；
@@ -69,6 +71,23 @@
 | d | T64 + T80 项目级 N 与预筛加固 | M | T63 | D33、G2、G3、G4 |
 | e | T66 → T65 → T68 | — | 见上表 | 批准点不变 |
 
+**第十三轮审核增补**（2026-10-28，见 `docs/reviews/2026-10-28-review-round13.md`）：三份批准件的结论如下。
+- D34 关卡 v3：结构批准，工作点补充标定（T85）后冻结；
+- D35 事件模式：批准，附修改（主统计量改为随机化参照）；
+- R1 草案：不批准（C001 退出，C002 等数据）。
+
+H 线剩余任务按下表推进。
+
+| 顺序 | 任务 | 规模 | 依赖 | 解决的问题 |
+| --- | --- | --- | --- | --- |
+| f | T83 成本口径：研究路径的隔夜费 | S | — | 第十三轮 K5、K6 |
+| g | T84 预筛 σ、样本量口径与候选更正 | S | — | K3、K4、K8 |
+| h | T88 台账迁移保真证明与按事件序号锚定 | S | — | K7、P 线审核一移交 |
+| i | T87 HistData 启用（下载耗时，可与 f–h 交替） | M | — | D36 补充结论 |
+| j | T85 关卡 v3 工作点补充标定（批准点）→ 冻结 | M | T83 | K1、K2、D34/D35 |
+| k | T86 关卡 v3 的 bt 接线 | M | T85 冻结 | D34/D35 落地 |
+| l | T68b R1 重提（批准点） | S | T84、T86、T87 | 首轮 |
+
 规模按以往节奏估计，仅供排序：S ≈ 半个工作日，M ≈ 1 个工作日，L ≈ 2 个工作日及以上。
 
 ---
@@ -82,6 +101,12 @@
 - [x] **D33–D35 原则同意**：已同意（蓝图 v4 §8）。最终批准在 T65、T66 的标定报告出来之后，由审核会话按报告中预先写定的选择规则确认。
 - [x] **外部数据源规则**：已决定——只用免费、条款允许个人研究使用的来源，不买付费数据，条款不明的不用，原始数据不进公开仓库（蓝图 v4 §8 D36）。T67 的来源清单交审核会话确认。**审核结论（第十二轮）**：FRED、Bitstamp 批准；HistData 暂不批准（待条款核实）；Yahoo 不批准；Dukascopy 原则可用、当前不可达——落地见 T81。
 - [ ] **账户隔夜费状态**：在 Exness 个人区确认模拟盘账户是否为 swap-free；将来实盘打算用的账户类型。
+  - 第十三轮补充：它已不再决定 C001（C001 按文献退出），但决定多夜持仓类策略能不能做。请确认两件事：
+    1. 个人区里模拟盘与实盘账户类型的免隔夜费状态（Standard 还是 Extended swap-free）；
+    2. MT5 里 USTEC、XAUUSD、EURUSD、BTCUSD 各自"规格"中的 Swap long/short。
+  - 结果由 agent 写进 `config/account-profile.toml`（T83，不含账号与服务器名）。
+- [x] **HistData**：第十三轮审核有条件批准用于个人研究（依据与限定见第十三轮报告 §5，落地见 T87）。用户如不同意，回复"HistData 不用"即撤销。
+- [x] **D33 口径修订**：主检验的 N = 两线轮次内累计 + 所延续谱系的历史；轮次制之前的其余历史只报告（第十三轮 §4.1）。用户如不同意，回复即撤销。
 - [ ] **沿用的用户事项**：S1 清单、ACL 与分支保护、MT5 策略测试器对账。
 
 ## T70：脱敏与杂项（F1、F2、F4、F6、F7）
@@ -297,6 +322,125 @@ def randomize_event_times(events, trading_days, *, seed: int) -> list[EventWindo
 - **Dukascopy**（可选）：在用户网络下测试接通；接通后先做条款核对与一致性核对，再交审核会话。
 - **USTEC 口径**：报告写明 FRED 指数收盘（纽约 16:00）与券商差价合约日线（纽约 17:00 结算）的差异。事件窗口用指数收盘定义时，实盘执行按差价合约在 16:00 前后成交，并在候选登记里写清。
 - [x] 全部完成（84b5c9a+P3/P4 修正 c1623b2）：独立成果审核通过（白名单实测拒 6 个 histdata 序列、cutoff 纪律核对、条款核查独立抽查印证无 Terms 页、合成未测年份 2019/2022 攻击测试判别真实、9 失败测试红→绿）；实际导出 fred USTEC 39.8 年+cdd BTCUSD 10.9 年入研究库；HistData 维持不批准（原文存 data/ext/terms）。
+
+## T83：成本口径——研究路径的隔夜费（第十三轮 K5、K6）
+
+**Files:** `scripts/bt.py`、`scripts/gate_calibration.py`、`scripts/run_backtest.py`（`build_costs`）、`scripts/calibrate_costs.py`；新建 `config/account-profile.toml`；测试。
+
+- [ ] **参考价接线**：
+  - `bt screen/gate` 与 `gate_calibration` 调 `build_costs` 时传 `swap_ref_price`，取研究库该品种最后收盘，与 CLI 主路径同一约定；`cost_version` 带 relref。
+  - 对账路径保持绝对口径（与 MT5 策略测试器同口径），代码里写明原因。
+  - 失败测试先行：
+    - 经 `bt gate` 的 1986 反例不再爆仓；
+    - C001、C002 的 precheck 数字逐位不变（预筛本来就按参考价折算）。
+- [ ] **模拟盘实测不进研究成本**：
+  - `calibrated.json` 增加 `account_kind`（demo | real），由 `calibrate_costs` 从网关读出的账户交易模式写入。
+  - 研究库与 bt 路径只接受 real 账户的隔夜费实测；demo 实测只写进报告，`cost_version` 注明"demo 实测未采用"。
+  - 失败测试先行：demo 的 `free_of_swap=true` 不改变研究成本。
+- [ ] **账户隔夜费配置** `config/account-profile.toml`：
+  - 内容（不含账号与服务器名）：将来实盘的账户类型；各品种隔夜费状态（charged | swap_free | unknown）；确认人；确认日期；证据说明。
+  - 只有用户确认过的条目才生效，缺省按 charged。
+- [ ] **预筛双口径**：
+  - 持仓过夜的候选，在 precheck JSON 里同时给出 charged 与 swap_free 两种口径的成本倍数与检验力；
+  - 决定按 account-profile 的状态取；
+  - swap_free 口径通过而 charged 口径不通过的，登记 `swap_dependent = true`。
+
+## T84：预筛 σ、样本量口径与候选更正（第十三轮 K3、K4、K8）
+
+**Files:** `src/mt5quant/research/candidates.py`、`src/mt5quant/validation/events.py`（共用 σ 函数）、蓝图附录 C、`research/candidates/C001.toml`、`C002.toml`、`docs/research/event-mode-calibration-2026-10-28.md`、`docs/p6/research-agent.md`；测试。
+
+- [ ] **σ 按事件窗取**：
+  - 候选登记 `[declared]` 新增 `window_bars`：从入场到出场的持仓周期 bar 数。
+  - σ = 同长度窗口收益的标准差；日内周期按 `entry_hour_ny` 取同一时段起点。与 T66 的 σ_w 共用一个函数。
+  - 缺 `window_bars` 的登记，装载时报错。
+  - 失败测试先行：4 日窗的 σ 约为单日的 2 倍（独立同分布合成数据）；定盘小时的 σ 高于全天平均（合成的时段异方差数据）。
+- [ ] **样本量规则按 α/N**：
+  - 事件模式样本量规则改为 z_{α/N}（`events.required_events` 增加 `n_tests` 参数）；
+  - 预筛仍按单次检验判定（蓝图 §6.2 条件 4）；
+  - `bt round open` 按本轮 N 复核每个候选的检验力，写进轮次报告骨架（只报告）。
+- [ ] **C001 更正**（第十三轮 §4.3）：
+  - status 保持 screened_fail，理由改为"目标市场发表后证据（Han、Han 与 Tian 2025）显示效应在 2001 年后消失"；
+  - 补 `window_bars`，事件窗按 K8 写清（第 −2 日纽约 16:00 收盘 → 第 +3 日 16:00 收盘）；
+  - 加 `observed_in_sample = "T66 §3.2"`；
+  - 重跑预筛（台账留痕）。
+- [ ] **样本内观察入账**（K3）：
+  - 把 T66 报告 §3.2 与 §1.5 对 USTEC、BTCUSD 月末窗的两次真实事件时间观察，作为 run_class=research 的试验记入台账，注明来源；
+  - 报告 §5 的"0.4–0.6%"删除，或改为引用 C001 的登记值；
+  - §7 与 §4.2 的随机化时刻净均值统一为实测值。
+- [ ] **规则**：`docs/p6/research-agent.md` 写明——标定与演示只用随机化时刻或植入效应；候选机制在真实事件时间上的统计量，只能在已开启轮次内计算。守护测试检查关键词。
+- [ ] **还原成本判定**（K10，P 线审核三转达）：H 线 `precheck` 的判定块恢复 0d92448 之前的写法——`not cost_ok` 判 fail，`elif not power_ok` 判 waiting_data（P 线的 `precheck_prob` 不动）。失败测试先行：成本条件返回 numpy 布尔值 False 或 None 时，判为 fail。
+- [ ] **C002**：补 `window_bars = 1`；等 T87 数据延长后重检。
+
+## T85：关卡 v3 工作点补充标定（第十三轮 K1、K2；D34 冻结前置，批准点）
+
+**Files:** `src/mt5quant/research/ledger.py`、`scripts/bt.py`（N 取数）、`src/mt5quant/validation/gates.py`（方案丙与 V₀）、`scripts/gate_calibration.py`、`scripts/merge_gate_power.py`、`config/gates-v3.toml`；报告 `docs/research/gates-v3-operating-point-<日期>.md`；测试。
+
+以下规则写于结果之前（第十三轮 §4.1、§4.2），不按结果调整。
+
+- [ ] **N 口径**：
+  - `ledger.stats` 新增 `project_n_dedup_rounds`：run_class=research 且 round_id 非空，两条线合并；
+  - 新增 `lineage_n_dedup(family)`；候选登记新增可选字段 `continues_family`；
+  - 主检验 N = 两者之和；
+  - 现行键的语义不变，轮次制之前的其余历史只在报告里列出。
+- [ ] **两个方案**：
+  - 甲 = DSR(N, V₀) ≥ 0.95，V₀ = 1/(n−1)，n 为样本外 bar 数；
+  - 丙 = PSR(0) ≥ 1 − α/N；
+  - 两者都从同一样本外收益计算；台账试验夏普的经验方差只作诊断。
+- [ ] **重算**：用现有 300 条标定运行重算 N ∈ {2, 6, 24} 的联合误报率与检出率。产物里有收益序列就直接重算，没有就重跑。
+- [ ] **选择**：在三个 N、全部设置、两种零假设下联合误报率都 ≤ 5% 的方案里，选 N=6 时夏普 1.0 联合检出率较高的；处处相同选丙。按选中方案在 N=6 的结果重判"测不了"清单，N=2 与 N=24 并列报告。
+- [ ] **事件模式分支写进 `gates-v3.toml`**：
+  - 主检验：随机化参照，p ≤ α/N，随机化次数 ≥ max(1999, ⌈20N/α⌉)；
+  - 否决：成本 ×1.5 后净均值 > 0；
+  - 事件模式不适用买入持有超额与延迟一根两项否决；
+  - 诊断：年块自助对 0、事件窗前后移一根、分段均值、已知缺口注记。
+- [ ] **停下**：报告开头写"状态：待审核"和本节规则，推送后交 H 线审核会话核对数字。
+- [ ] **冻结**（审核通过后）：按提案 §8 一次提交完成——`gates.toml` 替换、冻结指纹更新、蓝图附录 B 与 D34 记录同步。
+
+## T86：关卡 v3 的 bt 接线（T85 冻结之后）
+
+**Files:** `scripts/bt.py`、`src/mt5quant/validation/gates.py`、`src/mt5quant/validation/events.py`；测试。
+
+- [ ] **bar 级卡**：`bt gate` 按 `[v3].primary_test` 走主检验 + 三项否决 + 诊断，N 按 T85 口径取数。关卡报告列出 N 的组成：轮次内、所延续谱系的历史、其余历史（只报告）。
+- [ ] **事件模式卡**：轮次 `[evaluation]` 中 mode="event" 的卡走事件分支（随机化参照、α/N、成本 ×1.5 否决、诊断）。
+- [ ] **失败测试先行**：
+  - 事件卡不跑买入持有与延迟否决；
+  - 随机化次数低于下限时拒绝运行；
+  - 报告中 N 的组成与台账一致。
+- [ ] **与 P 线 T73B 协调**：通用接线放在 T86；P 线拟合策略的逐窗拟合放在 T73B。分工由 P 线审核会话确认，先落地的一方提供接口。
+
+## T87：HistData 启用（D36 第十三轮补充结论）
+
+**Files:** `src/mt5data/ext/approvals.py`、`adapters.py`、`consistency.py`、`scripts/fetch_ext_data.py`、`scripts/export_research_store.py`；报告 `docs/research/ext-data-2026-10-27.md` 增补节；测试。
+
+- [ ] **来源白名单**加入 HistData：
+  - manifest 写明使用限定（同 FRED/CDD：只作个人研究、不再分发）与依据（FAQ 原文、抓取日期、本地 `data/ext/terms/` 路径）；
+  - 下载走网站正常路径，低频、不并发、不绕过限制。
+- [ ] **逐年口径验证**（T81 方法）：
+  - 只导出判为一致的年份，inconsistent 与 undetermined 的年份登记后不用；
+  - EURUSD 另加定盘锚点：伦敦 16:00 定盘窗口分钟级波动尖峰的位置，逐年核对。
+  - 失败测试先行：在合成数据里把尖峰错位一小时，判定为不一致。
+- [ ] **导出研究库**（cutoff 之前），与 MT5 重叠期做一致性核对；更新覆盖表与延长后的检验力表。
+- [ ] **C002 重检**：按 T84 的口径（定盘前一小时的时段 σ）重跑预筛，台账留痕；2015-02-15 前后两段作为诊断。
+
+## T88：台账迁移保真证明与按事件序号锚定（第十三轮 K7、P 线审核一移交）
+
+**Files:** `scripts/ledger_anchor.py`、`src/mt5quant/research/ledger.py`；报告 `docs/ops/rechain-proof-<日期>.md`；测试。
+
+- [ ] **保真检查**：`--accept-rechain` 增加一项——按迁移前的列集合（迁移声明的新增列除外）重算旧前缀，必须等于旧头；声明的新增列写进注记。
+  - 失败测试先行：迁移时改动一行旧内容，准入被拒绝。
+- [ ] **事后补证**：对两次已发生的重封各跑一次，结果写进报告。
+  - T63：去掉 round_id 与 run_class，重算前 441 行，应得 `72709d12…`；
+  - T80：去掉 run_class，重算前 445 行，应得 `ddd8106f…`。
+- [ ] **按事件序号锚定**：锚定行记录 ledger_events 序号，前缀重放按序号进行，替代按时刻重放，消除同刻度竞态（d96c523 的根因）。旧锚兼容读取。
+
+## T68b：R1 重提（批准点）
+
+- [ ] **候选**：T87 重检后通过的 C002；可以再登记 1–2 个日内、不过夜、在 XAUUSD 或 EURUSD 上的事件型候选，机制类别避开 cross_asset，按同一套预筛。月末类候选不在 USTEC、BTCUSD 上登记（K3）。
+- [ ] **`R1.toml`**：
+  - trial_budget = 2 × 候选数；每个候选只跑登记的一个主规格，窗口变体只作诊断；
+  - `[evaluation]` 按第十三轮 §4.2；
+  - approved_by 留空，由 H 线审核会话在批准时填写，执行会话不得填写。
+- [ ] **停下**：候选报告开头写"状态：待审核"和预写判定标准，推送后交 H 线审核会话。
 
 ---
 
