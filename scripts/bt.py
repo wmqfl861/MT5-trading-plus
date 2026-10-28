@@ -2656,6 +2656,11 @@ def cmd_gate(args) -> int:
                 out["project_n_trials"] = st["project_n_dedup"]
                 out["n_trials_project_research"] = st[
                     "project_n_dedup_research"]
+                # T85（第十三轮 §4.1）：关卡 v3 主检验 N 的轮次内成分
+                # （N = project_n_dedup_rounds + 候选 continues_family 的
+                # lineage_n_dedup，见 ledger.primary_test_n）——只报告，
+                # 现行 G4 语义不变（T86 接线 v3 主检验时作取数来源）
+                out["project_n_dedup_rounds"] = st["project_n_dedup_rounds"]
                 return out
             _run("G4", _g4)
         if "G5" in wanted:
@@ -2700,7 +2705,11 @@ def cmd_gate(args) -> int:
                 f"- 项目 N（research 口径）："
                 f"{g4.get('n_trials_project_research')}"
                 "（只计 run_class=research；dsr_trial_scope=project 时"
-                " G4 用这个）\n")
+                " G4 用这个）\n"
+                f"- 项目 N（轮次内，T85）：{g4.get('project_n_dedup_rounds')}"
+                "（run_class=research 且 round_id 非空——关卡 v3 主检验 N 的"
+                "第一成分；N = 它 + 候选延续谱系的 lineage_n_dedup，"
+                "见 ledger.primary_test_n）\n")
         print(report)
         if args.out:
             out = Path(args.out)

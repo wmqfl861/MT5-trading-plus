@@ -82,7 +82,10 @@ _POWER_N_TESTS = 1              # 铁律 18：单次检验
 _ID_PATTERN = re.compile(r"^C\d{3,}$")
 _TOP_KEYS = ("id", "title", "mechanism_class", "status", "symbols",
              "holding", "mechanism", "source_card", "notes",
-             "observed_in_sample")
+             "observed_in_sample", "continues_family")
+# continues_family 合法形态（T85）：卡谱系 id（H012 这类，cards.family_of
+# 的输出域）——字母前缀 + 数字，不带 -v 版本后缀（那是卡 id 不是谱系）。
+_FAMILY_PATTERN = re.compile(r"^[A-Z]+\d{2,}$")
 _LIT_KEYS = ("original", "replications", "rebuttals", "search_log",
              "published_effect", "expected_effect")
 _DECLARED_KEYS = ("events_per_year", "gross_return_per_event",
@@ -302,6 +305,9 @@ class Candidate:
     source_card: str = ""           # T61 簿记登记指向的卡（研究候选为空）
     notes: str = ""
     observed_in_sample: str = ""    # T84/K3：样本内被看过时如实登记来源（如 "T66 §3.2"）
+    continues_family: str = ""      # T85/K1：延续的历史谱系（如 "H012"）——
+    # 主检验 N 的 lineage 成分取数对象（ledger.lineage_n_dedup）；空 = 全新
+    # 机制（lineage N = 0）。不带 -v 后缀（谱系 id，不是卡 id）。
     declared: Declared | None = None
     prob_declared: ProbDeclared | None = None   # T76：[prob]（price_lines 候选）
     path: str = ""
@@ -496,6 +502,13 @@ def validate_candidate(data: dict, *, source: str) -> Candidate:
             f"{source}：observed_in_sample 必须是字符串（T84/K3：候选机制"
             f"在本项目样本内被看过时如实登记来源，如 \"T66 §3.2\"），收到"
             f" {observed_in_sample!r}")
+    continues_family = str(data.get("continues_family", "") or "").strip()
+    if continues_family and not _FAMILY_PATTERN.match(continues_family):
+        raise CandidateError(
+            f"{source}：continues_family 必须是谱系 id（形如 H012——不带"
+            f"-v 版本后缀，那是卡 id 不是谱系；T85/K1：主检验 N 的 lineage"
+            f"成分按 ledger.lineage_n_dedup(谱系) 取数），收到 "
+            f"{continues_family!r}")
 
     literature = _validate_literature(data.get("literature"), source)
     declared = None
@@ -527,6 +540,7 @@ def validate_candidate(data: dict, *, source: str) -> Candidate:
         symbols=tuple(symbols), holding=holding, mechanism=mechanism,
         literature=literature, source_card=source_card, notes=notes,
         observed_in_sample=observed_in_sample,
+        continues_family=continues_family,
         declared=declared, prob_declared=prob_declared)
 
 
@@ -551,6 +565,7 @@ def load_candidate(path) -> Candidate:
         mechanism=cand.mechanism, literature=cand.literature,
         source_card=cand.source_card, notes=cand.notes,
         observed_in_sample=cand.observed_in_sample,
+        continues_family=cand.continues_family,
         declared=cand.declared, prob_declared=cand.prob_declared,
         path=str(p))
 

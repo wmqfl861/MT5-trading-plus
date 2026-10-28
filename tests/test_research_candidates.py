@@ -262,6 +262,27 @@ def test_load_optional_observed_in_sample(tmp_path):
         load_candidate(write_candidate(tmp_path, bad))
 
 
+def test_load_optional_continues_family(tmp_path):
+    """T85/K1 失败测试：可选顶层字段 continues_family——候选延续的历史谱系
+    （如 "H012"，主检验 N 的 lineage 成分取数对象；全新机制缺省空串）；
+    非字符串拒绝；带版本后缀（是卡 id 不是谱系）拒绝。"""
+    body = CANDIDATE_TOML.replace(
+        'mechanism = "月末与月初的固定资金流（工资、养老金、再平衡）"',
+        'mechanism = "月末与月初的固定资金流（工资、养老金、再平衡）"\n'
+        'continues_family = "H012"')
+    c = load_candidate(write_candidate(tmp_path, body))
+    assert c.continues_family == "H012"
+    assert load_candidate(write_candidate(tmp_path)).continues_family == ""
+    bad_type = body.replace('continues_family = "H012"',
+                            "continues_family = 12")
+    with pytest.raises(CandidateError, match="continues_family"):
+        load_candidate(write_candidate(tmp_path, bad_type))
+    bad_card = body.replace('continues_family = "H012"',
+                            'continues_family = "H012-v1"')
+    with pytest.raises(CandidateError, match="谱系"):
+        load_candidate(write_candidate(tmp_path, bad_card))
+
+
 def test_repo_research_candidates_declare_window_bars():
     """T84/K4、K8、K3：仓库研究候选 C001/C002 带 window_bars（σ 按事件窗
     取）；C001 的 K8 事件窗 = 4 根 D1（第 −2 日纽约 16:00 收盘 → 第 +3 日

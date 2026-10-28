@@ -1295,10 +1295,16 @@ V3_DEFAULT_SETUPS = ("XAUUSD:H1", "XAUUSD:H4", "XAUUSD+USTEC:H1")
 V3_DEFAULT_LEVELS = (0.5, 1.0, 1.5)       # 校准后年化夏普档位（扣成本）
 V3_BONFERRONI_SENSITIVITY_N = 40          # 方案乙 Bonferroni 敏感性档
 # （R1 草案的轮次预算量级；正式取数按台账 project_n_dedup）
+V3_N_GRID = (2, 6, 24)                    # T85 工作点：重算的 N 档（预写）
 V3_PRIMARY_CHECKS = {"dsr": "primary.dsr",
                      "year_block": "primary.year_block",
                      f"year_block@N{V3_BONFERRONI_SENSITIVITY_N}":
-                         f"primary.year_block@N{V3_BONFERRONI_SENSITIVITY_N}"}
+                         f"primary.year_block@N{V3_BONFERRONI_SENSITIVITY_N}",
+                     # T85 甲（DSR(N, V₀)）/ 丙（PSR(0) ≥ 1−α/N）逐 N 记录
+                     **{f"dsr_v0@N{n}": f"primary.dsr_v0@N{n}"
+                        for n in V3_N_GRID},
+                     **{f"psr0_bonf@N{n}": f"primary.psr0_bonf@N{n}"
+                        for n in V3_N_GRID}}
 V3_VETO_CHECKS = ("G0", "veto.cost_x15", "veto.delay_1_bar",
                   "veto.buyhold_excess")
 
@@ -1375,6 +1381,33 @@ def walk_forward_oos(spec, bars, costs, grid, cfg) -> tuple[pd.Series, int]:
     return oos_returns, n_seg
 
 
+def v3_primary_suite(oos_returns, cfg, seed: int,
+                      *, n_trials: int = 1,
+                      n_grid=V3_N_GRID) -> dict:
+    """v3 主检验组（现行键语义不变 + T85 工作点键）：现行三键
+    （primary.dsr / primary.year_block / @N40 敏感性，n_trials=1——实验
+    不经台账选择）逐位照旧；新增 N ∈ n_grid 的方案甲（DSR(N, V₀=1/(n−1))
+    ——v3_primary_dsr_null_variance）与方案丙（PSR(0) ≥ 1−α/N——
+    v3_primary_psr_bonferroni）逐档记录（T85 预写：同一 OOS 收益重算
+    联合误报/检出）。"""
+    primary = {
+        "dsr": vgate.v3_primary_dsr(oos_returns, n_trials=n_trials,
+                                    trial_sharpes=None, cfg=cfg),
+        "year_block": vgate.v3_primary_year_block(
+            oos_returns, n_trials=n_trials, cfg=cfg, seed=seed),
+        f"year_block@N{V3_BONFERRONI_SENSITIVITY_N}":
+            vgate.v3_primary_year_block(
+                oos_returns, n_trials=V3_BONFERRONI_SENSITIVITY_N,
+                cfg=cfg, seed=seed),
+    }
+    for n in n_grid:
+        primary[f"dsr_v0@N{n}"] = vgate.v3_primary_dsr_null_variance(
+            oos_returns, n_trials=int(n), cfg=cfg)
+        primary[f"psr0_bonf@N{n}"] = vgate.v3_primary_psr_bonferroni(
+            oos_returns, n_trials=int(n), cfg=cfg)
+    return primary
+
+
 def run_v3_gate_suite(strategy, params, *, timeframe, bars, costs,
                       contract_size, vols, cfg, seed, grid=None,
                       symbol: str = "TST", session_policy=None,
@@ -1405,16 +1438,7 @@ def run_v3_gate_suite(strategy, params, *, timeframe, bars, costs,
     base_sharpe = summary.get("sharpe")
     oos_returns, n_seg = walk_forward_oos(spec, bars, costs,
                                           dict(grid or {}), cfg)
-    primary = {
-        "dsr": vgate.v3_primary_dsr(oos_returns, n_trials=n_trials,
-                                    trial_sharpes=None, cfg=cfg),
-        "year_block": vgate.v3_primary_year_block(
-            oos_returns, n_trials=n_trials, cfg=cfg, seed=seed),
-        f"year_block@N{V3_BONFERRONI_SENSITIVITY_N}":
-            vgate.v3_primary_year_block(
-                oos_returns, n_trials=V3_BONFERRONI_SENSITIVITY_N,
-                cfg=cfg, seed=seed),
-    }
+    primary = v3_primary_suite(oos_returns, cfg, seed, n_trials=n_trials)
     veto_cost = vgate.v3_veto_cost_scale(spec, bars, costs, params, cfg)
     veto_delay = vgate.v3_veto_delay(spec, bars, costs, params, cfg)
     veto_buyhold = vgate.v3_veto_buyhold(spec, bars, costs, base.trades,
@@ -1483,6 +1507,131 @@ def v3_joint_rates(runs: list[dict]) -> dict[str, float]:
     return rates
 
 
+# ------------------------------------------------ T85：工作点补充标定（K1）
+# 预写规则（写于结果之前，第十三轮审核 §4.1/计划 T85，不得按结果调整）：
+# 1. N 口径 = project_n_dedup_rounds + lineage_n_dedup（ledger.primary_test_n）；
+# 2. 甲 = DSR(N, V₀) ≥ 0.95（V₀ = 1/(n−1)，n = 样本外 bar 数）；
+#    丙 = PSR(0) ≥ 1 − α/N；同一样本外收益；
+# 3. 重算 N ∈ {2, 6, 24} 的联合误报率与检出率；
+# 4. 选择：在三个 N、全部设置、两种零假设下联合误报率都 ≤ 5% 的方案里，
+#    选 N=6 时夏普 1.0 联合检出率较高的（逐设置：不低于且至少一处严格
+#    更高者胜；互有高低取最差设置较高者）；处处相同选丙（实现更简单）；
+# 5. 按选中方案在 N=6 的联合检出率重判"测不了"（< 50%），N=2 与 N=24
+#    两列并列报告。
+V3_T85_SCHEMES = ("dsr_v0", "psr0_bonf")
+V3_T85_SCHEME_LABELS = {"dsr_v0": "甲 DSR(N,V₀)",
+                        "psr0_bonf": "丙 PSR(0)≥1−α/N"}
+V3_T85_FP_MAX = 0.05          # 联合误报合格线（预写）
+V3_T85_LOW_DETECTION = 0.50   # "测不了"线（预写）
+V3_T85_DECISION_LEVEL = 1.0   # 选择规则盯住的档位（预写）
+V3_T85_DECISION_N = 6         # 选择规则盯住的 N 档（预写）
+
+
+def v3_t85_operating_point(results: dict) -> dict:
+    """T85 工作点补充标定的汇总与判定（规则文本见上方注释——先于结果
+    预写）。输入 = --phase v3 的（合并）产物 dict；联合率全部由逐条记录
+    重算（v3_joint_pass），与主标定同一口径。"""
+    neg = (results.get("negative") or {}).get("runs") or []
+    pos = (results.get("positive") or {}).get("runs") or []
+    if not neg or not pos:
+        raise ValueError("产物缺 negative/positive runs——T85 判定无从做起")
+    setups = sorted({r["setup"] for r in neg})
+    nulls = sorted({r.get("null") for r in neg if r.get("null")})
+    levels = sorted({float(r["level"]) for r in pos})
+
+    fp: dict[str, dict[str, float]] = {}
+    det: dict[str, dict[str, float]] = {}
+    for scheme in V3_T85_SCHEMES:
+        for n in V3_N_GRID:
+            key = f"{scheme}@N{n}"
+            fp[key] = {}
+            for setup in setups:
+                for null in nulls:
+                    bucket = [r for r in neg
+                              if r["setup"] == setup and r.get("null") == null]
+                    fp[key][f"{setup}|{null}"] = float(np.mean(
+                        [v3_joint_pass(r["checks"], key) for r in bucket]))
+            det[key] = {}
+            for setup in setups:
+                for level in levels:
+                    bucket = [r for r in pos
+                              if r["setup"] == setup
+                              and float(r["level"]) == level]
+                    det[key][f"{setup}|{level:.1f}"] = float(np.mean(
+                        [v3_joint_pass(r["checks"], key) for r in bucket]))
+
+    # ---- 预写规则 4a：合格 = 三个 N、全部设置、两种零假设联合误报都 ≤5%
+    eligibility: dict[str, bool] = {}
+    violations: dict[str, list[str]] = {}
+    for scheme in V3_T85_SCHEMES:
+        bad = [f"{scheme}@N{n}：{cell}={rate:.0%}"
+               for n in V3_N_GRID
+               for cell, rate in fp[f"{scheme}@N{n}"].items()
+               if rate > V3_T85_FP_MAX]
+        eligibility[scheme] = not bad
+        violations[scheme] = bad
+
+    # ---- 预写规则 4b：合格方案里选 N=6 夏普 1.0 联合检出率较高者
+    level_key = f"{V3_T85_DECISION_LEVEL:.1f}"
+    at_n6 = {scheme: {setup: det[f"{scheme}@N{V3_T85_DECISION_N}"]
+                      .get(f"{setup}|{level_key}", 0.0)
+                      for setup in setups}
+             for scheme in V3_T85_SCHEMES}
+    eligible = [s for s in V3_T85_SCHEMES if eligibility[s]]
+    if not eligible:
+        raise ValueError(
+            "甲丙两方案都不满足'三个 N 全设置双零假设联合误报 ≤5%'——按预写"
+            "规则须收紧显著性重新标定（不得就地放宽规则）")
+    if len(eligible) == 1:
+        selected, reason = eligible[0], "唯一合格方案"
+    else:
+        a, b = eligible[0], eligible[1]
+        da, db = at_n6[a], at_n6[b]
+        a_ge = all(da[s] >= db[s] for s in setups)
+        a_hi = any(da[s] > db[s] for s in setups)
+        b_ge = all(db[s] >= da[s] for s in setups)
+        b_hi = any(db[s] > da[s] for s in setups)
+        if a_ge and a_hi:
+            selected, reason = a, "N=6 夏普1.0 联合检出逐设置不低于且至少一处严格更高"
+        elif b_ge and b_hi:
+            selected, reason = b, "N=6 夏普1.0 联合检出逐设置不低于且至少一处严格更高"
+        elif min(da.values()) != min(db.values()):
+            winner = a if min(da.values()) > min(db.values()) else b
+            selected = winner
+            reason = "互有高低 → 取最差设置联合检出较高者（预写平局规则）"
+        else:
+            selected, reason = "psr0_bonf", "处处相同 → 选丙（实现更简单）"
+
+    # ---- 预写规则 5：按选中方案 N=6 重判"测不了"（<50%），N=2/N=24 并列
+    unmeasurable = []
+    for setup in setups:
+        for level in levels:
+            cell = f"{setup}|{level:.1f}"
+            rates_by_n = {f"N{n}": det[f"{selected}@N{n}"].get(cell, 0.0)
+                          for n in V3_N_GRID}
+            if rates_by_n[f"N{V3_T85_DECISION_N}"] < V3_T85_LOW_DETECTION:
+                unmeasurable.append({
+                    "category": f"{setup} 夏普{level:.1f}", "setup": setup,
+                    "level": level, "rates": rates_by_n,
+                    "verdict": "现有数据上测不了（N=6 联合检出 <50%）"})
+    return {
+        "n_grid": list(V3_N_GRID),
+        "schemes": dict(V3_T85_SCHEME_LABELS),
+        "joint_false_positive": fp,
+        "joint_detection": det,
+        "eligibility": eligibility,
+        "eligibility_violations": violations,
+        "detection_at_n6_level_1": at_n6,
+        "selected": selected,
+        "selected_label": V3_T85_SCHEME_LABELS[selected],
+        "selection_reason": reason,
+        "unmeasurable": unmeasurable,
+        "rule": ("预写（先于结果，第十三轮 §4.1）：合格=三 N 全设置双零假设"
+                 "联合误报≤5%；合格方案里选 N=6 夏普1.0 联合检出较高者，"
+                 "处处相同选丙；测不了=选中方案 N=6 联合检出<50%，N=2/24 并列"),
+    }
+
+
 def _v3_suite_for_symbols(symbols, timeframe, packs, cfg, seed, *,
                           planted: float | None = None,
                           shuffle_null: str | None = None,
@@ -1532,16 +1681,7 @@ def _v3_suite_for_symbols(symbols, timeframe, packs, cfg, seed, *,
                 "sharpe_by_symbol": {symbols[0]: only["summary"]["sharpe"]},
                 "wf_segments": only["wf_segments"]}
     pooled = pd.concat(oos_parts)
-    primary = {
-        "dsr": vgate.v3_primary_dsr(pooled, n_trials=1, trial_sharpes=None,
-                                    cfg=cfg),
-        "year_block": vgate.v3_primary_year_block(pooled, n_trials=1,
-                                                  cfg=cfg, seed=seed),
-        f"year_block@N{V3_BONFERRONI_SENSITIVITY_N}":
-            vgate.v3_primary_year_block(
-                pooled, n_trials=V3_BONFERRONI_SENSITIVITY_N, cfg=cfg,
-                seed=seed),
-    }
+    primary = v3_primary_suite(pooled, cfg, seed, n_trials=1)
     veto_all = {
         "G0": all(s["checks"]["G0"] for s in per_symbol.values()),
         **{f"veto.{k}": all(s["checks"][f"veto.{k}"]
@@ -1722,15 +1862,7 @@ def run_v3_phase(args, log) -> dict:
                     checks, verdict = only["checks"], only["verdict"]
                 else:
                     pooled = pd.concat(oos_parts)
-                    primary = {
-                        "dsr": vgate.v3_primary_dsr(
-                            pooled, n_trials=1, trial_sharpes=None, cfg=cfg),
-                        "year_block": vgate.v3_primary_year_block(
-                            pooled, n_trials=1, cfg=cfg, seed=seed),
-                        f"year_block@N{V3_BONFERRONI_SENSITIVITY_N}":
-                            vgate.v3_primary_year_block(
-                                pooled, n_trials=V3_BONFERRONI_SENSITIVITY_N,
-                                cfg=cfg, seed=seed)}
+                    primary = v3_primary_suite(pooled, cfg, seed, n_trials=1)
                     veto_all = {
                         "G0": all(s["checks"]["G0"] for s in
                                   out_by_symbol.values()),
@@ -1790,6 +1922,7 @@ def run_v3_phase(args, log) -> dict:
             "nulls": nulls, "primary_schemes": ["dsr", "year_block"],
             "bonferroni_sensitivity_n": V3_BONFERRONI_SENSITIVITY_N,
             "n_trials": 1,
+            "t85_n_grid": list(V3_N_GRID),
             "test_sims": int(test_sims),
             "gates_v3_sha256": gates_v3_sha,
             "initial_capital": float(args.initial_capital),
@@ -1819,13 +1952,15 @@ def run_v3_phase(args, log) -> dict:
 
 def render_v3_report(results: dict) -> str:
     """--phase v3 产物（gate-power-v3.md）：联合误报/检出表（两方案 +
-    Bonferroni 敏感性）+ 分检查率 + 校准 + 口径。"""
+    Bonferroni 敏感性 + T85 N 网格甲/丙）+ 分检查率 + 校准 + 口径。"""
     meta = results.get("meta", {})
     fmt = lambda v: "—" if v is None else f"{float(v) * 100:.0f}%"  # noqa: E731
     cols = ["joint.dsr", "joint.year_block",
             f"joint.year_block@N{V3_BONFERRONI_SENSITIVITY_N}",
             "primary.dsr", "primary.year_block", "G0", "veto.cost_x15",
-            "veto.delay_1_bar", "veto.buyhold_excess"]
+            "veto.delay_1_bar", "veto.buyhold_excess",
+            *[f"joint.{s}@N{n}" for s in ("dsr_v0", "psr0_bonf")
+              for n in V3_N_GRID]]
 
     def table(rows: list[tuple[str, dict[str, float]]], first_header: str
               ) -> list[str]:
@@ -1836,7 +1971,8 @@ def render_v3_report(results: dict) -> str:
                          + " | ".join(fmt(rates.get(c)) for c in cols) + " |")
         return lines
 
-    lines = ["# 关卡 v3 对照实验（gate-power-v3，T65/D34 提案标定）", "",
+    lines = ["# 关卡 v3 对照实验（gate-power-v3，T65/D34 提案标定"
+             " + T85 工作点重跑）", "",
              f"- 序列/设置：{'; '.join(meta.get('setups', []))}",
              f"- 档位（校准后年化夏普）：{meta.get('levels')}；"
              f"种子 {meta.get('seeds')}；零假设 {meta.get('nulls')}",
@@ -1844,6 +1980,9 @@ def render_v3_report(results: dict) -> str:
              "台账选择）/ 乙 年块自助（Bonferroni 同 N；另报 "
              f"N={meta.get('bonferroni_sensitivity_n')} 敏感性档）；自助 "
              f"{meta.get('test_sims')} 次",
+             f"- T85 工作点键：甲 DSR(N,V₀=1/(n−1)) 与丙 PSR(0)≥1−α/N 逐 "
+             f"N∈{meta.get('t85_n_grid', list(V3_N_GRID))} 记录（同一 OOS "
+             "收益；joint.dsr_v0@N* / joint.psr0_bonf@N* 两列）",
              f"- gates-v3 sha256：{str(meta.get('gates_v3_sha256', ''))[:12]}"
              f"；生成：{meta.get('generated_utc', '?')}", "",
              "联合通过率 = 主检验 + 全部否决项（G0 / 成本 ×1.5 / 延迟一根 /"

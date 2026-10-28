@@ -1209,3 +1209,114 @@ def test_v3_run_primary_test_dispatch():
     assert via_yb["test"] == "year_block"
     direct = vg.v3_primary_year_block(rets, n_trials=1, cfg=cfg_b, seed=5)
     assert via_yb["p_value"] == direct["p_value"]
+
+
+def _det_returns(n=6000, per_bar_sr=0.0285, std=0.004, seed=17):
+    """确定性收益：样本均值/标准差精确设定 → 每根 bar 夏普 = per_bar_sr。"""
+    rng = np.random.default_rng(seed)
+    eps = rng.normal(0.0, 1.0, n)
+    eps = (eps - eps.mean()) / eps.std(ddof=1) * std
+    return pd.Series(eps + per_bar_sr * std)
+
+
+def test_v3_primary_dsr_null_variance_v0():
+    """T85/§4.1 方差口径（预写于结果之前）：方案甲 V = V₀ = 1/(n−1)（零假设
+    下每根 bar 夏普估计的抽样方差，n = OOS bar 数），不用台账经验方差。
+
+    - null_variance_trial_sharpes(v) 的 ddof=1 样本方差恰为 v（确定性两点集，
+      与 N 无关——trial_sharpes 在 DSR 里只进方差）；
+    - N=1 时 SR₀=0 → 甲@N=1 与现行 PSR(0) 概率逐位相同（现行 primary.dsr
+      键语义不变的对照锚点）；
+    - N 抬高 → SR₀ 抬高 → 同一收益概率单调不增；
+    - 恒定序列 fail-closed。"""
+    cfg = vg.load_gates(suite="v3")[0]
+    ts = vg.null_variance_trial_sharpes(0.0002)
+    assert float(np.var(ts, ddof=1)) == pytest.approx(0.0002, rel=1e-12)
+    rets = _det_returns()
+    a1 = vg.v3_primary_dsr_null_variance(rets, n_trials=1, cfg=cfg)
+    p0 = vg.v3_primary_dsr(rets, n_trials=1, trial_sharpes=None, cfg=cfg)
+    assert a1["probability"] == pytest.approx(p0["probability"])
+    assert a1["v0"] == pytest.approx(1.0 / (len(rets) - 1))
+    assert a1["test"] == "dsr_v0"
+    probs = [vg.v3_primary_dsr_null_variance(rets, n_trials=n, cfg=cfg)
+             ["probability"] for n in (1, 2, 6, 24)]
+    assert probs == sorted(probs, reverse=True)   # N↑ → SR₀↑ → 概率↓
+    # 零均值噪声 → 任何 N 都不过
+    noise = _det_returns(per_bar_sr=0.0)
+    for n in (1, 6, 24):
+        out = vg.v3_primary_dsr_null_variance(noise, n_trials=n, cfg=cfg)
+        assert out["passed"] is False
+    # 恒定序列（无方差）→ fail-closed 概率 0 + reason
+    flat = vg.v3_primary_dsr_null_variance(pd.Series([0.001] * 50),
+                                           n_trials=6, cfg=cfg)
+    assert flat["passed"] is False and flat["probability"] == 0.0
+    assert flat.get("reason")
+
+
+def test_v3_primary_psr_bonferroni():
+    """T85/§4.1 方案丙（预写于结果之前）：PSR(0) ≥ 1 − α/N（Bonferroni）。
+
+    - 同一 OOS 收益：概率与 N 无关（就是 PSR(0)），阈值随 N 收紧；
+    - 边界样本（PSR≈0.986）N=1/2 过、N=6/24 不过——丙比甲（DSR 先扣
+      SR₀ 再叠 95% 置信）宽，这是两方案差异的机制；
+    - 噪声不过；恒定序列 fail-closed。"""
+    cfg = vg.load_gates(suite="v3")[0]
+    rets = _det_returns()
+    base = vg.v3_primary_dsr(rets, n_trials=1, trial_sharpes=None, cfg=cfg)
+    for n in (1, 2, 6, 24):
+        out = vg.v3_primary_psr_bonferroni(rets, n_trials=n, cfg=cfg)
+        assert out["test"] == "psr0_bonferroni"
+        assert out["threshold"] == pytest.approx(1.0 - cfg.alpha / n)
+        assert out["bonferroni_n"] == n
+        assert out["probability"] == pytest.approx(base["probability"])
+    verdicts = {n: vg.v3_primary_psr_bonferroni(rets, n_trials=n, cfg=cfg)
+                ["passed"] for n in (1, 2, 6, 24)}
+    assert verdicts == {1: True, 2: True, 6: False, 24: False}
+    noise = _det_returns(per_bar_sr=0.0)
+    assert vg.v3_primary_psr_bonferroni(noise, n_trials=1,
+                                        cfg=cfg)["passed"] is False
+    flat = vg.v3_primary_psr_bonferroni(pd.Series([0.001] * 50), n_trials=6,
+                                        cfg=cfg)
+    assert flat["passed"] is False and flat.get("reason")
+
+
+def test_v3_event_branch_config():
+    """T85/§4.2：事件模式分支写进 gates-v3.toml（D35 修改三条全落地）——
+    主检验=随机化参照 p ≤ α/N、随机化次数下限 max(1999, ⌈20N/α⌉)、
+    否决=成本 ×1.5 净均值 > 0、不适用买入持有超额与延迟一根、四项诊断；
+    [v3] 原键语义逐位不变；冻结指纹同步更新。"""
+    cfg, sha = vg.load_gates(suite="v3")
+    assert sha == vg.FROZEN_GATES_V3_SHA256
+    assert cfg.primary_test == "dsr" and cfg.alpha == pytest.approx(0.05)
+    assert cfg.cost_scale_veto == pytest.approx(1.5)
+    assert cfg.delay_bars == 1 and cfg.buyhold_excess_veto is True
+    ev = cfg.event
+    assert ev.primary_test == "randomization"
+    assert ev.draws_min_base == 1999
+    assert ev.draws_per_test_coeff == pytest.approx(20.0)
+    assert ev.buyhold_excess_veto is False      # D35 修改 2：不适用
+    assert ev.delay_bars_veto is False          # D35 修改 2：不适用
+    assert set(ev.diagnostics) == {"year_block_vs_zero", "window_shift_1_bar",
+                                   "segmented_means", "known_gaps"}
+    # 随机化次数下限：max(1999, ⌈20N/α⌉)——p 分辨率足以判到 α/N
+    assert vg.v3_event_draws_min(1, cfg) == 1999
+    assert vg.v3_event_draws_min(2, cfg) == 1999      # ⌈800⌉ < 1999
+    assert vg.v3_event_draws_min(6, cfg) == 2400
+    assert vg.v3_event_draws_min(24, cfg) == 9600
+
+
+def test_v3_event_branch_schema_rejects(tmp_path):
+    """[v3.event] 未知键 / 非法 primary_test / 非法诊断名 → 拒绝加载。"""
+    raw = (Path(vg.DEFAULT_GATES_V3_TOML).read_text(encoding="utf-8")
+           + '\nunknown_event_key = 1\n')
+    p = tmp_path / "gates-v3-bad.toml"
+    p.write_text(raw, encoding="utf-8")
+    with pytest.raises(vg.GatesConfigError, match="v3.event"):
+        vg.load_gates(p, frozen_sha=vg.gates_sha256(p), suite="v3")
+    bad_test = (Path(vg.DEFAULT_GATES_V3_TOML).read_text(encoding="utf-8")
+                .replace('primary_test = "randomization"',
+                         'primary_test = "year_block"'))
+    p2 = tmp_path / "gates-v3-bad2.toml"
+    p2.write_text(bad_test, encoding="utf-8")
+    with pytest.raises(vg.GatesConfigError, match="randomization"):
+        vg.load_gates(p2, frozen_sha=vg.gates_sha256(p2), suite="v3")

@@ -1468,7 +1468,13 @@ def test_v3_joint_pass_recomputed_from_checks(gc):
                            "primary.year_block": yb,
                            "primary.year_block@N40": yb,
                            "veto.cost_x15": cost, "veto.delay_1_bar": delay,
-                           "veto.buyhold_excess": True}}
+                           "veto.buyhold_excess": True,
+                           # T85 N 网格键（联合重算要求逐条在场；本测试只
+                           # 断言现行键的率，新键布尔取与 primary.dsr 同值）
+                           **{f"primary.dsr_v0@N{n}": dsr
+                              for n in gc.V3_N_GRID},
+                           **{f"primary.psr0_bonf@N{n}": dsr
+                              for n in gc.V3_N_GRID}}}
     runs = [rec(True, True, True, True), rec(True, False, True, True),
             rec(False, True, True, False), rec(True, True, False, True)]
     rates = gc.v3_joint_rates(runs)
@@ -1491,7 +1497,10 @@ def test_merge_v3_recomputes_joint_from_records(tmp_path, monkeypatch):
         return {"G0": True, "primary.dsr": dsr, "primary.year_block": yb,
                 "primary.year_block@N40": yb, "veto.cost_x15": cost,
                 "veto.delay_1_bar": True, "veto.buyhold_excess": True,
-                "diag.param_plateau": True}
+                "diag.param_plateau": True,
+                # T85 N 网格键（新记录模式；布尔随 dsr——本测试断言现行键）
+                **{f"primary.dsr_v0@N{n}": dsr for n in (2, 6, 24)},
+                **{f"primary.psr0_bonf@N{n}": dsr for n in (2, 6, 24)}}
 
     def shard(dirname, seeds_from, seeds, joint_lied, cost_last):
         runs = [{"setup": "TST H1", "null": "day", "seed": s,
@@ -1575,3 +1584,120 @@ def test_cli_v3_quick_end_to_end(gc, monkeypatch, tmp_path):
                 "veto.buyhold_excess"} <= set(run["checks"])
     md = (out_dir / "gate-power-v3.md").read_text(encoding="utf-8")
     assert "联合" in md
+
+
+# ================================================ T85：工作点补充标定（K1/K2）
+def test_v3_primary_suite_records_n_grid(gc):
+    """T85 失败测试：v3 主检验组逐条记录 N∈{2,6,24} 的方案甲
+    （DSR(N, V₀=1/(n−1))）与方案丙（PSR(0) ≥ 1−α/N）；现行键
+    （primary.dsr / primary.year_block / @N40）语义不变。"""
+    cfg = _v3_cfg(gc)
+    hours = pd.date_range("2016-01-01", periods=6000, freq="6h")
+    rng = np.random.default_rng(21)
+    rets = pd.Series(0.0004 + rng.normal(0.0, 0.004, 6000),
+                     index=pd.DatetimeIndex(hours))
+    primary = gc.v3_primary_suite(rets, cfg=cfg, seed=5)
+    assert "dsr" in primary and "year_block" in primary \
+        and "year_block@N40" in primary               # 现行键不变
+    for n in gc.V3_N_GRID:
+        assert n in (2, 6, 24)
+        a = primary[f"dsr_v0@N{n}"]
+        c = primary[f"psr0_bonf@N{n}"]
+        assert a["test"] == "dsr_v0" and a["n_trials"] == n
+        assert a["v0"] == pytest.approx(1.0 / (len(rets) - 1))
+        assert c["test"] == "psr0_bonferroni" and c["bonferroni_n"] == n
+        assert c["threshold"] == pytest.approx(1.0 - cfg.alpha / n)
+    # 甲：N 抬高 → SR₀ 抬高 → 概率单调不增；丙：概率与 N 无关（同一 PSR(0)）
+    a_probs = [primary[f"dsr_v0@N{n}"]["probability"] for n in gc.V3_N_GRID]
+    assert a_probs == sorted(a_probs, reverse=True)
+    c_probs = {primary[f"psr0_bonf@N{n}"]["probability"] for n in gc.V3_N_GRID}
+    assert len(c_probs) == 1
+    # 联合通过率对新增键逐条重算；缺键拒绝（两方案必须逐条记录）
+    checks = {"G0": True, "primary.dsr": True, "primary.year_block": True,
+              "primary.year_block@N40": True, "veto.cost_x15": True,
+              "veto.delay_1_bar": True, "veto.buyhold_excess": True,
+              **{f"primary.dsr_v0@N{n}": True for n in gc.V3_N_GRID},
+              **{f"primary.psr0_bonf@N{n}": False for n in gc.V3_N_GRID}}
+    rates = gc.v3_joint_rates([{"checks": dict(checks)}])
+    assert rates["joint.dsr_v0@N6"] == pytest.approx(1.0)
+    assert rates["joint.psr0_bonf@N6"] == pytest.approx(0.0)
+    with pytest.raises(KeyError):
+        gc.v3_joint_pass({k: v for k, v in checks.items()
+                          if k != "primary.psr0_bonf@N24"},
+                         "psr0_bonf@N24")
+
+
+_T85_SETUPS = ("XAUUSD H1", "XAUUSD H4", "MERGED:XAUUSD+USTEC H1")
+
+
+def _t85_synthetic_results(*, fp_bing=0.0, det_jia=(0.6, 0.6, 0.3),
+                           det_bing=(0.8, 0.7, 0.4)):
+    """合成 v3 产物（3 设置 × 2 零假设 × 10 种子；档位 0.5/1.0）：否决层
+    全过，主检验布尔编码目标率——甲@N6 检出 det_jia、丙@N6 det_bing
+    （两档位同率）；丙联合误报 fp_bing（甲恒 0）；N=2 同 N=6，N=24 各再
+    收一档（测试只断言 N=6 与合格性，其余档只为凑齐键）。"""
+    def checks(j_by_n, b_by_n):
+        grid = {f"primary.dsr_v0@N{n}": j_by_n[n] for n in (2, 6, 24)}
+        grid.update({f"primary.psr0_bonf@N{n}": b_by_n[n] for n in (2, 6, 24)})
+        return {"G0": True, "primary.dsr": True, "primary.year_block": True,
+                "primary.year_block@N40": True, "veto.cost_x15": True,
+                "veto.delay_1_bar": True, "veto.buyhold_excess": True,
+                **grid}
+
+    neg, pos = [], []
+    for si, setup in enumerate(_T85_SETUPS):
+        for null in ("slot", "day"):
+            for s in range(10):
+                bing = s < round(fp_bing * 10)
+                neg.append({"setup": setup, "null": null, "seed": s,
+                            "checks": checks(
+                                {n: False for n in (2, 6, 24)},
+                                {n: bing for n in (2, 6, 24)})})
+        for level in (0.5, 1.0):
+            for s in range(10):
+                j6 = s < round(det_jia[si] * 10)
+                b6 = s < round(det_bing[si] * 10)
+                pos.append({"setup": setup, "level": level, "seed": s,
+                            "checks": checks(
+                                {2: j6, 6: j6,
+                                 24: j6 and s < max(0, round(det_jia[si] * 5))},
+                                {2: b6, 6: b6,
+                                 24: b6 and s < max(0, round(det_bing[si] * 10)
+                                                    - 1)})})
+    return {"meta": {"phase": "v3", "levels": [0.5, 1.0], "seeds": 10},
+            "negative": {"runs": neg}, "positive": {"runs": pos}}
+
+
+def test_v3_t85_selection_rule(gc):
+    """T85 失败测试：预写选择规则（先于结果，不得按结果调整）——
+    1) 合格 = 三个 N、全部设置、两种零假设下联合误报都 ≤5%；
+    2) 合格方案里选 N=6 时夏普 1.0 联合检出率较高者（逐设置：不低于且
+       至少一处严格更高者胜）；处处相同选丙；
+    3) 按选中方案在 N=6 重判"测不了"（<50%），N=2/N=24 并列报告。"""
+    out = gc.v3_t85_operating_point(_t85_synthetic_results())
+    assert out["eligibility"] == {"dsr_v0": True, "psr0_bonf": True}
+    assert out["selected"] == "psr0_bonf"
+    assert out["detection_at_n6_level_1"]["dsr_v0"] == \
+        pytest.approx({"XAUUSD H1": 0.6, "XAUUSD H4": 0.6,
+                       "MERGED:XAUUSD+USTEC H1": 0.3})
+    assert out["detection_at_n6_level_1"]["psr0_bonf"] == \
+        pytest.approx({"XAUUSD H1": 0.8, "XAUUSD H4": 0.7,
+                       "MERGED:XAUUSD+USTEC H1": 0.4})
+    by_cat = {row["category"]: row for row in out["unmeasurable"]}
+    assert "MERGED:XAUUSD+USTEC H1 夏普1.0" in by_cat       # 0.4 < 0.5
+    row = by_cat["MERGED:XAUUSD+USTEC H1 夏普1.0"]
+    assert row["rates"]["N6"] == pytest.approx(0.4)
+    assert set(row["rates"]) == {"N2", "N6", "N24"}         # 并列报告
+    assert "XAUUSD H1 夏普1.0" not in by_cat                # 0.8 ≥ 0.5 可测
+    # 处处相同 → 选丙（实现更简单）
+    tie = gc.v3_t85_operating_point(_t85_synthetic_results(
+        det_jia=(0.8, 0.7, 0.4), det_bing=(0.8, 0.7, 0.4)))
+    assert tie["selected"] == "psr0_bonf"
+    # 甲逐设置不低于且至少一处严格更高 → 选甲
+    jia_wins = gc.v3_t85_operating_point(_t85_synthetic_results(
+        det_jia=(0.9, 0.8, 0.5), det_bing=(0.8, 0.7, 0.4)))
+    assert jia_wins["selected"] == "dsr_v0"
+    # 丙任一 N 档联合误报 >5% → 丙不合格，只剩甲
+    fp_case = gc.v3_t85_operating_point(_t85_synthetic_results(fp_bing=0.1))
+    assert fp_case["eligibility"] == {"dsr_v0": True, "psr0_bonf": False}
+    assert fp_case["selected"] == "dsr_v0"

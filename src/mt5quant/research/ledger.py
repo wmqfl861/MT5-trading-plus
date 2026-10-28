@@ -116,6 +116,10 @@ research 的运行（排除 calibration/ops/migration——标定与运维不是
 试验；H 线与 P 线合并计算）。n_dedup / family_n_dedup / project_n_dedup
 的现行语义冻结不变（G4 缺省 family 口径逐位一致），研究口径只作为新增
 键与 dsr_trial_scope=project 时的取数来源。
+T85（第十三轮 §4.1）新增关卡 v3 主检验的 N 口径：project_n_dedup_rounds
+（run_class=research 且 round_id 非空，全项目、跨轮累计）+ lineage_n_dedup
+(候选 continues_family 指向的历史谱系，只计轮次外)——主检验 N = 两者之和
+（primary_test_n）；轮次制之前的其余历史只报告、不进门槛。
 """
 from __future__ import annotations
 
@@ -1289,14 +1293,18 @@ class Ledger:
             " ORDER BY run_id LIMIT 1", (card_id, version)).fetchone()
         return None if row is None else str(row["strategy_sha"])
 
-    def _dedup_n(self, rows: list, *, only_research: bool = False) -> int:
+    def _dedup_n(self, rows: list, *, only_research: bool = False,
+                 rounds: str | None = None) -> int:
         """按 (strategy, params, symbol, timeframe, data_sha256,
         cost_model_version, strategy_sha) 对成功运行去重计数（params 键序
         无关；T37：指纹进键——改代码重跑即新试验；run_class=migration 的
         迁移行不是试验，不计入——与旧行为 actor=migration 等价）。
         only_research=True（T64/D33）：只计 run_class=research（排除
         calibration/ops/migration——标定与运维不是研究试验）；行缺
-        run_class 键时按 actor 推断（迁移前旧数据）。"""
+        run_class 键时按 actor 推断（迁移前旧数据）。
+        rounds（T85/第十三轮 §4.1，N 口径）："in" = 只计 round_id 非空
+        （轮次内试验）；"out" = 只计 round_id 空（轮次制之前/之外）；
+        None = 不过滤（现行语义逐位不变）。"""
         keys = set()
         for r in rows:
             rc = r["run_class"] if "run_class" in r.keys() else None
@@ -1306,6 +1314,11 @@ class Ledger:
                 continue
             if only_research and rc != "research":
                 continue
+            if rounds is not None:
+                rid = r["round_id"] if "round_id" in r.keys() else None
+                in_round = bool(rid)
+                if (rounds == "in") != in_round:
+                    continue
             if not json.loads(r["metrics_json"]).get("ok"):
                 continue
             params = json.loads(r["params_json"])
@@ -1314,6 +1327,57 @@ class Ledger:
                       r["symbol"], r["timeframe"], r["data_sha256"],
                       r["cost_model_version"], r["strategy_sha"]))
         return len(keys)
+
+    _RUN_COLS_FOR_STATS = (
+        "card_id, metrics_json, strategy, params_json, symbol,"
+        " timeframe, data_sha256, strategy_sha, cost_model_version,"
+        " created_utc, actor, run_class, round_id")
+
+    def lineage_n_dedup(self, family: str) -> int:
+        """候选所延续**历史谱系**的去重研究试验数（T85/第十三轮 §4.1）：
+        该谱系（cards.family_of）run_class=research 且 round_id 空——即
+        轮次制之前/之外的谱系历史——的七元组去重计数。轮次内的试验已由
+        stats() 的 project_n_dedup_rounds 全项目计入，这里不重复计。
+        全新机制（不延续任何谱系）为 0（调用方对 continues_family 空串
+        不调本函数或忽略返回）。"""
+        family = str(family).strip()
+        if not family:
+            return 0
+        rows = self.conn.execute(
+            f"SELECT {self._RUN_COLS_FOR_STATS} FROM runs").fetchall()
+        fam_rows = [r for r in rows if family_of(r["card_id"]) == family]
+        return self._dedup_n(fam_rows, only_research=True, rounds="out")
+
+    def primary_test_n(self, continues_family: str = "") -> dict:
+        """关卡 v3 主检验 N（T85/第十三轮 §4.1 修订 D33，预写规则）：
+
+        N = project_n_dedup_rounds（全项目已开启轮次内的去重研究试验，
+        跨轮累计）+ lineage_n_dedup（候选所延续谱系的轮次外历史去重研究
+        试验；continues_family 空 = 全新机制 → 0）。
+
+        轮次制之前的**其余**历史（不在延续谱系里的轮次外研究试验）照常
+        统计、只在本返回值列出（pre_round_other_n_dedup），**不进主检验
+        的门槛**——新候选来自文献与预注册，不是从那些历史运行里挑出来的
+        （四百多次无关试验计入则任何策略都过不了，关卡不提供信息）。"""
+        rows = self.conn.execute(
+            f"SELECT {self._RUN_COLS_FOR_STATS} FROM runs").fetchall()
+        family = str(continues_family or "").strip()
+        rounds_n = self._dedup_n(rows, only_research=True, rounds="in")
+        lineage_n = self.lineage_n_dedup(family)
+        other_rows = [
+            r for r in rows
+            if not (r["round_id"] if "round_id" in r.keys() else None)
+            and (not family or family_of(r["card_id"]) != family)]
+        return {
+            "n": int(rounds_n + lineage_n),
+            "continues_family": family,
+            "project_n_dedup_rounds": int(rounds_n),
+            "lineage_n_dedup": int(lineage_n),
+            "pre_round_other_n_dedup": int(self._dedup_n(
+                other_rows, only_research=True)),
+            "note": ("主检验 N = 轮次内（跨轮累计）+ 延续谱系的轮次外历史；"
+                     "pre_round_other_n_dedup 只报告不进门槛（T85/§4.1）"),
+        }
 
     def stats(self, card_id: str | None = None) -> dict:
         """运行计数（供 DSR 的试验次数与 `bt ledger stats`）。
@@ -1332,12 +1396,15 @@ class Ledger:
           H 线与 P 线合并计算），dsr_trial_scope=project 时 G4 的取数
           来源。现行 n_dedup / family_n_dedup / project_n_dedup 的语义
           冻结不变（缺省 family 口径逐位一致）。
+        - project_n_dedup_rounds（T85/第十三轮 §4.1）：全项目 run_class=
+          research 且 round_id 非空的去重 N——已开启轮次内的研究试验
+          （跨轮累计），关卡 v3 主检验 N 的第一成分（N = 它 +
+          lineage_n_dedup(候选的 continues_family)，见 primary_test_n）。
+          轮次制之前的其余历史不进门槛、只经 primary_test_n 列出。
         迁移行（run_class=migration）计入 total_runs（可审计）、不计入 N。
         """
         all_rows = self.conn.execute(
-            "SELECT card_id, metrics_json, strategy, params_json, symbol,"
-            " timeframe, data_sha256, strategy_sha, cost_model_version,"
-            " created_utc, actor, run_class FROM runs").fetchall()
+            f"SELECT {self._RUN_COLS_FOR_STATS} FROM runs").fetchall()
         sel = ([r for r in all_rows if r["card_id"] == card_id]
                if card_id else list(all_rows))
         by_card: dict = {}
@@ -1360,6 +1427,8 @@ class Ledger:
             "project_n_dedup": project_n,
             "project_n_dedup_research": self._dedup_n(
                 all_rows, only_research=True),
+            "project_n_dedup_rounds": self._dedup_n(
+                all_rows, only_research=True, rounds="in"),
         }
         if sel:
             times = sorted(r["created_utc"] for r in sel)

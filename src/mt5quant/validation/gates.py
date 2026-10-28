@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,8 +36,9 @@ FROZEN_GATES_SHA256 = "68f49237d1b56df62691ab8516804349fce245e1dc3cdb8896bf03716
 DEFAULT_GATES_V3_TOML = (Path(__file__).resolve().parents[3] / "config"
                          / "gates-v3.toml")
 # 冻结指纹（2026-10-28，T65 提案冻结：[v3] 主检验两方案 + 三否决 +
-# [g4].dsr_trial_scope = "project"）
-FROZEN_GATES_V3_SHA256 = "6de391d57abe461d42db03972c9440fa43a02469be6046a3daaa74ba49d5f017"
+# [g4].dsr_trial_scope = "project"；T85 同日增补 [v3.event] 事件模式分支
+# ——D35 修改三条，冻结指纹随之更新）
+FROZEN_GATES_V3_SHA256 = "6fa560a0ce784739a6898d1b4215cba36e91dc3fae5ed21865227f45a14b572f"
 
 GATE_ORDER = ("G0", "G1", "G2", "G3", "G4", "G5")
 
@@ -120,11 +122,34 @@ class GatesConfig:
 
 
 @dataclass(frozen=True)
+class GatesV3EventConfig:
+    """关卡 v3 事件模式分支（config/gates-v3.toml 的 [v3.event]，T85 写入
+    D35 修改三条——T86 接线生效）。bar 级 [v3] 节的 alpha / cost_scale_veto
+    复用不另设（同一 α、同一 ×1.5），本节只放事件模式特有键。"""
+
+    primary_test: str = "randomization"   # 主检验：随机化参照（漂移稳健）
+    # 随机化次数下限：max(draws_min_base, ⌈draws_per_test_coeff × N / α⌉)
+    # ——保证 p 值分辨率足以判到 α/N（D35 修改 1；α 取 [v3].alpha）
+    draws_min_base: int = 1999
+    draws_per_test_coeff: float = 20.0
+    delay_bars_veto: bool = False         # D35 修改 2：事件模式不适用"延迟一根"
+    buyhold_excess_veto: bool = False     # D35 修改 2：不适用"买入持有超额"
+    # D35 修改 3：诊断四项（只报告）
+    diagnostics: tuple[str, ...] = (
+        "year_block_vs_zero",     # 年块自助对 0 的检验
+        "window_shift_1_bar",     # 事件窗前后各移一根 bar 的结果
+        "segmented_means",        # 按 10 年或文献制度变化点分段均值
+        "known_gaps",             # 已知缺口注记
+    )
+
+
+@dataclass(frozen=True)
 class GatesV3Config(GatesConfig):
     """关卡 v3 提案配置（config/gates-v3.toml，T65/D34——**不生效**，只在
     load_gates(suite="v3") 时加载）。[g1]–[g5] 字段沿用 GatesConfig（[g1]
     与 [g3].min_oos_ratio、[g4].mc_drawdown_* 在 v3 归诊断层；[g5] 不变；
-    [g3] 窗口是主检验的数据源），新增 [v3] 节四个主检验/否决键。"""
+    [g3] 窗口是主检验的数据源），新增 [v3] 节四个主检验/否决键与
+    [v3.event] 事件模式分支（T85/D35）。"""
 
     # [v3]（蓝图 v4 附录 B"关卡 v3 提案框架"）
     primary_test: str = "dsr"        # 方案甲 dsr | 方案乙 year_block
@@ -133,6 +158,8 @@ class GatesV3Config(GatesConfig):
     cost_scale_veto: float = 1.5     # 否决：成本 ×1.5 期望仍 > 0
     delay_bars: int = 1              # 否决：延迟一根 bar 净利仍 > 0
     buyhold_excess_veto: bool = True  # 否决：纯多头策略超额（vs 买入持有）> 0
+    # [v3.event]（T85/D35 修改）：事件模式分支（T86 接线）
+    event: GatesV3EventConfig = GatesV3EventConfig()
 
 
 _SCHEMA: dict[str, dict[str, type]] = {
@@ -169,6 +196,19 @@ _V3_SCHEMA: dict[str, dict[str, type]] = {
            "cost_scale_veto": float, "delay_bars": int,
            "buyhold_excess_veto": bool}}
 V3_PRIMARY_TESTS = ("dsr", "year_block")
+
+# [v3.event]（T85/D35 修改）：事件模式分支——主检验=随机化参照 p ≤ α/N
+# （N 口径同 [v3] 主检验：project_n_dedup_rounds + lineage_n_dedup）、
+# 随机化次数下限 max(1999, ⌈20N/α⌉)、否决=成本 ×1.5 净均值 > 0、
+# 不适用"买入持有超额"与"延迟一根"两项 bar 级否决、诊断四项（只报告）。
+# alpha / cost_scale_veto 复用 [v3] 节（同一值，不另设第二来源）。
+_V3_EVENT_SCHEMA: dict[str, dict[str, type]] = {
+    "v3.event": {"primary_test": str, "draws_min_base": int,
+                 "draws_per_test_coeff": float, "delay_bars_veto": bool,
+                 "buyhold_excess_veto": bool}}
+_V3_EVENT_PRIMARY_TESTS = ("randomization",)
+_V3_EVENT_DIAGNOSTICS = ("year_block_vs_zero", "window_shift_1_bar",
+                         "segmented_means", "known_gaps")
 
 
 def gates_sha256(path) -> str:
@@ -227,8 +267,9 @@ def _parse(data: dict, source: str) -> GatesConfig:
 
 
 def _parse_v3(data: dict, source: str) -> GatesV3Config:
-    """suite="v3" 的解析：[g1]–[g5] 复用 _parse（[v3] 节先剥离），再校验
-    [v3] 节与 version=3。"""
+    """suite="v3" 的解析：[g1]–[g5] 复用 _parse（[v3]/[v3.event] 节先
+    剥离），再校验 [v3] 节、[v3.event] 事件模式分支（T85/D35）与
+    version=3。"""
     if data.get("version") != 3:
         raise GatesConfigError(
             f"{source}：version 必须是 3（关卡 v3 提案文件），收到 "
@@ -236,6 +277,7 @@ def _parse_v3(data: dict, source: str) -> GatesV3Config:
     raw = data.get("v3")
     if not isinstance(raw, dict):
         raise GatesConfigError(f"{source}：[v3] 必须是表（主检验/否决键）")
+    raw_event = raw.pop("event", None)          # [v3.event]（T85）单独校验
     fields = _V3_SCHEMA["v3"]
     unknown = sorted(set(raw) - set(fields))
     if unknown:
@@ -273,7 +315,62 @@ def _parse_v3(data: dict, source: str) -> GatesV3Config:
             f"{source}：[v3].delay_bars 须 ≥1（蓝图：延迟一根），收到 "
             f"{v3['delay_bars']!r}")
     return GatesV3Config(
-        **{f: getattr(base, f) for f in base.__dataclass_fields__}, **v3)
+        **{f: getattr(base, f) for f in base.__dataclass_fields__},
+        **v3, event=_parse_v3_event(raw_event, v3, source))
+
+
+def _parse_v3_event(raw_event, v3: dict, source: str) -> GatesV3EventConfig:
+    """[v3.event]（T85/D35）解析：键类型 + primary_test 枚举 + 诊断名
+    枚举；diagnostics 是字符串数组（每个 ∈ 四项枚举，去重）。"""
+    if not isinstance(raw_event, dict):
+        raise GatesConfigError(
+            f"{source}：[v3.event] 必须是表（事件模式分支，T85/D35）——"
+            "缺表不可装载")
+    fields = _V3_EVENT_SCHEMA["v3.event"]
+    unknown = sorted(set(raw_event) - set(fields) - {"diagnostics"})
+    if unknown:
+        raise GatesConfigError(
+            f"{source}：[v3.event] 有未知键 {unknown}，合法键 "
+            f"{list(fields) + ['diagnostics']}")
+    ev: dict = {}
+    for key, typ in fields.items():
+        if key not in raw_event:
+            raise GatesConfigError(f"{source}：[v3.event] 缺键 {key}")
+        v = raw_event[key]
+        if isinstance(v, bool) is not (typ is bool) \
+                or (typ is not bool and (isinstance(v, bool)
+                                         or not isinstance(v, typ))):
+            raise GatesConfigError(
+                f"{source}：[v3.event].{key} 必须是 {typ.__name__}，"
+                f"收到 {v!r}")
+        ev[key] = v
+    if ev["primary_test"] not in _V3_EVENT_PRIMARY_TESTS:
+        raise GatesConfigError(
+            f"{source}：[v3.event].primary_test 只能是 "
+            f"{list(_V3_EVENT_PRIMARY_TESTS)}（D35 修改 1：随机化参照，"
+            f"对资产漂移稳健），收到 {ev['primary_test']!r}")
+    if int(ev["draws_min_base"]) < 2:
+        raise GatesConfigError(
+            f"{source}：[v3.event].draws_min_base 须 ≥2，收到 "
+            f"{ev['draws_min_base']!r}")
+    if float(ev["draws_per_test_coeff"]) <= 0.0:
+        raise GatesConfigError(
+            f"{source}：[v3.event].draws_per_test_coeff 须为正（下限公式 "
+            f"max(base, ⌈coeff×N/α⌉)），收到 "
+            f"{ev['draws_per_test_coeff']!r}")
+    diags_raw = raw_event.get("diagnostics", list(_V3_EVENT_DIAGNOSTICS))
+    if (not isinstance(diags_raw, list)
+            or not all(isinstance(d, str) and d.strip() for d in diags_raw)):
+        raise GatesConfigError(
+            f"{source}：[v3.event].diagnostics 必须是字符串数组"
+            f"（D35 修改 3 的四项诊断，只报告），收到 {diags_raw!r}")
+    bad = sorted(set(diags_raw) - set(_V3_EVENT_DIAGNOSTICS))
+    if bad:
+        raise GatesConfigError(
+            f"{source}：[v3.event].diagnostics 含未知项 {bad}，合法项 "
+            f"{list(_V3_EVENT_DIAGNOSTICS)}")
+    ev["diagnostics"] = tuple(diags_raw)
+    return GatesV3EventConfig(**ev)
 
 
 def load_gates(path=None, *, frozen_sha: str | None = None,
@@ -451,6 +548,85 @@ def v3_primary_dsr(oos_returns, *, n_trials: int, trial_sharpes,
         "test": "dsr",
         **({"reason": reason} if reason else {}),
     }
+
+
+def null_variance_trial_sharpes(variance: float) -> list[float]:
+    """V₀ 的确定性两点表示 [a, −a]（ddof=1 样本方差 = 2a² = variance）。
+
+    DSR 的 trial_sharpes 只通过其样本方差进入检验（SR₀ =
+    expected_max_sharpe(N, V)），两点集把"给定方差"表示成确定值——与 N
+    无关、可逐位复现（第十三轮审核探针同法）。T85/§4.1 方差口径：方案甲
+    的 V 取零假设抽样方差 V₀ = 1/(n−1)（n = 样本外 bar 数），台账里试验
+    夏普的经验方差只作诊断。
+    """
+    if variance <= 0.0 or not math.isfinite(variance):
+        raise ValueError(f"variance 必须为正有限值，收到 {variance!r}")
+    a = math.sqrt(variance / 2.0)
+    return [a, -a]
+
+
+def v3_primary_dsr_null_variance(oos_returns, *, n_trials: int,
+                                 cfg: GatesV3Config) -> dict:
+    """主检验方案甲（T85 工作点口径）：DSR(N, V₀) ≥ 0.95，V₀ = 1/(n−1)
+    为零假设下每根 bar 夏普估计的抽样方差（n = OOS bar 数）——同一 OOS
+    收益，N 为项目级口径（T85：project_n_dedup_rounds + lineage）。
+
+    N=1 时 SR₀=0，概率与 v3_primary_dsr(n_trials=1, trial_sharpes=None)
+    逐位相同（现行 primary.dsr 键的语义对照锚点）。OOS 无方差/观测不足 →
+    fail-closed（概率 0 + reason）。
+    """
+    arr = np.asarray(pd.Series(oos_returns).dropna(), dtype="float64")
+    n = int(arr.size)
+    if n < 3:
+        return {"passed": False, "probability": 0.0, "min":
+                float(cfg.dsr_min_probability), "n_trials": int(n_trials),
+                "trial_scope": str(cfg.dsr_trial_scope), "test": "dsr_v0",
+                "v0": None,
+                "reason": f"OOS 观测不足（{n} < 3），V₀=1/(n−1) 无定义"}
+    v0 = 1.0 / (n - 1.0)
+    out = v3_primary_dsr(oos_returns, n_trials=n_trials,
+                         trial_sharpes=null_variance_trial_sharpes(v0),
+                         cfg=cfg)
+    return {**out, "test": "dsr_v0", "v0": v0,
+            "n_oos_bars": n}
+
+
+def v3_primary_psr_bonferroni(oos_returns, *, n_trials: int,
+                              cfg: GatesV3Config) -> dict:
+    """主检验方案丙（T85/第十三轮 §4.1）：PSR(0) ≥ 1 − α/N（Bonferroni）。
+
+    同一 OOS 收益：概率就是 PSR(0)（DSR 取 N=1、SR₀=0），与 N 无关；
+    阈值 1 − α/N 随 N 收紧。OOS 无方差/观测不足 → fail-closed。"""
+    n = max(1, int(n_trials))
+    threshold = 1.0 - float(cfg.alpha) / n
+    try:
+        probability = vstats.deflated_sharpe_probability(
+            oos_returns, n_trials=1, trial_sharpes=None)
+        reason = None
+    except ValueError as e:
+        probability, reason = 0.0, str(e)
+    return {
+        "passed": bool(probability >= threshold),
+        "probability": float(probability),
+        "threshold": threshold,
+        "alpha": float(cfg.alpha),
+        "bonferroni_n": n,
+        "n_trials": n,
+        "trial_scope": str(cfg.dsr_trial_scope),
+        "test": "psr0_bonferroni",
+        **({"reason": reason} if reason else {}),
+    }
+
+
+def v3_event_draws_min(n_tests: int, cfg: GatesV3Config) -> int:
+    """事件模式随机化次数下限（D35 修改 1/T85）：
+    max(draws_min_base, ⌈draws_per_test_coeff × N / α⌉)——α 取 [v3].alpha。
+    保证 p 值分辨率（≥1/次数）足以判到 α/N。"""
+    n = max(1, int(n_tests))
+    ev = cfg.event
+    return max(int(ev.draws_min_base),
+               math.ceil(float(ev.draws_per_test_coeff) * n
+                         / float(cfg.alpha)))
 
 
 def v3_primary_year_block(oos_returns, *, n_trials: int,

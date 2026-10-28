@@ -25,6 +25,31 @@ delay_bars = 1                          # 信号延迟一根 bar 执行净利仍
 buyhold_excess_veto = true              # 纯多头策略夏普须高于同期买入持有
                                         # （非纯多头不适用，不否决）
 
+[v3.event]                              # 事件模式分支（D35 修改三条，T85 写入；
+                                        # T86 接线生效）。评估单位=事件窗，alpha
+                                        # 与成本 ×1.5 复用 [v3] 节同一值（不设第
+                                        # 二来源）。bar 级的"延迟一根"与"纯多头
+                                        # 相对买入持有超额"两项否决对按时钟定义
+                                        # 的事件窗不适用（第十三轮 K2：延迟一根
+                                        # 落到定盘后反转段、真实月末效应的夏普通
+                                        # 常低于全程持有——两项都会误杀）。
+primary_test = "randomization"          # 主检验：随机化参照（对资产漂移稳健、
+                                        # 误报率不依赖年块数——D35 修改 1），
+                                        # 单侧 p ≤ alpha/N（N 口径同 [v3] 主检验：
+                                        # project_n_dedup_rounds + lineage）
+draws_min_base = 1999                   # 随机化次数下限基数项；总下限 =
+                                        # max(1999, ⌈20N/alpha⌉)
+draws_per_test_coeff = 20.0             # 下限公式的 N/alpha 系数——保证 p 值
+                                        # 分辨率足以判到 alpha/N
+delay_bars_veto = false                 # D35 修改 2：事件模式不适用"延迟一根"
+buyhold_excess_veto = false             # D35 修改 2：事件模式不适用"买入持有超额"
+diagnostics = [                         # D35 修改 3：诊断四项（只报告，不否决）
+  "year_block_vs_zero",                 # 年块自助对 0 的检验
+  "window_shift_1_bar",                 # 事件窗前后各移一根 bar 的结果
+  "segmented_means",                    # 按 10 年或文献制度变化点分段均值
+  "known_gaps",                         # 已知缺口的注记
+]
+
 [g1]                                   # 样本内线（v3：诊断层，只报告）
 trade_count_min_intraday = 300
 trade_count_min_hourly = 150

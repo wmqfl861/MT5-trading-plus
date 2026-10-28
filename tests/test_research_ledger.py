@@ -31,7 +31,7 @@ def load_anchor():
 
 
 def record(led: Ledger, run_n=1, *, card_id="H001", error=None,
-           created_utc=None, symbol="XAUUSD"):
+           created_utc=None, symbol="XAUUSD", round_id=None, actor="test"):
     return led.record_run(
         card_id=card_id, card_version=1,
         strategy="mt5quant.strategies.library.buy_hold:BuyHold",
@@ -40,7 +40,8 @@ def record(led: Ledger, run_n=1, *, card_id="H001", error=None,
         data_sha256="deadbeef" * 8, engine_version="A-1.1",
         cost_model_version="zero-v0", gates_hash="",
         metrics=None if error else {"net_profit": 123.4, "trade_count": 1},
-        error=error, actor="test", created_utc=created_utc)
+        error=error, actor=actor, created_utc=created_utc,
+        round_id=round_id)
 
 
 def rows(led: Ledger, table: str):
@@ -1168,6 +1169,75 @@ def test_stats_project_n_dedup_research(tmp_path):
     st2 = led.stats("H202")
     assert st2["family_n_dedup"] == 11            # 10 研究 + 1 运维
     assert st2["project_n_dedup_research"] == 20
+    led.close()
+
+
+def test_stats_project_n_dedup_rounds(tmp_path):
+    """T85/K1 失败测试（N 口径·轮次成分，预写规则第十三轮 §4.1）：
+    project_n_dedup_rounds = 全项目 run_class=research 且 round_id 非空的
+    七元组去重数——跨轮累计、同键跨轮只计一次；轮次外研究 / 轮次内标定 /
+    失败运行不计；现行键（project_n_dedup / project_n_dedup_research /
+    family_n_dedup / n_dedup）语义逐位不变。"""
+    led = Ledger(tmp_path / "l.sqlite")
+    t = datetime(2026, 10, 20, tzinfo=timezone.utc)
+    # H301：R1 内 3 次去重研究试验；R2 内 1 次重复 R1 的键 + 1 次新键
+    for i in (1, 2, 3):
+        record(led, run_n=i, card_id="H301", created_utc=t, round_id="R1")
+    record(led, run_n=1, card_id="H301", created_utc=t, round_id="R2")   # 跨轮同键
+    record(led, run_n=4, card_id="H301", created_utc=t, round_id="R2")
+    # H302：R1 内 2 次（另一谱系——项目级合并计数）
+    for i in (1, 2):
+        record(led, run_n=i, card_id="H302", symbol="EURUSD", created_utc=t,
+               round_id="R1")
+    # 不计：轮次外研究 / 轮次内标定 / 轮次内失败运行
+    record(led, run_n=10, card_id="H301", created_utc=t)                 # 无轮次
+    record(led, run_n=99, card_id="H301", created_utc=t, round_id="R1",
+           actor="calibration")                                          # 轮次内标定
+    record(led, run_n=11, card_id="H301", created_utc=t, round_id="R1",
+           error="ValueError: bars 为空")                                # 失败
+    st = led.stats()
+    assert st["project_n_dedup_rounds"] == 6      # H301{1,2,3,4} + H302{1,2}
+    # 现行键逐位不变（冻结语义）
+    assert st["project_n_dedup_research"] == 7    # + 轮次外 run=10
+    assert st["project_n_dedup"] == 8             # + 轮次内标定 run=99
+    st1 = led.stats("H301")
+    assert st1["family_n_dedup"] == 6             # {1,2,3,4,10,99}（含标定）
+    assert st1["n_dedup"] == 6
+    assert st1["project_n_dedup_rounds"] == 6     # 两种调用都附带
+    led.close()
+
+
+def test_lineage_n_dedup_and_primary_test_n(tmp_path):
+    """T85/K1 失败测试（N 口径·延续谱系成分，预写规则第十三轮 §4.1）：
+    lineage_n_dedup(family) = 候选所延续谱系**轮次外**研究试验的七元组去重
+    数（轮次内试验已由 project_n_dedup_rounds 全项目计入，不重复计）；
+    主检验 N = 两者之和（continues_family 空 = 全新机制 → lineage 0）；
+    轮次制之前的其余历史只在报告列出（pre_round_other_n_dedup），不进 N。"""
+    led = Ledger(tmp_path / "l.sqlite")
+    t = datetime(2026, 10, 20, tzinfo=timezone.utc)
+    # 轮次内：两谱系各 2 次去重研究试验
+    for fam, sym in (("H401", "XAUUSD"), ("H402", "EURUSD")):
+        for i in (1, 2):
+            record(led, run_n=i, card_id=fam, symbol=sym, created_utc=t,
+                   round_id="R1")
+    # 轮次外历史：H401 3 次（延续对象）+ H403 2 次（其余历史）+ 标定 1 次
+    for i in (10, 11, 12):
+        record(led, run_n=i, card_id="H401", created_utc=t)
+    for i in (20, 21):
+        record(led, run_n=i, card_id="H403", symbol="BTCUSD", created_utc=t)
+    record(led, run_n=99, card_id="H401", created_utc=t, actor="calibration")
+    assert led.lineage_n_dedup("H401") == 3       # 只计研究类、轮次外
+    assert led.lineage_n_dedup("H403") == 2
+    assert led.lineage_n_dedup("H999") == 0       # 未知谱系
+    n = led.primary_test_n("H401")
+    assert n["project_n_dedup_rounds"] == 4
+    assert n["lineage_n_dedup"] == 3
+    assert n["n"] == 7                            # 主检验 N = 两者之和
+    assert n["continues_family"] == "H401"
+    assert n["pre_round_other_n_dedup"] == 2      # H403 的轮次外（只报告）
+    fresh = led.primary_test_n("")
+    assert fresh["n"] == 4 and fresh["lineage_n_dedup"] == 0
+    assert fresh["pre_round_other_n_dedup"] == 5  # H401 3 + H403 2（只报告）
     led.close()
 
 
