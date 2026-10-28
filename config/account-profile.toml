@@ -24,25 +24,25 @@ confirmed_on = ""
 # ---- 各品种隔夜费状态（按需增行；缺行 = unknown = 按 charged 计） ----
 
 [symbols.USTEC]
-status = "unknown"
-confirmed_by = ""
-confirmed_on = ""
-evidence = ""
+status = "swap_free"
+confirmed_by = "user"
+confirmed_on = "2026-10-29"
+evidence = "用户 2026-10-29 确认四个品种隔夜费按 0 计算；模拟盘三个观测窗（10-26..10-28）swap 全程 0.0"
 
 [symbols.XAUUSD]
-status = "unknown"
-confirmed_by = ""
-confirmed_on = ""
-evidence = ""
+status = "swap_free"
+confirmed_by = "user"
+confirmed_on = "2026-10-29"
+evidence = "用户 2026-10-29 确认四个品种隔夜费按 0 计算；模拟盘三个观测窗（10-26..10-28）swap 全程 0.0"
 
 [symbols.EURUSD]
-status = "unknown"
-confirmed_by = ""
-confirmed_on = ""
-evidence = ""
+status = "swap_free"
+confirmed_by = "user"
+confirmed_on = "2026-10-29"
+evidence = "用户 2026-10-29 确认四个品种隔夜费按 0 计算；模拟盘三个观测窗（10-26..10-28）swap 全程 0.0"
 
 [symbols.BTCUSD]
-status = "unknown"
-confirmed_by = ""
-confirmed_on = ""
-evidence = ""
+status = "swap_free"
+confirmed_by = "user"
+confirmed_on = "2026-10-29"
+evidence = "用户 2026-10-29 确认四个品种隔夜费按 0 计算；模拟盘三个观测窗（10-26..10-28）swap 全程 0.0"

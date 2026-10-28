@@ -514,14 +514,16 @@ def test_account_profile_invalid_status_rejected(tmp_path):
 
 
 def test_repo_account_profile_template_defaults_all_charged():
-    """T83 失败测试：仓库模板存在且只含 unknown 缺省（不含账号/服务器名），
-    装载结果 = 全 charged——用户确认后才改状态。"""
+    """T83：仓库模板存在（不含账号/服务器名）。2026-10-29 用户确认四品种
+    swap_free（隔夜费按 0 计）——装载返回确认过的映射。"""
     p = REPO_ROOT / "config" / "account-profile.toml"
     assert p.is_file()
     src = p.read_text(encoding="utf-8")
     assert "login" not in src and "server" not in src
     mod = load_bt()
-    assert mod.load_account_profile(p) == {}
+    assert mod.load_account_profile(p) == {
+        "XAUUSD": "swap_free", "EURUSD": "swap_free",
+        "BTCUSD": "swap_free", "USTEC": "swap_free"}
 
 
 # ----------------------------------------------------- 预筛双口径
