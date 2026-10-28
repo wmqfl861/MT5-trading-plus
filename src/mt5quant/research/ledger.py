@@ -1125,6 +1125,34 @@ class Ledger:
             (round_id,)).fetchall()
         return self._dedup_n(rows)
 
+    def runs_of_round(self, round_id: str) -> list[dict]:
+        """本轮全部 runs（只读；T90 轮次报告用）——每行含 run_id、
+        card_id、params（解析后 dict）、ok/error/metrics（解析
+        metrics_json 载荷）、actor、run_class，按 run_id 升序。"""
+        import json as _json
+        rows = self.conn.execute(
+            "SELECT run_id, card_id, params_json, metrics_json, actor,"
+            " run_class FROM runs WHERE round_id=? ORDER BY run_id",
+            (round_id,)).fetchall()
+        out = []
+        for r in rows:
+            try:
+                params = _json.loads(r["params_json"])                     if r["params_json"] else {}
+            except ValueError:
+                params = {}
+            try:
+                payload = _json.loads(r["metrics_json"])                     if r["metrics_json"] else {}
+            except ValueError:
+                payload = {}
+            out.append({"run_id": r["run_id"], "card_id": r["card_id"],
+                        "params": params,
+                        "ok": bool(payload.get("ok")),
+                        "error": payload.get("error"),
+                        "metrics": payload.get("metrics") or {},
+                        "actor": r["actor"],
+                        "run_class": r["run_class"]})
+        return out
+
     def round_lockbox_uses(self, round_id: str) -> int:
         """本轮已消耗的 G5 次数（lockbox_uses_max 的计数口径）：该轮内
         跑过的卡（runs.round_id 匹配）在 lockbox_uses 中的行数——含

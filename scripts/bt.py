@@ -1218,6 +1218,222 @@ def _reject_fittable_walkforward(strategy_cls, wanted_gates) -> str | None:
     return None
 
 
+def _prob_preconditions(ledger, card, path, *, actor: str) -> tuple | None:
+    """T90 前置检查（任一不满足打印原因并返回 None）：
+    evaluation_mode=probability 且 segment=discovery；轮次可装载且
+    approved_by 非空；候选评估 mode=probability；卡的假设表与轮次
+    [hypotheses] 一致；轮次剩余预算 ≥ 假设条数。返回 (round_obj, split)。"""
+    if card.evaluation_mode != "probability":
+        print(f"✗ bt prob test 只用于 probability 卡（收到 "
+              f"{card.evaluation_mode!r}）")
+        return None
+    if card.segment != "discovery":
+        print("✗ P1 只在发现段跑（segment 必须 discovery；验证段属 T92/P2）")
+        return None
+    rnd_path = Path(path).parent.parent / "rounds" / f"{card.round}.toml"
+    try:
+        round_obj = rnd.load_round(rnd_path)
+    except rnd.RoundError as e:
+        print(f"✗ 轮次 {card.round} 不可装载：{e}")
+        return None
+    if not round_obj.approved_by.strip():
+        print(f"✗ 轮次 {card.round} 的 approved_by 为空——轮次未获批"
+              "（P 线审核会话批准时填写；执行会话不得代填）")
+        return None
+    ev = round_obj.evaluation.get(card.candidate) or {}
+    if ev.get("mode") != "probability":
+        print(f"✗ 轮次 {card.round} 中候选 {card.candidate} 的评估模式是 "
+              f"{ev.get('mode')!r}（须 probability）")
+        return None
+    listed = list(round_obj.hypotheses.get(card.candidate, ()))
+    if sorted(card.prob["hypotheses"]) != sorted(listed):
+        print(f"✗ 卡的假设表与轮次 [hypotheses].{card.candidate} 不一致"
+              f"（卡 {sorted(card.prob['hypotheses'])} vs 轮次 "
+              f"{sorted(listed)}——先卡后测：改卡须新版本入新轮）")
+        return None
+    if not (round_obj.segments or {}).get("split"):
+        print(f"✗ 轮次 {card.round} 缺 [segments].split（D50）")
+        return None
+    used = ledger.round_n_dedup(round_obj.id)
+    if used + len(listed) > round_obj.trial_budget:
+        print(f"✗ 轮次预算不足：已用 {used}/{round_obj.trial_budget}，"
+              f"本卡还需 {len(listed)} 条假设各一行")
+        return None
+    return round_obj
+
+
+def cmd_prob_test(args) -> int:
+    """T90：bt prob test --card <P###-v#>——P1 现象检验（发现段）。"""
+    if _reject_ops_ack(args):
+        return 1
+    path = _card_path(args.card, Path(args.cards_dir))
+    try:
+        card = cards.load_card(path)
+    except cards.CardError as e:
+        print(f"✗ {e}")
+        return 1
+    try:
+        cards.ensure_strategy_matches(card, args.strategy)
+    except cards.CardStrategyMismatchError as e:
+        print(f"✗ {e}")
+        return 1
+    actor = _enforce_candidate_status(args, card)
+    if actor is None:
+        return 1
+    try:
+        data_root, store_kind = _resolve_store(args)
+    except ValueError as e:
+        print(f"✗ {e}")
+        return 1
+    ledger_path = _ledger_default(args)
+    from mt5quant.prob import p1 as p1mod
+
+    with Ledger(ledger_path) as ledger:
+        committed = cards.committed_at(path)
+        try:
+            cards.ensure_card_precedes_run(
+                card.id, committed,
+                ledger.first_run_at(card.id, version=card.version),
+                worktree_clean=cards.worktree_clean(path))
+        except (cards.CardNotCommittedError, cards.CardLateCommitError,
+                cards.CardDirtyWorktreeError) as e:
+            print(f"✗ {e}")
+            return 1
+        pre = _prob_preconditions(ledger, card, path, actor=actor)
+        if pre is None:
+            return 1
+        round_obj = pre
+        split = pd.Timestamp(round_obj.segments["split"])
+        try:
+            strategy_cls = load_strategy(args.strategy)
+            del strategy_cls          # P1 不跑策略引擎（标签经 prob.labels）
+            sizes = {sym: resolve_contract_size(data_root, sym, None)
+                     for sym in card.symbols}
+            bars_by_sym = {}
+            for sym in card.symbols:
+                bars_full = load_series(data_root, sym, card.timeframe,
+                                        args.end)
+                times = pd.to_datetime(bars_full["time"])
+                below = bars_full[times < split]
+                if len(below) == 0:
+                    print(f"✗ {sym} 在分界 {split} 前无数据（发现段为空）")
+                    return 1
+                bars_by_sym[sym] = below.reset_index(drop=True)
+            from mt5data.sessions import load_session_policy
+            sess_policy = load_session_policy(str(SESSIONS_PATH))
+            sess_sha = sessions_sha256(str(_SP))
+            costs_by_sym = {}
+            for sym in card.symbols:
+                costs_by_sym[sym], cost_version = build_costs(
+                    data_root, sym, args.spread_fraction, args.commission,
+                    sessions_sha=sess_sha, research_store=store_kind == "research")
+            results = p1mod.run_p1_card(card, round_obj, bars_by_sym,
+                                        costs_by_sym, sizes=sizes,
+                                        sims=args.sims)
+        except Exception as e:
+            print(f"✗ P1 运行失败：{type(e).__name__}: {e}")
+            return 1
+        for r in results:
+            params = {"hypothesis": r["hypothesis"],
+                      "prob": {"segment": card.segment,
+                               "split": round_obj.segments["split"],
+                               "bracket": dict(card.prob["bracket"]),
+                               "seed": r["seed"]}}
+            metrics = {"prob": {"prob_version": r["prob_version"],
+                                "n_triggers": r["n_triggers"],
+                                "n_trigger_days": r["n_trigger_days"],
+                                "real_win_rate": r["real_win_rate"],
+                                "null_win_rate": r["null_win_rate"],
+                                "delta_p": r["delta_p"],
+                                "p_value": r["p_value"]}}
+            rid = ledger.record_run(
+                card_id=card.id, card_version=card.version,
+                strategy=args.strategy, params=params,
+                symbol=card.symbols[0], timeframe=card.timeframe,
+                data_first=pd_iso(bars_by_sym[card.symbols[0]]["time"].iloc[0]),
+                data_last=pd_iso(bars_by_sym[card.symbols[0]]["time"].iloc[-1]),
+                data_sha256=data_sha256(bars_by_sym[card.symbols[0]]),
+                engine_version=ENGINE_VERSION,
+                cost_model_version=cost_version, gates_hash=_gates_hash(),
+                metrics=metrics, actor=actor,
+                strategy_sha=_bind_strategy_sha(ledger, card, args.strategy),
+                run_class="research", round_id=round_obj.id)
+            mark = "✓" if r["p_value"] < 0.05 else "·"
+            print(f"{mark} run#{rid} {r['hypothesis']}：触发 "
+                  f"{r['n_triggers']}（{r['n_trigger_days']} 日），Δp="
+                  f"{r['delta_p']:+.4f}，p={r['p_value']:.4f}（种子 "
+                  f"{r['seed']}）")
+        print(f"— {len(results)} 条假设全部完成（不能只跑几条）；台账 "
+              f"{ledger_path}")
+        return 0
+
+
+def cmd_prob_round_report(args) -> int:
+    """T90：bt prob round-report <R#>——本轮全部假设 Holm + 推进判定。"""
+    try:
+        data_root, _store_kind = _resolve_store(args)
+    except ValueError as e:
+        print(f"✗ {e}")
+        return 1
+    rnd_path = Path(data_root).parent / "research" / "rounds" / \
+        f"{args.round}.toml"
+    if not rnd_path.is_file():
+        rnd_path = Path("research/rounds") / f"{args.round}.toml"
+    try:
+        round_obj = rnd.load_round(rnd_path)
+    except rnd.RoundError as e:
+        print(f"✗ {e}")
+        return 1
+    ledger_path = _ledger_default(args)
+    from mt5quant.validation.prob_mode import holm
+    with Ledger(ledger_path) as ledger:
+        pvals: dict[str, float] = {}
+        rows = []
+        all_runs = ledger.runs_of_round(round_obj.id)
+        for cid, hyps in round_obj.hypotheses.items():
+            for h in hyps:
+                key = f"{cid}:{h}"
+                runs = [r for r in all_runs
+                        if (r["params"] or {}).get("hypothesis") == h
+                        and r.get("ok")]
+                if not runs:
+                    print(f"✗ 假设 {h} 没有运行记录——全部卡跑完才能出报告")
+                    return 1
+                last = runs[-1]
+                m = (last.get("metrics") or {}).get("prob") or {}
+                pvals[key] = float(m.get("p_value", 1.0))
+                rows.append({"candidate": cid, "hypothesis": h,
+                             "p_value": pvals[key],
+                             "delta_p": m.get("delta_p"),
+                             "n_trigger_days": m.get("n_trigger_days")})
+        adjusted = holm(pvals)
+        out_dir = Path("docs/research")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = pd.Timestamp.now().strftime("%Y-%m-%d")
+        md = out_dir / f"round-{round_obj.id}-p1-{stamp}.md"
+        js = out_dir / f"round-{round_obj.id}-p1-{stamp}.json"
+        lines = [f"# P1 轮次报告 {round_obj.id}（{stamp}）", "",
+                 "状态：待审核", "",
+                 "推进规则（预写）：Holm 校正后 p < 0.05 且 Δp 点估计满足"
+                 "事前成本要求（轮次文件 advance_rule）。", "",
+                 "| 候选 | 假设 | 触发日数 | Δp | 原始 p | Holm p | 结论 |",
+                 "| --- | --- | --- | --- | --- | --- | --- |"]
+        for r in rows:
+            adj = adjusted[f"{r['candidate']}:{r['hypothesis']}"]
+            concl = "推进" if adj < 0.05 else "进墓地"
+            lines.append(f"| {r['candidate']} | {r['hypothesis']} | "
+                         f"{r['n_trigger_days']} | {r['delta_p']:+.4f} | "
+                         f"{r['p_value']:.4f} | {adj:.4f} | {concl} |")
+        md.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        js.write_text(json.dumps({"round": round_obj.id,
+                                  "status": "待审核",
+                                  "rows": rows, "holm": adjusted},
+                                 ensure_ascii=False, indent=2),
+                      encoding="utf-8")
+        print(f"✓ 报告：{md}（同 JSON）——交 P 线审核会话")
+        return 0
+
+
 def cmd_fit(args) -> int:
     """T73A：bt fit <卡>——概率卡按分段约束拟合，模型冻结落盘并打印
     路径与哈希（不产生 runs——模型身份随其后的 screen/gate 运行入台账）。"""
@@ -1947,6 +2163,30 @@ def build_parser() -> argparse.ArgumentParser:
                     help="概率模式预筛的分界日期（月初；缺省自动 "
                          "propose_split 提案，T76/D50）")
     pc.set_defaults(func=cmd_candidate_check)
+
+    p_prob = sub.add_parser("prob", help="P1 概率模式检验（T90/D42）")
+    prob_sub = p_prob.add_subparsers(dest="prob_cmd", required=True)
+    ptst = prob_sub.add_parser("test", help="bt prob test --card P###-v#："
+                                "真实触发 vs 随机化触发的 Δp 检验（发现段）")
+    ptst.add_argument("--card", required=True)
+    ptst.add_argument("--strategy", required=True)
+    ptst.add_argument("--cards-dir", default="research/cards")
+    ptst.add_argument("--data-root", default=None)
+    ptst.add_argument("--end", default=None)
+    ptst.add_argument("--spread-fraction", type=float, default=0.1)
+    ptst.add_argument("--commission", type=float, default=0.0)
+    ptst.add_argument("--sims", type=int, default=400,
+                      help="月内置换次数（p 值分辨率）")
+    ptst.add_argument("--specimen", action="store_true")
+    ptst.add_argument("--ops-ack", action="store_true")
+    ptst.set_defaults(func=cmd_prob_test)
+    prpt = prob_sub.add_parser("round-report", help="本轮全部假设 Holm + "
+                               "推进判定，产出待审核报告")
+    prpt.add_argument("round", help="轮次 id（R#）")
+    prpt.add_argument("--rounds-dir", default="research/rounds")
+    prpt.add_argument("--data-root", default=None)
+    prpt.add_argument("--ledger", default=None)
+    prpt.set_defaults(func=cmd_prob_round_report)
 
     p_fit = sub.add_parser("fit", help="概率卡拟合+冻结模型（T73A/D43）")
     p_fit.add_argument("card", help="卡 id（P###-v#）或 .toml 路径")
