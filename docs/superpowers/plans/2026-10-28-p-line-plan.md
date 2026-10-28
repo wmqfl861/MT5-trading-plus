@@ -1,6 +1,14 @@
-# P 线施工计划（2026-10-28）：概率决策线 v1（T71–T78）
+# P 线施工计划（2026-10-28，第二版）：概率决策线 v1（T71–T78、T90–T93）
 
-> **For agentic workers:** 按本文"总执行顺序"推进（它同时排好了第十一轮计划 T61–T70 的顺序）。每个任务的流程：
+> **第二版（2026-10-28，依据 `docs/reviews/2026-10-28-review-pline-02.md`）**：
+> - 总执行顺序改为两个会话分列；
+> - T73 拆成 T73A（现在可做）与 T73B（等 T65 批准）；T73A 不改台账表结构；
+> - T75 的代码可先写；标定设计改为 12 个假设一组、以触发日数为样本单位，首批只要求 XAUUSD；
+> - T76 增补审核二的修正项（Q1–Q3、Q6）；T77 按 D51–D53 调整；
+> - 新增 T90–T93，覆盖 P1 运行入口、P1 现象检验、P2 决策系统和确认阶段；
+> - 新增"双会话分工"一节。
+>
+> **For agentic workers:** P 线会话按本文"总执行顺序"中 P 线会话的部分推进，H 线会话负责的任务见同一节。每个任务的流程：
 > 1. 先写失败测试；
 > 2. 实现；
 > 3. 本任务测试通过；
@@ -18,10 +26,12 @@
 - 概率模式评估及其标定；
 - 检验力与预筛；
 - 首批候选与轮次草案；
-- 风控号段子上限与实盘接入（阶段 F 之后）。
+- 风控号段子上限与实盘接入（阶段 F 之后，H 线会话负责）；
+- P1 现象检验、P2 决策系统、确认阶段（G5、影子盘、前向样本）。
 
 **输入文档（先读）：**
-1. `docs/blueprint-p-line.md`：P 线蓝图 v1，包括框架、研究流程、铁律 20–22、决策 D38–D50、附录模板。
+1. `docs/blueprint-p-line.md`：P 线蓝图 v1.1，包括框架、研究流程、铁律 20–22、决策 D38–D54、§8 双会话分工、附录模板。
+1a. `docs/reviews/2026-10-28-review-pline-01.md`、`docs/reviews/2026-10-28-review-pline-02.md`：P 线审核一、二；复现脚本 `docs/reviews/probes/2026-10-28-pline-probes.py`。
 2. `docs/blueprint.md`（v4）：§2 当前禁止事项、§4 铁律、§6 研究方向、§8 决策（含按审核建议代用户作出的决定）。
 3. `docs/superpowers/plans/2026-10-28-round11-research-process.md`：第十一轮计划 T61–T70。本计划多个任务依赖它。
 4. `docs/ops/demo-launch-proposal-2026-10-27.md`：阶段 F 启动方案。
@@ -31,7 +41,7 @@
    - `src/mt5live/executor.py`（启动时拒绝 `time_stop_bars` 与 `week_close_exit`）；
    - `src/mt5quant/validation/walkforward.py`、`src/mt5quant/research/cards.py`（卡模式严格拒绝未知键）。
 
-**基线：** 提交 `b77b040`（第十一轮文档）；GitHub Actions 1728 passed、2 skipped。
+**基线：** 第一版 `b77b040`（第十一轮文档；GitHub Actions 1728 passed、2 skipped）；第二版 `dacf08f`（tests run#100 绿；全量 2012 passed、1 skipped）。
 
 ## Global Constraints（所有任务隐含遵守）
 
@@ -39,7 +49,7 @@
   - T75 标定报告与 T77 轮次草案经审核批准之前，不在真实局面触发上计算任何标签、拟合或 Δp。
   - 在此之前允许做的：合成数据上的单元测试；用随机时点、随机化触发和植入效应做对账与标定；只数触发次数、不看结果的计数（T76）。
 - **不改现有执行语义**（D44）：
-  - T71–T77 不修改 `src/mt5quant/backtest/engine_a.py`、`engine_b.py`、`src/mt5live/`、`src/mt5gw/`；
+  - T71–T77、T90–T93 不修改 `src/mt5quant/backtest/engine_a.py`、`engine_b.py`、`src/mt5live/`、`src/mt5gw/`；
   - T78 等阶段 F 结束后才做。
 - **非拟合策略逐位不变**：凡改到 `bt`、关卡、walk-forward、G0、台账的任务，都要证明现有策略（B1–B6、MaCrossATR）的结果逐位不变。
 - **标定期间不改被标定的代码路径**：T65、T66、T75 的标定分片运行期间，不合并会改变其代码路径的改动。
@@ -48,28 +58,33 @@
 - **测试命令**（Git Bash）：`./.venv/Scripts/python.exe -m pytest -q -p no:cacheprovider`
 - **提交**：消息格式 `<type>(T##): 摘要`；不改写 git 历史、不强推、不改仓库可见性。
 
-## 总执行顺序（两份计划合并）
+## 总执行顺序（两个会话分列，截至 dacf08f）
 
-| 顺序 | 任务 | 所属 | 依赖 | 备注 |
-| --- | --- | --- | --- | --- |
-| 0 | 阶段 F 启动 | 运维 | — | 按启动方案，2026-10-28 开盘后启动（蓝图 v4 §8，D49 授权）；先做方案里的启动前检查单 |
-| 1 | T70 脱敏与杂项 | 第十一轮 | — | |
-| 2 | T61 基线重新定位 | 第十一轮 | — | |
-| 3 | T62 候选登记与预筛 | 第十一轮 | T61 | |
-| 4 | T72 首达标签与概率表 | P 线 | — | 只新增 `src/mt5quant/prob/`，可与 T62、T63 交替 |
-| 5 | T63 轮次预注册 | 第十一轮 | T62 | |
-| 6 | T67 外部数据 | 第十一轮 | — | 下载耗时，交替推进 |
-| 7 | T64 项目级 N | 第十一轮 | T63 | |
-| 8 | T66 事件模式与标定 | 第十一轮 | T64 | 批准点 |
-| 9 | T65 关卡 v3 与标定 | 第十一轮 | T64、T66 | 批准点 |
-| 10 | T68 首轮候选与 R1 草案 | 第十一轮 | T62、T63、T65、T66、T67 | 批准点 |
-| 11 | T73 拟合钩子与分段 | P 线 | T63、T64、T65（标定跑完） | |
-| 12 | T74 局面库与动作库 | P 线 | T72、T73 | |
-| 13 | T75 概率模式标定 | P 线 | T66、T72、T74 | 批准点 |
-| 14 | T76 检验力与 P 线预筛 | P 线 | T62、T67、T75 | |
-| 15 | T77 P 线候选与轮次草案 | P 线 | T63、T75（已批准）、T76 | 批准点 |
-| 16 | T69 规则文档 + T71 P 线规则 | 两份 | 各阶段结束时 | |
-| 17 | T78 风控号段子上限与实盘接入 | P 线 | 阶段 F 结束 | |
+**H 线会话**（主工作区，`main`）：阶段 F → 第十一轮计划的剩余任务（按该计划）→ T71（随 T69）→ T78（阶段 F 结束后）→ 台账锚定改为事件序号（审核一越界修复的后续）。
+
+**P 线会话**（worktree `../mt5-pline`，分支 `pline/dev`）：
+
+| 顺序 | 任务 | 依赖 | 状态与备注 |
+| --- | --- | --- | --- |
+| 1 | T72 首达标签与概率表 | — | 完成（含审核一修正） |
+| 2 | T74 局面、动作、特征部分 | T72 | 完成（含审核一修正） |
+| 3 | T76 检验力、分段与预筛 | T62、T67 | 完成；审核二修正待做 |
+| 4 | T76 审核二修正（Q1–Q3、Q6） | — | **现在做**；验收含复现脚本 P4 由 FAIL 转 PASS |
+| 5 | T73A 拟合协议、P 卡与轮次字段、台账字段、`bt fit`、G0 冻结模型、分段约束 | T63、T64 | **现在可做** |
+| 6 | T74 收尾（`LevelDecisionV1` 等） | T73A | |
+| 7 | T75 代码与合成数据测试 | T72、T74 | T66 批准前就可以写；不跑正式标定 |
+| 8 | T90 P1 运行入口 `bt prob test` | T73A、T75 代码 | 只用合成数据测试；真实运行要等 T77 批准 |
+| 9 | T73B 逐窗拟合与 purge、关卡 v3 主检验接线 | T65 批准 | 等 H 线审核会话批准 T65 |
+| 10 | T75 正式标定与报告 | T66 批准 | 等 H 线审核会话批准 T66；报告是 P 线批准点 |
+| 11 | T76 收尾：接入 T75 实测样本量规则 | T75 批准 | |
+| 12 | T77 首批候选与第一轮草案 | T63、T75 批准、T76 收尾 | P 线批准点 |
+| 13 | T91 P1 现象检验轮 | T77 批准、T90 | 轮次结束报告是 P 线批准点 |
+| 14 | T92 P2 决策系统 | T91 批准且有通过的假设、T73B、T74 收尾 | 轮次草案、轮次结束报告各是一个 P 线批准点 |
+| 15 | T93 确认：G5、影子盘、前向样本 | T92 批准、T78 | 每次用 G5 前是 P 线批准点；部署由 H 线会话执行 |
+
+T66 若在审核中被要求修改，T75 的代码跟着调整后再正式标定；T65 同理影响 T73B。
+
+阻塞时（依赖未满足、停在批准点），先做不依赖它的任务；都做完了，就停下告诉用户在等什么、等谁。
 
 规模：S ≈ 半个工作日，M ≈ 1 个工作日，L ≈ 2 个工作日及以上，仅供排序。
 
@@ -81,14 +96,30 @@
 2. 在会话里告诉用户："请把 <报告路径> 交给审核会话"；
 3. 停在这里，不进入依赖它的任务。其他不依赖它的任务可以继续。
 
-批准点包括：
+批准点与归属（D54）：
 
-- T65、T66 标定报告；
-- T68 的 R1 草案；
-- T75 标定报告；
-- T77 候选与轮次草案；
-- 每一次 G5 使用之前；
-- 每一轮结束报告（进入下一阶段之前）。
+| 批准点 | 交给 |
+| --- | --- |
+| T65、T66 标定报告；T68 的 R1 草案；H 线各轮结束报告与 G5 | H 线审核会话 |
+| T75 标定报告；T77 候选与轮次草案；T91 轮次结束报告；T92 轮次草案与轮次结束报告；P 线每次 G5 使用之前 | P 线审核会话 |
+
+是否已批准，以 main 上 `docs/reviews/` 里对应审核会话的报告为准。P 线轮次文件的 `approved_by` 由 P 线审核会话批准时填写，执行会话不得填写或修改（蓝图 P 线 §8）。
+
+## 双会话分工（D54）
+
+细则见蓝图 P 线 §8。P 线会话的日常操作：
+
+- **目录**：只在 `../mt5-pline`（分支 `pline/dev`）里工作。主工作区的未提交改动、未跟踪文件和进程一律不碰。研究库与台账通过目录链接 `data_research`、`data/research` 共用，不链接 `data/live`。
+- **文件**：只改蓝图 P 线 §8 列出的 P 线文件。共用代码只在对应的 H 线任务已在 main 上完成之后才改，且保证非拟合策略的结果逐位不变。
+- **推送**（每个任务结束时）：
+  ```bash
+  git fetch origin && git rebase origin/main
+  ./.venv/Scripts/python.exe -m pytest -q -p no:cacheprovider
+  git push origin pline/dev:main      # 只推本分支的提交；被拒就重新同步，不得强推
+  ```
+  只 `git add` 自己改过的文件。rebase 冲突如果出在不归自己的文件里，停下告诉用户。
+- **证据**：推送后确认 GitHub Actions 为绿再勾复选框。CI 证据写提交号加 tests 工作流的 run_number（以 GitHub API 为准，例如 `gh api repos/<owner>/<repo>/actions/runs?head_sha=<sha>`），不要自行推算编号。
+- **CI 红**：出在不归自己的文件里时，告诉用户、停止推送，不自行修复。
 
 ## U0：只能由用户亲手完成的事项（agent 不得代办，只列清单提醒）
 
@@ -107,7 +138,7 @@
 
 ---
 
-## T71：P 线规则与权限（S）
+## T71：P 线规则与权限（S，H 线会话随 T69 完成）
 
 **Files:** `docs/p6/research-agent.md`、`docs/p6/review-agent.md`、`docs/p6/permissions.md`；路径白名单（本地钩子与 CI 同源，与 T69 同一处实现）；守护测试；`README.md`。
 
@@ -198,18 +229,31 @@ def load_model(path, *, expected_sha256: str) -> dict               # 哈希不�
   - 模型文件往返一致，同一输入两次生成的哈希相同，哈希不符 → ModelIntegrityError——`test_to_dict_from_dict_roundtrip`、`test_same_input_same_hash`、`test_load_model_tampered_content_raises`。
 - [x] **真数据对账证据**（本机运行，不进 CI）：XAUUSD H1 研究库（52,146 根，成本 rel@NY p90 快照 + swap 快照）随机时点 200 个（seed=20261027），结局 loss 90 / win 85 / time 25，逐笔对照不一致 0 处、max|net_r−r_multiple|=0.000e+00；日志 `data/prob/t72-evidence-2026-10-27.log`（本机 worktree，结论存档于本提交说明）。随机时点不是研究结论，不违反禁止事项。
   （CI 如实注：8d14c41 自身的 CI 因锚定测试同刻度偶发为红，与本任务内容无关；同树重跑 8739667 绿、修复后 d96c523 绿——见下方审核修正行。）
-- [x] **审核修正（R12，2026-10-28）**：① 概率表 r̄ 收缩改按结局伪样本数 r̄_o=(Σr_o+m·p_base_o·r_base_o)/(k_o+m·p_base_o)——同分布格=基准条件均值、大样本趋近经验条件均值、EV 手算一致三测（test_rbar_same_distribution_equals_base_mean/test_rbar_large_n_approaches_empirical_conditional_mean/test_ev_from_lookup_matches_hand_calc）；② purge 改按 bar 下标（t+K+1 存在且 time<train_end），周末/节假日缺口测试（test_purge_weekend_gap_dropped_by_bar_index/test_purge_holiday_gap_dropped_by_bar_index）；③ 模型文件原子写对齐仓库统一模式（唯一 tmp+fsync+replace 带重试，tests/test_prob_artifact.py）；④ 新增切片 vs 全序列对账 100 例（|Δnet_r|<1e-6，test_slice_label_matches_full_series_engine）。CI 绿灯 2df2ca6（run#84 success，全量 1981 passed, 1 skipped）。
+- [x] **审核修正（R12，2026-10-28）**：① 概率表 r̄ 收缩改按结局伪样本数 r̄_o=(Σr_o+m·p_base_o·r_base_o)/(k_o+m·p_base_o)——同分布格=基准条件均值、大样本趋近经验条件均值、EV 手算一致三测（test_rbar_same_distribution_equals_base_mean/test_rbar_large_n_approaches_empirical_conditional_mean/test_ev_from_lookup_matches_hand_calc）；② purge 改按 bar 下标（t+K+1 存在且 time<train_end），周末/节假日缺口测试（test_purge_weekend_gap_dropped_by_bar_index/test_purge_holiday_gap_dropped_by_bar_index）；③ 模型文件原子写对齐仓库统一模式（唯一 tmp+fsync+replace 带重试，tests/test_prob_artifact.py）；④ 新增切片 vs 全序列对账 100 例（|Δnet_r|<1e-6，test_slice_label_matches_full_series_engine）。CI 绿灯 2df2ca6（tests run#97 success，全量 1981 passed, 1 skipped；编号已由审核二按 GitHub API 更正）。
 
-## T73：拟合钩子、分段与模型身份（L）
+## T73：拟合钩子、分段与模型身份（L；第二版拆为 T73A、T73B）
 
-**Files:**
+**T73A（现在可做；T63、T64 已在 main 完成）Files:**
 - `src/mt5quant/strategies/base.py`：新增可选协议，`fittable = False` 为缺省；
-- `src/mt5quant/research/cards.py`：P 卡字段 `segment` 与 `[prob]` 段，`evaluation_mode = "probability"`；
-- `src/mt5quant/research/ledger.py`：runs 增加 `model_sha256`、`prob_version`、`fit_start`、`fit_end`、`segment`，迁移时保持哈希链；
-- `scripts/bt.py`：新增 `bt fit`；screen 与 gate 自动拟合；分段约束；
-- `src/mt5quant/validation/walkforward.py` 与关卡 v3 主检验：逐窗重新拟合 + purge；
+- `src/mt5quant/research/cards.py`：P 卡字段 `segment` 与 `[prob]` 段（复用 `candidates.py` 里 `[prob]` 的校验），`evaluation_mode = "probability"`，`primary_statistic = "delta_p_one_sided"`；其他卡的未知键仍然严格拒绝；
+- `src/mt5quant/research/rounds.py`：
+  - 新增 `[segments] split`（格式 `YYYY-MM-01`，必须是月初）；
+  - `lockbox_uses_max = 0` 只在全部候选的 `[evaluation]` 都是 `mode = "probability"` 时允许；上限 1 不变（D16）；
+  - H 线现有轮次文件的装载结果逐字段不变；
+- 台账（`src/mt5quant/research/ledger.py` 只读或只加辅助函数）：**不改 runs 表结构，不触发生产台账迁移**。两个会话共用一份台账，改表结构要按 T80 的流程重锚。P 线字段这样放：
+  - 决定试验身份的（`segment`、`split`、假设、止损止盈）放进 `params_json`；
+  - 来源信息（`model_sha256`、`prob_version`、`fit_start`、`fit_end`、`purge_bars`）放进 `metrics_json` 的 `metrics.prob`；
+  - 两处都已进入哈希链；
+- `scripts/bt.py`：新增 `bt fit`；screen 与 gate 对拟合策略先拟合再评估（单一训练窗）；分段约束；T73B 完成前，拟合策略的 walk-forward 与关卡 v3 主检验一律拒绝运行，报错写明要等 T73B；
 - `src/mt5quant/validation/lookahead.py`：G0 用冻结模型；
 - 测试。
+
+**T73B（等 H 线审核会话批准 T65）Files:**
+- `src/mt5quant/validation/walkforward.py` 与关卡 v3 主检验：拟合策略逐窗重新拟合 + purge；非拟合策略逐位不变；
+- 关卡 v3 增加 P 线专属否决项"样本外校准"（Brier 技能分 > 0，阈值与做法以 T75 标定为准），只对拟合的概率策略生效；
+- 测试。
+
+T73B 改的是 T65 的代码路径。T65 批准后才动，并证明 T65 标定用到的结果逐位不变。
 
 **Interfaces:**
 ```python
@@ -235,13 +279,17 @@ class BaseStrategy:
   - 每次运行记录所用模型的 sha256；
   - 同样的输入重新拟合，哈希必须相同；
   - 模型文件写到 `data_research/models/<卡>/<sha256>.json`。
-- [ ] 失败测试先行：
-  - 非拟合策略逐位不变；
+- [ ] T73A 失败测试先行：
+  - 非拟合策略逐位不变（现有测试全过；B1 在固定夹具上的 G3 结果改动前后逐位一致）；
   - 拟合不读 `train_end` 之后的数据，最后 K 根的触发被 purge；
-  - 合成的非平稳数据上，各训练窗的模型哈希不同；
   - 冻结模型的拟合策略能过 G0；故意在 `generate_signals` 里现场统计全部历史的坏策略被 G0 查出；
   - discovery 卡读 `>= split` 被拒；validation 卡在 `< split` 上评估被拒；
-  - 台账迁移后 `bt ledger verify` 通过。
+  - 轮次文件：`[segments] split` 非月初或格式错 → 拒；概率模式轮次 `lockbox_uses_max = 0` → 过；含非概率候选的轮次为 0 → 拒；> 1 仍拒；H 线现有轮次文件装载结果不变；
+  - P 线字段写入 `params_json`、`metrics_json` 后 `bt ledger verify` 通过，runs 表结构不变。
+- [ ] T73B 失败测试先行：
+  - 合成的非平稳数据上，各训练窗的模型哈希不同；每个训练窗末尾 K 根内的触发被 purge；
+  - 非拟合策略的 walk-forward 与关卡 v3 结果逐位不变；
+  - 样本外校准否决项：预测恒等于基准率的模型（技能分为 0）与反向信息的模型被否决，植入信息的模型通过。
 
 ## T74：局面库、动作库与决策策略 v1（M）
 
@@ -267,8 +315,8 @@ class BaseStrategy:
 - **回看声明**：`lookback_bars` ≥ max(2,000, 480 + M, 200) + K + 24。
 - [x] **局面/动作/特征（不依赖 T73 拟合协议的部分）**：`situations.py`（Approach M/D/d + S1 网格/S2 前一交易日 17:00 NY 划界（DST 由 zoneinfo，EST 22:00/EDT 21:00 UTC 边界实测）/S3 B1 同法通道 shift(1)）+ `actions.py`（A1–A4 阻力支撑对称，b 与 m 取卡参数，A2 带 ±0.25 ATR）+ `features.py`（trend_sma200 / atr_pct_2000 有界窗口、未满窗 None）。测试 `test_strategies_prob_situations.py`（9）+ `test_strategies_prob_actions.py`（7）+ `test_strategies_prob_features.py`（4），共 20 个，先红后绿：A1–A4 触发与手算一致（阻力 `test_actions_hand_computed_resistance`、支撑 `test_support_actions_mirror_hand_case`）；镜像对称（价格围绕价位反射后 kind 互换、方向取反、bar 不变——`test_s1_support_touch_and_mirror`、`test_actions_mirror_symmetry`）。
   （CI 如实注：572396d 自身的 CI 因锚定测试同刻度偶发为红，与本任务内容无关；绿灯证据来自 d96c523。）
-- [x] **审核修正（R12，2026-10-28）**："接近价位"定义更正——本根进入触及带；前 M 根都在带外且价位同侧（阻力 high_j < L − d·ATR_j），其中至少一根 ≥ D·ATR；蓝图 P 线 §2.1 同步更正；渐进接近测试（旧定义拒绝、新定义触发，test_s1_ramp_approach_accepted_new_definition），既有手算测试全部复绿。CI 绿灯 2df2ca6（run#84 success，全量 1981 passed, 1 skipped）。
-- [ ] **剩余项（依赖 T73 拟合协议，待 T63–T65 在 main 勾选后随 T73 一并落地）**：
+- [x] **审核修正（R12，2026-10-28）**："接近价位"定义更正——本根进入触及带；前 M 根都在带外且价位同侧（阻力 high_j < L − d·ATR_j），其中至少一根 ≥ D·ATR；蓝图 P 线 §2.1 同步更正；渐进接近测试（旧定义拒绝、新定义触发，test_s1_ramp_approach_accepted_new_definition），既有手算测试全部复绿。CI 绿灯 2df2ca6（tests run#97 success，全量 1981 passed, 1 skipped；编号已由审核二按 GitHub API 更正）。
+- [ ] **剩余项（依赖拟合协议，T73A 完成后做）**：
   - 持有到第 K 根归零；止损后同一次触发不再重入（经引擎验证）；
   - G0：冻结模型下截断一致，窗口不变性 ≥ 100 个随机探针；
   - 没装模型 → ModelMissingError；模型哈希不符 → ModelIntegrityError；
@@ -290,15 +338,19 @@ def brier_skill(p_pred, outcome, p_base) -> float
 ```
 
 - **标定只用随机化触发与植入效应**，不生成任何真实局面触发的标签。
+  - 随机时点的标签不得与计数工具输出的真实触发时刻做任何连接（连接就等于看了真实触发的结局）；
+  - 为省时间，可以先把一批随机时点的标签算好，各种子从池中抽样；这个池只放在本次运行的临时目录里，运行结束删除。
+- **时间安排**：代码与合成数据测试在 T66 批准前就可以写；正式标定运行与报告等 T66 批准后再做（T66 若被要求修改，先跟着调整）。
 - **设计**（报告开头写清，先于运行）：
-  - 品种：XAUUSD H1、EURUSD H1，以及两者合并；
-  - 负对照：触发数 n ∈ {500, 1000, 2000}，每档 200 个种子，计算单假设误报率；6 个假设一组，计算 Holm 联合误报率；
+  - 品种：XAUUSD H1 必做（首批候选只用它，D53）；EURUSD H1 与合并口径可选，供以后加入 EURUSD 时使用；
+  - 样本单位：按日聚合后的触发日数，与 `delta_p_test` 一致；
+  - 负对照：触发日数 n ∈ {500, 1000, 2000}，每档 200 个种子，计算单假设误报率；12 个假设一组（与第一轮的结构一致：3 个局面 × 4 个动作，同一次随机化），计算 Holm 联合误报率；
   - 正对照：植入 Δp ∈ {0.02, 0.03, 0.05} × n ∈ {500, 1000, 2000, 4000}，每档 100 个种子，计算检出率；
   - P2 的样本外校准否决项：无信息特征下 Brier 技能分 > 0 的比例（应接近 0），以及植入信息下的检出率。
 - **选择规则**（写进报告，先于结果）：
   - 负对照的单假设误报率与 Holm 联合误报率都 ≤ 5%，才采用；
   - 超出时，加长块长或收紧 α 后重新标定；
-  - 报告检出率曲线，并据此写出"概率模式样本量规则"；实测要求比蓝图 §3.4 的解析表更严的，以实测为准。
+  - 报告检出率曲线，并据此写出"概率模式样本量规则"（单位为触发日数，给出 4 个假设与 12 个假设两种口径）；实测要求比蓝图 §3.4 的解析表更严的，以实测为准。
 - [ ] 失败测试先行：
   - 随机化后，小时、星期与 ATR 分位的分布与原触发一致（卡方检验，或逐桶计数相等）；
   - 同一种子结果逐位一致；
@@ -333,11 +385,11 @@ def n_needed_proportion(p0: float, dp: float, *, alpha: float = 0.05, power: flo
   1. 文献：同蓝图 v4；
   2. 决策周期 ≥ H1；
   3. 事前成本：按文献折算的预期 Δp 换算成期望净收益（R），必须满足蓝图 P 线 §3.4 的"毛利 ≥ 3 倍成本"。成本取成本模型 v3 在触发所在纽约小时的来回成本，触发小时分布来自计数；
-  4. 检验力：发现段内可用触发数 ≥ 样本量规则（取 T75 实测与解析表中更严的一个）的 50% 检验力要求，否则 `waiting_data`；
+  4. 检验力：逐条假设，发现段内可用触发日数 ≥ 样本量规则（取 T75 实测与解析表中更严的一个）的 50% 检验力要求，否则该条 `waiting_data`（第二版按 D52 修订，见下方审核二修正）；
   5. 机制空缺：`price_levels` 是新类别。
 - **计数不看结果**：计数工具只输出触发时刻、小时、品种，不调用标签与引擎。用静态检查证明它不 import `mt5quant.prob.labels`。
 - **分界日期**：`bt segment propose --symbols ... --timeframe H1` 取研究库（含外部数据）中这些品种共同覆盖期的中点，取整到月初，结果确定。
-- [x] 失败测试先行（CI 绿灯 3a772db，run#86 success，全量 2012 passed, 1 skipped）：
+- [x] 失败测试先行（CI 绿灯 3a772db，tests run#99 success，全量 2012 passed, 1 skipped；编号已由审核二按 GitHub API 更正）：
   - 检验力函数复现表中数值（`test_n_needed_reproduces_blueprint_table` 九格参数化 + `test_review_examples`）；
   - 预期 Δp 不够覆盖成本 → fail（`test_precheck_prob_cost_fail`）；触发数不足 → `waiting_data`（`test_precheck_prob_insufficient_triggers_waiting`）；
   - 同样的输入，分界日期相同（`test_propose_split_deterministic_and_month_floored`）；
@@ -348,6 +400,15 @@ def n_needed_proportion(p0: float, dp: float, *, alpha: float = 0.05, power: flo
   - `candidates.py`：`MECHANISM_CLASSES` 增 `price_levels`；`[prob]` 段装载校验（ProbDeclared：situations/hypotheses≤4/bracket/level_grid 全品种/approach/breakout_atr/retest_window_bars/expected_delta_p∈(0,0.5)；price_levels 研究候选必带 [prob] 且不带 [declared]）；`precheck_prob` 五条件（成本口径 ΔEV_R=Δp×(tp_R+1) ≥ 3×触发小时均值成本(R)；检验力按假设（局面×动作，跨品种/方向合并）发现段最小触发数 vs 解析样本量，**t75_rule_pending=True——T75 实测样本量规则批准后取两者更严，届时接线**）；`propose_split`（各品种计入段并集→共同覆盖最长段中点→取整月初）；
   - `bt.py`：`bt candidate check` 概率模式分支（逐品种×局面计数→发现段子集→precheck_prob；`--split` 可显式指定月初，缺省自动提案）+ `bt segment propose` 子命令（真实库冒烟：XAUUSD H1 → 2019-12-01）——tests/test_prob_precheck.py 15 例。
   - 计划测试行对应：复现表 `test_n_needed_reproduces_blueprint_table`（九格参数化）+ `test_review_examples`；成本 fail `test_precheck_prob_cost_fail`、触发不足 waiting `test_precheck_prob_insufficient_triggers_waiting`；分界确定 `test_propose_split_deterministic_and_month_floored`；计数无结果列 `test_count_output_has_no_outcome_columns`、不 import 标签 `test_count_module_does_not_import_labels`（AST）。
+- [ ] **审核二修正（现在做，`docs/reviews/2026-10-28-review-pline-02.md`）**：
+  - Q1 事前成本逐品种：每个品种都要满足 ΔEV ≥ 3 倍成本（等价于取成本最高的品种）；保留 `checks["ex_ante_cost_prob"]["passed"]` 这个键；补两品种测试（一便宜一贵，贵的不满足 → fail）；
+  - Q2 佣金换算：`commission_per_lot / cs`（价格单位），再除以 `sl_atr × ATR` 换成 R；补一条非零佣金的手算测试；
+  - Q3 检验力的多重校正：`n_tests` 取候选登记的假设条数（4）；给开轮复核提供同一函数的全轮口径（T77 用）；测试复现蓝图 P 线 §3.4 的 D52 表（4 个假设：3,014 / 1,340 / 483；12 个假设：4,176 / 1,856 / 669）；
+  - Q6 样本单位与逐条判定：检验力样本数按发现段内的触发日数计；逐条判定，结果写进 `checks["power_prob"]` 的逐条明细；不足的假设判 waiting_data 并列出，候选至少一条通过才算通过；
+  - `precheck_prob` 对每个条件都给出结果，不短路；不改 `tests/test_prob_precheck.py` 里 `prob_data`、`counted_df` 的调用方式（复现脚本在用）；
+  - 已知限制写进预筛输出的 note：事前成本未计入隔夜费与止损越幅；基准赢率固定为 0.40（比按止损止盈推算的 1/3 保守）；
+  - 验收：本任务测试与全量回归通过；`./.venv/Scripts/python.exe docs/reviews/probes/2026-10-28-pline-probes.py` 四项 PASS（P4 由 FAIL 转 PASS）；CI 绿，证据写提交号与 tests run_number。
+- [ ] **收尾（T75 批准后）**：`t75_rule_pending` 改为 False；检验力取解析表与 T75 实测样本量规则中更严的一个，单位同为触发日数；测试覆盖"实测更严时以实测为准"。
 
 ## T77：P 线首批候选与第一轮草案（M）——批准点
 
@@ -359,18 +420,21 @@ def n_needed_proportion(p0: float, dp: float, *, alpha: float = 0.05, power: flo
   - 数据挖掘方面的警示：Sullivan、Timmermann、White（1999）；
   - C102 找不到文献就判 fail，不开卡。
 - [ ] **候选内容**：
-  - 按蓝图 P 线 §7 写明局面、品种、要检验的"动作 × 方向"（每个候选 ≤ 4 条，全轮 ≤ 12 条）；
-  - 预期 Δp 按文献折算，没有复现时按 −58%；
-  - 跑 `bt candidate check`。
+  - 品种只用 XAUUSD（D53）；
+  - 按蓝图 P 线 §7 登记本局面的全部四个动作，方向由动作定义决定（D51）：`S#:A1:follow>base`、`S#:A2:follow>base`、`S#:A3:fade>base`、`S#:A4:fade>base`；不得依据计数或任何看过的数据增删动作、改方向；
+  - 预期 Δp 只按文献折算，没有复现时按 −58%；不得取自发现段的结果（发现段就是 P1 的检验数据）；
+  - 跑 `bt candidate check`（审核二修正后的版本）。
 - [ ] **轮次草案**：
-  - 候选 ≤ 3；`evaluation_mode = "probability"`；`segment = "discovery"`；
-  - `[segments] split` 取自 `bt segment propose`；
-  - 试验预算 ≤ 12 次去重试验；`lockbox_uses_max = 0`（P1 不用锁箱）；
+  - 候选 ≤ 3；`[evaluation]` 每个候选 `{ mode = "probability", primary = "delta_p_one_sided" }`；
+  - `[segments] split` 写入前重跑 `bt segment propose --symbols XAUUSD --timeframe H1` 确认（审核时为 2019-12-01）；
+  - 试验预算 = 本轮假设条数（≤ 12 次去重试验）；`lockbox_uses_max = 0`（P1 不用锁箱，需 T73A）；`dsr_trial_scope` 按 T64 的项目级口径；
+  - 本轮假设表 = 各候选预筛通过的假设；再按全轮条数做一次检验力复核（D52，只做一遍），不足的假设判 waiting_data 移出；最终假设表写进草案，作为 Holm 的假设族；
   - 推进规则：Holm 校正后显著，且 Δp 点估计满足事前成本要求；
-  - 结束条件：全部假设有结论，或预算用尽。
-- [ ] **候选报告**：材料对比表，列出机制、文献三栏、折算效应、事前成本、触发数与检验力、预筛结论。**提交后停下，等审核批准；批准前不开卡、不跑任何运行。**
+  - 结束条件：全部假设有结论，或预算用尽；
+  - `approved_by` 留空，由 P 线审核会话批准时填写。
+- [ ] **候选报告**：材料对比表，列出机制、文献三栏、折算效应、事前成本（逐品种）、逐条假设的发现段触发日数与检验力（4 条与全轮两种口径）、预筛结论。**提交后停下，等 P 线审核会话批准；批准前不开卡、不跑任何运行。**
 
-## T78：风控号段子上限与 P 线实盘接入（M，阶段 F 结束后）
+## T78：风控号段子上限与 P 线实盘接入（M，阶段 F 结束后，H 线会话负责）
 
 **Files:**
 - `src/mt5live/riskproc.py`；`config/risk.toml`、`config/risk-demo.toml`：新增 `[[line_caps]]`；
@@ -394,6 +458,99 @@ def n_needed_proportion(p0: float, dp: float, *, alpha: float = 0.05, power: flo
   - 非拟合策略配置逐字段行为不变；
   - 执行器对 `time_stop_bars`、`week_close_exit` 的启动拒绝保持不变。
 
+## T90：P1 运行入口 `bt prob test`（M）
+
+**Files:** 新建 `src/mt5quant/prob/p1.py`（编排：计数 → 标签 → 随机化零假设 → Δp 检验）；`scripts/bt.py` 新增 `bt prob test` 与 `bt prob round-report`；测试 `tests/test_prob_p1.py`。
+
+**时间安排**：T73A 与 T75 的代码完成后就可以写，只用合成数据测试；真实数据上的运行属于 T91，要等 T77 批准。
+
+- **`bt prob test --card <P###-v#>`**：
+  - 前置检查，任一不满足就拒绝运行：
+    - 卡已提交并登记（先卡后测）；
+    - 卡的 `evaluation_mode = "probability"`、`segment = "discovery"`；
+    - 所属轮次能装载（`approved_by` 非空），且该候选的 `[evaluation].mode = "probability"`；
+    - 卡的假设表与轮次草案写定的假设族一致；
+    - 本轮剩余试验预算够用；
+  - 数据：只读 `time < split` 的 bar；标签取 `train_end = split`，越过分界的触发按 bar 下标剔除；
+  - 每条假设：
+    - 真实触发 → 标签；
+    - 随机化触发（T75 的 `randomize_triggers`；种子由卡号与假设确定性生成，并记录）→ 标签；
+    - `delta_p_test`（按日聚合、按月块自助）→ 原始 p 值；
+  - 一张卡的全部假设一次跑完，不能只跑其中几条；
+  - 台账（T73A 的字段约定，不改表结构）：
+    - 每条假设一行 run，`run_class = "research"`，带 `round_id`；
+    - `params_json` 含假设、止损止盈、`segment`、`split`、种子；
+    - `metrics_json.metrics` 含触发次数与触发日数、真实与零假设赢率、Δp、单侧 p 值、`prob_version`；
+    - 相同输入重跑按现有去重规则不增加 N。
+- **`bt prob round-report <R#>`**：
+  - 本轮全部卡都跑完才能出；
+  - 在本轮假设族上做 Holm，按轮次文件的推进规则判定；
+  - 输出 `docs/research/round-<R#>-p1-<日期>.md`（报告头"状态：待审核"）与同名 JSON。
+- [ ] 失败测试先行（只用合成数据）：
+  - 植入 Δp = 0.05、触发日数 2,000 → 检出；未植入 → 不检出（固定种子）；
+  - 前置检查逐条：未批准的轮次、validation 卡、读到 `>= split` 的数据、假设表与草案不一致、预算不足 → 拒绝；
+  - 越过分界的触发被剔除；
+  - 同一输入两次运行结果逐位一致，台账去重 N 不变；
+  - 有卡未跑时 round-report 拒绝；Holm 与手算一致。
+
+## T91：P1 现象检验轮（M）——批准点
+
+**前提：** T77 已获 P 线审核会话批准（轮次文件的 `approved_by` 已由审核会话填写）；T90 完成。
+
+- [ ] **开卡**：
+  - 每个进入本轮的候选一张 P 卡（`P001-v1` 起，按蓝图 P 线附录 A），绑定 T74 的局面与动作；
+  - 假设表与草案写定的假设族一致；卡里不出现任何结果；
+  - 先提交卡，再运行。
+- [ ] **运行**：逐卡 `bt prob test`，然后 `bt prob round-report`。
+- [ ] **轮次报告**：
+  - 逐条假设：触发日数、真实与零假设赢率、Δp 及区间、原始 p、Holm 校正后的 p、推进结论；
+  - 同一套代码上的对照复核：植入效应能检出，随机化触发不检出；
+  - 已知限制；
+  - 不通过的假设按现有规则进墓地。
+- 看完结果后不得改卡重跑。任何改动只能作为新版本，在新一轮登记。
+- **报告头"状态：待审核"；提交后停下，交 P 线审核会话。**
+
+## T92：P2 决策系统（L）——两个批准点
+
+**前提：** T91 已批准且至少一条假设通过；T73B、T74 收尾完成。
+
+- [ ] **决策卡**：
+  - `segment = "validation"`、`evaluation_mode = "standard"`，绑定 `LevelDecisionV1` 的子类；
+  - 只用 P1 通过的"局面 × 动作"；
+  - 特征、收缩与门槛取蓝图 P 线 §2.4–§2.5 的缺省值（m = 100、min_cell = 100、lb_z = 1.0、门槛 2 倍成本、两个特征），不调参；要偏离缺省值，只能依据发现段，并在草案里写明依据。
+- [ ] **轮次草案**：
+  - 新的轮次编号；
+  - `[evaluation]` 的主检验按 T65 批准的关卡 v3 填写；
+  - `lockbox_uses_max = 1`（G5 在本轮内使用，见 T93）；试验预算 = 决策卡张数；
+  - `[segments] split` 与 P1 轮相同；
+  - **提交后停下，交 P 线审核会话批准（第一个批准点）。**
+- [ ] **运行（草案批准后）**：
+  - 验证段 walk-forward，逐窗重新拟合 + purge（T73B）；
+  - 关卡 v3 主检验、否决项、样本外校准否决项；诊断。
+- [ ] **轮次报告**：`docs/research/round-<R#>-p2-<日期>.md`，含：
+  - 各窗口的模型哈希；
+  - 校准（Brier 技能分）；
+  - 成本敏感性与交易次数。
+  - **报告头"状态：待审核"；提交后停下（第二个批准点）。**
+
+## T93：确认——G5、影子盘与前向样本（M，持续 6–12 个月）——批准点
+
+**前提：** T92 已批准；T78 已由 H 线会话落地。
+
+- [ ] **G5**：
+  - 先查 D16 剩余预算：每个锁箱 3 次、每轮 ≤ 1 次，两条线共用；
+  - **每次使用前停下，交 P 线审核会话批准**；
+  - 按现有锁箱流程：先写 started，再读锁箱数据。
+- [ ] **部署准备（G5 通过后）**：
+  - 模型：用 T92 草案写定的最终拟合窗拟合一次，哈希记入台账；
+  - 准备模型文件、哈希，以及影子盘（magic 903001–903099）与模拟盘（903101–903199）的配置草案；
+  - 写交接说明：文件、哈希与配置。
+- 部署与运行由 H 线会话执行（实盘链路、`data/live/`、`config/` 归 H 线）。P 线会话不启动、不停止任何实盘进程。
+- [ ] **前向样本**：
+  - 每月一份 `docs/research/forward-<卡>-<年月>.md`：交易次数、实测赢率与概率表预测的对比（Brier）、实盘与回测对账、成本偏差；
+  - 6–12 个月后按 D37 下结论，交 P 线审核会话。
+- 只用模拟盘，不进真金。
+
 ---
 
 ## 集成与验收
@@ -407,7 +564,11 @@ def n_needed_proportion(p0: float, dp: float, *, alpha: float = 0.05, power: flo
    - 分段约束生效。
 3. 评估（T75）：标定报告给出误报率、检出率与样本量规则，交审核。
 4. 首批候选（T76–T77）：候选报告与轮次草案交审核；批准后才进入阶段 P1。
-5. 实盘接入（T78）：P 线进入前向样本之前完成。
+5. 实盘接入（T78，H 线会话）：P 线进入前向样本之前完成。
+6. P1 运行入口（T90）：前置检查与 purge 由测试证明；合成数据上植入效应能检出、零假设不检出。
+7. P1（T91）：轮次报告交审核；只有通过的假设能进入 P2。
+8. P2（T92）：轮次草案与轮次报告都交审核；样本外校准否决项生效。
+9. 确认（T93）：每次 G5 前经审核批准；前向样本按月报告。
 
 ## 明确不做
 
@@ -416,4 +577,6 @@ def n_needed_proportion(p0: float, dp: float, *, alpha: float = 0.05, power: flo
 - 马丁、网格、摊平（铁律 20）；
 - 机器学习模型；LLM 参与逐笔决策；
 - 在批准点之前推进依赖它的任务；
-- 实盘真金下单；修改现行 `config/gates.toml`（只能经 T65 批准）。
+- 实盘真金下单；修改现行 `config/gates.toml`（只能经 T65 批准）；
+- 改台账 runs 表结构（P 线字段放进已有的 JSON 列，见 T73A）；
+- P 线会话部署、启停实盘进程（归 H 线会话）。
