@@ -1160,8 +1160,8 @@ def main(argv=None) -> int:
                                    tf_seconds=tf_seconds,
                                    start=start, end=end)
         if args.costs == "auto":
-            costs, cost_version = # T83：对账路径刻意不传 swap_ref_price——与 MT5 策略测试器的绝对计费同口径（守护测试钉住）
-    build_costs(
+            # T83：对账路径刻意不传隔夜费参考价参数——与 MT5 策略测试器的绝对计费同口径（守护测试钉住）
+            costs, cost_version = build_costs(
                 args.data_root, args.symbol, args.spread_fraction,
                 args.commission, allow_zero_swap=args.allow_zero_swap,
                 spread_mode=args.spread_mode)
