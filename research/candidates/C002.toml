@@ -4,7 +4,7 @@
 id = "C002"
 title = "月末对冲调仓（USTEC 当月涨跌 → EURUSD，伦敦定盘前）"
 mechanism_class = "cross_asset"
-status = "waiting_data"             # 2026-10-28 bt candidate check 实测：waiting_data（检验力 23% < 50%，EURUSD 日内 4.44 年且外部日内源未批准）；事前成本倍数 3.15 过线
+status = "waiting_data"             # 2026-10-28 bt candidate check 实测（ECB 14bp 口径修订后）：waiting_data（检验力 45% < 50%，EURUSD 日内 4.44 年且外部日内源未批准——MDS 2.14 封顶）；事前成本倍数 4.89 过线
 symbols = ["EURUSD"]
 holding = "H1"
 mechanism = "外国股票组合管理人按月末市值调汇率对冲敞口：当月美股上涨 → 对冲市值上升 → 月末最后一个定盘前须卖出 USD 买回本币（或反向），集中在伦敦定盘前一小时成交（Melvin & Prins 2015 的对冲通道）。送钱方：在定盘前一小时被动承接对冲流的对手方。信号 = USTEC 上月倒数第二日至本月倒数第二日的累计涨跌；交易 = 月末最后交易日伦敦定盘前 1 小时的 EURUSD 方向仓（涨→多 EURUSD/USD 贬值方向）。"
