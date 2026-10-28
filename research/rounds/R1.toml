@@ -1,30 +1,55 @@
-# R1 研究轮次预注册【草案】（T68，2026-10-28）——批准点文件：
+# R1 研究轮次预注册【重提草案】（T68b/R14，2026-10-29）——批准点文件：
 # approved_by 留空 = 草案；装载器（rounds.load_round）拒绝空 approved_by，
 # 因此"批准前不开轮"由机器保证。用户批准时填入批准人并提交，才可
-# bt round open R1。
+# bt round open R1（开启另有前置：本文件已提交且工作区干净、候选全部
+# screened_pass——台账 candidate_checks 最新 decision=pass、lockbox 申报
+# ≤ D16 剩余预算）。
 #
-# 现状如实记录（2026-10-28 bt candidate check 实测）：
-# - C001 预筛 fail（事前成本倍数 1.79 < 3，USTEC 快照隔夜费主导；
-#   U0"账户是否 swap-free"确认后重检可能翻盘——见候选报告 §2.3）；
-# - C002 预筛 waiting_data（EURUSD 日内 4.44 年检验力 45% < 50%；外部日内源
-#   未批准——HistData 条款待核实、Dukascopy 不可达）。
-# 因此本草案的 candidates 是**拟议组成**：截至草案日无一候选 screened_pass，
-# R1 不满足开启前置条件（bt round open 会拒）。批准前若预筛结论更新
-# （重检翻案以台账最新为准，T62 口径），candidates 按届时事实增删并随
-# 批准一并定稿——本草案不预先列入未通过预筛的新候选。
+# 现状如实记录（2026-10-29 重提时点，台账 candidate_checks 最新结论）：
+# - C001 pass（2026-10-28T21:03:54Z，T94 重跑终值）：swap_dependent=true
+#   ——swap_free 口径（成本倍数 29.68、检验力 53.5%）通过而 charged 口径
+#   （1.47、16.1%）不通过；翻案首发于 ccaad37（2026-10-28T16:57Z，倍数
+#   29.63）：依赖 2026-10-29 用户对四品种 swap_free 的账户确认
+#   （config/account-profile.toml，三观测窗证据）。
+# - C002 pass（2026-10-28T21:03:46Z 终检，b3b65d0/T94）：EURUSD 研究段
+#   18.72 年（histdata 2007-01 起 ∪ MT5，扣月级闸门丢弃月份）、隐含夏普
+#   0.49 下检验力 64.0%、成本倍数 4.88——不再边际。
+# 两候选均 screened_pass（台账口径，T62；运行约束以台账为准，候选 TOML
+# 的 status 字段是登记材料）。
+#
+# 两点如实披露（详见 docs/research/candidates-R1-2026-10-29.md，交批准点裁决）：
+# 1. C001 研究段非盲检（R13 K3）：observed_in_sample="T66 §3.2"，两次观察
+#    已记台账 run 447/448——只能靠锁箱与前向样本确认（本轮 advance_rule
+#    即含 G5）。"月末类候选不在 USTEC、BTCUSD 上登记（K3）"（计划 T68b）
+#    约束**新登记**，不溯及 2026-10-28 已登记的 C001。
+# 2. R13 §4.3 曾按目标市场发表后证据（Han, Han & Tian 2025：美股 TOM
+#    2001 年后消失）判 C001 预期≈0、退出 R1，并明言"是否 swap-free 都
+#    改变不了这一点"；2026-10-29 swap_free 确认后按登记折算值（−58% 口径
+#    0.24%/事件）机械重检翻 pass（swap_dependent 如实标注）。两种口径在
+#    C001.toml 的 expected_effect 并存，重提以台账最新结论（pass）列入；
+#    若批准点维持 R13 §4.3 判定，则 candidates 改为 ["C002"]、trial_budget
+#    相应改为 2 后再批——本草案不预改。
 id = "R1"
-opened = "2026-10-28"
-candidates = ["C001", "C002"]        # 拟议组成（≤3，附录 D）；开启前置：全部 screened_pass
-trial_budget = 24                    # 2 候选 × 事件模式参数网格 ≤10 组（T66 建议）+ 少量迭代余量
+opened = "2026-10-29"
+candidates = ["C001", "C002"]        # 台账最新预筛均 pass（附录 D ≤3）；
+                                     # 开启前置"全部 screened_pass"已满足
+trial_budget = 4                     # 2 × 候选数（R13 §4.3 修订要求/计划 T68b：
+                                     # 每个候选只跑登记的一个主规格，窗口变体
+                                     # 只作诊断（关卡套件内部计算，不单独作研
+                                     # 究运行），留一次代码修复后的重跑）
 lockbox_uses_max = 1                 # D16 机器强制：每研究轮次最多 1 次 G5（总预算 3 次，H/P 线共用）
-dsr_trial_scope = "rounds_lineage"   # T96 对齐 T85/D34 冻结口径（[g4].dsr_trial_scope=
-                                     # rounds_lineage = ledger.primary_test_n 的门槛部分：
-                                     # 轮次内全项目累计 + 候选延续谱系的轮次外历史；
-                                     # T64/D33 原 project 语义已被冻结版取代）
-advance_rule = "推进（本轮算过）= 候选的主检验通过且全部否决项通过：事件模式候选按 T66 事件收益均值单侧检验（年块自助、显著性按项目级 N 校正——D35 批准后的口径）；如走关卡 v3 标准路径则按方案甲（DSR 项目级 N ≥ 0.95）+ G0 与三稳健性否决（成本 ×1.5、延迟一根、多头相对买入持有超额——D34 批准后的口径）。任一候选判定'过'后，本轮不再为其挑选参数或开新变体（过了不再同轮挑选）；判定依据全部为轮次文件与关卡配置预写规则，不按结果临时调整。"
-close_rule = "结束条件（先到即止）：(a) 试验预算 24 次去重研究试验用尽；或 (b) 全部候选均有结论——通过者最多 1 次 G5（lockbox_uses_max）后关闭，未通过者登记结论关闭。关闭后 bt round close R1 生成轮次报告（含全部运行与按 advance_rule 的判定），本轮不能再运行。"
-approved_by = ""                     # 草案留空：交 H 线审核会话复核、用户批准后填写（批准点）
+dsr_trial_scope = "rounds_lineage"   # T85/D34 冻结 + T96 对齐：N = ledger.primary_test_n
+                                     # 的门槛部分 = 轮次内全项目累计去重研究试验
+                                     # + 候选延续谱系的轮次外去重试验；轮次制
+                                     # 之前的其余历史只报告不进门槛
+advance_rule = "推进（本轮算过）= 候选的主检验与全部适用否决项通过（两候选均事件模式，按冻结 config/gates.toml 的 [v3.event]/D35 口径）：主检验 = 随机化参照检验，单侧 p ≤ α/N（α=0.05 复用 [v3] 同一值；N 按 dsr_trial_scope=rounds_lineage 口径——轮次内全项目累计去重研究试验 + 候选延续谱系轮次外去重试验，不吃 n_min，随机化检验 N=1 也精确；随机化次数 ≥ max(1999, ⌈20N/α⌉)，入口预检低于下限拒绝运行）；G0 通过；否决仅一项适用 = 成本 ×1.5 后每事件净均值仍 > 0（'延迟一根'与'多头相对买入持有超额'两项对按时钟定义的事件窗不适用、不运行——[v3.event] 两 veto=false）；诊断四项（年块自助对 0、事件窗前后各移一根 bar、分段均值、已知缺口注记）只报告不否决。任一候选判定'过'后，本轮不再为其挑选参数或开新变体（过了不再同轮挑选）；判定依据全部为本文件与冻结 gates.toml 的预写规则，不按结果临时调整。"
+close_rule = "结束条件（先到即止）：(a) 试验预算 4 次去重研究试验用尽；或 (b) 全部候选均有结论——通过者最多 1 次 G5（lockbox_uses_max=1，D16）后关闭，未通过者登记结论关闭。关闭后 bt round close R1 生成轮次报告（含全部运行与按 advance_rule 的判定），本轮不能再运行。"
+approved_by = ""                     # 草案留空：交 H 线审核会话复核、用户批准后由批准方填写（批准点；执行会话不得填写）
 
 [evaluation]
-C001 = { mode = "event", primary = "event_mean_return_one_sided" }
-C002 = { mode = "event", primary = "event_mean_return_one_sided" }
+C001 = { mode = "event", primary = "randomization" }   # 月末事件模式（USTEC D1，
+                                                      # T84/K8 事件窗）：主检验与
+                                                      # 冻结 [v3.event].primary_test
+                                                      # ="randomization" 同名
+C002 = { mode = "event", primary = "randomization" }   # 定盘事件模式（EURUSD H1，
+                                                      # 伦敦定盘前一小时）
