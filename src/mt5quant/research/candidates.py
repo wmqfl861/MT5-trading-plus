@@ -932,9 +932,9 @@ def precheck(candidate: Candidate, *, data_root, cost_model,
                                "active_mechanisms": sorted(active)}
     reasons.append(gap_note)
 
-    if not lit_ok or not holding_ok or not cost_ok:
+    if not lit_ok or not holding_ok or cost_ok is False:
         decision = "fail"
-    elif not power_ok:
+    elif cost_ok is None or not power_ok:
         decision = "waiting_data"
     else:
         decision = "pass"
@@ -964,16 +964,16 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
     条件（与 H 线 precheck 平行；只做事前计算，不看任何结局）：
     1. 文献：同 H 线；
     2. 决策周期 ≥ H1（candidate.holding）；
-    3. 事前成本：Δp×(tp_R+1) ≥ 3 × 来回成本(R)——ΔEV 为折算预期 Δp 的
-       边际期望毛收益（赢一注替掉输一注，毛收益差 = tp_R+1 个 R；与 G1/
-       蓝图 P 线 §3.4 的"毛利 ≥ 3 倍成本"同型）。成本 = 触发纽约小时的
-       （点差 + 双腿滑点 + 佣金）÷ (sl_atr×ATR)，按品种取均值、取最紧
-       品种；触发小时分布来自计数（不看结果）；
-    4. 检验力：发现段内每个假设（局面×动作，跨品种、跨方向合并——蓝图
-       P 线 §3.2 的假设单位）的触发数 ≥ n_needed_proportion(0.40, Δp,
-       power=0.5)（解析表；T75 实测样本量规则落地后取两者更严——本接线
-       待 T75，见 checks["power_prob"]["t75_rule_pending"]）；不足 →
-       waiting_data（铁律 18）；
+    3. 事前成本（审核二 Q1/Q2）：**逐品种**检查 ΔEV = Δp×(tp_R+1) ≥
+       3×来回成本(R)——每个品种都要满足（等价于按成本最高的品种判断）。
+       成本 = 触发纽约小时的（点差 + 双腿滑点 + 佣金/合约大小）÷
+       (sl_atr×ATR) 按触发均值（佣金 commission_per_lot/cs 为价格单位）；
+       触发小时分布来自计数（不看结果）；
+    4. 检验力（审核二 Q3/Q6，D52）：样本单位为发现段内的**触发日数**
+       （同一天多次触发记 1）；Bonferroni 条数 = 候选登记的假设条数；
+       **逐条判定**——不足的假设判 waiting_data 并列出（开轮时移出），
+       候选至少一条通过才算通过；解析表 vs T75 实测取更严（接线待 T75，
+       见 checks["power_prob"]["t75_rule_pending"]）；
     5. 机制空缺：price_levels 是新类别（D45）——排序类理由，不阻塞。
     """
     if candidate.status in BOOKKEEPING_STATUSES:
@@ -1012,7 +1012,9 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
     tp_r = pdecl.bracket["tp_atr"] / pdecl.bracket["sl_atr"]
     edge_ev_r = pdecl.expected_delta_p * (tp_r + 1.0)
 
-    # 条件 3：事前成本（R 口径，按品种均值取最紧）
+    # 条件 3：事前成本（R 口径；审核二 Q1：逐品种检查，每个品种都要满足，
+    # 等价于按成本最高的品种判断；Q2：佣金 = commission_per_lot / cs 为价格
+    # 单位，再除以 (sl_atr×ATR) 换成 R）。每个条件都给出结果，不短路。
     per_symbol: dict[str, dict] = {}
     for sym in candidate.symbols:
         rows = None
@@ -1022,76 +1024,109 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
             per_symbol[sym] = {"n": 0, "cost_r": None}
             continue
         cs = _contract_size(data_root, sym)
+        comm_price = cost_model.commission_per_lot(sym) / cs
         costs_r = []
         for r in rows.itertuples(index=False):
             hour, price = int(r.ny_hour), float(r.close)
             spr = cost_model.spread_p90(sym, hour, price=price)
             slip = cost_model.slippage(sym, hour, price=price)
-            comm = cost_model.commission_per_lot(sym) / (cs * price)
             r_price = pdecl.bracket["sl_atr"] * float(r.atr)
-            costs_r.append((spr + 2.0 * slip + comm) / r_price)
+            costs_r.append((spr + 2.0 * slip + comm_price) / r_price)
         per_symbol[sym] = {"n": int(len(rows)),
                            "cost_r": float(np.mean(costs_r))}
     known = {s: d["cost_r"] for s, d in per_symbol.items()
              if d["cost_r"] is not None}
+    cost_ok: bool | None
     if len(known) == len(candidate.symbols):
-        worst_symbol = min(known, key=lambda s: known[s])
-        worst_cost_r = known[worst_symbol]
-        cost_ok = edge_ev_r >= _COST_MULTIPLE_MIN * worst_cost_r
+        # 逐品种判定（Q1）：任一品种 ΔEV < 3×cost → 不通过
+        failing = sorted(s for s, v in known.items()
+                         if edge_ev_r < _COST_MULTIPLE_MIN * v)
+        cost_ok = not failing
+        dearest = max(known, key=lambda s: known[s])
         checks["ex_ante_cost_prob"] = {
             "passed": cost_ok, "edge_ev_r": edge_ev_r,
             "expected_delta_p": pdecl.expected_delta_p, "tp_r": tp_r,
-            "worst_symbol": worst_symbol,
+            "binding_symbol": dearest,
             "cost_r_by_symbol": {s: float(v) for s, v in known.items()},
+            "failing_symbols": failing,
             "min": _COST_MULTIPLE_MIN,
-            "formula": "ΔEV_R = Δp×(tp_R+1) ≥ 3×来回成本(R)；成本 = 触发纽约"
-                       "小时（点差+双腿滑点+佣金）÷ (sl_atr×ATR) 的均值"}
-        if not cost_ok:
+            "formula": "逐品种：ΔEV_R = Δp×(tp_R+1) ≥ 3×来回成本(R) 须对每个"
+                       "品种成立（等价于按成本最高品种判断，Q1）；成本 = 触发"
+                       "纽约小时（点差+双腿滑点+佣金/合约大小）÷ (sl_atr×ATR)"
+                       "的均值（Q2：佣金 commission_per_lot/cs 为价格单位）",
+            "note": "已知限制：未计入隔夜费与止损越幅；基准赢率固定为 0.40"
+                    "（比按止损止盈推算的 sl/(sl+tp)=1/3 保守）"}
+        for s in failing:
             reasons.append(
                 f"事前成本：ΔEV {edge_ev_r:.4f}R < "
-                f"{_COST_MULTIPLE_MIN:g}×{worst_cost_r:.4f}R（{worst_symbol}，"
-                "预筛条件 3——折算 Δp 覆盖不了 3 倍成本）")
+                f"{_COST_MULTIPLE_MIN:g}×{known[s]:.4f}R（{s}——逐品种检查，"
+                "预筛条件 3：折算 Δp 覆盖不了该品种的 3 倍成本）")
     else:
-        cost_ok = True      # 无计数时成本无从按小时分布算——由检验力条件挡
+        cost_ok = None      # 无计数 → 条件如实给出"无法计算"，不视为通过
         checks["ex_ante_cost_prob"] = {
             "passed": None, "edge_ev_r": edge_ev_r,
             "note": "无触发计数——成本无从按小时分布计算（与检验力同因）"}
 
-    # 条件 4：检验力（发现段触发数 vs 解析样本量；T75 实测规则待接线）
+    # 条件 4：检验力（审核二 Q3/Q6，D52）——样本单位为发现段内的**触发
+    # 日数**（同一天多次触发记 1，与 P1 主检验的按日聚合一致）；Bonferroni
+    # 条数 = 候选登记的假设条数；逐条判定：不足的假设机械判 waiting_data
+    # 并列出（开轮时从本轮移除，不替换动作、不改方向），候选至少一条通过
+    # 才算通过；开轮复核按全轮假设条数再算一遍（T77 用同一函数的全轮口径）。
+    # T75 实测样本量规则批准后取解析与实测更严者（收尾接线）。
+    n_hyp = len(pdecl.hypotheses)
     n_required = power.n_needed_proportion(
         _PROB_BASE_RATE, pdecl.expected_delta_p,
-        alpha=_POWER_ALPHA, power=_POWER_MIN, n_tests=_POWER_N_TESTS)
-    groups: dict[tuple[str, str], int] = {}
-    available_min = None
-    if counted is not None and len(counted) > 0:
-        groups = {k: int(v) for k, v in
-                  counted.groupby(["situation", "action"]).size().items()}
-        available_min = min(
-            (groups.get((h.split(":")[0], h.split(":")[1]), 0)
-             for h in pdecl.hypotheses), default=0)
-    power_ok = available_min is not None and available_min >= n_required
+        alpha=_POWER_ALPHA, power=_POWER_MIN, n_tests=n_hyp)
+    per_hypothesis: dict[str, dict] = {}
+    insufficient: list[str] = []
+    if counted is None or len(counted) == 0:
+        power_ok = False
+    else:
+        sub = pd.DataFrame({
+            "situation": counted["situation"].to_numpy(),
+            "action": counted["action"].to_numpy(),
+            "day": pd.to_datetime(counted["time"]).dt.date.to_numpy()})
+        for h in pdecl.hypotheses:
+            sit, act = h.split(":")[0], h.split(":")[1]
+            n_days = int(sub.loc[(sub["situation"] == sit)
+                                 & (sub["action"] == act), "day"].nunique())
+            ok_h = n_days >= n_required
+            per_hypothesis[h] = {"trigger_days": n_days,
+                                 "required_days": int(n_required),
+                                 "passed": bool(ok_h)}
+            if not ok_h:
+                insufficient.append(h)
+        power_ok = len(per_hypothesis) > len(insufficient)
     checks["power_prob"] = {
         "passed": power_ok,
+        "unit": "trigger_days",
+        "n_tests": n_hyp,
         "n_required_analytic": int(n_required),
-        "n_available_min": (None if available_min is None
-                            else int(available_min)),
-        "counts_by_situation_action": {f"{s}|{a}": n
-                                       for (s, a), n in sorted(
-                                           groups.items())},
+        "per_hypothesis": per_hypothesis,
+        "insufficient": insufficient,
+        "passing_count": len(per_hypothesis) - len(insufficient),
         "split": str(split),
         "base_rate": _PROB_BASE_RATE,
-        "alpha": _POWER_ALPHA, "n_tests": _POWER_N_TESTS,
+        "alpha": _POWER_ALPHA,
         "t75_rule_pending": True,
-        "note": ("无触发计数" if available_min is None else
-                 "发现段（time < split）内假设（局面×动作，跨品种/方向合并）"
-                 "的最小触发数 vs 解析样本量；T75 实测样本量规则批准后取"
-                 "两者更严——t75_rule_pending 届时改接实测")}
-    if not power_ok:
-        detail = ("无触发计数" if available_min is None else
-                  f"发现段可用触发 {available_min} < 解析样本量 {n_required}")
+        "note": ("无触发计数" if counted is None or len(counted) == 0 else
+                 "逐条判定（D52）：样本单位为发现段（time < split）内该假设"
+                 "（局面×动作，跨品种/方向合并）的触发日数；Bonferroni 条数"
+                 "=候选登记假设数；不足的假设判 waiting_data（开轮时移出，"
+                 "不替换不改向），候选至少一条通过才算通过；开轮复核用同一"
+                 "函数按全轮假设条数（T77）；T75 实测规则批准后取更严者")}
+    if counted is not None and len(counted) > 0:
+        for h in insufficient:
+            d = per_hypothesis[h]
+            reasons.append(
+                f"检验力：假设 {h} 发现段触发日数 {d['trigger_days']} < "
+                f"解析样本量 {d['required_days']}（按 {n_hyp} 条假设 "
+                "Bonferroni）→ 该假设待数据（铁律 18；开轮时从本轮移除，"
+                "不替换动作、不改方向）")
+    elif not power_ok:
         reasons.append(
-            f"检验力：{detail} → 待数据（铁律 18：延长研究段（T67）/合并"
-            "品种后重检；T75 实测规则批准前按解析表）")
+            "检验力：无触发计数 → 待数据（计数经 bt candidate check 自动"
+            "执行；T75 实测规则批准前按解析表）")
 
     # 条件 5：机制空缺（排序类，不阻塞）
     active = set(active_mechanisms or ())
@@ -1106,9 +1141,9 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
                                "active_mechanisms": sorted(active)}
     reasons.append(gap_note)
 
-    if not lit_ok or not holding_ok or not cost_ok:
+    if not lit_ok or not holding_ok or cost_ok is False:
         decision = "fail"
-    elif not power_ok:
+    elif cost_ok is None or not power_ok:
         decision = "waiting_data"
     else:
         decision = "pass"

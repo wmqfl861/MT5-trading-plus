@@ -1041,14 +1041,24 @@ def cmd_candidate_check(args) -> int:
         print(f"  单次检验力 {pw:.0%}（门槛 ≥50%，{years_note}）")
     pp = payload["checks"].get("power_prob")
     if pp is not None:
-        print(f"  发现段最小触发数 {pp['n_available_min']} / 解析样本量 "
-              f"{pp['n_required_analytic']}（分界 {pp['split']}；"
-              "T75 实测规则批准前按解析表）")
+        # D52：逐条假设按触发日数判定（审核二 Q6）
+        for h, d in pp.get("per_hypothesis", {}).items():
+            mark = "✓" if d["passed"] else "⏳"
+            print(f"  {mark} 假设 {h}：触发日数 {d['trigger_days']} / "
+                  f"解析样本量 {d['required_days']}（{pp['n_tests']} 条假设 "
+                  f"Bonferroni；分界 {pp['split']}；单位=触发日）")
+        if not pp.get("per_hypothesis"):
+            print(f"  ⏳ 无触发计数（解析样本量 "
+                  f"{pp['n_required_analytic']} 日；分界 {pp['split']}）")
+        print("  （T75 实测样本量规则批准前按解析表）")
         ec = payload["checks"].get("ex_ante_cost_prob", {})
         if ec.get("cost_r_by_symbol"):
-            worst = min(ec["cost_r_by_symbol"].values())
-            print(f"  ΔEV {ec['edge_ev_r']:.4f}R vs 3×成本 "
-                  f"{3 * worst:.4f}R（最紧品种 {min(ec['cost_r_by_symbol'], key=ec['cost_r_by_symbol'].get)}）")
+            cs_map = ec["cost_r_by_symbol"]
+            dearest = max(cs_map, key=cs_map.get)
+            print(f"  ΔEV {ec['edge_ev_r']:.4f}R vs 逐品种 3×成本（最贵 "
+                  f"{dearest} 3×{cs_map[dearest]:.4f}R）"
+                  + (f"；不满足：{ec['failing_symbols']}"
+                     if ec.get("failing_symbols") else "；全部品种满足"))
     for r in result.reasons:
         print(f"  - {r}")
     print(f"预筛结果：{out_path}；台账 {ledger_path}（candidate_checks 哈希链）")

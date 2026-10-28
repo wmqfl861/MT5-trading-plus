@@ -19,6 +19,20 @@ def test_n_needed_reproduces_blueprint_table(cell, expected):
     assert n_needed_proportion(0.40, dp, power=power, n_tests=n_tests) == expected
 
 
+# 蓝图 P 线 v1.1 §3.4（D52）：检验力 50% 下按假设条数 Bonferroni 的
+# 所需触发日数表（4 条=候选预筛，12 条=开轮复核口径）
+D52_TABLE = {
+    (0.02, 4): 3014, (0.03, 4): 1340, (0.05, 4): 483,
+    (0.02, 12): 4176, (0.03, 12): 1856, (0.05, 12): 669,
+}
+
+
+@pytest.mark.parametrize("cell,expected", sorted(D52_TABLE.items()))
+def test_d52_trigger_days_table(cell, expected):
+    dp, n_tests = cell
+    assert n_needed_proportion(0.40, dp, power=0.5, n_tests=n_tests) == expected
+
+
 def test_review_examples():
     assert n_needed_proportion(0.40, 0.03, power=0.8) == 1661
     assert n_needed_proportion(0.40, 0.03, power=0.8, n_tests=6) == 2808

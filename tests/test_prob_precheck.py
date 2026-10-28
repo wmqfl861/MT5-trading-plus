@@ -54,7 +54,10 @@ class FlatCosts:
 
 
 def counted_df(rows):
-    """rows: (symbol, situation, action, ny_hour, atr, close, time)。"""
+    """rows: (symbol, situation, action, ny_hour, atr, close, time)。
+
+    time 同一天多行只记一个触发日（D52：检验力按触发日数计）。
+    """
     return pd.DataFrame(
         [{"symbol": s, "situation": sit, "action": a, "side": 1,
           "level": 2000.0, "kind": "resistance", "anchor": i,
@@ -130,13 +133,17 @@ def test_precheck_prob_pass(data_root):
     c = cand.validate_candidate(prob_data(), source="t")
     # 成本：spread0.3 + 2×slip0.1 = 0.5 价格单位；R = 1.0×atr
     # cost_R = 0.5/20 = 0.025R；ΔEV = 0.04×3 = 0.12R ≥ 3×0.025R ✓
-    # Δp=0.04/power=0.5 的解析样本量 = (1.645×√0.24/0.04)² = 406 → 500 行过
-    rows = [("TEST", "S1", "A3", 9, 20.0, 2000.0, "2024-01-02 14:00")] * 500
+    # Δp=0.04/power=0.5/1 条假设 → 需 406 个触发日 → 500 个不同日过
+    days = pd.date_range("2018-01-01", periods=500, freq="1D")
+    rows = [("TEST", "S1", "A3", 9, 20.0, 2000.0, str(d))
+            for d in days]
     res = cand.precheck_prob(c, data_root=data_root, cost_model=FlatCosts(),
                              counted=counted_df(rows),
                              split=pd.Timestamp("2025-01-01"))
     assert res.decision == "pass", res.reasons
     assert res.checks["power_prob"]["n_required_analytic"] == 406
+    assert res.checks["power_prob"]["per_hypothesis"]["S1:A3:fade>base"][
+        "trigger_days"] == 500
 
 
 def test_precheck_prob_cost_fail(data_root):
@@ -159,7 +166,11 @@ def test_precheck_prob_insufficient_triggers_waiting(data_root):
                              counted=counted_df(rows),
                              split=pd.Timestamp("2025-01-01"))
     assert res.decision == "waiting_data"
-    assert res.checks["power_prob"]["n_available_min"] == 100
+    # Q6：100 次触发都在同一天 → 触发日数 1（不是 100），逐条列出
+    ph = res.checks["power_prob"]["per_hypothesis"]["S1:A3:fade>base"]
+    assert ph["trigger_days"] == 1
+    assert res.checks["power_prob"]["insufficient"] == ["S1:A3:fade>base"]
+    assert res.checks["power_prob"]["unit"] == "trigger_days"
     assert res.checks["power_prob"]["t75_rule_pending"] is True
 
 
@@ -168,7 +179,10 @@ def test_precheck_prob_no_counted_waiting(data_root):
     res = cand.precheck_prob(c, data_root=data_root, cost_model=FlatCosts(),
                              counted=None, split=pd.Timestamp("2025-01-01"))
     assert res.decision == "waiting_data"
-    assert res.checks["power_prob"]["n_available_min"] is None
+    pp = res.checks["power_prob"]
+    assert pp["per_hypothesis"] == {} and pp["passed"] is False
+    assert pp["note"] == "无触发计数"
+    assert res.checks["ex_ante_cost_prob"]["passed"] is None
 
 
 def test_precheck_prob_literature_fail(data_root):
@@ -222,3 +236,161 @@ def test_propose_split_no_common_coverage(tmp_path):
                     "2016-01-02T00:00:00")
     with pytest.raises(ValueError, match="共同覆盖"):
         cand.propose_split(tmp_path, ["AAA", "BBB"], "H1")
+
+
+# ------------------------------------------------- 审核二修正（Q1/Q2/Q6）
+
+class TwoSymCosts:
+    """Q1 实验：两品种一来回成本一贵一贱（价格单位）。"""
+
+    def __init__(self, cheap=0.05, dear=0.50):
+        self.spreads = {"CHEAP": cheap, "DEAR": dear}
+
+    def spread_p90(self, symbol, hour_ny, *, price=None):
+        return self.spreads[symbol]
+
+    def slippage(self, symbol, hour_ny, *, price=None):
+        return 0.0
+
+    def commission_per_lot(self, symbol):
+        return 0.0
+
+
+def _two_sym_setup(tmp_path, delta_p=0.02):
+    (tmp_path / "specs").mkdir(exist_ok=True)
+    (tmp_path / "specs" / "latest.json").write_text(
+        json.dumps({"CHEAP": {"contract_size": 100.0},
+                    "DEAR": {"contract_size": 100.0}}), encoding="utf-8")
+    data = prob_data(symbols=["CHEAP", "DEAR"])
+    data["prob"] = {**data["prob"],
+                    "level_grid": {"CHEAP": 50.0, "DEAR": 50.0},
+                    "expected_delta_p": delta_p}
+    return cand.validate_candidate(data, source="t")
+
+
+def test_q1_cost_per_symbol_cheap_and_dear(tmp_path):
+    """Q1：一品种便宜（0.005R）一品种贵（0.05R）——贵的不满足 → 整体 fail。
+
+    atr=10、sl_atr=1 → R=10 价格单位；CHEAP 0.05/10=0.005R、DEAR 0.5/10
+    =0.05R；Δp=0.02、tp_R=2 → ΔEV=0.06R：CHEAP 过（0.015），DEAR 不过
+    （0.15）。"""
+    c = _two_sym_setup(tmp_path)
+    rows = [(s, "S1", "A3", 10, 10.0, 2000.0, "2018-01-02")
+            for s in ("CHEAP", "DEAR") for _ in range(50)]
+    res = cand.precheck_prob(c, data_root=tmp_path,
+                             cost_model=TwoSymCosts(),
+                             counted=counted_df(rows), split="2020-01-01")
+    ec = res.checks["ex_ante_cost_prob"]
+    assert ec["passed"] is False
+    assert ec["failing_symbols"] == ["DEAR"]
+    assert ec["binding_symbol"] == "DEAR"
+    assert ec["cost_r_by_symbol"]["CHEAP"] == pytest.approx(0.005)
+    assert ec["cost_r_by_symbol"]["DEAR"] == pytest.approx(0.05)
+    assert res.decision == "fail"
+    # 不短路：成本 fail 时检验力条件照样给出逐条结果
+    assert "per_hypothesis" in res.checks["power_prob"]
+
+
+def test_q2_nonzero_commission_hand_calc(tmp_path):
+    """Q2：佣金按 commission_per_lot/cs 折成价格单位再换 R（手算对账）。"""
+    class CommCosts(TwoSymCosts):
+        def spread_p90(self, symbol, hour_ny, *, price=None):
+            return 0.10
+
+        def commission_per_lot(self, symbol):
+            return 2.0            # 每手来回 2 账户货币
+
+    root = data_root_of(tmp_path)
+    data = prob_data()
+    # Δp=0.20（tp_R=2 → ΔEV=0.6R）：0.6 ≥ 3×0.12=0.36 → 成本条件过；
+    # 再用 Δp=0.03（ΔEV=0.09R < 0.36R）→ 不过。两档手算对账。
+    data["prob"] = {**data["prob"], "expected_delta_p": 0.20}
+    c = cand.validate_candidate(data, source="t")
+    rows = [("TEST", "S1", "A3", 9, 1.0, 2000.0, "2018-01-02")]
+    res = cand.precheck_prob(c, data_root=root, cost_model=CommCosts(),
+                             counted=counted_df(rows), split="2020-01-01")
+    ec = res.checks["ex_ante_cost_prob"]
+    # 手算：comm_price = 2.0/100 = 0.02；成本 = (0.10 + 0 + 0.02)/1.0 = 0.12R
+    assert ec["cost_r_by_symbol"]["TEST"] == pytest.approx(0.12)
+    assert ec["passed"] is True and ec["failing_symbols"] == []
+
+    data2 = prob_data()
+    data2["prob"] = {**data2["prob"], "expected_delta_p": 0.03}
+    c2 = cand.validate_candidate(data2, source="t")
+    res2 = cand.precheck_prob(c2, data_root=root, cost_model=CommCosts(),
+                              counted=counted_df(rows), split="2020-01-01")
+    ec2 = res2.checks["ex_ante_cost_prob"]
+    assert ec2["cost_r_by_symbol"]["TEST"] == pytest.approx(0.12)
+    assert ec2["passed"] is False      # ΔEV = 0.03×3 = 0.09R < 0.36R
+
+
+def data_root_of(tmp_path):
+    (tmp_path / "specs").mkdir(exist_ok=True)
+    (tmp_path / "specs" / "latest.json").write_text(
+        json.dumps({"TEST": {"contract_size": 100.0}}), encoding="utf-8")
+    return tmp_path
+
+def data_root_of(tmp_path):
+    (tmp_path / "specs").mkdir(exist_ok=True)
+    (tmp_path / "specs" / "latest.json").write_text(
+        json.dumps({"TEST": {"contract_size": 100.0}}), encoding="utf-8")
+    return tmp_path
+
+
+def test_q6_days_unit_and_per_hypothesis(data_root):
+    """Q6：样本单位=触发日数；逐条判定（一条过候选即过，不足的列出）。"""
+    c = cand.validate_candidate(prob_data(), source="t")
+    days = pd.date_range("2018-01-01", periods=650, freq="1D")
+    a3_rows = [("TEST", "S1", "A3", 9, 20.0, 2000.0, str(d)) for d in days]
+    # 同一天 300 次 A1 触发——按次计 300 会过（需 406），按日计只有 1 日
+    a1_rows = [("TEST", "S1", "A1", 9, 20.0, 2000.0, "2018-06-01")] * 300
+    data2 = prob_data()
+    data2["prob"] = {**data2["prob"],
+                     "hypotheses": ["S1:A3:fade>base", "S1:A1:follow>base"]}
+    c2 = cand.validate_candidate(data2, source="t")
+    res = cand.precheck_prob(c2, data_root=data_root, cost_model=FlatCosts(),
+                             counted=counted_df(a3_rows + a1_rows),
+                             split=pd.Timestamp("2025-01-01"))
+    pp = res.checks["power_prob"]
+    # 两条假设 → 需 577 触发日（z_a(2)=1.96）；A3 650 日过；A1 1 日不足
+    assert pp["n_required_analytic"] == 577
+    assert pp["per_hypothesis"]["S1:A3:fade>base"]["passed"] is True
+    assert pp["per_hypothesis"]["S1:A1:follow>base"]["trigger_days"] == 1
+    assert pp["insufficient"] == ["S1:A1:follow>base"]
+    assert pp["passing_count"] == 1
+    assert pp["passed"] is True            # 至少一条通过 → 候选过
+    assert res.decision == "pass"
+    assert any("S1:A1:follow>base" in r for r in res.reasons)
+
+
+def test_q6_all_hypotheses_insufficient_waiting(data_root):
+    """Q6：全部假设都不足 → 候选 waiting_data，逐条列出。"""
+    data = prob_data()
+    data["prob"] = {**data["prob"],
+                    "hypotheses": ["S1:A3:fade>base", "S1:A1:follow>base"]}
+    c = cand.validate_candidate(data, source="t")
+    rows = [("TEST", "S1", "A3", 9, 20.0, 2000.0, "2018-01-02")] * 30
+    res = cand.precheck_prob(c, data_root=data_root, cost_model=FlatCosts(),
+                             counted=counted_df(rows),
+                             split=pd.Timestamp("2025-01-01"))
+    assert res.decision == "waiting_data"
+    assert set(res.checks["power_prob"]["insufficient"]) == {
+        "S1:A3:fade>base", "S1:A1:follow>base"}
+    assert res.checks["power_prob"]["passing_count"] == 0
+
+
+def test_q3_bonferroni_uses_registered_hypothesis_count(data_root):
+    """Q3：n_tests = 候选登记的假设条数（不是 1）。"""
+    data = prob_data()
+    data["prob"] = {**data["prob"],
+                    "hypotheses": ["S1:A1:follow>base", "S1:A2:follow>base",
+                                   "S1:A3:fade>base", "S1:A4:fade>base"]}
+    c = cand.validate_candidate(data, source="t")
+    rows = [("TEST", "S1", "A3", 9, 20.0, 2000.0, "2018-01-02")]
+    res = cand.precheck_prob(c, data_root=data_root, cost_model=FlatCosts(),
+                             counted=counted_df(rows),
+                             split=pd.Timestamp("2025-01-01"))
+    pp = res.checks["power_prob"]
+    assert pp["n_tests"] == 4
+    # Δp=0.04、4 条假设（z_a(4)=2.241）→ (2.241×√0.24/0.04)² = 754 日
+    assert pp["n_required_analytic"] == 754
