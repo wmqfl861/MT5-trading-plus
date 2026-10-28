@@ -3,7 +3,7 @@
   "decision": "pass",
   "reasons": [
     "机制空缺：flow_calendar 是组合里还没有的类别（蓝图 §6.2 条件 5）",
-    "swap_dependent=true：swap_free 口径（倍数 29.63）通过而 charged 口径（倍数 1.51）不通过——该候选的结论依赖账户免隔夜费状态（config/account-profile.toml 用户确认条目）"
+    "swap_dependent=true：swap_free 口径（倍数 29.68）通过而 charged 口径（倍数 1.47）不通过——该候选的结论依赖账户免隔夜费状态（config/account-profile.toml 用户确认条目）"
   ],
   "events_per_year": 12.0,
   "checks": {
@@ -23,7 +23,7 @@
     },
     "ex_ante_cost": {
       "passed": true,
-      "multiple": 29.633365879534047,
+      "multiple": 29.679039161756002,
       "min": 3.0,
       "gross_return_per_event": 0.0024,
       "binding_symbol": "USTEC",
@@ -32,15 +32,15 @@
           "reference_price": 25171.46,
           "reference_timeframe": "D1",
           "contract_size": 1.0,
-          "spread_round_trip": 6.749148942885619e-05,
-          "spread_entry_frac": 6.749148942885619e-05,
-          "spread_exit_frac": 6.749148942885619e-05,
-          "slippage_entry": 6.749148942885619e-06,
-          "slippage_exit": 6.749148942885619e-06,
+          "spread_round_trip": 6.738762630082621e-05,
+          "spread_entry_frac": 6.738762630082621e-05,
+          "spread_exit_frac": 6.738762630082621e-05,
+          "slippage_entry": 6.73876263008262e-06,
+          "slippage_exit": 6.73876263008262e-06,
           "commission": 0.0,
           "overnight": 0.0,
-          "round_trip_cost": 8.098978731462743e-05,
-          "multiple": 29.633365879534047
+          "round_trip_cost": 8.086515156099145e-05,
+          "multiple": 29.679039161756002
         }
       }
     },
@@ -50,10 +50,10 @@
       "min": 0.5,
       "years": 39.80561259411362,
       "expected_sharpe": 0.28,
-      "implied_sharpe": 0.3161323629576054,
+      "implied_sharpe": 0.31614935356639634,
       "sharpe_used": 0.28,
       "implied_sharpe_by_symbol": {
-        "USTEC": 0.3161323629576054
+        "USTEC": 0.31614935356639634
       },
       "sigma_by_symbol": {
         "USTEC": 0.025411150405887553
@@ -88,19 +88,17 @@
       "coverage_merged_years": {
         "USTEC/D1": 39.80561259411362
       },
-      "coverage_merge_method": "计入段日历区间并集：相接/重叠的段合成连续跨度（min(first)..max(last)），不相接的分段各自计入——重叠不双计（T80/G3 审核修正：相加会把完全包含/部分重叠的覆盖虚增，如 fred/USTEC 39.8 年包住 mt5 4.3 年 → 合并 39.8 而非 44.1）"
+      "coverage_merge_method": "计入段日历区间并集：相接/重叠的段合成连续跨度（min(first)..max(last)），不相接的分段各自计入——重叠不双计（T80/G3 审核修正：相加会把完全包含/部分重叠的覆盖虚增，如 fred/USTEC 39.8 年包住 mt5 4.3 年 → 合并 39.8 而非 44.1）；每段在产出侧已在 >30 天内部空洞处切开（T94/R14-L3：实测间隔+known_gaps+manifest 未启用年份，边界随段的 gaps 字段）"
     },
     "mechanism_gap": {
       "blocking": false,
       "note": "机制空缺：flow_calendar 是组合里还没有的类别（蓝图 §6.2 条件 5）",
       "mechanism_class": "flow_calendar",
-      "active_mechanisms": [
-        "cross_asset"
-      ]
+      "active_mechanisms": []
     }
   },
-  "cost_model_version": "tick-spread-p90[rel@NY/bar_open_m1#10a66c54]+slip0.1-comm0-cli-swap-snapshot[c71b0267]-relref[257d0355]-no-overshoot-missNY[17]+swapfree(account-profile)",
-  "checked_at_utc": "2026-10-28T16:57:28.116240+00:00",
+  "cost_model_version": "tick-spread-p90[rel@NY/bar_open_m1#abed3b8f]+slip0.1-comm0-cli-swap-snapshot[d5b50486]-relref[257d0355]-no-overshoot-missNY[17]+swapfree(account-profile)",
+  "checked_at_utc": "2026-10-28T21:03:54.393926+00:00",
   "swap_basis": {
     "applicable": true,
     "account_profile": {
@@ -108,12 +106,12 @@
     },
     "decision_basis": "swap_free",
     "charged": {
-      "multiple": 1.507775977241775,
-      "power": 0.17056373429171423,
+      "multiple": 1.4678843146875522,
+      "power": 0.16137404477421557,
       "decision": "fail"
     },
     "swap_free": {
-      "multiple": 29.633365879534047,
+      "multiple": 29.679039161756002,
       "power": 0.5350332065175746,
       "decision": "pass"
     },

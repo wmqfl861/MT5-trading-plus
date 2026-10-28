@@ -11,12 +11,15 @@
     # Stooq（实测被拒也会如实记录并退出非零）
     .venv/Scripts/python.exe scripts/fetch_ext_data.py stooq
 
-批准状态（T81 落地 D36/第十二轮审核；T87 落地第十三轮 §5，详见
-mt5data.ext.approvals）：
+批准状态（T81 落地 D36/第十二轮审核；T87 落地第十三轮 §5；T94 落地
+第十四轮 L4/L9，详见 mt5data.ext.approvals）：
 - **fred/cdd/histdata 批准**入研究库（export_research_store
   --include-ext 白名单放行；manifest 自带使用限定 usage_restriction；
   histdata 为第十三轮 §5 有条件批准：只作个人研究、不再分发、低频
-  下载、只启用逐年口径验证通过的年份——EURUSD 另加定盘锚点）；
+  下载、只启用逐年时间口径验证通过的年份——T94 起 EURUSD 定盘锚点
+  **只有 inconsistent（尖峰在错的小时）才排除**，undetermined 以标签
+  规则检测为准、manifest 注明（L4）；年判 inconsistent/undetermined
+  的过渡年**按月分段回收**能判定的月份（L9））；
 - **yahoo 不批准**，已从可选来源移除；Stooq 不用（拒服务）。
 
 行为：
@@ -31,6 +34,7 @@ import argparse
 import glob
 import os
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -76,20 +80,48 @@ def _store(ext_root: str, series: ExtSeries, *, resample_to=()) -> None:
 
 HISTDATA_SUPPORTED_RULES = {"eu_calendar": 3, "us_wall": 4}
 
+# either_supported 月两支持规则换算逐分钟等价（整月美欧 DST 状态一致），
+# 回收时确定性地用 v3 转换（结果与 v4 相同）
+_SALVAGE_EITHER_RULE = "eu_calendar"
+
+
+def _salvage_month_assignment(monthly: dict) -> dict[str, str]:
+    """月级判定 → 回收分派 {月: 转换规则}（T94/R14-L9）。
+
+    eu_calendar/us_wall → 该规则；either_supported → 等价规则（确定性）；
+    inconsistent/undetermined → 不回收。"""
+    out: dict[str, str] = {}
+    for month, rep in sorted(monthly.items()):
+        cal = rep.get("calendar")
+        if cal in HISTDATA_SUPPORTED_RULES:
+            out[month] = cal
+        elif cal == "either_supported":
+            out[month] = _SALVAGE_EITHER_RULE
+    return out
+
 
 def _histdata_year_gate(raw: bytes, *, pair: str,
                         downloaded_at_utc: str,
                         source_name: str) -> tuple[object | None, dict]:
-    """单年入库闸门（T87/R13 §5 逐年启用条件），返回 (ExtSeries|None, 记录)。
+    """单年入库闸门（T87/R13 §5 逐年启用条件 + T94/R14-L4 锚点规则 +
+    T94/R14-L9 按月回收），返回 (ExtSeries|None, 记录)。
 
     1. **逐年口径检测**（consistency.yearly_label_calendar，原始标签）：
        判为 eu_calendar（converter v3）或 us_wall（converter v4）→ 按
-       该年自己的规则转换；inconsistent/undetermined/fixed_est →
-       **登记后不用**（不入库）；
+       该年自己的规则转换；inconsistent/undetermined/fixed_est → 先试
+       **按月回收**（L9，consistency.monthly_label_calendar）：能判定的
+       月份（规则明确或 either_supported）分月转换入库，无可回收月份
+       才登记后不用；
     2. **EURUSD 另加定盘锚点**（consistency.fix_window_vol_spike，
-       月末口径——C002 的事件总体）：status 必须为 consistent（尖峰锚在
-       伦敦 16:00 定盘窗），否则该年同样登记后不用。
+       月末口径——C002 的事件总体；回收年用回收后的子集测）。**T94/
+       R14-L4：只有 inconsistent（尖峰出现在错的小时 = 标签口径错一
+       小时证据）才排除**；undetermined（余量不足分不出位置）**不
+       排除**——锚点用的是月末定盘窗的波动强度，与 C002 机制（月末
+       对冲流）相关，按"尖峰够不够强"取舍年份等于按效应强弱挑样本；
+       undetermined 年以口径检测为准入库，anchor_note 写进 manifest
+       （2014 年按此重判回收）。
     """
+    from mt5data.ext import ExtSeries
     from mt5data.ext import consistency as cons
 
     stamps = adapters.histdata_raw_stamps(raw)
@@ -104,21 +136,53 @@ def _histdata_year_gate(raw: bytes, *, pair: str,
                  "label_deviations": rep[year].get("deviations"),
                  "label_tolerance": rep[year].get("tolerance"),
                  "converter_version": HISTDATA_SUPPORTED_RULES.get(calendar)}
-    if calendar not in HISTDATA_SUPPORTED_RULES:
-        rec["reason"] = (f"逐年口径判为 {calendar}（三种规则偏差均超容差"
-                         "或无区分度）——登记后不用（R13 §5）")
-        return None, rec
-    s = adapters.histdata_m1_from_bytes(
-        raw, symbol=pair, downloaded_at_utc=downloaded_at_utc,
-        source_name=source_name, label_rule=calendar)
+    if calendar in HISTDATA_SUPPORTED_RULES:
+        s = adapters.histdata_m1_from_bytes(
+            raw, symbol=pair, downloaded_at_utc=downloaded_at_utc,
+            source_name=source_name, label_rule=calendar)
+    else:
+        # 年级不过 → 按月回收（L9）：分月判定，能判定的月份按各自规则
+        # （either_supported 月两支持规则换算等价）转换后拼回该年序列
+        monthly = cons.monthly_label_calendar(stamps).get(year, {})
+        rec["monthly"] = monthly
+        assignment = _salvage_month_assignment(monthly)
+        if not assignment:
+            rec["reason"] = (f"逐年口径判为 {calendar}（三种规则偏差均超容差"
+                             "或无区分度），按月判定亦无可回收月份——"
+                             "登记后不用（R13 §5）")
+            return None, rec
+        parts = []
+        manifest_tpl = None
+        for rule in sorted(set(assignment.values())):
+            months = [m for m, r in assignment.items() if r == rule]
+            conv = adapters.histdata_m1_from_bytes(
+                raw, symbol=pair, downloaded_at_utc=downloaded_at_utc,
+                source_name=source_name, label_rule=rule)
+            mp = pd.to_datetime(conv.df["time"]).dt.to_period("M") \
+                .astype(str)
+            parts.append(conv.df[mp.isin(months).to_numpy()])
+            manifest_tpl = manifest_tpl or conv.manifest
+        df = pd.concat(parts, ignore_index=True) \
+            .sort_values("time").reset_index(drop=True)
+        s = ExtSeries(df=df, manifest=manifest_tpl).replace(df=df)
+        rec["salvage"] = True
+        rec["salvaged_months"] = assignment
+        rec["converter_version"] = max(
+            HISTDATA_SUPPORTED_RULES[r] for r in set(assignment.values()))
     if pair.upper() == "EURUSD":
         anchor = cons.fix_window_vol_spike(s.df, month_end_only=True)
         rec["fix_anchor_month_end"] = anchor.get(year)
-        if anchor.get(year, {}).get("status") != "consistent":
-            rec["reason"] = (f"定盘锚点月末口径判为 "
-                             f"{anchor.get(year, {}).get('status')}——"
-                             "尖峰未锚在伦敦 16:00 定盘窗，登记后不用")
+        status = anchor.get(year, {}).get("status")
+        if status == "inconsistent":
+            rec["reason"] = (f"定盘锚点月末口径判为 inconsistent（尖峰在 "
+                             f"{anchor.get(year, {}).get('location')}——"
+                             "标签口径错一小时的证据），登记后不用")
             return None, rec
+        if status == "undetermined":
+            rec["anchor_note"] = (
+                "T94/R14-L4：定盘锚点 undetermined（月末定盘窗尖峰分不出"
+                "位置）不排除——以逐年口径检测为准（偏差见 "
+                "label_deviations），锚点实测值仍如实登记")
     rec["used"] = True
     return s, rec
 
@@ -129,24 +193,25 @@ def cmd_histdata(args) -> int:
     failures = 0
     print("ℹ HistData 有条件批准入研究库（R13 §5：只作个人研究、不再分发；"
           "低频下载不并发不绕限；只入库逐年口径验证通过的年份，EURUSD "
-          "另加定盘锚点月末口径）")
+          "另加定盘锚点月末口径——T94/R14-L4：锚点 inconsistent 才排除，"
+          "undetermined 以标签规则检测为准、manifest 注明）")
     for pair in args.pairs.split(","):
         pair = pair.strip().upper()
-        for year in [int(y) for y in args.years.split(",")]:
+        for i, year in enumerate([int(y) for y in args.years.split(",")]):
             name = f"DAT_ASCII_{pair}_M1_{year}.zip"
             raw_path = os.path.join(args.ext_root, "_raw", "histdata", name)
             if os.path.exists(raw_path) and not args.force:
-                with open(raw_path, "rb") as f:
-                    raw = f.read()
-            else:
-                print(f"↓ HistData {pair} {year} …", flush=True)
-                try:
-                    raw, fname = adapters.fetch_histdata_year(pair, year)
-                except adapters.ExtSourceUnreachable as e:
-                    print(f"✗ {pair} {year} 下载失败：{e}")
-                    failures += 1
-                    continue
-                _save_raw(args.ext_root, "histdata", fname, raw)
+                continue
+            if i and args.pace_seconds > 0:
+                time.sleep(args.pace_seconds)   # 低频纪律：年与年之间留间隔
+            print(f"↓ HistData {pair} {year} …", flush=True)
+            try:
+                raw, fname = adapters.fetch_histdata_year(pair, year)
+            except adapters.ExtSourceUnreachable as e:
+                print(f"✗ {pair} {year} 下载失败：{e}")
+                failures += 1
+                continue
+            _save_raw(args.ext_root, "histdata", fname, raw)
         # 全量重建：只合并通过闸门的年份（R13 §5 逐年启用条件）
         raw_dir = os.path.join(args.ext_root, "_raw", "histdata")
         usable: list[ExtSeries] = []
@@ -167,7 +232,9 @@ def cmd_histdata(args) -> int:
             extra = rec.get("reason", "")
             cal = rec.get("calendar", "?")
             anchor = (rec.get("fix_anchor_month_end") or {}).get("status")
-            print(f"  {mark} {pair} {year}：口径={cal}"
+            salvage = (f"，回收 {len(rec['salvaged_months'])} 个月"
+                       if rec.get("salvage") else "")
+            print(f"  {mark} {pair} {year}：口径={cal}{salvage}"
                   + (f"，定盘锚点={anchor}" if anchor else "")
                   + (f"——{extra}" if extra else ""))
             if s is not None:
@@ -287,6 +354,8 @@ def main(argv=None) -> int:
     p.add_argument("--years", default="2020,2021",
                    help="样本段年份；全量历史 2003 起按年追加")
     p.add_argument("--force", action="store_true", help="重下已存在的年份")
+    p.add_argument("--pace-seconds", type=float, default=3.0, dest="pace_seconds",
+                   help="年与年下载之间的间隔秒数（低频纪律；0=不留间隔）")
     p.set_defaults(fn=cmd_histdata)
 
     p = sub.add_parser("cdd", help="CryptoDataDownload 日线（默认 Bitstamp BTC）")

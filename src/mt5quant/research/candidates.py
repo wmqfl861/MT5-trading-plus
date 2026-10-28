@@ -577,6 +577,111 @@ def _span_years(first: pd.Timestamp, last: pd.Timestamp) -> float:
             / (_DAYS_PER_YEAR * 86400.0))
 
 
+# T94/R14-L3：长于 30 天的内部空洞才切开（周末/节假日/换日空档远小于
+# 此；EURUSD 主库 27 天服务器缺口也不属于"年数级"空洞，不切）
+_GAP_SPLIT = pd.Timedelta(days=30)
+
+
+def _observed_gaps(times) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """bar 时刻序列里 >30 天的相邻间隔 → (末根现存 bar, 空洞后首根 bar)。
+
+    差分用 pandas Timedelta 比较（单位安全：pandas 3 的 DatetimeIndex
+    底层分辨率随来源可为 us/ns，asi8 原始整数不可直接比 ns 阈值）。
+    """
+    t = pd.DatetimeIndex(times)
+    if len(t) < 2:
+        return []
+    diffs = pd.Series(t).diff()
+    idx = np.nonzero((diffs > _GAP_SPLIT).to_numpy())[0]
+    return [(t[i - 1], t[i]) for i in idx]
+
+
+def _manifest_gap_intervals(manifest: dict
+                            ) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """ext manifest 里的空洞依据（T94/R14-L3）：
+
+    - ``yearly_verification`` 中 used=False 的年份 → [Y-01-01, Y+1-01-01)
+      （histdata 逐年闸门拒用的整年，数据不在场或未启用都如实切开）；
+    - ``known_gaps``（若有）→ 登记过的长缺口。
+    """
+    out: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    yv = manifest.get("yearly_verification")
+    if isinstance(yv, dict):
+        for y, rec in yv.items():
+            if isinstance(rec, dict) and rec.get("used") is False:
+                try:
+                    y0 = int(str(y))
+                except (TypeError, ValueError):
+                    continue
+                out.append((pd.Timestamp(y0, 1, 1),
+                            pd.Timestamp(y0 + 1, 1, 1)))
+    kg = manifest.get("known_gaps")
+    if isinstance(kg, list):
+        for g in kg:
+            if isinstance(g, dict) and g.get("start") and g.get("end"):
+                try:
+                    s, e = pd.Timestamp(g["start"]), pd.Timestamp(g["end"])
+                except ValueError:
+                    continue
+                if e > s:
+                    out.append((s, e))
+    return out
+
+
+def _split_span(first: pd.Timestamp, last: pd.Timestamp,
+                gaps: list[tuple[pd.Timestamp, pd.Timestamp]]
+                ) -> tuple[list[tuple[pd.Timestamp, pd.Timestamp]],
+                           list[tuple[pd.Timestamp, pd.Timestamp]]]:
+    """[first, last] 在长于 30 天的空洞处切开（T94/R14-L3）。
+
+    空洞与段边界相交时按截断处理（段首/段尾本就不计空洞外的时间）。
+    返回 (切出的连续子区间, 实际切开的空洞区间)——空洞边界随段记录
+    写进 precheck JSON，切分依据可复核。
+    """
+    kept = [(first, last)]
+    used: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    for s, e in sorted(set(gaps)):
+        s = max(pd.Timestamp(s), first)
+        e = min(pd.Timestamp(e), last)
+        if e - s <= _GAP_SPLIT:
+            continue
+        nxt: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+        for a, b in kept:
+            if e <= a or s >= b:
+                nxt.append((a, b))
+                continue
+            if a < s:
+                nxt.append((a, s))
+            if e < b:
+                nxt.append((e, b))
+        if nxt != kept:
+            used.append((s, e))
+        kept = nxt
+        if not kept:
+            break
+    return kept, used
+
+
+def _segments_for_span(source: str, first: pd.Timestamp, last: pd.Timestamp,
+                       gaps: list[tuple[pd.Timestamp, pd.Timestamp]]
+                       ) -> list[dict]:
+    """一个序列（主段或一个 ext 序列）的段记录：在空洞处切开后逐段给出。"""
+    spans, used = _split_span(first, last, gaps)
+    gap_note = [{"start": s.isoformat(), "end": e.isoformat()}
+                for s, e in used]
+    out = []
+    for a, b in spans:
+        seg = {"source": source, "first": a.isoformat(),
+               "last": b.isoformat(), "years": _span_years(a, b),
+               "counted": True}
+        if gap_note:
+            seg["gaps"] = gap_note
+            seg["note"] = (f"内部空洞切分（T94/R14-L3：{len(used)} 处 "
+                           ">30 天空洞，边界见 gaps）")
+        out.append(seg)
+    return out
+
+
 def coverage_segments(data_root, symbols, timeframes) -> dict[str, list[dict]]:
     """研究库按 品种×周期 的覆盖分段（T80/G3）——主段（bars/，MT5 导出）
     + 已批准外部序列（{root}/ext/<来源>/<品种>/<周期>/）。
@@ -589,6 +694,12 @@ def coverage_segments(data_root, symbols, timeframes) -> dict[str, list[dict]]:
     批准状态查 mt5data.ext.approvals.SOURCE_APPROVALS。没有数据的序列
     不出现在结果里（调用方按缺失处理）。不同来源之间的口径差异只记录
     （source 标识），不折算。
+
+    T94/R14-L3：每个序列在**长于 30 天的内部空洞**处切开后再进入并集
+    （空洞依据：parquet 实测相邻 bar 间隔、meta/manifest 的 known_gaps、
+    ext manifest yearly_verification 未启用年份）——首尾跨度会把空洞虚
+    计成年数（审核 L3：histdata EURUSD 2013→2022 缺 2014/2019 两年仍按
+    9.99 年计，把 C002 的检验力抬过 50% 门槛）。切开的段带 gaps 边界。
     """
     from mt5data.ext.approvals import SOURCE_APPROVALS
     from mt5data.ext.core import ExtDataError, load_ext_series
@@ -601,6 +712,7 @@ def coverage_segments(data_root, symbols, timeframes) -> dict[str, list[dict]]:
             key = f"{sym}/{tf_u}"
             segs: list[dict] = []
             first = last = None
+            known: list[tuple[pd.Timestamp, pd.Timestamp]] = []
             meta_p = root / "bars" / str(sym) / tf_u / "meta.json"
             if meta_p.is_file():
                 try:
@@ -609,17 +721,28 @@ def coverage_segments(data_root, symbols, timeframes) -> dict[str, list[dict]]:
                     last = pd.Timestamp(wm["last_closed_time"])
                 except (ValueError, KeyError, TypeError):
                     first = last = None
-            if first is None or last is None or last <= first:
-                bars = load_bars(str(root), str(sym), tf_u)
-                if bars is not None and len(bars) >= 2:
-                    t = pd.to_datetime(bars["time"])
+                raw_kg = wm.get("known_gaps") if isinstance(wm, dict) else None
+                if isinstance(raw_kg, list):
+                    for g in raw_kg:
+                        if isinstance(g, dict) and g.get("start") \
+                                and g.get("end"):
+                            try:
+                                s = pd.Timestamp(g["start"])
+                                e = pd.Timestamp(g["end"])
+                            except ValueError:
+                                continue
+                            if e > s:
+                                known.append((s, e))
+            bars = load_bars(str(root), str(sym), tf_u)
+            observed: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+            if bars is not None and len(bars) >= 2:
+                t = pd.to_datetime(bars["time"])
+                observed = _observed_gaps(t)
+                if first is None or last is None or last <= first:
                     first, last = t.iloc[0], t.iloc[-1]
             if first is not None and last is not None and last > first:
-                segs.append({"source": "mt5",
-                             "first": first.isoformat(),
-                             "last": last.isoformat(),
-                             "years": _span_years(first, last),
-                             "counted": True})
+                segs.extend(_segments_for_span(
+                    "mt5", first, last, observed + known))
             ext_root = root / "ext"
             if ext_root.is_dir():
                 for src_dir in sorted(ext_root.iterdir()):
@@ -647,12 +770,10 @@ def coverage_segments(data_root, symbols, timeframes) -> dict[str, list[dict]]:
                         t = pd.to_datetime(df["time"])
                         e_first, e_last = t.iloc[0], t.iloc[-1]
                         if e_last > e_first:
-                            segs.append({
-                                "source": src_dir.name,
-                                "first": e_first.isoformat(),
-                                "last": e_last.isoformat(),
-                                "years": _span_years(e_first, e_last),
-                                "counted": True})
+                            gaps = (_observed_gaps(t)
+                                    + _manifest_gap_intervals(_manifest))
+                            segs.extend(_segments_for_span(
+                                src_dir.name, e_first, e_last, gaps))
                     else:
                         # 未批准来源（如 stooq/yahoo，批准表
                         # mt5data.ext.approvals；histdata 已按 R13 §5
@@ -688,6 +809,10 @@ def merged_coverage_years(segments: list[dict]) -> float:
     并集：相接/重叠的段合成一段（取 min(first)..max(last) 的连续跨度），
     不相接的分段各自计入、跨度累加——缺口段自然被排除在并集之外。
     counted=False 的段（未批准来源）不参与。
+
+    T94/R14-L3：段在产出侧已在 >30 天内部空洞处切开（coverage_segments
+    逐序列切分），并集前不再含首尾跨度虚计的空洞（histdata EURUSD 缺
+    2014/2019 两年按 8 年计、不是 9.99 年）。
     """
     intervals = sorted(
         (pd.Timestamp(s["first"]), pd.Timestamp(s["last"]))
@@ -1013,7 +1138,9 @@ def precheck(candidate: Candidate, *, data_root, cost_model,
             "计入段日历区间并集：相接/重叠的段合成连续跨度（min(first).."
             "max(last)），不相接的分段各自计入——重叠不双计（T80/G3 审核"
             "修正：相加会把完全包含/部分重叠的覆盖虚增，如 fred/USTEC "
-            "39.8 年包住 mt5 4.3 年 → 合并 39.8 而非 44.1）")
+            "39.8 年包住 mt5 4.3 年 → 合并 39.8 而非 44.1）；每段在产出侧"
+            "已在 >30 天内部空洞处切开（T94/R14-L3：实测间隔+known_gaps+"
+            "manifest 未启用年份，边界随段的 gaps 字段）")
     if not power_ok:
         if missing:
             reasons.append(

@@ -50,7 +50,9 @@ TERMS_HISTDATA = (
     "与开发者回测交易系统而免费分享、'Use the data at your own will "
     "and risk.'——只作个人研究、不再分发；按网站正常下载路径低频下载、"
     "不并发、不绕过限制；只启用逐年时间口径验证通过的年份（EURUSD 另加"
-    "伦敦 16:00 定盘窗分钟波动尖峰锚点逐年核对）。")
+    "伦敦 16:00 定盘窗分钟波动尖峰锚点逐年核对——T94/R14-L4 起锚点 "
+    "inconsistent（尖峰在错的小时）才排除，undetermined 以标签规则检测"
+    "为准、manifest 注明）。")
 TERMS_CDD = (
     "CryptoDataDownload 免费提供交易所公开行情的聚合 CSV；页面条款允许"
     "个人下载使用、限非商业用途。Bitstamp 数据为交易所公开成交。"
@@ -227,10 +229,12 @@ def fetch_histdata_year(pair: str, year: int, *, opener=None
     """下载 HistData 一年 M1 zip：GET 表单页取 tk → POST /get.php。
 
     返回 (zip 字节, 文件名)。表单流为公开页面流程，无需登录。
+    重试 ≤2（T94 下载纪律：低频、顺序、不并发、重试不过两次——
+    批量年份由调用方逐个串行驱动，年与年之间留间隔）。
     """
     op = opener or _opener_with_cookies()
     page = HISTDATA_TK_URL.format(pair_lower=pair.lower(), year=year)
-    html = _http_get(op, page).decode("utf-8", "replace")
+    html = _http_get(op, page, tries=2).decode("utf-8", "replace")
     m = re.search(r'name="tk"[^>]*value="([^"]+)"', html)
     if not m:
         raise ExtSourceUnreachable(
@@ -241,8 +245,8 @@ def fetch_histdata_year(pair: str, year: int, *, opener=None
         "platform": "ASCII", "timeframe": "M1", "fxpair": pair.upper(),
     }).encode()
     raw = _http_post(op, "https://www.histdata.com/get.php",
-                     form, headers={"Referer": page,
-                                    "Origin": "https://www.histdata.com"})
+                     form, tries=2, headers={"Referer": page,
+                                             "Origin": "https://www.histdata.com"})
     if raw[:2] != b"PK":
         raise ExtSourceUnreachable(
             f"HistData {pair} {year} 返回的不是 zip（{len(raw)} 字节 HTML？）")

@@ -710,6 +710,77 @@ class TestYearlyLabelCalendar:
         assert rep[2021]["calendar"] == "eu_calendar", rep[2021]
 
 
+# ================================================================ T94/R14-L9 按月
+
+class TestMonthlyLabelCalendar:
+    """失败测试先行（T94/R14-L9）：年判 inconsistent（两代规则过渡年）
+    时按月分段判定——能判定的月份给出规则或 either_supported（该月美欧
+    DST 状态一致，两支持规则转换等价），回收部分月份。"""
+
+    def _mixed_labels_2021(self):
+        """2021：上半年 us_wall、下半年 eu_calendar——错位月分出各自
+        规则；区分度不足的月判 undetermined（不回收）。"""
+        utc = _synth_weeks_utc(2021)
+        first = utc[utc < pd.Timestamp("2021-07-01")]
+        second = utc[utc >= pd.Timestamp("2021-07-01")]
+        return pd.concat([_labels_for_rule(first, "us_wall"),
+                          _labels_for_rule(second, "eu_calendar")],
+                         ignore_index=True)
+
+    def test_mixed_year_months_classified(self):
+        from mt5data.ext import consistency as cons
+        months = cons.monthly_label_calendar(self._mixed_labels_2021())[2021]
+        # 3 月（美已切夏、欧未切——错位窗标签跟 us_wall，偏差分离清晰）
+        assert months["2021-03"]["calendar"] == "us_wall", months["2021-03"]
+        # 11 月（欧已回冬、美未回：错位窗标签跟 eu_calendar）
+        assert months["2021-11"]["calendar"] == "eu_calendar", months["2021-11"]
+        # 10 月：唯一错位日 10-31 的单个观测跟 eu_calendar，但两支持规则
+        # 偏差都在容差内、区分度不足 → undetermined（不回收，保守）
+        assert months["2021-10"]["calendar"] == "undetermined", \
+            months["2021-10"]
+        # 1 月（全冬）/7 月（全夏）：美欧状态一致，两支持规则不可分但
+        # 都自洽——either_supported（转换等价，可回收）
+        assert months["2021-01"]["calendar"] == "either_supported"
+        assert months["2021-07"]["calendar"] == "either_supported"
+
+    def test_inconsistent_year_monthly_salvage(self):
+        """两代规则过渡场景（春季错位窗跟 eu、秋冬错位窗跟 us）——月份
+        分歧正是一致性破坏的来源，按月判定各自给出规则：3 月 eu_calendar、
+        11 月 us_wall、1 月 either_supported。（年判 inconsistent 的真实
+        场景 = 2019/2024 文件，见 ext-data 报告 T94 节实测。）"""
+        from mt5data.ext import consistency as cons
+        utc = _synth_weeks_utc(2021)
+        us_labels = pd.to_datetime(_labels_for_rule(utc, "us_wall"))
+        eu_labels = pd.to_datetime(_labels_for_rule(utc, "eu_calendar"))
+        months_idx = utc.month.to_numpy()
+        mixed = pd.Series(us_labels)
+        mixed[months_idx == 3] = eu_labels[months_idx == 3]
+        months = cons.monthly_label_calendar(mixed)[2021]
+        assert months["2021-03"]["calendar"] == "eu_calendar", \
+            months["2021-03"]
+        assert months["2021-11"]["calendar"] == "us_wall", months["2021-11"]
+        assert months["2021-01"]["calendar"] == "either_supported"
+
+    def test_pure_rule_year_months_agree_or_either(self):
+        """整年单一规则：错位月判出该规则，非错位月 either_supported。"""
+        from mt5data.ext import consistency as cons
+        labels = _labels_for_rule(_synth_weeks_utc(2021), "us_wall")
+        months = cons.monthly_label_calendar(labels)[2021]
+        assert months["2021-03"]["calendar"] == "us_wall", months["2021-03"]
+        assert months["2021-06"]["calendar"] == "either_supported"
+
+    def test_fixed_est_month_not_salvageable(self):
+        """错位月标签跟固定 EST（不支持规则）→ 该月不可回收（偏差对
+        两个支持规则都超容差 → inconsistent）。"""
+        from mt5data.ext import consistency as cons
+        labels = _labels_for_rule(_synth_weeks_utc(2021), "fixed_est")
+        months = cons.monthly_label_calendar(labels)[2021]
+        assert months["2021-03"]["calendar"] == "inconsistent", \
+            months["2021-03"]
+        assert months["2021-07"]["calendar"] == "inconsistent", \
+            months["2021-07"]
+
+
 # ================================================================ 一致性核对
 
 class TestConsistencyDetector:
@@ -849,8 +920,9 @@ class TestFixWindowAnchor:
         assert rep[2016]["location"] == "minus_1h", rep[2016]
 
     def test_no_spike_undetermined(self):
-        """无定盘尖峰（平价波动）→ 分不出位置 → undetermined（不能证明
-        对齐，该年不启用——与 inconsistent 同样登记后不用）。"""
+        """无定盘尖峰（平价波动）→ 分不出位置 → undetermined。T94/R14-L4
+        起 undetermined **不排除**年份（锚点强度与效应强弱相关，按强度取舍
+        等于按效应挑样本）——闸门侧以标签规则检测为准，manifest 注明。"""
         from mt5data.ext import consistency as cons
         df = _synth_fix_spike_minutes(2015)
         n = len(df)
@@ -937,16 +1009,31 @@ class TestHistDataUsWallRule:
 class TestHistDataYearGate:
     """T87/R13 §5 逐年闸门（scripts/fetch_ext_data.py::_histdata_year_gate）：
     口径判为支持规则才入库；inconsistent 年份登记后不用；EURUSD 另加
-    月末定盘锚点。用合成年度 zip 直接驱动闸门。"""
+    月末定盘锚点——T94/R14-L4 起**只有锚点 inconsistent（尖峰在错的
+    小时）才排除**，undetermined 不排除（以标签规则检测为准，manifest
+    注明）。用合成年度 zip 直接驱动闸门。"""
 
-    def _year_zip(self, rule: str, year: int) -> bytes:
-        labels = _labels_for_rule(_synth_weeks_utc(year), rule)
+    def _year_zip(self, rule: str, year: int, *, spike_london_minute=None
+                  ) -> bytes:
+        """合成年度 zip；spike_london_minute=(lo, hi) 时在该伦敦本地
+        分钟窗放波动尖峰（×20 幅度）——错位窗=C−1h 用于构造锚点
+        inconsistent 的年份。"""
+        utc = _synth_weeks_utc(year)
+        labels = _labels_for_rule(utc, rule)
+        local = pd.DatetimeIndex(utc).tz_localize("UTC") \
+            .tz_convert("Europe/London")
+        mod_min = local.hour * 60 + local.minute
+        n = len(labels)
+        amp = np.where((mod_min >= spike_london_minute[0])
+                       & (mod_min < spike_london_minute[1]),
+                       20.0, 1.0) if spike_london_minute else np.ones(n)
+        ret = 1e-4 * amp * np.where(np.arange(n) % 2 == 0, 1.0, -1.0)
+        px = 1.10 * np.cumprod(1.0 + ret)
+        prev = np.concatenate([[1.10], px[:-1]])
         rows = []
-        px = 1.1
-        for t in labels:
-            px += 0.0001
-            rows.append(f"{t.strftime('%Y%m%d %H%M%S')};{px:.5f};{px:.5f};"
-                        f"{px:.5f};{px:.5f};0")
+        for t, o, c in zip(labels, prev, px):
+            rows.append(f"{t.strftime('%Y%m%d %H%M%S')};{o:.5f};"
+                        f"{max(o, c):.5f};{min(o, c):.5f};{c:.5f};0")
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr(f"DAT_ASCII_EURUSD_M1_{year}.csv", "\n".join(rows))
@@ -960,15 +1047,52 @@ class TestHistDataYearGate:
                 self._year_zip(rule, 2021), pair="EURUSD",
                 downloaded_at_utc="2026-10-28T00:00:00+00:00",
                 source_name=f"DAT_ASCII_EURUSD_M1_2021.zip")
-            # 合成数据无定盘尖峰 → EURUSD 锚点 undetermined → 不入库
-            # （口径本身判对，记录在案）
-            assert s is None and rec["used"] is False, (rule, rec)
+            # 合成数据无定盘尖峰 → EURUSD 锚点 undetermined——T94/R14-L4
+            # 起**不排除**：口径判对即入库（undetermined 以标签规则检测
+            # 为准，manifest 注明），2014 年按此重判回收
+            assert s is not None and rec["used"] is True, (rule, rec)
             assert rec["calendar"] == rule, rec
             assert rec["converter_version"] == cv
             assert rec["fix_anchor_month_end"]["status"] == "undetermined"
+            assert "undetermined" in rec.get("anchor_note", ""), rec
+
+    def test_inconsistent_anchor_year_excluded(self):
+        """T94/R14-L4 失败测试：锚点 inconsistent（月末定盘窗尖峰出现在
+        错的小时，C−1h）才是排除条件——合成尖峰放在伦敦 14:57–15:03
+        （= 定盘窗平移 −1h）→ inconsistent → 登记后不用。"""
+        mod = load_script("fetch_ext_data_gate_anchor",
+                          REPO_ROOT / "scripts" / "fetch_ext_data.py")
+        s, rec = mod._histdata_year_gate(
+            self._year_zip("us_wall", 2021,
+                           spike_london_minute=(14 * 60 + 57, 15 * 60 + 3)),
+            pair="EURUSD",
+            downloaded_at_utc="2026-10-28T00:00:00+00:00",
+            source_name="DAT_ASCII_EURUSD_M1_2021.zip")
+        assert s is None and rec["used"] is False, rec
+        assert rec["calendar"] == "us_wall"        # 口径本身通过
+        assert rec["fix_anchor_month_end"]["status"] == "inconsistent"
+        assert rec["fix_anchor_month_end"]["location"] == "minus_1h"
+        assert "inconsistent" in rec["reason"]
+
+    def test_consistent_anchor_year_used(self):
+        """尖峰锚在定盘窗（伦敦 15:57–16:03）→ consistent → 入库（锚点
+        两态与 L4 规则的组合完整性）。"""
+        mod = load_script("fetch_ext_data_gate_anchor2",
+                          REPO_ROOT / "scripts" / "fetch_ext_data.py")
+        s, rec = mod._histdata_year_gate(
+            self._year_zip("us_wall", 2021,
+                           spike_london_minute=(15 * 60 + 57, 16 * 60 + 3)),
+            pair="EURUSD",
+            downloaded_at_utc="2026-10-28T00:00:00+00:00",
+            source_name="DAT_ASCII_EURUSD_M1_2021.zip")
+        assert s is not None and rec["used"] is True, rec
+        assert rec["fix_anchor_month_end"]["status"] == "consistent"
 
     def test_inconsistent_year_registered_not_used(self):
-        """同年混两种规则 → inconsistent → 登记后不用。"""
+        """同年混两种规则 → 年级判 inconsistent。T94/R14-L9 起不再整年
+        报废：上半年（eu_calendar/either 月）按月回收，下半年（fixed_est
+        月：盛夏两支持规则恒差 1h、秋冬换日锚恒差 1h）不可回收——
+        rec 保留年级判定与不可回收月份的原因。"""
         mod = load_script("fetch_ext_data_gate2",
                           REPO_ROOT / "scripts" / "fetch_ext_data.py")
         utc = _synth_weeks_utc(2021)
@@ -987,12 +1111,65 @@ class TestHistDataYearGate:
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr("DAT_ASCII_EURUSD_M1_2021.csv", "\n".join(rows))
         s, rec = mod._histdata_year_gate(
-            buf.getvalue(), pair="EURUSD",
+            buf.getvalue(), pair="XAUUSD",
             downloaded_at_utc="2026-10-28T00:00:00+00:00",
-            source_name="DAT_ASCII_EURUSD_M1_2021.zip")
-        assert s is None and rec["used"] is False
-        assert rec["calendar"] == "inconsistent"
-        assert "登记后不用" in rec["reason"]
+            source_name="DAT_ASCII_XAUUSD_M1_2021.zip")
+        assert rec["calendar"] == "inconsistent"      # 年级判定如实保留
+        assert rec["used"] is True and rec["salvage"] is True
+        salvaged = rec["salvaged_months"]
+        # 1–6 月（eu/either）+ 11/12 月（fixed_est 在美欧皆冬时与支持
+        # 规则逐分钟等价；11 月标签恰跟 eu_calendar）回收；7–10 月
+        # （fixed_est 与支持规则恒差 1h 或无区分度）不回收
+        assert set(salvaged) == {"2021-01", "2021-02", "2021-03", "2021-04",
+                                 "2021-05", "2021-06", "2021-11", "2021-12"}
+        assert salvaged["2021-03"] == "eu_calendar"
+        assert salvaged["2021-11"] == "eu_calendar"
+        t = pd.to_datetime(s.df["time"])
+        assert not t.dt.strftime("%Y-%m").isin(["2021-07", "2021-08",
+                                                "2021-09", "2021-10"]).any()
+
+    def test_inconsistent_year_monthly_salvage_stores_months(self):
+        """T94/R14-L9 失败测试：年判 inconsistent 的过渡年按月分段回收——
+        盛夏三个月标签跟 fixed_est（该季 fixed_est 与支持规则恒差 1h，
+        月判 inconsistent 不回收），其余月份 us_wall/either 可回收：入库
+        序列只含回收月份，manifest 注明逐月判定。"""
+        mod = load_script("fetch_ext_data_gate_l9",
+                          REPO_ROOT / "scripts" / "fetch_ext_data.py")
+        utc = _synth_weeks_utc(2021)
+        us_labels = pd.to_datetime(_labels_for_rule(utc, "us_wall"))
+        est_labels = pd.to_datetime(_labels_for_rule(utc, "fixed_est"))
+        months = utc.month.to_numpy()
+        mixed = pd.Series(us_labels)
+        bad = np.isin(months, (7, 8, 9))
+        mixed[bad] = est_labels[bad]
+        rows = []
+        px = 1.1
+        for t in mixed:
+            px += 0.0001
+            rows.append(f"{t.strftime('%Y%m%d %H%M%S')};{px:.5f};{px:.5f};"
+                        f"{px:.5f};{px:.5f};0")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("DAT_ASCII_EURUSD_M1_2021.csv", "\n".join(rows))
+        s, rec = mod._histdata_year_gate(
+            buf.getvalue(), pair="XAUUSD",      # 锚点闸只加给 EURUSD，隔离变量
+            downloaded_at_utc="2026-10-29T00:00:00+00:00",
+            source_name="DAT_ASCII_XAUUSD_M1_2021.zip")
+        assert rec["used"] is True, rec
+        assert rec["calendar"] == "inconsistent"      # 年级判定保持原样
+        assert rec["salvage"] is True
+        salvaged = rec["salvaged_months"]
+        assert "2021-07" not in salvaged and "2021-08" not in salvaged
+        assert salvaged.get("2021-01") in ("us_wall", "eu_calendar")
+        assert salvaged.get("2021-03") == "us_wall"
+        # 10 月只含单个错位日观测，两支持规则都在容差内、区分度不足 →
+        # 月判 undetermined，不回收（与 TestMonthlyLabelCalendar 一致）
+        assert "2021-10" not in salvaged
+        assert salvaged.get("2021-11") == "us_wall"
+        t = pd.to_datetime(s.df["time"])
+        assert not t.dt.strftime("%Y-%m").isin(["2021-07", "2021-08",
+                                                "2021-09"]).any()
+        assert (t < pd.Timestamp("2021-07-01")).any()   # 回收了盛夏之外的月份
 
     def test_xauusd_skips_fix_anchor(self):
         """定盘锚点只加给 EURUSD（R13 §5）；XAUUSD 只过口径闸。"""

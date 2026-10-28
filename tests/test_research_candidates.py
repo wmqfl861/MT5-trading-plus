@@ -991,3 +991,115 @@ def test_precheck_json_carries_coverage_segments(tmp_path):
         == pytest.approx(years[f"{SYMBOL}/D1"])
     assert "并集" in pw["coverage_merge_method"]
     assert "implied_sharpe" in pw and "sigma_method" in pw
+
+
+# ------------------------------------------------------- T94/R14-L3 切分
+
+def _write_ext_gappy(root, source, symbol, tf, *, first_day, holes,
+                     extra_manifest=None, days=3653):
+    """研究库 ext 布局的带洞序列：first_day 起连续 days 天（缺省≈10 年），
+    holes=挖掉的 [start, end) 日期区间（数据本身留洞——C002 式场景：
+    histdata 段缺整年未启用年份）。"""
+    d = root / "ext" / source / symbol / tf
+    d.mkdir(parents=True)
+    times = pd.date_range(pd.Timestamp(first_day), periods=days, freq="D")
+    keep = pd.Series(True, index=times)
+    for hs, he in holes:
+        keep &= ~((times >= pd.Timestamp(hs)) & (times < pd.Timestamp(he)))
+    df = pd.DataFrame({"time": times[keep.to_numpy()],
+                       "open": 100.0, "high": 100.0, "low": 100.0,
+                       "close": 100.0, "tick_volume": 1, "spread": 0,
+                       "real_volume": 0}).reset_index(drop=True)
+    df.to_parquet(d / "data.parquet")
+    manifest = {
+        "source": source, "source_url": "https://example.test/x",
+        "symbol": symbol, "timeframe": tf, "price_side": "mid",
+        "original_timezone": "UTC", "dst_rule": "无", "terms_note": "测试",
+        "downloaded_at_utc": "2026-10-29T00:00:00+00:00",
+        "source_files": [{"name": "x.csv", "sha256": "0" * 64}],
+        "converter_version": 1, "rows": int(len(df)),
+        "first_time": df["time"].iloc[0].isoformat(),
+        "last_time": df["time"].iloc[-1].isoformat()}
+    manifest.update(extra_manifest or {})
+    (d / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return d
+
+
+def test_coverage_segments_split_at_internal_gaps(tmp_path):
+    """T94/R14-L3 失败测试：计入段在**长于 30 天的内部空洞**处切开后再求
+    并集——首尾跨约 10 年但中间缺 2 整年的 histdata 段，年数按扣除空洞
+    计（C002 场景：12.81 → 10.8 实际），不再按首尾跨度虚计。"""
+    key = f"{SYMBOL}/D1"
+    holes = [("2014-01-01", "2015-01-01"),      # 缺 2014 整年
+             ("2019-01-01", "2020-01-01")]      # 缺 2019 整年
+    yv = {str(pd.Timestamp(hs).year): {"used": False, "reason": "登记后不用"}
+          for hs, _ in holes}
+    root = tmp_path / "plain"                  # 无主段：只看 ext 段自身
+    root.mkdir()
+    _write_ext_gappy(root, "histdata", SYMBOL, "D1", first_day="2013-01-01",
+                     holes=holes,
+                     extra_manifest={"yearly_verification": yv})
+    cov = candidates.coverage_years(root, [SYMBOL], ["D1"])
+    # 按扣除计：10 年跨度 − 2 年空洞 ≈ 8 年（不是 9.99）
+    assert cov[key] == pytest.approx(8.0, abs=0.02), cov[key]
+    segs = candidates.coverage_segments(root, [SYMBOL], ["D1"])
+    hist = [s for s in segs[key] if s["source"] == "histdata"]
+    assert len(hist) == 3, hist                # 切成三段（2013/2015-18/2020-）
+    assert [s["counted"] for s in hist] == [True] * 3
+    assert pd.Timestamp(hist[0]["last"]) < pd.Timestamp("2014-01-02")
+    assert pd.Timestamp(hist[1]["first"]) >= pd.Timestamp("2015-01-01")
+    assert pd.Timestamp(hist[1]["last"]) < pd.Timestamp("2019-01-02")
+    assert pd.Timestamp(hist[2]["first"]) >= pd.Timestamp("2020-01-01")
+    # 洞的边界写进段记录（precheck JSON 可复核切分依据）
+    assert all("gaps" in s for s in hist)
+
+
+def test_coverage_gap_sources_manifest_known_gaps_and_observed(tmp_path):
+    """L3 空洞依据三处来源逐一生效：manifest 未启用年份（数据在场也切开）、
+    parquet 实测 >30 天间隔、meta known_gaps；≤30 天的洞不切开。"""
+    key = f"{SYMBOL}/D1"
+    # 1) manifest 标记未启用年份，但数据本身连续 → 仍按 manifest 切开
+    root = tmp_path / "m1"
+    root.mkdir()
+    _write_ext_gappy(root, "histdata", SYMBOL, "D1", first_day="2013-01-01",
+                     holes=[],
+                     extra_manifest={"yearly_verification": {
+                         "2014": {"used": False}}})
+    cov = candidates.coverage_years(root, [SYMBOL], ["D1"])
+    assert cov[key] == pytest.approx(9.0, abs=0.02), cov[key]
+    # 2) ≤30 天的洞不切（周常规缺口/节假日不属于"内部空洞"）
+    root2 = tmp_path / "m2"
+    root2.mkdir()
+    _write_ext_gappy(root2, "histdata", SYMBOL, "D1", first_day="2013-01-01",
+                     holes=[("2014-06-01", "2014-06-25")])
+    cov2 = candidates.coverage_years(root2, [SYMBOL], ["D1"])
+    assert cov2[key] > 9.9, cov2[key]          # 24 天洞不扣
+    segs2 = candidates.coverage_segments(root2, [SYMBOL], ["D1"])
+    assert len([s for s in segs2[key] if s["source"] == "histdata"]) == 1
+    # 3) 主段（mt5）按 parquet 实测 >30 天间隔切开
+    root3 = make_data_root(tmp_path / "m3", years=6.05)
+    bdir = root3 / "bars" / SYMBOL / "D1"
+    df = pd.read_parquet(bdir / "data.parquet")
+    t = pd.to_datetime(df["time"])
+    hole = (t > t.iloc[100]) & (t <= t.iloc[1000])
+    gap_days = (t.iloc[1001] - t.iloc[100]).total_seconds() / 86400.0
+    assert gap_days > 30                        # 夹具自检：确为 >30 天空洞
+    df = df[~hole.to_numpy()].reset_index(drop=True)
+    df.to_parquet(bdir / "data.parquet")
+    cov3 = candidates.coverage_years(root3, [SYMBOL], ["D1"])
+    assert cov3[key] == pytest.approx(YEARS_D1 - gap_days / 365.25, abs=0.03)
+    segs3 = candidates.coverage_segments(root3, [SYMBOL], ["D1"])
+    mt5 = [s for s in segs3[key] if s["source"] == "mt5"]
+    assert len(mt5) == 2, mt5
+    # 4) meta known_gaps（数据未挖洞、登记在案）同样切开
+    root4 = make_data_root(tmp_path / "m4", years=6.05)
+    meta_p = root4 / "bars" / SYMBOL / "D1" / "meta.json"
+    meta = json.loads(meta_p.read_text(encoding="utf-8"))
+    t4 = pd.to_datetime(pd.read_parquet(
+        root4 / "bars" / SYMBOL / "D1" / "data.parquet")["time"])
+    gs, ge = t4.iloc[200], t4.iloc[200] + pd.Timedelta(days=200)
+    meta["known_gaps"] = [{"start": gs.isoformat(), "end": ge.isoformat(),
+                           "reason": "测试：服务器端缺口"}]
+    meta_p.write_text(json.dumps(meta), encoding="utf-8")
+    cov4 = candidates.coverage_years(root4, [SYMBOL], ["D1"])
+    assert cov4[key] == pytest.approx(YEARS_D1 - 200 / 365.25, abs=0.03)

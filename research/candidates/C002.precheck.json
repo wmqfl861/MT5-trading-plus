@@ -22,7 +22,7 @@
     },
     "ex_ante_cost": {
       "passed": true,
-      "multiple": 4.888805126182647,
+      "multiple": 4.884458226278745,
       "min": 3.0,
       "gross_return_per_event": 0.00031,
       "binding_symbol": "EURUSD",
@@ -31,28 +31,28 @@
           "reference_price": 1.16168,
           "reference_timeframe": "H1",
           "contract_size": 100000.0,
-          "spread_round_trip": 5.284183383623596e-05,
-          "spread_entry_frac": 5.284183383623596e-05,
-          "spread_exit_frac": 5.2841601136066094e-05,
-          "slippage_entry": 5.284183383623596e-06,
-          "slippage_exit": 5.284160113606609e-06,
+          "spread_round_trip": 5.289093008715635e-05,
+          "spread_entry_frac": 5.289093008715635e-05,
+          "spread_exit_frac": 5.2865858173084335e-05,
+          "slippage_entry": 5.289093008715636e-06,
+          "slippage_exit": 5.286585817308434e-06,
           "commission": 0.0,
           "overnight": 0.0,
-          "round_trip_cost": 6.341017733346615e-05,
-          "multiple": 4.888805126182647
+          "round_trip_cost": 6.346660891318042e-05,
+          "multiple": 4.884458226278745
         }
       }
     },
     "power": {
       "passed": true,
-      "power": 0.5050528019549135,
+      "power": 0.6401520938128765,
       "min": 0.5,
-      "years": 12.8077800593201,
+      "years": 18.72381930184805,
       "expected_sharpe": 0.83,
-      "implied_sharpe": 0.4902309230701391,
-      "sharpe_used": 0.4902309230701391,
+      "implied_sharpe": 0.49011873471980705,
+      "sharpe_used": 0.49011873471980705,
       "implied_sharpe_by_symbol": {
-        "EURUSD": 0.4902309230701391
+        "EURUSD": 0.49011873471980705
       },
       "sigma_by_symbol": {
         "EURUSD": 0.0017424690340341038
@@ -63,9 +63,9 @@
       "alpha": 0.05,
       "n_tests": 1,
       "years_detail": {
-        "EURUSD/H1": 12.8077800593201
+        "EURUSD/H1": 18.72381930184805
       },
-      "min_detectable_sharpe": 0.7977336716812023,
+      "min_detectable_sharpe": 0.6289200898791262,
       "coverage_segments": {
         "EURUSD/H1": [
           {
@@ -77,17 +77,140 @@
           },
           {
             "source": "histdata",
-            "first": "2013-01-01T22:00:00",
-            "last": "2022-12-30T21:00:00",
-            "years": 9.99304129591604,
-            "counted": true
+            "first": "2007-01-02T01:00:00",
+            "last": "2019-09-30T23:00:00",
+            "years": 12.74446725986767,
+            "counted": true,
+            "gaps": [
+              {
+                "start": "2019-09-30T23:00:00",
+                "end": "2019-11-01T00:00:00"
+              },
+              {
+                "start": "2023-01-31T23:00:00",
+                "end": "2023-08-01T00:00:00"
+              },
+              {
+                "start": "2023-09-29T20:00:00",
+                "end": "2023-11-01T00:00:00"
+              },
+              {
+                "start": "2024-09-30T23:00:00",
+                "end": "2024-11-01T00:00:00"
+              }
+            ],
+            "note": "内部空洞切分（T94/R14-L3：4 处 >30 天空洞，边界见 gaps）"
+          },
+          {
+            "source": "histdata",
+            "first": "2019-11-01T00:00:00",
+            "last": "2023-01-31T23:00:00",
+            "years": 3.252452657996806,
+            "counted": true,
+            "gaps": [
+              {
+                "start": "2019-09-30T23:00:00",
+                "end": "2019-11-01T00:00:00"
+              },
+              {
+                "start": "2023-01-31T23:00:00",
+                "end": "2023-08-01T00:00:00"
+              },
+              {
+                "start": "2023-09-29T20:00:00",
+                "end": "2023-11-01T00:00:00"
+              },
+              {
+                "start": "2024-09-30T23:00:00",
+                "end": "2024-11-01T00:00:00"
+              }
+            ],
+            "note": "内部空洞切分（T94/R14-L3：4 处 >30 天空洞，边界见 gaps）"
+          },
+          {
+            "source": "histdata",
+            "first": "2023-08-01T00:00:00",
+            "last": "2023-09-29T20:00:00",
+            "years": 0.16381473876340405,
+            "counted": true,
+            "gaps": [
+              {
+                "start": "2019-09-30T23:00:00",
+                "end": "2019-11-01T00:00:00"
+              },
+              {
+                "start": "2023-01-31T23:00:00",
+                "end": "2023-08-01T00:00:00"
+              },
+              {
+                "start": "2023-09-29T20:00:00",
+                "end": "2023-11-01T00:00:00"
+              },
+              {
+                "start": "2024-09-30T23:00:00",
+                "end": "2024-11-01T00:00:00"
+              }
+            ],
+            "note": "内部空洞切分（T94/R14-L3：4 处 >30 天空洞，边界见 gaps）"
+          },
+          {
+            "source": "histdata",
+            "first": "2023-11-01T00:00:00",
+            "last": "2024-09-30T23:00:00",
+            "years": 0.9170659365731234,
+            "counted": true,
+            "gaps": [
+              {
+                "start": "2019-09-30T23:00:00",
+                "end": "2019-11-01T00:00:00"
+              },
+              {
+                "start": "2023-01-31T23:00:00",
+                "end": "2023-08-01T00:00:00"
+              },
+              {
+                "start": "2023-09-29T20:00:00",
+                "end": "2023-11-01T00:00:00"
+              },
+              {
+                "start": "2024-09-30T23:00:00",
+                "end": "2024-11-01T00:00:00"
+              }
+            ],
+            "note": "内部空洞切分（T94/R14-L3：4 处 >30 天空洞，边界见 gaps）"
+          },
+          {
+            "source": "histdata",
+            "first": "2024-11-01T00:00:00",
+            "last": "2025-10-23T23:00:00",
+            "years": 0.9772986538900297,
+            "counted": true,
+            "gaps": [
+              {
+                "start": "2019-09-30T23:00:00",
+                "end": "2019-11-01T00:00:00"
+              },
+              {
+                "start": "2023-01-31T23:00:00",
+                "end": "2023-08-01T00:00:00"
+              },
+              {
+                "start": "2023-09-29T20:00:00",
+                "end": "2023-11-01T00:00:00"
+              },
+              {
+                "start": "2024-09-30T23:00:00",
+                "end": "2024-11-01T00:00:00"
+              }
+            ],
+            "note": "内部空洞切分（T94/R14-L3：4 处 >30 天空洞，边界见 gaps）"
           }
         ]
       },
       "coverage_merged_years": {
-        "EURUSD/H1": 12.8077800593201
+        "EURUSD/H1": 18.72381930184805
       },
-      "coverage_merge_method": "计入段日历区间并集：相接/重叠的段合成连续跨度（min(first)..max(last)），不相接的分段各自计入——重叠不双计（T80/G3 审核修正：相加会把完全包含/部分重叠的覆盖虚增，如 fred/USTEC 39.8 年包住 mt5 4.3 年 → 合并 39.8 而非 44.1）"
+      "coverage_merge_method": "计入段日历区间并集：相接/重叠的段合成连续跨度（min(first)..max(last)），不相接的分段各自计入——重叠不双计（T80/G3 审核修正：相加会把完全包含/部分重叠的覆盖虚增，如 fred/USTEC 39.8 年包住 mt5 4.3 年 → 合并 39.8 而非 44.1）；每段在产出侧已在 >30 天内部空洞处切开（T94/R14-L3：实测间隔+known_gaps+manifest 未启用年份，边界随段的 gaps 字段）"
     },
     "mechanism_gap": {
       "blocking": false,
@@ -96,8 +219,8 @@
       "active_mechanisms": []
     }
   },
-  "cost_model_version": "tick-spread-p90[rel@NY/bar_open_m1#10a66c54]+slip0.1-comm0-calibrated-swap-snapshot[95bd5691]-relref[1b22b468]-no-overshoot",
-  "checked_at_utc": "2026-10-28T13:27:25.933160+00:00",
+  "cost_model_version": "tick-spread-p90[rel@NY/bar_open_m1#abed3b8f]+slip0.1-comm0-calibrated-swap-snapshot[95bd5691]-relref[1b22b468]-no-overshoot",
+  "checked_at_utc": "2026-10-28T21:03:46.374551+00:00",
   "swap_basis": {
     "applicable": false,
     "note": "候选不过夜（overnight_nights=0）：隔夜费恒 0，双口径无差别"

@@ -44,8 +44,9 @@ USAGE_RESTRICTION_HISTDATA = (
     "数据与逐 bar 序列不入公开仓库（data/ 与 data_research/ 均 gitignore）"
     "，报告只放汇总统计；按网站正常下载路径低频下载、不并发、不绕过限制"
     "；只启用逐年时间口径验证通过的年份（EURUSD 另加伦敦 16:00 定盘窗"
-    "分钟波动尖峰锚点逐年核对），判为 inconsistent 或 undetermined 的"
-    "年份登记后不用；早年点差用情景倍数（bid-only 无 ask）")
+    "分钟波动尖峰锚点逐年核对），口径判为 inconsistent 的年份登记后不用"
+    "；锚点判为 undetermined 的年份不排除——以标签规则检测为准，manifest "
+    "注明（T94/R14-L4）；早年点差用情景倍数（bid-only 无 ask）")
 
 # ---------------------------------------------------------------- 批准表
 
@@ -82,7 +83,9 @@ SOURCE_APPROVALS: dict[str, dict] = {
                   "存本地 data/ext/terms/histdata-2026-10-27.txt（data/ "
                   "不入库）。限定：只作个人研究、不再分发、低频下载不并发"
                   "不绕限、只启用逐年口径验证通过的年份（EURUSD 另加定盘"
-                  "锚点）；用户可撤销"),
+                  "锚点——T94/R14-L4 起锚点 inconsistent 才排除，"
+                  "undetermined 不排除、以标签规则检测为准并在 manifest "
+                  "注明）；用户可撤销"),
         "review": REVIEW_REF_R13,
         "approved_at": APPROVED_AT_HISTDATA,
     },

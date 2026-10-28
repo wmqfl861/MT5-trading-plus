@@ -349,6 +349,142 @@ def yearly_label_calendar(stamps, *, winter_months=(1, 2, 12),
     return out
 
 
+# ---------------------------------------------------------------- 按月口径（T94/R14-L9）
+
+def _label_calendar_observations(t: pd.DatetimeIndex, *, winter_months,
+                                 gap_min, gap_max):
+    """收集口径观测（周开盘/换日空档恢复）并按年给锚——yearly 与 monthly
+    共用同一观测框架。返回 DataFrame(day, kind, bucket) 与年→锚表。"""
+    obs_day: list = []
+    obs_kind: list = []
+    obs_bucket: list = []
+    sun = t[t.dayofweek == 6]
+    if len(sun):
+        firsts = pd.Series(sun).groupby(pd.Series(sun).dt.date).min()
+        for d, v in firsts.items():
+            obs_day.append(pd.Timestamp(d))
+            obs_kind.append("week_open")
+            obs_bucket.append(_hour_bucket(v))
+    if len(t) > 1:
+        diffs = t.to_series().diff().iloc[1:]
+        modal = diffs.mode().iloc[0] if len(diffs) else gap_min
+        gap_lo = max(gap_min, 3 * modal)
+        mask = (diffs >= gap_lo) & (diffs < gap_max)
+        for end in t[1:][mask.to_numpy()]:
+            obs_day.append(pd.Timestamp(end.date()))
+            obs_kind.append("daily_gap")
+            obs_bucket.append(_hour_bucket(end))
+    if not obs_day:
+        return None, {}
+    frame = pd.DataFrame({"day": obs_day, "kind": obs_kind,
+                          "bucket": obs_bucket})
+    anchors_by_year: dict[int, dict[str, int]] = {}
+    for year, grp in frame.groupby(frame["day"].dt.year):
+        anchors: dict[str, int] = {}
+        winter = grp[grp["day"].dt.month.isin(winter_months)]
+        for kind in ("week_open", "daily_gap"):
+            wk = winter[winter["kind"] == kind]
+            if len(wk):
+                anchors[kind] = int(wk["bucket"].mode().iloc[0])
+        anchors_by_year[int(year)] = anchors
+    return frame, anchors_by_year
+
+
+def _month_dst_divergence(days, tz_us: str = NY_TZ, tz_eu: str = EU_TZ):
+    """逐日美/欧 DST 状态是否分歧（eu_calendar 与 us_wall 在该日转换
+    不同的充要条件——状态一致时两规则换算逐分钟等价）。"""
+    us = _dst_on(days, tz_us)
+    eu = _dst_on(days, tz_eu)
+    return us != eu
+
+
+def monthly_label_calendar(stamps, *, winter_months=(1, 2, 12),
+                           gap_min=pd.Timedelta(minutes=30),
+                           gap_max=pd.Timedelta(hours=24),
+                           tol_rate: float = 0.05, tol_min: int = 2
+                           ) -> dict[int, dict[str, dict]]:
+    """按月分段口径检测（T94/R14-L9）——年判 inconsistent 的过渡年
+    （2019/2024：两代标签规则的切换年）回收能判定的月份。
+
+    与 yearly_label_calendar 同一观测框架与锚（锚取**该年深冬**的模态
+    小时），按月分组比对三种规则的期望小时。月级判定：
+
+    - ``us_wall`` / ``eu_calendar``：该月含美欧 DST 分歧日（两支持规则
+      可分），某一支持规则偏差最小、≤容差且唯一；
+    - ``either_supported``：该月**整月**美欧 DST 状态一致（深冬/盛夏）
+      ——eu_calendar 与 us_wall 对该月的换算逐分钟等价，观测对两者
+      都自洽（fixed_est 超容差）即判可回收（转换用哪个都一样）；
+    - ``inconsistent``：两个支持规则偏差都超容差（如该月标签跟
+      fixed_est）；
+    - ``undetermined``：含分歧日但观测无区分度（规则并列、无法取舍）。
+
+    返回 {年: {月: {calendar, deviations, tolerance, observations,
+    dst_divergence_days}}}。锚缺失的年不出现（与 yearly 同语义）。
+    """
+    t = pd.DatetimeIndex(pd.to_datetime(stamps)).sort_values()
+    if len(t) == 0:
+        return {}
+    frame, anchors_by_year = _label_calendar_observations(
+        t, winter_months=winter_months, gap_min=gap_min, gap_max=gap_max)
+    if frame is None:
+        return {}
+    rules = ("eu_calendar", "fixed_est", "us_wall")
+    out: dict[int, dict[str, dict]] = {}
+    for year, ygrp in frame.groupby(frame["day"].dt.year):
+        anchors = anchors_by_year.get(int(year), {})
+        usable = ygrp[ygrp["kind"].isin(anchors)]
+        if usable.empty:
+            continue
+        year_months: dict[str, dict] = {}
+        for month, grp in usable.groupby(
+                usable["day"].dt.to_period("M").astype(str)):
+            days = pd.DatetimeIndex(grp["day"])
+            us = _dst_on(days, NY_TZ)
+            eu = _dst_on(days, EU_TZ)
+            anchor = grp["kind"].map(anchors).astype(int).to_numpy()
+            expected = {
+                "us_wall": anchor % 24,
+                "fixed_est": (anchor - us) % 24,
+                "eu_calendar": (anchor - (us & ~eu).astype(int)) % 24,
+            }
+            observed = grp["bucket"].to_numpy()
+            deviations = {r: int((observed != expected[r]).sum())
+                          for r in rules}
+            n = len(grp)
+            tol = max(tol_min, -(-int(tol_rate * n * 100) // 100))
+            supported_ok = [r for r in ("eu_calendar", "us_wall")
+                            if deviations[r] <= tol]
+            best = min(rules, key=lambda r: (deviations[r], rules.index(r)))
+            divergence = bool(_month_dst_divergence(days).any())
+            if not divergence:
+                # 整月美欧状态一致：两支持规则换算等价，观测自洽即回收
+                if supported_ok:
+                    calendar = "either_supported"
+                else:
+                    calendar = "inconsistent"
+            else:
+                if len(supported_ok) == 1:
+                    calendar = supported_ok[0]
+                elif len(supported_ok) == 2:
+                    calendar = "undetermined"   # 含分歧日但并列无区分度
+                elif best in ("eu_calendar", "us_wall") \
+                        and deviations[best] <= tol:
+                    calendar = best
+                else:
+                    calendar = "inconsistent"
+            year_months[str(month)] = {
+                "calendar": calendar,
+                "deviations": deviations,
+                "tolerance": tol,
+                "observations": n,
+                "dst_divergence_days": int(
+                    _month_dst_divergence(days).sum()),
+            }
+        if year_months:
+            out[int(year)] = year_months
+    return out
+
+
 # ---------------------------------------------------------------- 定盘锚点（T87/R13 §5）
 
 LONDON_TZ = "Europe/London"
@@ -377,6 +513,12 @@ def fix_window_vol_spike(bars: pd.DataFrame, *, tz: str = LONDON_TZ,
     month_end_only：只取每月最后交易日的分钟（Melvin-Prins 的月末
     定盘窗——对冲流集中在月末，C002 的事件总体）；EURUSD 的启用
     判定用该口径（报告并列全日口径作证据）。
+
+    状态的闸门语义（T94/R14-L4）：只有 ``inconsistent``（尖峰出现在
+    错的小时 = 标签口径错一小时的证据）才排除年份；``undetermined``
+    （余量不足分不出位置）不排除——月末定盘窗的波动强度与 C002 机制
+    相关，按尖峰强弱取舍年份等于按效应强弱挑样本；undetermined 年以
+    标签规则检测为准入库，本函数的实测值仍如实写进 manifest。
 
     返回 {年: {location, margin, v_core/v_minus_1h/v_plus_1h（实测均值）,
     peak_minute_london（搜索窗内最大分钟，证据）, observations,
