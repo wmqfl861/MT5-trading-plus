@@ -146,6 +146,12 @@ class ProbDeclared:
     breakout_atr: float             # b（A1 突破幅度，ATR 倍数）
     retest_window_bars: int         # m（A2/A4 窗口）
     expected_delta_p: float         # 折算后预期 Δp（单侧赢率增量，文献折算）
+    # 审核四 E2：五个决策字段（缺省 None=P1 未写；写了须与策略类常量一致）
+    features: tuple[str, ...] | None = None
+    prior_strength: int | None = None
+    min_cell: int | None = None
+    lb_z: float | None = None
+    entry_threshold_cost_mult: float | None = None
 
 
 def _validate_prob(raw: object, source: str, symbols: tuple[str, ...]
@@ -154,9 +160,13 @@ def _validate_prob(raw: object, source: str, symbols: tuple[str, ...]
     if not isinstance(raw, dict):
         raise CandidateError(
             f"{source}：[prob] 必须是 TOML 表，收到 {type(raw).__name__}")
-    unknown = sorted(set(raw) - {"situations", "hypotheses", "bracket",
-                                 "level_grid", "approach", "breakout_atr",
-                                 "retest_window_bars", "expected_delta_p"})
+    unknown = sorted(set(raw) - {
+        "situations", "hypotheses", "bracket", "level_grid", "approach",
+        "breakout_atr", "retest_window_bars", "expected_delta_p",
+        # 审核四 E2：蓝图附录 A 的五个决策字段（P2 必写、P1 可选，
+        # 写了即校验并与策略类常量核对）
+        "features", "prior_strength", "min_cell", "lb_z",
+        "entry_threshold_cost_mult"})
     if unknown:
         raise CandidateError(f"{source}：[prob] 未知字段 {unknown}")
 
@@ -238,13 +248,44 @@ def _validate_prob(raw: object, source: str, symbols: tuple[str, ...]
         raise CandidateError(
             f"{source}：[prob].expected_delta_p 必须在开区间 (0, 0.5)"
             f"（文献折算的预期赢率增量），收到 {dp!r}")
+    # ---- 审核四 E2：五个决策字段（可选；写了即校验） ----
+    feats = raw.get("features", None)
+    if feats is not None:
+        if (not isinstance(feats, list)
+                or not all(isinstance(x, str) for x in feats)
+                or len(feats) > 2
+                or not set(feats) <= {"trend_sma200", "atr_pct_2000"}):
+            raise CandidateError(
+                f"{source}：[prob].features 必须是 "
+                '["trend_sma200", "atr_pct_2000"] 的子集（≤2 项），'
+                f"收到 {feats!r}")
+    for fname, fmin in (("prior_strength", 1), ("min_cell", 1)):
+        v = raw.get(fname, None)
+        if v is not None and (isinstance(v, bool)
+                              or not isinstance(v, int) or v < fmin):
+            raise CandidateError(
+                f"{source}：[prob].{fname} 必须是 ≥{fmin} 整数，收到 {v!r}")
+    for fname in ("lb_z", "entry_threshold_cost_mult"):
+        v = raw.get(fname, None)
+        if v is not None and (isinstance(v, bool)
+                              or not isinstance(v, (int, float))
+                              or not math.isfinite(v) or v <= 0):
+            raise CandidateError(
+                f"{source}：[prob].{fname} 必须是有限正数，收到 {v!r}")
     return ProbDeclared(
         situations=tuple(situations), hypotheses=tuple(hypotheses),
         bracket=b, level_grid=dict(level_grid), approach=ap,
         breakout_atr=_pos("breakout_atr", raw.get("breakout_atr")),
         retest_window_bars=_int("retest_window_bars",
                                 raw.get("retest_window_bars")),
-        expected_delta_p=float(dp))
+        expected_delta_p=float(dp),
+        features=(tuple(feats) if feats is not None else None),
+        prior_strength=raw.get("prior_strength"),
+        min_cell=raw.get("min_cell"),
+        lb_z=(float(raw["lb_z"]) if raw.get("lb_z") is not None else None),
+        entry_threshold_cost_mult=(
+            float(raw["entry_threshold_cost_mult"])
+            if raw.get("entry_threshold_cost_mult") is not None else None))
 
 
 @dataclass(frozen=True)

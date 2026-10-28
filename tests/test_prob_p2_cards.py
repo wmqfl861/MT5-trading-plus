@@ -197,8 +197,8 @@ def _dict_to_toml(d):
 
 
 def test_slice_validation_eval(tmp_path):
-    """D1：validation 评估窗切 [split, cutoff)——分界前数据被裁掉，
-    分界后无数据 → ValueError。"""
+    """E1：评估窗 = [split − lookback·周期, cutoff)——预热保留分界前
+    lookback 根；分界后无数据 → ValueError。"""
     card_path = _validation_env(tmp_path)
     card = rcards.load_card(card_path)
     assert card.segment == "validation"
@@ -207,16 +207,20 @@ def test_slice_validation_eval(tmp_path):
     times = pd.date_range("2019-11-01", periods=1000, freq="1h")
     bars_all = pd.DataFrame({"time": times, "open": 100.0, "high": 100.5,
                              "low": 99.5, "close": 100.0})
-    bars = {"XAUUSD": bars_all}
-    BT._slice_validation_eval(card, rnd_obj, bars)
-    after = pd.to_datetime(bars["XAUUSD"]["time"])
-    assert after.min() >= pd.Timestamp("2019-12-01")
-    assert len(bars["XAUUSD"]) < 500          # 分界前被裁
+    out = BT._slice_validation_eval(
+        card, rnd_obj, {"XAUUSD": bars_all}, lookback_bars=200)
+    t = pd.to_datetime(out["XAUUSD"]["time"])
+    split = pd.Timestamp("2019-12-01")
+    assert (t >= split).any()                      # 分界后必有
+    assert t.min() < split                         # 预热跨过分界
+    assert t.min() >= split - pd.Timedelta(hours=200)   # 恰留 200 根预热
+    assert len(out["XAUUSD"]) < 1000
     # 分界后无数据 → 拒
-    bars_before_only = {"XAUUSD": bars_all[bars_all["time"]
-                                           < "2019-11-01"].reset_index(drop=True)}
+    bars_before = {"XAUUSD": bars_all[bars_all["time"] < "2019-11-01"]
+                   .reset_index(drop=True)}
     with pytest.raises(ValueError, match="没有数据"):
-        BT._slice_validation_eval(card, rnd_obj, bars_before_only)
+        BT._slice_validation_eval(card, rnd_obj, bars_before,
+                                  lookback_bars=200)
 
 
 def test_reject_probability_card_backtest():

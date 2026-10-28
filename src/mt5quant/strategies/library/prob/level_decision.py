@@ -65,6 +65,11 @@ class LevelDecisionV1(BaseStrategy):
                                   touch_atr=0.25)
     BREAKOUT_ATR: float = 0.25
     RETEST_WINDOW_BARS: int = 6
+    # 审核四 E2：决策配置类常量（卡的 [prob] 五字段与之核对；不再在
+    # fit 里写死）
+    FEATURES: tuple[str, ...] = ("trend_sma200", "atr_pct_2000")
+    PRIOR_STRENGTH: int = 100
+    MIN_CELL: int = 100
     POLICY: DecisionPolicy = DecisionPolicy()
     SYMBOLS: tuple[str, ...] = ("XAUUSD",)
     TIMEFRAME: str = "H1"
@@ -103,8 +108,9 @@ class LevelDecisionV1(BaseStrategy):
                            ignore_index=True) if any(len(p) for p in parts) \
             else pd.DataFrame(columns=["situation", "action", "outcome",
                                        "net_r", *FEATURES])
-        table = ProbTable.fit(labels, group_by=list(FEATURES),
-                              prior_strength=100, min_cell=100)
+        table = ProbTable.fit(labels, group_by=list(self.FEATURES),
+                              prior_strength=self.PRIOR_STRENGTH,
+                              min_cell=self.MIN_CELL)
         model = {
             "schema_version": 1,
             "prob_version": PROB_VERSION,

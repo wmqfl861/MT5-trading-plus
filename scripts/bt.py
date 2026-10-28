@@ -1429,6 +1429,30 @@ def _check_card_strategy_constants(card, strategy_cls) -> str | None:
             return (f"卡 [prob].approach.{k}={ap[k]!r} 与策略类 "
                     f"APPROACH.{attr}={getattr(cls_ap, attr)!r} 不一致——"
                     "拒绝运行")
+    # 审核四 E2：五个决策字段（写了才核对；None=卡未写，跳过）
+    feat_c = tuple(getattr(strategy_cls, "FEATURES", ()) or ())
+    if prob.get("features") is not None             and tuple(prob["features"]) != feat_c:
+        return (f"卡 [prob].features={list(prob['features'])} 与策略类 "
+                f"FEATURES={list(feat_c)} 不一致——拒绝运行")
+    for pkey, cls_attr in (("prior_strength", "PRIOR_STRENGTH"),
+                           ("min_cell", "MIN_CELL")):
+        v = prob.get(pkey)
+        c = getattr(strategy_cls, cls_attr, None)
+        if v is not None and (c is None or int(v) != int(c)):
+            return (f"卡 [prob].{pkey}={v!r} 与策略类 {cls_attr}={c!r} "
+                    "不一致——拒绝运行")
+    pol = getattr(strategy_cls, "POLICY", None)
+    if pol is None:
+        return "策略类缺 POLICY 常量——lb_z/门槛无法核对"
+    lb = prob.get("lb_z")
+    if lb is not None and float(lb) != float(pol.z):
+        return (f"卡 [prob].lb_z={lb!r} 与策略类 POLICY.z={pol.z!r} "
+                "不一致——拒绝运行（审核四 E2/R7 后半）")
+    tm = prob.get("entry_threshold_cost_mult")
+    if tm is not None and float(tm) != float(pol.threshold_mult):
+        return (f"卡 [prob].entry_threshold_cost_mult={tm!r} 与策略类 "
+                f"POLICY.threshold_mult={pol.threshold_mult!r} 不一致——"
+                "拒绝运行")
     return None
 
 
@@ -1442,21 +1466,76 @@ def _reject_probability_card_backtest(card) -> str | None:
     return None
 
 
-def _slice_validation_eval(card, round_obj, bars_by_sym) -> None:
-    """审核三 D1：validation 卡的评估切到 [split, cutoff)——就地裁剪
-    bars_by_sym（训练窗在 _prob_fit_context 里取 < split）；分界后无
-    数据 → ValueError。"""
+def _slice_validation_eval(card, round_obj, bars_by_sym, *,
+                           lookback_bars: int) -> dict:
+    """审核四 E1：validation 卡的评估窗 = [split − lookback·周期, cutoff)。
+
+    - 分界（含）之后无数据 → ValueError（"在 < split 上评估被拒"）；
+    - 从分界往前多取 lookback_bars 根作预热（ATR/SMA200/分位特征需要
+      历史），返回**新字典**（训练窗已在拟合上下文里取 < split——调用
+      顺序必须先拟合、后切评估窗）；
+    - 分界之前的信号由 _ZeroedBeforeSplit 门归零（见下），指标只按
+      分界之后入场的交易计算（信号为 0 则分界前不可能入场）。
+    """
     if card.segment != "validation":
-        return
+        return bars_by_sym
     split = pd.Timestamp((round_obj.segments or {})["split"])
-    for sym, bars in list(bars_by_sym.items()):
+    from mt5data.store import TIMEFRAME_SECONDS as _TS
+    tf_s = _TS[card.timeframe.upper()]
+    warm = pd.Timedelta(seconds=tf_s * max(int(lookback_bars), 0))
+    out = {}
+    for sym, bars in bars_by_sym.items():
         times = pd.to_datetime(bars["time"])
-        after = bars[times >= split].reset_index(drop=True)
-        if len(after) == 0:
+        if not (times >= split).any():
             raise ValueError(
                 f"{sym} 在分界 {split} 之后没有数据——validation 卡的评估"
                 "窗是 [split, cutoff)，分界前数据不算样本外（D50；审核三 D1）")
-        bars_by_sym[sym] = after
+        keep = times >= (split - warm)
+        if not keep.any():          # 理论不可达（含分界后必有），防御
+            keep = times >= split
+        out[sym] = bars[keep].reset_index(drop=True)
+    return out
+
+
+class _ZeroedBeforeSplit:
+    """评估门（审核四 E1）：分界之前的信号一律为 0。策略在预热 bar 上
+    照常计算特征（有界窗口历史），但不出信号；分界之后透传。纯函数、
+    截断一致（掩码按绝对时刻）。"""
+
+    def __init__(self, inner, split):
+        self._inner = inner
+        self._split = pd.Timestamp(split)
+        self.fittable = False
+
+    def generate_signals(self, bars, params):
+        sig = self._inner.generate_signals(bars, params)
+        times = pd.to_datetime(bars["time"])
+        return sig.mask(times < self._split, 0)
+
+    def validate_params(self, params):
+        return self._inner.validate_params(params)
+
+    @property
+    def exit_rules(self):
+        return self._inner.exit_rules
+
+    @property
+    def required_data(self):
+        return self._inner.required_data
+
+
+class _GatedFactory:
+    """_ZeroedBeforeSplit 的工厂（与 _FittedFactory 同构：实例化返回
+    装门的实例；类属性透传）。"""
+
+    def __init__(self, base, split):
+        self._base, self._split = base, pd.Timestamp(split)
+
+    def __call__(self):
+        return _ZeroedBeforeSplit(self._base(), self._split)
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
 
 
 def _prob_fit_context(card, round_ctx, bars_by_sym, costs_by_sym, data_root,
@@ -2045,14 +2124,9 @@ def cmd_screen(args) -> int:
             if _cs_msg:
                 print(f"✗ {_cs_msg}")
                 return 1
-            if getattr(card, "segment", "") == "validation":
-                # D1：评估切 [split, cutoff)（训练窗由拟合上下文取 < split）
-                rnd_path = Path(card.path).parent.parent / "rounds" / \
-                    f"{card.round}.toml"
-                _slice_validation_eval(
-                    card, rnd.load_round(rnd_path), bars_by_sym)
-                bars_by_sym = {k: v for k, v in bars_by_sym.items()}
-            # T73A：fittable 策略先拟合再评估（单一训练窗，D44/铁律 21）
+            # 审核四 E1：先拟合（训练窗 < split，用**全量** bars），再切
+            # 评估窗（含预热）——顺序反了会让训练窗变空
+            fit_ctx = None
             if getattr(strategy_cls, "fittable", False):
                 try:
                     fit_ctx = _prob_fit_context(
@@ -2069,8 +2143,20 @@ def cmd_screen(args) -> int:
                 strategy_cls = _FittedFactory(strategy_cls, fit_ctx["model"])
                 print(f"— 概率卡拟合：模型 {fit_ctx['model_sha'][:12]}… -> "
                       f"{fit_ctx['model_path']}")
-            else:
-                fit_ctx = None
+            if getattr(card, "segment", "") == "validation":
+                rnd_path = Path(card.path).parent.parent / "rounds" / \
+                    f"{card.round}.toml"
+                round_obj_v = rnd.load_round(rnd_path)
+                lookback = getattr(
+                    getattr(strategy_cls, "required_data", None),
+                    "lookback_bars", 0) or 0
+                bars_by_sym = _slice_validation_eval(
+                    card, round_obj_v, bars_by_sym,
+                    lookback_bars=lookback)
+                split_v = round_obj_v.segments["split"]
+                strategy_cls = _GatedFactory(strategy_cls, split_v)
+                print(f"— validation 评估窗：分界 {split_v} 前留 "
+                      f"{lookback} 根预热，分界前信号为 0")
         except Exception as e:
             print(f"✗ 装配失败（未开跑，无 runs 记录）：{type(e).__name__}: {e}")
             return 1
@@ -2335,16 +2421,13 @@ def cmd_gate(args) -> int:
         if _cs_msg:
             print(f"✗ {_cs_msg}")
             return 1
-        if getattr(card, "segment", "") == "validation":
-            rnd_path = Path(card.path).parent.parent / "rounds" / \
-                f"{card.round}.toml"
-            _slice_validation_eval(card, rnd.load_round(rnd_path),
-                                   bars_by_sym)
-        # T73A：拟合策略先拟合再评估；walk-forward（G3）与关卡 v3 主检验
-        # 在 T73B（逐窗拟合 + purge 接线，等 H 线审核会话批准 T65）完成前
-        # 一律拒绝运行
+        # T73A：拟合策略先拟合再评估（审核四 E1：拟合用**全量** bars、
+        # 训练窗 < split，之后才切评估窗）；walk-forward（G3）与关卡 v3
+        # 主检验在 T73B 完成前一律拒绝。_strategy_cls 恒为装门前的原始类
+        # （_ZeroedBeforeSplit 只包实例，不作拟合工厂）。
+        _strategy_cls = type(strategy)
         fit_ctx = None
-        _g3_msg = _reject_fittable_walkforward(type(strategy), wanted)
+        _g3_msg = _reject_fittable_walkforward(_strategy_cls, wanted)
         if _g3_msg:
             print(f"✗ {_g3_msg}")
             return 1
@@ -2352,7 +2435,7 @@ def cmd_gate(args) -> int:
             try:
                 fit_ctx = _prob_fit_context(
                     card, round_ctx, bars_by_sym, costs_by_sym, data_root)
-                _fit_and_freeze(type(strategy), card, fit_ctx, bars_by_sym,
+                _fit_and_freeze(_strategy_cls, card, fit_ctx, bars_by_sym,
                                 costs_by_sym, data_root,
                                 fit_meta={"sizes": sizes,
                                           "vols_by_sym": vols_by_sym,
@@ -2364,6 +2447,18 @@ def cmd_gate(args) -> int:
             strategy = strategy.with_model(fit_ctx["model"])
             print(f"— 概率卡拟合：模型 {fit_ctx['model_sha'][:12]}… -> "
                   f"{fit_ctx['model_path']}")
+        if getattr(card, "segment", "") == "validation":
+            rnd_path = Path(card.path).parent.parent / "rounds" /                 f"{card.round}.toml"
+            round_obj_v = rnd.load_round(rnd_path)
+            lookback = getattr(
+                getattr(_strategy_cls, "required_data", None),
+                "lookback_bars", 0) or 0
+            bars_by_sym = _slice_validation_eval(
+                card, round_obj_v, bars_by_sym, lookback_bars=lookback)
+            strategy = _ZeroedBeforeSplit(
+                strategy, round_obj_v.segments["split"])
+            print(f"— validation 评估窗：分界前留 {lookback} 根预热，"
+                  "分界前信号为 0")
 
         symbol = card.symbols[0]
         bars = bars_by_sym[symbol]
@@ -2481,14 +2576,13 @@ def cmd_gate(args) -> int:
                 g0_ctx = _prob_fit_context(
                     card, round_ctx, g0_bars, costs_by_sym, data_root,
                     for_g0=True)
-                _fit_and_freeze(type(strategy), card, g0_ctx, bars_by_sym,
+                _fit_and_freeze(_strategy_cls, card, g0_ctx, bars_by_sym,
                                 costs_by_sym, data_root,
                                 fit_meta={"sizes": sizes,
                                           "vols_by_sym": vols_by_sym,
                                           "sizing": sizing_info,
                                           "policies": policy_by_sym})
-                g0_strategy = load_strategy(args.strategy)().with_model(
-                    g0_ctx["model"])
+                g0_strategy = _strategy_cls().with_model(g0_ctx["model"])
             _run("G0", lambda: vlook.run_g0(g0_strategy, bars, params))
         if "G1" in wanted:
             _run("G1", lambda: vgate.run_g1(base.trades,
