@@ -9,6 +9,7 @@ T32（D21）：全平指令编号协议的执行器消费侧——ack 引用指�
 """
 import json
 import os
+import re
 from datetime import datetime
 
 import pytest
@@ -889,3 +890,31 @@ def test_t58_deals_write_failure_alerts_but_does_not_block(tmp_path,
     orders_log = (tmp_path / f"orders-{MAGIC}.jsonl").read_text(
         encoding="utf-8")
     assert "fill" not in orders_log and '"kind": "open"' in orders_log
+
+
+# ---- F 阶段停修：decision_id → MT5 安全 comment（端到端） ----
+# 首战事故：开仓 comment=decision_id（XAUUSD|M15|2026-10-28T06:30:00）被 MT5
+# 拒单（last_error=(-2, 'Invalid "comment" argument')）。开仓 comment 改为
+# 压缩安全形态（白名单 [A-Za-z0-9 _-.]、≤31）；完整 decision_id 恒在本地
+# 留痕（expected-<magic>.json 的 cause 与 orders-<magic>.jsonl），注释仅
+# 辅助定位，可从日志还原原 decision_id。
+
+_SAFE_COMMENT = re.compile(r"[A-Za-z0-9 _\-.]+")
+
+
+def test_open_comment_safe_and_decision_id_recoverable_from_logs(tmp_path):
+    """④ 端到端（FakeBroker）：comment 安全落到订单请求（压缩形态）；
+    完整 decision_id 可从本地日志还原。"""
+    b = FakeBroker()
+    d = mk_decision(decision_id="XAUUSD|M15|2026-10-20T18:00:00",
+                    signal=-1, volume_lots=0.01)
+    rr = _mk_executor(b, tmp_path).poll(d, NOW)
+    assert rr.action == "open"
+    sent = b.market_orders[0]
+    assert _SAFE_COMMENT.fullmatch(sent["comment"])    # 仅白名单字符
+    assert len(sent["comment"]) <= 31
+    assert sent["comment"] == "XAUUSD_M15_1020_1800"   # 压缩：月日_时分
+    # 完整 decision_id 本地留痕（意图 cause + 下单日志行），可还原
+    assert read_intent(tmp_path)["cause"] == d.decision_id
+    with open(tmp_path / f"orders-{MAGIC}.jsonl", encoding="utf-8") as f:
+        assert json.loads(f.readline())["decision_id"] == d.decision_id

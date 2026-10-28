@@ -27,6 +27,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 from mt5gw.models import DEAL_REASON_SL, DEAL_REASON_SO, DEAL_REASON_TP
+from mt5gw.trading import sanitize_comment
 from mt5live.commands import (
     ALERT_COMMAND_UNREADABLE,
     CommandUnreadableError,
@@ -49,6 +50,29 @@ from mt5live.runner import Decision
 from mt5quant.strategies.base import ExitRules
 
 _EPS = 1e-9
+
+
+def decision_comment(decision_id: str) -> str:
+    """decision_id → MT5 安全订单 comment（压缩形态，仅辅助定位）。
+
+    canonical decision_id = "{symbol}|{TF}|{bar_close_iso}"（runner 与风控
+    进程的接口约定）。'|' 与 ISO 冒号触发 MT5 拒单（F 阶段首战事故，
+    last_error=(-2, 'Invalid "comment" argument')），压缩为
+    "{symbol}_{TF}_{MMDD}_{HHMM}"（白名单字符、≤31）。非 canonical 形态
+    退回 sanitize_comment 兜底安全化。完整 decision_id 恒在本地留痕
+    （expected-<magic>.json 的 cause 与 orders-<magic>.jsonl 行），
+    注释不承担还原职责。
+    """
+    parts = decision_id.split("|")
+    if len(parts) == 3:
+        symbol, timeframe, iso = parts
+        try:
+            close_time = datetime.fromisoformat(iso)
+            stamp = f"{close_time:%m%d}_{close_time:%H%M}"
+        except ValueError:                       # 非 ISO（测试简写等）→ 原样安全化
+            stamp = iso
+        return sanitize_comment(f"{symbol}_{timeframe}_{stamp}")
+    return sanitize_comment(decision_id)
 
 
 @dataclass(frozen=True)
@@ -219,7 +243,8 @@ class ExecutionAdapter:
         before = {p.ticket for p in self._my_positions()}
         res = self._trading.market_order(
             self._symbol, side, lots, sl=sl, tp=tp,
-            deviation=self._deviation, comment=decision.decision_id,
+            deviation=self._deviation,
+            comment=decision_comment(decision.decision_id),  # 安全压缩（F 停修）
             magic=self._magic)
         outcome = OrderOutcome(
             kind="open", ticket=res.order_ticket, side=side,

@@ -7,7 +7,9 @@
 """
 from __future__ import annotations
 
+import logging
 import math
+import re
 
 from mt5gw.account import AccountService
 from mt5gw.config import GatewayConfig, ensure_trade_allowed
@@ -24,6 +26,26 @@ _TIME_GTC = 0  # ORDER_TIME_GTC
 # DONE=完成；DONE_PARTIAL=部分成交（仓位已建立）；PLACED=已受理（多见于挂单）
 _OK_RETCODES = frozenset({RETCode.DONE, RETCode.DONE_PARTIAL, RETCode.PLACED})
 _REQUOTE_ATTEMPTS = 3  # 10004 Requote 的有界重试（每次重取参考价）
+
+logger = logging.getLogger(__name__)
+
+# MT5 订单 comment 安全化（F 阶段停修，2026-10-28 首战事故根因）：真实 Demo
+# 下单 comment="XAUUSD|M15|2026-10-28T06:30:00" 被 MT5 校验层拒绝——
+# last_error=(-2, 'Invalid "comment" argument')（'|' 与 ISO 冒号均在被拒之
+# 列）。不猜黑名单，用保守白名单：字母数字 + 空格 _ - . ；上限取 31。
+_COMMENT_UNSAFE_RE = re.compile(r"[^A-Za-z0-9 _\-.]")
+MT5_COMMENT_MAX = 31  # MT5 comment 字段普遍 32 字节上限，保守取 31
+
+
+def sanitize_comment(comment: str | None) -> str:
+    """把 comment 安全化为 MT5 可接受形态（网关最后一道防线）。
+
+    白名单外字符逐个替换为 '_'（保对齐、不丢位），再截断至 31 字符；
+    None/空串 → ""（合法缺省）。合法 comment 原样返回。
+    """
+    if not comment:
+        return ""
+    return _COMMENT_UNSAFE_RE.sub("_", comment)[:MT5_COMMENT_MAX]
 
 _PENDING_TYPE = {
     ("buy", "limit"): "ORDER_TYPE_BUY_LIMIT",
@@ -86,6 +108,7 @@ class TradingService:
     ) -> OrderResult:
         if side not in ("buy", "sell"):
             raise ValueError(f"非法方向 {side}，仅接受 buy/sell")
+        comment = self._safe_comment(comment)
         spec = self._symbols.get(symbol)  # 含可见性保证（不在 Market Watch 会自动加入）
         request = {
             "action": self._mt5.TRADE_ACTION_DEAL,
@@ -119,6 +142,7 @@ class TradingService:
     ) -> OrderResult:
         if side not in ("buy", "sell") or kind not in ("limit", "stop"):
             raise ValueError(f"非法挂单参数 side={side} kind={kind}")
+        comment = self._safe_comment(comment)
         spec = self._symbols.get(symbol)
         request = {
             "action": self._mt5.TRADE_ACTION_PENDING,
@@ -211,13 +235,25 @@ class TradingService:
             "volume": vol,
             "deviation": deviation,
             "magic": self._config.magic if magic is None else magic,  # 每策略可逐单覆盖
-            "comment": f"close #{ticket}",
+            # '#' 不在白名单：构造即安全（close 9001），免得每次平仓告警
+            "comment": f"close {ticket}",
             "type_time": _TIME_GTC,
             "type_filling": pick_filling(spec.filling_mode),
         }
         return self._send_deal_with_requote(request, pos.symbol, close_side)
 
     # ---- 内部 ----
+
+    def _safe_comment(self, comment: str) -> str:
+        """入口预校验：不合法即安全化并告警记录 原文→安全文（绝不静默）。"""
+        safe = sanitize_comment(comment)
+        if safe != comment:
+            logger.warning(
+                "MT5 comment 不合法，已安全化：原文=%r → 安全文=%r"
+                "（白名单 [A-Za-z0-9 _-.] + %d 截断；F 阶段首战根因"
+                ' \'Invalid "comment" argument\'）',
+                comment, safe, MT5_COMMENT_MAX)
+        return safe
 
     def _send_deal_with_requote(self, request: dict, symbol: str, side: str) -> OrderResult:
         """市价类请求：10004 Requote 时重取参考价有界重试（执行层鲁棒性）。"""

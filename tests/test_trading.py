@@ -1,4 +1,6 @@
 from collections import namedtuple
+import logging
+import re
 
 import pytest
 
@@ -478,3 +480,67 @@ def test_explicit_magic_overrides_config_everywhere():
     assert box["req"]["magic"] == 777
     tr.close_position(9001, magic=777)
     assert box["req"]["magic"] == 777
+
+
+# ---- F 阶段停修：MT5 订单 comment 安全化 ----
+# 2026-10-28 首战真实事故：comment="XAUUSD|M15|2026-10-28T06:30:00" 被拒，
+# last_error=(-2, 'Invalid "comment" argument')（data/demo/runner-902601-
+# 20261028-143730.log.err）。不猜黑名单：保守白名单 [A-Za-z0-9 _-.] + 31 截断。
+
+_SAFE_COMMENT = re.compile(r"[A-Za-z0-9 _\-.]+")
+
+
+def test_sanitize_comment_real_incident_shape():
+    """① 真实失败形态（XAUUSD|M15|ISO 冒号时间戳，30 字符）→ ≤31 且仅白名单。"""
+    from mt5gw.trading import sanitize_comment   # TDD 红→绿同形态（延迟导入）
+    raw = "XAUUSD|M15|2026-10-28T06:30:00"       # 首战原始 comment
+    safe = sanitize_comment(raw)
+    assert len(safe) <= 31
+    assert _SAFE_COMMENT.fullmatch(safe)
+    assert "|" not in safe and ":" not in safe
+    assert safe.startswith("XAUUSD_M15_")        # 非法字符替换为 '_'：信息保留
+
+
+def test_sanitize_comment_35_chars_with_pipe_truncated():
+    """①补：35 字符带 '|' → 截 31 且无 '|'。"""
+    from mt5gw.trading import sanitize_comment
+    raw = "EURUSD|" + "x" * 29                   # 35 字符、含 '|'
+    safe = sanitize_comment(raw)
+    assert len(safe) == 31
+    assert _SAFE_COMMENT.fullmatch(safe)
+
+
+def test_sanitize_comment_empty_and_none_untouched():
+    """③ 空 / None 不受影响（空串是合法缺省，None 归一为空串）。"""
+    from mt5gw.trading import sanitize_comment
+    assert sanitize_comment("") == ""
+    assert sanitize_comment(None) == ""
+
+
+def test_market_order_sanitizes_comment_before_send_with_warning(caplog):
+    """② 35 字符带 '|' 的 comment 发送前被安全化；告警记录 原文→安全文。"""
+    from mt5gw.trading import sanitize_comment  # noqa: F401  红阶段锚点
+    tr, fake = make()
+    box = capture_request(fake)
+    raw = "EURUSD|" + "x" * 29                   # 35 字符、含 '|'
+    with caplog.at_level(logging.WARNING, logger="mt5gw.trading"):
+        tr.market_order("EURUSD", "buy", 0.01, comment=raw)
+    sent = box["req"]["comment"]
+    assert len(sent) == 31 and "|" not in sent   # 发送前已安全化
+    assert _SAFE_COMMENT.fullmatch(sent)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(raw in r.getMessage() and sent in r.getMessage()
+               for r in warnings)                # 不静默：原文→安全文都有
+
+
+def test_market_order_clean_comment_passes_through_silently(caplog):
+    """③ 合法/缺省 comment 原样透传，不告警（含空串）。"""
+    tr, fake = make()
+    box = capture_request(fake)
+    with caplog.at_level(logging.WARNING, logger="mt5gw.trading"):
+        tr.market_order("EURUSD", "sell", 0.01)  # 缺省空 comment
+        assert box["req"]["comment"] == ""
+        tr.market_order("EURUSD", "buy", 0.01, comment="ok cmt-1.0_x")
+    assert box["req"]["comment"] == "ok cmt-1.0_x"
+    assert [r for r in caplog.records
+            if r.levelno == logging.WARNING] == []
