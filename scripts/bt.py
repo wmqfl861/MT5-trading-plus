@@ -1094,6 +1094,179 @@ def cmd_card_check(args) -> int:
 
 # ---------------------------------------------------------------- screen
 
+class _FittedFactory:
+    """fittable 策略的工厂（T73A）：实例化返回装好**冻结**模型的新实例；
+    类属性透传（validate_params/required_data 等按类使用的地方不变）。"""
+
+    def __init__(self, cls, model):
+        self._cls, self._model = cls, model
+
+    def __call__(self):
+        return self._cls().with_model(self._model)
+
+    def __getattr__(self, name):
+        return getattr(self._cls, name)
+
+
+def _prob_fit_context(card, round_ctx, bars_by_sym, costs_by_sym, data_root,
+                      *, for_g0: bool = False):
+    """T73A/D50：概率卡的拟合上下文——分段约束 + 单一训练窗拟合 + 冻结模型。
+
+    返回 None（非概率卡）；否则 dict(model, model_sha, model_path, split,
+    purge_bars, params_prob, metrics_prob)。分段约束（D50）：
+    - discovery：任一品种的 bar 时刻 >= split → 拒（不得读取分界后数据）；
+    - validation：训练窗只用 < split（评估窗的切片由调用方/关卡层处理，
+      本函数只备训练数据；评估段在 < split 上无数据时同样拒）。
+    for_g0=True（铁律 21/G0）：改按研究段前 70% 拟合冻结模型。
+    模型写 data_research 模型库：{data_root}/models/<卡>/<sha256>.json
+    （蓝图 P 线附录 B；同一输入重拟合哈希相同——确定性由策略 fit 保证）。
+    """
+    if getattr(card, "evaluation_mode", "standard") != "probability":
+        return None
+    rnd_path = Path(card.path).parent.parent / "rounds" / f"{card.round}.toml"
+    try:
+        round_obj = rnd.load_round(rnd_path)
+    except rnd.RoundError as e:
+        raise ValueError(
+            f"概率卡 {card.id} 所属轮次 {card.round} 的预注册不可装载：{e}"
+            "（D50：分界 [segments].split 与假设族 [hypotheses] 由轮次文件"
+            "提供）") from e
+    split_raw = (round_obj.segments or {}).get("split")
+    if not split_raw:
+        raise ValueError(
+            f"轮次 {card.round} 缺 [segments].split——概率卡的发现段/验证段"
+            "分界必须由轮次预注册写死（D50）")
+    split = pd.Timestamp(split_raw)
+    horizon = int(card.prob["bracket"]["horizon_bars"])
+    purge = horizon + 2
+    if for_g0:
+        fit_bars = {sym: bars.iloc[:max(1, int(len(bars) * 0.7))]
+                    for sym, bars in bars_by_sym.items()}
+        train_end = None                      # 已物理截断到前 70%
+    else:
+        fit_bars = {}
+        for sym, bars in bars_by_sym.items():
+            times = pd.to_datetime(bars["time"])
+            below = bars[times < split]
+            if card.segment == "discovery":
+                if len(times) and times.iloc[-1] >= split:
+                    raise ValueError(
+                        f"{sym} 的数据到 {times.iloc[-1]}，越过分界 {split}——"
+                        "discovery 卡不得读取 >= split 的数据（D50），把 "
+                        "--end 收窄到分界之前")
+                fit_bars[sym] = bars
+            else:                             # validation：训练窗可用更早数据
+                if len(below) == 0:
+                    raise ValueError(
+                        f"{sym} 在分界 {split} 之前没有数据——validation 卡"
+                        "的训练窗需要 < split 的数据（D50）")
+                fit_bars[sym] = below
+        train_end = split
+    return {"split": split_raw, "purge_bars": purge,
+            "train_end": train_end, "fit_bars": fit_bars}
+
+
+def _fit_and_freeze(strategy_cls, card, fit_ctx, bars_by_sym, costs_by_sym,
+                    data_root):
+    """执行拟合 + 冻结落盘，补全 fit_ctx（model/model_sha/model_path 与
+    台账字段）。同一输入重拟合 → 同一模型 dict → 同一 sha（策略 fit 的
+    确定性；铁律 21）。"""
+    from mt5quant.prob.artifact import save_model
+
+    inst = strategy_cls()
+    model = inst.fit(fit_ctx["fit_bars"], costs_by_sym, {},
+                     train_end=fit_ctx["train_end"],
+                     purge_bars=fit_ctx["purge_bars"])
+    root = Path(data_root) / "models" / card.id
+    path, sha = save_model(model, root)
+    fit_ctx.update(
+        model=model, model_sha=sha, model_path=path,
+        params_prob={"segment": card.segment, "split": fit_ctx["split"],
+                     "bracket": dict(card.prob["bracket"])},
+        metrics_prob={"model_sha256": sha,
+                      "prob_version": model.get("prob_version"),
+                      "fit_start": (model.get("fit_window") or {}).get("start"),
+                      "fit_end": (model.get("fit_window") or {}).get("end"),
+                      "purge_bars": fit_ctx["purge_bars"]})
+    return fit_ctx
+
+
+def _prob_run_fields(fit_ctx, params, summary):
+    """P 线字段落台账（T73A：不改 runs 表结构）：
+    params_json += {"prob": {segment, split, bracket}}（试验身份）；
+    metrics_json += {"prob": {model_sha256, prob_version, fit_start,
+    fit_end, purge_bars}}（模型身份，D43）。两处都进哈希链。"""
+    if fit_ctx is None:
+        return params, summary
+    params = {**params, "prob": fit_ctx["params_prob"]}
+    if summary is not None:
+        summary = {**summary, "prob": fit_ctx["metrics_prob"]}
+    return params, summary
+
+
+def _reject_fittable_walkforward(strategy_cls, wanted_gates) -> str | None:
+    """T73A：拟合策略的 walk-forward（G3）与关卡 v3 主检验在 T73B（逐窗
+    拟合 + purge 接线，等 H 线审核会话批准 T65）完成前一律拒绝。"""
+    if not getattr(strategy_cls, "fittable", False):
+        return None
+    if "G3" in wanted_gates:
+        return ("拟合策略的 walk-forward（G3）在 T73B 之前拒绝运行——"
+                "逐窗重新拟合与 purge 接线未完成（等 H 线审核会话批准 "
+                "T65 后做 T73B）；关卡 v3 主检验同理")
+    return None
+
+
+def cmd_fit(args) -> int:
+    """T73A：bt fit <卡>——概率卡按分段约束拟合，模型冻结落盘并打印
+    路径与哈希（不产生 runs——模型身份随其后的 screen/gate 运行入台账）。"""
+    path = _card_path(args.card, Path(args.cards_dir))
+    try:
+        card = cards.load_card(path)
+    except cards.CardError as e:
+        print(f"✗ {e}")
+        return 1
+    try:
+        cards.ensure_strategy_matches(card, args.strategy)
+    except cards.CardStrategyMismatchError as e:
+        print(f"✗ {e}")
+        return 1
+    if card.evaluation_mode != "probability":
+        print("✗ bt fit 只用于 evaluation_mode = probability 的卡（T73A）")
+        return 1
+    try:
+        data_root, store_kind = _resolve_store(args)
+    except ValueError as e:
+        print(f"✗ {e}")
+        return 1
+    try:
+        strategy_cls = load_strategy(args.strategy)
+        bars_by_sym = {sym: load_series(data_root, sym, card.timeframe,
+                                        args.end)
+                       for sym in card.symbols}
+        from mt5data.sessions import load_session_policy
+        sess_policy = load_session_policy(str(SESSIONS_PATH))
+        sess_sha = sessions_sha256(str(SESSIONS_PATH))
+        costs_by_sym = {}
+        for sym in card.symbols:
+            costs_by_sym[sym], _ver = build_costs(
+                data_root, sym, args.spread_fraction, args.commission,
+                sessions_sha=sess_sha, research_store=store_kind == "research")
+        fit_ctx = _prob_fit_context(card, None, bars_by_sym, costs_by_sym,
+                                    data_root)
+        _fit_and_freeze(strategy_cls, card, fit_ctx, bars_by_sym, costs_by_sym,
+                        data_root)
+    except Exception as e:
+        print(f"✗ 拟合失败：{type(e).__name__}: {e}")
+        return 1
+    fw = (fit_ctx["model"].get("fit_window") or {})
+    print(f"✓ 模型冻结：{fit_ctx['model_path']}")
+    print(f"  sha256={fit_ctx['model_sha']}")
+    print(f"  段={card.segment} split={fit_ctx['split']} "
+          f"fit={fw.get('start')}..{fw.get('end')} "
+          f"purge={fit_ctx['purge_bars']} 根")
+    return 0
+
+
 def cmd_screen(args) -> int:
     if _reject_ops_ack(args):                 # R6/C6：研究命令拒绝运维豁免
         return 1
@@ -1193,6 +1366,21 @@ def cmd_screen(args) -> int:
                 cost_version = "zero-v0"
                 costs_by_sym = {sym: ZeroCosts() for sym in card.symbols}
                 policy_by_sym = {sym: sess_policy for sym in card.symbols}
+            # T73A：fittable 策略先拟合再评估（单一训练窗，D44/铁律 21）
+            if getattr(strategy_cls, "fittable", False):
+                try:
+                    fit_ctx = _prob_fit_context(
+                        card, round_ctx, bars_by_sym, costs_by_sym, data_root)
+                    _fit_and_freeze(strategy_cls, card, fit_ctx, bars_by_sym,
+                                    costs_by_sym, data_root)
+                except ValueError as e:
+                    print(f"✗ {e}")
+                    return 1
+                strategy_cls = _FittedFactory(strategy_cls, fit_ctx["model"])
+                print(f"— 概率卡拟合：模型 {fit_ctx['model_sha'][:12]}… -> "
+                      f"{fit_ctx['model_path']}")
+            else:
+                fit_ctx = None
         except Exception as e:
             print(f"✗ 装配失败（未开跑，无 runs 记录）：{type(e).__name__}: {e}")
             return 1
@@ -1244,14 +1432,16 @@ def cmd_screen(args) -> int:
                         vol_min=vols_by_sym[sym][0] if vols_by_sym else None,
                         vol_step=vols_by_sym[sym][1] if vols_by_sym else None,
                         vol_max=vols_by_sym[sym][2] if vols_by_sym else None)
+                    rec_params, rec_summary = _prob_run_fields(
+                        fit_ctx, params, summary)
                     rid = ledger.record_run(
                         card_id=card.id, card_version=card.version,
-                        strategy=args.strategy, params=params, symbol=sym,
+                        strategy=args.strategy, params=rec_params, symbol=sym,
                         timeframe=card.timeframe, data_first=data_first,
                         data_last=data_last, data_sha256=dsha,
                         engine_version=ENGINE_VERSION,
                         cost_model_version=cost_version, gates_hash=gates_hash,
-                        metrics=summary, actor=actor,
+                        metrics=rec_summary, actor=actor,
                         strategy_sha=strategy_sha, run_class=run_class,
                         round_id=(round_ctx or {}).get("round_id"))
                     skipped = summary.get("skipped_zero_lots") or 0
@@ -1261,9 +1451,10 @@ def cmd_screen(args) -> int:
                           + (f"（零手数跳过 {skipped}）" if skipped else ""))
                 except Exception as e:  # 失败组合也进台账
                     failed += 1
+                    rec_params, _ = _prob_run_fields(fit_ctx, params, None)
                     rid = ledger.record_run(
                         card_id=card.id, card_version=card.version,
-                        strategy=args.strategy, params=params, symbol=sym,
+                        strategy=args.strategy, params=rec_params, symbol=sym,
                         timeframe=card.timeframe, data_first=data_first,
                         data_last=data_last, data_sha256=dsha,
                         engine_version=ENGINE_VERSION,
@@ -1441,6 +1632,27 @@ def cmd_gate(args) -> int:
             print(f"✗ 装配失败（未开跑，无 runs 记录）：{type(e).__name__}: {e}")
             return 1
 
+        # T73A：拟合策略先拟合再评估；walk-forward（G3）与关卡 v3 主检验
+        # 在 T73B（逐窗拟合 + purge 接线，等 H 线审核会话批准 T65）完成前
+        # 一律拒绝运行
+        fit_ctx = None
+        _g3_msg = _reject_fittable_walkforward(type(strategy), wanted)
+        if _g3_msg:
+            print(f"✗ {_g3_msg}")
+            return 1
+        if getattr(strategy, "fittable", False):
+            try:
+                fit_ctx = _prob_fit_context(
+                    card, round_ctx, bars_by_sym, costs_by_sym, data_root)
+                _fit_and_freeze(type(strategy), card, fit_ctx, bars_by_sym,
+                                costs_by_sym, data_root)
+            except ValueError as e:
+                print(f"✗ {e}")
+                return 1
+            strategy = strategy.with_model(fit_ctx["model"])
+            print(f"— 概率卡拟合：模型 {fit_ctx['model_sha'][:12]}… -> "
+                  f"{fit_ctx['model_path']}")
+
         symbol = card.symbols[0]
         bars = bars_by_sym[symbol]
         costs = costs_by_sym[symbol]
@@ -1473,9 +1685,10 @@ def cmd_gate(args) -> int:
 
         # 基准运行（引擎 A）：先入台账（失败的也记），关卡结果挂在它名下
         data_first, data_last = pd_iso(bars["time"].iloc[0]), pd_iso(bars["time"].iloc[-1])
+        rec_params, _unused = _prob_run_fields(fit_ctx, params, None)
         common = dict(
             card_id=card.id, card_version=card.version,
-            strategy=args.strategy, params=params, symbol=symbol,
+            strategy=args.strategy, params=rec_params, symbol=symbol,
             timeframe=card.timeframe, data_first=data_first,
             data_last=data_last, data_sha256=dsha,
             engine_version=ENGINE_VERSION, cost_model_version=cost_version,
@@ -1497,6 +1710,7 @@ def cmd_gate(args) -> int:
                 base_kwargs["volume_lots"] = lots
             base = run_backtest(strategy, bars, costs, **base_kwargs)
             summary = summarize(base, cost_version=cost_version)
+            _, summary = _prob_run_fields(fit_ctx, params, summary)
             summary["sizing"] = dict(
                 sizing_info,
                 vol_min=(vols_by_sym[symbol][0] if vols_by_sym else None),
@@ -1543,7 +1757,18 @@ def cmd_gate(args) -> int:
                                  "error": f"{type(e).__name__}: {e}"}
 
         if "G0" in wanted:
-            _run("G0", lambda: vlook.run_g0(strategy, bars, params))
+            g0_strategy = strategy
+            if fit_ctx is not None:
+                # T73A：G0 用研究段前 70% 拟合出的冻结模型（截断一致与
+                # 窗口不变性检查针对装好模型的策略）
+                g0_ctx = _prob_fit_context(
+                    card, round_ctx, bars_by_sym, costs_by_sym, data_root,
+                    for_g0=True)
+                _fit_and_freeze(type(strategy), card, g0_ctx, bars_by_sym,
+                                costs_by_sym, data_root)
+                g0_strategy = load_strategy(args.strategy)().with_model(
+                    g0_ctx["model"])
+            _run("G0", lambda: vlook.run_g0(g0_strategy, bars, params))
         if "G1" in wanted:
             _run("G1", lambda: vgate.run_g1(base.trades,
                                             timeframe=card.timeframe, cfg=cfg))
@@ -1714,6 +1939,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="概率模式预筛的分界日期（月初；缺省自动 "
                          "propose_split 提案，T76/D50）")
     pc.set_defaults(func=cmd_candidate_check)
+
+    p_fit = sub.add_parser("fit", help="概率卡拟合+冻结模型（T73A/D43）")
+    p_fit.add_argument("card", help="卡 id（P###-v#）或 .toml 路径")
+    p_fit.add_argument("--strategy", required=True,
+                       help="策略引用 module:Class（与卡绑定一致）")
+    p_fit.add_argument("--cards-dir", default="research/cards")
+    p_fit.add_argument("--data-root", default=None)
+    p_fit.add_argument("--end", default=None, help="序列末端（缺省全量；"
+                       "discovery 卡会被分界校验拦截）")
+    p_fit.add_argument("--spread-fraction", type=float, default=0.1)
+    p_fit.add_argument("--commission", type=float, default=0.0)
+    p_fit.set_defaults(func=cmd_fit)
 
     p_seg = sub.add_parser("segment", help="P 线发现段/验证段分界（T76/D50）")
     seg_sub = p_seg.add_subparsers(dest="segment_cmd", required=True)

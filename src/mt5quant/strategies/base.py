@@ -76,11 +76,32 @@ _TYPE_CHECKS = {
 
 
 class BaseStrategy(abc.ABC):
-    """所有策略的基类：子类定义即校验参数模式。"""
+    """所有策略的基类：子类定义即校验参数模式。
+
+    拟合协议（T73A/D43，铁律 21"拟合与使用分离"）：fittable 缺省 False——
+    非拟合策略走原路径，结果逐位不变；声明 fittable=True 的策略实现
+    fit（只用 time < train_end 的 bar，按 purge_bars 剔除标签越界的触发，
+    返回可冻结为带哈希文件的模型 dict）与 with_model（返回装好模型的
+    **新实例**，不改自身）。缺省实现抛 RuntimeError（非拟合策略不可拟合）。
+    """
 
     params_schema: tuple[ParamSpec, ...] = ()
     required_data: RequiredData = RequiredData(symbols=(), timeframe="", lookback_bars=0)
     exit_rules: ExitRules = ExitRules()
+    fittable: bool = False
+
+    def fit(self, bars_by_symbol: dict, costs_by_symbol: dict, params: dict,
+            *, train_end, purge_bars: int) -> dict:
+        """拟合（仅 fittable=True 的策略被调用）：返回模型 dict（附录 B 格式）。"""
+        raise RuntimeError(
+            f"{type(self).__name__} 不是拟合策略（fittable={self.fittable}）"
+            "——fit 只对声明 fittable=True 的策略调用（T73A/D43）")
+
+    def with_model(self, model: dict) -> "BaseStrategy":
+        """返回装好模型的新实例（不改自身）；仅拟合策略实现。"""
+        raise RuntimeError(
+            f"{type(self).__name__} 不是拟合策略（fittable={self.fittable}）"
+            "——with_model 只对声明 fittable=True 的策略调用（T73A/D43）")
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)

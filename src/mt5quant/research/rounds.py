@@ -56,6 +56,7 @@ _CANDIDATE_ID = re.compile(r"^C\d{3,}$")
 _TOP_KEYS = ("id", "opened", "candidates", "trial_budget", "lockbox_uses_max",
              "dsr_trial_scope", "advance_rule", "close_rule", "approved_by")
 _EVAL_KEYS = ("mode", "primary")
+_HYPOTHESIS_RE = re.compile(r"^S[123]:A[1-4]:[A-Za-z][A-Za-z0-9_>]*$")
 
 
 class RoundError(ValueError):
@@ -76,6 +77,8 @@ class Round:
     close_rule: str                    # 结束条件
     approved_by: str
     evaluation: dict = field(default_factory=dict)   # C### -> {mode, primary}
+    segments: dict | None = None      # T73A：{"split": "YYYY-MM-01"}（D50）
+    hypotheses: dict = field(default_factory=dict)   # T73A：C### -> 假设数组
     path: str = ""
 
     def content_sha256(self) -> str:
@@ -158,7 +161,8 @@ def validate_round(data: dict, *, source: str) -> Round:
     """附录 D 模式校验（fail-fast）。"""
     if not isinstance(data, dict):
         raise RoundError(f"{source}：轮次预注册必须是 TOML 表")
-    unknown = sorted(set(data) - set(_TOP_KEYS) - {"evaluation"})
+    unknown = sorted(set(data) - set(_TOP_KEYS)
+                     - {"evaluation", "segments", "hypotheses"})
     if unknown:
         raise RoundError(
             f"{source}：未知顶层字段 {unknown}（附录 D 字段齐了才可信，"
@@ -205,19 +209,82 @@ def validate_round(data: dict, *, source: str) -> Round:
             f"{source}：dsr_trial_scope {scope!r} 不在枚举 "
             f"{list(DSR_TRIAL_SCOPES)} 内（T64/D33：G4 试验计数的取数范围）")
 
+    evaluation = _validate_evaluation(data.get("evaluation"), candidates,
+                                      source)
+    all_prob = all(ev["mode"] == "probability"
+                   for ev in evaluation.values())
+
+    # T73A：lockbox_uses_max = 0（P1 不用锁箱）只对全部候选都是 probability
+    # 模式的轮次放行；上限 1 不变（D16：每个研究轮次最多 1 次 G5）
+    lockbox_uses_max = _require_int(
+        data, "lockbox_uses_max", source, minimum=0, maximum=1,
+        maximum_msg=f"{source}：lockbox_uses_max 超过 1——D16 机器强制"
+        "（用户 2026-10-28 授权）：每个研究轮次最多 1 次 G5")
+    if lockbox_uses_max == 0 and not all_prob:
+        raise RoundError(
+            f"{source}：lockbox_uses_max = 0 只在全部候选的 [evaluation] 都是 "
+            'mode = "probability" 时允许（P1 不用锁箱；H 线/混合轮次仍按 D16'
+            " 申报 ≥1）")
+
+    # T73A/D50：[segments].split（概率轮次的发现段/验证段分界，月初）
+    segments = data.get("segments")
+    if segments is not None:
+        if not isinstance(segments, dict) or set(segments) != {"split"}:
+            raise RoundError(
+                f"{source}：[segments] 必须且只含 split（YYYY-MM-01，月初；"
+                "D50），收到 " + repr(sorted(segments) if isinstance(
+                    segments, dict) else segments))
+        split = segments["split"]
+        try:
+            from datetime import date as _d
+            y, m, dd = (int(x) for x in split.split("-"))
+            ok = _d(y, m, dd) and dd == 1 and len(split) == 10
+        except (TypeError, ValueError):
+            ok = False
+        if not ok:
+            raise RoundError(
+                f"{source}：[segments].split 必须是月初的 ISO 日期"
+                f"（YYYY-MM-01，D50），收到 {split!r}")
+
+    # T73A（蓝图 P 线附录 A）：[hypotheses]——概率模式候选必填（Holm 假设
+    # 族），每条形如 S#:A#:fade>base；非概率候选不得出现。与候选登记的
+    # 交叉校验（每条都在候选登记的假设里）在 bt round open 做（那里装载
+    # 候选登记）。
+    hyp_raw = data.get("hypotheses", {})
+    if not isinstance(hyp_raw, dict):
+        raise RoundError(f"{source}：[hypotheses] 必须是表（C### -> 假设数组）")
+    hypotheses: dict[str, tuple[str, ...]] = {}
+    unknown_h = sorted(set(hyp_raw) - set(candidates))
+    if unknown_h:
+        raise RoundError(
+            f"{source}：[hypotheses] 有不在候选名单内的键 {unknown_h}")
+    for cid, ev in evaluation.items():
+        listed = hyp_raw.get(cid)
+        if ev["mode"] == "probability":
+            if not listed:
+                raise RoundError(
+                    f"{source}：概率模式候选 {cid} 缺 [hypotheses]（本轮要"
+                    "检验的假设族，Holm 校正的对象——蓝图 P 线附录 A）")
+            for h in listed:
+                if not isinstance(h, str) or not _HYPOTHESIS_RE.match(h):
+                    raise RoundError(
+                        f"{source}：[hypotheses].{cid} 的条目 {h!r} 必须形如 "
+                        "'S1:A3:fade>base'（局面:动作:方向）")
+            hypotheses[cid] = tuple(listed)
+        elif listed:
+            raise RoundError(
+                f"{source}：[hypotheses].{cid} 不允许——非概率候选（mode="
+                f"{ev['mode']!r}）不带假设族")
+
     return Round(
         id=rid, opened=opened, candidates=candidates,
         trial_budget=_require_int(data, "trial_budget", source, minimum=1),
-        lockbox_uses_max=_require_int(
-            data, "lockbox_uses_max", source, minimum=1, maximum=1,
-            maximum_msg=f"{source}：lockbox_uses_max 超过 1——D16 机器强制"
-            "（用户 2026-10-28 授权）：每个研究轮次最多 1 次 G5"),
+        lockbox_uses_max=lockbox_uses_max,
         dsr_trial_scope=scope,
         advance_rule=_require_str(data, "advance_rule", source),
         close_rule=_require_str(data, "close_rule", source),
         approved_by=_require_str(data, "approved_by", source),
-        evaluation=_validate_evaluation(data.get("evaluation"), candidates,
-                                        source))
+        evaluation=evaluation, segments=segments, hypotheses=hypotheses)
 
 
 def load_round(path) -> Round:
@@ -241,6 +308,7 @@ def load_round(path) -> Round:
                  dsr_trial_scope=r.dsr_trial_scope,
                  advance_rule=r.advance_rule, close_rule=r.close_rule,
                  approved_by=r.approved_by, evaluation=r.evaluation,
+                 segments=r.segments, hypotheses=r.hypotheses,
                  path=str(p))
 
 

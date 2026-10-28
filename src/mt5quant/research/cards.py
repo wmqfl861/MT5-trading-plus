@@ -54,10 +54,15 @@ MAX_GRID_POINTS = 100
 
 _RULES_KEYS = ("entry", "exit", "stop")
 _EXPECTED_KEYS = ("trades_per_year", "win_rate", "payoff_ratio")
+_PROB_EXPECTED_KEYS = ("delta_p", "triggers_per_year")   # 蓝图 P 线附录 A
 _TOP_KEYS = ("id", "family", "version", "parent", "strategy",
              "selection_rule", "round", "candidate", "symbols", "timeframe",
              "session", "phenomenon", "mechanism", "should_fail_when",
-             "falsified_if", "graveyard_checked")
+             "falsified_if", "graveyard_checked",
+             "evaluation_mode", "primary_statistic", "segment")
+_EVALUATION_MODES = ("standard", "probability")
+_SEGMENTS = ("discovery", "validation")
+_P_CARD_ID = re.compile(r"^P\d+-v\d+$")
 
 _ROUND_ID_RE = re.compile(r"^R\d{1,4}$")
 _CANDIDATE_ID_RE = re.compile(r"^C\d{3,}$")
@@ -117,6 +122,10 @@ class Card:
     selection_rule: str = "max_net_profit"
     round: str = ""                     # T63/D32：所属研究轮次（R#；空=未入轮）
     candidate: str = ""                 # T63/D32：轮次名单内的候选（C###；空=未入轮）
+    evaluation_mode: str = "standard"   # T73A：standard | probability（P 线）
+    primary_statistic: str = ""         # T73A：probability 卡恒 delta_p_one_sided
+    segment: str = ""                   # T73A：discovery | validation（D50）
+    prob: dict | None = None            # T73A：[prob] 段（仅 probability 卡）
     rules: dict = field(default_factory=dict)     # entry/exit/stop -> str
     params: dict = field(default_factory=dict)    # 名 -> 网格 tuple（标量）
     expected: dict = field(default_factory=dict)  # 三项预期 -> str
@@ -312,7 +321,8 @@ def validate_card(data: dict, *, source: str) -> Card:
     """模式校验（fail-fast）：字段齐全且类型正确、参数 ≤4、网格 ≤100。"""
     if not isinstance(data, dict):
         raise CardError(f"{source}：卡内容必须是 TOML 表")
-    unknown = sorted(set(data) - set(_TOP_KEYS) - {"rules", "params", "expected"})
+    unknown = sorted(set(data) - set(_TOP_KEYS)
+                     - {"rules", "params", "expected", "prob"})
     if unknown:
         raise CardError(
             f"{source}：未知顶层字段 {unknown}（拼写错误会静默丢约束，全部拒绝）；"
@@ -346,6 +356,52 @@ def validate_card(data: dict, *, source: str) -> Card:
     # 周期统一大写，台账与引擎口径一致
     timeframe = timeframe.upper()
 
+    # T73A：评估模式与 P 卡专属字段（蓝图 P 线附录 A）
+    evaluation_mode = data.get("evaluation_mode", "standard")
+    if evaluation_mode not in _EVALUATION_MODES:
+        raise CardError(
+            f"{source}：evaluation_mode {evaluation_mode!r} 不在枚举 "
+            f"{list(_EVALUATION_MODES)} 内（T73A）")
+    primary_statistic = data.get("primary_statistic", "")
+    segment = data.get("segment", "")
+    prob_raw = data.get("prob")
+    if evaluation_mode == "probability":
+        if not _P_CARD_ID.match(cid):
+            raise CardError(
+                f"{source}：probability 卡的 id 必须形如 P###-v#（蓝图 P 线"
+                f" §5/D45），收到 {cid!r}")
+        if primary_statistic != "delta_p_one_sided":
+            raise CardError(
+                f"{source}：probability 卡的 primary_statistic 恒为 "
+                f'"delta_p_one_sided"（P1 主检验），收到 {primary_statistic!r}')
+        if segment not in _SEGMENTS:
+            raise CardError(
+                f"{source}：probability 卡必须声明 segment ∈ "
+                f"{list(_SEGMENTS)}（D50：发现段/验证段），收到 {segment!r}")
+        if prob_raw is None:
+            raise CardError(
+                f"{source}：probability 卡必须带 [prob] 段（局面/假设/止损"
+                "止盈/网格/接近参数/预期 Δp——蓝图 P 线附录 A）")
+        if data.get("params"):
+            raise CardError(
+                f"{source}：probability 卡不开参数网格（P1 建议不设网格，"
+                "蓝图 P 线附录 A）")
+        from mt5quant.research.candidates import CandidateError, _validate_prob
+        try:
+            prob = dict(vars(_validate_prob(prob_raw, source, tuple(symbols))))
+        except CandidateError as e:
+            raise CardError(str(e)) from e
+    else:
+        if prob_raw is not None:
+            raise CardError(
+                f"{source}：[prob] 段只允许出现在 evaluation_mode="
+                '"probability" 的卡上（T73A）')
+        if segment:
+            raise CardError(
+                f"{source}：segment 只对 probability 卡有意义（D50），"
+                f"收到 {segment!r}")
+        prob = None
+
     graveyard = data.get("graveyard_checked")
     if not isinstance(graveyard, list) or not all(
             isinstance(g, str) for g in graveyard):
@@ -367,10 +423,15 @@ def validate_card(data: dict, *, source: str) -> Card:
         family=family, parent=parent, strategy=strategy,
         selection_rule=selection_rule,
         round=round_id, candidate=candidate_id,
+        evaluation_mode=evaluation_mode,
+        primary_statistic=primary_statistic, segment=segment, prob=prob,
         rules=_validate_table(data.get("rules"), _RULES_KEYS, "rules", source),
         params=_validate_params(data.get("params", {}), source),
-        expected=_validate_table(data.get("expected"), _EXPECTED_KEYS,
-                                 "expected", source),
+        expected=_validate_table(
+            data.get("expected"),
+            _PROB_EXPECTED_KEYS if evaluation_mode == "probability"
+            else _EXPECTED_KEYS,
+            "expected", source),
     )
 
 
@@ -398,6 +459,9 @@ def load_card(path) -> Card:
         parent=card.parent, strategy=card.strategy,
         selection_rule=card.selection_rule,
         round=card.round, candidate=card.candidate,
+        evaluation_mode=card.evaluation_mode,
+        primary_statistic=card.primary_statistic, segment=card.segment,
+        prob=card.prob,
         rules=card.rules, params=card.params, expected=card.expected,
         path=str(p))
 
