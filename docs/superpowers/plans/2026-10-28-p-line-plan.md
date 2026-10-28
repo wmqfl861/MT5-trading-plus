@@ -340,7 +340,7 @@ class BaseStrategy:
   - G0：冻结模型下截断一致，窗口不变性 ≥ 100 个随机探针；
   - 没装模型 → ModelMissingError；模型哈希不符 → ModelIntegrityError；
   - 连续亏损后手数不变（`basis = "initial"`；铁律 20）。
-- [ ] **审核三修正（S4、S5、S8、D2；现在做）**：
+- [x] **审核三修正（S4、S5、S8、D2；提交 3f2cf4b，tests run_number 122 success；探针 03 的 R3/R4 由 FAIL 转 PASS；level_decision 14 测试绿）**：
   - 每次决策后第 i+K 根信号固定为 0，这一根上的新触发忽略（不链式续持）；
   - `fit` 不改实例状态（成本用局部变量算、写进模型）；
   - `fit` 的标签传与 bt 相同的入场政策；合约大小缺失时报错，不默认 1.0；
@@ -388,7 +388,7 @@ def brier_skill(p_pred, outcome, p_base) -> float
   - 合成数据上未植入效应时，误报率接近名义水平（1,000 次）；
   - 植入 Δp = 0.05、n = 2,000 时检出率 > 90%；
   - Holm 校正与手算一致。
-- [ ] **审核三修正（S3、S7、S9；现在做）**：
+- [x] **审核三修正（S3、S7、S9；提交 838d00d，tests run_number 121 success；探针 03 的 R2/R6 由 FAIL 转 PASS；本文件 16 测试绿）**：
   - `randomize_triggers` 的桶键加入 ATR 分位档（口径 `atr_pct_2000`）；同桶没有候选时拒绝；
   - `delta_p_test` 只用 outcome ∈ {win, loss, time} 的标签；p 值改为 (1 + k) / (1 + B)；
   - 补齐缺的测试：ATR 分位匹配；误报率 1,000 次；Δp = 0.05、n = 2,000 时检出率 > 90%（多个种子）；
@@ -532,7 +532,7 @@ def n_needed_proportion(p0: float, dp: float, *, alpha: float = 0.05, power: flo
   - 越过分界的触发被剔除；
   - 同一输入两次运行结果逐位一致，台账去重 N 不变；
   - 有卡未跑时 round-report 拒绝；Holm 与手算一致。
-- [ ] **审核三修正（S1、S2、S6、S8；现在做）**：
+- [x] **审核三修正（S1、S2、S6、S8；提交 0310757，tests run_number 120 success；探针 03 的 R1/R5 由 FAIL 转 PASS；CLI 端到端 6 例 + p1 7 例）**：
   - `bt prob test` 补 `--actor`、`--ledger`，`_SP` 改为 `SESSIONS_PATH`；
   - 走 `_round_context`（轮次已开启、未关闭、候选预筛 pass），并核对轮次文件 sha256 与开启时入账的 `toml_sha256` 一致；
   - 标签传与 bt 相同的入场政策；合约大小缺失时报错；
