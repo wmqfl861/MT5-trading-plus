@@ -16,6 +16,9 @@ import pandas as pd
 
 NY_TZ = "America/New_York"
 
+# S7：skipped（未成交/截尾）只计数不进概率（T72 约定）
+_USABLE_OUTCOMES = {"win", "loss", "time"}
+
 
 # ---------------------------------------------------------------- 随机化
 
@@ -82,18 +85,18 @@ def delta_p_test(real_labels: pd.DataFrame, null_labels: pd.DataFrame, *,
                  block: str = "month", sims: int, seed: int) -> dict:
     """单侧 Δp 检验：触发组日赢率均值 − 随机组日赢率均值（样本单位=
     触发日，D52）；p 值按**月内置换**（把两组的日赢率在各自月份内随机
-    重新分组，sims 次；单侧：置换统计量 ≥ 观测 Δ 的比例）。
+    重新分组，sims 次；单侧：置换统计量 ≥ 观测 Δ 的比例，+1 修正
+    (1+k)/(1+B)）。
 
-    real_labels / null_labels：含 time、outcome 的标签表（win 计 1）。
-    返回 {"delta_p", "p_value", "n_days_real", "n_days_null",
-    "block", "sims"}。
+    向量化实现（与逐 sim 逐月 shuffle 同一统计过程：统计量只依赖
+    Σ月(组A子集和)，按月独立随机子集等价于逐月 shuffle；同 seed 确定）。
+    real_labels / null_labels：含 time、outcome 的标签表（win 计 1；
+    skipped 剔除——S7）。
     """
     rng = np.random.default_rng(seed)
 
-    usable = {"win", "loss", "time"}   # S7：skipped（未成交/截尾）只计数不进概率
-
     def _day_winrates(df: pd.DataFrame) -> pd.Series:
-        d = df[df["outcome"].isin(usable)]
+        d = df[df["outcome"].isin(_USABLE_OUTCOMES)]
         if len(d) == 0:
             return pd.Series(dtype=float)
         t = pd.to_datetime(d["time"])
@@ -106,30 +109,38 @@ def delta_p_test(real_labels: pd.DataFrame, null_labels: pd.DataFrame, *,
         return {"delta_p": float("nan"), "p_value": 1.0,
                 "n_days_real": int(len(r)), "n_days_null": int(len(nul)),
                 "block": block, "sims": int(sims)}
-    obs = float(r.mean() - nul.mean())
-    r_months = pd.PeriodIndex(pd.to_datetime(
-        [d for d in r.index]), freq="M")
-    n_months = pd.PeriodIndex(pd.to_datetime(
-        [d for d in nul.index]), freq="M")
-    counts = np.empty(sims)
     r_arr, n_arr = r.to_numpy(), nul.to_numpy()
-    for s_i in range(sims):
-        d_r, d_n = [], []
-        for m in set(r_months) | set(n_months):
-            pooled = np.concatenate([
-                r_arr[r_months == m], n_arr[n_months == m]])
-            rng.shuffle(pooled)
-            k = int((r_months == m).sum())
-            d_r.append(pooled[:k])
-            d_n.append(pooled[k:])
-        a = np.concatenate(d_r) if d_r else np.array([0.0])
-        b = np.concatenate(d_n) if d_n else np.array([0.0])
-        counts[s_i] = a.mean() - b.mean()
-    # S9：+1 修正（p 不为 0；分辨率 1/(1+B)）
-    k = int((counts >= obs).sum()) if sims else 1
-    p = float((1 + k) / (1 + sims)) if sims else 1.0
+    r_months = pd.PeriodIndex(pd.to_datetime(list(r.index)), freq="M")
+    n_months = pd.PeriodIndex(pd.to_datetime(list(nul.index)), freq="M")
+    obs = float(r_arr.mean() - n_arr.mean())
+
+    months = sorted(set(r_months) | set(n_months))
+    k_list, pool_list, sum_pool = [], [], 0.0
+    for m in months:
+        pool = np.concatenate([r_arr[r_months == m], n_arr[n_months == m]])
+        k = int((r_months == m).sum())
+        k_list.append(k)
+        pool_list.append(pool)
+        sum_pool += float(pool.sum())
+    n_a = int(sum(k_list))
+    n_b = int(len(r_arr) + len(n_arr) - n_a)
+    # 统计量 = ΣA·(1/N_A + 1/N_B) − S_total/N_B（逐 sim 等价推导）
+    t_obs = float(r_arr.sum())
+    coef = (1.0 / n_a + 1.0 / n_b)
+    t_sim = np.empty(sims)
+    for mi, (k, pool) in enumerate(zip(k_list, pool_list)):
+        rnd = rng.random((sims, len(pool)))
+        mask = np.argsort(rnd, axis=1) < k
+        part = np.where(mask, pool[None, :], 0.0).sum(axis=1)
+        if mi == 0:
+            t_sim = part
+        else:
+            t_sim = t_sim + part
+    stat_sim = t_sim * coef - sum_pool / n_b
+    k_ge = int((stat_sim >= obs).sum())
+    p = float((1 + k_ge) / (1 + sims))
     return {"delta_p": obs, "p_value": p,
-            "n_days_real": int(len(r)), "n_days_null": int(len(nul)),
+            "n_days_real": n_a, "n_days_null": n_b,
             "block": block, "sims": int(sims)}
 
 
