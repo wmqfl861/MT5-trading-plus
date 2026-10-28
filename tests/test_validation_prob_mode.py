@@ -203,19 +203,34 @@ def test_s9_p_value_has_plus_one_correction():
     assert res["p_value"] >= 1.0 / 201           # (1+k)/(1+B) 下界
 
 
-def test_t75_missing_false_positive_1000_sims():
-    """计划缺测：同分布下误报率接近名义 5%（40 组独立重复 × sims=50，
-    总置换抽样 2,000 次）。名义 P(p<0.05) ≈ 2/51 ≈ 3.9%（+1 修正下
-    k≤1 才判显著），期望命中 ≈ 1.6/40；界 6 ≈ +3σ（实证校准：三轮
-    独立种子基得 2–5/40）。"""
+def test_fpr_fast_smoke():
+    """快测（CI 内）：同分布 40 组×50 置换的误报率界（粗检——正式
+    误报率以慢测试与 T75 标定为准）。"""
     hits = 0
-    reps = 40
-    for rep in range(reps):
+    for rep in range(40):
         a = labels_df(120, p_win=0.40, seed=1000 + rep)
         b = labels_df(120, p_win=0.40, seed=2000 + rep)
         if delta_p_test(a, b, sims=50, seed=rep)["p_value"] < 0.05:
             hits += 1
     assert hits <= 6, hits
+
+
+def test_fpr_slow_400x200():
+    """审核四 E5（慢测试，CI 外单独跑）：同分布 400 次重复、每次 200
+    次置换；名义 5% 下命中 ≤ 32（二项 95% 上界 ≈ 8%）。设环境变量
+    P_LINE_SLOW=1 启用。日志随复选框存档。"""
+    import os
+    if not os.environ.get("P_LINE_SLOW"):
+        pytest.skip("慢测试：设 P_LINE_SLOW=1 启用（400×200 置换）")
+    hits = 0
+    reps, sims = 400, 200
+    for rep in range(reps):
+        a = labels_df(120, p_win=0.40, seed=10_000 + rep)
+        b = labels_df(120, p_win=0.40, seed=20_000 + rep)
+        if delta_p_test(a, b, sims=sims, seed=rep)["p_value"] < 0.05:
+            hits += 1
+    rate = hits / reps
+    assert hits <= 32, f"误报率 {rate:.1%}（{hits}/{reps}）超过 8% 界"
 
 
 def test_t75_missing_detection_rate_90pct():
