@@ -1690,7 +1690,8 @@ def cmd_screen(args) -> int:
                                     costs_by_sym, data_root,
                                     fit_meta={"sizes": sizes,
                                               "vols_by_sym": vols_by_sym,
-                                              "sizing": sizing_info})
+                                              "sizing": sizing_info,
+                                              "policies": policy_by_sym})
                 except ValueError as e:
                     print(f"✗ {e}")
                     return 1
@@ -1966,7 +1967,8 @@ def cmd_gate(args) -> int:
                                 costs_by_sym, data_root,
                                 fit_meta={"sizes": sizes,
                                           "vols_by_sym": vols_by_sym,
-                                          "sizing": sizing_info})
+                                          "sizing": sizing_info,
+                                          "policies": policy_by_sym})
             except ValueError as e:
                 print(f"✗ {e}")
                 return 1
@@ -2086,7 +2088,11 @@ def cmd_gate(args) -> int:
                     card, round_ctx, bars_by_sym, costs_by_sym, data_root,
                     for_g0=True)
                 _fit_and_freeze(type(strategy), card, g0_ctx, bars_by_sym,
-                                costs_by_sym, data_root)
+                                costs_by_sym, data_root,
+                                fit_meta={"sizes": sizes,
+                                          "vols_by_sym": vols_by_sym,
+                                          "sizing": sizing_info,
+                                          "policies": policy_by_sym})
                 g0_strategy = load_strategy(args.strategy)().with_model(
                     g0_ctx["model"])
             _run("G0", lambda: vlook.run_g0(g0_strategy, bars, params))

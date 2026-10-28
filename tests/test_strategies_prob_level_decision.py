@@ -5,6 +5,7 @@ import pytest
 
 from mt5data.store import _COLUMNS, TIMEFRAME_SECONDS
 from mt5quant.backtest.engine_a import run_backtest
+from mt5quant.prob.tables import ProbTable
 from mt5quant.strategies import ExitRules
 from mt5quant.strategies.library.prob.level_decision import (
     LevelDecisionS1Demo, LevelDecisionV1, ModelMissingError,
@@ -161,3 +162,203 @@ def test_g0_frozen_model(fitted):
 def test_with_model_rejects_bad_structure():
     with pytest.raises(ValueError, match="prob_table"):
         DemoSmallGrid().with_model({"schema_version": 1})
+
+
+# ------------------------------------------------- 审核三（S4/S5/D2）+缺测
+
+def _chain_bars():
+    """第 40 根触 100 阻力带（A3 做空）、恰好 K=8 根后第 48 根触 102
+    阻力带（又一个 A3）——旧实现会链式续持 16 根（审核三 R3）。"""
+    rows = ([(98.5, 99.0, 98.0, 98.5)] * 40 + [(99.5, 99.9, 99.0, 99.0)]
+            + [(100.8, 101.3, 100.5, 101.0)] * 7
+            + [(101.5, 101.9, 101.2, 101.4)]
+            + [(101.2, 101.4, 100.9, 101.1)] * 30)
+    bars = pd.DataFrame(rows, columns=["open", "high", "low", "close"])
+    bars.insert(0, "time",
+                pd.date_range("2024-01-02", periods=len(rows), freq="1h"))
+    bars["tick_volume"], bars["spread"], bars["real_volume"] = 10, 5, 0
+    return bars[_COLUMNS]
+
+
+def test_s4_no_chaining_hold_capped_at_k():
+    """S4：K 根后强制归零一根——同向连续段 ≤ K；第 i+K 根的新触发被
+    忽略（不链式续持，每个决策对应一笔与标签同口径的交易）。"""
+    strat = DemoSmallGrid().with_model(_strong_model())
+    sig = strat.generate_signals(_chain_bars(), {}).to_numpy()
+    nz = np.flatnonzero(sig != 0)
+    assert len(nz) == DemoSmallGrid.HORIZON_BARS      # 只有第一段（8 根）
+    assert nz[0] == 40
+    run, best, prev = 0, 0, 0
+    for v in sig:
+        run = run + 1 if (v != 0 and v == prev) else (1 if v != 0 else 0)
+        best = max(best, run)
+        prev = v
+    assert best <= DemoSmallGrid.HORIZON_BARS
+    # 随机序列上同样不越界
+    sig2 = strat.generate_signals(synth_bars(4000, seed=42), {}).to_numpy()
+    run, best, prev = 0, 0, 0
+    for v in sig2:
+        run = run + 1 if (v != 0 and v == prev) else (1 if v != 0 else 0)
+        best = max(best, run)
+        prev = v
+    assert best <= DemoSmallGrid.HORIZON_BARS
+
+
+def test_missing_no_reentry_after_stop_via_engine():
+    """计划缺测：止损出场后，同一次触发（信号未归零前）不再同向重入
+    （reentry=after_signal_change 经引擎验证）。"""
+    from mt5quant.sizing import RiskSizing
+    bars = synth_bars(4000, seed=42)
+    strat = DemoSmallGrid().with_model(_strong_model())
+    res = run_backtest(strat, bars, FlatCosts(), symbol="XAUUSD", params={},
+                       contract_size=100.0, timeframe="H1",
+                       sizing=RiskSizing(risk_fraction=0.005),
+                       vol_min=0.01, vol_step=0.01, vol_max=10.0)
+    trades = res.trades
+    assert len(trades) >= 1
+    sig = strat.generate_signals(bars, {}).to_numpy()
+    pos = np.flatnonzero(sig != 0)
+    # 每笔交易的入场时刻必须落在信号归零之后重新出发的段里：
+    # 同一段（连续同向非零）内的入场数 ≤ 1（止损后无立即同向重入）
+    seg_id = np.zeros(len(sig), dtype=int)
+    cur = 0
+    for i in range(1, len(sig)):
+        if sig[i] != 0 and sig[i] == sig[i - 1]:
+            seg_id[i] = cur
+        else:
+            cur += 1
+            seg_id[i] = cur if sig[i] != 0 else 0
+    times = pd.Index(bars["time"])
+    for t in pd.to_datetime(trades["entry_time"]):
+        k = times.get_indexer([t])[0]
+        entries_in_seg = sum(
+            1 for et in pd.to_datetime(trades["entry_time"])
+            if seg_id[times.get_indexer([et])[0]] == seg_id[k] != 0)
+        assert entries_in_seg <= 1
+    # 止损出场的笔数 > 0 的序列上仍成立（强模型+随机游走必有 SL）
+    assert (trades["exit_reason"].isin(["stop", "stop_gap"])).any()
+
+
+def test_missing_volume_unchanged_after_losses():
+    """计划缺测：连续亏损后手数不变（basis="initial"，铁律 20）——
+    引擎 sizing 模式下所有交易 volume_lots 相同。"""
+    from mt5quant.sizing import RiskSizing
+    bars = synth_bars(4000, seed=42)
+    strat = DemoSmallGrid().with_model(_strong_model())
+    res = run_backtest(strat, bars, FlatCosts(), symbol="XAUUSD", params={},
+                       contract_size=100.0, timeframe="H1",
+                       sizing=RiskSizing(risk_fraction=0.005),
+                       vol_min=0.01, vol_step=0.01, vol_max=10.0)
+    # 手数 = lots_for_risk(初始资金, rf, SL_ATR×信号bar ATR, cs, vol)
+    # ——与累计盈亏无关（basis="initial"；逐笔复算比对）
+    from mt5quant.backtest.engine_a import atr_series
+    from mt5quant.sizing import lots_for_risk
+    atr = atr_series(bars).to_numpy()
+    pos = np.array(pd.Index(bars["time"]).get_indexer(
+        pd.to_datetime(res.trades["entry_time"])))
+    expected = [lots_for_risk(
+        10_000.0, 0.005, DemoSmallGrid.SL_ATR * float(atr[k - 1]),
+        100.0, 0.01, 0.01, 10.0) for k in pos]
+    actual = res.trades["volume_lots"].to_numpy(dtype=float)
+    assert np.allclose(actual, expected, rtol=1e-9)
+
+
+def test_s5_refit_same_instance_twice():
+    """S5：同一实例重复拟合不崩且模型相同（成本不再写实例状态）。"""
+    bars = synth_bars(3000, seed=17)
+    s = DemoSmallGrid()
+    kw = dict(train_end=pd.Timestamp("2020-03-01"), purge_bars=10)
+    meta = {"__fit__": {"sizes": {"XAUUSD": 100.0}}}
+    m1 = s.fit({"XAUUSD": bars}, {"XAUUSD": FlatCosts()}, meta, **kw)
+    m2 = s.fit({"XAUUSD": bars}, {"XAUUSD": FlatCosts()}, meta, **kw)
+    assert m1 == m2
+
+
+def test_s8_fit_requires_sizes():
+    bars = synth_bars(3000, seed=17)
+    s = DemoSmallGrid()
+    with pytest.raises(ValueError, match="合约大小"):
+        s.fit({"XAUUSD": bars}, {"XAUUSD": FlatCosts()}, {"__fit__": {}},
+              train_end=pd.Timestamp("2020-03-01"), purge_bars=10)
+
+
+def test_d2_choose_among_threshold_passers_and_bidirectional_skip():
+    """D2：最高 EV 不过门槛时取**满足门槛**者；同动作双向同 EV → 不做。"""
+    from mt5quant.prob.tables import CellEstimate
+
+    def cell(p_win):
+        return CellEstimate(n=10_000, p_win=p_win, p_loss=1 - p_win - 0.05,
+                            p_time=0.05, r_win=1.9, r_loss=-1.05, r_time=0.1,
+                            se_win=0.005, se_loss=0.005)
+
+    class TwoAction(DemoSmallGrid):
+        LEVEL_GRID = {"XAUUSD": 2.0}
+        HORIZON_BARS = 8
+        APPROACH = Approach(lookback_bars=12, min_distance_atr=1.0,
+                            touch_atr=0.25)
+        RETEST_WINDOW_BARS = 4
+
+    rows_a3 = [("win", 1.9)] * 500 + [("loss", -1.05)] * 500   # A3 EV 高
+    labels = pd.DataFrame({
+        "situation": "S1", "action": "A3",
+        "outcome": [o for o, _ in rows_a3],
+        "net_r": [r for _, r in rows_a3],
+        "trend_sma200": "na", "atr_pct_2000": "na"})
+    # 补 A1 的样本：EV 低但过门槛（赢率 0.42）
+    rows_a1 = [("win", 1.9)] * 420 + [("loss", -1.05)] * 580
+    labels = pd.concat([labels, pd.DataFrame({
+        "situation": "S1", "action": "A1",
+        "outcome": [o for o, _ in rows_a1],
+        "net_r": [r for _, r in rows_a1],
+        "trend_sma200": "na", "atr_pct_2000": "na"})], ignore_index=True)
+    tbl = ProbTable.fit(labels, group_by=["trend_sma200", "atr_pct_2000"],
+                        prior_strength=100, min_cell=100)
+    model = {"prob_version": "1.0.0", "prob_table": tbl.to_dict(),
+             "bracket": {"sl_atr": 1.0, "tp_atr": 2.0, "horizon_bars": 8},
+             # A3 成本高到不过门槛（EV≈+0.7R < 2×0.5R），A1 过（≈+0.16R ≥ 2×0.02）
+             "cost_r_by_situation_action": {"S1|A3": 0.5, "S1|A1": 0.02}}
+    strat = TwoAction().with_model(model)
+    # 序列同时产生 A3 与 A1 触发：锚点收盘未站上（A3 做空）、此前 A1
+    # 已突破（A1 做多出现在锚点后）——用链式序列：40 根 A3、之后上移
+    # 产生 A1。构造：40 根平台+锚（A3@40）；随后大幅上破（A1@41）
+    rows = ([(98.5, 99.0, 98.0, 98.5)] * 40 + [(99.5, 99.9, 99.0, 99.0)]
+            + [(99.6, 100.4, 99.5, 100.3)]      # 41：收盘 > 价位+0.25ATR → A1
+            + [(98.5, 99.0, 98.0, 98.5)] * 30)
+    bars = pd.DataFrame(rows, columns=["open", "high", "low", "close"])
+    bars.insert(0, "time",
+                pd.date_range("2024-01-02", periods=len(rows), freq="1h"))
+    bars["tick_volume"], bars["spread"], bars["real_volume"] = 10, 5, 0
+    bars = bars[_COLUMNS]
+    sig = strat.generate_signals(bars, {}).to_numpy()
+    # A3（bar 40）不过门槛 → 不做；A1（bar 41）过门槛 → 做多
+    assert sig[41] == 1, sig[38:46]
+    assert sig[40] == 0
+
+
+def test_d2_same_action_opposite_directions_skip():
+    """D2：同一根上同一动作两个方向（阻力 A3 做空 + 支撑 A3 做多）都过
+    门槛且 EV 相同（同一格）→ 不做。"""
+    strat = DemoSmallGrid().with_model(_strong_model())
+    # 走廊 101±0.2（ATR≈0.4）：同时满足 100 支撑与 102 阻力的接近条件
+    # （M=12 根都在带外同侧且距价位 ≥ 0.4）；末根 high=102.0、low=100.0
+    # 同时触两带 → 同 bar 两个 A3（一空一多），同格同 EV → 放弃。
+    rows = [(100.8, 101.2, 100.8, 101.0)] * 30   # ATR14 预热 + 12 根窗口
+    rows.append((101.0, 102.0, 100.0, 101.0))
+    rows += [(100.8, 101.2, 100.8, 101.0)] * 20
+    bars = pd.DataFrame(rows, columns=["open", "high", "low", "close"])
+    bars.insert(0, "time",
+                pd.date_range("2024-01-02", periods=len(rows), freq="1h"))
+    bars["tick_volume"], bars["spread"], bars["real_volume"] = 10, 5, 0
+    bars = bars[_COLUMNS]
+    from mt5quant.strategies.library.prob.situations import (
+        Approach, find_level_events, s1_level_rows)
+    from mt5quant.backtest.engine_a import atr_series
+    atr = atr_series(bars)
+    ap = DemoSmallGrid.APPROACH
+    levels = s1_level_rows(bars, grid_step=2.0, approach=ap, atr=atr)
+    evs = find_level_events(bars, levels, situation="S1", approach=ap,
+                            atr=atr)
+    assert {(e.kind, e.level) for e in evs} == {
+        ("resistance", 102.0), ("support", 100.0)}   # 双向确在
+    sig = strat.generate_signals(bars, {}).to_numpy()
+    assert (sig == 0).all()          # 同动作双向同 EV → 不做

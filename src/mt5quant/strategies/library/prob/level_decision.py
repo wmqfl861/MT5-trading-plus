@@ -19,7 +19,7 @@ import pandas as pd
 
 from mt5quant.backtest.engine_a import atr_series, run_backtest
 from mt5quant.prob.artifact import _canonical_bytes
-from mt5quant.prob.decision import choose, ev_lower
+from mt5quant.prob.decision import ev_lower
 from mt5quant.prob.labels import Bracket, label_triggers
 from mt5quant.prob.tables import ProbTable
 from mt5quant.strategies import BaseStrategy, ExitRules, RequiredData
@@ -81,14 +81,24 @@ class LevelDecisionV1(BaseStrategy):
 
     def fit(self, bars_by_symbol: dict, costs_by_symbol: dict, params: dict,
             *, train_end, purge_bars: int) -> dict:
+        # S5：成本在 fit 内局部累计（不改实例状态——同一实例重复拟合、
+        # 多品种卡都不得崩或串窗）；S8：合约大小与禁入窗必给，不默认。
         meta = params.get("__fit__") or {}
         sizes = meta.get("sizes") or {}
+        policies = meta.get("policies") or {}
+        cost_acc: dict[tuple[str, str], list[float]] = {}
         parts = []
-        for sym, bars in bars_by_symbol.items():
+        for sym in sorted(bars_by_symbol):
+            if sym not in sizes:
+                raise ValueError(
+                    f"{sym} 的合约大小未知（__fit__.sizes 缺失）——标签"
+                    "引擎须与评估同口径，不默认 1.0（审核三 S8）")
             parts.append(self._labels_for_symbol(
-                sym, bars, costs_by_symbol.get(sym),
-                contract_size=sizes.get(sym, 1.0),
-                train_end=train_end, purge_bars=purge_bars))
+                sym, bars_by_symbol[sym], costs_by_symbol.get(sym),
+                contract_size=sizes[sym],
+                session_policy=policies.get(sym),
+                train_end=train_end, purge_bars=purge_bars,
+                cost_acc=cost_acc))
         labels = pd.concat([p for p in parts if len(p)],
                            ignore_index=True) if any(len(p) for p in parts) \
             else pd.DataFrame(columns=["situation", "action", "outcome",
@@ -115,15 +125,16 @@ class LevelDecisionV1(BaseStrategy):
             "features": list(FEATURES),
             "policy": {"z": self.POLICY.z,
                        "threshold_mult": self.POLICY.threshold_mult},
-            "cost_r_by_situation_action": {f"{s}|{a}": v
-                                           for (s, a), v in
-                                           self._cost_r.items()},
+            "cost_r_by_situation_action": {
+                f"{k[0]}|{k[1]}": (sum(v) / len(v) if v else 0.0)
+                for k, v in cost_acc.items()},
             "prob_table": table.to_dict(),
         }
         return model
 
     def _labels_for_symbol(self, sym, bars, costs, *, contract_size,
-                           train_end, purge_bars) -> pd.DataFrame:
+                           session_policy, train_end, purge_bars,
+                           cost_acc: dict) -> pd.DataFrame:
         atr = atr_series(bars)
         aparams = ActionParams(breakout_atr=self.BREAKOUT_ATR,
                                retest_window_bars=self.RETEST_WINDOW_BARS)
@@ -164,13 +175,10 @@ class LevelDecisionV1(BaseStrategy):
         labeled = label_triggers(
             bars, triggers, costs, symbol=sym, timeframe=self.TIMEFRAME,
             bracket=bracket, contract_size=contract_size,
-            sizing=None, vol_bounds=(0.01, 0.01, 100.0),
-            volume_lots=1.0, train_end=train_end)
-        # 拟合期成本（R）：决策阈值查表用（D41；EV ≥ threshold×成本）
-        self._fit_cost_r(sym, triggers, costs, contract_size, atr)
-        return labeled
-
-    def _fit_cost_r(self, sym, triggers, costs, contract_size, atr):
+            sizing=None, volume_lots=1.0, train_end=train_end,
+            session_policy=session_policy)          # S8：禁入窗与引擎同口径
+        # 拟合期成本（R）：决策阈值查表用（D41；EV ≥ threshold×成本）。
+        # S5：局部累计（sum/list），由调用方收均值进模型。
         atrs = atr.to_numpy()
         for r in triggers.itertuples(index=False):
             hour, price, bar = int(r.ny_hour), float(r.close), int(r.bar)
@@ -180,13 +188,9 @@ class LevelDecisionV1(BaseStrategy):
             slip = costs.slippage(sym, hour, price=price)
             comm = costs.commission_per_lot(sym) / contract_size
             r_price = self.SL_ATR * float(atrs[bar])
-            key = (str(r.situation), str(r.action))
-            # 逐触发累计均值（(situation,action) 粒度）
-            tot, n = self._cost_r.get(key, (0.0, 0))
-            self._cost_r[key] = (tot + (spr + 2.0 * slip + comm) / r_price,
-                                 n + 1)
-        self._cost_r = {k: (t / n if n else 0.0) for k, (t, n)
-                        in self._cost_r.items()}
+            cost_acc.setdefault((str(r.situation), str(r.action)),
+                                []).append((spr + 2.0 * slip + comm) / r_price)
+        return labeled
 
     # ------------------------------------------------------------- 使用
 
@@ -233,11 +237,19 @@ class LevelDecisionV1(BaseStrategy):
                 trig_at.setdefault(int(t.bar), []).append(
                     (str(t.situation), str(t.action), int(t.side)))
         held_until = -1          # 持仓期间新触发忽略（信号层状态机）
+        forced_zero = -1         # S4：决策段结束后那一根固定 0（不链式续持）
         for i in range(n):
             if i <= held_until:
                 sig[i] = sig[i - 1] if i > 0 else 0
                 continue
-            best = None
+            if i == forced_zero:
+                sig[i] = 0        # 第 i+K 根：本段决策的终止 bar，新触发忽略
+                continue
+            # D2：把（局面,动作,方向,估计,成本）全部交给选择——在**满足
+            # 门槛**的候选里取期望值最高（旧实现先取最高再看门槛，会把
+            # 其他过门槛的动作放弃）；同一动作两个方向都过门槛 → 不做
+            # （方向不可确定）；并列按（局面,动作,方向）字典序取先。
+            cands = []
             for sit, action, side in trig_at.get(i, []):
                 if not math.isfinite(atrs[i]):
                     continue
@@ -248,22 +260,24 @@ class LevelDecisionV1(BaseStrategy):
                 try:
                     est = self._table.lookup(sit, action, feats)
                 except KeyError:
-                    continue          # 该动作无任何样本——不参与决策（缺省不做）
+                    continue      # 该动作无任何样本——不参与决策（缺省不做）
                 cost_r = self._cost_r.get((sit, action), 0.0)
-                cand = (action, est, cost_r)
-                if best is None or _ev_of(cand, self.POLICY.z) > \
-                        _ev_of(best, self.POLICY.z):
-                    best = cand
-            if best is None:
+                ev = ev_lower(est, z=self.POLICY.z)
+                if ev >= self.POLICY.threshold_mult * cost_r:
+                    cands.append((ev, sit, action, side))
+            if not cands:
                 continue
-            action = choose([(best[0], best[1], best[2])], z=self.POLICY.z,
-                            threshold_mult=self.POLICY.threshold_mult)
-            if action is not None:
-                side = next(s for sit2, a2, s in trig_at[i]
-                            if a2 == action)
-                for j in range(i, min(i + self.HORIZON_BARS, n)):
-                    sig[j] = side
-                held_until = i + self.HORIZON_BARS - 1
+            cands.sort(key=lambda c: (-c[0], c[1], c[2], c[3]))
+            top = cands[0]
+            same_action_opposite = [c for c in cands[1:]
+                                    if c[2] == top[2] and c[3] == -top[3]
+                                    and c[0] == top[0]]
+            if same_action_opposite:
+                continue          # D2：同动作双向同 EV 过门槛——方向不可定，不做
+            for j in range(i, min(i + self.HORIZON_BARS, n)):
+                sig[j] = top[3]
+            held_until = i + self.HORIZON_BARS - 1
+            forced_zero = i + self.HORIZON_BARS   # S4：K 根后强制归零一根
         return pd.Series(sig, index=bars.index, dtype="int64")
 
 

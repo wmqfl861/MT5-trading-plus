@@ -204,17 +204,18 @@ def test_s9_p_value_has_plus_one_correction():
 
 
 def test_t75_missing_false_positive_1000_sims():
-    """计划缺测：同分布 1,000 次置换的误报率接近名义 5%。
-
-    以 20 组独立重复 × sims=50 的月内置换近似（总抽样 1,000 次）：
-    每组 p < 0.05 的比例 ≤ 3/20（名义 5% 下二项 95% 上界）。"""
+    """计划缺测：同分布下误报率接近名义 5%（40 组独立重复 × sims=50，
+    总置换抽样 2,000 次）。名义 P(p<0.05) ≈ 2/51 ≈ 3.9%（+1 修正下
+    k≤1 才判显著），期望命中 ≈ 1.6/40；界 6 ≈ +3σ（实证校准：三轮
+    独立种子基得 2–5/40）。"""
     hits = 0
-    for rep in range(20):
+    reps = 40
+    for rep in range(reps):
         a = labels_df(120, p_win=0.40, seed=1000 + rep)
         b = labels_df(120, p_win=0.40, seed=2000 + rep)
         if delta_p_test(a, b, sims=50, seed=rep)["p_value"] < 0.05:
             hits += 1
-    assert hits <= 3, hits
+    assert hits <= 6, hits
 
 
 def test_t75_missing_detection_rate_90pct():
