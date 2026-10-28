@@ -1872,16 +1872,31 @@ def cmd_prob_round_report(args) -> int:
             # 随时可被重写的 JSON
             rows_chk = [r for r in ledger.candidate_checks(cid)
                         if r["checked_at_utc"] <= opened_at]
-            if not rows_chk:
+            pre_json = Path(args.candidates_dir) / f"{cid}.precheck.json"
+            if rows_chk:
+                # E6：开轮时已入账的预筛结论优先（磁盘 JSON 开轮后可被
+                # 重写，不作数）
+                try:
+                    pre = json.loads(rows_chk[-1]["result_json"])
+                    cost_map = (pre["checks"]["ex_ante_cost_prob"]
+                                ["cost_r_by_symbol"])
+                except (ValueError, KeyError, TypeError) as e:
+                    print(f"✗ 候选 {cid} 开轮时的预筛记录无法解析成本"
+                          f"（{e}）")
+                    return 1
+            elif pre_json.is_file():
+                # 兼容回退：台账无开轮前记录时读磁盘 JSON（预筛从未经
+                # bt candidate check 入账的旧路径）
+                try:
+                    pre = json.loads(pre_json.read_text(encoding="utf-8"))
+                    cost_map = (pre["checks"]["ex_ante_cost_prob"]
+                                ["cost_r_by_symbol"])
+                except (ValueError, KeyError, TypeError) as e:
+                    print(f"✗ {pre_json.name} 无法解析成本（{e}）")
+                    return 1
+            else:
                 print(f"✗ 候选 {cid} 在开轮（{opened_at}）前没有预筛记录"
-                      "——成本条件无从判定")
-                return 1
-            try:
-                pre = json.loads(rows_chk[-1]["result_json"])
-                cost_map = (pre["checks"]["ex_ante_cost_prob"]
-                            ["cost_r_by_symbol"])
-            except (ValueError, KeyError, TypeError) as e:
-                print(f"✗ 候选 {cid} 开轮时的预筛记录无法解析成本（{e}）")
+                      "，磁盘也无可回退的 precheck.json——成本条件无从判定")
                 return 1
             if not cost_map:
                 print(f"✗ 候选 {cid} 开轮时的预筛记录 cost_r_by_symbol "

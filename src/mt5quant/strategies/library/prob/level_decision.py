@@ -93,10 +93,19 @@ class LevelDecisionV1(BaseStrategy):
         policies = meta.get("policies") or {}
         for sym in sorted(bars_by_symbol):
             if policies.get(sym) is None:
-                raise ValueError(
-                    f"{sym} 缺入场政策（__fit__.policies）——标签引擎须与"
-                    " bt 同一 entry_policy_for（审核四 E4；蓝图 §2.3），"
-                    "不按'不限制'处理")
+                # E4：缺入场政策不按"不限制"处理——回退到仓库唯一来源
+                # config/sessions.toml 的 SessionPolicy（铁律 11；与 bt
+                # 同一配置）。加载失败才报错。生产路径（bt fit/screen/
+                # gate/prob test）恒经 __fit__.policies 显式传入，不走
+                # 此回退。
+                from mt5data.sessions import SessionConfigError,                     load_session_policy
+                try:
+                    policies[sym] = load_session_policy()
+                except SessionConfigError as e:
+                    raise ValueError(
+                        f"{sym} 缺入场政策（__fit__.policies），且仓库"
+                        f"sessions.toml 加载失败（{e}）——标签引擎须与 bt "
+                        "同一 entry_policy_for（审核四 E4；蓝图 §2.3）")                         from e
         cost_acc: dict[tuple[str, str], list[float]] = {}
         parts = []
         for sym in sorted(bars_by_symbol):

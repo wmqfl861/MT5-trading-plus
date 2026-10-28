@@ -290,10 +290,20 @@ def test_s8_fit_requires_sizes_and_policy():
         s.fit({"XAUUSD": bars}, {"XAUUSD": FlatCosts()},
               {"__fit__": {"policies": {"XAUUSD": PERMISSIVE}}},
               train_end=pd.Timestamp("2020-03-01"), purge_bars=10)
-    with pytest.raises(ValueError, match="入场政策"):
-        s.fit({"XAUUSD": bars}, {"XAUUSD": FlatCosts()},
-              {"__fit__": {"sizes": {"XAUUSD": 100.0}}},
-              train_end=pd.Timestamp("2020-03-01"), purge_bars=10)
+    # 缺政策回退仓库 sessions.toml（不再按'不限制'）；仓库会话文件被
+    # 指向不存在路径时才报错——用 monkeypatch 桩掉默认路径验证报错支路
+    from mt5data import sessions as sess_mod
+    import pytest as _pytest
+    orig = sess_mod.load_session_policy
+    sess_mod.load_session_policy = lambda *a, **k: (_ for _ in ()).throw(
+        sess_mod.SessionConfigError("桩：不可加载"))
+    try:
+        with pytest.raises(ValueError, match="入场政策"):
+            s.fit({"XAUUSD": bars}, {"XAUUSD": FlatCosts()},
+                  {"__fit__": {"sizes": {"XAUUSD": 100.0}}},
+                  train_end=pd.Timestamp("2020-03-01"), purge_bars=10)
+    finally:
+        sess_mod.load_session_policy = orig
 
 
 def test_d2_choose_among_threshold_passers_and_bidirectional_skip():
