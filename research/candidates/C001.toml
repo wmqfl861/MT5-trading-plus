@@ -5,7 +5,7 @@
 id = "C001"
 title = "月末效应（USTEC）"
 mechanism_class = "flow_calendar"
-status = "screened_fail"            # R13 §4.3：保持 screened_fail，理由改为——目标市场发表后证据（Han, Han & Tian 2025）显示效应 2001 年后消失（美股 TOM 归因于 2001 年小数化后交易成本大降），预期按目标市场证据取≈0，预筛不过；是否 swap-free 都改变不了这一点。退出 R1，不进首轮（另有 K4 σ 口径、K3 研究段已看、K8 事件窗三问题同向；2026-10-28 预筛重跑留痕见 C001.precheck.json 与台账）
+status = "withdrawn"            # R13 §4.3：保持 screened_fail，理由改为——目标市场发表后证据（Han, Han & Tian 2025）显示效应 2001 年后消失（美股 TOM 归因于 2001 年小数化后交易成本大降），预期按目标市场证据取≈0，预筛不过；是否 swap-free 都改变不了这一点。退出 R1，不进首轮（另有 K4 σ 口径、K3 研究段已看、K8 事件窗三问题同向；2026-10-28 预筛重跑留痕见 C001.precheck.json 与台账）
 symbols = ["USTEC"]
 holding = "D1"
 observed_in_sample = "T66 §3.2"    # K3：本候选机制在 R1 预注册之前于真实事件时间被看过（T66 标定报告 §3.2 的月末窗诊断观测，USTEC 净均值 +0.362%/事件）——研究段检验已不是盲检，只能靠锁箱与前向样本确认；该观察已作为 run_class=research 试验补记入台账
