@@ -152,6 +152,8 @@ from run_backtest import (  # noqa: E402
 from mt5quant.sizing import load_volume_limits  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# T83/R13-K6：账户隔夜费画像（研究侧口径开关；缺省不存在=全 charged）
+ACCOUNT_PROFILE_PATH = REPO_ROOT / "config" / "account-profile.toml"
 # T37/D23：策略代码指纹/干净检查的 git 根。从 mt5quant 包位置推导而非
 # REPO_ROOT——测试会 monkeypatch bt.REPO_ROOT 重定向 gates 配置（P7 的
 # CRLF 用例），而策略文件永远住在真正的仓库里，git 交互必须指向它。
@@ -934,8 +936,93 @@ def _g5_orchestrate(ledger, card, *, strategy, spec, params, base_summary,
 
 # ------------------------------------------------------------ candidate check
 
+_ACCOUNT_PROFILE_STATUSES = ("charged", "swap_free", "unknown")
+
+
+def load_account_profile(path=None) -> dict[str, str]:
+    """账户隔夜费画像装载器（T83/R13-K6，config/account-profile.toml）。
+
+    返回**生效**条目 {symbol: "swap_free"}（只含确认过的免隔夜费品种）；
+    不在返回里的品种一律按 charged（缺省保守）。规则：
+    - 文件不存在 → {}（全 charged——未配置即未确认）；
+    - 条目 status="swap_free" 且 confirmed_by 非空（用户确认过）→ 生效；
+    - status=charged/unknown、或 swap_free 未填确认人 → charged（不生效）；
+    - status 非法 → ValueError（fail-fast，不猜）；
+    - [account] 表只是将来实盘账户类型的登记，装载不消费（预筛决定只看
+      品种级状态）。
+    """
+    import tomllib
+
+    p = Path(path) if path is not None else ACCOUNT_PROFILE_PATH
+    if not p.is_file():
+        return {}
+    with open(p, "rb") as f:
+        doc = tomllib.load(f)
+    symbols = doc.get("symbols", {})
+    if not isinstance(symbols, dict):
+        raise ValueError(f"{p}：[symbols] 须是表（symbol 名 → 状态条目）")
+    effective: dict[str, str] = {}
+    for sym, entry in sorted(symbols.items()):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{p}：[symbols.{sym}] 须是表（status/确认人等）")
+        status = entry.get("status")
+        if status not in _ACCOUNT_PROFILE_STATUSES:
+            raise ValueError(
+                f"{p}：[symbols.{sym}].status 须为 "
+                f"{'/'.join(_ACCOUNT_PROFILE_STATUSES)}，收到 {status!r}")
+        confirmed_by = str(entry.get("confirmed_by") or "").strip()
+        if status == "swap_free" and confirmed_by:
+            effective[str(sym)] = "swap_free"
+    return effective
+
+
+def _swap_ref_prices(data_root, symbols, timeframe: str) -> dict[str, float]:
+    """各品种研究库最后收盘（T83/K5：build_costs 的 swap_ref_price）。
+
+    与 CLI 主路径同一约定（装载序列最后收盘）：优先候选持仓周期，该周期
+    缺序列时退回该品种任一可用周期（参考价只用于点数费率的相对化基准，
+    与周期无关——与 candidates._reference_price 同一 fallback 语义）。
+    """
+    from mt5data.store import load_bars
+
+    refs: dict[str, float] = {}
+    for sym in symbols:
+        bars = load_bars(str(data_root), sym, timeframe)
+        if bars is None or len(bars) == 0:
+            sym_dir = Path(data_root) / "bars" / str(sym)
+            bars = None
+            if sym_dir.is_dir():
+                for tdir in sorted(sym_dir.iterdir()):
+                    if tdir.is_dir():
+                        bars = load_bars(str(data_root), sym, tdir.name)
+                        if bars is not None and len(bars) > 0:
+                            break
+        if bars is None or len(bars) == 0:
+            raise ValueError(
+                f"研究库无 {sym} 任何周期的 K 线——swap_ref_price（T83/K5 "
+                "点数模式隔夜费相对基准）无从取；检查数据根或先导出研究库")
+        refs[sym] = float(pd.to_numeric(bars["close"]).iloc[-1])
+    return refs
+
+
+def _swap_free_costs(costs, symbols):
+    """swap_free 口径的成本模型（T83/R13-K6 预筛双口径）：同一份点差/
+    滑点/佣金，隔夜费规则全部置 0（用户确认免隔夜费时的口径）。"""
+    from mt5quant.costs import Costs, SwapModel, SwapRule
+
+    return Costs(
+        spread=costs.spread,
+        slippage_model=costs.slippage_model,
+        commission=costs.commission,
+        swap=SwapModel(per_symbol={
+            str(s): SwapRule(long_per_day=0.0, short_per_day=0.0)
+            for s in symbols}),
+        overshoot_model=getattr(costs, "overshoot_model", None))
+
+
 def _merged_costs(data_root, symbols, *, spread_fraction: float,
-                  commission: float, research_mode: bool):
+                  commission: float, research_mode: bool,
+                  swap_ref_prices: dict[str, float] | None = None):
     """候选预筛用的成本模型 v3：逐品种 build_costs 后合并成一个聚合体。
 
     预筛只信**缓存文件**的成本模型（与引擎同一缓存；tick 水位新鲜度由
@@ -944,6 +1031,11 @@ def _merged_costs(data_root, symbols, *, spread_fraction: float,
     merge（多品种点差）、CommissionModel per_symbol、SwapModel per_symbol
     规则、滑点按同一 spread_fraction 重建。返回 (Costs, cost_version)——
     版本串取各品种版本的去重拼接（进 precheck.json 的成本身份）。
+
+    swap_ref_prices（T83/R13-K5）：{symbol: 研究库该品种最后收盘}——点数
+    模式隔夜费折相对口径（与 CLI 主路径/bt screen/gate 同一约定），
+    cost_version 带 relref。预筛的事前成本数字本就按预筛自己的参考价折算
+    （candidates._reference_price），不随本参数变（有回归测试钉住逐位不变）。
     """
     from mt5quant.costs import CommissionModel, Costs, SlippageModel, SwapModel
 
@@ -952,9 +1044,11 @@ def _merged_costs(data_root, symbols, *, spread_fraction: float,
     rules: dict[str, object] = {}
     versions: list[str] = []
     for sym in symbols:
+        ref = (swap_ref_prices or {}).get(sym)
         costs_i, ver_i = build_costs(
             data_root, sym, spread_fraction, commission,
-            research_store=True)
+            research_store=True,
+            swap_ref_price=(None if ref is None else float(ref)))
         versions.append(ver_i)
         spread = costs_i.spread if spread is None else spread.merge(costs_i.spread)
         comm_by_sym[sym] = costs_i.commission_per_lot(sym)
@@ -1092,10 +1186,14 @@ def cmd_candidate_check(args) -> int:
                                research_coverage_segments=segs)
     else:
         try:
+            # T83/K5：点数模式隔夜费相对基准 = 研究库该品种最后收盘
+            swap_refs = _swap_ref_prices(data_root, candidate.symbols,
+                                         candidate.holding)
             costs, cost_version = _merged_costs(
                 data_root, candidate.symbols,
                 spread_fraction=args.spread_fraction,
-                commission=args.commission, research_mode=True)
+                commission=args.commission, research_mode=True,
+                swap_ref_prices=swap_refs)
         except Exception as e:
             print(f"✗ 成本模型装配失败：{type(e).__name__}: {e}")
             return 1
@@ -1114,13 +1212,74 @@ def cmd_candidate_check(args) -> int:
             segs = cand.coverage_segments(data_root, candidate.symbols,
                                           [candidate.holding])
             years = {k: cand.merged_coverage_years(v) for k, v in segs.items()}
+            # T83/R13-K6 预筛双口径：持仓过夜的候选同时算 charged 与
+            # swap_free 两口径，决定按 account-profile 状态取
             result = cand.precheck(candidate, data_root=data_root,
                                    cost_model=costs, research_years=years,
                                    active_mechanisms=active,
                                    research_coverage_segments=segs)
+            if candidate.declared is not None \
+                    and candidate.declared.overnight_nights > 0:
+                result_free = cand.precheck(
+                    candidate, data_root=data_root,
+                    cost_model=_swap_free_costs(costs, candidate.symbols),
+                    research_years=years, active_mechanisms=active,
+                    research_coverage_segments=segs)
+                profile = load_account_profile()
+                sym_status = {s: profile.get(s, "charged")
+                              for s in candidate.symbols}
+                basis = ("swap_free"
+                         if all(v == "swap_free" for v in sym_status.values())
+                         else "charged")
+                picked = result_free if basis == "swap_free" else result
+                dual_block = {
+                    "applicable": True,
+                    "account_profile": sym_status,
+                    "decision_basis": basis,
+                    "charged": {
+                        "multiple": result.checks.get(
+                            "ex_ante_cost", {}).get("multiple"),
+                        "power": result.checks.get("power", {}).get("power"),
+                        "decision": result.decision,
+                    },
+                    "swap_free": {
+                        "multiple": result_free.checks.get(
+                            "ex_ante_cost", {}).get("multiple"),
+                        "power": result_free.checks.get(
+                            "power", {}).get("power"),
+                        "decision": result_free.decision,
+                    },
+                    # swap_free 口径通过而 charged 口径不通过 → 该候选的
+                    # 通过依赖账户免隔夜费状态，登记 swap_dependent
+                    "swap_dependent": bool(
+                        result_free.decision == "pass"
+                        and result.decision != "pass"),
+                }
+                result, extra_reasons = picked, []
+                if dual_block["swap_dependent"]:
+                    extra_reasons.append(
+                        "swap_dependent=true：swap_free 口径"
+                        f"（倍数 {dual_block['swap_free']['multiple']:.2f}）"
+                        "通过而 charged 口径（倍数 "
+                        f"{dual_block['charged']['multiple']:.2f}）不通过——"
+                        "该候选的结论依赖账户免隔夜费状态"
+                        "（config/account-profile.toml 用户确认条目）")
+                if basis == "swap_free":
+                    cost_version += "+swapfree(account-profile)"
+            else:
+                dual_block = {
+                    "applicable": False,
+                    "note": "候选不过夜（overnight_nights=0）：隔夜费恒 0，"
+                    "双口径无差别",
+                }
+                extra_reasons = []
     payload = result.to_payload()
     payload["cost_model_version"] = cost_version
     payload["checked_at_utc"] = datetime.now(timezone.utc).isoformat()
+    if candidate.status not in cand.BOOKKEEPING_STATUSES \
+            and candidate.prob_declared is None:
+        payload["swap_basis"] = dual_block
+        payload["reasons"].extend(extra_reasons)
 
     # 结果落地：C###.precheck.json（原子写，铁律 15）+ 台账（哈希链）
     out_path = Path(candidate.path).with_suffix("").with_name(
@@ -1146,6 +1305,20 @@ def cmd_candidate_check(args) -> int:
         print(f"  事前成本倍数 {mult:.2f}（门槛 ≥3）")
     if pw is not None:
         print(f"  单次检验力 {pw:.0%}（门槛 ≥50%，{years_note}）")
+    sb = payload.get("swap_basis") or {}
+    if sb.get("applicable"):
+        def _fmt2(x):
+            return "—" if x is None else f"{x:.2f}"
+
+        def _fmt0(x):
+            return "—" if x is None else f"{x:.0%}"
+
+        print(f"  双口径（T83）：charged 倍数 {_fmt2(sb['charged']['multiple'])}"
+              f"/检验力 {_fmt0(sb['charged']['power'])}；swap_free 倍数 "
+              f"{_fmt2(sb['swap_free']['multiple'])}/检验力 "
+              f"{_fmt0(sb['swap_free']['power'])}；决定按 "
+              f"{sb['decision_basis']}（account-profile）"
+              + ("；swap_dependent=true" if sb["swap_dependent"] else ""))
     pp = payload["checks"].get("power_prob")
     if pp is not None:
         # D52：逐条假设按触发日数判定（审核二 Q6）
@@ -1166,7 +1339,7 @@ def cmd_candidate_check(args) -> int:
                   f"{dearest} 3×{cs_map[dearest]:.4f}R）"
                   + (f"；不满足：{ec['failing_symbols']}"
                      if ec.get("failing_symbols") else "；全部品种满足"))
-    for r in result.reasons:
+    for r in payload["reasons"]:
         print(f"  - {r}")
     print(f"预筛结果：{out_path}；台账 {ledger_path}（candidate_checks 哈希链）")
     return {"pass": 0, "fail": 1, "waiting_data": 2}[result.decision]
@@ -1451,7 +1624,10 @@ def cmd_prob_test(args) -> int:
             for sym in card.symbols:
                 costs_by_sym[sym], cost_version = build_costs(
                     data_root, sym, args.spread_fraction, args.commission,
-                    sessions_sha=sess_sha, research_store=store_kind == "research")
+                    sessions_sha=sess_sha, research_store=store_kind == "research",
+                    # T83/K5：点数模式隔夜费相对价格基准 = 全序列最后收盘
+                    # （与 CLI 主路径同一约定；bars_full 为锁箱语义装载的全序列）
+                    swap_ref_price=float(bars_full["close"].iloc[-1]))
                 policy_by_sym[sym] = entry_policy_for(
                     costs_by_sym[sym], sym, sess_policy)
             for sym in card.symbols:      # S8：合约大小必填，不默认 1.0
@@ -1652,7 +1828,9 @@ def cmd_fit(args) -> int:
         for sym in card.symbols:
             costs_by_sym[sym], _ver = build_costs(
                 data_root, sym, args.spread_fraction, args.commission,
-                sessions_sha=sess_sha, research_store=store_kind == "research")
+                sessions_sha=sess_sha, research_store=store_kind == "research",
+                # T83/K5：与 screen/gate 同一约定——该品种装载序列最后收盘
+                swap_ref_price=float(bars_by_sym[sym]["close"].iloc[-1]))
         fit_ctx = _prob_fit_context(card, None, bars_by_sym, costs_by_sym,
                                     data_root)
         _fit_and_freeze(strategy_cls, card, fit_ctx, bars_by_sym, costs_by_sym,
@@ -1761,7 +1939,12 @@ def cmd_screen(args) -> int:
                     costs_by_sym[sym], cost_version = build_costs(
                         data_root, sym, args.spread_fraction,
                         args.commission, sessions_sha=sess_sha,
-                        research_store=research_mode)
+                        research_store=research_mode,
+                        # T83/R13-K5：点数模式隔夜费相对价格基准 = 该品种
+                        # 研究库序列最后收盘（与 CLI 主路径同一约定——研究
+                        # 路径不再按快照时代绝对额对早年价格放大隔夜费）
+                        swap_ref_price=float(
+                            bars_by_sym[sym]["close"].iloc[-1]))
                     policy_by_sym[sym] = entry_policy_for(
                         costs_by_sym[sym], sym, sess_policy)
             else:
@@ -2027,7 +2210,10 @@ def cmd_gate(args) -> int:
                     costs_by_sym[sym], cost_version = build_costs(
                         data_root, sym, args.spread_fraction,
                         args.commission, sessions_sha=sess_sha,
-                        research_store=research_mode)
+                        research_store=research_mode,
+                        # T83/R13-K5：与 screen 同一约定——研究库序列最后收盘
+                        swap_ref_price=float(
+                            bars_by_sym[sym]["close"].iloc[-1]))
                     policy_by_sym[sym] = entry_policy_for(
                         costs_by_sym[sym], sym, sess_policy)
             else:
