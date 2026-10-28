@@ -82,7 +82,7 @@ H 线剩余任务按下表推进。
 | --- | --- | --- | --- | --- |
 | f | T83 成本口径：研究路径的隔夜费 | S | — | 第十三轮 K5、K6 |
 | g | T84 预筛 σ、样本量口径与候选更正 | S | — | K3、K4、K8 |
-| h | T88 台账迁移保真证明与按事件序号锚定 | S | — | K7、P 线审核一移交 |
+| h | T88 台账迁移保真证明与按事件序号锚定 | S | — | K7、锚定的同刻度竞态 |
 | i | T87 HistData 启用（下载耗时，可与 f–h 交替） | M | — | D36 补充结论 |
 | j | T85 关卡 v3 工作点补充标定（批准点）→ 冻结 | M | T83 | K1、K2、D34/D35 |
 | k | T86 关卡 v3 的 bt 接线 | M | T85 冻结 | D34/D35 落地 |
@@ -106,7 +106,7 @@ H 线剩余任务按下表推进。
     2. MT5 里 USTEC、XAUUSD、EURUSD、BTCUSD 各自"规格"中的 Swap long/short。
   - 结果由 agent 写进 `config/account-profile.toml`（T83，不含账号与服务器名）。
 - [x] **HistData**：第十三轮审核有条件批准用于个人研究（依据与限定见第十三轮报告 §5，落地见 T87）。用户如不同意，回复"HistData 不用"即撤销。
-- [x] **D33 口径修订**：主检验的 N = 两线轮次内累计 + 所延续谱系的历史；轮次制之前的其余历史只报告（第十三轮 §4.1）。用户如不同意，回复即撤销。
+- [x] **D33 口径修订**：主检验的 N = 全项目轮次内累计 + 所延续谱系的历史；轮次制之前的其余历史只报告（第十三轮 §4.1）。用户如不同意，回复即撤销。
 - [ ] **沿用的用户事项**：S1 清单、ACL 与分支保护、MT5 策略测试器对账。
 
 ## T70：脱敏与杂项（F1、F2、F4、F6、F7）
@@ -368,7 +368,7 @@ def randomize_event_times(events, trading_days, *, seed: int) -> list[EventWindo
   - 报告 §5 的"0.4–0.6%"删除，或改为引用 C001 的登记值；
   - §7 与 §4.2 的随机化时刻净均值统一为实测值。
 - [ ] **规则**：`docs/p6/research-agent.md` 写明——标定与演示只用随机化时刻或植入效应；候选机制在真实事件时间上的统计量，只能在已开启轮次内计算。守护测试检查关键词。
-- [ ] **还原成本判定**（K10，P 线审核三转达）：H 线 `precheck` 的判定块恢复 0d92448 之前的写法——`not cost_ok` 判 fail，`elif not power_ok` 判 waiting_data（P 线的 `precheck_prob` 不动）。失败测试先行：成本条件返回 numpy 布尔值 False 或 None 时，判为 fail。
+- [ ] **还原成本判定**（K10）：H 线 `precheck` 的判定块恢复 0d92448 之前的写法——`not cost_ok` 判 fail，`elif not power_ok` 判 waiting_data（只改 H 线的 `precheck`）。失败测试先行：成本条件返回 numpy 布尔值 False 或 None 时，判为 fail。
 - [ ] **C002**：补 `window_bars = 1`；等 T87 数据延长后重检。
 
 ## T85：关卡 v3 工作点补充标定（第十三轮 K1、K2；D34 冻结前置，批准点）
@@ -378,7 +378,7 @@ def randomize_event_times(events, trading_days, *, seed: int) -> list[EventWindo
 以下规则写于结果之前（第十三轮 §4.1、§4.2），不按结果调整。
 
 - [ ] **N 口径**：
-  - `ledger.stats` 新增 `project_n_dedup_rounds`：run_class=research 且 round_id 非空，两条线合并；
+  - `ledger.stats` 新增 `project_n_dedup_rounds`：run_class=research 且 round_id 非空，全项目计；
   - 新增 `lineage_n_dedup(family)`；候选登记新增可选字段 `continues_family`；
   - 主检验 N = 两者之和；
   - 现行键的语义不变，轮次制之前的其余历史只在报告里列出。
@@ -406,7 +406,6 @@ def randomize_event_times(events, trading_days, *, seed: int) -> list[EventWindo
   - 事件卡不跑买入持有与延迟否决；
   - 随机化次数低于下限时拒绝运行；
   - 报告中 N 的组成与台账一致。
-- [ ] **与 P 线 T73B 协调**：通用接线放在 T86；P 线拟合策略的逐窗拟合放在 T73B。分工由 P 线审核会话确认，先落地的一方提供接口。
 
 ## T87：HistData 启用（D36 第十三轮补充结论）
 
@@ -422,7 +421,7 @@ def randomize_event_times(events, trading_days, *, seed: int) -> list[EventWindo
 - [ ] **导出研究库**（cutoff 之前），与 MT5 重叠期做一致性核对；更新覆盖表与延长后的检验力表。
 - [ ] **C002 重检**：按 T84 的口径（定盘前一小时的时段 σ）重跑预筛，台账留痕；2015-02-15 前后两段作为诊断。
 
-## T88：台账迁移保真证明与按事件序号锚定（第十三轮 K7、P 线审核一移交）
+## T88：台账迁移保真证明与按事件序号锚定（第十三轮 K7）
 
 **Files:** `scripts/ledger_anchor.py`、`src/mt5quant/research/ledger.py`；报告 `docs/ops/rechain-proof-<日期>.md`；测试。
 
