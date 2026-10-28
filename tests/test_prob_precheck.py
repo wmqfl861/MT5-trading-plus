@@ -134,8 +134,9 @@ def test_precheck_prob_pass(data_root):
     c = cand.validate_candidate(prob_data(), source="t")
     # 成本：spread0.3 + 2×slip0.1 = 0.5 价格单位；R = 1.0×atr
     # cost_R = 0.5/20 = 0.025R；ΔEV = 0.04×3 = 0.12R ≥ 3×0.025R ✓
-    # Δp=0.04/power=0.5/1 条假设 → 需 406 个触发日 → 500 个不同日过
-    days = pd.date_range("2018-01-01", periods=500, freq="1D")
+    # Δp=0.04/power=0.5/1 条假设 → 解析 406 / T75 实测 1500（插值段，
+    # 更严）→ 需 1500 个触发日 → 1600 个不同日过
+    days = pd.date_range("2018-01-01", periods=1600, freq="1D")
     rows = [("TEST", "S1", "A3", 9, 20.0, 2000.0, str(d))
             for d in days]
     res = cand.precheck_prob(c, data_root=data_root, cost_model=FlatCosts(),
@@ -143,8 +144,9 @@ def test_precheck_prob_pass(data_root):
                              split=pd.Timestamp("2025-01-01"))
     assert res.decision == "pass", res.reasons
     assert res.checks["power_prob"]["n_required_analytic"] == 406
+    assert res.checks["power_prob"]["n_required_used"] == 1500
     assert res.checks["power_prob"]["per_hypothesis"]["S1:A3:fade>base"][
-        "trigger_days"] == 500
+        "trigger_days"] == 1600
 
 
 def test_precheck_prob_cost_fail(data_root):
@@ -172,7 +174,7 @@ def test_precheck_prob_insufficient_triggers_waiting(data_root):
     assert ph["trigger_days"] == 1
     assert res.checks["power_prob"]["insufficient"] == ["S1:A3:fade>base"]
     assert res.checks["power_prob"]["unit"] == "trigger_days"
-    assert res.checks["power_prob"]["t75_rule_pending"] is True
+    assert res.checks["power_prob"]["t75_rule_pending"] is False
 
 
 def test_precheck_prob_no_counted_waiting(data_root):
@@ -341,9 +343,9 @@ def data_root_of(tmp_path):
 def test_q6_days_unit_and_per_hypothesis(data_root):
     """Q6：样本单位=触发日数；逐条判定（一条过候选即过，不足的列出）。"""
     c = cand.validate_candidate(prob_data(), source="t")
-    days = pd.date_range("2018-01-01", periods=650, freq="1D")
+    days = pd.date_range("2018-01-01", periods=2200, freq="1D")
     a3_rows = [("TEST", "S1", "A3", 9, 20.0, 2000.0, str(d)) for d in days]
-    # 同一天 300 次 A1 触发——按次计 300 会过（需 406），按日计只有 1 日
+    # 同一天 300 次 A1 触发——按次计 300 次、按日计只有 1 日（远低于 2130）
     a1_rows = [("TEST", "S1", "A1", 9, 20.0, 2000.0, "2018-06-01")] * 300
     data2 = prob_data()
     data2["prob"] = {**data2["prob"],
@@ -353,8 +355,10 @@ def test_q6_days_unit_and_per_hypothesis(data_root):
                              counted=counted_df(a3_rows + a1_rows),
                              split=pd.Timestamp("2025-01-01"))
     pp = res.checks["power_prob"]
-    # 两条假设 → 需 577 触发日（z_a(2)=1.96）；A3 650 日过；A1 1 日不足
+    # 两条假设 → 解析 577（z_a(2)=1.96）/ T75 实测 1500×1.420=2130
+    # （更严）→ 需 2130 触发日；A3 2200 日过；A1 1 日不足
     assert pp["n_required_analytic"] == 577
+    assert pp["n_required_used"] == 2130
     assert pp["per_hypothesis"]["S1:A3:fade>base"]["passed"] is True
     assert pp["per_hypothesis"]["S1:A1:follow>base"]["trigger_days"] == 1
     assert pp["insufficient"] == ["S1:A1:follow>base"]
@@ -395,3 +399,128 @@ def test_q3_bonferroni_uses_registered_hypothesis_count(data_root):
     assert pp["n_tests"] == 4
     # Δp=0.04、4 条假设（z_a(4)=2.241）→ (2.241×√0.24/0.04)² = 754 日
     assert pp["n_required_analytic"] == 754
+
+
+# ------------------------------------------- T75 实测样本量规则（T76 收尾）
+# 计划 docs/superpowers/plans/2026-10-29-p-line-t76-finalize.md 模块 A §5：
+# 解析 D52 与 T75 实测（月内置换标定，2026-10-29 批准）取更严者。
+
+_FOUR_HYPOTHESES = ["S1:A1:follow>base", "S1:A2:follow>base",
+                    "S1:A3:fade>base", "S1:A4:fade>base"]
+
+
+def _prob_candidate(**prob_over):
+    """单品种候选（覆盖 [prob] 字段），4 假设档位默认带满。"""
+    data = prob_data()
+    over = {"hypotheses": list(_FOUR_HYPOTHESES)}
+    over.update(prob_over)
+    data["prob"] = {**data["prob"], **over}
+    return cand.validate_candidate(data, source="t")
+
+
+def _rows_for_days(action, n_days, atr=20.0):
+    """A3 在 n_days 个**不同**日各触发一次（atr 抬高可压低 R 成本）。"""
+    days = pd.date_range("2018-01-01", periods=n_days, freq="1D")
+    return [("TEST", "S1", action, 9, atr, 2000.0, str(d)) for d in days]
+
+
+def test_measured_rule_stricter_wins(data_root):
+    """实测更严以实测为准：4 假设 Δp=0.03 → 解析 1340 vs 实测
+    2000×1.856=3712 → required 3712（2000 日按旧解析口径会过、现在待数据）。"""
+    c = _prob_candidate(expected_delta_p=0.03)
+    res = cand.precheck_prob(c, data_root=data_root, cost_model=FlatCosts(),
+                             counted=counted_df(_rows_for_days("A3", 2000)),
+                             split=pd.Timestamp("2025-01-01"))
+    pp = res.checks["power_prob"]
+    assert pp["n_required_analytic"] == 1340
+    assert pp["n_required_measured"] == 3712    # 2000×(2.241/1.645)²=3711.8→3712
+    assert pp["n_required_used"] == 3712
+    assert pp["rule_source"] == "t75-measured+z2"
+    assert pp["per_hypothesis"]["S1:A3:fade>base"]["passed"] is False
+    assert res.decision == "waiting_data"
+
+
+def test_analytic_stricter_in_extrapolation_region(data_root):
+    """外推区解析更严 → 取解析：4 假设 Δp=0.20 → 实测沿段斜率外推为负、
+    max(0,·) 截断到 0；解析 31 → required 31，50 日过。"""
+    c = _prob_candidate(expected_delta_p=0.20)
+    res = cand.precheck_prob(c, data_root=data_root, cost_model=FlatCosts(),
+                             counted=counted_df(_rows_for_days("A3", 50)),
+                             split=pd.Timestamp("2025-01-01"))
+    pp = res.checks["power_prob"]
+    assert pp["n_required_measured"] == 0     # 2000−50000×(0.20−0.03)=−6500→0
+    assert pp["n_required_analytic"] == 31
+    assert pp["n_required_used"] == 31
+    assert pp["open_ended"] is False
+    assert pp["per_hypothesis"]["S1:A3:fade>base"]["passed"] is True
+    assert res.decision == "pass"
+
+
+def test_open_ended_interval_requires_strictly_more(data_root):
+    """开区间档（Δp=0.02 端继承开区间语义）：4 假设 4000×1.856=7424、
+    open_ended=True——days=7424 不算过（须 >），days=7425 过。"""
+    c = _prob_candidate(expected_delta_p=0.02)
+    kwargs = dict(data_root=data_root, cost_model=FlatCosts(),
+                  split=pd.Timestamp("2025-01-01"))
+    res_7424 = cand.precheck_prob(
+        c, counted=counted_df(_rows_for_days("A3", 7424, atr=100.0)), **kwargs)
+    pp = res_7424.checks["power_prob"]
+    assert pp["open_ended"] is True
+    assert pp["n_required_measured"] == 7424     # 4000×(2.241/1.645)²=7423.6→7424
+    assert pp["n_required_used"] == 7424         # 解析 3014（D52）不敌实测
+    assert pp["per_hypothesis"]["S1:A3:fade>base"]["passed"] is False
+    assert res_7424.decision == "waiting_data"
+    res_7425 = cand.precheck_prob(
+        c, counted=counted_df(_rows_for_days("A3", 7425, atr=100.0)), **kwargs)
+    assert res_7425.checks["power_prob"][
+        "per_hypothesis"]["S1:A3:fade>base"]["passed"] is True
+    assert res_7425.decision == "pass"
+
+
+def test_measured_none_below_calibration_propagates_waiting(data_root):
+    """Δp=0.015（< 标定下界 0.02）实测未覆盖 → None 传播：4 假设恒待数据
+    （6000 日已超解析要求，仍被实测 None 卡住——不随触发日数增加改变）。"""
+    c = _prob_candidate(expected_delta_p=0.015)
+    res = cand.precheck_prob(
+        c, counted=counted_df(_rows_for_days("A3", 6000, atr=100.0)),
+        data_root=data_root, cost_model=FlatCosts(),
+        split=pd.Timestamp("2025-01-01"))
+    pp = res.checks["power_prob"]
+    assert pp["n_required_measured"] is None
+    assert pp["n_required_used"] is None
+    ph = pp["per_hypothesis"]["S1:A3:fade>base"]
+    assert ph["required_days"] is None and ph["passed"] is False
+    assert pp["n_required_analytic"] < 6000     # 旧解析口径下会过 → 决定翻转
+    assert res.decision == "waiting_data"
+
+
+def test_measured_rule_numeric_self_checks():
+    """数值自检（T75 报告 §3 推导式，计划模块 A）：
+    4 假设 Δp=0.03 → 2000×1.856=3712；2 假设 Δp=0.04 → 单假设 1500×
+    (1.960/1.645)²=2130；12 假设 Δp=0.05 → 1000×2.572=2572。"""
+    assert cand.measured_n_required(4, 0.03) == (3712, True)
+    assert cand.measured_n_required(2, 0.04) == (2130, False)
+    assert cand.measured_n_required(12, 0.05) == (2572, False)
+    # 单假设档（z² 换算系数=1）：锚点原样，0.02 端开、0.03 起闭
+    assert cand.measured_n_required(1, 0.02) == (4000, True)
+    assert cand.measured_n_required(1, 0.03) == (2000, True)
+    assert cand.measured_n_required(1, 0.05) == (1000, False)
+    assert cand.measured_n_required(1, 0.015) == (None, False)
+
+
+def test_measured_rule_monotonicity():
+    """性质测试（两维，扫描覆盖插值/外推全部档位——外推方向反了会被
+    Δp 扫描抓住）：n_required 对 Δp 非增（同假设数）、对假设数非减（同 Δp）。"""
+    dps = [0.02, 0.025, 0.029, 0.03, 0.031, 0.04, 0.049, 0.05,
+           0.06, 0.08, 0.10, 0.15, 0.20]
+    for n_hyp in (1, 2, 4, 12):
+        vals = [cand.measured_n_required(n_hyp, dp)[0] for dp in dps]
+        for dp, v, v_next in zip(dps, vals, vals[1:]):
+            assert v is not None and v_next is not None
+            assert v_next <= v, (
+                f"n_hyp={n_hyp}：dp {dp}→{dps[dps.index(dp) + 1]} 实测样本量 "
+                f"{v}→{v_next} 递增（应对 Δp 非增）")
+    for dp in dps:
+        vals = [cand.measured_n_required(k, dp)[0] for k in range(1, 13)]
+        assert all(b >= a for a, b in zip(vals, vals[1:])), (
+            f"dp={dp}：假设数 1..12 的实测样本量 {vals} 应非减")

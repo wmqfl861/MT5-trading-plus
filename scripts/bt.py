@@ -1589,16 +1589,22 @@ def cmd_candidate_check(args) -> int:
               + ("；swap_dependent=true" if sb["swap_dependent"] else ""))
     pp = payload["checks"].get("power_prob")
     if pp is not None:
-        # D52：逐条假设按触发日数判定（审核二 Q6）
+        # D52 解析 + T75 实测（T76 收尾接线）：逐假设显示两口径与取严结果
+        n_meas = pp.get("n_required_measured")
+        n_used = pp.get("n_required_used")
+        meas_s = "未覆盖（Δp<0.02，恒待数据）" if n_meas is None else str(n_meas)
+        used_s = "恒待数据（实测未覆盖）" if n_used is None else str(n_used)
+        strict_s = "；开区间档——须严格大于" if pp.get("open_ended") else ""
         for h, d in pp.get("per_hypothesis", {}).items():
             mark = "✓" if d["passed"] else "⏳"
             print(f"  {mark} 假设 {h}：触发日数 {d['trigger_days']} / "
-                  f"解析样本量 {d['required_days']}（{pp['n_tests']} 条假设 "
+                  f"样本量要求 {used_s}（解析 {pp['n_required_analytic']} / "
+                  f"T75 实测 {meas_s}，取严{strict_s}；{pp['n_tests']} 条假设 "
                   f"Bonferroni；分界 {pp['split']}；单位=触发日）")
         if not pp.get("per_hypothesis"):
-            print(f"  ⏳ 无触发计数（解析样本量 "
-                  f"{pp['n_required_analytic']} 日；分界 {pp['split']}）")
-        print("  （T75 实测样本量规则批准前按解析表）")
+            print(f"  ⏳ 无触发计数（样本量要求 {used_s}——解析 "
+                  f"{pp['n_required_analytic']} / T75 实测 {meas_s}，取严"
+                  f"{strict_s}；分界 {pp['split']}；单位=触发日）")
         ec = payload["checks"].get("ex_ante_cost_prob", {})
         if ec.get("cost_r_by_symbol"):
             cs_map = ec["cost_r_by_symbol"]

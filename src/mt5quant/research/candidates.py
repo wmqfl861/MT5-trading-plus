@@ -59,6 +59,7 @@ __all__ = [
     "BOOKKEEPING_STATUSES", "PRECHECK_DECISIONS", "load_candidate",
     "coverage_years", "coverage_segments", "merged_coverage_years",
     "unconditional_volatility", "precheck", "precheck_prob", "propose_split",
+    "measured_n_required",
 ]
 
 # 附录 C：机制类别七分类（蓝图 v4 §6.2 预筛条件 5）+ P 线价位类（D45/T76）
@@ -1196,6 +1197,63 @@ def precheck(candidate: Candidate, *, data_root, cost_model,
 
 _PROB_BASE_RATE = 0.40        # 蓝图 P 线 §3.4：基准赢率口径（止盈 2R/止损 1R）
 
+# ----------------------------- T75 实测样本量规则（T76 收尾接线，2026-10-29 批准）
+# 标定报告 docs/research/prob-mode-calibration-2026-10-29.md §2.5/§3（月内置换
+# 方法获批；基准赢率≈0.34 实测口径——解析表用 0.40，实测更保守）的单假设
+# 实测锚点（单位=触发日数，单假设/单侧 5%/50% 检验力）：
+#   Δp=0.02 → ">4,000"（开区间：n=4000 检验力仅 34%，精确下界未测出）；
+#   Δp=0.03 → ≈2,000（53%）；Δp=0.05 → ≈1,000（70%）
+# 规则（报告 §3 + 计划 T76 修订 v2）：
+# - dp < 0.02：None——低于标定最小档，未测出（恒 waiting_data，不外推）；
+# - 0.02 ≤ dp ≤ 0.03：4000@0.02 ↔ 2000@0.03 线性插值，open_ended=True
+#   （0.02 端继承开区间语义：判 pass 需 days **>** n_required）；
+# - 0.03 < dp ≤ 0.05：2000@0.03 ↔ 1000@0.05 线性插值（闭区间，≥ 即过）；
+# - dp > 0.05：沿 0.03→0.05 段斜率**外推**（非 clamp），max(值, 0) 截断
+#   （dp≳0.07 后外推到 0、解析 D52 主导——由调用方的 max 取严兜底，如实注明）。
+# 假设数维度（审核推荐 z² 换算，任意 n_hyp ≥ 1；即 T75 报告 §3 的 4/12 列
+# 推导式——(z₄/z₁)²≈1.856、(z₁₂/z₁)²≈2.572，z 取 power._z_alpha(0.05, n_hyp)
+# 与解析 n_needed_proportion 同一取位约定）：
+#   n_required_measured(n_hyp, dp) = 单假设值(dp) × (z_α(n_hyp)/z_α(1))²
+# 实现按推导式而非报告取整表（3700/5100/7400 等——相差 ≤3%），常量注释写明。
+# 数值自检（tests/test_prob_precheck.py::test_measured_rule_numeric_self_checks）：
+#   4 假设 Δp=0.03 → 2000×1.856 = 3712；2 假设 Δp=0.04 → 单假设 1500×
+#   (1.960/1.645)² = 2130；12 假设 Δp=0.05 → 1000×2.572 = 2572。
+
+# 单假设实测锚点：(Δp, n_required)（T75 报告 §3 表的"1 假设（实测）"列）
+_MEASURED_ANCHORS = ((0.02, 4000.0), (0.03, 2000.0), (0.05, 1000.0))
+
+
+def measured_n_required(n_hyp: int, dp: float) -> tuple[int | None, bool]:
+    """T75 实测样本量规则（单位=触发日数）→ (n_required, open_ended)。
+
+    - n_required=None：dp < 0.02 未测出——该假设**恒 waiting_data**，
+      不随触发日数增加改变（调用方见 None 即判不过，不与解析取 max）；
+    - open_ended=True（0.02 ≤ dp ≤ 0.03）：判 pass 需 days **>** n_required
+      （0.02 端 ">4,000" 锚点的开区间语义随插值段继承）；其余档位 ≥ 即过。
+    取严（n_required = max(解析 D52, 实测)）由调用方 precheck_prob 做，
+    单假设值 × (z_α(n_hyp)/z_α(1))² 在本函数内完成。
+    """
+    if isinstance(n_hyp, bool) or not isinstance(n_hyp, int) or n_hyp < 1:
+        raise ValueError(f"n_hyp 必须是 ≥1 整数，收到 {n_hyp!r}")
+    if not (isinstance(dp, (int, float)) and math.isfinite(dp) and dp > 0.0):
+        raise ValueError(f"dp 必须为有限正数，收到 {dp!r}")
+    (lo_dp, lo_n), (mid_dp, mid_n), (hi_dp, hi_n) = _MEASURED_ANCHORS
+    if dp < lo_dp:
+        return None, False                  # 未测出：恒 waiting_data
+    if dp <= mid_dp:
+        a_dp, a_n, b_dp, b_n = lo_dp, lo_n, mid_dp, mid_n
+        open_ended = True                   # [0.02, 0.03]：开区间档
+    else:
+        # (0.03, +∞)：0.03→0.05 段线性插值；>0.05 沿同一斜率外推
+        a_dp, a_n, b_dp, b_n = mid_dp, mid_n, hi_dp, hi_n
+        open_ended = False
+    single = a_n + (dp - a_dp) * (b_n - a_n) / (b_dp - a_dp)
+    if dp > hi_dp:                          # 外推区：非负截断 max(值, 0)
+        single = max(single, 0.0)
+    z1 = power._z_alpha(_POWER_ALPHA, 1)
+    z_h = power._z_alpha(_POWER_ALPHA, n_hyp)
+    return math.ceil(single * (z_h / z1) ** 2 - 1e-9), open_ended
+
 
 def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
                   split, active_mechanisms=None) -> PrecheckResult:
@@ -1218,8 +1276,10 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
     4. 检验力（审核二 Q3/Q6，D52）：样本单位为发现段内的**触发日数**
        （同一天多次触发记 1）；Bonferroni 条数 = 候选登记的假设条数；
        **逐条判定**——不足的假设判 waiting_data 并列出（开轮时移出），
-       候选至少一条通过才算通过；解析表 vs T75 实测取更严（接线待 T75，
-       见 checks["power_prob"]["t75_rule_pending"]）；
+       候选至少一条通过才算通过；样本量取解析 D52 与 **T75 实测规则**
+       （measured_n_required，月内置换标定 2026-10-29 批准）的**更严者**：
+       实测未覆盖（Δp<0.02）→ 恒 waiting_data；开区间档（0.02≤Δp≤0.03）
+       判 pass 需 days > n_required（见 checks["power_prob"]）；
     5. 机制空缺：price_levels 是新类别（D45）——排序类理由，不阻塞。
     """
     if candidate.status in BOOKKEEPING_STATUSES:
@@ -1318,11 +1378,16 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
     # 条数 = 候选登记的假设条数；逐条判定：不足的假设机械判 waiting_data
     # 并列出（开轮时从本轮移除，不替换动作、不改方向），候选至少一条通过
     # 才算通过；开轮复核按全轮假设条数再算一遍（T77 用同一函数的全轮口径）。
-    # T75 实测样本量规则批准后取解析与实测更严者（收尾接线）。
+    # T76 收尾接线：样本量 = max(解析 D52, T75 实测)——实测规则见
+    # measured_n_required；实测 None（Δp<0.02 未测出）不参与 max，
+    # 该假设恒 waiting_data；开区间档（0.02≤Δp≤0.03）须严格大于。
     n_hyp = len(pdecl.hypotheses)
     n_required = power.n_needed_proportion(
         _PROB_BASE_RATE, pdecl.expected_delta_p,
         alpha=_POWER_ALPHA, power=_POWER_MIN, n_tests=n_hyp)
+    n_meas, open_ended = measured_n_required(n_hyp, pdecl.expected_delta_p)
+    n_used = (None if n_meas is None
+              else max(int(n_required), n_meas))
     per_hypothesis: dict[str, dict] = {}
     insufficient: list[str] = []
     if counted is None or len(counted) == 0:
@@ -1336,9 +1401,14 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
             sit, act = h.split(":")[0], h.split(":")[1]
             n_days = int(sub.loc[(sub["situation"] == sit)
                                  & (sub["action"] == act), "day"].nunique())
-            ok_h = n_days >= n_required
+            if n_used is None:              # 实测未覆盖 → 恒 waiting_data
+                ok_h = False
+            elif open_ended:                # 开区间档：须 days > n_required
+                ok_h = n_days > n_used
+            else:
+                ok_h = n_days >= n_used
             per_hypothesis[h] = {"trigger_days": n_days,
-                                 "required_days": int(n_required),
+                                 "required_days": n_used,
                                  "passed": bool(ok_h)}
             if not ok_h:
                 insufficient.append(h)
@@ -1348,31 +1418,48 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
         "unit": "trigger_days",
         "n_tests": n_hyp,
         "n_required_analytic": int(n_required),
+        "n_required_measured": n_meas,   # None = T75 实测未覆盖（Δp<0.02）
+        "n_required_used": n_used,       # max(解析, 实测)；None = 恒待数据
+        "open_ended": open_ended,
+        "rule_source": "t75-measured+z2",
         "per_hypothesis": per_hypothesis,
         "insufficient": insufficient,
         "passing_count": len(per_hypothesis) - len(insufficient),
         "split": str(split),
         "base_rate": _PROB_BASE_RATE,
         "alpha": _POWER_ALPHA,
-        "t75_rule_pending": True,
+        "t75_rule_pending": False,
         "note": ("无触发计数" if counted is None or len(counted) == 0 else
                  "逐条判定（D52）：样本单位为发现段（time < split）内该假设"
                  "（局面×动作，跨品种/方向合并）的触发日数；Bonferroni 条数"
-                 "=候选登记假设数；不足的假设判 waiting_data（开轮时移出，"
+                 "=候选登记假设数；样本量取解析 D52 与 T75 实测规则"
+                 "（rule_source=t75-measured+z2：单假设锚点 4000@0.02（开）/"
+                 "2000@0.03/1000@0.05 插值、>0.05 沿段斜率外推 max(0,·)，"
+                 "假设数按 (z_α(n)/z_α(1))² 换算）的更严者——实测未覆盖"
+                 "（Δp<0.02）恒待数据，开区间档（0.02≤Δp≤0.03）判 pass 需 "
+                 "days > n_required；不足的假设判 waiting_data（开轮时移出，"
                  "不替换不改向），候选至少一条通过才算通过；开轮复核用同一"
-                 "函数按全轮假设条数（T77）；T75 实测规则批准后取更严者")}
+                 "函数按全轮假设条数（T77）")}
     if counted is not None and len(counted) > 0:
         for h in insufficient:
             d = per_hypothesis[h]
-            reasons.append(
-                f"检验力：假设 {h} 发现段触发日数 {d['trigger_days']} < "
-                f"解析样本量 {d['required_days']}（按 {n_hyp} 条假设 "
-                "Bonferroni）→ 该假设待数据（铁律 18；开轮时从本轮移除，"
-                "不替换动作、不改方向）")
+            if d["required_days"] is None:
+                reasons.append(
+                    f"检验力：假设 {h} 的 T75 实测规则未覆盖"
+                    f"（Δp={pdecl.expected_delta_p:g} < 标定下界 0.02——"
+                    "开区间下界未测出，不外推）→ 该假设恒待数据"
+                    "（铁律 18；延长标定覆盖前不随触发日数增加改变）")
+            else:
+                reasons.append(
+                    f"检验力：假设 {h} 发现段触发日数 {d['trigger_days']} < "
+                    f"样本量要求 {d['required_days']}（解析 {int(n_required)} / "
+                    f"T75 实测 {n_meas}，取严；按 {n_hyp} 条假设 "
+                    "Bonferroni）→ 该假设待数据（铁律 18；开轮时从本轮移除，"
+                    "不替换动作、不改方向）")
     elif not power_ok:
         reasons.append(
             "检验力：无触发计数 → 待数据（计数经 bt candidate check 自动"
-            "执行；T75 实测规则批准前按解析表）")
+            "执行）")
 
     # 条件 5：机制空缺（排序类，不阻塞）
     active = set(active_mechanisms or ())

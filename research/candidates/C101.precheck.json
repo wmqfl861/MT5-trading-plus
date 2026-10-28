@@ -1,0 +1,96 @@
+{
+  "candidate_id": "C101",
+  "decision": "fail",
+  "reasons": [
+    "事前成本：ΔEV 0.0600R < 3×0.0218R（XAUUSD——逐品种检查，预筛条件 3：折算 Δp 覆盖不了该品种的 3 倍成本）",
+    "检验力：假设 S1:A1:follow>base 发现段触发日数 24 < 样本量要求 7424（解析 3014 / T75 实测 7424，取严；按 4 条假设 Bonferroni）→ 该假设待数据（铁律 18；开轮时从本轮移除，不替换动作、不改方向）",
+    "检验力：假设 S1:A2:follow>base 发现段触发日数 6 < 样本量要求 7424（解析 3014 / T75 实测 7424，取严；按 4 条假设 Bonferroni）→ 该假设待数据（铁律 18；开轮时从本轮移除，不替换动作、不改方向）",
+    "检验力：假设 S1:A3:fade>base 发现段触发日数 49 < 样本量要求 7424（解析 3014 / T75 实测 7424，取严；按 4 条假设 Bonferroni）→ 该假设待数据（铁律 18；开轮时从本轮移除，不替换动作、不改方向）",
+    "检验力：假设 S1:A4:fade>base 发现段触发日数 6 < 样本量要求 7424（解析 3014 / T75 实测 7424，取严；按 4 条假设 Bonferroni）→ 该假设待数据（铁律 18；开轮时从本轮移除，不替换动作、不改方向）",
+    "机制空缺：price_levels 是组合里还没有的类别（蓝图 §6.2 条件 5；D45 新类别）"
+  ],
+  "events_per_year": null,
+  "checks": {
+    "literature": {
+      "passed": true,
+      "original_n": 2,
+      "replications_n": 2,
+      "rebuttals_n": 3
+    },
+    "holding": {
+      "passed": true,
+      "holding": "H1",
+      "min": "H1"
+    },
+    "ex_ante_cost_prob": {
+      "passed": false,
+      "edge_ev_r": 0.06,
+      "expected_delta_p": 0.02,
+      "tp_r": 2.0,
+      "binding_symbol": "XAUUSD",
+      "cost_r_by_symbol": {
+        "XAUUSD": 0.02175690081861332
+      },
+      "failing_symbols": [
+        "XAUUSD"
+      ],
+      "min": 3.0,
+      "formula": "逐品种：ΔEV_R = Δp×(tp_R+1) ≥ 3×来回成本(R) 须对每个品种成立（等价于按成本最高品种判断，Q1）；成本 = 触发纽约小时（点差+双腿滑点+佣金/合约大小）÷ (sl_atr×ATR)的均值（Q2：佣金 commission_per_lot/cs 为价格单位）",
+      "note": "已知限制：未计入隔夜费与止损越幅；基准赢率固定为 0.40（比按止损止盈推算的 sl/(sl+tp)=1/3 保守）"
+    },
+    "power_prob": {
+      "passed": false,
+      "unit": "trigger_days",
+      "n_tests": 4,
+      "n_required_analytic": 3014,
+      "n_required_measured": 7424,
+      "n_required_used": 7424,
+      "open_ended": true,
+      "rule_source": "t75-measured+z2",
+      "per_hypothesis": {
+        "S1:A1:follow>base": {
+          "trigger_days": 24,
+          "required_days": 7424,
+          "passed": false
+        },
+        "S1:A2:follow>base": {
+          "trigger_days": 6,
+          "required_days": 7424,
+          "passed": false
+        },
+        "S1:A3:fade>base": {
+          "trigger_days": 49,
+          "required_days": 7424,
+          "passed": false
+        },
+        "S1:A4:fade>base": {
+          "trigger_days": 6,
+          "required_days": 7424,
+          "passed": false
+        }
+      },
+      "insufficient": [
+        "S1:A1:follow>base",
+        "S1:A2:follow>base",
+        "S1:A3:fade>base",
+        "S1:A4:fade>base"
+      ],
+      "passing_count": 0,
+      "split": "2019-05-01 00:00:00",
+      "base_rate": 0.4,
+      "alpha": 0.05,
+      "t75_rule_pending": false,
+      "note": "逐条判定（D52）：样本单位为发现段（time < split）内该假设（局面×动作，跨品种/方向合并）的触发日数；Bonferroni 条数=候选登记假设数；样本量取解析 D52 与 T75 实测规则（rule_source=t75-measured+z2：单假设锚点 4000@0.02（开）/2000@0.03/1000@0.05 插值、>0.05 沿段斜率外推 max(0,·)，假设数按 (z_α(n)/z_α(1))² 换算）的更严者——实测未覆盖（Δp<0.02）恒待数据，开区间档（0.02≤Δp≤0.03）判 pass 需 days > n_required；不足的假设判 waiting_data（开轮时移出，不替换不改向），候选至少一条通过才算通过；开轮复核用同一函数按全轮假设条数（T77）"
+    },
+    "mechanism_gap": {
+      "blocking": false,
+      "note": "机制空缺：price_levels 是组合里还没有的类别（蓝图 §6.2 条件 5；D45 新类别）",
+      "mechanism_class": "price_levels",
+      "active_mechanisms": [
+        "cross_asset"
+      ]
+    }
+  },
+  "cost_model_version": "tick-spread-p90[rel@NY/bar_open_m1#abed3b8f]+slip0.1-comm0-cli-swap-snapshot[2152cda6]-relref[c999a9a6]-no-overshoot-missNY[17]",
+  "checked_at_utc": "2026-10-28T23:03:53.244771+00:00"
+}
