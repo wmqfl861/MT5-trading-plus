@@ -2,7 +2,7 @@
   "candidate_id": "C002",
   "decision": "waiting_data",
   "reasons": [
-    "检验力 23% < 50%（4.44 年、隐含夏普 0.46 < 声明 0.46——按较小者计，T80/G2：毛收益−成本按品种波动 σ 折算到不了声明的夏普）→ 待数据（铁律 18：检验力不足不开卡）",
+    "检验力 45% < 50%（4.44 年、隐含夏普 0.83 < 声明 0.83——按较小者计，T80/G2：毛收益−成本按品种波动 σ 折算到不了声明的夏普）→ 待数据（铁律 18：检验力不足不开卡）",
     "机制空缺：cross_asset 是组合里还没有的类别（蓝图 §6.2 条件 5）"
   ],
   "events_per_year": 12.0,
@@ -11,7 +11,7 @@
       "passed": true,
       "original_n": 1,
       "replications_n": 2,
-      "rebuttals_n": 2,
+      "rebuttals_n": 1,
       "note": "复现与折算依据见 expected_effect"
     },
     "holding": {
@@ -23,9 +23,9 @@
     },
     "ex_ante_cost": {
       "passed": true,
-      "multiple": 3.154067823343643,
+      "multiple": 4.888805126182647,
       "min": 3.0,
-      "gross_return_per_event": 0.0002,
+      "gross_return_per_event": 0.00031,
       "binding_symbol": "EURUSD",
       "per_symbol": {
         "EURUSD": {
@@ -40,20 +40,20 @@
           "commission": 0.0,
           "overnight": 0.0,
           "round_trip_cost": 6.341017733346615e-05,
-          "multiple": 3.154067823343643
+          "multiple": 4.888805126182647
         }
       }
     },
     "power": {
       "passed": false,
-      "power": 0.2343125211165082,
+      "power": 0.4450675406464431,
       "min": 0.5,
       "years": 4.436459046315309,
-      "expected_sharpe": 0.46,
-      "implied_sharpe": 0.4593951062586388,
-      "sharpe_used": 0.4593951062586388,
+      "expected_sharpe": 0.83,
+      "implied_sharpe": 0.8293601644300742,
+      "sharpe_used": 0.8293601644300742,
       "implied_sharpe_by_symbol": {
-        "EURUSD": 0.4593951062586388
+        "EURUSD": 0.8293601644300742
       },
       "sigma_by_symbol": {
         "EURUSD": 0.0010299653149638264
@@ -89,5 +89,5 @@
     }
   },
   "cost_model_version": "tick-spread-p90[rel@NY/bar_open_m1#10a66c54]+slip0.1-comm0-calibrated-swap-snapshot[95bd5691]-no-overshoot",
-  "checked_at_utc": "2026-10-28T00:40:45.590471+00:00"
+  "checked_at_utc": "2026-10-28T01:27:41.219987+00:00"
 }

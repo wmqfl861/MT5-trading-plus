@@ -6,7 +6,7 @@
 # 现状如实记录（2026-10-28 bt candidate check 实测）：
 # - C001 预筛 fail（事前成本倍数 1.79 < 3，USTEC 快照隔夜费主导；
 #   U0"账户是否 swap-free"确认后重检可能翻盘——见候选报告 §2.3）；
-# - C002 预筛 waiting_data（EURUSD 日内 4.44 年检验力 23%；外部日内源
+# - C002 预筛 waiting_data（EURUSD 日内 4.44 年检验力 45% < 50%；外部日内源
 #   未批准——HistData 条款待核实、Dukascopy 不可达）。
 # 因此本草案的 candidates 是**拟议组成**：截至草案日无一候选 screened_pass，
 # R1 不满足开启前置条件（bt round open 会拒）。批准前若预筛结论更新
