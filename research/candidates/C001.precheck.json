@@ -1,0 +1,100 @@
+{
+  "candidate_id": "C001",
+  "decision": "fail",
+  "reasons": [
+    "事前成本倍数 1.79 < 3（USTEC：折算后每笔毛收益 0.0024 ÷ 来回成本 0.00133963，预筛条件 3）",
+    "机制空缺：flow_calendar 是组合里还没有的类别（蓝图 §6.2 条件 5）"
+  ],
+  "events_per_year": 12.0,
+  "checks": {
+    "literature": {
+      "passed": true,
+      "original_n": 1,
+      "replications_n": 2,
+      "rebuttals_n": 3,
+      "note": "复现与折算依据见 expected_effect"
+    },
+    "holding": {
+      "passed": true,
+      "holding": "D1",
+      "seconds": 86400,
+      "min": "H1",
+      "min_seconds": 3600
+    },
+    "ex_ante_cost": {
+      "passed": false,
+      "multiple": 1.7915364658972663,
+      "min": 3.0,
+      "gross_return_per_event": 0.0024,
+      "binding_symbol": "USTEC",
+      "per_symbol": {
+        "USTEC": {
+          "reference_price": 25171.46,
+          "reference_timeframe": "D1",
+          "contract_size": 1.0,
+          "spread_round_trip": 6.749148942885619e-05,
+          "spread_entry_frac": 6.426085747678745e-05,
+          "spread_exit_frac": 6.749148942885619e-05,
+          "slippage_entry": 6.426085747678745e-06,
+          "slippage_exit": 6.749148942885619e-06,
+          "commission": 0.0,
+          "overnight": 0.0012589655109397709,
+          "round_trip_cost": 0.0013396322350591914,
+          "multiple": 1.7915364658972663
+        }
+      }
+    },
+    "power": {
+      "passed": true,
+      "power": 0.5221648471765447,
+      "min": 0.5,
+      "years": 39.80561259411362,
+      "expected_sharpe": 0.28,
+      "implied_sharpe": 0.2745755796596754,
+      "sharpe_used": 0.2745755796596754,
+      "implied_sharpe_by_symbol": {
+        "USTEC": 0.2745755796596754
+      },
+      "sigma_by_symbol": {
+        "USTEC": 0.013377816380190347
+      },
+      "sigma_method": "无条件收益波动 σ：候选持仓周期 bar 的相邻收盘相对收益全体（随机时点抽样的总体极限，ddof=1）——品种性质，与候选信号无关、不取自本项目样本内（T80/G2）；隐含夏普 =（毛收益−事前来回成本）÷σ×√每年事件数，检验力取 min(声明, 隐含)",
+      "alpha": 0.05,
+      "n_tests": 1,
+      "years_detail": {
+        "USTEC/D1": 39.80561259411362
+      },
+      "min_detectable_sharpe": 0.41038354866913607,
+      "coverage_segments": {
+        "USTEC/D1": [
+          {
+            "source": "mt5",
+            "first": "2021-07-02T00:00:00",
+            "last": "2025-10-23T00:00:00",
+            "years": 4.309377138945927,
+            "counted": true
+          },
+          {
+            "source": "fred",
+            "first": "1986-01-02T00:00:00",
+            "last": "2025-10-23T00:00:00",
+            "years": 39.80561259411362,
+            "counted": true
+          }
+        ]
+      },
+      "coverage_merged_years": {
+        "USTEC/D1": 39.80561259411362
+      },
+      "coverage_merge_method": "计入段日历区间并集：相接/重叠的段合成连续跨度（min(first)..max(last)），不相接的分段各自计入——重叠不双计（T80/G3 审核修正：相加会把完全包含/部分重叠的覆盖虚增，如 fred/USTEC 39.8 年包住 mt5 4.3 年 → 合并 39.8 而非 44.1）"
+    },
+    "mechanism_gap": {
+      "blocking": false,
+      "note": "机制空缺：flow_calendar 是组合里还没有的类别（蓝图 §6.2 条件 5）",
+      "mechanism_class": "flow_calendar",
+      "active_mechanisms": []
+    }
+  },
+  "cost_model_version": "tick-spread-p90[rel@NY/bar_open_m1#10a66c54]+slip0.1-comm0-cli-swap-snapshot[c71b0267]-no-overshoot-missNY[17]",
+  "checked_at_utc": "2026-10-28T00:40:43.559599+00:00"
+}

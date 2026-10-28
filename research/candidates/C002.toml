@@ -1,0 +1,32 @@
+# C002 月末对冲调仓（USTEC 当月涨跌 → EURUSD，月末定盘前）——蓝图 v4 §6.6
+# 首批候选之二（T68，2026-10-28 登记）。只写材料、不跑数据（附录 C）。
+# 信号品种 USTEC（只出信号不下单），交易品种 EURUSD（symbols 为成交品种）。
+id = "C002"
+title = "月末对冲调仓（USTEC 当月涨跌 → EURUSD，伦敦定盘前）"
+mechanism_class = "cross_asset"
+status = "waiting_data"             # 2026-10-28 bt candidate check 实测：waiting_data（检验力 23% < 50%，EURUSD 日内 4.44 年且外部日内源未批准）；事前成本倍数 3.15 过线
+symbols = ["EURUSD"]
+holding = "H1"
+mechanism = "外国股票组合管理人按月末市值调汇率对冲敞口：当月美股上涨 → 对冲市值上升 → 月末最后一个定盘前须卖出 USD 买回本币（或反向），集中在伦敦定盘前一小时成交（Melvin & Prins 2015 的对冲通道）。送钱方：在定盘前一小时被动承接对冲流的对手方。信号 = USTEC 上月倒数第二日至本月倒数第二日的累计涨跌；交易 = 月末最后交易日伦敦定盘前 1 小时的 EURUSD 方向仓（涨→多 EURUSD/USD 贬值方向）。"
+
+[literature]
+original = ["Melvin & Prins (2015), Equity hedging and exchange rates at the London 4 p.m. fix, Journal of Financial Markets 22: 50-72"]
+replications = [
+  "Ito & Yamada (2017/2018), Did the Reform Fix the London Fix Problem?, NBER WP 23327；Journal of International Money and Finance 80: 75-95——2015-02-15 定盘改革（WMR 4pm 计算窗口 1 分钟→5 分钟，约 15:57:30-16:02:30）后：定盘窗口成交量尖峰消失，但'此前文献报告的价格动态异象仍然存在'，且银行被动化执行带来新的可预测成分",
+  "Krohn, Mueller & Whelan (2024), Foreign Exchange Fixings and Returns Around the Clock, Journal of Finance 79(1): 541-578——1999-2018 二十年逐年存在定盘前持续升值、定盘后反转的日内模式（样本覆盖 2015 改革前后），EUR 定盘周边策略回测夏普 0.65（扣足成本前）",
+]
+rebuttals = [
+  "Krohn, Mueller & Whelan (2024) 同文：定盘周边日内波动'扣足全额买卖价差后大多消失'（hard to exploit after costs）——对可交易性（而非统计存在性）的直接反驳，与本项目事前成本口径正面冲突",
+  "原文幅度不可核验：Melvin & Prins (2015) 的公开文本（摘要/Highlights/引言/工作稿首页）只给方向性与显著性，未给 bps 级效应幅度（付费数表不可及，2026-10-28 检索）——本登记的量化锚取自相邻口径（Krohn 等 2024 的全样本定盘策略），非同一策略的复现，如实标注",
+]
+search_log = "Web 检索（聚合引擎），2026-10-28：（1）Melvin Prins London 4pm fix equity hedging replication/after 2015 reform——命中 Ito & Yamada（NBER 23327，JIMF 2018）、Krohn-Mueller-Whelan（JF 2024，IDEAS/学者主页核对卷期 79(1) 541-578）、Evans-Marsh-Payne-Saar (2018, JFQA) 'Fixing the Fix?'（定盘窗口参与者价格冲击 1-1.2bp，秒级口径，作量级参照不计入复现）；（2）WMR 2015 改革细节：检索 WM Reuters 4pm fix February 2015 five-minute window——Norges Bank（Marsh/Panagiotou/Saarinen 系列）与 Ito-Yamada 核对为 2015-02-15 起 1 分钟→5 分钟（15:57:30-16:02:30），未发现定盘时刻移至 15:30 的证据（与早先印象相反，如实记录）；（3）原文幅度：ECB 会议稿 PDF（WebFetch 不支持 PDF）与 ScienceDirect 付费页（403）均不可及，未取得 bps 幅度——检索词 Melvin Prins basis points month-end depreciation；（4）数据可得性（仓库内，2026-10-28 查阅 docs/research/ext-data-2026-10-27.md 与 T81）：EURUSD 日内仅 MT5 段 4.44 年；HistData 未批准（未找到使用条款原文）、Dukascopy 原则可用但当前不可达——日内长历史待定。未从本项目任何数据取值（铁律 17）。"
+published_effect = "2004-2013 八大流动货币（USD/EUR/JPY/GBP/CAD/AUD/SEK/CHF）：上月倒数第二日至本月倒数第二日的股市收益可预测本月最后一日伦敦定盘前的货币收益——股市上涨 → 该国货币在月末最后定盘前可预测贬值（对冲再平衡方向），逐小时伦敦日收益回归统计显著（方向性结论；公开文本无数值幅度）。"
+expected_effect = "折算（全部文献折算/事前计算，不取自本项目数据，铁律 17）：原文幅度不可及（见 rebuttals），取两个可及锚的保守下沿：(a) Krohn-Mueller-Whelan (2024) 定盘周边策略回测夏普 0.65（1999-2018，扣费前，逐日事件）→ 按事件均收益 = SR×σ_日/√250 ≈ 0.65×0.5%/15.8 ≈ 2bp/事件；Melvin-Prins 的月末日效应应强于平均日（月末对冲流集中），不放大、按平均日下沿申报；(b) Evans-Marsh-Payne-Saar (2018) 定盘窗口参与者价格冲击 1-1.2bp（秒级，量级参照）。声明 0.0002/事件（2bp）；不另乘 -58%（McLean & Pontiff 2016）：锚样本 1999-2018 已覆盖 2015 改革后的衰减，且为扣费前回测，再乘即近乎归零——保守性已由'取平均日下沿'承担，口径写明供审核。年化夏普按隐含口径事前折算：（0.0002 − 事前来回成本）÷ 品种 H1 无条件波动 σ × √12 ≈ 0.46（σ 为品种性质，2026-10-28 预检工具实测约 0.10%）。"
+
+[declared]
+events_per_year = 12                # 每月最后一个交易日各一个定盘前事件
+gross_return_per_event = 0.0002     # 2bp：Krohn 等 (2024) 定盘策略夏普 0.65 的事件均收益折算（见 expected_effect）
+entry_hour_ny = 10                  # 伦敦 15:00（定盘前 1 小时窗起点）= 纽约 10:00（DST 同步）
+exit_hour_ny = 11                   # 伦敦 16:00 定盘 = 纽约 11:00；夏令时由 zoneinfo 处理（T66 london_fix_events）
+overnight_nights = 0.0              # 事件窗为日内 1 小时，不过夜
+expected_sharpe = 0.46              # （0.0002 − 事前成本）÷σ_H1×√12 的文献折算值（见 expected_effect）

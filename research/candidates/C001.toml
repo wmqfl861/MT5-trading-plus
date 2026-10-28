@@ -1,0 +1,32 @@
+# C001 月末效应（USTEC）——蓝图 v4 §6.6 首批候选之一（T68，2026-10-28 登记）。
+# 只写材料、不跑数据（附录 C）；预期效应全部文献折算（铁律 17）。
+id = "C001"
+title = "月末效应（USTEC）"
+mechanism_class = "flow_calendar"
+status = "screened_fail"            # 2026-10-28 bt candidate check 实测：fail（事前成本倍数 1.79 < 3，隔夜费主导）；预筛 json 与台账为凭
+symbols = ["USTEC"]
+holding = "D1"
+mechanism = "月末与月初的固定资金流：工资、养老金与 401(k) 缴款、指数基金申购与组合再平衡集中在月末最后交易日与下月前三个交易日入市（ McConnell & Xu 2008：该窗口承担了全月几乎全部的风险补偿）。送钱方：为月末现金流提供流动性的对手方与在窗口外减仓的机构。"
+
+[literature]
+original = ["McConnell & Xu (2008), Equity Returns at the Turn of the Month, Financial Analysts Journal 64(2): 49-64"]
+replications = [
+  "Vasileiou (2018), Is the turn of the month effect an 'abnormal normality'? Research in International Business and Finance 44: 153-175——1999 年加入欧元的 11 国股市长期确认 TOM（结论：非短命异象而是 'abnormal normality'，但构成 TOM 的交易日须随时间定期修订）",
+  "Mäkilä (2014), The Turn of the Month Effect in International Stock Markets, Aalto University 硕士论文——43 国指数检验支持 TOM（学位论文，证据等级低于期刊）",
+]
+rebuttals = [
+  "Han, Han & Tian (2025), The disappearing turn-of-month effect, Finance Research Letters 71: 106461——美股 TOM 在 2001 年后完全消失；Ogden (1990) 流动性解释近二十年不再成立；归因于 2001 年小数化后交易成本大降（套利者更容易反向交易、投资者不必把交易集中在月末），非单纯发表后衰减",
+  "Marquering, Nisser & Valla (2006), Disappearing anomalies: a dynamic analysis of the persistence of anomalies, Applied Financial Economics 16(4): 291-302——含 TOM 在内的日历异象在广为人知后减弱或消失（动态持续性分析）",
+  "Zakamulin (2026), Calendar anomalies: Real patterns or data-mining artifacts?, North American Journal of Economics and Finance 85: 102653——数据挖掘调整后，日历异象族（星期几、月内周几、月份、Sell-in-May；未单列 TOM 本身，按族近似）在 1990 年代初起的后期子样本里大幅消失",
+]
+search_log = "Web 检索（聚合引擎），2026-10-28：（1）turn-of-the-month effect equity post-publication decline replication/weakened/ETF era——命中 Vasileiou 2018（IDEAS 条目核对）、Mäkilä 2014、Han-Han-Tian 2025（IDEAS 条目核对：'disappears entirely after 2001' 摘要原文）、Zakamulin 2026（IDEAS 条目核对）、Marquering-Nisser-Valla 2006（IDEAS 条目核对：AFE 16(4) 291-302）；（2）cxoadvisory.com/calendar-effects/the-turn-of-the-month-effect 页面抓取 2026-10-28（Xu & McConnell 2006 工作稿口径摘要：1987-2005 市值加权 TOM 日均 0.14% vs 其余 16 日 -0.01%，等权 0.24% vs 0.04%，30/34 个非美市场存在）；（3）未找到：针对美股 2010 年后 ETF 时代 TOM 的独立大样本复现（最接近的证据是 Han et al 2025 的 2001 断点结论与 Zakamulin 2026 的族级结论）；McConnell & Xu 2008 原文数表不可及（付费），数值口径取自 CXO 摘要页，已如实标注。未从本项目任何数据取值（铁律 17）。"
+published_effect = "1926-2005 美股 TOM 窗口（最后交易日起至下月第三个交易日止，4 个交易日）：1987-2005 段市值加权日均超额收益 0.14%（窗口外 16 个交易日 -0.01%）；等权 0.24% vs 0.04%；窗口内波动不升高；非小盘/低价股独有（小盘在月末最后一日尤强）、不限于年末/季末；债券与国库券无对应现象（McConnell & Xu 2008；数值口径转引自 CXO Advisory 2006-07 摘要页，2026-10-28 抓取）。"
+expected_effect = "折算（全部文献折算，不取自本项目数据，铁律 17）：日均 0.14%（市值加权——USTEC 为大市值指数代理，取 VW 而非 EW 是保守选择）×（1-0.58）（McLean & Pontiff 2016：发表后收益平均衰减 58%）= 0.0588%/日 × 4 日窗口 = 0.235%/事件 ≈ 0.0024（相对价格）。年化夏普按隐含口径事前折算：（0.0024 − 事前来回成本）÷ 品种 D1 无条件波动 σ × √12 ≈ 0.28（σ 为品种性质，2026-10-28 预检工具实测约 1.34%）。反驳侧如实登记：Han-Han-Tian 2025 的结论是 2001 年后完全消失——若按该更强衰减折算预期≈0，本登记按任务口径（发表后 -58%）折算，两种口径都写明，由审核会话与用户权衡。"
+
+[declared]
+events_per_year = 12                # 每月一个 TOM 窗口
+gross_return_per_event = 0.0024     # 0.235%：0.14%/日 × 0.42 × 4 日（见 expected_effect）
+entry_hour_ny = 9                   # 末月最后交易日开盘（09:30 现金盘开市前后）成交
+exit_hour_ny = 16                   # 下月第 +3 日纽约 16:00 指数收盘前后成交（T81 口径注记）
+overnight_nights = 5.0              # 保守申报：窗口基础 3 夜 + 周五三倍日期望外按最坏补足（d-1/+1/+2 内含周五概率 3/5，3+2=5 为最坏情形；期望 4.2）
+expected_sharpe = 0.28              # （0.0024 − 事前成本）÷σ_D1×√12 的文献折算值（见 expected_effect）

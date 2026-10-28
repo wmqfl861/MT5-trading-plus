@@ -1,0 +1,27 @@
+# R1 研究轮次预注册【草案】（T68，2026-10-28）——批准点文件：
+# approved_by 留空 = 草案；装载器（rounds.load_round）拒绝空 approved_by，
+# 因此"批准前不开轮"由机器保证。用户批准时填入批准人并提交，才可
+# bt round open R1。
+#
+# 现状如实记录（2026-10-28 bt candidate check 实测）：
+# - C001 预筛 fail（事前成本倍数 1.79 < 3，USTEC 快照隔夜费主导；
+#   U0"账户是否 swap-free"确认后重检可能翻盘——见候选报告 §2.3）；
+# - C002 预筛 waiting_data（EURUSD 日内 4.44 年检验力 23%；外部日内源
+#   未批准——HistData 条款待核实、Dukascopy 不可达）。
+# 因此本草案的 candidates 是**拟议组成**：截至草案日无一候选 screened_pass，
+# R1 不满足开启前置条件（bt round open 会拒）。批准前若预筛结论更新
+# （重检翻案以台账最新为准，T62 口径），candidates 按届时事实增删并随
+# 批准一并定稿——本草案不预先列入未通过预筛的新候选。
+id = "R1"
+opened = "2026-10-28"
+candidates = ["C001", "C002"]        # 拟议组成（≤3，附录 D）；开启前置：全部 screened_pass
+trial_budget = 24                    # 2 候选 × 事件模式参数网格 ≤10 组（T66 建议）+ 少量迭代余量
+lockbox_uses_max = 1                 # D16 机器强制：每研究轮次最多 1 次 G5（总预算 3 次，H/P 线共用）
+dsr_trial_scope = "project"          # T64/D33：G4 试验计数按项目级（gates-v3 待批口径）
+advance_rule = "推进（本轮算过）= 候选的主检验通过且全部否决项通过：事件模式候选按 T66 事件收益均值单侧检验（年块自助、显著性按项目级 N 校正——D35 批准后的口径）；如走关卡 v3 标准路径则按方案甲（DSR 项目级 N ≥ 0.95）+ G0 与三稳健性否决（成本 ×1.5、延迟一根、多头相对买入持有超额——D34 批准后的口径）。任一候选判定'过'后，本轮不再为其挑选参数或开新变体（过了不再同轮挑选）；判定依据全部为轮次文件与关卡配置预写规则，不按结果临时调整。"
+close_rule = "结束条件（先到即止）：(a) 试验预算 24 次去重研究试验用尽；或 (b) 全部候选均有结论——通过者最多 1 次 G5（lockbox_uses_max）后关闭，未通过者登记结论关闭。关闭后 bt round close R1 生成轮次报告（含全部运行与按 advance_rule 的判定），本轮不能再运行。"
+approved_by = ""                     # 草案留空：交 H 线审核会话复核、用户批准后填写（批准点）
+
+[evaluation]
+C001 = { mode = "event", primary = "event_mean_return_one_sided" }
+C002 = { mode = "event", primary = "event_mean_return_one_sided" }

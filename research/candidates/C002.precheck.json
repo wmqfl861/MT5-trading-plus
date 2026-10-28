@@ -1,0 +1,93 @@
+{
+  "candidate_id": "C002",
+  "decision": "waiting_data",
+  "reasons": [
+    "检验力 23% < 50%（4.44 年、隐含夏普 0.46 < 声明 0.46——按较小者计，T80/G2：毛收益−成本按品种波动 σ 折算到不了声明的夏普）→ 待数据（铁律 18：检验力不足不开卡）",
+    "机制空缺：cross_asset 是组合里还没有的类别（蓝图 §6.2 条件 5）"
+  ],
+  "events_per_year": 12.0,
+  "checks": {
+    "literature": {
+      "passed": true,
+      "original_n": 1,
+      "replications_n": 2,
+      "rebuttals_n": 2,
+      "note": "复现与折算依据见 expected_effect"
+    },
+    "holding": {
+      "passed": true,
+      "holding": "H1",
+      "seconds": 3600,
+      "min": "H1",
+      "min_seconds": 3600
+    },
+    "ex_ante_cost": {
+      "passed": true,
+      "multiple": 3.154067823343643,
+      "min": 3.0,
+      "gross_return_per_event": 0.0002,
+      "binding_symbol": "EURUSD",
+      "per_symbol": {
+        "EURUSD": {
+          "reference_price": 1.16168,
+          "reference_timeframe": "H1",
+          "contract_size": 100000.0,
+          "spread_round_trip": 5.284183383623596e-05,
+          "spread_entry_frac": 5.284183383623596e-05,
+          "spread_exit_frac": 5.2841601136066094e-05,
+          "slippage_entry": 5.284183383623596e-06,
+          "slippage_exit": 5.284160113606609e-06,
+          "commission": 0.0,
+          "overnight": 0.0,
+          "round_trip_cost": 6.341017733346615e-05,
+          "multiple": 3.154067823343643
+        }
+      }
+    },
+    "power": {
+      "passed": false,
+      "power": 0.2343125211165082,
+      "min": 0.5,
+      "years": 4.436459046315309,
+      "expected_sharpe": 0.46,
+      "implied_sharpe": 0.4593951062586388,
+      "sharpe_used": 0.4593951062586388,
+      "implied_sharpe_by_symbol": {
+        "EURUSD": 0.4593951062586388
+      },
+      "sigma_by_symbol": {
+        "EURUSD": 0.0010299653149638264
+      },
+      "sigma_method": "无条件收益波动 σ：候选持仓周期 bar 的相邻收盘相对收益全体（随机时点抽样的总体极限，ddof=1）——品种性质，与候选信号无关、不取自本项目样本内（T80/G2）；隐含夏普 =（毛收益−事前来回成本）÷σ×√每年事件数，检验力取 min(声明, 隐含)",
+      "alpha": 0.05,
+      "n_tests": 1,
+      "years_detail": {
+        "EURUSD/H1": 4.436459046315309
+      },
+      "min_detectable_sharpe": 2.1442029778985106,
+      "coverage_segments": {
+        "EURUSD/H1": [
+          {
+            "source": "mt5",
+            "first": "2021-05-17T13:00:00",
+            "last": "2025-10-23T23:00:00",
+            "years": 4.436459046315309,
+            "counted": true
+          }
+        ]
+      },
+      "coverage_merged_years": {
+        "EURUSD/H1": 4.436459046315309
+      },
+      "coverage_merge_method": "计入段日历区间并集：相接/重叠的段合成连续跨度（min(first)..max(last)），不相接的分段各自计入——重叠不双计（T80/G3 审核修正：相加会把完全包含/部分重叠的覆盖虚增，如 fred/USTEC 39.8 年包住 mt5 4.3 年 → 合并 39.8 而非 44.1）"
+    },
+    "mechanism_gap": {
+      "blocking": false,
+      "note": "机制空缺：cross_asset 是组合里还没有的类别（蓝图 §6.2 条件 5）",
+      "mechanism_class": "cross_asset",
+      "active_mechanisms": []
+    }
+  },
+  "cost_model_version": "tick-spread-p90[rel@NY/bar_open_m1#10a66c54]+slip0.1-comm0-calibrated-swap-snapshot[95bd5691]-no-overshoot",
+  "checked_at_utc": "2026-10-28T00:40:45.590471+00:00"
+}
