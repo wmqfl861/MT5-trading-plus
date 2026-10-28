@@ -1390,8 +1390,9 @@ def test_merge_md_includes_r7_supplement_sections(tmp_path, monkeypatch):
 # ================================================ T65/D34：关卡 v3 对照臂
 
 def _v3_cfg(gc):
-    """v3 提案配置的小样本替身（窗口/自助次数缩到测试可跑；正式标定用
-    仓库 config/gates-v3.toml 原值）。"""
+    """v3 配置的小样本替身（窗口/自助次数缩到测试可跑；正式标定用仓库
+    config/gates.toml 原值——D34 冻结后即 v3 内容，原 gates-v3.toml 已
+    替换退役）。"""
     c, _ = gc.vgate.load_gates(suite="v3")
     return dataclasses.replace(c, train_months_hourly=12, test_months_hourly=3,
                                train_months_intraday=12,

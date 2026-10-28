@@ -68,10 +68,10 @@
 - G4（T21c 接线；T64/D33 取数口径）：n_trials 与试验夏普按
   (strategy, params, symbol, timeframe, data_sha256, cost_model_version,
   strategy_sha) 去重（_dedup_trial_sharpes，同参 screen+gate 只计 1），
-  取数范围按门槛键 [g4].dsr_trial_scope（family|project；现行 gates.toml
-  无此键 → 缺省 family，冻结语义逐位不变；project = 项目级研究口径
-  run_class=research，H 线与 P 线合并计算）；关卡结果与报告同时列
-  谱系/轮次/项目三种 N；蒙特卡洛回撤块长 = 一个交易日的 bar 数
+  取数范围按门槛键 [g4].dsr_trial_scope（family|project|rounds_lineage；
+  D34 冻结后 gates.toml 显式写 rounds_lineage = ledger.primary_test_n 的
+  门槛部分——T85 冻结 L1；family/project 语义不变）；关卡结果与报告
+  同时列谱系/轮次/项目三种 N；蒙特卡洛回撤块长 = 一个交易日的 bar 数
   （block_len）。
 - contract_size 只认 {data-root}/specs/latest.json（与 run_backtest 同规：
   缺则报错，绝不静默按 1 折算）。
@@ -738,32 +738,46 @@ def _dedup_trial_sharpes(ledger, card_id: str, bars_per_year: float, *,
     试验）；失败运行不计。
 
     scope（T64/D33，[g4].dsr_trial_scope）：
-    - "family"（缺省，**冻结语义逐位不变**）：谱系（cards.family_of）内
+    - "family"（函数缺省，**语义逐位不变**）：谱系（cards.family_of）内
       去重，run_class=migration 不计（与旧 actor=migration 过滤等价）；
       calibration 运行照现行语义计入；
     - "project"：项目级、只计 run_class=research（H 线与 P 线合并；
-      calibration/ops/migration 不计——标定与运维不是研究试验）。
+      calibration/ops/migration 不计——标定与运维不是研究试验）；
+    - "rounds_lineage"（T85 冻结 L1，D34 后 gates.toml 的冻结值）：
+      ledger.primary_test_n(continues_family) 的门槛部分——全项目已开启
+      轮次内的去重研究试验（跨轮跨谱系：run_class=research 且 round_id
+      非空）+ 被评估卡谱系的轮次外研究历史；轮次外其余历史/标定/迁移
+      不计。试验夏普（经验方差）按 T85 冻结只作诊断——v3 主检验接线
+      （T86）前，现行 G4 栈仍按此取数运行。
 
     返回 (去重后 N, 每根 bar 口径的试验夏普列表)；成功但无夏普的运行计入
     N、不进夏普列表（与 ledger.stats 的 n_dedup 同键口径）。
     """
-    if scope not in ("family", "project"):
+    if scope not in ("family", "project", "rounds_lineage"):
         raise ValueError(
-            f"scope 必须是 family|project（[g4].dsr_trial_scope，T64/D33），"
+            f"scope 必须是 family|project|rounds_lineage"
+            f"（[g4].dsr_trial_scope，T64/D33 + T85 冻结 L1），"
             f"收到 {scope!r}")
     family = cards.family_of(card_id)
     rows = ledger.conn.execute(
         "SELECT card_id, strategy, params_json, symbol, timeframe,"
         " data_sha256, strategy_sha, cost_model_version, actor, run_class,"
-        " metrics_json FROM runs").fetchall()
+        " round_id, metrics_json FROM runs").fetchall()
     by_key: dict[tuple, float | None] = {}
     for r in rows:
         rc = r["run_class"] or run_class_for_actor(r["actor"])
+        rid = r["round_id"]
         if scope == "family":
             if rc == "migration" or cards.family_of(r["card_id"]) != family:
                 continue
-        else:                                   # project：只计研究类
+        elif scope == "project":                # project：只计研究类
             if rc != "research":
+                continue
+        else:               # rounds_lineage（T85 冻结 L1）：门槛口径
+            if rc != "research":
+                continue
+            # 轮次内全项目计；轮次外只计被评估卡延续的谱系（lineage）
+            if not rid and cards.family_of(r["card_id"]) != family:
                 continue
         payload = json.loads(r["metrics_json"])
         if not payload.get("ok"):
@@ -2635,8 +2649,9 @@ def cmd_gate(args) -> int:
                 bpy = summary.get("annualization_bars_per_year") \
                     or bars_per_year(card.timeframe)
                 # T21c/M4 + T64/D33：N 与试验夏普按 [g4].dsr_trial_scope
-                # 取数（现行 gates.toml 无此键 → family，冻结语义逐位不变；
-                # project = 项目级研究口径 run_class=research）
+                # 取数（D34 冻结后 = rounds_lineage——ledger.primary_test_n
+                # 的门槛部分，T85 冻结 L1；family/project 语义不变。经验
+                # 方差按冻结只作诊断，v3 主检验接线在 T86）
                 scope = cfg.dsr_trial_scope
                 n_dedup, trial_sharpes = _dedup_trial_sharpes(
                     ledger, card.id, float(bpy), scope=scope)
@@ -2698,7 +2713,8 @@ def cmd_gate(args) -> int:
             report += (
                 "\n## G4 试验计数（T64/D33）\n\n"
                 f"- 取数口径 dsr_trial_scope = {g4.get('trial_scope')}"
-                "（[g4].dsr_trial_scope；缺省 family = 现行冻结语义）\n"
+                "（[g4].dsr_trial_scope；D34 冻结 = rounds_lineage"
+                "（T85/L1））\n"
                 f"- 谱系 N：{g4['n_trials_family']}"
                 "（谱系去重口径，现行语义）\n"
                 f"- 轮次 N：{n_round_s}\n"

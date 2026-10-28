@@ -1077,11 +1077,16 @@ def test_repo_candidate_registrations_specimen_and_withdrawn():
 def test_g4_trials_default_family_scope_bitwise_unchanged(tmp_path):
     """T64/D33 冻结失败测试：缺省（现行 gates.toml 无 dsr_trial_scope 键）
     family 口径的 N 与试验夏普与现行**逐位一致**——calibration 运行仍计入
-    谱系 N（现行语义），migration 行不计；家系外不计。"""
+    谱系 N（现行语义），migration 行不计；家系外不计。
+
+    D34 冻结语义变更（2026-10-29，如实更新）：gates.toml（v3）显式写
+    dsr_trial_scope = "rounds_lineage"（L1）——配置缺省不再是 family；
+    family 的取数语义本身不变（本测试主体逐位保留，见
+    test_g4_trials_rounds_lineage_scope_matches_primary_test_n）。"""
     import math as _math
 
     mod = load_bt()
-    assert mod.vgate.load_gates()[0].dsr_trial_scope == "family"
+    assert mod.vgate.load_gates()[0].dsr_trial_scope == "rounds_lineage"
     with Ledger(tmp_path / "l.sqlite") as led:
         common = dict(card_id="H700", card_version=1, strategy="s:SmaK",
                       symbol="XAUUSD", timeframe="H1", data_first="",
@@ -1137,6 +1142,57 @@ def test_g4_trials_project_scope_counts_project_research_only(tmp_path):
         assert len(sharpes) == 20
         with pytest.raises(ValueError, match="scope"):
             mod._dedup_trial_sharpes(led, "H701", 6_000.0, scope="global")
+
+
+def test_g4_trials_rounds_lineage_scope_matches_primary_test_n(tmp_path):
+    """T85 冻结（R14 §2 条件 1/L1）失败测试：D34 冻结（2026-10-29）后
+    [g4].dsr_trial_scope = "rounds_lineage"——bt 的 G4 取数按
+    ledger.primary_test_n 的门槛部分计数：全项目已开启轮次内的去重研究
+    试验（跨轮、跨谱系）+ 候选所延续谱系的轮次外研究历史；轮次外其余
+    谱系、标定与迁移行不计。"""
+    import math as _math
+
+    mod = load_bt()
+    assert mod.vgate.load_gates()[0].dsr_trial_scope == "rounds_lineage"
+    with Ledger(tmp_path / "l.sqlite") as led:
+        t = "mt5quant.strategies.library.buy_hold:BuyHold"
+        common = dict(card_version=1, strategy=t, symbol="XAUUSD",
+                      timeframe="H1", data_first="", data_last="",
+                      data_sha256="a" * 64, engine_version="A",
+                      cost_model_version="v", gates_hash="")
+        # 轮次内：H701 两条 + H702 一条（跨轮跨谱系，全项目计）
+        led.record_run(card_id="H701", params={"r": 1},
+                       metrics={"sharpe": 1.0}, actor="s", round_id="R1",
+                       **common)
+        led.record_run(card_id="H701", params={"r": 2},
+                       metrics={"sharpe": 2.0}, actor="s", round_id="R1",
+                       **common)
+        led.record_run(card_id="H702", params={"o": 1},
+                       metrics={"sharpe": 3.0}, actor="s", round_id="R2",
+                       **common)
+        # H701 轮次外历史（被评估卡 H701 所延续的谱系）
+        led.record_run(card_id="H701", params={"h": 1},
+                       metrics={"sharpe": 4.0}, actor="s", **common)
+        # 不计：轮次外其余谱系 / 标定 / 迁移
+        led.record_run(card_id="H999", params={"x": 1},
+                       metrics={"sharpe": 9.0}, actor="s", **common)
+        led.record_run(card_id="H701", params={"c": 1},
+                       metrics={"sharpe": 5.0}, actor="calibration",
+                       round_id="R1", **common)
+        led.record_run(card_id="H701", params={"m": 1},
+                       metrics={"sharpe": 6.0}, actor="migration",
+                       round_id="R1", **common)
+        n, sharpes = mod._dedup_trial_sharpes(led, "H701", 6_000.0,
+                                              scope="rounds_lineage")
+        assert n == 4          # 轮次内 3 + H701 谱系轮次外 1
+        assert sorted(sharpes) == sorted(
+            [s / _math.sqrt(6000.0) for s in (1.0, 2.0, 3.0, 4.0)])
+        assert n == led.primary_test_n("H701")["n"]   # 与台账口径一致
+        # 函数缺省仍是 family（T64 冻结语义：谱系内轮次内外全计、标定
+        # 计入、迁移不计）——H701 的 r1/r2/h1/c1 四键去重
+        n_def, _ = mod._dedup_trial_sharpes(led, "H701", 6_000.0)
+        assert n_def == 4
+
 
 
 @pytest.mark.parametrize("reserved", ["calibration", "ops", "migration"])
@@ -1221,7 +1277,12 @@ def test_screen_run_class_research_and_specimen_calibration(tmp_path,
 
 def test_gate_g4_reports_three_trial_counts(tmp_path, monkeypatch, capsys):
     """T64/D33 失败测试：G4 关卡结果同时列谱系/轮次/项目三种 N 与
-    dsr_trial_scope（现行 gates.toml 缺省 family）；报告 Markdown 同列。"""
+    dsr_trial_scope；报告 Markdown 同列。
+
+    D34 冻结语义变更（2026-10-29，如实更新）：gates.toml（v3）显式写
+    dsr_trial_scope = "rounds_lineage"（T85 冻结 L1）——trial_scope 记录
+    冻结口径（原"现行 gates.toml 缺省 family"）；谱系/轮次/项目三种 N
+    照列（可审计）。"""
     mod = load_bt()
     root = make_data_root(tmp_path)
     cards_dir = write_card(tmp_path)
@@ -1240,7 +1301,7 @@ def test_gate_g4_reports_three_trial_counts(tmp_path, monkeypatch, capsys):
             "SELECT details_json FROM gates WHERE gate='G4'").fetchone()
     assert row is not None
     details = json.loads(row["details_json"])
-    assert details["trial_scope"] == "family"
+    assert details["trial_scope"] == "rounds_lineage"   # D34 冻结口径
     assert details["n_trials_family"] >= 1
     assert details["n_trials_round"] is None          # 轮次制之前
     assert details["n_trials_project_research"] >= 1

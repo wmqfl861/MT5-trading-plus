@@ -24,21 +24,13 @@ from mt5data.store import TIMEFRAME_SECONDS
 from mt5quant.validation import stats as vstats
 
 DEFAULT_GATES_TOML = Path(__file__).resolve().parents[3] / "config" / "gates.toml"
-# 冻结指纹（2026-10-26，T21 第二次冻结：[g3] 改日历月窗口（H5）、
-# [g5] 改单侧判定（C3）；键名随蓝图 v3 附录 B 变更）
-FROZEN_GATES_SHA256 = "68f49237d1b56df62691ab8516804349fce245e1dc3cdb8896bf03716f594357"
-
-# ------------------------------------------------------- T65/D34：关卡 v3
-# gates-v3.toml 是**提案文件，不生效**：load_gates 只在显式 suite="v3" 时
-# 读它；缺省（suite="v2"）路径与 FROZEN_GATES_SHA256 的冻结校验逐位不变。
-# 批准后：gates-v3.toml 内容替换 gates.toml，同一提交更新
-# FROZEN_GATES_SHA256（与 FROZEN_GATES_V3_SHA256 合一），蓝图追加 D34。
-DEFAULT_GATES_V3_TOML = (Path(__file__).resolve().parents[3] / "config"
-                         / "gates-v3.toml")
-# 冻结指纹（2026-10-28，T65 提案冻结：[v3] 主检验两方案 + 三否决 +
-# [g4].dsr_trial_scope = "project"；T85 同日增补 [v3.event] 事件模式分支
-# ——D35 修改三条，冻结指纹随之更新）
-FROZEN_GATES_V3_SHA256 = "6fa560a0ce784739a6898d1b4215cba36e91dc3fae5ed21865227f45a14b572f"
+# 冻结指纹（2026-10-29，T85/D34 第三次冻结：v3——T65 提案 + T85 工作点
+# 补充标定按提案 §8 替换 gates.toml，v2/v3 双轨收束（load_gates 缺省即
+# v3 语义，gates-v3.toml 随替换退役）；R14 §2 四项冻结条件同一提交：
+# [v3].primary_test="dsr_v0"（L1，方案甲 V₀ 工作点）、[v3].n_min=2（L2）、
+# [g4].dsr_trial_scope="rounds_lineage"（L1）。冻结历史：2026-10-24 T12
+# 初值；2026-10-26 T21 第二次冻结（v2，68f49237…）。）
+FROZEN_GATES_SHA256 = "d0a8b2f3105366e4173adcf15fb6dc650a032e277425ca7277abdc92086bb17b"
 
 GATE_ORDER = ("G0", "G1", "G2", "G3", "G4", "G5")
 
@@ -115,15 +107,16 @@ class GatesConfig:
     lockbox_warn_percentile: float
     lockbox_min_trades_ratio: float
     lockbox_bootstrap_sims: int
-    # [g4] 可选（T64/D33）：G4 的 N 与试验夏普取数范围 family|project。
-    # 现行 config/gates.toml 无此键 → 缺省 family（冻结语义逐位不变）；
-    # gates-v3.toml（T65）写 project。只支持新键，不改现行文件。
+    # [g4] 可选（T64/D33）：G4 的 N 与试验夏普取数范围
+    # family|project|rounds_lineage。缺键 → 缺省 family（v2 形态文件的
+    # 冻结语义）；D34 冻结后的 config/gates.toml 显式写 rounds_lineage
+    # （T85 冻结 L1：N = ledger.primary_test_n 的门槛部分）。
     dsr_trial_scope: str = "family"
 
 
 @dataclass(frozen=True)
 class GatesV3EventConfig:
-    """关卡 v3 事件模式分支（config/gates-v3.toml 的 [v3.event]，T85 写入
+    """关卡 v3 事件模式分支（config/gates.toml 的 [v3.event]，T85 写入
     D35 修改三条——T86 接线生效）。bar 级 [v3] 节的 alpha / cost_scale_veto
     复用不另设（同一 α、同一 ×1.5），本节只放事件模式特有键。"""
 
@@ -145,14 +138,18 @@ class GatesV3EventConfig:
 
 @dataclass(frozen=True)
 class GatesV3Config(GatesConfig):
-    """关卡 v3 提案配置（config/gates-v3.toml，T65/D34——**不生效**，只在
-    load_gates(suite="v3") 时加载）。[g1]–[g5] 字段沿用 GatesConfig（[g1]
-    与 [g3].min_oos_ratio、[g4].mc_drawdown_* 在 v3 归诊断层；[g5] 不变；
-    [g3] 窗口是主检验的数据源），新增 [v3] 节四个主检验/否决键与
-    [v3.event] 事件模式分支（T85/D35）。"""
+    """关卡 v3 配置（config/gates.toml，T85/D34 冻结 2026-10-29——缺省
+    加载即 v3 语义，原 gates-v3.toml 已按提案 §8 替换退役）。[g1]–[g5]
+    字段沿用 GatesConfig（[g1] 与 [g3].min_oos_ratio、[g4].mc_drawdown_*
+    在 v3 归诊断层；[g5] 不变；[g3] 窗口是主检验的数据源），[v3] 节为
+    主检验/否决键（冻结值 primary_test="dsr_v0"、n_min=2）与
+    [v3.event] 事件模式分支（T85/D35，T86 接线）。"""
 
-    # [v3]（蓝图 v4 附录 B"关卡 v3 提案框架"）
-    primary_test: str = "dsr"        # 方案甲 dsr | 方案乙 year_block
+    # [v3]（蓝图 v4 附录 B"关卡 v3 提案框架"；T85/D34 冻结值）
+    primary_test: str = "dsr_v0"     # 方案甲 dsr_v0（冻结生效）| 对照锚点
+                                     # dsr | 方案乙 year_block
+    n_min: int = 2                   # L2（R14 §2）：主检验 N 下限——
+                                     # N_eff = max(N, n_min)；事件分支不受影响
     alpha: float = 0.05              # 方案乙名义单侧显著性（Bonferroni 前）
     bootstrap_sims: int = 1000       # 方案乙年块自助次数
     cost_scale_veto: float = 1.5     # 否决：成本 ×1.5 期望仍 > 0
@@ -183,19 +180,23 @@ _SCHEMA: dict[str, dict[str, type]] = {
            "lockbox_bootstrap_sims": int},
 }
 
-# 可选键及其缺省（T64/D33）：现行 gates.toml 不含 dsr_trial_scope——
-# 缺省 family 保持冻结语义（缺省口径结果与现行逐位一致）；显式给出时
-# 只接受 family|project。
+# 可选键及其缺省（T64/D33）：缺键 → 缺省 family（v2 形态文件的冻结
+# 语义，缺省口径结果逐位一致）；D34 冻结后的 gates.toml 显式写
+# rounds_lineage。合法值 family|project|rounds_lineage（第三值 T85
+# 冻结 L1：N = ledger.primary_test_n 的门槛部分，轮次内 + 延续谱系）。
 _OPTIONAL_DEFAULTS = {("g4", "dsr_trial_scope"): "family"}
-_TRIAL_SCOPES = ("family", "project")
+_TRIAL_SCOPES = ("family", "project", "rounds_lineage")
 
-# [v3] 节（T65/D34）：只在 suite="v3" 的解析路径出现；v2 的 _parse 把 v3
-# 当未知顶层键拒绝（现行 gates.toml 不含它）。
+# [v3] 节（T65/D34 冻结）：只在 suite="v3"（缺省）的解析路径出现；v2 的
+# _parse 把 v3 当未知顶层键拒绝（历史 v2 形态文件不含它）。
 _V3_SCHEMA: dict[str, dict[str, type]] = {
-    "v3": {"primary_test": str, "alpha": float, "bootstrap_sims": int,
-           "cost_scale_veto": float, "delay_bars": int,
+    "v3": {"primary_test": str, "n_min": int, "alpha": float,
+           "bootstrap_sims": int, "cost_scale_veto": float, "delay_bars": int,
            "buyhold_excess_veto": bool}}
-V3_PRIMARY_TESTS = ("dsr", "year_block")
+# T85 冻结（R14 §2 条件 1）：生效主检验 = 方案甲 V₀ 工作点 dsr_v0；
+# dsr 保留为经验方差对照锚点（标定臂 N=1 ↔ PSR(0) 语义），year_block
+# 为方案乙（备选，未选用）。
+V3_PRIMARY_TESTS = ("dsr", "dsr_v0", "year_block")
 
 # [v3.event]（T85/D35 修改）：事件模式分支——主检验=随机化参照 p ≤ α/N
 # （N 口径同 [v3] 主检验：project_n_dedup_rounds + lineage_n_dedup）、
@@ -259,8 +260,9 @@ def _parse(data: dict, source: str) -> GatesConfig:
             if key == "dsr_trial_scope" and v not in _TRIAL_SCOPES:
                 raise GatesConfigError(
                     f"{source}：[g4].dsr_trial_scope 只能是 "
-                    f"{list(_TRIAL_SCOPES)}，收到 {v!r}（T64/D33：G4 的 N 与"
-                    "试验夏普按谱系或项目（研究口径）取数）")
+                    f"{list(_TRIAL_SCOPES)}，收到 {v!r}（T64/D33 + T85 冻结"
+                    " L1：family=谱系 | project=项目 | rounds_lineage=轮次内"
+                    "+延续谱系，即 ledger.primary_test_n 的门槛部分）")
             # 各节键名全局唯一，直接作字段名（顶层 version 除外）
             by_field[key] = v
     return GatesConfig(**by_field)
@@ -298,7 +300,12 @@ def _parse_v3(data: dict, source: str) -> GatesV3Config:
     if v3["primary_test"] not in V3_PRIMARY_TESTS:
         raise GatesConfigError(
             f"{source}：[v3].primary_test 只能是 {list(V3_PRIMARY_TESTS)}"
-            f"（方案甲 DSR / 方案乙 年块自助），收到 {v3['primary_test']!r}")
+            f"（方案甲 V₀ 工作点 dsr_v0（冻结生效）/ 对照锚点 dsr / 方案乙"
+            f" 年块自助），收到 {v3['primary_test']!r}")
+    if int(v3["n_min"]) < 1:
+        raise GatesConfigError(
+            f"{source}：[v3].n_min 须 ≥1（L2/R14 §2：主检验 N 下限，"
+            f"冻结值 2），收到 {v3['n_min']!r}")
     if not 0.0 < v3["alpha"] < 1.0:
         raise GatesConfigError(
             f"{source}：[v3].alpha 必须在 (0,1) 开区间，收到 {v3['alpha']!r}")
@@ -374,28 +381,32 @@ def _parse_v3_event(raw_event, v3: dict, source: str) -> GatesV3EventConfig:
 
 
 def load_gates(path=None, *, frozen_sha: str | None = None,
-               suite: str = "v2") -> tuple[GatesConfig, str]:
+               suite: str = "v3") -> tuple[GatesConfig, str]:
     """加载并核对门槛文件；返回 (配置, 文件 sha256)。
 
-    frozen_sha 为注入点（测试用）；缺省与冻结值比对。suite（T65/D34）：
-    - "v2"（缺省）：config/gates.toml + FROZEN_GATES_SHA256——现行冻结
-      校验逐位不变；
-    - "v3"（提案，不生效）：config/gates-v3.toml + FROZEN_GATES_V3_SHA256，
-      返回 GatesV3Config。
+    frozen_sha 为注入点（测试用）；缺省与冻结值比对。suite：
+    - "v3"（缺省，D34 冻结 2026-10-29 后唯一现行口径）：config/gates.toml
+      （即原 gates-v3.toml 内容，v2/v3 双轨收束）+ FROZEN_GATES_SHA256，
+      返回 GatesV3Config；
+    - "v2"（冻结前的历史口径，仅测试注入 v2 形态文件用）：必须显式给
+      path——仓库缺省文件已是 v3，v2 解析对 [v3] 节按未知顶层键拒绝。
     """
     if suite == "v3":
-        p = DEFAULT_GATES_V3_TOML if path is None else Path(path)
-        default_sha = FROZEN_GATES_V3_SHA256
-    elif suite == "v2":
         p = DEFAULT_GATES_TOML if path is None else Path(path)
+        default_sha = FROZEN_GATES_SHA256
+    elif suite == "v2":
+        if path is None:
+            raise GatesConfigError(
+                'suite="v2" 需显式 path：D34 冻结（2026-10-29）后'
+                " config/gates.toml 即 v3 内容，缺省加载即 v3 语义")
+        p = Path(path)
         default_sha = FROZEN_GATES_SHA256
     else:
         raise GatesConfigError(
-            f"suite 只能是 v2|v3（v3 为 T65 提案路径），收到 {suite!r}")
+            f"suite 只能是 v2|v3（v3 为现行冻结口径），收到 {suite!r}")
     if not p.is_file():
         raise GatesConfigError(
-            f"门槛文件不存在：{p}（config/gates.toml 必须入库；v3 提案为 "
-            "config/gates-v3.toml，只在 suite=\"v3\" 时读取）")
+            f"门槛文件不存在：{p}（config/gates.toml 必须入库）")
     sha = gates_sha256(p)
     expected = default_sha if frozen_sha is None else frozen_sha
     if sha != expected:
@@ -516,13 +527,15 @@ def run_g4(returns, *, n_trials: int, trial_sharpes, actual_max_drawdown,
             "checks": checks, "seed": int(seed)}
 
 
-# ------------------------------------------------- 关卡 v3（T65/D34，提案）
+# ------------------------------------------------ 关卡 v3（T65/D34，冻结）
 # 蓝图 v4 附录 B"关卡 v3 提案框架"：数据卫生否决（G0）+ 一个主检验（否决）
 # + 稳健性否决（成本 ×1.5 / 延迟一根 / 多头相对买入持有超额为正）+ 其余
-# 诊断（只报告）+ G5 不变。主检验的两个备选（都要实现与标定）：
-# - 方案甲：walk-forward 拼接样本外收益的 PSR/DSR（N 取项目级
-#   [g4].dsr_trial_scope="project"）；
-# - 方案乙：同一 OOS 收益序列按年块自助的单侧 p 值（Bonferroni 按项目级 N）。
+# 诊断（只报告）+ G5 不变。T85 冻结（R14 §2 批准，2026-10-29）后按方案甲：
+# - 生效主检验 = 甲的 V₀ 工作点 dsr_v0：DSR(N, V₀) ≥ 0.95，V₀ = 1/(n−1)，
+#   N 取 rounds_lineage 口径（[g4].dsr_trial_scope = "rounds_lineage"：
+#   ledger.primary_test_n 的门槛部分 = project_n_dedup_rounds +
+#   lineage_n_dedup），N_eff = max(N, [v3].n_min=2)；
+# - 台账试验夏普的经验方差只进诊断；方案乙（year_block）保留为备选实现。
 
 def v3_primary_dsr(oos_returns, *, n_trials: int, trial_sharpes,
                    cfg: GatesV3Config) -> dict:
@@ -661,15 +674,36 @@ def v3_primary_year_block(oos_returns, *, n_trials: int,
     }
 
 
+def v3_n_eff(n_trials: int, cfg: GatesV3Config) -> int:
+    """主检验有效试验数 N_eff = max(N, [v3].n_min)（L2/R14 §2 条件 2）。
+
+    冻结值 n_min=2：N=1 不在标定网格（{2, 6, 24}）内，且 T85 §4.3 实测
+    PSR 家族在 N=1 的联合误报偏高（H4|slot 25%）——主检验按下限 2 取数。
+    事件模式分支不适用（随机化检验在 N=1 时也是精确的，
+    v3_event_draws_min 直接用 raw N）。"""
+    return max(int(n_trials), int(cfg.n_min))
+
+
 def run_primary_test(oos_returns, *, n_trials: int, cfg: GatesV3Config,
                      seed: int, trial_sharpes=None) -> dict:
-    """按 [v3].primary_test 分派主检验（批准后 bt 接线用；标定臂两方案
-    都算）。"""
+    """按 [v3].primary_test 分派主检验（T86 bt 接线的生产入口；标定臂
+    两方案都算，不经此函数）。
+
+    T85 冻结（R14 §2 条件 1）：生效主检验 = 方案甲 V₀ 工作点
+    （"dsr_v0" → v3_primary_dsr_null_variance，V₀=1/(n−1)）；台账试验
+    夏普的经验方差（trial_sharpes）只进诊断——dsr_v0 分派忽略它。
+    L2（条件 2）：分派层取 N_eff = max(n_trials, cfg.n_min)（[v3].n_min=2）
+    ——直调函数按传入 N 原样计算（对照锚点语义不变）；事件模式分支
+    不经此函数（随机化检验 N=1 也精确，不吃 n_min）。"""
+    n_eff = v3_n_eff(n_trials, cfg)
+    if cfg.primary_test == "dsr_v0":
+        return v3_primary_dsr_null_variance(oos_returns, n_trials=n_eff,
+                                            cfg=cfg)
     if cfg.primary_test == "dsr":
-        return v3_primary_dsr(oos_returns, n_trials=n_trials,
+        return v3_primary_dsr(oos_returns, n_trials=n_eff,
                               trial_sharpes=trial_sharpes, cfg=cfg)
     if cfg.primary_test == "year_block":
-        return v3_primary_year_block(oos_returns, n_trials=n_trials,
+        return v3_primary_year_block(oos_returns, n_trials=n_eff,
                                      cfg=cfg, seed=seed)
     raise GatesConfigError(
         f"[v3].primary_test 只能是 {list(V3_PRIMARY_TESTS)}，收到 "

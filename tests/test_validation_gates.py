@@ -79,7 +79,9 @@ def test_missing_gates_file_is_error(tmp_path):
 def test_unknown_key_rejected(tmp_path):
     p = tmp_path / "gates.toml"
     body = vg.DEFAULT_GATES_TOML.read_text(encoding="utf-8")
-    p.write_text(body.replace("[g1]", "stray_key = 1\n\n[g1]"),
+    # 只替换 [g1] 节头（D34 冻结后文件头注释含 "[g1]–[g5]" 字样）
+    assert "\n[g1]" in body
+    p.write_text(body.replace("\n[g1]", "\nstray_key = 1\n\n[g1]", 1),
                  encoding="utf-8")
     with pytest.raises(vg.GatesConfigError, match="未知"):
         vg.load_gates(p, frozen_sha=vg.gates_sha256(p))
@@ -993,93 +995,93 @@ def test_gate_cli_g5_orchestration_started_then_done(tmp_path, monkeypatch,
 
 # ================================================ T64/D33：dsr_trial_scope 键
 
-def test_g4_dsr_trial_scope_absent_defaults_family():
-    """T64/D33 失败测试：现行 gates.toml 无 dsr_trial_scope 键 → 缺省
-    family（冻结语义：G4 取数逐位不变），且文件未动（sha 仍为冻结值）。"""
-    cfg, sha = vg.load_gates()
-    assert cfg.dsr_trial_scope == "family"
-    assert sha == vg.FROZEN_GATES_SHA256
+def test_g4_dsr_trial_scope_absent_defaults_family(tmp_path):
+    """T64/D33：dsr_trial_scope 缺键 → 缺省 family（v2 形态文件的冻结
+    语义，缺省口径结果与现行逐位一致）。
 
-
-def test_g4_dsr_trial_scope_project_parses(tmp_path):
-    """[g4] 带 dsr_trial_scope = "project"（gates-v3 的形态）→ 可解析；
-    非法枚举值拒绝。"""
+    D34 冻结语义变更（2026-10-29，如实更新）：仓库 gates.toml 已是 v3，
+    显式写 dsr_trial_scope = "rounds_lineage"（L1，见
+    test_t85_freeze_l1）——缺省加载不再 family；本测试改对"缺键变体"
+    验证缺省值不变。"""
     body = vg.DEFAULT_GATES_TOML.read_text(encoding="utf-8")
-    p = tmp_path / "gates-v3.toml"
-    p.write_text(body.replace(
-        "dsr_min_probability = 0.95",
-        'dsr_trial_scope = "project"\ndsr_min_probability = 0.95'),
-        encoding="utf-8")
+    assert 'dsr_trial_scope = "rounds_lineage"' in body   # 冻结文件显式写出
+    p = tmp_path / "gates-noscope.toml"
+    p.write_text(body.replace('dsr_trial_scope = "rounds_lineage"',
+                              "# （缺键变体：dsr_trial_scope 缺省）"),
+                 encoding="utf-8")
     cfg, _ = vg.load_gates(p, frozen_sha=vg.gates_sha256(p))
-    assert cfg.dsr_trial_scope == "project"
-    assert cfg.dsr_min_probability == 0.95
-    # family 也合法（显式写出的缺省值）
-    p2 = tmp_path / "gates-family.toml"
-    p2.write_text(body.replace(
-        "dsr_min_probability = 0.95",
-        'dsr_trial_scope = "family"\ndsr_min_probability = 0.95'),
-        encoding="utf-8")
-    assert vg.load_gates(p2, frozen_sha=vg.gates_sha256(p2))[0] \
-        .dsr_trial_scope == "family"
+    assert cfg.dsr_trial_scope == "family"          # 缺键缺省（T64 语义）
+
+
+def test_g4_dsr_trial_scope_scopes_parse(tmp_path):
+    """[g4].dsr_trial_scope 三个合法枚举（family | project |
+    rounds_lineage）都可解析；非法枚举拒绝（D34 冻结值 = rounds_lineage）。"""
+    body = vg.DEFAULT_GATES_TOML.read_text(encoding="utf-8")
+
+    def variant(val: str, name: str) -> Path:
+        p = tmp_path / name
+        p.write_text(body.replace('dsr_trial_scope = "rounds_lineage"',
+                                  f'dsr_trial_scope = "{val}"'),
+                     encoding="utf-8")
+        return p
+
+    for val, name in (("family", "gates-family.toml"),
+                      ("project", "gates-project.toml"),
+                      ("rounds_lineage", "gates-rounds.toml")):
+        p = variant(val, name)
+        cfg, _ = vg.load_gates(p, frozen_sha=vg.gates_sha256(p))
+        assert cfg.dsr_trial_scope == val
+        assert cfg.dsr_min_probability == 0.95
     # 枚举外拒绝
-    p3 = tmp_path / "gates-bad.toml"
-    p3.write_text(body.replace(
-        "dsr_min_probability = 0.95",
-        'dsr_trial_scope = "global"\ndsr_min_probability = 0.95'),
-        encoding="utf-8")
+    p3 = variant("global", "gates-bad.toml")
     with pytest.raises(vg.GatesConfigError, match="dsr_trial_scope"):
         vg.load_gates(p3, frozen_sha=vg.gates_sha256(p3))
 
 
 # ================================================ T65/D34：关卡 v3（suite="v3"）
 
-def test_v3_path_leaves_frozen_v2_bit_for_bit(tmp_path):
-    """T65 失败测试 1：v3 路径不影响现行 gates.toml 冻结校验。
-
-    - v2 缺省加载（文件、sha、类型、解析）逐位不变，gates.toml 仍是
-      FROZEN_GATES_SHA256 的冻结对象；
-    - gates-v3.toml 只在显式 suite="v3" 时读，有自己的冻结 sha；
-    - v3 加载前后 v2 结果一致（不留任何状态）；两份文件被篡改各自在
-      自己的 suite 里拒。
+def test_d34_freeze_collapses_dual_track_single_fingerprint(tmp_path):
+    """原 T65 失败测试 1"v3 路径不影响现行 gates.toml 冻结校验"（原名
+    test_v3_path_leaves_frozen_v2_bit_for_bit）——D34 冻结（2026-10-29，
+    R14 §2 批准）后前提反转，如实更名与更新为收束守护：
+    gates-v3.toml 内容已替换 gates.toml，单一冻结对象与指纹——
+    - 缺省与显式 suite="v3" 加载同一文件、同一 sha（FROZEN_GATES_SHA256，
+      原 FROZEN_GATES_V3_SHA256 合一移除）；
+    - suite="v2" 是冻结前历史口径：仓库文件缺省路径上拒绝（须显式 path
+      注入 v2 形态文件）；
+    - 篡改拒绝照常（单文件单指纹）。
     """
-    cfg, sha = vg.load_gates()                        # v2 缺省
+    cfg, sha = vg.load_gates()                        # 缺省 = v3 语义
     assert vg.DEFAULT_GATES_TOML.name == "gates.toml"
     assert sha == vg.FROZEN_GATES_SHA256
-    assert type(cfg) is vg.GatesConfig and cfg.version == 2
-    assert cfg.dsr_trial_scope == "family"            # 现行文件无此键 → 缺省
-    v3cfg, v3sha = vg.load_gates(suite="v3")
-    assert vg.DEFAULT_GATES_V3_TOML.name == "gates-v3.toml"
-    assert v3sha == vg.FROZEN_GATES_V3_SHA256 == vg.gates_sha256(
-        vg.DEFAULT_GATES_V3_TOML)
-    assert v3sha != sha                               # 两个独立冻结对象
-    assert isinstance(v3cfg, vg.GatesV3Config) and v3cfg.version == 3
-    assert v3cfg.dsr_trial_scope == "project"         # 蓝图附录 B：N 项目级
-    assert v3cfg.primary_test in ("dsr", "year_block")
-    assert vg.load_gates() == (cfg, sha)              # v3 不留状态
-    assert vg.load_gates(suite="v2")[1] == sha        # 显式 v2 同缺省
-    # 篡改各自拒绝（v3 的损坏不污染 v2 的守护，反之亦然）
+    assert type(cfg) is vg.GatesV3Config and cfg.version == 3
+    explicit, explicit_sha = vg.load_gates(suite="v3")
+    assert explicit_sha == sha and explicit == cfg    # 缺省=显式 v3，不留状态
+    assert not hasattr(vg, "FROZEN_GATES_V3_SHA256")  # 指纹合一（收束）
+    assert not hasattr(vg, "DEFAULT_GATES_V3_TOML")
+    # suite="v2" 只保留给显式 path 的历史（v2 形态）文件
+    with pytest.raises(vg.GatesConfigError, match="v2"):
+        vg.load_gates(suite="v2")
+    # 篡改拒绝（冻结对象 = 替换后的 gates.toml）
     bad = tmp_path / "gates.toml"
     bad.write_bytes(vg.DEFAULT_GATES_TOML.read_bytes() + b"\n# x\n")
     with pytest.raises(vg.GatesConfigError, match="sha256"):
         vg.load_gates(bad)
-    bad3 = tmp_path / "gates-v3.toml"
-    bad3.write_bytes(vg.DEFAULT_GATES_V3_TOML.read_bytes() + b"\n# x\n")
-    with pytest.raises(vg.GatesConfigError, match="sha256"):
-        vg.load_gates(bad3, suite="v3")
-    assert vg.load_gates()[1] == sha                  # v2 守护原样
+    assert vg.load_gates()[1] == sha                  # 守护原样
 
 
 def test_v3_toml_schema_validation(tmp_path):
-    """gates-v3.toml 的 [v3] 节与 version 校验：非法枚举/范围/类型/未知键
-    拒绝；v2 路径读到 [v3] 节按未知顶层键拒绝（v3 键不进 v2 语义）。"""
-    body = vg.DEFAULT_GATES_V3_TOML.read_text(encoding="utf-8")
+    """gates.toml（D34 冻结后即 v3 内容）的 [v3] 节与 version 校验：非法
+    枚举/范围/类型/未知键拒绝；v2 解析路径读到 [v3] 节按未知顶层键拒绝
+    （v3 键不进 v2 语义——suite="v2" 显式注入）。"""
+    body = vg.DEFAULT_GATES_TOML.read_text(encoding="utf-8")
 
     def variant(*repl: tuple[str, str]) -> Path:
         t = body
         for old, new in repl:
             assert old in t, old
             t = t.replace(old, new)
-        p = tmp_path / "gates-v3.toml"
+        p = tmp_path / "gates.toml"
         p.write_text(t, encoding="utf-8")
         return p
 
@@ -1087,21 +1089,25 @@ def test_v3_toml_schema_validation(tmp_path):
         return vg.load_gates(p, frozen_sha=vg.gates_sha256(p), suite="v3")
 
     with pytest.raises(vg.GatesConfigError, match="primary_test"):
-        load(variant(('primary_test = "dsr"', 'primary_test = "crystal"')))
+        load(variant(('primary_test = "dsr_v0"',
+                      'primary_test = "crystal"')))
+    with pytest.raises(vg.GatesConfigError, match="n_min"):
+        load(variant(("n_min = 2", "n_min = 0")))     # L2：下限键 ≥1
     with pytest.raises(vg.GatesConfigError, match="alpha"):
         load(variant(("alpha = 0.05", "alpha = 1.5")))
     with pytest.raises(vg.GatesConfigError, match="bootstrap_sims"):
         load(variant(("bootstrap_sims = 1000", "bootstrap_sims = 1")))
     with pytest.raises(vg.GatesConfigError, match="未知"):
-        load(variant(("[g1]", "stray = 1\n\n[g1]")))
+        load(variant(("\n[g1]", "\nstray = 1\n\n[g1]")))
     with pytest.raises(vg.GatesConfigError, match="未知"):
         load(variant(("cost_scale_veto = 1.5", "cost_scale_veto = 1.5\n"
                                              "oracle = true")))
     with pytest.raises(vg.GatesConfigError, match="version"):
         load(variant(("version = 3", "version = 2")))
-    # v2 路径读 v3 文件（带 [v3] 节）→ 未知顶层键 v3 拒绝
+    # v2 解析路径读 v3 文件（带 [v3] 节）→ 未知顶层键 v3 拒绝
     with pytest.raises(vg.GatesConfigError, match="v3"):
-        vg.load_gates(variant())
+        vg.load_gates(variant(), frozen_sha=vg.gates_sha256(variant()),
+                      suite="v2")
 
 
 def test_v3_diagnostic_failures_do_not_change_verdict():
@@ -1161,7 +1167,8 @@ def test_v3_primary_tests_dsr_and_year_block():
                                 cfg=cfg)
     assert a_good["passed"] is True and a_good["probability"] >= 0.95
     assert a_noise["passed"] is False and a_noise["probability"] < 0.95
-    assert a_noise["trial_scope"] == "project" and a_noise["test"] == "dsr"
+    assert a_noise["trial_scope"] == "rounds_lineage" \
+        and a_noise["test"] == "dsr"   # D34 冻结口径（原 project，如实更新）
     # OOS 无方差（常数）→ fail-closed 概率 0
     flat = vg.v3_primary_dsr(pd.Series([0.0] * 50), n_trials=1,
                              trial_sharpes=None, cfg=cfg)
@@ -1194,21 +1201,26 @@ def test_v3_primary_tests_dsr_and_year_block():
 
 
 def test_v3_run_primary_test_dispatch():
-    """run_primary_test 按 [v3].primary_test 分派；未知值（不可达，schema
-    已挡）fail-closed。"""
+    """run_primary_test 按 [v3].primary_test 分派（D34 冻结后 = "dsr_v0"，
+    原为 "dsr"——如实更新）；year_block 仍可显式配置分派；未知值（不可达，
+    schema 已挡）fail-closed。N_eff 下限见 test_t85_freeze_l2。"""
     cfg = vg.load_gates(suite="v3")[0]
     rng = np.random.default_rng(3)
     rets = pd.Series(0.001 + rng.normal(0.0, 0.001, 4000),
                      index=pd.DatetimeIndex(
                          pd.date_range("2016-01-01", periods=4000,
                                        freq="6h")))
-    via_dsr = vg.run_primary_test(rets, n_trials=1, cfg=cfg, seed=5)
-    assert via_dsr["test"] == "dsr"
+    via = vg.run_primary_test(rets, n_trials=3, cfg=cfg, seed=5)
+    assert via["test"] == "dsr_v0"
+    assert via == vg.v3_primary_dsr_null_variance(rets, n_trials=3, cfg=cfg)
     cfg_b = dataclasses.replace(cfg, primary_test="year_block")
-    via_yb = vg.run_primary_test(rets, n_trials=1, cfg=cfg_b, seed=5)
+    via_yb = vg.run_primary_test(rets, n_trials=3, cfg=cfg_b, seed=5)
     assert via_yb["test"] == "year_block"
-    direct = vg.v3_primary_year_block(rets, n_trials=1, cfg=cfg_b, seed=5)
+    direct = vg.v3_primary_year_block(rets, n_trials=3, cfg=cfg_b, seed=5)
     assert via_yb["p_value"] == direct["p_value"]
+    cfg_bad = dataclasses.replace(cfg, primary_test="crystal")
+    with pytest.raises(vg.GatesConfigError, match="primary_test"):
+        vg.run_primary_test(rets, n_trials=3, cfg=cfg_bad, seed=5)
 
 
 def _det_returns(n=6000, per_bar_sr=0.0285, std=0.004, seed=17):
@@ -1281,13 +1293,15 @@ def test_v3_primary_psr_bonferroni():
 
 
 def test_v3_event_branch_config():
-    """T85/§4.2：事件模式分支写进 gates-v3.toml（D35 修改三条全落地）——
+    """T85/§4.2：事件模式分支写进门槛文件（D35 修改三条全落地）——
     主检验=随机化参照 p ≤ α/N、随机化次数下限 max(1999, ⌈20N/α⌉)、
     否决=成本 ×1.5 净均值 > 0、不适用买入持有超额与延迟一根、四项诊断；
-    [v3] 原键语义逐位不变；冻结指纹同步更新。"""
+    [v3] 原键语义逐位不变；D34 冻结：primary_test="dsr_v0"、n_min=2，
+    冻结指纹合一（FROZEN_GATES_SHA256）。"""
     cfg, sha = vg.load_gates(suite="v3")
-    assert sha == vg.FROZEN_GATES_V3_SHA256
-    assert cfg.primary_test == "dsr" and cfg.alpha == pytest.approx(0.05)
+    assert sha == vg.FROZEN_GATES_SHA256
+    assert cfg.primary_test == "dsr_v0" and cfg.n_min == 2
+    assert cfg.alpha == pytest.approx(0.05)
     assert cfg.cost_scale_veto == pytest.approx(1.5)
     assert cfg.delay_bars == 1 and cfg.buyhold_excess_veto is True
     ev = cfg.event
@@ -1307,16 +1321,144 @@ def test_v3_event_branch_config():
 
 def test_v3_event_branch_schema_rejects(tmp_path):
     """[v3.event] 未知键 / 非法 primary_test / 非法诊断名 → 拒绝加载。"""
-    raw = (Path(vg.DEFAULT_GATES_V3_TOML).read_text(encoding="utf-8")
+    raw = (Path(vg.DEFAULT_GATES_TOML).read_text(encoding="utf-8")
            + '\nunknown_event_key = 1\n')
     p = tmp_path / "gates-v3-bad.toml"
     p.write_text(raw, encoding="utf-8")
     with pytest.raises(vg.GatesConfigError, match="v3.event"):
         vg.load_gates(p, frozen_sha=vg.gates_sha256(p), suite="v3")
-    bad_test = (Path(vg.DEFAULT_GATES_V3_TOML).read_text(encoding="utf-8")
+    bad_test = (Path(vg.DEFAULT_GATES_TOML).read_text(encoding="utf-8")
                 .replace('primary_test = "randomization"',
                          'primary_test = "year_block"'))
     p2 = tmp_path / "gates-v3-bad2.toml"
     p2.write_text(bad_test, encoding="utf-8")
     with pytest.raises(vg.GatesConfigError, match="randomization"):
         vg.load_gates(p2, frozen_sha=vg.gates_sha256(p2), suite="v3")
+
+
+# ================================ T85 冻结（R14 §2 四项条件，2026-10-29）
+# 第十四轮审核 §2：批准关卡 v3 冻结（方案甲），冻结提交同一提交满足四项
+# 条件并配失败测试（每条件至少一个先红）。台账替身沿用
+# test_research_ledger.py 的 record 口径（七元组去重）。
+
+def _freeze_ledger_record(led, run_n=1, *, card_id="H401", symbol="XAUUSD",
+                          created_utc=None, round_id=None, actor="test"):
+    return led.record_run(
+        card_id=card_id, card_version=1,
+        strategy="mt5quant.strategies.library.buy_hold:BuyHold",
+        params={"run": run_n}, symbol=symbol, timeframe="H1",
+        data_first="2024-01-01T00:00:00", data_last="2026-06-30T23:00:00",
+        data_sha256="deadbeef" * 8, engine_version="A-1.1",
+        cost_model_version="zero-v0", gates_hash="",
+        metrics={"net_profit": 123.4, "trade_count": 1},
+        actor=actor, created_utc=created_utc, round_id=round_id)
+
+
+def _freeze_ledger(tmp_path):
+    """台账替身：轮次内两谱系各 2 次研究试验 + H401 轮次外历史 3 次
+    （延续谱系）→ primary_test_n("H401") 门槛 N = 4 + 3 = 7。"""
+    led = Ledger(tmp_path / "freeze-l.sqlite")
+    t = PAST
+    for fam, sym in (("H401", "XAUUSD"), ("H402", "EURUSD")):
+        for i in (1, 2):
+            _freeze_ledger_record(led, run_n=i, card_id=fam, symbol=sym,
+                                  created_utc=t, round_id="R1")
+    for i in (10, 11, 12):
+        _freeze_ledger_record(led, run_n=i, card_id="H401", created_utc=t)
+    return led
+
+
+def test_t85_freeze_l1_primary_dsr_v0_rounds_lineage(tmp_path):
+    """R14 §2 条件 1（失败测试先行）：冻结配置的主检验与 N 口径真正指向
+    方案甲 V₀ 工作点与新 N 口径——
+    - [v3] primary_test = "dsr_v0"（V3_PRIMARY_TESTS 含该值），
+      run_primary_test 分派到 v3_primary_dsr_null_variance；
+    - [g4] dsr_trial_scope = "rounds_lineage"：N 取
+      ledger.primary_test_n(continues_family) 的门槛部分；
+    - 台账经验方差（trial_sharpes）只进诊断：传入不改变主检验结果；
+    - 按冻结配置走 run_primary_test 与 v3_primary_dsr_null_variance 直调
+      逐位相同（dict 全等）。"""
+    cfg = vg.load_gates(suite="v3")[0]
+    assert "dsr_v0" in vg.V3_PRIMARY_TESTS
+    assert cfg.primary_test == "dsr_v0"
+    assert cfg.dsr_trial_scope == "rounds_lineage"
+    led = _freeze_ledger(tmp_path)
+    n_info = led.primary_test_n("H401")
+    led.close()
+    assert n_info["project_n_dedup_rounds"] == 4
+    assert n_info["lineage_n_dedup"] == 3
+    assert n_info["n"] == 7                     # 门槛 N = 轮次内 + 延续谱系
+    rets = _det_returns()
+    via = vg.run_primary_test(rets, n_trials=n_info["n"], seed=5, cfg=cfg,
+                              trial_sharpes=[0.9, 0.7, 1.3, 0.2])  # 经验方差
+    direct = vg.v3_primary_dsr_null_variance(rets, n_trials=n_info["n"],
+                                             cfg=cfg)
+    assert via == direct                        # 逐位相同（经验方差不进）
+    assert via["test"] == "dsr_v0"
+    assert via["n_trials"] == n_info["n"]       # N 取自 primary_test_n
+    assert via["trial_scope"] == "rounds_lineage"
+    assert via["v0"] == pytest.approx(1.0 / (len(rets) - 1))   # V₀ 口径
+
+
+def test_t85_freeze_l2_n_min_floor():
+    """R14 §2 条件 2（失败测试先行）：L2——[v3] n_min = 2，主检验
+    N_eff = max(N, n_min)（N=1 → N_eff=2）；事件模式分支不受影响
+    （随机化检验在 N=1 时也是精确的，n_min 不进随机化次数下限）。"""
+    cfg = vg.load_gates(suite="v3")[0]
+    assert cfg.n_min == 2
+    assert vg.v3_n_eff(1, cfg) == 2             # N=1 → N_eff=2
+    assert vg.v3_n_eff(2, cfg) == 2
+    assert vg.v3_n_eff(7, cfg) == 7             # N ≥ n_min 原样
+    rets = _det_returns()
+    via = vg.run_primary_test(rets, n_trials=1, seed=5, cfg=cfg)
+    assert via["n_trials"] == 2                 # 下限生效
+    assert via == vg.v3_primary_dsr_null_variance(rets, n_trials=2, cfg=cfg)
+    # 事件分支不受 n_min 影响：随机化次数下限按 raw N 计算（N=1 → 1999）
+    assert vg.v3_event_draws_min(1, cfg) == 1999
+    assert vg.v3_event_draws_min(6, cfg) == 2400
+    assert cfg.event.primary_test == "randomization"
+
+
+def test_t85_freeze_c3_t65_report_superseded_annotation():
+    """R14 §2 条件 3（失败测试先行）：T65 报告开头注明其数字按 T83 之前
+    的成本口径计算、已被 T85 工作点补充标定取代。"""
+    doc = (REPO_ROOT / "docs" / "research"
+           / "gates-v3-proposal-2026-10-28.md").read_text(encoding="utf-8")
+    head = doc[:doc.index("## 0.")]             # 结论摘要之前的开头
+    assert "T83" in head and "取代" in head
+    assert "gates-v3-operating-point-2026-10-28" in head
+
+
+def test_t85_freeze_c4_gates_toml_replaced_single_fingerprint(tmp_path):
+    """R14 §2 条件 4（失败测试先行，提案 §8）：gates-v3.toml 内容替换
+    gates.toml，冻结指纹合一，v2/v3 双轨收束——
+    - 缺省加载即 v3 语义（GatesV3Config、version=3、primary_test="dsr_v0"）；
+    - FROZEN_GATES_SHA256 = 替换后 gates.toml 的 sha（与 v3 指纹合一）；
+    - gates-v3.toml 随替换退役（不再存在第二来源）；
+    - 篡改拒绝照常。"""
+    cfg, sha = vg.load_gates()                  # 缺省 = v3 语义（收束）
+    assert type(cfg) is vg.GatesV3Config
+    assert cfg.version == 3
+    assert cfg.primary_test == "dsr_v0" and cfg.n_min == 2
+    assert cfg.dsr_trial_scope == "rounds_lineage"
+    assert sha == vg.FROZEN_GATES_SHA256 == vg.gates_sha256(
+        vg.DEFAULT_GATES_TOML)
+    assert not (REPO_ROOT / "config" / "gates-v3.toml").exists()
+    bad = tmp_path / "gates.toml"
+    bad.write_bytes(vg.DEFAULT_GATES_TOML.read_bytes() + b"\n# x\n")
+    with pytest.raises(vg.GatesConfigError, match="sha256"):
+        vg.load_gates(bad)
+
+
+def test_t85_freeze_c4_blueprint_d34_sync():
+    """R14 §2 条件 4（失败测试先行）：蓝图附录 B 与 D34 记录同步——
+    附录 B 的现行表换为 v3 冻结（方案甲 dsr_v0、rounds_lineage、n_min=2、
+    新冻结指纹）；D34 决策记录注明冻结已执行、"冻结后按方案甲"。"""
+    bp = (REPO_ROOT / "docs" / "blueprint.md").read_text(encoding="utf-8")
+    assert "冻结后按方案甲" in bp                       # D34 决策记录
+    appendix_b = bp[bp.index("## 附录 B"):bp.index("## 附录 C")]
+    assert "冻结后按方案甲" in appendix_b               # 现行表 = v3
+    assert "dsr_v0" in appendix_b
+    assert "rounds_lineage" in appendix_b
+    assert "n_min = 2" in appendix_b
+    assert vg.FROZEN_GATES_SHA256[:8] in appendix_b     # 新冻结指纹入册
