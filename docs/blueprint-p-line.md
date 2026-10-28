@@ -11,6 +11,7 @@ v1 → v1.1 的变化（依据 `docs/reviews/2026-10-28-review-pline-01.md`、`-
 - §7 首批候选先只用 XAUUSD（D53）；
 - 新增 §8 双会话分工与批准归属（D54）；
 - 附录 A 假设格式改为代码实际使用的 `S1:A3:fade>base`，并补充轮次文件的 P 线字段。
+- 审核三补充（`docs/reviews/2026-10-28-review-pline-03.md`）：§8 补两条推送规则；附录 A 写明 P2 决策卡的字段。
 
 ## 1. 定位
 
@@ -269,7 +270,8 @@ P 线的概率表本来就要从数据里估计。同一段数据如果既用来
 
 推送规则：
 
-- 推送前先同步：P 线会话 `git fetch origin && git rebase origin/main`，H 线会话 `git pull --rebase origin main`；然后全量回归。
+- 推送前先同步：P 线会话 `git fetch origin && git rebase origin/main`，H 线会话 `git pull --rebase origin main`；**同步之后**重跑全量回归，再推送（同步之前跑的不算）。
+- 修改共用接口（函数签名、策略协议、成本模型的方法等）的一方，负责同步所有调用点，包括对方会话的测试夹具，并在提交说明里写明。这是可以改对方文件的唯一情形。
 - P 线会话用 `git push origin pline/dev:main` 推送，只含本分支的提交；被拒就重新同步，不得强推。
 - 只 `git add` 本会话改过的文件，不用 `git add -A` 或 `git add .`。
 - 推送后确认 GitHub Actions 为绿，再勾复选框。证据写提交号加 GitHub tests 工作流的 run_number（或 run id），以 GitHub API 的值为准。
@@ -333,6 +335,11 @@ stop = "sl_atr×ATR（信号 bar 的 ATR）"
 delta_p = "<折算后的预期 Δp 与依据（文献或发现段），不得取自验证段>"
 triggers_per_year = "<只数触发次数得到，不看结果>"
 ```
+
+P2 的决策卡用同一模板，区别是（审核三 D1）：
+- `evaluation_mode = "standard"`、`segment = "validation"`，`primary_statistic` 按 T65 批准的关卡 v3 主检验填写；
+- `[prob]` 写决策配置（局面、动作、止损止盈、网格、接近参数、特征、收缩、门槛），必须与策略类常量逐项一致；
+- 训练窗只用分界之前的数据，评估只在 [split, cutoff) 内。
 
 P 线轮次文件在蓝图 v4 附录 D 的基础上增加三点（T73A 实现）：`lockbox_uses_max` 允许为 0；新增 `[segments]` 表；新增 `[hypotheses]` 表。`[evaluation]` 是附录 D 已有的表，这里示范 P 线的写法。
 
