@@ -337,12 +337,12 @@ def n_needed_proportion(p0: float, dp: float, *, alpha: float = 0.05, power: flo
   5. 机制空缺：`price_levels` 是新类别。
 - **计数不看结果**：计数工具只输出触发时刻、小时、品种，不调用标签与引擎。用静态检查证明它不 import `mt5quant.prob.labels`。
 - **分界日期**：`bt segment propose --symbols ... --timeframe H1` 取研究库（含外部数据）中这些品种共同覆盖期的中点，取整到月初，结果确定。
-- [ ] 失败测试先行（T76 主体已实现，等 CI 绿后附号勾选）：
-  - 检验力函数复现表中数值；
-  - 预期 Δp 不够覆盖成本 → fail；触发数不足 → `waiting_data`；
-  - 同样的输入，分界日期相同；
-  - 计数输出不含结果列；计数模块不 import 标签模块。
-- [x] **实现摘要（待下方测试行附 CI 绿灯号后视为完成）**：
+- [x] 失败测试先行（CI 绿灯 3a772db，run#86 success，全量 2012 passed, 1 skipped）：
+  - 检验力函数复现表中数值（`test_n_needed_reproduces_blueprint_table` 九格参数化 + `test_review_examples`）；
+  - 预期 Δp 不够覆盖成本 → fail（`test_precheck_prob_cost_fail`）；触发数不足 → `waiting_data`（`test_precheck_prob_insufficient_triggers_waiting`）；
+  - 同样的输入，分界日期相同（`test_propose_split_deterministic_and_month_floored`）；
+  - 计数输出不含结果列（`test_count_output_has_no_result_columns` 同义用例 `test_count_output_has_no_outcome_columns`）；计数模块不 import 标签模块（AST 静态检查 `test_count_module_does_not_import_labels`）。
+- [x] **实现摘要**：
   - `power.py` 新增 `power_proportion_one_sided`/`n_needed_proportion`（正态近似，z 取位与模块夏普口径同约定；蓝图 §3.4 九格全复现，含 6306 边界格 raw=6305.909）——tests/test_prob_power.py 10 例；
   - `mt5quant/prob/counting.py`：`count_triggers`（局面→事件→动作触发，输出 time/ny_hour/symbol/situation/action/side/level/kind/atr/close，无任何结局列）+ `triggers_before`（发现段子集）；AST 静态检查不 import `prob.labels`——tests/test_prob_counting.py 5 例；
   - `candidates.py`：`MECHANISM_CLASSES` 增 `price_levels`；`[prob]` 段装载校验（ProbDeclared：situations/hypotheses≤4/bracket/level_grid 全品种/approach/breakout_atr/retest_window_bars/expected_delta_p∈(0,0.5)；price_levels 研究候选必带 [prob] 且不带 [declared]）；`precheck_prob` 五条件（成本口径 ΔEV_R=Δp×(tp_R+1) ≥ 3×触发小时均值成本(R)；检验力按假设（局面×动作，跨品种/方向合并）发现段最小触发数 vs 解析样本量，**t75_rule_pending=True——T75 实测样本量规则批准后取两者更严，届时接线**）；`propose_split`（各品种计入段并集→共同覆盖最长段中点→取整月初）；
