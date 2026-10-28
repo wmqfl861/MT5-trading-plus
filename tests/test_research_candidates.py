@@ -289,7 +289,7 @@ def test_repo_research_candidates_declare_window_bars():
     16:00 收盘）、样本内观察如实登记、screened_fail 理由改按目标市场
     发表后证据（Han, Han & Tian 2025：效应 2001 年后消失）。"""
     c1 = load_candidate(REPO_ROOT / "research" / "candidates" / "C001.toml")
-    assert c1.status == "screened_fail"
+    assert c1.status == "withdrawn"
     assert c1.declared.window_bars == 4
     assert c1.observed_in_sample.strip()
     raw = (REPO_ROOT / "research" / "candidates" / "C001.toml").read_text(
