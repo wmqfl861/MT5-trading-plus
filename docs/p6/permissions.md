@@ -131,9 +131,16 @@ main 分支保护的 required status check（设置步骤见下"分支保护"清
 
 - `A research/cards/*.toml`——**仅新增**卡文件（git 状态 A）；已提交的卡
   不得修改/删除（M/D/R 拒）；
+- `A research/candidates/*.toml` 与 `A research/candidates/*.precheck.json`
+  ——**仅新增**候选登记与预筛产物（T69；precheck.json 由
+  `bt candidate check` 工具生成，重跑预筛覆盖已有文件的更新走管理员）；
 - `src/mt5quant/strategies/library/**`——策略库；
 - `tests/test_strategies_*.py`——策略测试；
 - `docs/research/**`——研究文档。
+
+`research/rounds/*.toml`（轮次预注册，T69）**不在此列**——只允许管理员写
+（轮次文件含试验预算与锁箱用量，须经用户批准，铁律 16"先定规则再开卡"）；
+研究/审查角色提交它 = 越权预注册，本地钩子与 CI 检查同样拒绝。
 
 明确在拒绝之列（M12 漏项补齐）：成本模型 `src/mt5quant/costs/`、
 `src/mt5quant/research/`（台账与锁箱预算）、`src/mt5data/`（锁箱加载器）、
@@ -233,6 +240,38 @@ GitHub 仓库设置里开启分支保护（管理员在网页上操作）：
       本清单旁注明实际做法；
 - [ ] 设完后用一条违规 PR（如 `research/test-hook` 分支改
       `scripts/bt.py`）验证：`research-allowlist` 检查应为红。
+
+## 9a. 管理员路径：管理员与审核会话的文档如何进入 main（R12-G7）
+
+research-allowlist 检查对**所有 PR 头分支**强制（R8/I4 收口），而管理员与
+审核会话的常规产出——`docs/p6/*` 规则维护、`docs/reviews/*` 审核报告、
+蓝图/README、钩子与工作流自身——都在研究角色白名单**之外**；不写清入库
+路径，这些 PR 会常年红灯（G7 的由来）。路径只有两条，均以"谁能触发"为界：
+
+1. **直推 main（现状，无需任何配置）**：管理员/主会话直接 `git push origin
+   main`——research-allowlist 只挂 `pull_request` 事件，直推不经 PR，检查
+   天然不触发；本地钩子对 `MT5QUANT_COMMIT_ROLE=admin` 全放行。这也是
+   本仓库当前的唯一不受白名单约束的入库路径。**现状：分支保护未开启**
+   （用户操作 U0，见 §9 清单；蓝图 §2 开放清单已标注"ACL 与分支保护未
+   落地（用户）"），直推可用；审核会话（H 线/P 线批准点）的报告交由
+   管理员按此路径入库。
+2. **PR + 经用户批准的标签豁免（分支保护开启后的可选做法，需用户选定）**：
+   §9 开启 "Require a pull request before merging" 后，管理员直推同样被
+   拦。两个可选口径：
+   - **管理员直推豁免**：分支规则不勾 "Do not allow bypassing the above
+     settings"（或把管理员角色列入例外）——管理员继续直推 main，其余
+     一律经 PR。代价：引擎/门槛类改动也可能绕过 PR 记录，靠试验台账
+     （哈希链）与 git 历史事后审计兜底；
+   - **标签豁免**：所有改动一律经 PR；research-allowlist 工作流增加
+     job 级 `if:` 判断标签（如 `admin-docs`，仅仓库 write/admin 角色
+     可打）跳过路径检查。**这要改工作流自身**（信任边界相关），改动
+     须经用户批准并交审核会话复核后方可生效；标签权限必须限定为研究/
+     审查账户不具备的角色。
+
+   两条口径都要保证：豁免只对**管理员发起**的 PR 生效，研究/审查账户
+   打不了标签、开不了分支规则（GitHub 侧角色权限）；`bt` 侧的轮次/
+   预算/锁箱机器强制与本地钩子对 admin 不设限是设计（admin = 用户授权
+   的主会话），越权面由分支保护 + 事后审计收口。
 
 ## 10. 备份与回滚
 

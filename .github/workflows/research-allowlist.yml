@@ -94,10 +94,16 @@ jobs:
                     " whitelist (or disallowed statuses):")
               for v in violations:
                   print("  - " + v)
-              print("Allowed: new cards research/cards/*.toml (status A only),"
-                    " src/mt5quant/strategies/library/**, tests/test_strategies_*.py,"
-                    " docs/research/** (A/M only). Engine/gates/risk/config/scripts/"
-                    "hook/CI are read-only for the research role - open an issue or"
+              print("Allowed: new cards research/cards/*.toml and new"
+                    " candidate registrations research/candidates/*.toml"
+                    " / *.precheck.json (status A only),"
+                    " src/mt5quant/strategies/library/**,"
+                    " tests/test_strategies_*.py, docs/research/**"
+                    " (A/M only). Round files research/rounds/*.toml"
+                    " are admin-only (trial budget & lockbox use need"
+                    " user approval, iron rule 16)."
+                    " Engine/gates/risk/config/scripts/hook/CI are"
+                    " read-only for the research role - open an issue or"
                     " ask the main session instead.")
               sys.exit(1)
           print("OK research-allowlist: all changes within the research whitelist")

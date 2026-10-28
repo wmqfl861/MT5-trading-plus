@@ -502,6 +502,46 @@ def test_research_allowlist_workflow_loads_checker_from_main_baseline(tmp_path):
     assert not any("H012" in v for v in viol), "新增卡仍放行"
 
 
+# ---------------- T69 审核修正：P3（CI 提示串）与 G7（管理员路径） ----------------
+
+
+def test_research_allowlist_hint_lists_candidates_and_rounds():
+    """T69/P3：research-allowlist.yml 的英文提示串（Allowed: 列表）与
+    钩子白名单同步——含候选 toml/precheck.json（状态 A）与轮次文件
+    管理员专属说明（只改文案，check_paths 执行路径不动）。"""
+    text = ALLOWLIST_YML.read_text(encoding="utf-8")
+    assert "Allowed:" in text, "缺 Allowed: 提示串"
+    for kw in ("research/cards/*.toml", "research/candidates/*.toml",
+               "*.precheck.json", "research/rounds/*.toml",
+               "admin-only"):
+        assert kw in text, f"Allowed 提示串缺：{kw}"
+
+
+def test_permissions_doc_admin_path_section_g7():
+    """R12-G7（T69）：permissions.md 写明管理员与审核会话的文档如何进入
+    main——直推 main 或经用户批准的标签豁免；写明现状（分支保护未开 =
+    用户操作 U0，开放清单已标）。"""
+    text = PERMISSIONS.read_text(encoding="utf-8")
+    assert "管理员路径" in text, "permissions.md 缺'管理员路径'一节（G7）"
+    assert "直推 main" in text, "G7：缺管理员直推 main 路径说明"
+    assert "标签豁免" in text, "G7：缺 PR 标签豁免路径说明"
+    assert "分支保护" in text, "G7：缺分支保护现状说明"
+    assert "U0" in text, "G7：分支保护未开应标注为用户操作（U0）"
+
+
+def test_permissions_doc_whitelist_includes_candidates_rounds():
+    """T69：permissions.md §5 的白名单清单与钩子同步——候选登记/
+    precheck.json（仅状态 A）在列，research/rounds/*.toml 标注管理员
+    专属（不作为研究角色白名单项）。"""
+    text = PERMISSIONS.read_text(encoding="utf-8")
+    assert "research/candidates/*.toml" in text, \
+        "permissions.md 白名单清单缺候选登记（T69）"
+    assert "*.precheck.json" in text, \
+        "permissions.md 白名单清单缺预筛产物（T69）"
+    assert "research/rounds" in text and "管理员" in text, \
+        "permissions.md 应写明 research/rounds/*.toml 管理员专属（T69）"
+
+
 # ---------------- R8-I1（T46）：head_ref 不得内插进 shell 文本 ----------------
 
 # P15 复现的注入分支名：git check-ref-format --branch 认可的合法名字，
