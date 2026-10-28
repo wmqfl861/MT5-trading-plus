@@ -33,7 +33,7 @@ class FlatCosts:
     def commission_per_lot(self, s):
         return 0.0
 
-    def overnight_fee(self, s, side, f, t):
+    def overnight_fee(self, s, side, f, t, *, price=None):
         return 0.0
 
 
