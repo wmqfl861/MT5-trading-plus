@@ -702,3 +702,17 @@ def test_research_rules_new_version_requires_candidate_registration():
     # 新路径：候选登记 + 预筛 + 轮次，引用蓝图 v4 §6.2
     for kw in ("候选登记", "轮次", "蓝图 v4 §6.2"):
         assert kw in text, f"研究规则缺新版本路径条款：{kw}"
+
+
+# ---------------- T84（R13/K3）：真实事件时间的统计量只在轮次内算 ----------------
+
+
+def test_research_rules_event_statistics_only_inside_opened_rounds():
+    """T84/K3：标定与演示只用随机化时刻或植入效应；候选机制在真实事件
+    时间上的统计量只能在已开启轮次内计算（R13 K3——T66 在 R1 预注册
+    之前看了月末真实数据，USTEC/BTCUSD 月末类候选的研究段检验已不是
+    盲检）。"""
+    text = RESEARCH_RULES.read_text(encoding="utf-8")
+    for kw in ("随机化时刻", "植入效应", "真实事件时间",
+               "只能在已开启轮次内计算"):
+        assert kw in text, f"研究规则缺 K3 条款关键词：{kw}"

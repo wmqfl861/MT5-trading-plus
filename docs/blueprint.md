@@ -366,6 +366,8 @@ status = "registered"               # registered | screened_pass | screened_fail
 symbols = ["USTEC"]
 holding = "D1"
 mechanism = "<谁在给你送钱>"
+# observed_in_sample = "<来源>"     # 可选（T84/K3）：候选机制在本项目样本内被看过时
+                                     # 如实登记来源（如 "T66 §3.2"）——盲检失效要让后续轮次可见
 
 [literature]
 original = ["McConnell & Xu (2008), FAJ 64(2)"]
@@ -374,9 +376,20 @@ rebuttals = []                       # 反驳文献；没找到也要写检索�
 search_log = "<检索词、数据库、日期>"
 published_effect = "<原文效应>"
 expected_effect = "<折算后效应与依据；不得取自本项目数据的样本内结果>"
+
+[declared]                           # 研究候选必填（预筛计算输入；specimen/withdrawn 簿记不带）
+events_per_year = 12                 # 每年事件数（事件模式）或交易数
+gross_return_per_event = 0.0024      # 每事件/每笔折算后预期毛收益（相对价格）
+window_bars = 4                      # 事件窗持仓 bar 数（T84/K4 必填）——σ 按此窗长取
+                                     # （单根 bar 口径少算 √h）；日内周期再按 entry_hour_ny
+                                     # 取同一时段起点（时段异方差；与 T66 σ_w 同一函数）
+entry_hour_ny = 16                   # 入场成交的纽约本地小时
+exit_hour_ny = 16                    # 出场成交的纽约本地小时
+overnight_nights = 6.0               # 每笔/每事件预期计费夜数（0=不过夜；保守申报）
+expected_sharpe = 0.28               # 折算后预期年化夏普（检验力用）
 ```
 
-预筛结果不手填：`bt candidate check C###` 计算事前成本倍数、每年事件或交易数、研究年数（按研究库实际覆盖）、单次检验力与结论（pass / fail / waiting_data），写入 `research/candidates/C###.precheck.json` 并记入台账（带哈希链）。
+预筛结果不手填：`bt candidate check C###` 计算事前成本倍数、每年事件或交易数、研究年数（按研究库实际覆盖）、单次检验力与结论（pass / fail / waiting_data），写入 `research/candidates/C###.precheck.json` 并记入台账（带哈希链）。预筛按单次检验判定（§6.2 条件 4）；`bt round open` 另按本轮候选数 N 复核每个候选的 α/N 检验力，写进开轮输出与轮次报告骨架（只报告，T84）。
 
 ## 附录 D：研究轮次预注册模板（`research/rounds/R#.toml`）
 

@@ -494,6 +494,89 @@ def test_window_volatility_matches_hand_computed():
         float(np.std(closes[1:] / closes[:-1] - 1.0, ddof=1)))
 
 
+def test_required_events_bonferroni_n_tests():
+    """T84（D35 修改 4）失败测试：样本量规则按 α/N——z 走 z_{α/N}
+    （_z_alpha 同一 Bonferroni 约定）；与第十三轮探针 B 节对照：
+    每事件 SR=0.2、检验力 50% 时 N=1/2/6/24 → 70/98/147/210 个事件。"""
+    sigma, effect = 0.01, 0.002              # SR = 0.2
+    assert ev.required_events(effect, sigma, power=0.5) == 70
+    assert ev.required_events(effect, sigma, power=0.5, n_tests=1) == 70
+    assert ev.required_events(effect, sigma, power=0.5, n_tests=2) == 98
+    assert ev.required_events(effect, sigma, power=0.5, n_tests=6) == 147
+    assert ev.required_events(effect, sigma, power=0.5, n_tests=24) == 210
+    # N 越大所需事件越多（单调）
+    assert ev.required_events(effect, sigma, power=0.5, n_tests=3) \
+        > ev.required_events(effect, sigma, power=0.5, n_tests=2)
+    # 非法 N（0、布尔、非整数）→ ValueError（fail-closed）
+    for bad in (0, -1, True, 2.0):
+        with pytest.raises(ValueError):
+            ev.required_events(effect, sigma, n_tests=bad)
+
+
+def test_window_volatility_4day_iid_about_double_single_day():
+    """T84/K4 失败测试 1：σ 按事件窗长度取——独立同分布合成数据上
+    4 日窗的 σ ≈ 单日 σ 的 2 倍（σ_h = σ_1·√h；单根 bar 口径少算 √h、
+    隐含夏普多算 √h——K4 的 C001 反例）。"""
+    rng = np.random.default_rng(20261028)
+    n = 4000
+    closes = 100.0 * np.cumprod(1.0 + rng.normal(0.0, 0.01, n))
+    days = pd.date_range("2015-01-01", periods=n, freq="D")
+    bars = daily_bars(days, closes)
+    s1 = ev.window_volatility(bars, hold_bars=1)
+    s4 = ev.window_volatility(bars, hold_bars=4)
+    assert s4 == pytest.approx(2.0 * s1, rel=0.1), \
+        f"4 日窗 σ {s4:.4f} 应 ≈ 2×单日 σ（{2.0 * s1:.4f}）"
+    assert ev.window_volatility(bars, hold_bars=9) \
+        == pytest.approx(3.0 * s1, rel=0.1)
+
+
+def test_window_volatility_entry_hour_fixes_time_of_day():
+    """T84/K4 失败测试 2：日内按 entry_hour_ny 取同一时段起点——
+    窗口起点 = 锚 bar 的**收盘时刻**（入场成交时点），只取纽约本地小时
+    等于 entry_hour_ny 的锚；合成的时段异方差数据上（纽约 10→11 点窗
+    波动 3 倍于其余小时），定盘前一时段的 σ 高于全天平均。
+
+    冬令时段（EST=UTC-5，2021-01 起六周内无 DST 切换）：纽约 10:00
+    = 15:00 UTC → 锚 bar = 14:00 UTC（收盘 15:00）、窗长 1 根 H1 的
+    窗口收益 = 15:00→16:00 UTC。
+    """
+    rng = np.random.default_rng(20261028)
+    days = synthetic_trading_days("2021-01-04", 40)
+    n = len(days) * 24
+    vols = np.full(n, 0.0004)
+    times = pd.DatetimeIndex(
+        [d + pd.Timedelta(hours=h) for d in days for h in range(24)])
+    # 15:00→16:00 UTC（纽约 10→11 点）的 bar 收益波动放大 3 倍：
+    # 单 bar 收益 r_i = closes[i]/closes[i-1]-1 覆盖 (t_[i-1]+1h, t_i+1h]，
+    # 15:00 UTC 收盘的锚配上窗长 1 恰好取到 r_{i(15点)}
+    vols[np.asarray([t.hour for t in times]) == 15] = 0.0012
+    rets = rng.normal(0.0, 1.0, n) * vols
+    closes = 1.10 * np.cumprod(1.0 + rets)
+    opens = np.concatenate(([1.10], closes[:-1]))
+    bars = pd.DataFrame({
+        "time": times, "open": opens,
+        "high": np.maximum(opens, closes) * 1.0002,
+        "low": np.minimum(opens, closes) * 0.9998, "close": closes,
+        "tick_volume": 1, "spread": 0, "real_volume": 0})
+    all_day = ev.window_volatility(bars, hold_bars=1)
+    fix_hour = ev.window_volatility(bars, hold_bars=1, entry_hour_ny=10)
+    assert fix_hour == pytest.approx(0.0012, rel=0.25), \
+        f"定盘前一小时（纽约 10 点窗）σ 应 ≈ 0.0012，得到 {fix_hour:.5f}"
+    assert fix_hour > 1.5 * all_day, \
+        f"定盘时段 σ {fix_hour:.5f} 应显著高于全天平均 {all_day:.5f}"
+    # 全天平均不传时段 → 与逐 bar 全体一致（缺省行为不变）
+    rets_all = closes[1:] / closes[:-1] - 1.0
+    assert all_day == pytest.approx(float(np.std(rets_all, ddof=1)))
+    # 非法时段/窗口数不足 → ValueError（fail-closed，σ 无定义）
+    with pytest.raises(ValueError):
+        ev.window_volatility(bars, hold_bars=1, entry_hour_ny=24)
+    with pytest.raises(ValueError):
+        ev.window_volatility(bars, hold_bars=1, entry_hour_ny=True)
+    few = bars.iloc[:24]                     # 一天只有一个 10 点窗
+    with pytest.raises(ValueError):
+        ev.window_volatility(few, hold_bars=1, entry_hour_ny=10)
+
+
 def test_plant_event_effect_shifts_window_return():
     """植入：出场端 ×(1+δ) → 事件毛收益近似 +δ、非事件窗不受影响。"""
     days = synthetic_trading_days("2020-01-01", 90)

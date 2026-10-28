@@ -480,9 +480,25 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
     bar 价 × contract；早年价格不再被按快照时代绝对额放大——T65 实测 1986
     段 6 笔后权益爆掉的根因），cost_version 追加 relref[ref_price sha 前 8
     位]（哈希运行时规则实际持有的 ref_price，与计费同源单点——台账可区分
-    新旧口径）；货币模式（2/3/4）费率是绝对金额语义，一律保留绝对。未给
-    swap_ref_price 时点数模式保持旧绝对口径（预筛/关卡/对账装配路径的现状，
-    引擎 CLI 主路径之外不在本函数强行改动）。
+    新旧口径）；货币模式（2/3/4）费率是绝对金额语义，一律保留绝对。
+
+    T83（R13-K5，2026-10-27）：bt screen/gate/prob/fit 与候选预筛
+    （_merged_costs）、gate_calibration（assemble_experiment 与事件臂）调
+    本函数时同样传 swap_ref_price（各自装载的研究库序列最后收盘，与 CLI
+    主路径同一约定）。**对账路径（reconcile_ab / reconcile_mt5_tester）
+    有意保持绝对口径**（不传本参数）：对账的对照物是 MT5 策略测试器/实盘
+    成交，测试器按快照点数换算的绝对额计费——对账必须与被对照物同口径，
+    否则残差里混进口径差、不再是执行差；这是刻意保留，不是遗漏（守护测试
+    test_t83_swap_basis 钉住对账脚本不得出现 swap_ref_price）。
+
+    account_kind（T83/R13-K6）：calibrated.json 顶层的账户类型（demo|real，
+    scripts/calibrate_costs.py 从网关账户 trade_mode 写入）。**隔夜费实测
+    只认 real 账户**——demo（与缺失 account_kind 的旧文件，校准工具历史
+    上只连模拟盘）的实测费率/免隔夜费判定不进任何研究成本，回落快照推算，
+    cost_version 注明 "demo-measured-not-adopted"（demo 实测未采用——只
+    落 calibration.md 报告作信息；模拟盘的免隔夜费状态不能代表实盘，研究
+    侧免隔夜费口径走 config/account-profile.toml 的用户确认条目）。佣金
+    实测不受此限（点差/佣金与账户类型无关）。
     """
     from mt5quant.costs import (
         CommissionModel, Costs, SlippageModel, SpreadModel, SwapModel,
@@ -541,8 +557,14 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
         comm_tag = f"comm{commission_per_lot:g}-cli"
 
     # ---- 隔夜费：calibrated 实测费率 > 快照推算 > 报错/显式零 ----
+    # T83/R13-K6：隔夜费实测只认 real 账户（account_kind）。demo/缺失（旧
+    # 文件——校准工具历史上只连模拟盘）的实测费率与 free_of_swap 判定一律
+    # 不采用，回落快照推算——模拟盘的免隔夜费状态不能代表实盘（Exness 的
+    # 免隔夜费按居住国/交易行为授予且可降级）；demo 实测只落 calibration.md
+    # 报告。佣金实测不受限（与账户类型无关）。
     swap = None
     swap_tag = "swap?"
+    account_kind = (calibrated or {}).get("account_kind")
     cal_sw = cal_sym.get("swap") if cal_sym else None
     cal_rate = None
     if cal_sw:
@@ -551,6 +573,12 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
         if lng_r is not None or sht_r is not None:
             cal_rate = (lng_r if lng_r is not None else 0.0,
                         sht_r if sht_r is not None else 0.0)
+    demo_measured_skipped = (
+        cal_sw is not None and account_kind != "real"
+        and (cal_rate is not None
+             or cal_sw.get("free_of_swap") is True))
+    if account_kind != "real":
+        cal_rate = None          # 非 real 的实测费率不作数（回落快照）
     if cal_rate is not None:
         # T20：三倍日一律取快照 swap_rollover3days——校准费率是"每夜"口径，
         # 回测按同一规则（含 ×3）复算才与实测对上（探针 P3 的修复）。
@@ -570,7 +598,10 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
             **_swap_relative_kwargs(symbol, swap_mode, snap_entry,
                                     swap_ref_price))})
         swap_tag = f"swap-cal(tri{triple_py})"
-    elif cal_sw and cal_sw.get("free_of_swap") is True:
+    elif (cal_sw and cal_sw.get("free_of_swap") is True
+          and account_kind == "real"):
+        # T83/K6：free_of_swap=true 属合法实测零费——但仅 real 账户作数
+        # （demo 的免隔夜费状态不代表实盘，见上注）。
         swap = SwapModel(per_symbol={symbol: SwapRule(
             long_per_day=0.0, short_per_day=0.0)})
         swap_tag = "swap0-calibrated(free)"
@@ -623,6 +654,9 @@ def build_costs(data_root: str, symbol: str, spread_fraction: float,
                                            for d in _rule.triple_weekdays)},
     })[:8]
     swap_tag = f"{swap_tag}[{swap_digest8}]"
+    # T83/K6：跳过了非 real 账户的实测隔夜费 → 版本串注明（demo 实测未采用）
+    if demo_measured_skipped:
+        swap_tag += "-demo-measured-not-adopted"
     # T82：相对价格基准身份——哈希**运行时规则实际持有的 ref_price**（与计费
     # 同源单点取值，不从 bars/缓存另取一遍）；绝对口径规则无此标记。
     if _rule.ref_price is not None:

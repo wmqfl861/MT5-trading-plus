@@ -21,11 +21,15 @@ precheck 对其短路为 fail（理由写明），不进入预筛数值条件。
    ext/ 白名单 fred/cdd，逐段列来源），不用常数）上算单次检验
    （mt5quant.research.power，与 round11 探针逐位一致）；夏普取**声明
    与隐含中较小者**（T80/G2：隐含夏普 =（声明每事件毛收益 − 事前来回
-   成本）÷ 品种在持仓长度上的无条件收益波动 σ × √每年事件数；σ 由工具
-   从研究库算——随机时点抽样的总体极限 = 持仓周期 bar 的相邻收盘相对
-   收益全体，品种性质、与候选信号无关）；σ=0 或序列不可用 → 隐含记
-   None、按声明夏普计；不足 → waiting_data（铁律 18"待数据"队列），
-   不是 fail；
+   成本）÷ 品种在事件窗长度上的无条件收益波动 σ × √每年事件数；σ 由
+   工具从研究库算——按候选声明的 window_bars 根持仓周期 bar 取同长度
+   滚动窗口收益（T84/K4：单根 bar 口径少算 √h），日内周期再按
+   entry_hour_ny 取同一时段起点，与 T66 的 σ_w 共用一个函数
+   （validation.events.window_volatility）；随机时点抽样的总体极限 =
+   品种性质、与候选信号无关）；σ=0 或序列不可用 → 隐含记 None、按
+   声明夏普计；不足 → waiting_data（铁律 18"待数据"队列），不是 fail；
+   预筛仍按单次检验判定（蓝图 §6.2 条件 4），α/N 只用于事件模式样本
+   量规则与 bt round open 的开轮复核（T84）；
 5. 机制空缺：组合里已有同类别活跃谱系 → **排后**（排序类理由，不阻塞
    ——决定只有 pass/fail/waiting_data 三值，本条件作为理由记录）。
 
@@ -77,12 +81,13 @@ _POWER_N_TESTS = 1              # 铁律 18：单次检验
 
 _ID_PATTERN = re.compile(r"^C\d{3,}$")
 _TOP_KEYS = ("id", "title", "mechanism_class", "status", "symbols",
-             "holding", "mechanism", "source_card", "notes")
+             "holding", "mechanism", "source_card", "notes",
+             "observed_in_sample")
 _LIT_KEYS = ("original", "replications", "rebuttals", "search_log",
              "published_effect", "expected_effect")
 _DECLARED_KEYS = ("events_per_year", "gross_return_per_event",
-                  "entry_hour_ny", "exit_hour_ny", "overnight_nights",
-                  "expected_sharpe")
+                  "window_bars", "entry_hour_ny", "exit_hour_ny",
+                  "overnight_nights", "expected_sharpe")
 
 _DAYS_PER_YEAR = 365.25
 
@@ -113,6 +118,7 @@ class Declared:
     """
     events_per_year: float          # 每年事件数（事件模式）或交易数
     gross_return_per_event: float   # 每事件/每笔预期毛收益（相对价格，0.001=10bp）
+    window_bars: int                # 事件窗持仓 bar 数（T84/K4：σ 按此窗长取）
     entry_hour_ny: int              # 入场成交的纽约本地小时（成本取该小时实测）
     exit_hour_ny: int               # 出场成交的纽约本地小时
     overnight_nights: float         # 每笔/每事件预期计费夜数（0=不过夜；保守申报）
@@ -254,6 +260,7 @@ class Candidate:
     literature: Literature
     source_card: str = ""           # T61 簿记登记指向的卡（研究候选为空）
     notes: str = ""
+    observed_in_sample: str = ""    # T84/K3：样本内被看过时如实登记来源（如 "T66 §3.2"）
     declared: Declared | None = None
     prob_declared: ProbDeclared | None = None   # T76：[prob]（price_lines 候选）
     path: str = ""
@@ -368,9 +375,19 @@ def _validate_declared(raw: object, source: str) -> Declared:
                 f"（纽约本地小时），收到 {v!r}")
         return int(v)
 
+    def _window_bars() -> int:
+        v = raw["window_bars"]
+        if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+            raise CandidateError(
+                f"{source}：[declared].window_bars 必须是 ≥1 的整数"
+                f"（事件窗持仓 bar 数——T84/K4：σ 按此窗长取，缺算会少算"
+                f"√h、隐含夏普多算 √h），收到 {v!r}")
+        return int(v)
+
     return Declared(
         events_per_year=_num("events_per_year", positive=True),
         gross_return_per_event=_num("gross_return_per_event", positive=True),
+        window_bars=_window_bars(),
         entry_hour_ny=_hour("entry_hour_ny"),
         exit_hour_ny=_hour("exit_hour_ny"),
         overnight_nights=_num("overnight_nights", positive=False),
@@ -432,6 +449,12 @@ def validate_candidate(data: dict, *, source: str) -> Candidate:
     notes = data.get("notes", "")
     if not isinstance(notes, str):
         raise CandidateError(f"{source}：notes 必须是字符串，收到 {notes!r}")
+    observed_in_sample = data.get("observed_in_sample", "")
+    if not isinstance(observed_in_sample, str):
+        raise CandidateError(
+            f"{source}：observed_in_sample 必须是字符串（T84/K3：候选机制"
+            f"在本项目样本内被看过时如实登记来源，如 \"T66 §3.2\"），收到"
+            f" {observed_in_sample!r}")
 
     literature = _validate_literature(data.get("literature"), source)
     declared = None
@@ -443,8 +466,9 @@ def validate_candidate(data: dict, *, source: str) -> Candidate:
     if status in RESEARCH_STATUSES and declared is None             and mechanism_class != "price_levels":
         raise CandidateError(
             f"{source}：status={status} 的研究候选必须带 [declared] 数值声明"
-            "（每年事件/交易数、每笔折算后毛收益、入出场小时、计费夜数、"
-            "折算后预期夏普——预筛的计算输入；折算依据写在 "
+            "（每年事件/交易数、每笔折算后毛收益、事件窗 bar 数"
+            "（window_bars，T84/K4）、入出场小时、计费夜数、折算后预期"
+            "夏普——预筛的计算输入；折算依据写在 "
             "[literature].expected_effect，不得取自本项目样本内，铁律 17）")
     if mechanism_class == "price_levels" and status in RESEARCH_STATUSES:
         if declared is not None:
@@ -461,6 +485,7 @@ def validate_candidate(data: dict, *, source: str) -> Candidate:
         id=cid, title=title, mechanism_class=mechanism_class, status=status,
         symbols=tuple(symbols), holding=holding, mechanism=mechanism,
         literature=literature, source_card=source_card, notes=notes,
+        observed_in_sample=observed_in_sample,
         declared=declared, prob_declared=prob_declared)
 
 
@@ -484,6 +509,7 @@ def load_candidate(path) -> Candidate:
         status=cand.status, symbols=cand.symbols, holding=cand.holding,
         mechanism=cand.mechanism, literature=cand.literature,
         source_card=cand.source_card, notes=cand.notes,
+        observed_in_sample=cand.observed_in_sample,
         declared=cand.declared, prob_declared=cand.prob_declared,
         path=str(p))
 
@@ -634,25 +660,42 @@ def coverage_years(data_root, symbols, timeframes) -> dict[str, float]:
 
 # ------------------------------------------------- 无条件收益波动（T80/G2）
 
-def unconditional_volatility(data_root, symbol: str,
-                             timeframe: str) -> float | None:
-    """品种在持仓长度上的无条件收益波动 σ（相对价格，随机时点口径）。
+def unconditional_volatility(data_root, symbol: str, timeframe: str, *,
+                             window_bars: int = 1,
+                             entry_hour_ny: int | None = None) -> float | None:
+    """品种在事件窗长度上的无条件收益波动 σ（相对价格，随机时点口径）。
 
-    σ = 该品种**持仓周期** bar 的相邻收盘相对收益全体的样本标准差
-    （ddof=1）——随机时点抽样的总体极限：随机等权抽取入场时点、持有
-    一个周期长度的收益分布，即品种本身的性质（与候选信号无关、不是
-    策略样本内结果，第十二轮 G2）。用全体而非抽样的原因：确定性、无
-    种子，precheck 结果逐位可复算。
+    T84/K4：σ = **同长度窗口**收益的标准差——window_bars 根持仓周期 bar
+    的滚动窗口收益全体（ddof=1），与 T66 的 σ_w 共用同一个函数
+    （mt5quant.validation.events.window_volatility；随机时点抽样的总体
+    极限：随机等权抽取入场时点、持有 window_bars 根 bar 的收益分布，
+    即品种本身的性质，与候选信号无关、不是样本内结果）。单根 bar 口径
+    会少算 √h（C001 的 4 日窗差约一半、隐含夏普多算约一倍——K4）。
 
-    序列缺失 → None；数据不足（<3 根）→ None；恒价序列 → 0.0（隐含
-    夏普无从折算，调用方按声明夏普计并如实记录）。
+    entry_hour_ny：日内周期（< D1）按入场小时取**同一时段起点**的窗口
+    （窗口起点 = 锚 bar 收盘时刻；时段异方差：定盘前一小时 ≠ 全天平均
+    ——C002 的 K4 更正）；D1 及以上周期全天只有一种起点，不传（传了
+    也按 None 处理）。用全体而非抽样的原因：确定性、无种子，precheck
+    结果逐位可复算。
+
+    序列缺失/数据不足/时段窗口不足 → None；恒价序列 → 0.0（隐含夏普
+    无从折算，调用方按声明夏普计并如实记录）。
     """
+    from mt5quant.validation.events import window_volatility
+
     bars = load_bars(str(data_root), str(symbol), timeframe.upper())
     if bars is None or len(bars) < 3:
         return None
-    closes = pd.to_numeric(bars["close"]).to_numpy(dtype="float64")
-    rets = closes[1:] / closes[:-1] - 1.0
-    return float(np.std(rets, ddof=1))
+    intraday = (TIMEFRAME_SECONDS[timeframe.upper()]
+                < TIMEFRAME_SECONDS["D1"])
+    try:
+        return float(window_volatility(
+            bars, int(window_bars),
+            entry_hour_ny=(int(entry_hour_ny)
+                           if intraday and entry_hour_ny is not None
+                           else None)))
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------- 预筛
@@ -838,6 +881,9 @@ def precheck(candidate: Candidate, *, data_root, cost_model,
     # T80/G2：夏普取声明与隐含中较小者——隐含夏普 =（每事件毛收益 − 事前
     # 来回成本）÷ σ × √每年事件数；σ 是品种性质（随机时点口径，与信号
     # 无关），乐观的夏普声明过不了"毛收益−成本按波动折算"这一关。
+    # T84/K4：σ 按声明的 window_bars 事件窗取（与 T66 σ_w 同一函数），
+    # 日内周期再按 entry_hour_ny 取同一时段起点——单根 bar 口径会少算
+    # √h、时段平均会盖掉定盘前一小时这类时段异方差。
     years_detail = {f"{s}/{candidate.holding}":
                     float(research_years.get(f"{s}/{candidate.holding}", 0.0))
                     for s in candidate.symbols}
@@ -846,7 +892,10 @@ def precheck(candidate: Candidate, *, data_root, cost_model,
     sigma_by_symbol: dict[str, float | None] = {}
     implied_by_symbol: dict[str, float | None] = {}
     for s in candidate.symbols:
-        sigma = unconditional_volatility(data_root, s, candidate.holding)
+        sigma = unconditional_volatility(
+            data_root, s, candidate.holding,
+            window_bars=declared.window_bars,
+            entry_hour_ny=declared.entry_hour_ny)
         sigma_by_symbol[s] = sigma
         if sigma is None or sigma <= 0.0:
             implied_by_symbol[s] = None      # σ 缺失/恒价 → 无从折算
@@ -874,11 +923,19 @@ def precheck(candidate: Candidate, *, data_root, cost_model,
         "sharpe_used": float(sharpe_used),
         "implied_sharpe_by_symbol": implied_by_symbol,
         "sigma_by_symbol": sigma_by_symbol,
+        "sigma_window_bars": declared.window_bars,
+        "sigma_entry_hour_ny": (
+            declared.entry_hour_ny
+            if TIMEFRAME_SECONDS[candidate.holding]
+            < TIMEFRAME_SECONDS["D1"] else None),
         "sigma_method": (
-            "无条件收益波动 σ：候选持仓周期 bar 的相邻收盘相对收益全体"
-            "（随机时点抽样的总体极限，ddof=1）——品种性质，与候选信号"
-            "无关、不取自本项目样本内（T80/G2）；隐含夏普 =（毛收益−事前"
-            "来回成本）÷σ×√每年事件数，检验力取 min(声明, 隐含)"),
+            "无条件收益波动 σ：候选声明 window_bars 根持仓周期 bar 的滚动"
+            "窗口收益全体（随机时点抽样的总体极限，ddof=1，与 T66 σ_w 同一"
+            "函数 validation.events.window_volatility——T84/K4：单根 bar 口"
+            "径少算 √h）；日内周期按 entry_hour_ny 取同一时段起点（窗口"
+            "起点=锚 bar 收盘时刻）；σ 是品种性质，与候选信号无关、不取自"
+            "本项目样本内（T80/G2）。隐含夏普 =（毛收益−事前来回成本）÷σ"
+            "×√每年事件数，检验力取 min(声明, 隐含)"),
         "alpha": _POWER_ALPHA, "n_tests": _POWER_N_TESTS,
         "years_detail": years_detail,
         "min_detectable_sharpe": (
@@ -932,9 +989,14 @@ def precheck(candidate: Candidate, *, data_root, cost_model,
                                "active_mechanisms": sorted(active)}
     reasons.append(gap_note)
 
-    if not lit_ok or not holding_ok or cost_ok is False:
+    # 判定块（K10/R13 还原 0d92448 之前写法）：`not cost_ok` 判 fail——
+    # 成本链路返回 numpy 布尔值（np.False_ is False 为假）或成本无法计算
+    # （None）时，`cost_ok is False` 会漏判/改判 waiting_data；`not`
+    # 对两者都成立（成本不过/算不出都不是"待数据"）。P 线 precheck_prob
+    # 的 cost_ok=None（无触发计数）语义不同，保留其三分支写法。
+    if not lit_ok or not holding_ok or not cost_ok:
         decision = "fail"
-    elif cost_ok is None or not power_ok:
+    elif not power_ok:
         decision = "waiting_data"
     else:
         decision = "pass"

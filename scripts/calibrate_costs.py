@@ -251,6 +251,19 @@ def calibrate_swap(symbol: str, positions: list[ClosedPosition],
     return result
 
 
+def _account_kind(trade_mode: int) -> str:
+    """T83/R13-K6：网关账户 trade_mode → account_kind（写进 calibrated.json）。
+
+    mt5gw 同枚举：0=DEMO 1=CONTEST 2=REAL。CONTEST 不是实盘、按 demo 类计；
+    未知值如实 unknown。build_costs 只认 "real" 的隔夜费实测。
+    """
+    if trade_mode == 2:
+        return "real"
+    if trade_mode in (0, 1):
+        return "demo"
+    return "unknown"
+
+
 def build_result(gw, snap: dict, since: datetime, to: datetime,
                  *, now_utc: datetime | None = None) -> dict:
     """主逻辑（gateway 可注入）：读成交历史 → 校准结果 dict（写盘前的唯一真相）。"""
@@ -286,6 +299,9 @@ def build_result(gw, snap: dict, since: datetime, to: datetime,
     return {
         "version": 1,
         "generated_utc": (now_utc or datetime.now(timezone.utc)).isoformat(),
+        # T83/R13-K6：账户类型随实测落盘——build_costs 只认 real 的隔夜费
+        # 实测；demo 实测不进研究成本（只留在本报告），版本串注明未采用。
+        "account_kind": _account_kind(state.trade_mode),
         "account": {"login": state.login, "server": state.server,
                     "currency": state.currency},
         "window": {"since": since.isoformat(sep=" "),
@@ -318,6 +334,11 @@ def render_markdown(res: dict) -> str:
         f"{res['summary']['closed_positions']}，未平仓 {res['summary']['open_positions']}）",
         f"- 免隔夜费：{_fmt(res['account_free_of_swap'])}；"
         f"生成：{res['generated_utc']}",
+        f"- 账户类型：{res.get('account_kind', 'unknown')}（T83/R13-K6：只有"
+        f" real 账户的隔夜费实测进研究成本；demo 实测只写进本报告、"
+        f"cost_version 注明 demo 实测未采用——模拟盘的免隔夜费状态不能代表"
+        f"实盘，研究侧免隔夜费口径走 config/account-profile.toml 的用户确认"
+        f"条目）",
         "",
     ]
     for sym, info in res["symbols"].items():

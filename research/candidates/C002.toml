@@ -25,7 +25,8 @@ expected_effect = "折算（全部文献折算/事前计算，不取自本项目
 [declared]
 events_per_year = 12                # 每月最后一个交易日各一个定盘前事件
 gross_return_per_event = 0.00031    # 3.1bp：Melvin-Prins 14bp/10% × E|r_月|5.25% × 0.42（见 expected_effect）
+window_bars = 1                     # T84/K4：事件窗 = 定盘前 1 小时 = 1 根 H1（伦敦 15:00→16:00）；σ 按 entry_hour_ny=10 的同一时段起点取（定盘前一小时时段 σ，非全天平均）——等 T87 数据延长后按此口径重检
 entry_hour_ny = 10                  # 伦敦 15:00（定盘前 1 小时窗起点）= 纽约 10:00（DST 同步）
 exit_hour_ny = 11                   # 伦敦 16:00 定盘 = 纽约 11:00；夏令时由 zoneinfo 处理（T66 london_fix_events）
 overnight_nights = 0.0              # 事件窗为日内 1 小时，不过夜
-expected_sharpe = 0.83              # （0.00031 − 事前成本）÷σ_H1×√12 的文献折算值（见 expected_effect）
+expected_sharpe = 0.83              # （0.00031 − 事前成本）÷σ_H1×√12 的文献折算值（见 expected_effect；σ 为全天平均口径的登记折算，T84 重检起按定盘前一小时时段 σ 取，以 precheck JSON 为准）

@@ -1000,13 +1000,15 @@ def test_cost_version_cache_hit_equals_direct_build(tmp_path):
 # ----------------------------------------------- R7/I2 残留：swap 费率身份
 
 def _write_calibrated_swap(root, long_rate, short_rate=-0.5):
-    """calibrated.json + specs 快照（calibrated 三倍日来源）——swap 实测费率路径。"""
+    """calibrated.json + specs 快照（calibrated 三倍日来源）——swap 实测费率路径。
+
+    T83/K6：account_kind=real（隔夜费实测只认 real 账户，demo 不进研究成本）。"""
     import os
 
     costs = os.path.join(str(root), "costs")
     os.makedirs(costs, exist_ok=True)
     Path(costs, "calibrated.json").write_text(json.dumps({
-        "version": 1, "symbols": {"XAUUSD": {
+        "version": 1, "account_kind": "real", "symbols": {"XAUUSD": {
             "swap": {"free_of_swap": None,
                      "long": {"per_lot_per_night": long_rate},
                      "short": {"per_lot_per_night": short_rate}}}}}),
@@ -1123,7 +1125,7 @@ def test_t82_calibrated_path_same_relative_basis(tmp_path):
     costs_dir = os.path.join(str(root), "costs")
     os.makedirs(costs_dir, exist_ok=True)
     Path(costs_dir, "calibrated.json").write_text(json.dumps({
-        "version": 1, "symbols": {"USTEC": {
+        "version": 1, "account_kind": "real", "symbols": {"USTEC": {
             "swap": {"free_of_swap": None,
                      "long": {"per_lot_per_night": -6.338},
                      "short": {"per_lot_per_night": 0.0}}}}}),

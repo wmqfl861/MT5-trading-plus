@@ -2,8 +2,10 @@
   "candidate_id": "C001",
   "decision": "fail",
   "reasons": [
-    "事前成本倍数 1.79 < 3（USTEC：折算后每笔毛收益 0.0024 ÷ 来回成本 0.00133963，预筛条件 3）",
-    "机制空缺：flow_calendar 是组合里还没有的类别（蓝图 §6.2 条件 5）"
+    "事前成本倍数 1.51 < 3（USTEC：折算后每笔毛收益 0.0024 ÷ 来回成本 0.00159175，预筛条件 3）",
+    "检验力 17% < 50%（39.81 年、隐含夏普 0.11 < 声明 0.28——按较小者计，T80/G2：毛收益−成本按品种波动 σ 折算到不了声明的夏普）→ 待数据（铁律 18：检验力不足不开卡）",
+    "机制空缺：flow_calendar 是组合里还没有的类别（蓝图 §6.2 条件 5）",
+    "swap_dependent=true：swap_free 口径（倍数 29.63）通过而 charged 口径（倍数 1.51）不通过——该候选的结论依赖账户免隔夜费状态（config/account-profile.toml 用户确认条目）"
   ],
   "events_per_year": 12.0,
   "checks": {
@@ -23,7 +25,7 @@
     },
     "ex_ante_cost": {
       "passed": false,
-      "multiple": 1.7915364658972663,
+      "multiple": 1.507775977241775,
       "min": 3.0,
       "gross_return_per_event": 0.0024,
       "binding_symbol": "USTEC",
@@ -33,32 +35,34 @@
           "reference_timeframe": "D1",
           "contract_size": 1.0,
           "spread_round_trip": 6.749148942885619e-05,
-          "spread_entry_frac": 6.426085747678745e-05,
+          "spread_entry_frac": 6.749148942885619e-05,
           "spread_exit_frac": 6.749148942885619e-05,
-          "slippage_entry": 6.426085747678745e-06,
+          "slippage_entry": 6.749148942885619e-06,
           "slippage_exit": 6.749148942885619e-06,
           "commission": 0.0,
-          "overnight": 0.0012589655109397709,
-          "round_trip_cost": 0.0013396322350591914,
-          "multiple": 1.7915364658972663
+          "overnight": 0.0015107586131277249,
+          "round_trip_cost": 0.0015917484004423523,
+          "multiple": 1.507775977241775
         }
       }
     },
     "power": {
-      "passed": true,
-      "power": 0.5221648471765447,
+      "passed": false,
+      "power": 0.17056373429171423,
       "min": 0.5,
       "years": 39.80561259411362,
       "expected_sharpe": 0.28,
-      "implied_sharpe": 0.2745755796596754,
-      "sharpe_used": 0.2745755796596754,
+      "implied_sharpe": 0.11018256264449226,
+      "sharpe_used": 0.11018256264449226,
       "implied_sharpe_by_symbol": {
-        "USTEC": 0.2745755796596754
+        "USTEC": 0.11018256264449226
       },
       "sigma_by_symbol": {
-        "USTEC": 0.013377816380190347
+        "USTEC": 0.025411150405887553
       },
-      "sigma_method": "无条件收益波动 σ：候选持仓周期 bar 的相邻收盘相对收益全体（随机时点抽样的总体极限，ddof=1）——品种性质，与候选信号无关、不取自本项目样本内（T80/G2）；隐含夏普 =（毛收益−事前来回成本）÷σ×√每年事件数，检验力取 min(声明, 隐含)",
+      "sigma_window_bars": 4,
+      "sigma_entry_hour_ny": null,
+      "sigma_method": "无条件收益波动 σ：候选声明 window_bars 根持仓周期 bar 的滚动窗口收益全体（随机时点抽样的总体极限，ddof=1，与 T66 σ_w 同一函数 validation.events.window_volatility——T84/K4：单根 bar 口径少算 √h）；日内周期按 entry_hour_ny 取同一时段起点（窗口起点=锚 bar 收盘时刻）；σ 是品种性质，与候选信号无关、不取自本项目样本内（T80/G2）。隐含夏普 =（毛收益−事前来回成本）÷σ×√每年事件数，检验力取 min(声明, 隐含)",
       "alpha": 0.05,
       "n_tests": 1,
       "years_detail": {
@@ -95,6 +99,24 @@
       "active_mechanisms": []
     }
   },
-  "cost_model_version": "tick-spread-p90[rel@NY/bar_open_m1#10a66c54]+slip0.1-comm0-cli-swap-snapshot[c71b0267]-no-overshoot-missNY[17]",
-  "checked_at_utc": "2026-10-28T00:40:43.559599+00:00"
+  "cost_model_version": "tick-spread-p90[rel@NY/bar_open_m1#10a66c54]+slip0.1-comm0-cli-swap-snapshot[c71b0267]-relref[257d0355]-no-overshoot-missNY[17]",
+  "checked_at_utc": "2026-10-28T07:55:23.923999+00:00",
+  "swap_basis": {
+    "applicable": true,
+    "account_profile": {
+      "USTEC": "charged"
+    },
+    "decision_basis": "charged",
+    "charged": {
+      "multiple": 1.507775977241775,
+      "power": 0.17056373429171423,
+      "decision": "fail"
+    },
+    "swap_free": {
+      "multiple": 29.633365879534047,
+      "power": 0.5350332065175746,
+      "decision": "pass"
+    },
+    "swap_dependent": true
+  }
 }

@@ -93,6 +93,7 @@ def test_price_levels_requires_prob():
 def test_price_levels_rejects_declared():
     d = prob_data()
     d["declared"] = {"events_per_year": 10, "gross_return_per_event": 0.001,
+                     "window_bars": 1,
                      "entry_hour_ny": 9, "exit_hour_ny": 10,
                      "overnight_nights": 0.0, "expected_sharpe": 0.8}
     with pytest.raises(cand.CandidateError, match="不带 \\[declared\\]"):

@@ -219,6 +219,42 @@ def test_nights_between_matches_engine_semantics():
     assert mod.nights_between(T(2026, 10, 19, 20, 0), T(2026, 10, 26, 20, 0), rule) == 7
 
 
+# ------------------------------------------- T83/R13-K6：account_kind 落盘
+
+class _StatefulGW:
+    def __init__(self, mode, deals=None):
+        self.account = FakeAccount(
+            eur_deals() if deals is None else deals, AccountState(
+                login=12345, server="Exness-MT5Trial", company="Exness",
+                currency="USD", leverage=200, balance=1000.0, equity=1000.0,
+                margin=0.0, margin_free=1000.0, margin_mode=0, trade_mode=mode))
+
+
+@pytest.mark.parametrize("trade_mode,kind", [(0, "demo"), (1, "demo"),
+                                             (2, "real"), (9, "unknown")])
+def test_account_kind_written_from_gateway_trade_mode(trade_mode, kind):
+    """T83/K6 失败测试：calibrate_results 从网关账户 trade_mode 写
+    account_kind（demo|real；CONTEST 按 demo 类、未知值如实 unknown）——
+    build_costs 只认 real 的实测隔夜费，demo 实测不进研究成本。"""
+    mod = load_script()
+    res = mod.build_result(_StatefulGW(trade_mode), EUR_SNAP, *WINDOW,
+                           now_utc=T(2026, 12, 20, 12, 0))
+    assert res["account_kind"] == kind
+
+
+def test_report_states_account_kind_and_demo_not_adopted_note():
+    """T83/K6：报告（demo 实测的唯一去处）写明账户类型与"实测未采用"。"""
+    mod = load_script()
+    res = mod.build_result(_StatefulGW(0), EUR_SNAP, *WINDOW,
+                           now_utc=T(2026, 12, 20, 12, 0))
+    md = mod.render_markdown(res)
+    assert "账户类型：demo" in md
+    assert "demo 实测未采用" in md          # 与 cost_version 标记同一语义
+    res_real = mod.build_result(_StatefulGW(2), EUR_SNAP, *WINDOW,
+                                now_utc=T(2026, 12, 20, 12, 0))
+    assert "账户类型：real" in mod.render_markdown(res_real)
+
+
 def test_write_outputs_and_commission_from_calibrated_roundtrip(tmp_path):
     mod, res = build()
     json_path, md_path = mod.write_outputs(res, str(tmp_path))
@@ -254,7 +290,10 @@ def test_rate_includes_triple_day_round_trip():
 
 def test_calibrated_rate_round_trips_through_build_costs(tmp_path):
     """校准产物 → run_backtest.build_costs：三倍日取快照（不再 frozenset()），
-    同一持仓区间复算回实测 −40。"""
+    同一持仓区间复算回实测 −40。
+
+    T83/K6：实测费率要被 build_costs 采用，账户须是 real（trade_mode=2）
+    ——demo 账户的实测隔夜费不进研究成本。"""
     from mt5data.ticks import save_ticks
     from mt5quant.costs.swap import charge_nights
     import importlib.util as ilu
@@ -264,7 +303,10 @@ def test_calibrated_rate_round_trips_through_build_costs(tmp_path):
         mk_deal(T(2026, 10, 22, 6, 0), "EURUSD", "sell", "out", 1.0, comm=20.0,
                 swap=-40.0, pos=1),
     ]
-    mod, res = build(deals=deals)
+    mod = load_script()
+    res = mod.build_result(_StatefulGW(2, deals=deals), EUR_SNAP, *WINDOW,
+                           now_utc=T(2026, 12, 20, 12, 0))
+    assert res["account_kind"] == "real"
     assert res["symbols"]["EURUSD"]["swap"]["long"]["per_lot_per_night"] == pytest.approx(-10.0)
 
     root = tmp_path / "data"

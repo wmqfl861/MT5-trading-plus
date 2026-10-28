@@ -13,6 +13,7 @@ import importlib.util
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -61,6 +62,7 @@ expected_effect = "按发表后衰减 −58% 折算（McLean & Pontiff 2016）�
 [declared]
 events_per_year = 12
 gross_return_per_event = 0.003
+window_bars = 4
 entry_hour_ny = 16
 exit_hour_ny = 10
 overnight_nights = 1
@@ -222,6 +224,58 @@ def test_load_rejects_bad_declared_values(tmp_path):
         p = write_candidate(tmp_path, CANDIDATE_TOML.replace(good, bad))
         with pytest.raises(CandidateError):
             load_candidate(p)
+
+
+def test_load_rejects_declared_without_window_bars(tmp_path):
+    """T84/K4 失败测试：[declared].window_bars（事件窗持仓 bar 数）必填
+    ——σ 按事件窗长度取（K4：单根 bar 口径少算 √h、隐含夏普多算 √h），
+    缺字段的登记装载即报错（fail-fast，不静默按 1 根算）。"""
+    body = CANDIDATE_TOML.replace("window_bars = 4\n", "")
+    with pytest.raises(CandidateError, match="window_bars"):
+        load_candidate(write_candidate(tmp_path, body))
+
+
+@pytest.mark.parametrize("bad", ["window_bars = 0", "window_bars = -1",
+                                 "window_bars = 1.5", "window_bars = true",
+                                 'window_bars = "4"'])
+def test_load_rejects_bad_window_bars(tmp_path, bad):
+    """window_bars 必须是 ≥1 的整数（bar 数）。"""
+    body = CANDIDATE_TOML.replace("window_bars = 4", bad)
+    with pytest.raises(CandidateError, match="window_bars"):
+        load_candidate(write_candidate(tmp_path, body))
+
+
+def test_load_optional_observed_in_sample(tmp_path):
+    """T84/K3 失败测试：可选顶层字段 observed_in_sample——候选机制在
+    本项目样本内被看过时如实登记来源（C001 = "T66 §3.2"）；缺省空串
+    兼容（未看过的候选不带）；非字符串拒绝。"""
+    body = CANDIDATE_TOML.replace(
+        'mechanism = "月末与月初的固定资金流（工资、养老金、再平衡）"',
+        'mechanism = "月末与月初的固定资金流（工资、养老金、再平衡）"\n'
+        'observed_in_sample = "T66 §3.2"')
+    c = load_candidate(write_candidate(tmp_path, body))
+    assert c.observed_in_sample == "T66 §3.2"
+    assert load_candidate(write_candidate(tmp_path)).observed_in_sample == ""
+    bad = body.replace('observed_in_sample = "T66 §3.2"',
+                       "observed_in_sample = 3")
+    with pytest.raises(CandidateError, match="observed_in_sample"):
+        load_candidate(write_candidate(tmp_path, bad))
+
+
+def test_repo_research_candidates_declare_window_bars():
+    """T84/K4、K8、K3：仓库研究候选 C001/C002 带 window_bars（σ 按事件窗
+    取）；C001 的 K8 事件窗 = 4 根 D1（第 −2 日纽约 16:00 收盘 → 第 +3 日
+    16:00 收盘）、样本内观察如实登记、screened_fail 理由改按目标市场
+    发表后证据（Han, Han & Tian 2025：效应 2001 年后消失）。"""
+    c1 = load_candidate(REPO_ROOT / "research" / "candidates" / "C001.toml")
+    assert c1.status == "screened_fail"
+    assert c1.declared.window_bars == 4
+    assert c1.observed_in_sample.strip()
+    raw = (REPO_ROOT / "research" / "candidates" / "C001.toml").read_text(
+        encoding="utf-8")
+    assert "2001" in raw and "Han" in raw        # 发表后消失理由（R13 §4.3）
+    c2 = load_candidate(REPO_ROOT / "research" / "candidates" / "C002.toml")
+    assert c2.declared.window_bars == 1          # 定盘前 1 小时 = 1 根 H1
 
 
 def test_load_literature_required_keys(tmp_path):
@@ -467,6 +521,7 @@ def make_cli_root(tmp_path):
         rb.spread_model_cache_path(str(root)), model,
         {SYMBOL: {"rows": 0, "first_msc": 0, "last_msc": 0}})
     (root / "costs" / "calibrated.json").write_text(json.dumps({
+        "account_kind": "real",     # T83/K6：隔夜费实测只认 real 账户
         "symbols": {SYMBOL: {
             "commission": {"round_trip_per_lot": 6.0},
             "swap": {"free_of_swap": None,
@@ -613,7 +668,8 @@ def test_precheck_power_uses_min_of_declared_and_implied_sharpe(tmp_path):
     import math as _math
 
     body = CANDIDATE_TOML.replace("expected_sharpe = 1.0",
-                                  "expected_sharpe = 1.5")
+                                  "expected_sharpe = 1.5"
+                                  ).replace("window_bars = 4", "window_bars = 1")
     c = load_candidate(write_candidate(tmp_path, body))
     root = make_volatile_data_root(tmp_path)
     sigma = candidates.unconditional_volatility(root, SYMBOL, "D1")
@@ -649,6 +705,154 @@ def test_precheck_power_uses_declared_when_sigma_zero(tmp_path):
     assert pw["power"] == pytest.approx(
         candidates.power.power_one_sided(1.0, YEARS_D1))
     assert res.decision == "pass"
+
+
+# ================================================ T84/K4：σ 按事件窗与时段取
+
+def make_rw_data_root(tmp_path, *, n=3000, vol=0.01, s0=2000.0):
+    """独立同分布随机游走 D1 数据根（σ>0 且窗长口径可手算：σ_h≈σ_1·√h）。"""
+    rng = np.random.default_rng(20261028)
+    closes = s0 * np.cumprod(1.0 + rng.normal(0.0, vol, n))
+    root = tmp_path / "data"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "specs").mkdir(exist_ok=True)
+    (root / "specs" / "latest.json").write_text(json.dumps(
+        {SYMBOL: {"contract_size": 100.0, "volume_min": 0.01,
+                  "volume_step": 0.01, "volume_max": 100.0}}),
+        encoding="utf-8")
+    times = pd.date_range(end="2026-01-01", periods=n, freq="D")
+    df = pd.DataFrame({"time": times, "open": closes, "high": closes,
+                       "low": closes, "close": closes, "tick_volume": 1,
+                       "spread": 2, "real_volume": 0})
+    sdir = root / "bars" / SYMBOL / "D1"
+    sdir.mkdir(parents=True)
+    df.to_parquet(sdir / "data.parquet")
+    (sdir / "meta.json").write_text(json.dumps({
+        "symbol": SYMBOL, "timeframe": "D1", "rows": n,
+        "first_time": times[0].isoformat(),
+        "last_closed_time": times[-1].isoformat()}), encoding="utf-8")
+    return root
+
+
+def test_precheck_sigma_uses_declared_window_bars(tmp_path):
+    """T84/K4 失败测试：隐含夏普的 σ 按声明的 window_bars 事件窗取（与
+    T66 σ_w 同一函数）——独立同分布合成库上 4 日窗 σ ≈ 2×单根 D1、隐含
+    夏普 ≈ 单根口径的一半；预筛检验力仍按**单次**判定（蓝图 §6.2 条件
+    4，n_tests=1——α/N 只用于事件模式样本量规则与开轮复核）。"""
+    import math as _math
+
+    root = make_rw_data_root(tmp_path)
+    years = 3000 / 365.25
+    res = {}
+    for cid, wb in (("C001", 1), ("C004", 4)):
+        body = (CANDIDATE_TOML
+                .replace('id = "C001"', f'id = "{cid}"')
+                .replace("window_bars = 4", f"window_bars = {wb}"))
+        c = load_candidate(write_candidate(tmp_path, body, name=f"{cid}.toml"))
+        res[wb] = precheck(c, data_root=root, cost_model=make_costs(),
+                           research_years={f"{SYMBOL}/D1": years})
+    s1 = res[1].checks["power"]["sigma_by_symbol"][SYMBOL]
+    s4 = res[4].checks["power"]["sigma_by_symbol"][SYMBOL]
+    assert s1 == pytest.approx(0.01, rel=0.1)
+    assert s4 == pytest.approx(2.0 * s1, rel=0.1), \
+        f"4 日窗 σ {s4:.4f} 应 ≈ 2×单根 D1 σ（{2.0 * s1:.4f}）"
+    assert res[4].checks["power"]["sigma_window_bars"] == 4
+    assert res[4].checks["power"]["n_tests"] == 1     # 预筛仍按单次判定
+    imp1 = res[1].checks["power"]["implied_sharpe"]
+    imp4 = res[4].checks["power"]["implied_sharpe"]
+    assert imp4 == pytest.approx(imp1 / 2.0, rel=0.1)
+    # 手算对账：隐含夏普 =（毛收益 − 事前来回成本）÷σ_4 × √12
+    # （成本按参考价折算——随机游走库的参考价≠2000，从 checks 里取实测值）
+    cost = (res[4].checks["ex_ante_cost"]["per_symbol"][SYMBOL]
+            ["round_trip_cost"])
+    assert imp4 == pytest.approx(
+        (0.003 - cost) / s4 * _math.sqrt(12.0))
+
+
+def test_precheck_sigma_intraday_uses_entry_hour_window(tmp_path):
+    """T84/K4 失败测试：日内候选的 σ 按 entry_hour_ny 取**同一时段起点**
+    的窗口（窗口起点=锚 bar 收盘时刻=入场成交时点）——合成时段异方差
+    （纽约 10→11 点窗波动 3 倍于其余小时）下，定盘前一时段的 σ 显著
+    高于全天平均（C002 的 K4 更正口径）。"""
+    rng = np.random.default_rng(20261028)
+    days = pd.date_range("2021-01-04", periods=40, freq="B")  # EST 无 DST 切换
+    n = len(days) * 24
+    vols = np.full(n, 0.0004)
+    times = pd.DatetimeIndex(
+        [d + pd.Timedelta(hours=h) for d in days for h in range(24)])
+    vols[np.asarray([t.hour for t in times]) == 15] = 0.0012  # 纽约 10 点窗
+    closes = 1.10 * np.cumprod(1.0 + rng.normal(0.0, 1.0, n) * vols)
+    root = tmp_path / "data"
+    root.mkdir(parents=True)
+    (root / "specs").mkdir()
+    (root / "specs" / "latest.json").write_text(json.dumps(
+        {SYMBOL: {"contract_size": 100.0, "volume_min": 0.01,
+                  "volume_step": 0.01, "volume_max": 100.0}}),
+        encoding="utf-8")
+    df = pd.DataFrame({"time": times, "open": closes, "high": closes,
+                       "low": closes, "close": closes, "tick_volume": 1,
+                       "spread": 2, "real_volume": 0})
+    sdir = root / "bars" / SYMBOL / "H1"
+    sdir.mkdir(parents=True)
+    df.to_parquet(sdir / "data.parquet")
+
+    body = (CANDIDATE_TOML
+            .replace('holding = "D1"', 'holding = "H1"')
+            .replace("entry_hour_ny = 16", "entry_hour_ny = 10")
+            .replace("exit_hour_ny = 10", "exit_hour_ny = 11")
+            .replace("window_bars = 4", "window_bars = 1"))
+    c = load_candidate(write_candidate(tmp_path, body))
+    res = precheck(c, data_root=root, cost_model=make_costs(),
+                   research_years={f"{SYMBOL}/H1": 0.15})
+    sigma_hour = res.checks["power"]["sigma_by_symbol"][SYMBOL]
+    sigma_all = candidates.unconditional_volatility(root, SYMBOL, "H1")
+    assert sigma_hour == pytest.approx(0.0012, rel=0.25)
+    assert sigma_hour > 1.5 * sigma_all, \
+        f"定盘前一小时 σ {sigma_hour:.5f} 应显著高于全天平均 {sigma_all:.5f}"
+    assert res.checks["power"]["sigma_entry_hour_ny"] == 10
+
+
+def test_precheck_cost_condition_numpy_false_or_none_fails(
+        tmp_path, monkeypatch):
+    """R13/K10 失败测试：成本条件为 numpy 布尔值 False 或 None 时判 fail
+    ——0d92448 把判定块写成 `cost_ok is False`，np.False_ is False 为假
+    （不通过被漏判）、None 落到 waiting_data；恢复 `not cost_ok` 写法后
+    两者都判 fail（成本不过/算不出都不是"待数据"，K10）。"""
+    c = load_candidate(write_candidate(tmp_path))
+    root = make_data_root(tmp_path)
+    years = {f"{SYMBOL}/D1": YEARS_D1}
+    base = {"reference_price": 2000.0, "reference_timeframe": "D1",
+            "contract_size": 100.0, "spread_round_trip": 0.0002,
+            "spread_entry_frac": 0.0002, "spread_exit_frac": 0.0002,
+            "slippage_entry": 0.00002, "slippage_exit": 0.00002,
+            "commission": 0.00003, "overnight": 0.000025,
+            "round_trip_cost": 0.000295, "multiple": 0.5}
+    # 1) multiple 为 np.float64（成本链路返回 numpy 标量）→ cost_ok=np.False_
+    fake_np = dict(base, multiple=np.float64(0.5))
+    monkeypatch.setattr(candidates, "_ex_ante_cost_per_symbol",
+                        lambda *a, **k: fake_np)
+    res = precheck(c, data_root=root, cost_model=make_costs(),
+                   research_years=years)
+    assert res.decision == "fail", \
+        f"np.False_ 的成本不通过须判 fail（不是 {res.decision}）"
+
+    # 2) 成本无法计算（与门槛的比较结果为 None）→ cost_ok=None → fail
+    #    （__format__ 让理由行的 {multiple:.2f} 仍可渲染——只测判定块，
+    #     不让格式化在判定之前把异常抛出来）
+    class _Uncomputable:
+        def __ge__(self, other):
+            return None
+
+        def __format__(self, spec):
+            return format(0.5, spec)
+
+    fake_none = dict(base, multiple=_Uncomputable())
+    monkeypatch.setattr(candidates, "_ex_ante_cost_per_symbol",
+                        lambda *a, **k: fake_none)
+    res2 = precheck(c, data_root=root, cost_model=make_costs(),
+                    research_years=years)
+    assert res2.decision == "fail", \
+        f"成本无法计算（None）须判 fail（不是 {res2.decision}）"
 
 
 def _write_ext(root, source, symbol, tf, *, first, days):

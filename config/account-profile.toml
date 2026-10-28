@@ -1,0 +1,48 @@
+# 账户隔夜费画像（T83/R13-K6，2026-10-27）。
+#
+# 用途：研究侧的隔夜费口径开关。预筛（bt candidate check）对持仓过夜的
+# 候选同时计算 charged 与 swap_free 两种口径的成本倍数与检验力，**决定**
+# 按本文件的状态取；免隔夜费状态未被用户确认的品种一律按 charged（缺省
+# 保守）。
+#
+# 纪律（第十三轮 K6）：
+# - 本文件**不含**账号与服务器名（那些是环境机密，与本口径无关）；
+# - 只有用户确认过的条目才生效：status = "swap_free" 且 confirmed_by 非空
+#   才按 swap_free 计，其余（charged / unknown / 未填确认人）一律 charged；
+# - 模板缺省全部 unknown——**用户确认后才改状态**，不确认就保持 unknown；
+# - 模拟盘的实测（calibrated.json 的 account_kind=demo）不进研究成本，
+#   与本文件无关：swap_free 的依据必须是实盘账户的隔夜费状态证据。
+#
+# 状态取值：charged | swap_free | unknown（非法值装载时报错，fail-fast）。
+
+[account]
+# 将来实盘的账户类型：demo | real | unknown（用户确认后填）
+kind = "unknown"
+confirmed_by = ""
+confirmed_on = ""
+
+# ---- 各品种隔夜费状态（按需增行；缺行 = unknown = 按 charged 计） ----
+
+[symbols.USTEC]
+status = "unknown"
+confirmed_by = ""
+confirmed_on = ""
+evidence = ""
+
+[symbols.XAUUSD]
+status = "unknown"
+confirmed_by = ""
+confirmed_on = ""
+evidence = ""
+
+[symbols.EURUSD]
+status = "unknown"
+confirmed_by = ""
+confirmed_on = ""
+evidence = ""
+
+[symbols.BTCUSD]
+status = "unknown"
+confirmed_by = ""
+confirmed_on = ""
+evidence = ""

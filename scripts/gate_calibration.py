@@ -2187,7 +2187,13 @@ def assemble_experiment(data_root, keys, max_bars=None) -> dict:
             bars = bars.iloc[-int(max_bars):].reset_index(drop=True)
         costs, _version = build_costs(data_root, symbol, 0.1, 0.0,
                                       sessions_sha=sess_sha,
-                                      research_store=research_store)
+                                      research_store=research_store,
+                                      # T83/R13-K5：点数模式隔夜费相对价格基准
+                                      # = 研究段 K 线最后收盘（与 CLI 主路径
+                                      # 同一约定）——长历史对照实验不再按快照
+                                      # 时代绝对额放大早年隔夜费（K5）
+                                      swap_ref_price=float(
+                                          bars["close"].iloc[-1]))
         out[key] = {
             "bars": bars,
             "costs": costs,
@@ -2344,7 +2350,11 @@ def run_event_phase(args, log) -> dict:
                                        max_bars=args.max_bars)
         costs, cost_version = build_costs(
             str(args.data_root), symbol, 0.1, 0.0, sessions_sha=sess_sha,
-            research_store=research_store)
+            research_store=research_store,
+            # T83/R13-K5：事件臂 K 线（ext/研究库同源）最后收盘——与
+            # assemble_experiment/CLI 主路径同一约定，relref 入 cost_version
+            # （进运行指纹，合并器可区分新旧口径）
+            swap_ref_price=float(bars["close"].iloc[-1]))
         contract_size = resolve_contract_size(str(args.data_root), symbol, None)
         log(f"[event] {symbol} {timeframe}：{len(bars)} 根（{source}），"
             f"成本 {cost_version}，合约 {contract_size} "

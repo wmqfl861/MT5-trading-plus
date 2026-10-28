@@ -588,6 +588,57 @@ def test_round_status_command(tmp_path, monkeypatch, capsys):
     assert rc == 1
 
 
+def test_round_open_power_recheck_at_round_n(tmp_path, monkeypatch, capsys):
+    """T84 失败测试：bt round open 按本轮 N（候选数，Bonferroni α/N）
+    复核每个候选的检验力——只报告不阻塞；轮次报告骨架带"开轮检验力
+    复核"一节，用**开轮时点最新**的预筛行（开轮后的新预筛不改开轮
+    复核）。预筛本身仍按单次判定（蓝图 §6.2 条件 4）。"""
+    from mt5quant.research import power
+
+    mod = load_bt()
+    ledger_path = tmp_path / "ledger.sqlite"
+    body = (ROUND_TOML
+            .replace('candidates = ["C001"]', 'candidates = ["C001", "C002"]')
+            .replace(
+                'C001 = { mode = "event", primary = "event_mean_return_one_sided" }',
+                'C001 = { mode = "event", primary = "event_mean_return_one_sided" }\n'
+                'C002 = { mode = "event", primary = "event_mean_return_one_sided" }'))
+    rdir = write_round(tmp_path, body)
+    # 单次检验力 59%（sharpe_used 0.65、10 年）≥ 50% 过预筛；α/N（N=2）
+    # 复核后 46% < 50% —— 只报告，不阻塞开轮
+    with Ledger(ledger_path) as led:
+        for cid in ("C001", "C002"):
+            led.record_candidate_check(cid, decision="pass", result={
+                "candidate_id": cid, "decision": "pass",
+                "checks": {"power": {"power": 0.588, "sharpe_used": 0.65,
+                                     "years": 10.0, "n_tests": 1}}})
+    patch_git(monkeypatch, mod)
+    rc = mod.main(["round", "open", "R1", "--rounds-dir", str(rdir),
+                   "--ledger", str(ledger_path)])
+    assert rc == 0, capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "检验力复核" in out and "N=2" in out and "只报告" in out
+    p_single = power.power_one_sided(0.65, 10.0, n_tests=1)
+    p_at_n = power.power_one_sided(0.65, 10.0, n_tests=2)
+    assert p_single >= 0.5 > p_at_n
+    assert f"{p_at_n:.0%}" in out
+    # 开轮后的新预筛（数据延长后重筛）不改开轮时点的复核
+    with Ledger(ledger_path) as led:
+        led.record_candidate_check("C001", decision="pass", result={
+            "candidate_id": "C001", "decision": "pass",
+            "checks": {"power": {"power": 0.99, "sharpe_used": 3.0,
+                                 "years": 10.0, "n_tests": 1}}})
+    report = tmp_path / "round-R1.md"
+    rc = mod.main(["round", "close", "R1", "--ledger", str(ledger_path),
+                   "--out", str(report)])
+    assert rc == 0, capsys.readouterr().out
+    text = report.read_text(encoding="utf-8")
+    assert "开轮检验力复核" in text and "α/N" in text and "只报告" in text
+    assert f"{p_single:.0%}" in text and f"{p_at_n:.0%}" in text
+    p_late = power.power_one_sided(3.0, 10.0, n_tests=2)
+    assert f"{p_late:.0%}" not in text, "开轮后的新预筛不得改开轮复核数字"
+
+
 # ----------------------------------------------- rounds 表入哈希链（7）
 
 def test_round_rows_in_hash_chain_tamper_detected(tmp_path, monkeypatch):

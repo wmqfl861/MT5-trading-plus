@@ -30,8 +30,9 @@
 required_events 用 Lo 2002 近似的事件口径——每事件夏普 SR = 每事件净
 效应 ÷ 窗口波动 σ_w，SE = sqrt((1+SR²/2)/n)，检验力 = Φ(SR/SE − z_α)；
 z 值一律取 mt5quant.research.power 的同一函数（千分位/万分位约定，
-不各自重算分位数产生口径漂移）。样本量规则：折算后预期净效应下检验力
-≥ 50% 所需事件数有闭式 n = (z_α+z_p)²·(1+SR²/2)/SR²。
+不各自重算分位数产生口径漂移）。样本量规则（D35 修改 4/T84）：折算后
+预期净效应下检验力 ≥ 50% 所需事件数有闭式 n = (z_{α/N}+z_p)²·(1+SR²/2)/
+SR²——多重校正按本轮候选数 N（Bonferroni α/N；预筛仍按单次判定）。
 
 随机化参照检验（randomization_test）：p = (1 + #{随机化统计量 ≥ 观测})
 / (sims+1)。相对年块自助（event_test）它是漂移稳健的——观测均值要与
@@ -540,18 +541,52 @@ def randomization_test(bars, events, *, side_fn, costs, symbol: str,
 
 # ---------------------------------------------------------------- 工具
 
-def window_volatility(bars, hold_bars: int) -> float:
+def window_volatility(bars, hold_bars: int,
+                      *, entry_hour_ny: int | None = None) -> float:
     """事件窗波动 σ_w（相对价格）：同窗长全样本滚动窗口收益的样本标准差
     （ddof=1）。随机时点口径（与 T80/G2 的 σ 同思想、作用在窗口长度上）
     ——品种性质，不是候选样本内结果；无种子、确定性可复算。
+
+    entry_hour_ny（T84/K4）：给定时段起点时，只取**窗口起点时刻**的
+    纽约本地小时等于该值的窗口——窗口起点 = 锚 bar 的收盘时刻（入场
+    成交时点：bar 收盘价即下一窗起点的成交参考），DST 由 zoneinfo 处理。
+    日内候选的"同一时段起点"（定盘前一小时等时段的波动异于全天平均，
+    K4 的 C002 更正）；bar 时长取序列内最小正间隔（日内序列等间隔）。
+    过滤后不足 2 个窗口收益 → ValueError（σ 无定义，fail-closed；
+    D1 及以上周期全天只有一种起点，调用方不传该参数）。
     """
     if not isinstance(hold_bars, int) or hold_bars < 1:
         raise ValueError(f"hold_bars 须为 ≥1 的整数，收到 {hold_bars!r}")
+    if entry_hour_ny is not None and (
+            isinstance(entry_hour_ny, bool) or not isinstance(entry_hour_ny, int)
+            or not 0 <= entry_hour_ny <= 23):
+        raise ValueError(f"entry_hour_ny 须为 0..23 的整数（纽约本地小时）"
+                         f"或 None，收到 {entry_hour_ny!r}")
+    times = pd.to_datetime(bars["time"])
     closes = pd.to_numeric(bars["close"]).to_numpy(dtype="float64")
     if len(closes) < hold_bars + 2:
         raise ValueError(f"收盘价 {len(closes)} 根不足窗长 {hold_bars} + 2"
                          "——σ_w 无定义")
-    rets = closes[hold_bars:] / closes[:-hold_bars] - 1.0
+    anchors = np.arange(len(closes) - hold_bars)
+    if entry_hour_ny is not None:
+        if len(closes) < 2:
+            raise ValueError("序列不足 2 根——bar 时长无从推断，σ_w 无定义")
+        diffs = np.diff(times.to_numpy()).astype("timedelta64[s]") \
+            .astype("int64")
+        pos = diffs[diffs > 0]
+        if len(pos) == 0:
+            raise ValueError("时间列无正间隔——bar 时长无从推断，σ_w 无定义")
+        bar_seconds = int(np.min(pos))
+        start_hours = (times + pd.Timedelta(seconds=bar_seconds)) \
+            .dt.tz_localize("UTC").dt.tz_convert("America/New_York") \
+            .dt.hour.to_numpy(dtype="int64")
+        anchors = anchors[start_hours[anchors] == int(entry_hour_ny)]
+        if len(anchors) < 2:
+            raise ValueError(
+                f"时段起点（纽约 {entry_hour_ny} 点）的窗口数 {len(anchors)}"
+                " < 2——该时段的 σ_w 无定义（fail-closed，不静默退回全天"
+                "平均）")
+    rets = closes[anchors + hold_bars] / closes[anchors] - 1.0
     return float(np.std(rets, ddof=1))
 
 
@@ -606,17 +641,27 @@ def event_power(effect_per_event: float, sigma_window: float, n_events: int,
 
 
 def required_events(effect_per_event: float, sigma_window: float, *,
-                    alpha: float = 0.05, power: float = 0.5) -> int:
-    """样本量规则（蓝图 §6.4）：折算后预期净效应下检验力 ≥ power 所需
-    事件数（闭式）：n = (z_α+z_p)²·(1+SR²/2)/SR²，向上取整。
+                    alpha: float = 0.05, power: float = 0.5,
+                    n_tests: int = 1) -> int:
+    """样本量规则（蓝图 §6.4；D35 修改 4/T84）：折算后预期净效应下检验力
+    ≥ power 所需事件数（闭式）：n = (z_{α/N}+z_p)²·(1+SR²/2)/SR²，向上
+    取整。
 
+    n_tests（T84）：多重校正按 α/N（本轮候选数/主检验数，Bonferroni），
+    z_{α/N} 走 mt5quant.research.power._z_alpha 的同一约定（千分位：
+    0.05→1.645、0.05/2→1.960、0.05/6→2.394）；预筛（蓝图 §6.2 条件 4）
+    仍按单次 n_tests=1 判定，α/N 用于事件模式样本量与开轮复核。
     power 缺省 0.5（预筛条件 4 同门槛）；z_p 取万分位（与
     min_detectable_sharpe 同约定：0.5→0.0、0.8→0.8416）。
     """
     sr = _check_effect(effect_per_event, sigma_window)
     if not 0.0 < float(power) < 1.0:
         raise ValueError(f"power 须在开区间 (0,1)，收到 {power!r}")
-    z_sum = _z_alpha(float(alpha), 1) + round(_norm_ppf(float(power)), 4)
+    if isinstance(n_tests, bool) or not isinstance(n_tests, int) \
+            or n_tests < 1:
+        raise ValueError(f"n_tests 必须是 ≥1 的整数，收到 {n_tests!r}")
+    z_sum = _z_alpha(float(alpha), int(n_tests)) \
+        + round(_norm_ppf(float(power)), 4)
     n = math.ceil(z_sum * z_sum * (1.0 + sr * sr / 2.0) / (sr * sr))
     return int(n)
 
