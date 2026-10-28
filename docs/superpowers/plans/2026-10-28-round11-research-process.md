@@ -240,22 +240,22 @@ def randomize_event_times(events, trading_days, *, seed: int) -> list[EventWindo
 
 **Files:** `research/candidates/C001.toml`、`C002.toml` 等；`research/rounds/R1.toml`（草案，`approved_by` 留空）；报告 `docs/research/candidates-R1-<日期>.md`。
 
-- [ ] **登记候选**（蓝图 §6.6），每个都补齐发表后证据与反驳检索记录，并跑 `bt candidate check`：
+- [x] 登记完成（00aa5aa+dc7d210+92d28f4，审核四条全闭环）：C001（复现 Vasileiou 2018/反驳 Han et al 2025 美股 2001 后消失等，24bp/事件折算；预筛 fail——成本倍数 1.79 由隔夜费 94% 驱动，swap-free 情景 29.8/检验力 96.7% 翻盘→U0 swap-free 确认升级为决定项）；C002（ECB 会议稿 0.0142 系数补正+Ito-Yamada 2018/Krohn 2024 修订后证据+−58% 折算 3.1bp/事件；预筛 waiting_data——成本 4.89 过线、检验力 45%<50% 纯数据长度）。文献真实性经审核员下载原文逐字核对（Krohn 两版+ECB PDF）。
   - C001 月末效应（USTEC）；
   - C002 月末对冲调仓（USTEC 当月涨跌 → EURUSD，伦敦 16:00 定盘前）；
   - 可再登记 1–2 个其他机制类别的候选。
-- [ ] **候选报告**：材料对比表，包括机制类别、文献（原始 / 复现 / 反驳）、折算后效应、事前成本、检验力（延长前后）、预筛结论。
-- [ ] **R1 草案**：最多 3 个候选，写明评估方式、试验预算、锁箱用量（≤ 1）、推进规则、结束条件。**提交草案后停下，等用户批准**；批准前不开卡、不跑任何运行。
+- [x] 候选报告完成（docs/research/candidates-R1-2026-10-28.md，状态待审核+六条预写标准；对比表 17 项与 precheck.json 逐项一致经审核复核）。
+- [x] R1 草案完成（research/rounds/R1.toml，approved_by="" 停批准点——装载器拒开实测两轮验证；budget 24/lockbox 1/event 评估；**已停下等批准，未开卡未跑任何研究运行**——台账 runs 446/lockbox 0/rounds 0 经审核核证）。
 
 ## T69：规则文档与权限
 
-- [ ] **规则文档**：`docs/p6/research-agent.md` 与 `review-agent.md` 改为新流程：候选 → 预筛 → 轮次 → 卡 → 关卡 v3 → 轮次报告；写明"预期不取自样本内"。
-- [ ] **路径白名单**（本地钩子与 CI 同源）：
+- [x] 规则文档改写完成（8561093）：六步流程+铁律 17/18 写明+旧路径取消（守护关键词全绿）；命令白名单加 bt candidate check/round status。
+- [x] 路径白名单完成（8561093+81f5bfa）：四情形守护测试红→绿（候选 toml/precheck.json 状态 A 允许；研究写 rounds 拒且文案点名管理员批准；admin 允许）；CI 同源自动生效；提示串同步（P3）。
   - 研究角色可以新增 `research/candidates/*.toml` 与 `*.precheck.json`（状态 A）；
   - `research/rounds/*.toml` 只允许管理员写（轮次含预算与锁箱用量，须用户批准）。
   - 守护测试覆盖以上三种情形。
-- [ ] **README**：指向本计划，更新当前禁止事项。
-- [ ] **阶段结束**：每完成一个阶段，更新蓝图 §2（四级证据如实），并重跑 `2026-10-25-round5-probes.py` 与 `2026-10-27-round11-power.py`，把输出贴进提交说明。
+- [x] README 完成（8561093）：指向 R11 计划与六步流程；禁止事项更新（screen/新卡/G5 前置照蓝图 §2 现状）。
+- [x] 阶段结束完成（8561093）：蓝图 §2 H 线四行核对更新；round5 与 round11-power 两探针输出入提交说明（P8–P13 全符合期望）。
 - [ ] **管理员路径**（第十二轮 G7）：在 `docs/p6/permissions.md` 写明管理员与审核会话的文档如何进入 main，避免 `research-allowlist` 红灯常态化。可选做法：管理员文档直推 main，或用经用户批准的 PR 标签豁免。
 
 ## T79：质检长缺口修复与主库缺口普查（第十二轮 G1）
