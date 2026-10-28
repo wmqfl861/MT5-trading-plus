@@ -290,7 +290,7 @@ class BaseStrategy:
   - discovery 卡读 `>= split` 被拒；validation 卡在 `< split` 上评估被拒；
   - 轮次文件：`[segments] split` 非月初或格式错 → 拒；概率模式轮次 `lockbox_uses_max = 0` → 过；含非概率候选的轮次为 0 → 拒；> 1 仍拒；概率模式候选缺 `[hypotheses]`、或列出候选没登记的假设 → 拒；H 线现有轮次文件装载结果不变；
   - P 线字段写入 `params_json`、`metrics_json` 后 `bt ledger verify` 通过，runs 表结构不变。
-- [ ] **审核三修正（`docs/reviews/2026-10-28-review-pline-03.md` D1 与小改；现在做）**：
+- [x] **审核三修正（`docs/reviews/2026-10-28-review-pline-03.md` D1 与小改；提交 d991411——tests run_number 124 红（run 的失败全在 H 线 scripts/reconcile_ab.py，P 线文件零失败），包含该提交的 4228926 为 run_number 125 success；探针 03 R1–R6 与 02 P1–P4 全 PASS；P2 卡/切片/常量核对/G0 冻结模型等 10+3 测试）**：
   - P 卡在 standard 模式下允许 `segment` 与 `[prob]`；拟合接线按"策略 fittable"判断，不按 `evaluation_mode`；probability 卡只能走 `bt prob test`，screen、gate 拒绝；
   - validation 卡的评估切到 [split, cutoff)，训练窗 < split；G0 冻结模型只用 < split 部分的前 70%，并传 `fit_meta`；
   - 卡的 `[prob]` 与策略类常量逐项核对，不一致拒绝；
@@ -298,7 +298,7 @@ class BaseStrategy:
   - H 线 `precheck` 判定那一行由 H 线 T84 还原（第十三轮审核 K10），P 线不改；
   - 补齐缺的测试：坏策略被 G0 查出；validation 卡在 < split 上评估被拒；`[hypotheses]` 列出候选没登记的假设被拒；standard 卡配拟合策略能拟合、能评估。
   - （审核四：d991411 已做大部分，但"standard 卡配拟合策略能拟合、能评估"没有做到，见下一项。）
-- [ ] **审核四修正（`docs/reviews/2026-10-28-review-pline-04.md` E1–E2；现在做）**：
+- [x] **审核四修正（`docs/reviews/2026-10-28-review-pline-04.md` E1–E2；提交 fb2432f，tests run_number 128 success；探针 04 R7 PASS；4+1 e2e + 五字段校验，全量 2188 passed）**：
   - screen、gate 先拟合（训练窗 < split）再切评估窗：现在先切片，训练窗变空，validation 卡一律报错；
   - 评估窗预热：评估数据从分界往前多取 `required_data.lookback_bars` 根，分界之前信号为 0，指标只按分界之后入场的交易计算；
   - `[prob]` 接受蓝图附录 A 的 `features`、`prior_strength`、`min_cell`、`lb_z`、`entry_threshold_cost_mult`（校验类型与取值），卡与策略类常量核对覆盖这五项；`prior_strength`、`min_cell` 改为策略类常量，不在 `fit` 里写死；
@@ -347,7 +347,7 @@ class BaseStrategy:
   - 决策把（局面, 动作, 方向, 估计, 成本）全部交给 `choose`；同一根上相反方向的触发都过门槛时不做；
   - 补齐缺的测试：每段同向信号 ≤ K 根、每笔交易持有 ≤ K 根；止损后同一次触发不再重入（经引擎验证）；连续亏损后手数不变；同一实例拟合两次结果相同；
   - 验收：复现脚本 `docs/reviews/probes/2026-10-28-pline-probes-03.py` 的 R3、R4 PASS。
-- [ ] **审核四修正（E3、E4；现在做）**：
+- [x] **审核四修正（E3、E4；提交 d9d4f4c，tests run_number 129 success；跨局面反向冲突+无成本键排除两测试；6b5cad3 run#133 复核 fit 政策回退调和）**：
   - 同一根 bar 上方向相反的动作都过门槛时不做（蓝图 §2.5 第 4 条补充）；现在只在"同动作、同期望值"时放弃；
   - 查不到成本的（局面, 动作）不参与决策（现在按成本 0 处理，门槛形同虚设）；`fit` 缺入场政策时报错（现在按"不限制"处理）；
   - `LevelDecisionS1Demo` 的常量已改成探针卡的取值，文档字符串注明"只供测试与探针，真实卡各自定义子类"；
@@ -394,7 +394,7 @@ def brier_skill(p_pred, outcome, p_base) -> float
   - 补齐缺的测试：ATR 分位匹配；误报率 1,000 次；Δp = 0.05、n = 2,000 时检出率 > 90%（多个种子）；
   - 正式标定的设计里加一组成簇负对照（计数得到的真实触发时刻整体平移若干周，只看平移后时刻的标签）；月内置换替代 D42 的按月块自助，作为方法变更在报告里写明理由与标定结果；正式运行 B ≥ 10,000；
   - 验收：复现脚本 03 的 R2、R6 PASS。
-- [ ] **审核四修正（E5；现在做）**：误报率单元测试现在是 40 次重复、每次 50 次置换，名义水平也随之变成约 3.9%；改为至少 400 次重复、每次 ≥ 200 次置换（耗时太长就标成慢测试，CI 外单独跑并在复选框写日志路径）。正式误报率以 T75 标定为准。
+- [x] **审核四修正（E5；提交 1b532e2，tests run_number 130 success）**：test_fpr_slow_400x200（400 重复×200 置换，P_LINE_SLOW=1 启用、CI 缺省 skip；本地实测 1 passed 139s，界 ≤32 即名义 ~8%；日志本机 data/prob/e5-fpr-400x200-2026-10-29.log）+ CI 内 40×50 粗检保留。正式误报率以 T75 标定为准。
 - [ ] **报告**：误报率表、检出率曲线、样本量规则、校准否决项的标定结果。**提交后停下，等审核批准。**
 
 ## T76：检验力、分段工具与 P 线预筛（M）
@@ -540,7 +540,7 @@ def n_needed_proportion(p0: float, dp: float, *, alpha: float = 0.05, power: flo
   - `round-report`：成本条件取候选预筛 `ex_ante_cost_prob.cost_r_by_symbol` 的最大值，按 ΔEV = Δp̂ × (tp_R + 1) ≥ 3 × 成本判定，报告分列"Holm 显著"与"成本条件"；一条假设有多条成功运行时拒绝；按候选与卡号过滤；用上 `--rounds-dir`；
   - 补齐缺的测试：端到端命令行测试（临时 git 仓库、已提交的卡、已开启的轮次、合成数据），覆盖 `bt prob test` 与 `round-report`；越过分界的触发被剔除（经 `run_p1_card`）；有卡未跑时 round-report 拒绝（经命令）；同一输入重跑台账去重 N 不变；
   - 验收：复现脚本 03 的 R1、R5 PASS。
-- [ ] **审核四修正（E6；现在做）**：
+- [x] **审核四修正（E6；提交 fac76b5（重排后 run#132 绿）+6b5cad3 run#133（兼容调和）；test_e6_report_uses_round_open_precheck_cost（开轮后磁盘 JSON 改写、报告仍按台账 0.05R）与 test_e6_empty_cost_map_rejected）**：
   - `run_p1_card` 的入场政策改为必填（现在缺省 None，等于不限制）；
   - round-report 的成本取开轮时已入账的预筛结论（台账 candidate_checks 里开轮时刻之前最新的一行），不读磁盘上随时可能重写的 JSON；`cost_r_by_symbol` 为空时拒绝（现在按成本 0 处理）；
   - 运行按（候选, 假设）过滤：`bt prob test` 把候选号写进 `params_json.prob`，round-report 按它过滤（现在按"卡号以 P 开头"过滤）；
