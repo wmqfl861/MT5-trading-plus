@@ -64,15 +64,16 @@ def card_triggers(card, bars_by_symbol: dict, *, approach: Approach,
 
 
 def run_p1_card(card, round_obj, bars_by_symbol: dict, costs_by_symbol: dict,
-                *, sizes: dict, policy_by_symbol: dict | None = None,
+                *, sizes: dict, policy_by_symbol: dict,
                 sims: int = 400) -> list[dict]:
     """一张卡的全部假设一次跑完（不能只跑几条）。
 
     每条假设返回 dict：{hypothesis, seed, n_triggers, n_trigger_days,
     real_win_rate, null_win_rate, delta_p, p_value, prob_version}。
     只读发现段（调用方保证 bars 的 time < split）；标签 train_end=split；
-    禁入窗与 bt 同一来源（policy_by_symbol[sym]——审核三 S8：蓝图 §2.3
-    标签与引擎同口径）；sizes 缺品种 → ValueError（不默认 1.0）。
+    禁入窗与 bt 同一来源（policy_by_symbol[sym]——审核三 S8/E6：蓝图
+    §2.3 标签与引擎同口径，**必填**，缺品种 → ValueError，不按"不限制"
+    处理）；sizes 缺品种 → ValueError（不默认 1.0）。
     """
     bracket = Bracket(sl_atr=card.prob["bracket"]["sl_atr"],
                       tp_atr=card.prob["bracket"]["tp_atr"],
@@ -99,7 +100,12 @@ def run_p1_card(card, round_obj, bars_by_symbol: dict, costs_by_symbol: dict,
                 raise ValueError(
                     f"{sym} 的合约大小未知（sizes 缺失）——标签引擎须与"
                     "评估同口径，不默认 1.0（审核三 S8）")
-            policy = (policy_by_symbol or {}).get(sym)
+            policy = policy_by_symbol.get(sym)
+            if policy is None:
+                raise ValueError(
+                    f"{sym} 缺入场政策（policy_by_symbol）——标签引擎须与"
+                    " bt 同一 entry_policy_for（审核四 E6；蓝图 §2.3），"
+                    "不按'不限制'处理")
             kw = dict(symbol=sym, timeframe=card.timeframe, bracket=bracket,
                       contract_size=sizes[sym],
                       volume_lots=1.0, train_end=split,

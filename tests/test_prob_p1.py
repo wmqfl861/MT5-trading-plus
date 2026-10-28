@@ -107,10 +107,15 @@ def test_run_p1_card_deterministic_and_structured():
     card = fake_card()
     rnd = fake_round()
     sizes = {"XAUUSD": 100.0}
+    from mt5data.sessions import SessionPolicy
+    permissive = SessionPolicy(exempt_symbols=frozenset({"XAUUSD"}))
+    pol = {"XAUUSD": permissive}
     r1 = p1mod.run_p1_card(card, rnd, {"XAUUSD": bars},
-                           {"XAUUSD": FlatCosts()}, sizes=sizes, sims=200)
+                           {"XAUUSD": FlatCosts()}, sizes=sizes,
+                           policy_by_symbol=pol, sims=200)
     r2 = p1mod.run_p1_card(card, rnd, {"XAUUSD": bars},
-                           {"XAUUSD": FlatCosts()}, sizes=sizes, sims=200)
+                           {"XAUUSD": FlatCosts()}, sizes=sizes,
+                           policy_by_symbol=pol, sims=200)
     assert r1 == r2                              # 逐位一致
     assert len(r1) == 1
     row = r1[0]

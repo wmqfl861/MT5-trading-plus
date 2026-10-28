@@ -156,8 +156,9 @@ def cli_env(tmp_path, monkeypatch):
     ledger_path = store / "research" / "ledger.sqlite"
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
     with Ledger(ledger_path) as led:
-        led.record_candidate_check("C101", decision="pass",
-                                   result={"probe": True})
+        led.record_candidate_check("C101", decision="pass", result={
+            "checks": {"ex_ante_cost_prob": {
+                "passed": True, "cost_r_by_symbol": {"XAUUSD": 0.05}}}})
         led.record_round_open(
             round_id="R2", candidates=["C101"], trial_budget=12,
             lockbox_uses_max=0, dsr_trial_scope="project",
@@ -350,3 +351,117 @@ def test_round_report_rejects_missing_hypothesis_runs(cli_env, monkeypatch):
         code = e.code
     assert code == 1
     assert "没有运行记录" in out.getvalue()
+
+
+def test_e6_report_uses_round_open_precheck_cost(cli_env, monkeypatch):
+    """E6：开轮后预筛 JSON 被改写（磁盘），报告仍用**开轮时入账**的
+    台账 candidate_checks 成本；候选号过滤生效。"""
+    import contextlib, io as _io
+    from datetime import datetime, timezone, timedelta
+    # 开轮前先入账一个"贵"成本预筛（记录即入链）
+    with Ledger(cli_env["ledger"]) as led:
+        led.record_candidate_check("C101", decision="pass", result={
+            "checks": {"ex_ante_cost_prob": {
+                "passed": True, "cost_r_by_symbol": {"XAUUSD": 0.05}}}})
+    # 磁盘 JSON 写个"便宜"成本（模拟开轮后被改写）
+    cands = cli_env["repo"] / "research" / "candidates"
+    cands.mkdir(parents=True, exist_ok=True)
+    (cands / "C101.precheck.json").write_text(json.dumps({
+        "candidate_id": "C101", "decision": "pass",
+        "checks": {"ex_ante_cost_prob": {
+            "passed": True, "cost_r_by_symbol": {"XAUUSD": 0.0001}}}}),
+        encoding="utf-8")
+    _git(cli_env["repo"], "add", ".")
+    _git(cli_env["repo"], "commit", "-q", "-m", "precheck")
+    code, _ = _run_prob_test(cli_env, monkeypatch)
+    assert code == 0
+    # 两条假设运行（Δp 真实值不定），直接重写台账两行成本无关字段使
+    # ΔEV 显著不足（p≈0、Δp=0.005 < 3×0.05R）——经台账正规写入
+    with Ledger(cli_env["ledger"]) as led:
+        rows = led.conn.execute(
+            "SELECT run_id, card_id, params_json FROM runs "
+            "WHERE round_id='R2'").fetchall()
+        for r in rows:
+            params = json.loads(r["params_json"])
+            params["prob"]["candidate"] = "C101"
+            metrics = {"prob": {"p_value": 1e-6, "delta_p": 0.005,
+                                "n_trigger_days": 5000, "n_triggers": 5000,
+                                "prob_version": "1.0.0"}}
+            conn = led.conn
+            payload_ok = json.dumps({"ok": True, "error": None,
+                                     "metrics": metrics})
+            conn.execute(
+                "UPDATE runs SET params_json=?, metrics_json=? "
+                "WHERE run_id=?",
+                (json.dumps(params), payload_ok, r["run_id"]))
+        led.conn.commit()
+    argv = ["prob", "round-report", "R2",
+            "--rounds-dir", str(cli_env["repo"] / "research" / "rounds"),
+            "--candidates-dir", str(cands),
+            "--data-root", str(cli_env["store"]),
+            "--ledger", str(cli_env["ledger"])]
+    out = _io.StringIO()
+    code = 0
+    monkeypatch.chdir(cli_env["tmp"])
+    try:
+        with contextlib.redirect_stdout(out):
+            code = BT.main(argv)
+    except SystemExit as e:
+        code = e.code
+    assert code == 0, out.getvalue()
+    reports = sorted((cli_env["tmp"] / "docs" / "research")
+                     .glob("round-R2-p1-*.md"))
+    text = reports[-1].read_text(encoding="utf-8")
+    # 台账开轮行成本 0.05 → 门槛 0.15R；磁盘 0.0001 → 0.0003R（若读磁盘
+    # 会误判推进）。ΔEV=0.005×3=0.015R：按台账成本"不推进"。
+    for h in ("S1:A1:follow>base", "S1:A3:fade>base"):
+        row = next(ln for ln in text.splitlines() if h in ln)
+        assert "不推进" in row, row
+
+
+def test_e6_empty_cost_map_rejected(cli_env, monkeypatch):
+    """E6：开轮时入账的预筛 cost_r_by_symbol 为空 → 拒出报告。"""
+    import contextlib, io as _io
+    db2 = cli_env["tmp"] / "ledger2.sqlite"
+    with Ledger(db2) as led:
+        led.record_candidate_check("C101", decision="pass", result={
+            "checks": {"ex_ante_cost_prob": {"passed": None,
+                                             "cost_r_by_symbol": {}}}})
+        led.record_round_open(
+            round_id="R2", candidates=["C101"], trial_budget=12,
+            lockbox_uses_max=0, dsr_trial_scope="project",
+            advance_rule="a", close_rule="c", approved_by="探针",
+            evaluation={"C101": {"mode": "probability",
+                                 "primary": "d"}},
+            toml_sha256=hashlib.sha256(
+                cli_env["round"].read_bytes()).hexdigest(),
+            git_commit="0" * 40)
+        for h in ("S1:A1:follow>base", "S1:A3:fade>base"):
+            led.record_run(
+                card_id="P001-v1", card_version=1, strategy=STRATEGY_REF,
+                params={"hypothesis": h,
+                        "prob": {"candidate": "C101",
+                                 "segment": "discovery",
+                                 "split": "2019-12-01",
+                                 "bracket": {"sl_atr": 1.0, "tp_atr": 2.0,
+                                             "horizon_bars": 8},
+                                 "seed": 1, "prob_version": "1.0.0"}},
+                symbol="XAUUSD", timeframe="H1", data_first=None,
+                data_last=None, data_sha256="a" * 64, engine_version="e",
+                cost_model_version="v", gates_hash="",
+                metrics={"prob": {"p_value": 0.5, "delta_p": 0.01,
+                                  "n_trigger_days": 10}},
+                actor="bt", round_id="R2")
+    argv = ["prob", "round-report", "R2",
+            "--rounds-dir", str(cli_env["repo"] / "research" / "rounds"),
+            "--data-root", str(cli_env["store"]),
+            "--ledger", str(db2)]
+    out = _io.StringIO()
+    code = 0
+    try:
+        with contextlib.redirect_stdout(out):
+            code = BT.main(argv)
+    except SystemExit as e:
+        code = e.code
+    assert code == 1
+    assert "为空" in out.getvalue() or "cost_r_by_symbol" in out.getvalue()

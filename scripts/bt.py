@@ -1803,7 +1803,8 @@ def cmd_prob_test(args) -> int:
             return 1                 # 策略未提交/脏/指纹绑定不符（已打印）
         for r in results:
             params = {"hypothesis": r["hypothesis"],
-                      "prob": {"segment": card.segment,
+                      "prob": {"candidate": card.candidate,
+                               "segment": card.segment,
                                "split": round_obj.segments["split"],
                                "bracket": dict(card.prob["bracket"]),
                                "seed": r["seed"],
@@ -1864,26 +1865,39 @@ def cmd_prob_round_report(args) -> int:
         all_runs = ledger.runs_of_round(round_obj.id)
         pvals: dict[str, float] = {}
         rows = []
+        opened_at = (ledger.round(round_obj.id) or {}).get("opened_utc", "")
         for cid, hyps in round_obj.hypotheses.items():
-            # 候选预筛成本（R 口径，逐品种取最大）
-            pre_json = Path(args.candidates_dir) / f"{cid}.precheck.json"
-            if not pre_json.is_file():
-                print(f"✗ 候选 {cid} 的预筛结果缺失（{pre_json.name}）——"
-                      "成本条件无从判定；先跑 bt candidate check")
+            # 审核四 E6：成本取**开轮时已入账**的预筛结论（台账
+            # candidate_checks 里 opened_utc 之前最新一行），不读磁盘上
+            # 随时可被重写的 JSON
+            rows_chk = [r for r in ledger.candidate_checks(cid)
+                        if r["checked_at_utc"] <= opened_at]
+            if not rows_chk:
+                print(f"✗ 候选 {cid} 在开轮（{opened_at}）前没有预筛记录"
+                      "——成本条件无从判定")
                 return 1
             try:
-                pre = json.loads(pre_json.read_text(encoding="utf-8"))
-                cost_r = max((pre["checks"]["ex_ante_cost_prob"]
-                              ["cost_r_by_symbol"] or {"X": 0.0}).values())
+                pre = json.loads(rows_chk[-1]["result_json"])
+                cost_map = (pre["checks"]["ex_ante_cost_prob"]
+                            ["cost_r_by_symbol"])
             except (ValueError, KeyError, TypeError) as e:
-                print(f"✗ {pre_json.name} 无法解析成本（{e}）")
+                print(f"✗ 候选 {cid} 开轮时的预筛记录无法解析成本（{e}）")
                 return 1
+            if not cost_map:
+                print(f"✗ 候选 {cid} 开轮时的预筛记录 cost_r_by_symbol "
+                      "为空——成本条件无从判定（E6：不按成本 0 处理）")
+                return 1
+            cost_r = max(float(v) for v in cost_map.values())
             for h in hyps:
                 key = f"{cid}:{h}"
+                # 审核四 E6：按（候选, 假设）过滤（候选号由 bt prob test
+                # 写进 params.prob.candidate；兼容缺候选号的旧运行——
+                # 假设字符串唯一即可）
                 runs = [r for r in all_runs
                         if (r["params"] or {}).get("hypothesis") == h
                         and r.get("ok")
-                        and _card_of(r).startswith("P")]
+                        and ((r["params"].get("prob") or {}).get(
+                            "candidate", cid) == cid)]
                 if not runs:
                     print(f"✗ 假设 {h} 没有运行记录——全部卡跑完才能出报告")
                     return 1
