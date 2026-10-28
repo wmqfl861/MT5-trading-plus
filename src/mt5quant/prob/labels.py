@@ -76,9 +76,11 @@ def _locate(bars: pd.DataFrame, times) -> list[int]:
 
 def label_triggers(bars: pd.DataFrame, triggers: pd.DataFrame, costs, *,
                    symbol: str, timeframe: str, bracket: Bracket,
-                   contract_size: float, sizing: RiskSizing,
-                   vol_bounds: tuple[float, float, float],
-                   train_end=None, session_policy=None) -> pd.DataFrame:
+                   contract_size: float,
+                   sizing: RiskSizing | None = None,
+                   vol_bounds: tuple[float, float, float] | None = None,
+                   train_end=None, session_policy=None,
+                   volume_lots: float | None = None) -> pd.DataFrame:
     """给每次触发打首达标签。
 
     triggers 列：time（触发 bar，收盘判断）、situation、action、side（±1）、
@@ -94,7 +96,16 @@ def label_triggers(bars: pd.DataFrame, triggers: pd.DataFrame, costs, *,
 
     vol_bounds = (vol_min, vol_step, vol_max)（品种快照三元组）。
     """
-    vol_min, vol_step, vol_max = validate_volume_bounds(*vol_bounds)
+    if sizing is None and volume_lots is None:
+        raise ValueError("sizing 与 volume_lots 至少给一个（引擎口径，"
+                         "二者同缺即拒）")
+    if sizing is not None and volume_lots is not None:
+        raise ValueError("sizing 与 volume_lots 二选一（引擎口径）")
+    vol_min = vol_step = vol_max = None
+    if vol_bounds is not None:
+        vol_min, vol_step, vol_max = validate_volume_bounds(*vol_bounds)
+    elif sizing is not None:
+        raise ValueError("sizing 模式需要 vol_bounds（品种快照三元组）")
     tf_seconds = TIMEFRAME_SECONDS.get(
         timeframe.upper() if timeframe else "")
     if tf_seconds is None:
@@ -135,11 +146,15 @@ def label_triggers(bars: pd.DataFrame, triggers: pd.DataFrame, costs, *,
             stop_loss_atr=bracket.sl_atr,
             take_profit_atr=bracket.tp_atr,
             reentry="after_signal_change"))
-        res = run_backtest(
-            strategy, sl, costs, symbol=symbol, params={},
-            contract_size=contract_size, timeframe=timeframe,
-            session_policy=session_policy, sizing=sizing,
-            vol_min=vol_min, vol_step=vol_step, vol_max=vol_max)
+        bt_kwargs = dict(symbol=symbol, params={},
+                         contract_size=contract_size, timeframe=timeframe,
+                         session_policy=session_policy)
+        if sizing is not None:
+            bt_kwargs.update(sizing=sizing, vol_min=vol_min,
+                             vol_step=vol_step, vol_max=vol_max)
+        else:
+            bt_kwargs["volume_lots"] = volume_lots
+        res = run_backtest(strategy, sl, costs, **bt_kwargs)
         if len(res.trades) == 0:
             outcomes.append("skipped")
             net_rs.append(float("nan"))

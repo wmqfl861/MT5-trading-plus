@@ -1167,14 +1167,16 @@ def _prob_fit_context(card, round_ctx, bars_by_sym, costs_by_sym, data_root,
 
 
 def _fit_and_freeze(strategy_cls, card, fit_ctx, bars_by_sym, costs_by_sym,
-                    data_root):
+                    data_root, *, fit_meta=None):
     """执行拟合 + 冻结落盘，补全 fit_ctx（model/model_sha/model_path 与
     台账字段）。同一输入重拟合 → 同一模型 dict → 同一 sha（策略 fit 的
-    确定性；铁律 21）。"""
+    确定性；铁律 21）。fit_meta（合约大小/手数口径等运行侧信息）经
+    params["__fit__"] 传入——协议签名不变，标签引擎与评估引擎同口径。"""
     from mt5quant.prob.artifact import save_model
 
     inst = strategy_cls()
-    model = inst.fit(fit_ctx["fit_bars"], costs_by_sym, {},
+    model = inst.fit(fit_ctx["fit_bars"], costs_by_sym,
+                     {"__fit__": fit_meta or {}},
                      train_end=fit_ctx["train_end"],
                      purge_bars=fit_ctx["purge_bars"])
     root = Path(data_root) / "models" / card.id
@@ -1372,7 +1374,10 @@ def cmd_screen(args) -> int:
                     fit_ctx = _prob_fit_context(
                         card, round_ctx, bars_by_sym, costs_by_sym, data_root)
                     _fit_and_freeze(strategy_cls, card, fit_ctx, bars_by_sym,
-                                    costs_by_sym, data_root)
+                                    costs_by_sym, data_root,
+                                    fit_meta={"sizes": sizes,
+                                              "vols_by_sym": vols_by_sym,
+                                              "sizing": sizing_info})
                 except ValueError as e:
                     print(f"✗ {e}")
                     return 1
@@ -1645,7 +1650,10 @@ def cmd_gate(args) -> int:
                 fit_ctx = _prob_fit_context(
                     card, round_ctx, bars_by_sym, costs_by_sym, data_root)
                 _fit_and_freeze(type(strategy), card, fit_ctx, bars_by_sym,
-                                costs_by_sym, data_root)
+                                costs_by_sym, data_root,
+                                fit_meta={"sizes": sizes,
+                                          "vols_by_sym": vols_by_sym,
+                                          "sizing": sizing_info})
             except ValueError as e:
                 print(f"✗ {e}")
                 return 1
