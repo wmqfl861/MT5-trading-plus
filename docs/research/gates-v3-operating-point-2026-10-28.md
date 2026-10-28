@@ -233,7 +233,7 @@ T65 的 USTEC D1 辅助臂（`v3-ext-before/`，短历史病理反例）不在"�
 
 ## 7. 口径、限制与守护
 
-- **失败测试（先红后绿，11 个新增）**：N 口径两谱系（`project_n_dedup_
+- **失败测试（先红后绿，9 个新增+2 个修改补键——T85 审核更正计数）**：N 口径两谱系（`project_n_dedup_
   rounds` 跨轮同键只计一次/轮次内标定与失败运行不计/现行键逐位不变；
   `lineage_n_dedup` 只计轮次外研究试验、`primary_test_n` 之和与
   pre_round_other 只报告）；`continues_family` 可选字段（缺省空、非字符串

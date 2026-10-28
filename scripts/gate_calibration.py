@@ -1598,7 +1598,7 @@ def v3_t85_operating_point(results: dict) -> dict:
         elif min(da.values()) != min(db.values()):
             winner = a if min(da.values()) > min(db.values()) else b
             selected = winner
-            reason = "互有高低 → 取最差设置联合检出较高者（预写平局规则）"
+            reason = "互有高低 → 取最差设置联合检出较高者（运行时补充平局规则——T85 审核更名：非预写文本）"
         else:
             selected, reason = "psr0_bonf", "处处相同 → 选丙（实现更简单）"
 
