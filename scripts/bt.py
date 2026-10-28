@@ -1388,6 +1388,77 @@ class _FittedFactory:
         return getattr(self._cls, name)
 
 
+def _check_card_strategy_constants(card, strategy_cls) -> str | None:
+    """审核三 D1：卡的 [prob] 与策略类常量逐项核对——不一致返回错误信息
+    （bracket/situations/level_grid/approach/breakout_atr/retest）。
+    防止卡上登记的检验配置与实际运行的策略配置脱节。"""
+    prob = card.prob
+    if prob is None:
+        return None
+    pairs = [
+        ("bracket.sl_atr", prob["bracket"]["sl_atr"], "SL_ATR"),
+        ("bracket.tp_atr", prob["bracket"]["tp_atr"], "TP_ATR"),
+        ("bracket.horizon_bars", prob["bracket"]["horizon_bars"],
+         "HORIZON_BARS"),
+        ("breakout_atr", prob["breakout_atr"], "BREAKOUT_ATR"),
+        ("retest_window_bars", prob["retest_window_bars"],
+         "RETEST_WINDOW_BARS"),
+    ]
+    for pkey, pval, cls_attr in pairs:
+        cval = getattr(strategy_cls, cls_attr, None)
+        if cval is None or float(pval) != float(cval):
+            return (f"卡 [prob].{pkey}={pval!r} 与策略类常量 "
+                    f"{cls_attr}={cval!r} 不一致——检验配置脱节，拒绝运行")
+    sit_c = tuple(getattr(strategy_cls, "SITUATIONS", ()) or ())
+    if tuple(prob["situations"]) != tuple(sit_c):
+        return (f"卡 [prob].situations={list(prob['situations'])} 与策略类 "
+                f"SITUATIONS={list(sit_c)} 不一致——拒绝运行")
+    grid_c = getattr(strategy_cls, "LEVEL_GRID", None) or {}
+    for sym, step in prob["level_grid"].items():
+        if float(grid_c.get(sym, 0.0)) != float(step):
+            return (f"卡 [prob].level_grid[{sym}]={step!r} 与策略类 "
+                    f"LEVEL_GRID[{sym}]={grid_c.get(sym)!r} 不一致——拒绝运行")
+    ap = prob["approach"]
+    cls_ap = getattr(strategy_cls, "APPROACH", None)
+    if cls_ap is None:
+        return "策略类缺 APPROACH 常量——与卡 [prob].approach 无法核对"
+    for k, attr in (("lookback_bars", "lookback_bars"),
+                    ("min_distance_atr", "min_distance_atr"),
+                    ("touch_atr", "touch_atr")):
+        if float(ap[k]) != float(getattr(cls_ap, attr)):
+            return (f"卡 [prob].approach.{k}={ap[k]!r} 与策略类 "
+                    f"APPROACH.{attr}={getattr(cls_ap, attr)!r} 不一致——"
+                    "拒绝运行")
+    return None
+
+
+def _reject_probability_card_backtest(card) -> str | None:
+    """审核三 D1：probability 卡只走 bt prob test（P1 现象检验），
+    screen/gate 拒绝——两套评估口径不可混用。"""
+    if card.evaluation_mode == "probability":
+        return ("probability 卡（P1 现象检验）不跑 screen/gate——"
+                "Δp 检验经 bt prob test（T90），关卡评估属 P2 决策卡"
+                "（standard+validation，T92）")
+    return None
+
+
+def _slice_validation_eval(card, round_obj, bars_by_sym) -> None:
+    """审核三 D1：validation 卡的评估切到 [split, cutoff)——就地裁剪
+    bars_by_sym（训练窗在 _prob_fit_context 里取 < split）；分界后无
+    数据 → ValueError。"""
+    if card.segment != "validation":
+        return
+    split = pd.Timestamp((round_obj.segments or {})["split"])
+    for sym, bars in list(bars_by_sym.items()):
+        times = pd.to_datetime(bars["time"])
+        after = bars[times >= split].reset_index(drop=True)
+        if len(after) == 0:
+            raise ValueError(
+                f"{sym} 在分界 {split} 之后没有数据——validation 卡的评估"
+                "窗是 [split, cutoff)，分界前数据不算样本外（D50；审核三 D1）")
+        bars_by_sym[sym] = after
+
+
 def _prob_fit_context(card, round_ctx, bars_by_sym, costs_by_sym, data_root,
                       *, for_g0: bool = False):
     """T73A/D50：概率卡的拟合上下文——分段约束 + 单一训练窗拟合 + 冻结模型。
@@ -1401,7 +1472,9 @@ def _prob_fit_context(card, round_ctx, bars_by_sym, costs_by_sym, data_root,
     模型写 data_research 模型库：{data_root}/models/<卡>/<sha256>.json
     （蓝图 P 线附录 B；同一输入重拟合哈希相同——确定性由策略 fit 保证）。
     """
-    if getattr(card, "evaluation_mode", "standard") != "probability":
+    # 审核三 D1：按卡是否带 segment 生效（probability 卡或
+    # standard+validation 的 P2 决策卡），不再只认 evaluation_mode
+    if not getattr(card, "segment", ""):
         return None
     rnd_path = Path(card.path).parent.parent / "rounds" / f"{card.round}.toml"
     try:
@@ -1603,6 +1676,10 @@ def cmd_prob_test(args) -> int:
         split = pd.Timestamp(round_obj.segments["split"])
         try:
             strategy_cls = load_strategy(args.strategy)
+            _cs = _check_card_strategy_constants(card, strategy_cls)
+            if _cs:
+                print(f"✗ {_cs}")
+                return 1
             del strategy_cls          # P1 不跑策略引擎（标签经 prob.labels）
             sizes = {sym: resolve_contract_size(data_root, sym, None)
                      for sym in card.symbols}
@@ -1642,6 +1719,9 @@ def cmd_prob_test(args) -> int:
         except Exception as e:
             print(f"✗ P1 运行失败：{type(e).__name__}: {e}")
             return 1
+        strategy_sha = _bind_strategy_sha(ledger, card, args.strategy)
+        if strategy_sha is None:
+            return 1                 # 策略未提交/脏/指纹绑定不符（已打印）
         for r in results:
             params = {"hypothesis": r["hypothesis"],
                       "prob": {"segment": card.segment,
@@ -1666,7 +1746,7 @@ def cmd_prob_test(args) -> int:
                 engine_version=ENGINE_VERSION,
                 cost_model_version=cost_version, gates_hash=_gates_hash(),
                 metrics=metrics, actor=actor,
-                strategy_sha=_bind_strategy_sha(ledger, card, args.strategy),
+                strategy_sha=strategy_sha,
                 run_class="research", round_id=round_obj.id)
             mark = "✓" if r["p_value"] < 0.05 else "·"
             print(f"{mark} run#{rid} {r['hypothesis']}：触发 "
@@ -1811,6 +1891,11 @@ def cmd_fit(args) -> int:
     if card.evaluation_mode != "probability":
         print("✗ bt fit 只用于 evaluation_mode = probability 的卡（T73A）")
         return 1
+    _cs = _check_card_strategy_constants(
+        card, load_strategy(args.strategy))
+    if _cs:
+        print(f"✗ {_cs}")
+        return 1
     try:
         data_root, store_kind = _resolve_store(args)
     except ValueError as e:
@@ -1951,6 +2036,22 @@ def cmd_screen(args) -> int:
                 cost_version = "zero-v0"
                 costs_by_sym = {sym: ZeroCosts() for sym in card.symbols}
                 policy_by_sym = {sym: sess_policy for sym in card.symbols}
+                # 审核三 D1：probability 卡拒绝 screen；卡/策略常量核对
+            _bc_msg = _reject_probability_card_backtest(card)
+            if _bc_msg:
+                print(f"✗ {_bc_msg}")
+                return 1
+            _cs_msg = _check_card_strategy_constants(card, strategy_cls)
+            if _cs_msg:
+                print(f"✗ {_cs_msg}")
+                return 1
+            if getattr(card, "segment", "") == "validation":
+                # D1：评估切 [split, cutoff)（训练窗由拟合上下文取 < split）
+                rnd_path = Path(card.path).parent.parent / "rounds" / \
+                    f"{card.round}.toml"
+                _slice_validation_eval(
+                    card, rnd.load_round(rnd_path), bars_by_sym)
+                bars_by_sym = {k: v for k, v in bars_by_sym.items()}
             # T73A：fittable 策略先拟合再评估（单一训练窗，D44/铁律 21）
             if getattr(strategy_cls, "fittable", False):
                 try:
@@ -2224,6 +2325,21 @@ def cmd_gate(args) -> int:
             print(f"✗ 装配失败（未开跑，无 runs 记录）：{type(e).__name__}: {e}")
             return 1
 
+        # 审核三 D1：probability 卡拒绝 gate；卡/策略常量核对；
+        # validation 评估切 [split, cutoff)
+        _bc_msg = _reject_probability_card_backtest(card)
+        if _bc_msg:
+            print(f"✗ {_bc_msg}")
+            return 1
+        _cs_msg = _check_card_strategy_constants(card, type(strategy))
+        if _cs_msg:
+            print(f"✗ {_cs_msg}")
+            return 1
+        if getattr(card, "segment", "") == "validation":
+            rnd_path = Path(card.path).parent.parent / "rounds" / \
+                f"{card.round}.toml"
+            _slice_validation_eval(card, rnd.load_round(rnd_path),
+                                   bars_by_sym)
         # T73A：拟合策略先拟合再评估；walk-forward（G3）与关卡 v3 主检验
         # 在 T73B（逐窗拟合 + purge 接线，等 H 线审核会话批准 T65）完成前
         # 一律拒绝运行
@@ -2356,9 +2472,14 @@ def cmd_gate(args) -> int:
             g0_strategy = strategy
             if fit_ctx is not None:
                 # T73A：G0 用研究段前 70% 拟合出的冻结模型（截断一致与
-                # 窗口不变性检查针对装好模型的策略）
+                # 窗口不变性检查针对装好模型的策略）。审核三 D1：validation
+                # 卡的 G0 只用 **< split 训练段** 的前 70%（评估段是样本外，
+                # 不得进 G0 的拟合）
+                g0_bars = bars_by_sym
+                if getattr(card, "segment", "") == "validation":
+                    g0_bars = dict(fit_ctx["fit_bars"])
                 g0_ctx = _prob_fit_context(
-                    card, round_ctx, bars_by_sym, costs_by_sym, data_root,
+                    card, round_ctx, g0_bars, costs_by_sym, data_root,
                     for_g0=True)
                 _fit_and_freeze(type(strategy), card, g0_ctx, bars_by_sym,
                                 costs_by_sym, data_root,

@@ -168,6 +168,8 @@ def cli_env(tmp_path, monkeypatch):
             git_commit="0" * 40)
     monkeypatch.setattr(BT, "build_costs",
                         lambda *a, **k: (FlatCosts(), "flat-probe"))
+    monkeypatch.setattr(BT, "_bind_strategy_sha",
+                        lambda led, card, ref: "f" * 40)
     return {"repo": repo, "store": store, "ledger": ledger_path,
             "card": card_p, "round": round_p, "tmp": tmp_path}
 

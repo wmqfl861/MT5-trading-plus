@@ -392,15 +392,41 @@ def validate_card(data: dict, *, source: str) -> Card:
         except CandidateError as e:
             raise CardError(str(e)) from e
     else:
-        if prob_raw is not None:
+        # 审核三 D1：P 卡（P###-v#）在 standard 模式（P2 决策卡）下允许
+        # segment（validation）与 [prob]——蓝图附录 A：P2 的卡
+        # evaluation_mode="standard"、segment="validation"；H 线卡不带。
+        is_p_card = _P_CARD_ID.match(cid) is not None
+        if prob_raw is not None and not is_p_card:
             raise CardError(
-                f"{source}：[prob] 段只允许出现在 evaluation_mode="
-                '"probability" 的卡上（T73A）')
-        if segment:
+                f"{source}：[prob] 段只允许出现在 P###-v# 卡（probability "
+                "的 P1 卡或 standard+validation 的 P2 决策卡——审核三 D1）")
+        if segment and not is_p_card:
             raise CardError(
-                f"{source}：segment 只对 probability 卡有意义（D50），"
+                f"{source}：segment 只对 P###-v# 卡有意义（D50），"
+                f"收到 {segment!r}")
+        if segment and segment not in _SEGMENTS:
+            raise CardError(
+                f"{source}：segment 必须是 {list(_SEGMENTS)} 之一（D50），"
                 f"收到 {segment!r}")
         prob = None
+        if prob_raw is not None:
+            if segment != "validation":
+                raise CardError(
+                    f"{source}：standard P 卡带 [prob] 时 segment 必须是 "
+                    f'"validation"（P2 决策卡——审核三 D1/蓝图附录 A），'
+                    f"收到 {segment!r}")
+            if primary_statistic and primary_statistic != "max_net_profit":
+                raise CardError(
+                    f"{source}：standard P 卡的 primary_statistic 按关卡 v3 "
+                    f'主检验（缺省 max_net_profit），收到 {primary_statistic!r}')
+            from mt5quant.research.candidates import (
+                CandidateError, _validate_prob,
+            )
+            try:
+                prob = dict(vars(_validate_prob(prob_raw, source,
+                                                tuple(symbols))))
+            except CandidateError as e:
+                raise CardError(str(e)) from e
 
     graveyard = data.get("graveyard_checked")
     if not isinstance(graveyard, list) or not all(
@@ -429,8 +455,8 @@ def validate_card(data: dict, *, source: str) -> Card:
         params=_validate_params(data.get("params", {}), source),
         expected=_validate_table(
             data.get("expected"),
-            _PROB_EXPECTED_KEYS if evaluation_mode == "probability"
-            else _EXPECTED_KEYS,
+            _PROB_EXPECTED_KEYS if (evaluation_mode == "probability"
+                                    or prob is not None) else _EXPECTED_KEYS,
             "expected", source),
     )
 

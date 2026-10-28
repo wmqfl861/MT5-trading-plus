@@ -103,7 +103,7 @@ def test_h_card_unchanged_and_prob_forbidden():
     assert c.prob is None
     bad = _h_card_data()
     bad["prob"] = p_card_data()["prob"]
-    with pytest.raises(cards.CardError, match="evaluation_mode"):
+    with pytest.raises(cards.CardError, match="P###"):
         cards.validate_card(bad, source="t")
 
 
@@ -112,4 +112,44 @@ def test_probability_forbidden_with_declared_grid_params():
     d = p_card_data()
     d["params"] = {"x": (1, 2)}
     with pytest.raises(cards.CardError, match="网格"):
+        cards.validate_card(d, source="t")
+
+
+# ------------------------------------------------- 审核三 D1：P2 决策卡
+
+def test_p2_standard_validation_card_loads():
+    """D1：P 卡 standard + segment=validation + [prob]——P2 决策卡可写。"""
+    d = p_card_data()
+    d["evaluation_mode"] = "standard"
+    d["segment"] = "validation"
+    d.pop("primary_statistic", None)
+    c = cards.validate_card(d, source="t")
+    assert c.evaluation_mode == "standard"
+    assert c.segment == "validation"
+    assert c.prob is not None and len(c.prob["hypotheses"]) == 4
+
+
+def test_p2_standard_requires_validation_segment():
+    d = p_card_data()
+    d["evaluation_mode"] = "standard"
+    d["segment"] = "discovery"
+    d.pop("primary_statistic", None)
+    with pytest.raises(cards.CardError, match="validation"):
+        cards.validate_card(d, source="t")
+
+
+def test_p2_card_wrong_primary_statistic_rejected():
+    d = p_card_data()
+    d["evaluation_mode"] = "standard"
+    d["segment"] = "validation"
+    d["primary_statistic"] = "delta_p_one_sided"
+    with pytest.raises(cards.CardError, match="关卡 v3"):
+        cards.validate_card(d, source="t")
+
+
+def test_p2_card_without_segment_rejected():
+    d = p_card_data()
+    d["evaluation_mode"] = "standard"
+    del d["segment"]
+    with pytest.raises(cards.CardError, match="segment 必须"):
         cards.validate_card(d, source="t")

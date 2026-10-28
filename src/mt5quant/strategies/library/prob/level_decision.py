@@ -291,18 +291,21 @@ def _ev_of(cand, z) -> float:
 
 
 class LevelDecisionS1Demo(LevelDecisionV1):
-    """S1 整数关口演示子类（XAUUSD H1，网格 50）。"""
+    """S1 整数关口演示子类（XAUUSD H1）——常量与审核探针卡一致
+    （K=8、网格 2.0、approach 12/1.0/0.25、retest 4；探针 R1 的
+    卡-策略常量核对按此对齐）。"""
 
     SL_ATR = 1.0
     TP_ATR = 2.0
-    HORIZON_BARS = 24
+    HORIZON_BARS = 8
     SITUATIONS = ("S1",)
-    LEVEL_GRID = {"XAUUSD": 50.0}
-    APPROACH = Approach(lookback_bars=24, min_distance_atr=1.0,
+    LEVEL_GRID = {"XAUUSD": 2.0}
+    APPROACH = Approach(lookback_bars=12, min_distance_atr=1.0,
                         touch_atr=0.25)
     BREAKOUT_ATR = 0.25
-    RETEST_WINDOW_BARS = 6
+    RETEST_WINDOW_BARS = 4
     SYMBOLS = ("XAUUSD",)
     TIMEFRAME = "H1"
     required_data = RequiredData(symbols=("XAUUSD",), timeframe="H1",
                                  lookback_bars=2100)
+
