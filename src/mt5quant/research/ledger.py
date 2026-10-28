@@ -73,6 +73,13 @@ row_hash = sha256(规范化行 JSON + prev_hash)
   进 ledger_events（审计附表，追加式），该行 row_hash 用
   (prev_hash, 新内容) 重算、后继行 prev_hash 联动重算——链上任何时刻
   都能重放出"改写前是什么"；
+- **事件序号单调（T88/R13-K7）**：ledger_events.event_id（AUTOINCREMENT）
+  在写事务 BEGIN IMMEDIATE 串行化下单调且与写入/提交序一致——链头
+  锚定（scripts/ledger_anchor.py）记录各表的 event_id 高水位（锚行
+  events≤ 列），前缀重放按序号进行、替代按时刻：同刻度（时钟粒度）
+  两事件的先后不再有歧义（d96c523 的根因消除）。改写归档因此**不得
+  改动 event_id**（AUTOINCREMENT 由库保证；直改 event_id 会被
+  chain_meta 的行内容摘要报出）；
 - **删尾检测（chain_meta 快照）**：每张链式表（含 ledger_events）在
   chain_meta 存 last_rowid / row_count / head_hash 快照，每次合法写后
   刷新；verify_chain() 比对快照——行数变少（删行/删尾）、最大 rowid

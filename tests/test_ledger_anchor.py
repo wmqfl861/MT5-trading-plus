@@ -4,6 +4,8 @@
 同链头不重复写；只读打开台账（绝不触发迁移、绝不写台账文件）。
 """
 import importlib.util
+import hashlib
+import json
 import sqlite3
 from pathlib import Path
 
@@ -262,13 +264,81 @@ def test_same_tick_rewrite_does_not_false_alarm(tmp_path, monkeypatch):
 
 # ===================================== T63b：锚定重封准入（--accept-rechain）
 
-def _rechain_scenario(tmp_path):
-    """T63 生产情境微缩复刻：锚定（2 runs）→ runs 补列后整链按新内容
-    重算（迁移重封，无篡改语义）→ 追加 1 run（迁移后合法增长，对应
-    生产 441→445）。返回 (mod, p, out, old_heads)——old_heads = 锚文件
-    最近条目的 {table: {rows, head}}（规格③"从锚文件最近条目读取"的
-    old-head 文件构造法；--dump-heads 对备份台账的输出是取证，行数
-    可已增长、不等于锚文件最近锚定）。"""
+def _raw_insert_run(conn):
+    """绕过 record_run 的原始追加（迁移列 migration_tag 存在时 record_run
+    不认识该列——夹具在 sqlite 层直接 INSERT），内容与 _ledger_with_runs
+    同口径，migration_tag 置 NULL。"""
+    from datetime import datetime, timezone
+
+    metrics = json.dumps({"ok": True, "error": None, "metrics": {"n": 1}},
+                         ensure_ascii=False)
+    with conn:
+        conn.execute(
+            "INSERT INTO runs(card_id, card_version, strategy, params_json,"
+            " symbol, timeframe, data_first, data_last, data_sha256,"
+            " strategy_sha, engine_version, cost_model_version, gates_hash,"
+            " metrics_json, created_utc, actor, run_class, migration_tag)"
+            " VALUES ('H001', 1, 's:C', ?, 'X', 'H1', NULL, NULL, ?,"
+            " 'legacy', 'e', 'v', '', ?, ?, 't', 'research', NULL)",
+            ('{"i": 9}', "a" * 64, metrics,
+             datetime.now(timezone.utc).isoformat()))
+
+
+def _full_rechain_runs(conn):
+    """整链重算 runs + chain_meta 同步（迁移夹具口径：链/快照自洽——
+    正是生产迁移与攻击者重封共有的 sqlite 侧形态，区分只能靠锚文件）。"""
+    conn.row_factory = sqlite3.Row
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(runs)")]
+    content_cols = [c for c in cols if c not in ("prev_hash", "row_hash")]
+    sel = ", ".join(f'"{c}"' for c in content_cols)
+    prev = "0" * 64
+    head = None
+    n = 0
+    max_rid = 0
+    for r in conn.execute(
+            f"SELECT rowid AS rid, {sel} FROM runs ORDER BY rowid").fetchall():
+        canon = json.dumps({c: r[c] for c in content_cols},
+                           sort_keys=True, ensure_ascii=False,
+                           separators=(",", ":"))
+        h = hashlib.sha256((canon + prev).encode("utf-8")).hexdigest()
+        conn.execute("UPDATE runs SET prev_hash=?, row_hash=? WHERE rowid=?",
+                     (prev, h, r["rid"]))
+        prev = h
+        head = h
+        n += 1
+        max_rid = r["rid"]
+    with conn:
+        conn.execute(
+            "UPDATE chain_meta SET last_rowid=?, row_count=?, head_hash=?,"
+            " updated_utc='2026-10-28T00:00:00+00:00'"
+            " WHERE table_name='runs'", (max_rid, n, head))
+    conn.commit()
+
+
+def _migrate_add_column(conn, *, mutate=None):
+    """T88 夹具：**真加列迁移**（与 T63 加 round_id / T80 加 run_class
+    同构）——ALTER TABLE 加新列 migration_tag（旧行 NULL）、可选顺带改
+    一行旧内容（mutate 给定时 = K7 要抓的"伪装成迁移的旧内容改写"）、
+    追加 1 run（迁移后合法增长，对应生产 441→445/445→446）、整链按新
+    内容重算 + chain_meta 同步——迁移后链/快照自洽（verify_chain 通过），
+    锚定视角前缀已不能重放出锚头。"""
+    with conn:
+        conn.execute("ALTER TABLE runs ADD COLUMN migration_tag TEXT")
+    if mutate:
+        with conn:
+            conn.execute("UPDATE runs SET actor=? WHERE run_id=1", (mutate,))
+    _raw_insert_run(conn)
+    _full_rechain_runs(conn)
+
+
+def _rechain_scenario(tmp_path, *, mutate=None):
+    """T63/T80 生产情境微缩复刻（T88 起用**真加列**迁移夹具）：锚定
+    （2 runs）→ runs 加新列 migration_tag 后整链按新内容重算（迁移重封，
+    无篡改语义；mutate 给定时夹带一行旧内容改写）→ 追加 1 run（迁移后
+    合法增长，对应生产 441→445）。返回 (mod, p, out, old_heads,
+    new_columns)——old_heads = 锚文件最近条目的 {table: {rows, head}}
+    （规格③"从锚文件最近条目读取"的 old-head 文件构造法；--dump-heads
+    对备份台账的输出是取证，行数可已增长、不等于锚文件最近锚定）。"""
     from mt5quant.research.ledger import Ledger
 
     mod = load_anchor()
@@ -276,28 +346,22 @@ def _rechain_scenario(tmp_path):
     out = tmp_path / "anchors.md"
     mod.write_anchor(out, p)
     conn = sqlite3.connect(str(p))
-    _rechain_runs(conn, mutate=None, backfill="2019-01-01")
+    _migrate_add_column(conn, mutate=mutate)
     conn.close()
     with Ledger(p) as led:
-        led.record_run(
-            card_id="H001", card_version=1, strategy="s:C",
-            params={"i": 9}, symbol="X", timeframe="H1",
-            data_first=None, data_last=None, data_sha256="a" * 64,
-            engine_version="e", cost_model_version="v", gates_hash="",
-            metrics={"n": 1}, actor="t")
         assert led.verify_chain() == []       # 迁移后链/快照自洽
     last: dict = {}
     for e in mod._read_entries(out):
         last[e["table"]] = e
     old_heads = {t: {"rows": e["rows"], "head": e["head"]}
                  for t, e in last.items()}
-    return mod, p, out, old_heads
+    return mod, p, out, old_heads, {"runs": ["migration_tag"]}
 
 
 def test_rechained_append_still_refused_without_accept(tmp_path):
     """准入①（不回归）：迁移重算链后，**不带** --accept-rechain 的追加
     仍被反收编保护拒绝，锚文件原文不变。"""
-    mod, p, out, _ = _rechain_scenario(tmp_path)
+    mod, p, out, _oh, _nc = _rechain_scenario(tmp_path)
     before = out.read_text(encoding="utf-8")
     with pytest.raises(RuntimeError, match="前缀"):
         mod.write_anchor(out, p)
@@ -307,7 +371,7 @@ def test_rechained_append_still_refused_without_accept(tmp_path):
 def test_accept_rechain_refuses_dirty_chain(tmp_path):
     """准入②：--accept-rechain 不豁免脏链——存量链头与按当前内容整链
     重算不符（内容被改而未重封）→ 拒绝，锚文件不变。"""
-    mod, p, out, old_heads = _rechain_scenario(tmp_path)
+    mod, p, out, old_heads, new_columns = _rechain_scenario(tmp_path)
     conn = sqlite3.connect(str(p))
     with conn:   # 改内容**不重封**：链不干净（前置条件①失败）
         conn.execute("UPDATE runs SET actor='evil' WHERE run_id=1")
@@ -315,14 +379,14 @@ def test_accept_rechain_refuses_dirty_chain(tmp_path):
     before = out.read_text(encoding="utf-8")
     with pytest.raises(RuntimeError, match="链不干净|完整性"):
         mod.write_anchor(out, p, accept_rechain="T63 迁移重算",
-                         old_heads=old_heads)
+                         old_heads=old_heads, new_columns=new_columns)
     assert out.read_text(encoding="utf-8") == before
 
 
 def test_accept_rechain_requires_reason_and_old_head_file(tmp_path, capsys):
     """准入③：缺原因（空白）/缺 --old-head-file 一律拒（CLI 返回 1，
     锚文件不变）；直接调 write_anchor 缺 old_heads 同样拒。"""
-    mod, p, out, _ = _rechain_scenario(tmp_path)
+    mod, p, out, _oh, _nc = _rechain_scenario(tmp_path)
     before = out.read_text(encoding="utf-8")
     rc = mod.main(["--ledger", str(p), "--anchor", str(out),
                    "--accept-rechain", "   "])
@@ -342,9 +406,7 @@ def test_accept_rechain_refuses_forged_old_head(tmp_path):
     """准入④（防伪造旧头）：old-head 文件里的 runs 旧头与锚文件最近
     锚定不符 → 拒绝，锚文件不变——旧头必须是 git 锚定的头（sha256
     原像），不能拿任意头冒充重封起点。"""
-    import json
-
-    mod, p, out, old_heads = _rechain_scenario(tmp_path)
+    mod, p, out, old_heads, new_columns = _rechain_scenario(tmp_path)
     ohf = tmp_path / "old-heads.json"
     ohf.write_text(json.dumps(
         {**old_heads, "runs": {"rows": old_heads["runs"]["rows"],
@@ -352,43 +414,45 @@ def test_accept_rechain_refuses_forged_old_head(tmp_path):
     before = out.read_text(encoding="utf-8")
     with pytest.raises(RuntimeError, match="old-head|旧头"):
         mod.write_anchor(out, p, accept_rechain="T63 迁移重算",
-                         old_heads=json.loads(ohf.read_text("utf-8")))
+                         old_heads=json.loads(ohf.read_text("utf-8")),
+                         new_columns=new_columns)
     assert out.read_text(encoding="utf-8") == before
 
 
 def test_accept_rechain_seals_new_head_with_audit_note(tmp_path, capsys):
     """准入⑤（全条件满足）：CLI 重封准入成功——追加的新锚带
-    "rechain accepted: <原因> from <旧头8位>" 与 rechain_from=<旧头>
-    注记，随后 --verify 通过；之后日常锚定恢复常态（幂等/增长照常）。"""
-    import json
-
+    "rechain accepted: <原因> from <旧头8位>" 与 rechain_from=<旧头>、
+    new_columns=<声明新增列>（T88）注记，随后 --verify 通过；之后日常
+    锚定恢复常态（幂等/增长照常）。"""
     from mt5quant.research.ledger import Ledger
 
-    mod, p, out, old_heads = _rechain_scenario(tmp_path)
+    mod, p, out, old_heads, new_columns = _rechain_scenario(tmp_path)
     ohf = tmp_path / "old-heads.json"
     ohf.write_text(json.dumps(old_heads), encoding="utf-8")
     reason = "T63 runs.round_id 迁移整链重算，重新锚定"
     rc = mod.main(["--ledger", str(p), "--anchor", str(out),
                    "--accept-rechain", reason,
-                   "--old-head-file", str(ohf)])
+                   "--old-head-file", str(ohf),
+                   "--new-columns", json.dumps(new_columns)])
     assert rc == 0
     text = out.read_text(encoding="utf-8")
     assert f"rechain accepted: {reason}" in text
     assert f"from {old_heads['runs']['head'][:8]}" in text
     assert "rechain_from=" in text
     assert old_heads["runs"]["head"] in text        # 旧头全量入注记
+    assert "new_columns=" in text                   # T88：新增列声明入注记
+    assert "migration_tag" in text
     assert mod.verify_anchor(out, p) == []
     assert mod.main(["--ledger", str(p), "--anchor", str(out),
                      "--verify"]) == 0
     # 重封准入是一次性豁免：其后日常锚定恢复（幂等不重复写）
     assert mod.write_anchor(out, p) is False
-    with Ledger(p) as led:                          # 增长照常可锚（无需豁免）
-        led.record_run(
-            card_id="H001", card_version=1, strategy="s:C",
-            params={"i": 10}, symbol="X", timeframe="H1",
-            data_first=None, data_last=None, data_sha256="a" * 64,
-            engine_version="e", cost_model_version="v", gates_hash="",
-            metrics={"n": 1}, actor="t")
+    conn = sqlite3.connect(str(p))                  # 增长照常可锚（无需豁免）
+    _raw_insert_run(conn)
+    _full_rechain_runs(conn)
+    conn.close()
+    with Ledger(p) as led:
+        assert led.verify_chain() == []
     assert mod.write_anchor(out, p) is True
     assert mod.verify_anchor(out, p) == []
 
@@ -396,8 +460,6 @@ def test_accept_rechain_seals_new_head_with_audit_note(tmp_path, capsys):
 def test_dump_heads_outputs_json_for_forensics(tmp_path, capsys):
     """附带（--dump-heads）：只读输出 {table: {rows, head}} JSON——
     生产备份台账头部取证；空表 head=null；输出即合法 old-head 文件格式。"""
-    import json
-
     mod = load_anchor()
     p, head = _ledger_with_runs(tmp_path, n=2)
     before = p.read_bytes()
@@ -410,3 +472,126 @@ def test_dump_heads_outputs_json_for_forensics(tmp_path, capsys):
     assert dumped["lockbox_uses"] == {"rows": 0, "head": None}
     assert dumped == mod.chain_heads(p)            # 与只读头部计算一致
     assert p.read_bytes() == before                # 纯只读
+
+
+# ================================ T88/R13-K7：迁移保真检查与按事件序号锚定
+
+def test_accept_rechain_refuses_old_content_mutation(tmp_path):
+    """T88/K7 保真检查（失败测试先行）：迁移在加列之外还改了一行旧内容
+    （actor 被改）再整链重算——链干净、旧头合法、新增列如实声明，准入
+    仍必须拒绝：按迁移前列集合重算旧前缀 ≠ 旧头，"迁移保留了旧内容"
+    不成立（旧头是 git 锚定的 sha256 原像，改了旧行就对不上）。"""
+    mod, p, out, old_heads, new_columns = _rechain_scenario(
+        tmp_path, mutate="evil-mutator")
+    before = out.read_text(encoding="utf-8")
+    with pytest.raises(RuntimeError, match="保真"):
+        mod.write_anchor(out, p, accept_rechain="伪装成迁移的旧内容改写",
+                         old_heads=old_heads, new_columns=new_columns)
+    assert out.read_text(encoding="utf-8") == before
+
+
+def test_accept_rechain_undeclared_new_column_fails(tmp_path):
+    """T88 缺省从严：加了列却**不声明** new_columns → 保真检查按全部
+    当前列重算旧前缀（含新列）→ 对不上旧头 → 拒绝——声明是载荷性的，
+    不是可选的宽免。"""
+    mod, p, out, old_heads, _new_columns = _rechain_scenario(tmp_path)
+    before = out.read_text(encoding="utf-8")
+    with pytest.raises(RuntimeError, match="保真"):
+        mod.write_anchor(out, p, accept_rechain="T63 迁移重算（漏声明）",
+                         old_heads=old_heads)
+    assert out.read_text(encoding="utf-8") == before
+
+
+def test_same_tick_two_events_ordered_by_event_id(tmp_path, monkeypatch):
+    """T88 按事件序号锚定（失败测试先行）：同刻度两笔归档改写，两次
+    锚定分别夹在"初始插入与 e1 之间"和"e1 与 e2 之间"（冻结时钟下
+    三者 recorded_utc/锚定 ts 全同）——按 event_id 重放各自选中正确的
+    old_content（写入序），两次校验都通过；按时刻重放（旧机制）两笔
+    同刻度事件都会被当作锚定后，一律选第一笔的 old → 误报链头不符
+    （d96c523 根因的同刻度竞态，序号机制下消除）。"""
+    from datetime import datetime, timezone
+
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 28, 8, 0, 0, 0, tzinfo=timezone.utc)
+
+    mod = load_anchor()
+    import mt5quant.research.ledger as ledger_mod
+    monkeypatch.setattr(mod, "datetime", Frozen)
+    monkeypatch.setattr(ledger_mod, "datetime", Frozen)
+
+    from mt5quant.research.ledger import Ledger
+    p = tmp_path / "ledger.sqlite"
+    with Ledger(p) as led:
+        rid = led.record_run(
+            card_id="H001", card_version=1, strategy="s:C", params={},
+            symbol="X", timeframe="H1", data_first=None, data_last=None,
+            data_sha256="a" * 64, engine_version="e",
+            cost_model_version="v", gates_hash="", metrics={"n": 1},
+            actor="t")
+        led.record_gate(rid, "G0", False, {"attempt": 1})
+    out0 = tmp_path / "anchors0.md"
+    assert mod.write_anchor(out0, p) is True      # 锚定①：夹在插入与 e1 之间
+    with Ledger(p) as led:
+        led.record_gate(rid, "G0", False, {"attempt": 2})    # e1（同刻度）
+    out1 = tmp_path / "anchors1.md"
+    assert mod.write_anchor(out1, p) is True      # 锚定②：夹在 e1 与 e2 之间
+    with Ledger(p) as led:
+        led.record_gate(rid, "G0", True, {"attempt": 3})     # e2（同刻度）
+    # 两个锚各自按自己的事件高水位回滚：锚①回滚 e1（取 attempt-1）、
+    # 锚②回滚 e2（取 attempt-2）——顺序确定且与写入序一致
+    assert mod.verify_anchor(out0, p) == []
+    assert mod.verify_anchor(out1, p) == []
+
+
+def test_old_format_anchor_file_still_reads_and_verifies(tmp_path):
+    """T88 旧锚兼容：无 events≤ 列的历史锚文件（git 里生产锚文件的形态）
+    解析/校验不破坏——无序号的锚按锚定时刻重放（兼容路径，真实时钟下
+    合法改写不误报）；其后新追加的锚行带 events≤ 列（8 列），锚链与
+    前缀核验两类校验都同时容纳两种行。"""
+    from mt5quant.research.ledger import Ledger
+
+    mod = load_anchor()
+    p = tmp_path / "ledger.sqlite"
+    with Ledger(p) as led:
+        rid = led.record_run(
+            card_id="H001", card_version=1, strategy="s:C", params={},
+            symbol="X", timeframe="H1", data_first=None, data_last=None,
+            data_sha256="a" * 64, engine_version="e",
+            cost_model_version="v", gates_hash="", metrics={"n": 1},
+            actor="t")
+        led.record_gate(rid, "G0", False, {"attempt": 1})
+    heads = mod.chain_heads(p)
+    label = mod._ledger_label(p)
+    ts = "2026-10-28T07:00:00+00:00"              # 早于下方真实改写时刻
+    prev = mod.GENESIS_ANCHOR
+    lines = ["# 旧格式锚文件夹具（7 列，无 events≤）", "",
+             "| 锚定 UTC | 台账 | 表 | 行数 | 链头 row_hash | prev_anchor"
+             " | anchor_hash |",
+             "| --- | --- | --- | --- | --- | --- | --- |"]
+    for t in mod.CHAIN_TABLES:
+        h = heads[t]
+        ah = mod._anchor_digest(ts, label, t, h["rows"], h["head"], prev)
+        lines.append(f"| {ts} | {label} | {t} | {h['rows']} | "
+                     f"{h['head'] or '（空表）'} | {prev} | {ah} |")
+        prev = ah
+    out = tmp_path / "anchors.md"
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    entries = mod._read_entries(out)
+    assert len(entries) == 3
+    assert all(e.get("events") is None for e in entries)   # 旧锚无序号
+    assert mod.verify_anchor(out, p) == []                 # 旧格式校验不破坏
+    # 锚定后合法改写（真实时钟，事件时刻晚于锚定 ts）→ 兼容路径按时刻
+    # 回滚归档 old_content，不误报
+    with Ledger(p) as led:
+        led.record_gate(rid, "G0", True, {"attempt": 2})
+    assert mod.verify_anchor(out, p) == []
+    # 新追加的锚行带 events≤ 列（gates 已有 1 笔归档事件 → 高水位 1）
+    assert mod.write_anchor(out, p) is True
+    by_table = {}
+    for e in mod._read_entries(out):
+        by_table[e["table"]] = e
+    assert by_table["gates"]["events"] == 1
+    assert by_table["runs"]["events"] == 0
+    assert mod.verify_anchor(out, p) == []       # 新旧行共存，两类校验都过

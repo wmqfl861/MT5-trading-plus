@@ -133,6 +133,7 @@ from mt5quant.backtest.report import (  # noqa: E402
 )
 from mt5quant.research import cards  # noqa: E402
 from mt5quant.research import candidates as cand  # noqa: E402
+from mt5quant.research import power  # noqa: E402
 from mt5quant.research import rounds as rnd  # noqa: E402
 from mt5quant.research.ledger import (  # noqa: E402
     Ledger, LedgerTamperedError, RESERVED_ACTORS, run_class_for_actor,
@@ -397,6 +398,50 @@ def _round_budget_exceeded(ledger, ctx) -> bool:
     return False
 
 
+def _round_power_recheck(ledger, candidates, *, n_tests: int,
+                         as_of: str | None = None) -> dict[str, dict]:
+    """T84（R13 §4.2 修改 4）：按本轮 N（候选数，Bonferroni α/N）复核
+    每个候选的检验力——**只报告**，不阻塞开轮、不改判定。
+
+    数据源 = 台账 candidate_checks 里该候选（as_of 给定时取 checked_at_utc
+    ≤ as_of 的）最新一条预筛的 checks.power（sharpe_used/years）——
+    开轮输出用当前最新（as_of=None），轮次报告骨架用 as_of=opened_utc
+    （开轮时点快照：开轮后的新预筛不改开轮复核）。单次与 α/N 两档检验力
+    都用 power.power_one_sided 现算（与预筛同一函数、逐位可复算）；
+    预筛本身仍按单次判定（蓝图 §6.2 条件 4），α/N 只进事件模式样本量
+    规则与本复核。概率模式候选（无 checks.power，按登记假设条数
+    Bonferroni）与无预筛记录的候选如实注明，不报数字。
+    """
+    out: dict[str, dict] = {}
+    for cid in candidates:
+        rows = ledger.candidate_checks(cid)
+        if as_of is not None:
+            rows = [row for row in rows
+                    if row["checked_at_utc"] <= as_of]
+        if not rows:
+            out[cid] = {"note": "无预筛记录（开轮前置已另行拦截）"}
+            continue
+        try:
+            result = json.loads(rows[-1]["result_json"])
+            pcheck = (result.get("checks") or {}).get("power") or {}
+            sr = float(pcheck["sharpe_used"])
+            yrs = float(pcheck["years"])
+        except (ValueError, KeyError, TypeError):
+            out[cid] = {"note": "概率模式候选（无单次检验力记录）——按登记"
+                                "假设条数 Bonferroni（T77 全轮口径），不在"
+                                "本复核内"}
+            continue
+        out[cid] = {
+            "decision": rows[-1]["decision"],
+            "sharpe_used": sr, "years": yrs, "n_tests": int(n_tests),
+            "power_single_test": (power.power_one_sided(sr, yrs)
+                                  if yrs > 0.0 else 0.0),
+            "power_at_n": (power.power_one_sided(sr, yrs, n_tests=int(n_tests))
+                           if yrs > 0.0 else 0.0),
+        }
+    return out
+
+
 def cmd_round_open(args) -> int:
     """bt round open R#：前置条件全过 → 写台账 rounds 表（带哈希链）。
 
@@ -470,6 +515,9 @@ def cmd_round_open(args) -> int:
                   f"{remaining}；D16/D49：H 线与 P 线共用）——轮次的锁箱"
                   "用量申报不得超总预算余额")
             return 1
+        # T84：按本轮 N（候选数）复核每个候选的检验力（α/N，只报告）
+        recheck = _round_power_recheck(ledger, r.candidates,
+                                       n_tests=len(r.candidates))
         ledger.record_round_open(
             round_id=r.id, candidates=r.candidates,
             trial_budget=r.trial_budget,
@@ -483,6 +531,18 @@ def cmd_round_open(args) -> int:
           f"（D16 剩余 {remaining}），批准人 {r.approved_by}；台账 "
           f"{args.ledger}（rounds 哈希链，toml_sha256="
           f"{r.content_sha256()[:12]}…）")
+    print(f"— 检验力复核（α/N，N={len(r.candidates)}（本轮候选数），只报告"
+          "不阻塞——预筛按单次判定，蓝图 §6.2 条件 4）：")
+    for cid, d in recheck.items():
+        if "power_at_n" not in d:
+            print(f"    — {cid}：{d['note']}")
+            continue
+        flag = "✓" if d["power_at_n"] >= 0.5 else "⚠"
+        tail = ("" if d["power_at_n"] >= 0.5
+                else "——低于 50%（只报告，不是开轮条件）")
+        print(f"    {flag} {cid}：单次 {d['power_single_test']:.0%} → "
+              f"α/N 后 {d['power_at_n']:.0%}（sharpe_used "
+              f"{d['sharpe_used']:.2f}、{d['years']:.1f} 年）{tail}")
     print(f"— 该轮的卡须带 round = \"{r.id}\" 与 candidate 字段；"
           f"bt round close {r.id} 关闭并生成报告骨架")
     return 0
@@ -561,6 +621,33 @@ def _round_report(ledger, row) -> str:
         "",
         "注：被运行约束（轮次未开启/预算满/锁箱上限/已关闭）拒绝的尝试"
         "不产生 runs 行——fail-closed，台账无迹；拒绝不是试验。",
+    ]
+    # T84：开轮检验力复核（α/N，只报告）——开轮时点最新预筛的快照
+    candidates = json.loads(row["candidates_json"])
+    recheck = _round_power_recheck(ledger, candidates,
+                                   n_tests=len(candidates),
+                                   as_of=row["opened_utc"])
+    lines += [
+        "",
+        "## 开轮检验力复核（α/N，只报告）",
+        "",
+        f"按本轮 N={len(candidates)}（候选数，Bonferroni）对每个候选在"
+        "**开轮时点最新**预筛的 sharpe_used 复核检验力"
+        "（mt5quant.research.power.power_one_sided，n_tests=N；开轮后的"
+        "新预筛不改本节）。预筛判定仍按单次检验（蓝图 §6.2 条件 4），"
+        "本节只报告、不构成开轮或判定条件。",
+        "",
+        "| 候选 | 单次检验力 | α/N 检验力 | sharpe_used | 研究年数 |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for cid, d in recheck.items():
+        if "power_at_n" not in d:
+            lines.append(f"| {cid} | — | — | — | — |（{d['note']}）")
+            continue
+        lines.append(
+            f"| {cid} | {d['power_single_test']:.0%} | {d['power_at_n']:.0%}"
+            f" | {d['sharpe_used']:.2f} | {d['years']:.1f} |")
+    lines += [
         "",
         "## 按 advance_rule 的判定（占位，关闭时人工填写）",
         "",
