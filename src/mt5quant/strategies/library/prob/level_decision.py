@@ -91,6 +91,12 @@ class LevelDecisionV1(BaseStrategy):
         meta = params.get("__fit__") or {}
         sizes = meta.get("sizes") or {}
         policies = meta.get("policies") or {}
+        for sym in sorted(bars_by_symbol):
+            if policies.get(sym) is None:
+                raise ValueError(
+                    f"{sym} 缺入场政策（__fit__.policies）——标签引擎须与"
+                    " bt 同一 entry_policy_for（审核四 E4；蓝图 §2.3），"
+                    "不按'不限制'处理")
         cost_acc: dict[tuple[str, str], list[float]] = {}
         parts = []
         for sym in sorted(bars_by_symbol):
@@ -267,7 +273,11 @@ class LevelDecisionV1(BaseStrategy):
                     est = self._table.lookup(sit, action, feats)
                 except KeyError:
                     continue      # 该动作无任何样本——不参与决策（缺省不做）
-                cost_r = self._cost_r.get((sit, action), 0.0)
+                key_cost = (sit, action)
+                if key_cost not in self._cost_r:
+                    continue      # E4：无成本估计的（局面,动作）不参与
+                    # 决策（按 0 计会让门槛形同虚设）
+                cost_r = self._cost_r[key_cost]
                 ev = ev_lower(est, z=self.POLICY.z)
                 if ev >= self.POLICY.threshold_mult * cost_r:
                     cands.append((ev, sit, action, side))
@@ -275,11 +285,11 @@ class LevelDecisionV1(BaseStrategy):
                 continue
             cands.sort(key=lambda c: (-c[0], c[1], c[2], c[3]))
             top = cands[0]
-            same_action_opposite = [c for c in cands[1:]
-                                    if c[2] == top[2] and c[3] == -top[3]
-                                    and c[0] == top[0]]
-            if same_action_opposite:
-                continue          # D2：同动作双向同 EV 过门槛——方向不可定，不做
+            sides = {c[3] for c in cands}
+            if -1 in sides and 1 in sides:
+                continue          # E3（蓝图 §2.5 第 4 条）：同一根上方向
+                # 相反的动作都过门槛（跨局面/跨动作 alike）——两个方向的
+                # 估计各自没有考虑对方，信号冲突按缺省不做
             for j in range(i, min(i + self.HORIZON_BARS, n)):
                 sig[j] = top[3]
             held_until = i + self.HORIZON_BARS - 1
@@ -297,9 +307,10 @@ def _ev_of(cand, z) -> float:
 
 
 class LevelDecisionS1Demo(LevelDecisionV1):
-    """S1 整数关口演示子类（XAUUSD H1）——常量与审核探针卡一致
-    （K=8、网格 2.0、approach 12/1.0/0.25、retest 4；探针 R1 的
-    卡-策略常量核对按此对齐）。"""
+    """S1 整数关口演示子类（XAUUSD H1）——**只供测试与审核探针**，
+    真实卡各自定义子类（常量随卡写死；审核四 E4）。常量与审核探针卡
+    一致（K=8、网格 2.0、approach 12/1.0/0.25、retest 4；探针 R1/R7
+    的卡-策略常量核对按此对齐）。"""
 
     SL_ATR = 1.0
     TP_ATR = 2.0

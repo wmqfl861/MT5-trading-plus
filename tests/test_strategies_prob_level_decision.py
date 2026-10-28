@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from mt5data.store import _COLUMNS, TIMEFRAME_SECONDS
-from mt5quant.backtest.engine_a import run_backtest
+from mt5quant.backtest.engine_a import atr_series, run_backtest
 from mt5quant.prob.tables import ProbTable
 from mt5quant.strategies import ExitRules
 from mt5quant.strategies.library.prob.level_decision import (
@@ -52,13 +52,19 @@ class DemoSmallGrid(LevelDecisionS1Demo):
     RETEST_WINDOW_BARS = 4
 
 
+from mt5data.sessions import SessionPolicy   # noqa: E402
+PERMISSIVE = SessionPolicy(exempt_symbols=frozenset({"XAUUSD"}))
+
+
 @pytest.fixture(scope="module")
 def fitted():
     bars = synth_bars(4000, seed=42)
     strat = DemoSmallGrid()
-    model = strat.fit({"XAUUSD": bars}, {"XAUUSD": FlatCosts()},
-                      {"__fit__": {"sizes": {"XAUUSD": 100.0}}},
-                      train_end=pd.Timestamp("2020-06-01"), purge_bars=10)
+    model = strat.fit(
+        {"XAUUSD": bars}, {"XAUUSD": FlatCosts()},
+        {"__fit__": {"sizes": {"XAUUSD": 100.0},
+                     "policies": {"XAUUSD": PERMISSIVE}}},
+        train_end=pd.Timestamp("2020-06-01"), purge_bars=10)
     return bars, model
 
 
@@ -73,9 +79,11 @@ def test_fit_produces_appendix_b_model(fitted):
     # 同一输入重拟合 → 同一模型（铁律 21：模型身份确定性）
     bars2 = synth_bars(4000, seed=42)
     strat2 = DemoSmallGrid()
-    model2 = strat2.fit({"XAUUSD": bars2}, {"XAUUSD": FlatCosts()},
-                        {"__fit__": {"sizes": {"XAUUSD": 100.0}}},
-                        train_end=pd.Timestamp("2020-06-01"), purge_bars=10)
+    model2 = strat2.fit(
+        {"XAUUSD": bars2}, {"XAUUSD": FlatCosts()},
+        {"__fit__": {"sizes": {"XAUUSD": 100.0},
+                     "policies": {"XAUUSD": PERMISSIVE}}},
+        train_end=pd.Timestamp("2020-06-01"), purge_bars=10)
     assert model2 == model
 
 
@@ -268,17 +276,23 @@ def test_s5_refit_same_instance_twice():
     bars = synth_bars(3000, seed=17)
     s = DemoSmallGrid()
     kw = dict(train_end=pd.Timestamp("2020-03-01"), purge_bars=10)
-    meta = {"__fit__": {"sizes": {"XAUUSD": 100.0}}}
+    meta = {"__fit__": {"sizes": {"XAUUSD": 100.0},
+                        "policies": {"XAUUSD": PERMISSIVE}}}
     m1 = s.fit({"XAUUSD": bars}, {"XAUUSD": FlatCosts()}, meta, **kw)
     m2 = s.fit({"XAUUSD": bars}, {"XAUUSD": FlatCosts()}, meta, **kw)
     assert m1 == m2
 
 
-def test_s8_fit_requires_sizes():
+def test_s8_fit_requires_sizes_and_policy():
     bars = synth_bars(3000, seed=17)
     s = DemoSmallGrid()
     with pytest.raises(ValueError, match="合约大小"):
-        s.fit({"XAUUSD": bars}, {"XAUUSD": FlatCosts()}, {"__fit__": {}},
+        s.fit({"XAUUSD": bars}, {"XAUUSD": FlatCosts()},
+              {"__fit__": {"policies": {"XAUUSD": PERMISSIVE}}},
+              train_end=pd.Timestamp("2020-03-01"), purge_bars=10)
+    with pytest.raises(ValueError, match="入场政策"):
+        s.fit({"XAUUSD": bars}, {"XAUUSD": FlatCosts()},
+              {"__fit__": {"sizes": {"XAUUSD": 100.0}}},
               train_end=pd.Timestamp("2020-03-01"), purge_bars=10)
 
 
@@ -362,3 +376,76 @@ def test_d2_same_action_opposite_directions_skip():
         ("resistance", 102.0), ("support", 100.0)}   # 双向确在
     sig = strat.generate_signals(bars, {}).to_numpy()
     assert (sig == 0).all()          # 同动作双向同 EV → 不做
+
+
+def test_e3_cross_situation_opposite_directions_skip():
+    """E3：同一根上 S1 支撑（A3 做多）与 S3 通道阻力（A3 做空）都过
+    门槛——跨局面的方向冲突也不做（蓝图 §2.5 第 4 条）。"""
+    from mt5quant.strategies.library.prob.situations import s3_level_rows
+
+    class S1S3(DemoSmallGrid):
+        SITUATIONS = ("S1", "S3")
+
+    corridor = (100.8, 101.2, 100.8, 101.0)          # TR=0.4 → ATR≈0.4
+    rows = [corridor] * 500
+    rows.append((100.8, 103.0, 100.8, 101.0))        # 500：造出通道高点 103
+    rows += [corridor] * 59                          # 501..559
+    rows.append((101.0, 103.0, 100.0, 101.0))        # 560：双触
+    rows += [corridor] * 30
+    bars = pd.DataFrame(rows, columns=["open", "high", "low", "close"])
+    bars.insert(0, "time",
+                pd.date_range("2024-01-02", periods=len(rows), freq="1h"))
+    bars["tick_volume"], bars["spread"], bars["real_volume"] = 10, 5, 0
+    bars = bars[_COLUMNS]
+    # 前置核对：S3 通道阻力=103（含 bar500 的窗口）、S1 网格支撑=100，
+    # bar 560 同时触发两个事件且方向相反
+    atr = atr_series(bars)
+    ch = s3_level_rows(bars)
+    assert ch["chan_high"].iloc[560] == 103.0
+    from mt5quant.strategies.library.prob.situations import (
+        find_level_events, s1_level_rows)
+    levels_s1 = s1_level_rows(bars, grid_step=2.0,
+                              approach=DemoSmallGrid.APPROACH, atr=atr)
+    ev_s1 = find_level_events(bars, levels_s1, situation="S1",
+                              approach=DemoSmallGrid.APPROACH, atr=atr)
+    from mt5quant.prob.counting import level_rows_for_situation
+    levels_s3 = level_rows_for_situation(bars, "S3")
+    ev_s3 = find_level_events(bars, levels_s3, situation="S3",
+                              approach=DemoSmallGrid.APPROACH, atr=atr)
+    assert any(e.bar == 560 and e.kind == "support" and e.level == 100.0
+               for e in ev_s1)
+    assert any(e.bar == 560 and e.kind == "resistance" and e.level == 103.0
+               for e in ev_s3)
+    model = dict(_strong_model())
+    model["cost_r_by_situation_action"] = {"S1|A3": 0.001, "S3|A3": 0.001}
+    strat = S1S3().with_model(model)
+    sig = strat.generate_signals(bars, {}).to_numpy()
+    assert (sig == 0).all()          # 双向过门槛 → 不做
+
+
+def test_e4_no_cost_key_excluded_from_decision():
+    """E4：模型缺 (S3, A3) 成本键时该候选不参与决策（门槛不按 0 计）——
+    与上一条同一构造，但成本只给 S1|A3：S3 空头被排除，S1 多头照常入场。"""
+    from mt5quant.strategies.library.prob.situations import s1_level_rows
+
+    class S1S3(DemoSmallGrid):
+        SITUATIONS = ("S1", "S3")
+
+    corridor = (100.8, 101.2, 100.8, 101.0)
+    rows = [corridor] * 500
+    rows.append((100.8, 103.0, 100.8, 101.0))
+    rows += [corridor] * 59
+    rows.append((101.0, 103.0, 100.0, 101.0))
+    rows += [corridor] * 30
+    bars = pd.DataFrame(rows, columns=["open", "high", "low", "close"])
+    bars.insert(0, "time",
+                pd.date_range("2024-01-02", periods=len(rows), freq="1h"))
+    bars["tick_volume"], bars["spread"], bars["real_volume"] = 10, 5, 0
+    bars = bars[_COLUMNS]
+    model = dict(_strong_model())
+    model["cost_r_by_situation_action"] = {"S1|A3": 0.001}   # S3 无成本键
+    strat = S1S3().with_model(model)
+    sig = strat.generate_signals(bars, {}).to_numpy()
+    nz = np.flatnonzero(sig != 0)
+    assert len(nz) == DemoSmallGrid.HORIZON_BARS
+    assert sig[nz[0]] == 1              # 只剩 S1 支撑的 A3 多头
