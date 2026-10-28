@@ -1,15 +1,17 @@
-"""外部数据来源批准状态与使用限定（T81 落地 D36 / 第十二轮审核）。
+"""外部数据来源批准状态与使用限定（T81 落地 D36 / T87 落地 R13 §5）。
 
-批准结论出自第十二轮审核报告的 D36 批准表（审核会话按蓝图 v4 §8 D49
-给出，docs/reviews/2026-10-27-review-round12.md）：
+批准结论出自审核报告的 D36 批准表：
 
 - **fred**（NASDAQ100 指数收盘价）与 **cdd**（CryptoDataDownload/
-  Bitstamp BTC 日线）批准用于研究；使用限定原文写入各自 manifest 的
-  `usage_restriction` 字段，导出侧逐字核对；
-- **histdata** 暂不批准：站内无使用条款页、未找到允许个人研究使用的
-  明文（D36"条款不明的不用"）。已下载样本只留主库侧 data/ext/ 作
-  一致性核对，不进研究库；查找记录存本地 data/ext/terms/
-  histdata-2026-10-27.txt（data/ 不入库）；
+  Bitstamp BTC 日线）第十二轮批准用于研究；使用限定原文写入各自
+  manifest 的 `usage_restriction` 字段，导出侧逐字核对；
+- **histdata** 第十三轮 §5 **有条件批准**（2026-10-28，
+  docs/reviews/2026-10-28-review-round13.md）：FAQ"Why Free?"写明数据
+  是为交易者与开发者回测交易系统而免费分享，另一处写"Use the data at
+  your own will and risk"——提供方本意即供个人回测，与本项目用途一致；
+  只作个人研究、不再分发、低频下载不并发不绕限、只启用逐年口径验证
+  通过的年份（EURUSD 另加定盘锚点）；用户可撤销（回复"HistData 不用"
+  即回退）；
 - **stooq** 不用（服务拒访问）；**yahoo** 不批准（已从可选来源移除）；
 - **dukascopy** 原则可用、当前网络不可达（接通后先条款核对与一致性
   核对，再交审核会话）。
@@ -23,6 +25,8 @@ from mt5data.ext.core import ExtDataError
 
 REVIEW_REF = "docs/reviews/2026-10-27-review-round12.md"
 APPROVED_AT = "2026-10-27"
+REVIEW_REF_R13 = "docs/reviews/2026-10-28-review-round13.md"
+APPROVED_AT_HISTDATA = "2026-10-28"
 
 # ---------------------------------------------------------------- 使用限定
 
@@ -35,6 +39,13 @@ USAGE_RESTRICTION_FRED = (
 USAGE_RESTRICTION_CDD = (
     "只作研究用途；不再分发；不进入任何对外产品；原始数据不入公开仓库"
     "（data/ 与 data_research/ 均 gitignore），报告只放汇总统计")
+USAGE_RESTRICTION_HISTDATA = (
+    "只作个人研究、不再分发（第十三轮 §5 有条件批准，2026-10-28）；原始"
+    "数据与逐 bar 序列不入公开仓库（data/ 与 data_research/ 均 gitignore）"
+    "，报告只放汇总统计；按网站正常下载路径低频下载、不并发、不绕过限制"
+    "；只启用逐年时间口径验证通过的年份（EURUSD 另加伦敦 16:00 定盘窗"
+    "分钟波动尖峰锚点逐年核对），判为 inconsistent 或 undetermined 的"
+    "年份登记后不用；早年点差用情景倍数（bid-only 无 ask）")
 
 # ---------------------------------------------------------------- 批准表
 
@@ -57,14 +68,23 @@ SOURCE_APPROVALS: dict[str, dict] = {
         "approved_at": APPROVED_AT,
     },
     "histdata": {
-        "approved": False,
-        "usage_restriction": None,
-        "basis": ("暂不批准（D36：条款不明的不用）——histdata.com 无使用条款"
-                  "页，未找到允许个人研究使用的明文；查找记录存本地 "
-                  "data/ext/terms/histdata-2026-10-27.txt。已下载样本只作"
-                  "一致性核对，不进研究库"),
-        "review": REVIEW_REF,
-        "approved_at": APPROVED_AT,
+        "approved": True,
+        "usage_restriction": USAGE_RESTRICTION_HISTDATA,
+        "basis": ("有条件批准（第十三轮 §5，2026-10-28，"
+                  f"{REVIEW_REF_R13}）：T81 核查确认该站无使用条款或许可页，"
+                  "但 FAQ 'Why Free?' 原文写明数据是为交易者与开发者回测"
+                  "交易系统而免费分享（'Like you, tons of traders and "
+                  "developers are looking for data to backtest their "
+                  "trading systems ... why not sharing it with you?'，"
+                  "抓取 2026-10-27），另一处写 'Use the data at your own "
+                  "will and risk.'——提供方本意即供个人回测，与本项目用途"
+                  "一致，第十二轮'条款不明'的顾虑由此解决；原文与查找过程"
+                  "存本地 data/ext/terms/histdata-2026-10-27.txt（data/ "
+                  "不入库）。限定：只作个人研究、不再分发、低频下载不并发"
+                  "不绕限、只启用逐年口径验证通过的年份（EURUSD 另加定盘"
+                  "锚点）；用户可撤销"),
+        "review": REVIEW_REF_R13,
+        "approved_at": APPROVED_AT_HISTDATA,
     },
     "stooq": {
         "approved": False,

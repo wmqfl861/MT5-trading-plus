@@ -347,3 +347,106 @@ def yearly_label_calendar(stamps, *, winter_months=(1, 2, 12),
         })
         out[int(year)] = rep
     return out
+
+
+# ---------------------------------------------------------------- 定盘锚点（T87/R13 §5）
+
+LONDON_TZ = "Europe/London"
+
+
+def fix_window_vol_spike(bars: pd.DataFrame, *, tz: str = LONDON_TZ,
+                         month_end_only: bool = False,
+                         core=(15 * 60 + 57, 16 * 60 + 3),
+                         search_window=((14, 0), (17, 0)),
+                         margin_min: float = 1.10,
+                         min_minutes: int = 60) -> dict[int, dict]:
+    """逐年定盘锚点检测（T87/R13 §5，EURUSD 启用条件）。
+
+    方法：把已换算的 UTC 分钟 bar 映到本地（缺省伦敦）墙钟，按本地
+    日内分钟聚合分钟收益 |Δclose/close| 的均值；对**定盘核心窗**
+    C=[15:57, 16:03)（2015-02-15 改革后 WMR 五分钟窗 15:57:30–16:02:30
+    ；改革前 1 分钟窗也落在其中）与其平移 ±1 小时的对照窗 C−1h、C+1h
+    比较窗内均值——**三分位置判定**：尖峰位置 = 三窗中均值最大者。
+    位置=C 且相对次名 ≥ margin_min → ``consistent``（定盘尖峰锚在
+    伦敦 16:00，标签对齐）；位置≠C 且分出次名 → ``inconsistent``
+    （标签口径错一小时，该年不得启用）；分不出（< margin_min）→
+    ``undetermined``。用平移对照而非"全下午最大分钟"：午后有别的
+    结构性尖峰（13:30 伦敦=8:30 NY 美国数据、15:00=10:00 NY），
+    强度逐年变化会污染全局 argmax，位置对照只问"尖峰在不在定盘窗"。
+
+    month_end_only：只取每月最后交易日的分钟（Melvin-Prins 的月末
+    定盘窗——对冲流集中在月末，C002 的事件总体）；EURUSD 的启用
+    判定用该口径（报告并列全日口径作证据）。
+
+    返回 {年: {location, margin, v_core/v_minus_1h/v_plus_1h（实测均值）,
+    peak_minute_london（搜索窗内最大分钟，证据）, observations,
+    status ∈ consistent/inconsistent/undetermined}}。
+    """
+    (sh, sm), (eh, em) = search_window
+    search_lo, search_hi = sh * 60 + sm, eh * 60 + em
+    c_lo, c_hi = core
+    df = bars.copy()
+    df["time"] = pd.to_datetime(df["time"])
+    df = df.sort_values("time")
+    close = pd.to_numeric(df["close"], errors="coerce")
+    ret = (close / close.shift(1) - 1.0).abs()
+    ok = ret.notna() & (df["time"].diff() > pd.Timedelta(0))
+    df = df[ok.to_numpy()]
+    if df.empty:
+        return {}
+    ret = ret[ok.to_numpy()]
+    local = df["time"].dt.tz_localize("UTC").dt.tz_convert(tz)
+    minute_of_day = local.dt.hour * 60 + local.dt.minute
+    year = local.dt.year
+    if month_end_only:
+        d = local.dt.date
+        d = pd.Series(d.to_numpy(), index=df.index)
+        month_last = d.groupby(pd.PeriodIndex(local, freq="M")
+                               .to_numpy()).transform("max")
+        me_mask = (d == month_last).to_numpy()
+    else:
+        me_mask = None
+    frame = pd.DataFrame({"year": year.to_numpy(),
+                          "minute": minute_of_day.to_numpy(),
+                          "absret": ret.to_numpy()})
+    if me_mask is not None:
+        frame = frame[me_mask]
+    out: dict[int, dict] = {}
+    for yr, grp in frame.groupby("year"):
+        g = grp[(grp["minute"] >= search_lo) & (grp["minute"] < search_hi)]
+        if len(g) < min_minutes:
+            out[int(yr)] = {"status": "undetermined",
+                            "reason": f"搜索窗观测不足（{len(g)} < "
+                                      f"{min_minutes} 分钟收益）"}
+            continue
+        prof = g.groupby("minute")["absret"].mean()
+
+        def w(lo: int, hi: int) -> float:
+            return float(prof[(prof.index >= lo) & (prof.index < hi)].mean())
+
+        vals = {"fix": w(c_lo, c_hi),
+                "minus_1h": w(c_lo - 60, c_hi - 60),
+                "plus_1h": w(c_lo + 60, c_hi + 60)}
+        location = max(vals, key=vals.get)
+        runner = max((v for k, v in vals.items() if k != location),
+                     default=0.0)
+        margin = (vals[location] / runner) if runner > 0 else float("inf")
+        peak_min = int(prof.idxmax())
+        if margin < margin_min:
+            status = "undetermined"
+        else:
+            status = "consistent" if location == "fix" else "inconsistent"
+        out[int(yr)] = {
+            "location": location,
+            "margin": round(margin, 3),
+            "v_fix": round(vals["fix"], 10),
+            "v_minus_1h": round(vals["minus_1h"], 10),
+            "v_plus_1h": round(vals["plus_1h"], 10),
+            "peak_minute_london": peak_min,
+            "fix_vs_window_median": round(
+                vals["fix"] / float(prof.median()), 3)
+            if float(prof.median()) > 0 else None,
+            "observations": int(len(g)),
+            "status": status,
+        }
+    return out

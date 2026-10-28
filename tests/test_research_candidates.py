@@ -879,11 +879,12 @@ def _write_ext(root, source, symbol, tf, *, first, days):
 
 def test_coverage_years_merges_approved_ext_segments(tmp_path):
     """T80/G3 失败测试 2：批准 ext 序列（fred）计入研究年数、逐段列来源
-    与年数；未批准来源（histdata）在场也不计。ext 段与主段**不相接**
-    （并集=分段相加，本用例）；重叠并集口径见下一个用例。"""
+    与年数；未批准来源在场也不计。ext 段与主段**不相接**
+    （并集=分段相加，本用例）；重叠并集口径见下一个用例。
+    T87 起未批准示例改用 stooq（histdata 已按 R13 §5 有条件批准）。"""
     root = make_data_root(tmp_path)
     _write_ext(root, "fred", SYMBOL, "D1", first="2010-01-05", days=3500)
-    _write_ext(root, "histdata", SYMBOL, "D1", first="1990-01-01", days=7300)
+    _write_ext(root, "stooq", SYMBOL, "D1", first="1990-01-01", days=7300)
     key = f"{SYMBOL}/D1"
     cov = candidates.coverage_years(root, [SYMBOL], ["D1"])
     ext_years = 3499 / 365.25                 # 不相交接的 ext 段自身跨度
@@ -895,11 +896,11 @@ def test_coverage_years_merges_approved_ext_segments(tmp_path):
     assert by_src["fred"]["counted"] is True
     assert by_src["fred"]["years"] == pytest.approx(ext_years, abs=0.01)
     assert "fred" == by_src["fred"]["source"]          # 逐段列来源
-    # 未批准来源：在场、可读，但不计入年数（D36 白名单外）
-    assert "histdata" in by_src
-    assert by_src["histdata"]["counted"] is False
-    assert by_src["histdata"]["years"] == pytest.approx(7300 / 365.25,
-                                                        abs=0.01)
+    # 未批准来源：在场、可读，但不计入年数（白名单外）
+    assert "stooq" in by_src
+    assert by_src["stooq"]["counted"] is False
+    assert by_src["stooq"]["years"] == pytest.approx(7300 / 365.25,
+                                                     abs=0.01)
     # 没有外部序列时与现行一致（只有主段）
     root2 = make_data_root(tmp_path / "plain")
     cov2 = candidates.coverage_years(root2, [SYMBOL], ["D1"])

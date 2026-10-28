@@ -26,8 +26,9 @@ docs/p6/permissions.md）；研究侧一切读取改走 data_research（--resear
 - `--include-ext` 才把 data/ext/**（外部源适配后的 K 线）导出为
   data_research/ext/<来源>/<品种>/<周期>/——研究库纳入外部数据须用户
   先确认数据源（docs/research/ext-data-*.md 的"来源清单"），因此缺省关；
-- **白名单硬校验（T81/D36）**：只有批准来源（mt5data.ext.approvals，
-  第十二轮审核批准 fred/cdd）可导出；未批准来源（histdata 等）逐条拒绝、
+- **白名单硬校验（T81/D36 + T87/R13 §5）**：只有批准来源
+  （mt5data.ext.approvals：fred/cdd 第十二轮批准；histdata 第十三轮
+  §5 有条件批准）可导出；未批准来源（stooq/yahoo 等）逐条拒绝、
   不进研究库——ext 库里只剩未批准序列时整体退出非零；
 - 批准来源的 manifest 必须带与批准表一致的使用限定
   （usage_restriction，只研究用/不再分发/原始数据不入公开仓库），

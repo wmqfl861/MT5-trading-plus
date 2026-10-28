@@ -11,11 +11,12 @@
     # Stooq（实测被拒也会如实记录并退出非零）
     .venv/Scripts/python.exe scripts/fetch_ext_data.py stooq
 
-批准状态（T81 落地 D36/第十二轮审核，详见 mt5data.ext.approvals）：
-- **fred/cdd 批准**入研究库（export_research_store --include-ext 白名单
-  只放行这两个来源；manifest 自带使用限定 usage_restriction）；
-- **histdata 暂不批准**（条款不明，查找记录存 data/ext/terms/）——下载
-  只为主库侧一致性核对，不进研究库；
+批准状态（T81 落地 D36/第十二轮审核；T87 落地第十三轮 §5，详见
+mt5data.ext.approvals）：
+- **fred/cdd/histdata 批准**入研究库（export_research_store
+  --include-ext 白名单放行；manifest 自带使用限定 usage_restriction；
+  histdata 为第十三轮 §5 有条件批准：只作个人研究、不再分发、低频
+  下载、只启用逐年口径验证通过的年份——EURUSD 另加定盘锚点）；
 - **yahoo 不批准**，已从可选来源移除；Stooq 不用（拒服务）。
 
 行为：
@@ -27,9 +28,12 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import sys
 from pathlib import Path
+
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -70,18 +74,68 @@ def _store(ext_root: str, series: ExtSeries, *, resample_to=()) -> None:
               f"[{agg['time'].iloc[0]} → {agg['time'].iloc[-1]}]")
 
 
+HISTDATA_SUPPORTED_RULES = {"eu_calendar": 3, "us_wall": 4}
+
+
+def _histdata_year_gate(raw: bytes, *, pair: str,
+                        downloaded_at_utc: str,
+                        source_name: str) -> tuple[object | None, dict]:
+    """单年入库闸门（T87/R13 §5 逐年启用条件），返回 (ExtSeries|None, 记录)。
+
+    1. **逐年口径检测**（consistency.yearly_label_calendar，原始标签）：
+       判为 eu_calendar（converter v3）或 us_wall（converter v4）→ 按
+       该年自己的规则转换；inconsistent/undetermined/fixed_est →
+       **登记后不用**（不入库）；
+    2. **EURUSD 另加定盘锚点**（consistency.fix_window_vol_spike，
+       月末口径——C002 的事件总体）：status 必须为 consistent（尖峰锚在
+       伦敦 16:00 定盘窗），否则该年同样登记后不用。
+    """
+    from mt5data.ext import consistency as cons
+
+    stamps = adapters.histdata_raw_stamps(raw)
+    rep = cons.yearly_label_calendar(stamps)
+    years = sorted(rep)
+    if len(years) != 1:
+        return None, {"used": False,
+                      "reason": f"zip 内年份 {years} 非单一年份"}
+    year = years[0]
+    calendar = rep[year]["calendar"]
+    rec: dict = {"used": False, "calendar": calendar,
+                 "label_deviations": rep[year].get("deviations"),
+                 "label_tolerance": rep[year].get("tolerance"),
+                 "converter_version": HISTDATA_SUPPORTED_RULES.get(calendar)}
+    if calendar not in HISTDATA_SUPPORTED_RULES:
+        rec["reason"] = (f"逐年口径判为 {calendar}（三种规则偏差均超容差"
+                         "或无区分度）——登记后不用（R13 §5）")
+        return None, rec
+    s = adapters.histdata_m1_from_bytes(
+        raw, symbol=pair, downloaded_at_utc=downloaded_at_utc,
+        source_name=source_name, label_rule=calendar)
+    if pair.upper() == "EURUSD":
+        anchor = cons.fix_window_vol_spike(s.df, month_end_only=True)
+        rec["fix_anchor_month_end"] = anchor.get(year)
+        if anchor.get(year, {}).get("status") != "consistent":
+            rec["reason"] = (f"定盘锚点月末口径判为 "
+                             f"{anchor.get(year, {}).get('status')}——"
+                             "尖峰未锚在伦敦 16:00 定盘窗，登记后不用")
+            return None, rec
+    rec["used"] = True
+    return s, rec
+
+
 def cmd_histdata(args) -> int:
+    from mt5data.ext import ExtSeries
+
     failures = 0
-    print("⚠ HistData 暂不批准入研究库（D36：条款不明的不用，查找记录见 "
-          "data/ext/terms/）——下载只作主库侧一致性核对，"
-          "--include-ext 白名单不放行该来源")
+    print("ℹ HistData 有条件批准入研究库（R13 §5：只作个人研究、不再分发；"
+          "低频下载不并发不绕限；只入库逐年口径验证通过的年份，EURUSD "
+          "另加定盘锚点月末口径）")
     for pair in args.pairs.split(","):
         pair = pair.strip().upper()
         for year in [int(y) for y in args.years.split(",")]:
             name = f"DAT_ASCII_{pair}_M1_{year}.zip"
             raw_path = os.path.join(args.ext_root, "_raw", "histdata", name)
             if os.path.exists(raw_path) and not args.force:
-                print(f"· {pair} {year}：原始文件已存在，直接转换（--force 重下）")
                 with open(raw_path, "rb") as f:
                     raw = f.read()
             else:
@@ -93,10 +147,62 @@ def cmd_histdata(args) -> int:
                     failures += 1
                     continue
                 _save_raw(args.ext_root, "histdata", fname, raw)
-            s = adapters.histdata_m1_from_bytes(
-                raw, symbol=pair, downloaded_at_utc=utc_now_iso(),
-                source_name=name)
-            _store(args.ext_root, s, resample_to=("H1", "D1"))
+        # 全量重建：只合并通过闸门的年份（R13 §5 逐年启用条件）
+        raw_dir = os.path.join(args.ext_root, "_raw", "histdata")
+        usable: list[ExtSeries] = []
+        verification: dict[str, dict] = {}
+        for zp in sorted(glob.glob(os.path.join(
+                raw_dir, f"DAT_ASCII_{pair}_M1_*.zip"))):
+            year = int(Path(zp).stem.split("_")[-1])
+            with open(zp, "rb") as f:
+                raw = f.read()
+            try:
+                s, rec = _histdata_year_gate(
+                    raw, pair=pair, downloaded_at_utc=utc_now_iso(),
+                    source_name=os.path.basename(zp))
+            except ExtDataError as e:
+                s, rec = None, {"used": False, "reason": f"转换失败：{e}"}
+            verification[str(year)] = rec
+            mark = "✓" if rec.get("used") else "✗"
+            extra = rec.get("reason", "")
+            cal = rec.get("calendar", "?")
+            anchor = (rec.get("fix_anchor_month_end") or {}).get("status")
+            print(f"  {mark} {pair} {year}：口径={cal}"
+                  + (f"，定盘锚点={anchor}" if anchor else "")
+                  + (f"——{extra}" if extra else ""))
+            if s is not None:
+                usable.append(s)
+        if not usable:
+            print(f"✗ {pair}：无可用年份（全部被逐年闸门拒绝），不落盘")
+            failures += 1
+            continue
+        df = pd.concat([s.df for s in usable], ignore_index=True) \
+            .sort_values("time").reset_index(drop=True)
+        m = dict(usable[-1].manifest)  # 以最新年份转换为模板
+        files = {}
+        for s in usable:
+            for f in s.manifest["source_files"]:
+                files[f["sha256"]] = f
+        m["source_files"] = sorted(files.values(), key=lambda f: f["name"])
+        m["converter_version"] = max(
+            int(s.manifest["converter_version"]) for s in usable)
+        m["label_rule"] = "per_year（逐年规则与版本见 yearly_verification）"
+        m["rows"] = int(len(df))
+        m["first_time"] = pd.Timestamp(df["time"].iloc[0]).isoformat()
+        m["last_time"] = pd.Timestamp(df["time"].iloc[-1]).isoformat()
+        m["yearly_verification"] = verification
+        rebuilt = ExtSeries(df=df, manifest=m)
+        # 全量重建：直接替换（不与旧序列合并——旧序列可能含按错误规则
+        # 转换的年份），H1/D1 由重建后的 M1 重采样
+        save_ext_series(args.ext_root, rebuilt)
+        print(f"  histdata/{pair}/M1: {len(df):,} 根 "
+              f"[{df['time'].iloc[0]} → {df['time'].iloc[-1]}]")
+        for tf2 in ("H1", "D1"):
+            agg = resample_bars(rebuilt.df, tf2)
+            save_ext_series(args.ext_root,
+                            rebuilt.with_timeframe(tf2, agg))
+            print(f"  histdata/{pair}/{tf2}: {len(agg):,} 根 "
+                  f"[{agg['time'].iloc[0]} → {agg['time'].iloc[-1]}]")
     return 1 if failures else 0
 
 

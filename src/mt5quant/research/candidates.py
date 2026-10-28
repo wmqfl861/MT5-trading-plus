@@ -639,8 +639,9 @@ def coverage_segments(data_root, symbols, timeframes) -> dict[str, list[dict]]:
                                 "years": _span_years(e_first, e_last),
                                 "counted": True})
                     else:
-                        # 未批准来源（如 histdata，D36"条款不明的不用"）：
-                        # 在场、如实列出，但不计入年数
+                        # 未批准来源（如 stooq/yahoo，批准表
+                        # mt5data.ext.approvals；histdata 已按 R13 §5
+                        # 有条件批准）：在场、如实列出，但不计入年数
                         try:
                             t = pd.to_datetime(pd.read_parquet(
                                 seg_dir / "data.parquet")["time"])

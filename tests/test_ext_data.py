@@ -13,12 +13,17 @@
   夏令时处理错误）。
 
 T81 追加（D36 批准落地、第十二轮 G5）：
-- **--include-ext 白名单硬校验**：只有批准来源（fred/cdd，第十二轮
-  审核批准表）可导出；未批准来源（histdata）被拒；
+- **--include-ext 白名单硬校验**：只有批准来源可导出；未批准来源被拒；
 - **使用限定入 manifest**：批准来源的 manifest 必须带
   usage_restriction 且与批准文本一致，缺/错 → 拒绝导出；
 - **逐年时间口径检测**（G5）：合成数据上能区分"固定美东（EST 不调
   表）/美东墙钟/欧盟日历"三种标签规则，并识别口径不一致的年份。
+
+T87 追加（第十三轮 D36 补充结论：HistData 有条件批准）：
+- histdata 进入 --include-ext 白名单（此前被拒的反转）：manifest 带
+  R13 §5 的使用限定（只作个人研究、不再分发）即可导出；
+- **定盘锚点检测**（EURUSD 逐年启用条件）：伦敦 16:00 定盘窗的分钟级
+  波动尖峰位置核对——合成数据里把尖峰错位一小时必须判为不一致。
 """
 import importlib.util
 import io
@@ -29,6 +34,7 @@ from datetime import timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -109,6 +115,25 @@ def make_fred_series(mt, *, df=None, drop_usage=False, **manifest_over):
         s = s.replace(df=df)
     if drop_usage:
         s.manifest.pop("usage_restriction", None)
+    for k, v in manifest_over.items():
+        s.manifest[k] = v
+    return s
+
+
+def make_stooq_series(mt, *, df=None, **manifest_over):
+    """未批准来源（stooq/USTEC D1，实测拒服务不用）的合法 ExtSeries。
+
+    T87 起 histdata 已批准，"白名单拒绝未批准来源"的行为改由 stooq
+    验证（批准表见 mt5data.ext.approvals.SOURCE_APPROVALS）。
+    """
+    raw = ("Date,Open,High,Low,Close,Volume\n"
+           "2026-05-28,100.0,101.0,99.5,100.5,1000\n"
+           "2026-05-29,100.5,101.5,100.0,101.0,1100\n"
+           "2026-06-01,101.0,102.0,100.5,101.5,1200\n")
+    s = mt.stooq_daily_from_bytes(raw.encode(), symbol="USTEC",
+                                  downloaded_at_utc="2026-10-27T00:00:00+00:00")
+    if df is not None:
+        s = s.replace(df=df)
     for k, v in manifest_over.items():
         s.manifest[k] = v
     return s
@@ -413,13 +438,16 @@ class TestCutoffDiscipline:
         assert v and "fred" in v[0]
 
 
-# ================================================================ T81 白名单
+# ================================================================ T81/T87 白名单
 
 class TestIncludeExtWhitelist:
-    """失败测试先行 ⑤（T81/D36）：--include-ext 白名单硬校验。
+    """失败测试先行 ⑤（T81/D36）+ T87 反转（第十三轮 D36 补充结论）。
 
-    第十二轮审核批准表：fred/cdd 批准（研究用途+使用限定入 manifest）；
-    histdata 暂不批准（条款不明）——样本只留主库侧作一致性核对。
+    批准表演变：第十二轮批准 fred/cdd、histdata 暂不批准；**第十三轮
+    §5 histdata 有条件批准**（只作个人研究、不再分发，依据 FAQ 原文 +
+    抓取日期 + 本地条款核查路径）——T87 起进入 --include-ext 白名单，
+    此前"histdata 被拒"的测试反转为"histdata 可导出"；未批准来源的
+    拒绝行为改由 stooq（实测拒服务不用）验证。
     """
 
     def histdata_store(self, path, ext_mod):
@@ -427,32 +455,36 @@ class TestIncludeExtWhitelist:
         ext_mod.save_ext_series(str(path), s)
         return path
 
+    def stooq_store(self, path, ext_mod):
+        ext_mod.save_ext_series(str(path), make_stooq_series(ext_mod))
+        return path
+
     def test_unapproved_only_present_refuses_export(self, tmp_path,
                                                     main_store, capsys):
-        """ext 库里只有未批准来源（histdata）→ --include-ext 下该序列被拒：
+        """ext 库里只有未批准来源（stooq）→ --include-ext 下该序列被拒：
         不进研究库；因没有任何批准序列可导出，整体退出非零。"""
         from mt5data import ext
         mod = load_script("export_research_store_ext",
                           REPO_ROOT / "scripts" / "export_research_store.py")
-        self.histdata_store(tmp_path / "extroot", ext)
+        self.stooq_store(tmp_path / "extroot", ext)
         rc = mod.main(["--data-root", str(main_store), "--dest",
                        str(tmp_path / "r"), "--include-ext", "--ext-root",
                        str(tmp_path / "extroot")])
         assert rc == 1
         out = capsys.readouterr().out
-        assert "白名单" in out and "histdata" in out
+        assert "白名单" in out and "stooq" in out
         # 研究库里绝不能出现未批准来源的数据
-        assert not (tmp_path / "r" / "ext" / "histdata").exists()
+        assert not (tmp_path / "r" / "ext" / "stooq").exists()
 
     def test_unapproved_skipped_approved_exported(self, tmp_path, main_store,
                                                   capsys):
-        """histdata（未批准）与 fred（批准）同库：histdata 被拒并逐条报告，
+        """stooq（未批准）与 fred（批准）同库：stooq 被拒并逐条报告，
         fred 正常导出——研究库只含批准来源。"""
         from mt5data import ext
         mod = load_script("export_research_store_ext",
                           REPO_ROOT / "scripts" / "export_research_store.py")
         root = tmp_path / "extroot"
-        self.histdata_store(root, ext)
+        self.stooq_store(root, ext)
         ext.save_ext_series(str(root), make_fred_series(ext))
         rc = mod.main(["--data-root", str(main_store), "--dest",
                        str(tmp_path / "r"), "--include-ext", "--ext-root",
@@ -461,9 +493,49 @@ class TestIncludeExtWhitelist:
         df, _ = ext.load_ext_series(str(tmp_path / "r" / "ext"), "fred",
                                     "USTEC", "D1")
         assert len(df) == 4
-        assert not (tmp_path / "r" / "ext" / "histdata").exists()
+        assert not (tmp_path / "r" / "ext" / "stooq").exists()
         out = capsys.readouterr().out
-        assert "白名单" in out and "histdata" in out
+        assert "白名单" in out and "stooq" in out
+
+    def test_histdata_now_approved_and_exported(self, tmp_path, main_store):
+        """失败测试先行（T87）：histdata 有条件批准后的反转——带 R13 §5
+        使用限定的 histdata 序列在 --include-ext 下**可以**导出（此前
+        该场景整体退出非零）；研究库 ext 段出现 histdata 数据，且
+        manifest 逐字携带批准时的使用限定。"""
+        from mt5data import ext
+        from mt5data.ext.approvals import SOURCE_APPROVALS
+        assert SOURCE_APPROVALS["histdata"]["approved"] is True  # R13 §5
+        mod = load_script("export_research_store_ext",
+                          REPO_ROOT / "scripts" / "export_research_store.py")
+        root = tmp_path / "extroot"
+        self.histdata_store(root, ext)
+        rc = mod.main(["--data-root", str(main_store), "--dest",
+                       str(tmp_path / "r"), "--include-ext", "--ext-root",
+                       str(root)])
+        assert rc == 0
+        df, manifest = ext.load_ext_series(str(tmp_path / "r" / "ext"),
+                                           "histdata", "EURUSD", "H1")
+        assert len(df) > 0
+        assert manifest["usage_restriction"] \
+            == SOURCE_APPROVALS["histdata"]["usage_restriction"]
+        assert manifest["research_cutoff"] == CUTOFF.isoformat()
+
+    def test_histdata_missing_usage_restriction_refuses(self, tmp_path,
+                                                        main_store, capsys):
+        """histdata 已批准但 manifest 缺使用限定（如 T87 之前的旧
+        manifest）→ 拒绝导出：使用限定必须随批准数据入库（重新下载/
+        重转换补齐 manifest），fail-fast 整体失败。"""
+        from mt5data import ext
+        mod = load_script("export_research_store_ext",
+                          REPO_ROOT / "scripts" / "export_research_store.py")
+        s = make_ext_series(ext)
+        s.manifest.pop("usage_restriction", None)
+        ext.save_ext_series(str(tmp_path / "extroot"), s)
+        rc = mod.main(["--data-root", str(main_store), "--dest",
+                       str(tmp_path / "r"), "--include-ext", "--ext-root",
+                       str(tmp_path / "extroot")])
+        assert rc == 1
+        assert "使用限定" in capsys.readouterr().out
 
     def test_approved_missing_usage_restriction_refuses(self, tmp_path,
                                                         main_store, capsys):
@@ -503,6 +575,18 @@ class TestIncludeExtWhitelist:
         assert s.manifest["usage_restriction"] \
             == SOURCE_APPROVALS["fred"]["usage_restriction"]
         assert "只作研究用途" in s.manifest["usage_restriction"]
+        assert "不再分发" in s.manifest["usage_restriction"]
+
+    def test_histdata_manifest_carries_r13_restriction(self):
+        """失败测试先行（T87）：histdata 适配器产出的 manifest 必须带
+        R13 §5 有条件批准的使用限定（只作个人研究、不再分发），且与
+        批准表逐字一致——缺限定即无法通过 --include-ext 导出。"""
+        from mt5data import ext
+        from mt5data.ext.approvals import SOURCE_APPROVALS
+        s = make_ext_series(ext)
+        assert s.manifest["usage_restriction"] \
+            == SOURCE_APPROVALS["histdata"]["usage_restriction"]
+        assert "个人研究" in s.manifest["usage_restriction"]
         assert "不再分发" in s.manifest["usage_restriction"]
 
 
@@ -690,3 +774,234 @@ class TestConsistencyDetector:
         utc2 = cons.server_to_utc(wall2, tz="Europe/Athens")
         assert utc2.iloc[0] == pd.Timestamp("2020-10-24 09:00")  # EEST +3
         assert utc2.iloc[1] == pd.Timestamp("2020-10-25 10:00")  # EET +2
+
+
+# ================================================================ T87 定盘锚点
+
+def _synth_fix_spike_minutes(year: int, *, freq_min: int = 1) -> pd.DataFrame:
+    """合成一年分钟 bar（naive UTC，全天连续）：定盘窗（伦敦本地
+    15:55–16:05）分钟收益幅度 ×20，其余分钟为基线幅度——尖峰位置即
+    "伦敦 16:00 定盘窗分钟级波动尖峰"的合成替身。确定性构造（无种子，
+    逐位可复算）：交替正负的三角波幅度序列。
+    """
+    t = pd.date_range(f"{year}-01-01", f"{year + 1}-01-01",
+                      freq=f"{freq_min}min", inclusive="left")
+    t = t[~(t.dayofweek == 5)]  # 剔除周六留周结构感（对小时画像无影响）
+    local = t.tz_localize("UTC").tz_convert("Europe/London")
+    mod = local.hour * 60 + local.minute
+    base = 1e-5
+    n = len(t)
+    # 幅度：基线小幅起伏 + 定盘窗放大
+    wave = base * (1 + ((np.arange(n) % 7) / 7.0))
+    amp = np.where((mod >= 15 * 60 + 55) & (mod < 16 * 60 + 5),
+                   wave * 20.0, wave)
+    ret = amp * np.where(np.arange(n) % 2 == 0, 1.0, -1.0)
+    close = 1.10 * np.cumprod(1.0 + ret)
+    prev = np.concatenate([[1.10], close[:-1]])
+    return pd.DataFrame({
+        "time": t, "open": prev, "high": np.maximum(prev, close),
+        "low": np.minimum(prev, close), "close": close,
+        "tick_volume": 1, "spread": 0, "real_volume": 0})
+
+
+class TestFixWindowAnchor:
+    """失败测试先行（T87/R13 §5）：定盘锚点逐年核对——伦敦 16:00 定盘窗
+    分钟级波动尖峰的位置（三分判定：定盘窗 vs 平移 ±1h 对照窗）；合成
+    数据里把尖峰错位一小时，必须判为不一致（该年份不得启用）。"""
+
+    def test_spike_located_at_fix_window(self):
+        from mt5data.ext import consistency as cons
+        df = _synth_fix_spike_minutes(2015)
+        rep = cons.fix_window_vol_spike(df)
+        assert 2015 in rep, rep
+        r = rep[2015]
+        assert r["status"] == "consistent", r
+        # 定盘窗均值压过两个平移对照窗（合成里 ×20）
+        assert r["location"] == "fix"
+        assert r["v_fix"] > 5 * r["v_minus_1h"], r
+        assert r["v_fix"] > 5 * r["v_plus_1h"], r
+
+    def test_spike_located_on_month_end_population(self):
+        """月末口径（C002 的事件总体）：判定与全日口径一致。"""
+        from mt5data.ext import consistency as cons
+        df = _synth_fix_spike_minutes(2015)
+        rep = cons.fix_window_vol_spike(df, month_end_only=True)
+        assert rep[2015]["status"] == "consistent", rep[2015]
+
+    def test_spike_shifted_one_hour_flagged_inconsistent(self):
+        """错位一小时攻击：整段时间 +1h（等效标签口径错一小时）→ 尖峰
+        落到 16:55–17:05 → 位置=plus_1h → inconsistent，该年不得启用。"""
+        from mt5data.ext import consistency as cons
+        df = _synth_fix_spike_minutes(2015)
+        shifted = df.copy()
+        shifted["time"] = shifted["time"] + pd.Timedelta(hours=1)
+        rep = cons.fix_window_vol_spike(shifted)
+        assert rep[2015]["status"] == "inconsistent", rep[2015]
+        assert rep[2015]["location"] == "plus_1h", rep[2015]
+
+    def test_shifted_minus_one_hour_also_flagged(self):
+        from mt5data.ext import consistency as cons
+        df = _synth_fix_spike_minutes(2016)
+        shifted = df.copy()
+        shifted["time"] = shifted["time"] - pd.Timedelta(hours=1)
+        rep = cons.fix_window_vol_spike(shifted)
+        assert rep[2016]["status"] == "inconsistent", rep[2016]
+        assert rep[2016]["location"] == "minus_1h", rep[2016]
+
+    def test_no_spike_undetermined(self):
+        """无定盘尖峰（平价波动）→ 分不出位置 → undetermined（不能证明
+        对齐，该年不启用——与 inconsistent 同样登记后不用）。"""
+        from mt5data.ext import consistency as cons
+        df = _synth_fix_spike_minutes(2015)
+        n = len(df)
+        flat = 1e-5 * np.where(np.arange(n) % 2 == 0, 1.0, -1.0)
+        close = 1.10 * np.cumprod(1.0 + flat)
+        prev = np.concatenate([[1.10], close[:-1]])
+        flat_df = pd.DataFrame({
+            "time": df["time"], "open": prev, "high": np.maximum(prev, close),
+            "low": np.minimum(prev, close), "close": close,
+            "tick_volume": 1, "spread": 0, "real_volume": 0})
+        rep = cons.fix_window_vol_spike(flat_df)
+        assert rep[2015]["status"] == "undetermined", rep[2015]
+
+    def test_years_reported_separately(self):
+        """多年序列逐年给出锚点结论（与 yearly_label_calendar 同粒度）。"""
+        from mt5data.ext import consistency as cons
+        df = pd.concat([_synth_fix_spike_minutes(2014),
+                        _synth_fix_spike_minutes(2015)], ignore_index=True)
+        rep = cons.fix_window_vol_spike(df)
+        assert set(rep) == {2014, 2015}
+        assert all(r["status"] == "consistent" for r in rep.values())
+
+
+# ================================================================ T87 v4/us_wall 与逐年闸门
+
+class TestHistDataUsWallRule:
+    """失败测试先行（T87）：2013–2018 文件实测为美东墙钟标签（v4），
+    与 2020+ 的欧盟日历管道（v3）不同——adapter 按 label_rule 分派转换，
+    切换周边界由 zoneinfo 钉死；混用 v3 会把美欧错位窗错一小时。"""
+
+    def _zip_from_labels(self, labels: pd.Series, year: int) -> bytes:
+        rows = []
+        px = 1.1
+        for t in labels:
+            px += 0.0001
+            rows.append(f"{t.strftime('%Y%m%d %H%M%S')};{px:.5f};"
+                        f"{px:.5f};{px:.5f};{px:.5f};0")
+        return histdata_zip("\n".join(rows).replace(
+            "DAT_ASCII_EURUSD_M1_2020.csv",
+            f"DAT_ASCII_EURUSD_M1_{year}.csv"))
+
+    def test_us_wall_labels_convert_with_v4(self):
+        """us_wall 标签（美东墙钟）经 v4 转换后：周日 18:00 标签的美东
+        冬/夏两季分别落在 23:00 / 22:00 UTC（跟美国 DST，不跟欧盟）；
+        2021-03-21（美国 03-14 已切夏、欧盟 03-28 未切）标签偏移已是
+        夏令 −4——v3 在同一时刻仍是 −5（美欧错位窗两规则分得开）。"""
+        from mt5data import ext
+        stamps = pd.Series([
+            pd.Timestamp("2021-01-10 18:00"),   # 美/欧均冬
+            pd.Timestamp("2021-07-11 18:00"),   # 美/欧均夏
+            pd.Timestamp("2021-03-21 18:00"),   # 美已切夏、欧未切
+        ])
+        s = ext.histdata_m1_from_bytes(
+            self._zip_from_labels(stamps, 2021), symbol="EURUSD",
+            downloaded_at_utc="2026-10-28T00:00:00+00:00",
+            label_rule="us_wall")
+        assert s.manifest["converter_version"] == 4
+        assert s.manifest["label_rule"] == "us_wall"
+        got = {pd.Timestamp(t).strftime("%Y-%m-%d %H:%M")
+               for t in s.df["time"]}
+        assert got == {"2021-01-10 23:00",   # EST −5
+                       "2021-07-11 22:00",   # EDT −4
+                       "2021-03-21 22:00"}   # 美墙钟已夏令 −4
+        # 同一标签按 v3（欧盟日历）：错位窗内 03-21 仍 −5 → 23:00
+        s3 = ext.histdata_m1_from_bytes(
+            self._zip_from_labels(stamps, 2021), symbol="EURUSD",
+            downloaded_at_utc="2026-10-28T00:00:00+00:00",
+            label_rule="eu_calendar")
+        got3 = {pd.Timestamp(t).strftime("%Y-%m-%d %H:%M")
+                for t in s3.df["time"]}
+        assert got3 == {"2021-01-10 23:00", "2021-07-11 22:00",
+                        "2021-03-21 23:00"}
+
+    def test_unsupported_rule_rejected(self):
+        from mt5data import ext
+        with pytest.raises(ext.ExtDataError, match="标签规则"):
+            ext.histdata_m1_from_bytes(
+                histdata_zip(week_csv("2020-01-06 00:00", "2020-01-07 00:00")),
+                symbol="EURUSD",
+                downloaded_at_utc="2026-10-28T00:00:00+00:00",
+                label_rule="fixed_est")
+
+
+class TestHistDataYearGate:
+    """T87/R13 §5 逐年闸门（scripts/fetch_ext_data.py::_histdata_year_gate）：
+    口径判为支持规则才入库；inconsistent 年份登记后不用；EURUSD 另加
+    月末定盘锚点。用合成年度 zip 直接驱动闸门。"""
+
+    def _year_zip(self, rule: str, year: int) -> bytes:
+        labels = _labels_for_rule(_synth_weeks_utc(year), rule)
+        rows = []
+        px = 1.1
+        for t in labels:
+            px += 0.0001
+            rows.append(f"{t.strftime('%Y%m%d %H%M%S')};{px:.5f};{px:.5f};"
+                        f"{px:.5f};{px:.5f};0")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr(f"DAT_ASCII_EURUSD_M1_{year}.csv", "\n".join(rows))
+        return buf.getvalue()
+
+    def test_supported_rules_gated_and_converted(self):
+        mod = load_script("fetch_ext_data_gate",
+                          REPO_ROOT / "scripts" / "fetch_ext_data.py")
+        for rule, cv in (("eu_calendar", 3), ("us_wall", 4)):
+            s, rec = mod._histdata_year_gate(
+                self._year_zip(rule, 2021), pair="EURUSD",
+                downloaded_at_utc="2026-10-28T00:00:00+00:00",
+                source_name=f"DAT_ASCII_EURUSD_M1_2021.zip")
+            # 合成数据无定盘尖峰 → EURUSD 锚点 undetermined → 不入库
+            # （口径本身判对，记录在案）
+            assert s is None and rec["used"] is False, (rule, rec)
+            assert rec["calendar"] == rule, rec
+            assert rec["converter_version"] == cv
+            assert rec["fix_anchor_month_end"]["status"] == "undetermined"
+
+    def test_inconsistent_year_registered_not_used(self):
+        """同年混两种规则 → inconsistent → 登记后不用。"""
+        mod = load_script("fetch_ext_data_gate2",
+                          REPO_ROOT / "scripts" / "fetch_ext_data.py")
+        utc = _synth_weeks_utc(2021)
+        first = utc[utc < pd.Timestamp("2021-07-01")]
+        second = utc[utc >= pd.Timestamp("2021-07-01")]
+        labels = pd.concat([_labels_for_rule(first, "eu_calendar"),
+                            _labels_for_rule(second, "fixed_est")],
+                           ignore_index=True)
+        rows = []
+        px = 1.1
+        for t in labels:
+            px += 0.0001
+            rows.append(f"{t.strftime('%Y%m%d %H%M%S')};{px:.5f};{px:.5f};"
+                        f"{px:.5f};{px:.5f};0")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("DAT_ASCII_EURUSD_M1_2021.csv", "\n".join(rows))
+        s, rec = mod._histdata_year_gate(
+            buf.getvalue(), pair="EURUSD",
+            downloaded_at_utc="2026-10-28T00:00:00+00:00",
+            source_name="DAT_ASCII_EURUSD_M1_2021.zip")
+        assert s is None and rec["used"] is False
+        assert rec["calendar"] == "inconsistent"
+        assert "登记后不用" in rec["reason"]
+
+    def test_xauusd_skips_fix_anchor(self):
+        """定盘锚点只加给 EURUSD（R13 §5）；XAUUSD 只过口径闸。"""
+        mod = load_script("fetch_ext_data_gate3",
+                          REPO_ROOT / "scripts" / "fetch_ext_data.py")
+        s, rec = mod._histdata_year_gate(
+            self._year_zip("eu_calendar", 2021), pair="XAUUSD",
+            downloaded_at_utc="2026-10-28T00:00:00+00:00",
+            source_name="DAT_ASCII_XAUUSD_M1_2021.zip")
+        assert s is not None and rec["used"] is True, rec
+        assert "fix_anchor_month_end" not in rec
+        assert s.manifest["label_rule"] == "eu_calendar"

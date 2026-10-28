@@ -12,10 +12,11 @@
 "Access denied"（即便通过其浏览器质询）；Dukascopy datafeed TLS 无法建立。
 两者的解析器保留（格式公开），下载函数会给出明确错误。
 
-批准状态（T81 落地 D36/第十二轮审核，详见 mt5data.ext.approvals）：
-fred/cdd 批准入研究库（manifest 带使用限定 usage_restriction）；histdata
-暂不批准（条款不明，样本只作一致性核对）；Yahoo 不批准（已从可选来源
-移除，不再作备选）。
+批准状态（T81 落地 D36/第十二轮审核；T87 落地第十三轮 §5，详见
+mt5data.ext.approvals）：fred/cdd/histdata 批准入研究库（manifest 带
+使用限定 usage_restriction——histdata 为第十三轮 §5 有条件批准：只作
+个人研究、不再分发、低频下载、只启用逐年口径验证通过的年份）；yahoo
+不批准（已从可选来源移除）。
 """
 from __future__ import annotations
 
@@ -33,19 +34,23 @@ import pandas as pd
 
 from mt5data.store import _COLUMNS
 from mt5data.ext.approvals import (USAGE_RESTRICTION_CDD,
-                                   USAGE_RESTRICTION_FRED)
+                                   USAGE_RESTRICTION_FRED,
+                                   USAGE_RESTRICTION_HISTDATA)
 from mt5data.ext.core import (ExtDataError, ExtSeries, histdata_stamps_to_utc,
                               sha256_bytes)
 
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
 
-# 使用条款摘要（批准结论见 mt5data.ext.approvals；第十二轮审核 D36）
+# 使用条款摘要（批准结论见 mt5data.ext.approvals；第十三轮 §5）
 TERMS_HISTDATA = (
-    "histdata.com 自称免费外汇/黄金历史数据；站内无使用条款页、未找到允许"
-    "个人研究使用的明文（D36：条款不明的不用）——暂不批准：样本只作一致性"
-    "核对、不进研究库、不对外再分发。查找记录存本地 data/ext/terms/"
-    "histdata-2026-10-27.txt；条款核实后交审核会话复核再启用。")
+    "histdata.com 免费外汇/黄金历史数据；站内无使用条款页（T81 核查，"
+    "查找记录存本地 data/ext/terms/histdata-2026-10-27.txt）。第十三轮"
+    " §5 有条件批准（2026-10-28）：FAQ 'Why Free?' 原文写明数据为交易者"
+    "与开发者回测交易系统而免费分享、'Use the data at your own will "
+    "and risk.'——只作个人研究、不再分发；按网站正常下载路径低频下载、"
+    "不并发、不绕过限制；只启用逐年时间口径验证通过的年份（EURUSD 另加"
+    "伦敦 16:00 定盘窗分钟波动尖峰锚点逐年核对）。")
 TERMS_CDD = (
     "CryptoDataDownload 免费提供交易所公开行情的聚合 CSV；页面条款允许"
     "个人下载使用、限非商业用途。Bitstamp 数据为交易所公开成交。"
@@ -103,21 +108,35 @@ def _opener_with_cookies():
 
 def histdata_m1_from_bytes(zip_bytes: bytes, *, symbol: str,
                            downloaded_at_utc: str,
-                           source_name: str | None = None
+                           source_name: str | None = None,
+                           label_rule: str = "eu_calendar",
                            ) -> ExtSeries:
     """HistData 年度 zip（DAT_ASCII_<SYM>_M1_<年>.csv）→ M1 bid K 线。
 
     格式：`YYYYMMDD HHMMSS;open;high;low;close;volume`，**无表头**；
     价格为 bid 小数（EURUSD 1.12345 六位）。
 
-    时区（实测推翻官方口径，converter_version=3）：histdata.com FAQ 称
-    标签为 EST（UTC-5）固定；对 2020–2021 文件与 MT5 主库（服务器=UTC）
-    重叠期的逐日收盘价对齐实测：偏移为美东量级（冬 −5/夏 −4），但
-    **夏令时窗按欧盟日历**切换（等效"EET−7h"管道）：美欧 DST 错位的
-    2–3 周（3 月/10 月底）按美东墙钟解释会错一小时；秋季回拨日
-    19:00–19:59 标签出现两次（先夏后冬）。换算规则实现于
-    mt5data.ext.core.histdata_stamps_to_utc，切换周边界由测试钉死。
+    时区——**标签规则逐年不同**，由调用方按逐年口径检测结果传入
+    （consistency.yearly_label_calendar，T87）：
+
+    - ``eu_calendar``（converter **v3**，实测 2020–2022 文件）：官方 FAQ
+      称 EST 固定，实测为"美东偏移 + **欧盟 DST 日历**"（等效 EET−7h
+      管道）：冬 −5/夏 −4，切换跟 3 月/10 月最后一个周日；秋季回拨日
+      19:00–19:59 标签出现两次（先夏后冬）。实现于
+      core.histdata_stamps_to_utc；
+    - ``us_wall``（converter **v4**，实测 2013–2018 文件）：标签即美东
+      墙钟（随美国 DST 调表），实现于 core.wall_clock_to_utc——早年
+      文件与 2020+ 的管道不同，混用 v3 会把美欧错位窗（每年约 4 周）
+      错一小时。
+
+    其他规则（fixed_est）或判 inconsistent/undetermined 的年份**不由
+    本适配器转换**——登记后不用（R13 §5 逐年启用条件）。
     """
+    from mt5data.ext.core import wall_clock_to_utc
+    if label_rule not in ("eu_calendar", "us_wall"):
+        raise ExtDataError(
+            f"不支持的 HistData 标签规则 {label_rule!r}（eu_calendar=v3 / "
+            "us_wall=v4；其余规则的年份登记后不用）")
     z = zipfile.ZipFile(io.BytesIO(zip_bytes))
     csvs = [n for n in z.namelist() if n.lower().endswith(".csv")]
     if not csvs:
@@ -132,7 +151,10 @@ def histdata_m1_from_bytes(zip_bytes: bytes, *, symbol: str,
                          header=None,
                          names=["stamp", "open", "high", "low", "close",
                                 "volume"])
-        df["time"] = histdata_stamps_to_utc(df["stamp"])
+        if label_rule == "us_wall":
+            df["time"] = wall_clock_to_utc(df["stamp"])
+        else:
+            df["time"] = histdata_stamps_to_utc(df["stamp"])
         frames.append(df)
     df = pd.concat(frames, ignore_index=True).sort_values("time") \
         .reset_index(drop=True)
@@ -152,15 +174,22 @@ def histdata_m1_from_bytes(zip_bytes: bytes, *, symbol: str,
         "timeframe": "M1",
         "price_side": "bid（HistData ASCII 只有买价；无 ask）",
         "original_timezone": (
-            "美东偏移+欧盟 DST 日历（官方 FAQ 称 EST 固定；实测 2020–2021 "
+            "美东偏移+美国 DST 墙钟（converter v4：冬 −5/夏 −4，切换跟"
+            "美国日历）" if label_rule == "us_wall" else
+            "美东偏移+欧盟 DST 日历（官方 FAQ 称 EST 固定；实测 2020–2022 "
             "等效 EET−7h 管道：冬 −5/夏 −4，切换按 3 月/10 月最后一个周日）"),
-        "dst_rule": ("夏令时窗 = 3 月最后一个周日 19:00 标签 → 10 月最后"
-                     "一个周日 19:00 标签；秋季回拨日 19:00–19:59 标签重复"
-                     "（先夏令时侧后冬令时侧）"),
+        "dst_rule": (
+            "标签=美东墙钟：3 月第二个周日 02:00 → 11 月第一个周日 02:00"
+            if label_rule == "us_wall" else
+            "夏令时窗 = 3 月最后一个周日 19:00 标签 → 10 月最后"
+            "一个周日 19:00 标签；秋季回拨日 19:00–19:59 标签重复"
+            "（先夏令时侧后冬令时侧）"),
         "terms_note": TERMS_HISTDATA,
+        "usage_restriction": USAGE_RESTRICTION_HISTDATA,
         "downloaded_at_utc": downloaded_at_utc,
         "source_files": [{"name": name, "sha256": sha256_bytes(zip_bytes)}],
-        "converter_version": 3,
+        "label_rule": label_rule,
+        "converter_version": 3 if label_rule == "eu_calendar" else 4,
         "rows": int(len(out)),
         "first_time": pd.Timestamp(out["time"].iloc[0]).isoformat(),
         "last_time": pd.Timestamp(out["time"].iloc[-1]).isoformat(),

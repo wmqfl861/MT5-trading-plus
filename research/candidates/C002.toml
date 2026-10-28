@@ -4,7 +4,7 @@
 id = "C002"
 title = "月末对冲调仓（USTEC 当月涨跌 → EURUSD，伦敦定盘前）"
 mechanism_class = "cross_asset"
-status = "waiting_data"             # 2026-10-28 bt candidate check 实测（ECB 14bp 口径修订后）：waiting_data（检验力 45% < 50%，EURUSD 日内 4.44 年且外部日内源未批准——MDS 2.14 封顶）；事前成本倍数 4.89 过线
+status = "screened_pass"             # 2026-10-28 T87 重检（bt candidate check，台账留痕）：预筛通过——HistData 有条件批准落地后研究段 4.44→12.81 年（histdata 2013→2022 入库段 + MT5），T84 口径定盘小时 σ=0.001742（时段异方差，约为全天 σ 的 1.7 倍）→ 隐含夏普 0.49，单次检验力 50.5%（门槛 50%，**边际通过**）；事前成本倍数 4.89 过线。注意：12.81 年为 T80/G3 日历区间并集口径，histdata 段内含两个未启用年份（2014 定盘锚点 undetermined、2019 口径 inconsistent），按实际数据密度折算约 10.8 年（检验力约 45%——边际性如实登记，交 H 线审核）。前值：waiting_data（2026-10-28 检验力 45% < 50%，EURUSD 日内 4.44 年且外部日内源未批准——MDS 2.14 封顶）
 symbols = ["EURUSD"]
 holding = "H1"
 mechanism = "外国股票组合管理人按月末市值调汇率对冲敞口：当月美股上涨 → 对冲市值上升 → 月末最后一个定盘前须卖出 USD 买回本币（或反向），集中在伦敦定盘前一小时成交（Melvin & Prins 2015 的对冲通道）。送钱方：在定盘前一小时被动承接对冲流的对手方。信号 = USTEC 上月倒数第二日至本月倒数第二日的累计涨跌；交易 = 月末最后交易日伦敦定盘前 1 小时的 EURUSD 方向仓（涨→多 EURUSD/USD 贬值方向）。"
