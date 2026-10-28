@@ -21,12 +21,25 @@
    接口 v2 的 price 惯例）；engine_a.py:448 调用点传入出场侧 bar 价格。
    **缺省行为**：不带 price 且模型为点数模式 → fail-fast 报错（不静默
    绝对额——防旧口径复活），B 层/其他调用点同步接线。
+   **接线链（计划审核 R2）**：CostModel 门面 `src/mt5quant/costs/__init__.py`
+   （:64-66 委托须接受并转发 price=，ref_price 注入 swap 构造在此接线）；
+   稳健性成本包装器 `src/mt5quant/validation/robustness.py`（:118-119
+   签名透传 price，否则带 price 调用直接 TypeError）。全仓调用点清点：
+   engine_a:150/:448、engine_b:129/:411、run_backtest.py:159 零成本桩
+   （已域内）——无其他。
 3. **身份**：成本版本串 swap 段追加基准标记 `relref[ref_price 8 位哈希]`
    （换算假设变了，台账去重必须区分新旧）；引擎 docstring 版本历史追加
-   A-1.7 条目。
+   A-1.7 条目。**relref 哈希运行时模型实际持有的 ref_price（与计费同源
+   单点取值，不得从另一路径重取——计划审核②）**。
+   **calibrated 路径同修（计划审核 R1）**：run_backtest.py 实测费率优先
+   路径（:535-549，swap-cal(tri…) tag）的 per_lot_per_night 同为"绝对
+   USD/手/夜、校准于近期价格"——快照 swap_mode==点数时按同一 ref 相对化
+   （货币模式保留绝对），relref 同样入串；无豁免。
 4. **快照时代自洽**：ref_price=近期收盘时，新旧行为在近期价格上数值近似
-   （差异 = |price/ref−1| × rel），2014–2025 段结果会小幅变化——**这是
-   修正而非回归**，受影响快照测试如实更新并注明。
+   （差异 = |price/ref−1| × rel）。2014–2025 段变化**量级由快照测试实证**
+   （计划审核注意：USTEC 早年价≈ref/5 时隔夜降约 80%，未必小）——这是
+   **修正而非回归**（点数模式=价格比例语义还原）；受影响快照测试更新时
+   注明实测差异+引用本计划编号与语义理由，防复审误判口径漂移。
 
 ## 验收（失败测试先行）
 
@@ -41,7 +54,11 @@
 
 ## 文件域
 
-src/mt5quant/costs/swap.py、src/mt5quant/backtest/engine_a.py、
-src/mt5quant/backtest/engine_b.py（同接口调用点）、scripts/run_backtest.py
-（版本串）、tests/test_costs_swap.py、tests/test_engine_a*.py 受影响者、
-蓝图开放清单勾销该待办。不碰 gates/mt5live/mt5gw/研究库。
+src/mt5quant/costs/swap.py、src/mt5quant/costs/__init__.py（门面转发+ref
+注入）、src/mt5quant/backtest/engine_a.py、src/mt5quant/backtest/
+engine_b.py、src/mt5quant/validation/robustness.py（包装器透传）、
+scripts/run_backtest.py（两路径+版本串）、tests/test_costs_swap.py、
+tests/test_engine_a*.py 受影响者、蓝图开放清单勾销该待办。
+不碰 gates/mt5live/mt5gw/研究库。
+**预筛无需同步（计划审核③核实）**：candidates.py:729-741 已是相对口径
+（notional_per_lot=cs×ref，T76 已切），本任务不改。
