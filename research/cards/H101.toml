@@ -1,0 +1,43 @@
+# H101（R1·C002）：月末对冲调仓——USTEC 当月涨跌 → EURUSD 伦敦定盘前一小时。
+# 事件模式卡（蓝图 v4 §6.6 / T84-K8 事件窗）：评估单位 = 事件窗（月末最后
+# 交易日伦敦 15:00 入、16:00 定盘出），bt gate 关卡 V3 事件分支——随机化
+# 参照主检验 p ≤ α/N + 成本 ×1.5 否决（buyhold/延迟两否决不适用）+ 四诊断。
+# 说明：卡装载器（T73A）的 evaluation_mode 枚举只有 standard|probability——
+# 本卡的事件模式由轮次预注册 research/rounds/R1.toml [evaluation]
+# C002 = { mode = "event", primary = "randomization" } 决定（T86 接线），
+# primary_statistic 与之同名。先卡后测：本文件在第一次 bt 运行前提交。
+id = "H101"
+family = "H101"
+version = 1
+parent = ""
+candidate = "C002"      # 候选登记（台账最新预筛 pass，2026-10-28T21:03:46Z）
+round = "R1"
+strategy = "mt5quant.strategies.library.b7_monthend_hedge_rebalance:MonthEndHedgeRebalance"
+symbols = ["EURUSD"]    # 成交品种；信号品种 USTEC 只出信号不下单（C002 登记）
+timeframe = "H1"
+evaluation_mode = "standard"          # 事件模式经轮次 [evaluation]（见文件头注）
+primary_statistic = "randomization"   # = R1 [evaluation].C002.primary（[v3.event] 冻结同名）
+selection_rule = "single_spec"        # 只跑登记主规格 threshold_pct=0.0，不做
+                                      # 网格挑选（R1 advance_rule：过了不再同轮
+                                      # 挑选；0.02 变体只可作诊断，不单独研究运行）
+session = "Europe/London 15:00-16:00"
+phenomenon = "月末定盘前一小时的可预测货币移动：2004-2013 八大流动货币上，月内股市收益可预测本月最后一日伦敦定盘前的货币收益——股市上涨 → 该国货币在月末最后定盘前一小时可预测贬值（Melvin & Prins 2015；量化口径：月内股市每涨 10% → 贬值 14bp，与本卡事件窗同构）。2015-02 定盘改革（WMR 4pm 窗 1→5 分钟）后成交尖峰消失但价格动态异象仍存在（Ito & Yamada 2018）；Krohn-Mueller-Whelan (2024) 1999-2019 样本跨改革前后逐年成立定盘前持续升值、定盘后反转"
+mechanism = "外国股票组合管理人按月末市值调汇率对冲敞口：当月美股上涨 → 对冲市值上升 → 月末最后一个定盘前须卖出 USD 买回本币（或反向），集中在伦敦定盘前一小时成交（Melvin & Prins 2015 的对冲通道）。送钱方：在定盘前一小时被动承接对冲流的对手方。信号 = 当月 USTEC 涨幅（上月末收盘 → 本月倒数第二日收盘）；交易 = 月末最后交易日伦敦定盘前 1 小时的 EURUSD 方向仓：涨幅 > +threshold_pct → USD 贬值方向 → 多 EURUSD（C002 登记口径：涨→多 EURUSD/USD 贬值方向）；涨幅 < -threshold_pct → 空 EURUSD"
+should_fail_when = "美股平盘月（|当月涨幅| ≤ 阈值）没有对冲调仓流——事件窗无方向可赚；对冲执行已被动化/前置（2015 定盘改革后银行执行方式变化、成交尖峰消失的路径，Ito & Yamada 2018）→ 定盘前一小时的可预测成分衰减"
+falsified_if = "随机化参照主检验 p > α/N（H1：月末定盘事件窗净收益均值 > 0 不成立），或成本 ×1.5 后每事件净均值 ≤ 0（否决）——机制在定盘前一小时窗内无可交易成分即放弃；发表后证据（Krohn 等 2024：扣足全额买卖价差后大多消失）已提示该风险"
+graveyard_checked = []
+
+[rules]
+entry = "月末最后交易日（伦敦日历最后工作日）定盘前一小时窗起点（伦敦 15:00）按当月 USTEC 涨幅定向：涨幅 > +threshold_pct → 多 EURUSD（USD 贬值/对冲调仓流方向）；涨幅 < -threshold_pct → 空 EURUSD；|涨幅| ≤ 阈值 → 不交易。bar 级实现（b7）：伦敦 14:00 开盘 bar 收盘（=15:00）出信号，引擎 15:00 开盘成交"
+exit = "伦敦 16:00 定盘时刻平仓（事件路径 london_fix_events：exit=定盘；bar 级：事件 bar 信号单根、引擎 16:00 开盘平仓）——日内 1 小时事件窗，不过夜（overnight_nights=0，window_bars=1）"
+stop = "1.0×ATR 保护性止损（ExitRules.stop_loss_atr=1.0）；无时间止损（事件窗本身 1 根 H1）"
+
+[params]
+threshold_pct = [0.0]   # 登记主规格：任何非零当月涨跌都触发（方向=涨跌符号；
+                        # 折算期望 3.1bp/事件按 E|r_月| 无条件口径）。策略类可
+                        # 接受网格 (0.0, 0.02)，0.02 变体未登记、本轮不跑
+
+[expected]
+trades_per_year = "12 事件/年（每月最后一个交易日各一个定盘前一小时事件窗）；文献折算 3.1bp/事件毛收益（Melvin-Prins 14bp/10% 月涨幅 × E|r_月|≈5.25% × 发表后衰减 0.42，全部文献折算、不取本项目样本内值）"
+win_rate = "未登记（事件方向盈亏概率由月度涨跌分布与对冲流强度决定，卡级不作点预测）"
+payoff_ratio = "不适用（固定 1 小时事件窗、对称方向仓，无参数化止盈结构）"
