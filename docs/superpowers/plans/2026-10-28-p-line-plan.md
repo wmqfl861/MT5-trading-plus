@@ -446,7 +446,7 @@ def n_needed_proportion(p0: float, dp: float, *, alpha: float = 0.05, power: flo
   - `precheck_prob` 对每个条件都给出结果，不短路；不改 `tests/test_prob_precheck.py` 里 `prob_data`、`counted_df` 的调用方式（复现脚本在用）；
   - 已知限制写进预筛输出的 note：事前成本未计入隔夜费与止损越幅；基准赢率固定为 0.40（比按止损止盈推算的 1/3 保守）；
   - 验收：本任务测试与全量回归通过；`./.venv/Scripts/python.exe docs/reviews/probes/2026-10-28-pline-probes.py` 四项 PASS（P4 由 FAIL 转 PASS）；CI 绿，证据写提交号与 tests run_number。
-- [ ] **收尾（T75 批准后）**：`t75_rule_pending` 改为 False；检验力取解析表与 T75 实测样本量规则中更严的一个，单位同为触发日数；测试覆盖"实测更严时以实测为准"。
+- [x] **收尾（T75 批准后；用户 2026-10-29 授权按执行侧推荐采纳 T75 报告）**：提交 29258a2，tests run_number 147 success——measured_n_required（z² 换算+开区间+外推截断）、n_required=max(解析,实测)、t75_rule_pending=False；测试覆盖实测更严/解析更严外推区/开区间严格大于/None 传播/两维单调性（test_measured_rule_* 六例）；全量 2244 passed，探针 02/03/04 全 PASS。
 
 ## T77：P 线首批候选与第一轮草案（M）——批准点
 
@@ -454,17 +454,17 @@ def n_needed_proportion(p0: float, dp: float, *, alpha: float = 0.05, power: flo
 
 **可以先做的部分（审核三）**：文献功课与预期 Δp 折算不碰数据，T75 批准前就可以做，候选文件草稿先提交；预期 Δp 提交之后，再跑计数（只数不看结果）。次序不能反，先看计数再定预期 Δp，会有把预期抬高来过检验力门槛的风险。计数结果与 D52 表的对照写进候选报告草稿；如果触发日数不够，按铁律 18 进"待数据"，不放宽标准。
 
-- [ ] **文献功课**（每个候选）：
+- [x] **文献功课**（提交 aa7317f run#136 绿；检索记录在各候选 search_log）：
   - 原始文献、发表后或其他市场的复现、反驳，以及检索记录（检索词、数据库、日期）；
   - 起点：Osler（2003；纽约联储 Staff Report 125 版本）；
   - 数据挖掘方面的警示：Sullivan、Timmermann、White（1999）；
   - C102 找不到文献就判 fail，不开卡。
-- [ ] **候选内容**：
+- [x] **候选内容**（提交 aa7317f；预筛实运行于 29258a2——三候选 **fail**：事前成本 ΔEV 0.06R < 3×成本 + 12 条假设触发日数 6–49 远低于 7424 开区间；报告 §4 照实记录）：
   - 品种只用 XAUUSD（D53）；
   - 按蓝图 P 线 §7 登记本局面的全部四个动作，方向由动作定义决定（D51）：`S#:A1:follow>base`、`S#:A2:follow>base`、`S#:A3:fade>base`、`S#:A4:fade>base`；不得依据计数或任何看过的数据增删动作、改方向；
   - 预期 Δp 只按文献折算，没有复现时按 −58%；不得取自发现段的结果（发现段就是 P1 的检验数据）；
   - 跑 `bt candidate check`（审核二修正后的版本）。
-- [ ] **轮次草案**：
+- [ ] **轮次草案**：**不提交（执行侧推荐，报告 §6；待审核确认）**——三候选零可运行假设（成本 fail+检验力待数据），开轮是空轮；原草案要求列此存档、若审核不同意再按其意见出 R2 草案：
   - 候选 ≤ 3；`[evaluation]` 每个候选 `{ mode = "probability", primary = "delta_p_one_sided" }`；
   - `[segments] split` 写入前重跑 `bt segment propose --symbols XAUUSD --timeframe H1` 确认（审核时为 2019-12-01）；
   - 试验预算 = 本轮假设条数（≤ 12 次去重试验）；`lockbox_uses_max = 0`（P1 不用锁箱，需 T73A）；`dsr_trial_scope` 按 T64 的项目级口径；
@@ -472,7 +472,7 @@ def n_needed_proportion(p0: float, dp: float, *, alpha: float = 0.05, power: flo
   - 推进规则：Holm 校正后显著，且 Δp 点估计满足事前成本要求；
   - 结束条件：全部假设有结论，或预算用尽；
   - `approved_by` 留空，由 P 线审核会话批准时填写。
-- [ ] **候选报告**：材料对比表，列出机制、文献三栏、折算效应、事前成本（逐品种）、逐条假设的发现段触发日数与检验力（4 条与全轮两种口径）、预筛结论。**提交后停下，等 P 线审核会话批准；批准前不开卡、不跑任何运行。**
+- [x] **候选报告**：docs/research/candidates-P1-2026-10-29.md（定稿于 29258a2 run#147 绿）——材料对比/折算依据/计数（§3）/预筛实运行（§4：fail 逐品种成本+逐假设检验力）/实测规则对照（§5）/轮次决定（§6）。**停下，等 P 线审核会话批准；批准前不开卡、不跑任何运行。**
 
 ## T78：风控号段子上限与 P 线实盘接入（M，阶段 F 结束后，H 线会话负责）
 
@@ -571,7 +571,7 @@ def n_needed_proportion(p0: float, dp: float, *, alpha: float = 0.05, power: flo
   - `segment = "validation"`、`evaluation_mode = "standard"`，绑定 `LevelDecisionV1` 的子类；
   - 只用 P1 通过的"局面 × 动作"；
   - 特征、收缩与门槛取蓝图 P 线 §2.4–§2.5 的缺省值（m = 100、min_cell = 100、lb_z = 1.0、门槛 2 倍成本、两个特征），不调参；要偏离缺省值，只能依据发现段，并在草案里写明依据。
-- [ ] **轮次草案**：
+- [ ] **轮次草案**：**不提交（执行侧推荐，报告 §6；待审核确认）**——三候选零可运行假设（成本 fail+检验力待数据），开轮是空轮；原草案要求列此存档、若审核不同意再按其意见出 R2 草案：
   - 新的轮次编号；
   - `[evaluation]` 的主检验按 T65 批准的关卡 v3 填写；
   - `lockbox_uses_max = 1`（G5 在本轮内使用，见 T93）；试验预算 = 决策卡张数；
