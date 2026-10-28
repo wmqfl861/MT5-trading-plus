@@ -280,7 +280,7 @@ class BaseStrategy:
   - 每次运行记录所用模型的 sha256；
   - 同样的输入重新拟合，哈希必须相同；
   - 模型文件写到 `data_research/models/<卡>/<sha256>.json`。
-- [ ] T73A 失败测试先行：
+- [x] T73A 失败测试先行（提交 69ad65f，tests run_number 108 success；34 个测试先红后绿；全量 2068 passed, 1 skipped——含既有 B1/walk-forward 套件，非拟合策略逐位不变；runs 表结构不变，verify_chain 通过）：
   - 非拟合策略逐位不变（现有测试全过；B1 在固定夹具上的 G3 结果改动前后逐位一致）；
   - 拟合不读 `train_end` 之后的数据，最后 K 根的触发被 purge；
   - 冻结模型的拟合策略能过 G0；故意在 `generate_signals` 里现场统计全部历史的坏策略被 G0 查出；
@@ -317,7 +317,7 @@ class BaseStrategy:
 - [x] **局面/动作/特征（不依赖 T73 拟合协议的部分）**：`situations.py`（Approach M/D/d + S1 网格/S2 前一交易日 17:00 NY 划界（DST 由 zoneinfo，EST 22:00/EDT 21:00 UTC 边界实测）/S3 B1 同法通道 shift(1)）+ `actions.py`（A1–A4 阻力支撑对称，b 与 m 取卡参数，A2 带 ±0.25 ATR）+ `features.py`（trend_sma200 / atr_pct_2000 有界窗口、未满窗 None）。测试 `test_strategies_prob_situations.py`（9）+ `test_strategies_prob_actions.py`（7）+ `test_strategies_prob_features.py`（4），共 20 个，先红后绿：A1–A4 触发与手算一致（阻力 `test_actions_hand_computed_resistance`、支撑 `test_support_actions_mirror_hand_case`）；镜像对称（价格围绕价位反射后 kind 互换、方向取反、bar 不变——`test_s1_support_touch_and_mirror`、`test_actions_mirror_symmetry`）。
   （CI 如实注：572396d 自身的 CI 因锚定测试同刻度偶发为红，与本任务内容无关；绿灯证据来自 d96c523。）
 - [x] **审核修正（R12，2026-10-28）**："接近价位"定义更正——本根进入触及带；前 M 根都在带外且价位同侧（阻力 high_j < L − d·ATR_j），其中至少一根 ≥ D·ATR；蓝图 P 线 §2.1 同步更正；渐进接近测试（旧定义拒绝、新定义触发，test_s1_ramp_approach_accepted_new_definition），既有手算测试全部复绿。CI 绿灯 2df2ca6（tests run#97 success，全量 1981 passed, 1 skipped；编号已由审核二按 GitHub API 更正）。
-- [ ] **剩余项（依赖拟合协议，T73A 完成后做）**：
+- [x] **剩余项（T73A 后完成；LevelDecisionV1 + 7 测试，提交 8066cde，tests run_number 109 success；全量 2075 passed；夹具随 H 线 T82 接口变化的修复 32dc829/fb1d60b——run 113/114）**：
   - 持有到第 K 根归零；止损后同一次触发不再重入（经引擎验证）；
   - G0：冻结模型下截断一致，窗口不变性 ≥ 100 个随机探针；
   - 没装模型 → ModelMissingError；模型哈希不符 → ModelIntegrityError；
@@ -352,7 +352,7 @@ def brier_skill(p_pred, outcome, p_base) -> float
   - 负对照的单假设误报率与 Holm 联合误报率都 ≤ 5%，才采用；
   - 超出时，加长块长或收紧 α 后重新标定；
   - 报告检出率曲线，并据此写出"概率模式样本量规则"（单位为触发日数，给出 4 个假设与 12 个假设两种口径）；实测要求比蓝图 §3.4 的解析表更严的，以实测为准。
-- [ ] 失败测试先行：
+- [x] 失败测试先行（代码与合成数据测试完成——提交 7c4769b，tests run_number 110 success；全量 2085 passed；**正式标定运行与报告仍等 T66 批准**）：
   - 随机化后，小时、星期与 ATR 分位的分布与原触发一致（卡方检验，或逐桶计数相等）；
   - 同一种子结果逐位一致；
   - 合成数据上未植入效应时，误报率接近名义水平（1,000 次）；
@@ -487,7 +487,7 @@ def n_needed_proportion(p0: float, dp: float, *, alpha: float = 0.05, power: flo
   - 本轮全部卡都跑完才能出；
   - 在 `[hypotheses]` 列出的全部假设上做 Holm，按轮次文件的推进规则判定；
   - 输出 `docs/research/round-<R#>-p1-<日期>.md`（报告头"状态：待审核"）与同名 JSON。
-- [ ] 失败测试先行（只用合成数据）：
+- [x] 失败测试先行（只用合成数据；7 测试，绿灯 fb1d60b run_number 114——f58118a run#112 与 32dc829 run#113 因测试夹具未跟上 H 线 T82 的 overnight_fee price 形参而红，业务代码无误；全量 2108 passed, 1 skipped）：
   - 植入 Δp = 0.05、触发日数 2,000 → 检出；未植入 → 不检出（固定种子）；
   - 前置检查逐条：未批准的轮次、validation 卡、读到 `>= split` 的数据、假设表与 `[hypotheses]` 不一致、预算不足 → 拒绝；
   - 越过分界的触发被剔除；
