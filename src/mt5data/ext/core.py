@@ -17,7 +17,9 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from mt5data.store import _COLUMNS, _atomic_replace, _fsync_file, merge_bars
+from mt5data.store import (
+    _COLUMNS, _atomic_replace, _fsync_file, merge_bars, unique_tmp_path,
+)
 
 # ---------------------------------------------------------------- 常量
 
@@ -223,7 +225,10 @@ def save_ext_series(ext_root, series: ExtSeries) -> str:
     """校验 manifest → 原子写 data.parquet + manifest.json；返回目录。
 
     目录布局 {ext_root}/<来源>/<品种>/<周期>/；data.parquet 列与
-    mt5data.store 一致（time naive UTC）。
+    mt5data.store 一致（time naive UTC）。H-11：临时文件唯一命名——两个
+    保存者并发写同一序列时不再争用固定名 .tmp（读到半截或 FileNotFoundError）；
+    parquet/manifest 分两次发布之间失败过的序列由 load_ext_series 的
+    rows 核对明确拒绝（fail-fast 既有行为）。
     """
     df = series.df[_COLUMNS].copy()
     df["time"] = pd.to_datetime(df["time"]).astype("datetime64[ns]")
@@ -231,11 +236,11 @@ def save_ext_series(ext_root, series: ExtSeries) -> str:
     d = _ext_dir(ext_root, series.manifest["source"],
                  series.manifest["symbol"], series.manifest["timeframe"])
     os.makedirs(d, exist_ok=True)
-    parquet_tmp = os.path.join(d, "data.parquet.tmp")
+    parquet_tmp = unique_tmp_path(os.path.join(d, "data.parquet"))
     df.to_parquet(parquet_tmp, index=False)
     _fsync_file(parquet_tmp)
     _atomic_replace(parquet_tmp, os.path.join(d, "data.parquet"))
-    mtmp = os.path.join(d, "manifest.json.tmp")
+    mtmp = unique_tmp_path(os.path.join(d, "manifest.json"))
     with open(mtmp, "w", encoding="utf-8") as f:
         json.dump(series.manifest, f, ensure_ascii=False, indent=2)
     _atomic_replace(mtmp, os.path.join(d, "manifest.json"))

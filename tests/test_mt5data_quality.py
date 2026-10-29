@@ -472,6 +472,37 @@ def test_read_known_gaps_tolerates_missing_meta(tmp_path):
     assert read_known_gaps(str(tmp_path), "NOSUCH", "H1") == []
 
 
+def test_write_known_gaps_uses_unique_tmp_per_write(tmp_path, monkeypatch):
+    """H-11 失败测试：两次登记各用各的临时文件（固定 .tmp 会被并发写者互踩）。"""
+    import os
+
+    from mt5data.quality import write_known_gaps
+    from mt5data.store import save_bars
+
+    t0 = datetime(2026, 10, 26, 0, 0)
+    save_bars(str(tmp_path), "EURUSD", "H1",
+              make_bars([t0 + timedelta(hours=i) for i in range(5)]))
+
+    recorded = []
+    real_replace = os.replace
+
+    def rec_replace(tmp, final):
+        recorded.append(tmp)
+        return real_replace(tmp, final)
+
+    monkeypatch.setattr(os, "replace", rec_replace)
+
+    write_known_gaps(str(tmp_path), "EURUSD", "H1", [
+        {"start": "2021-05-17T14:00:00", "end": "2021-06-14T11:00:00",
+         "reason": "a"}])
+    write_known_gaps(str(tmp_path), "EURUSD", "H1", [
+        {"start": "2022-01-03T00:00:00", "end": "2022-01-04T00:00:00",
+         "reason": "b"}])
+
+    assert len(recorded) == 2
+    assert len(set(recorded)) == 2, f"临时文件名复用：{recorded}"
+
+
 # ---- I4 回归：异常列表限量与 p99=0 防退化 ----
 
 def test_spread_anomaly_capped_with_count_and_histogram():

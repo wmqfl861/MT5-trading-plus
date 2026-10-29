@@ -93,3 +93,93 @@ def test_save_load_roundtrip_watermark_and_atomic(tmp_path):
 def test_load_missing_returns_none(tmp_path):
     assert load_bars(tmp_path, "XXX", "M1") is None
     assert read_watermark(tmp_path, "XXX", "M1") is None
+
+
+# ------------------------------------------------ H-11：写锁覆盖读改写 + 审计元数据保留
+
+def test_save_bars_preserves_registered_known_gaps(tmp_path):
+    """H-11 失败测试：save_bars 重建 meta 时保留 known_gaps（审计登记不是水位）。
+
+    场景：先落库 → quality.write_known_gaps 登记缺口 → 再 save_bars（刷新
+    落库的等价路径，不带任何 known_gaps 参数）。修复前 meta 只继承
+    server/login，登记被静默清掉。
+    """
+    from mt5data.quality import write_known_gaps
+
+    save_bars(tmp_path, "EURUSD", "M1", bars_df([0, 1], [1.0, 2.0]),
+              server="Exness-Trial", login=123456789)
+    write_known_gaps(str(tmp_path), "EURUSD", "M1", [
+        {"start": "2021-05-17T14:00:00", "end": "2021-06-14T11:00:00",
+         "reason": "终端无该段历史"}])
+
+    save_bars(tmp_path, "EURUSD", "M1", bars_df([0, 1, 2], [1.0, 2.0, 3.0]))
+
+    wm = read_watermark(tmp_path, "EURUSD", "M1")
+    assert wm["rows"] == 3  # 水位确实更新为最新数据
+    assert wm["server"] == "Exness-Trial" and wm["login"] == 123456789
+    gaps = wm.get("known_gaps")
+    assert gaps, "刷新后 known_gaps 丢失（H-11：审计登记必须保留）"
+    assert gaps[0]["start"] == "2021-05-17T14:00:00"
+    assert gaps[0]["end"] == "2021-06-14T11:00:00"
+    assert gaps[0]["reason"] == "终端无该段历史"
+    assert "registered_utc" in gaps[0]  # 登记时间等审计字段完整保留
+
+
+def test_save_bars_tmp_paths_unique_per_write(tmp_path, monkeypatch):
+    """H-11 失败测试：两次保存的临时文件各用各的名（固定 .tmp 会被第二写者截断）。"""
+    from mt5data import store
+
+    recorded = []
+    real_replace = store._atomic_replace
+
+    def rec_replace(tmp, final):
+        recorded.append(tmp)
+        return real_replace(tmp, final)
+
+    monkeypatch.setattr(store, "_atomic_replace", rec_replace)
+
+    save_bars(tmp_path, "EURUSD", "M1", bars_df([0, 1], [1.0, 2.0]))
+    save_bars(tmp_path, "EURUSD", "M1", bars_df([0, 1, 2], [1.0, 2.0, 3.0]))
+
+    # 两次写 × (parquet tmp + meta tmp) = 4 个临时文件名，两两互不相同
+    assert len(recorded) == 4
+    assert len(set(recorded)) == 4, f"临时文件名复用：{recorded}"
+    assert all(p.endswith(".tmp") for p in recorded)
+
+
+def test_load_bars_checked_rejects_torn_publish(tmp_path, monkeypatch):
+    """H-11 失败测试：parquet/meta 发布之间失败 → 读者要么一致版本要么明确拒绝。
+
+    data.parquet 与 meta.json 分两次原子发布；在两者之间注入失败后，
+    库里是"新 parquet + 旧水位"的撕裂快照——load_bars_checked 必须明确
+    拒绝（StoreConsistencyError），不得把自相矛盾的版本当正常数据返回。
+    正常再保存一次即可自愈。
+    """
+    from mt5data import store
+    from mt5data.store import StoreConsistencyError, load_bars_checked
+
+    save_bars(tmp_path, "EURUSD", "M1", bars_df([0, 1, 2], [1.0, 2.0, 3.0]))
+    # 一致状态：校验读取通过，与 load_bars 同值
+    assert len(load_bars_checked(tmp_path, "EURUSD", "M1")) == 3
+
+    real_replace = store._atomic_replace
+    calls = {"n": 0}
+
+    def boom(tmp, final):
+        calls["n"] += 1
+        if calls["n"] == 2:  # 第 2 次 _atomic_replace = meta.json 发布
+            raise OSError("注入：parquet 已发布、meta 尚未发布时崩溃")
+        return real_replace(tmp, final)
+
+    monkeypatch.setattr(store, "_atomic_replace", boom)
+    with pytest.raises(OSError, match="meta 尚未发布"):
+        save_bars(tmp_path, "EURUSD", "M1", bars_df([0, 1, 2, 3], [1.0, 2.0, 3.0, 4.0]))
+    monkeypatch.undo()
+
+    # 撕裂快照：数据 4 根、水位 3 根 → 明确拒绝
+    assert len(load_bars(tmp_path, "EURUSD", "M1")) == 4
+    with pytest.raises(StoreConsistencyError, match="不是同一份快照"):
+        load_bars_checked(tmp_path, "EURUSD", "M1")
+    # 正常保存一次即自愈
+    save_bars(tmp_path, "EURUSD", "M1", bars_df([0, 1, 2, 3], [1.0, 2.0, 3.0, 4.0]))
+    assert len(load_bars_checked(tmp_path, "EURUSD", "M1")) == 4

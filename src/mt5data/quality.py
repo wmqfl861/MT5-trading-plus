@@ -43,7 +43,9 @@ import pandas as pd
 from mt5data.sessions import (
     NY_TZ, gap_is_weekend, overlapped_weekend_windows,
 )
-from mt5data.store import TIMEFRAME_SECONDS, read_watermark, series_dir
+from mt5data.store import (
+    TIMEFRAME_SECONDS, read_watermark, series_dir, series_lock, unique_tmp_path,
+)
 
 _HOLIDAY_HOURS = 20.0
 _DAILY_BREAK_NUM, _DAILY_BREAK_DEN = 6, 10  # ≥60%，整数比较免浮点误差
@@ -374,28 +376,31 @@ def write_known_gaps(root, symbol: str, timeframe: str,
 
     entries 每条 {"start": iso, "end": iso, "reason": str}。整表先校验后
     写入（一条非法全部拒绝，不留半截登记）。离线运维操作（scripts/scan_gaps
-    --register-known），不走跨进程序列锁——不与下载/导出并发运行。
+    --register-known）。H-11 起"读 meta→合并登记→写回"的读改写整段走
+    跨进程序列写锁，与 save_bars 的 meta 重建互斥——登记与刷新并发时
+    不再互相覆盖（save_bars 侧同时保留 known_gaps）；临时文件唯一命名。
     """
     if not entries:
         raise ValueError("known_gaps 登记条目不能为空")
     validated = [(_known_gap_entry(e), e) for e in entries]
     d = series_dir(root, symbol, timeframe)
     path = os.path.join(d, "meta.json")
-    meta: dict = {}
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            meta = json.load(f)
-    by_start = {item["start"]: item
-                for item in meta.get("known_gaps", [])
-                if isinstance(item, dict) and "start" in item}
-    for (s, e), raw in validated:
-        by_start[raw["start"]] = {
-            "start": raw["start"], "end": raw["end"],
-            "reason": str(raw.get("reason", "")),
-            "registered_utc": datetime.now(timezone.utc).isoformat(),
-        }
-    meta["known_gaps"] = sorted(by_start.values(), key=lambda x: x["start"])
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    with series_lock(d):
+        meta: dict = {}
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                meta = json.load(f)
+        by_start = {item["start"]: item
+                    for item in meta.get("known_gaps", [])
+                    if isinstance(item, dict) and "start" in item}
+        for (s, e), raw in validated:
+            by_start[raw["start"]] = {
+                "start": raw["start"], "end": raw["end"],
+                "reason": str(raw.get("reason", "")),
+                "registered_utc": datetime.now(timezone.utc).isoformat(),
+            }
+        meta["known_gaps"] = sorted(by_start.values(), key=lambda x: x["start"])
+        tmp = unique_tmp_path(path)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)

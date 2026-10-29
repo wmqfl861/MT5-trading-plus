@@ -233,3 +233,80 @@ def test_refresh_without_old_file_falls_back_to_backfill(tmp_path, pinned_wall):
     pinned_wall(wall())
     stats = refresh_series(tmp_path, market, "EURUSD", "M1", lookback=50)
     assert stats["rows"] == 79  # 全量回填而非只存 50 根
+
+
+# ----------------------------------------------- H-11：写锁覆盖读改写过程
+
+
+def test_two_writers_disjoint_segments_both_survive(tmp_path, monkeypatch):
+    """H-11 失败测试：两个写者分别新增不相交时间段，合并后两段都在。
+
+    写者 A（深回填）在**抓取期间**，写者 B（向前刷新）完整跑完一轮：
+    B 读到旧表、发布了靠后的新段。A 若拿抓取前的旧快照合并发布（只有
+    save_bars 的写段在锁内），就会把 B 刚发布的段覆盖丢——丢更新。
+    修复后"读最新表→合并→校验→发布"在序列写锁内，A 在锁内重读最新
+    表再合并，深段（A）与近段（B）同时保留。
+    """
+    import pandas as pd
+
+    from mt5data.store import load_bars
+
+    real_fetch = downloader._fetch_pages
+    fake_a, market_a, _, _ = make_gateway(total_history=100, now_min=99)
+    fake_b, market_b, _, _ = make_gateway(total_history=110, now_min=109)
+    walls = {"cur": fake_a.state["now"]}
+    monkeypatch.setattr(downloader, "_utcnow", lambda: walls["cur"])
+    armed = {"go": False}
+
+    def seam(market, symbol, timeframe, chunk, max_chunks, stop_before):
+        # A 的深回填抓取开始时，让 B 先完整刷新一轮（读旧表→发布新段）
+        if armed["go"] and market is market_a:
+            armed["go"] = False
+            walls["cur"] = fake_b.state["now"]  # B 的墙钟（B 自校准用）
+            refresh_series(str(tmp_path), market_b, "EURUSD", "M1", lookback=50)
+            walls["cur"] = fake_a.state["now"]  # 换回 A 的墙钟
+        return real_fetch(market, symbol, timeframe, chunk, max_chunks,
+                          stop_before)
+
+    monkeypatch.setattr(downloader, "_fetch_pages", seam)
+
+    # 初始：99 根收盘 [T0+0:30 → T0+98:30]
+    backfill_series(str(tmp_path), market_a, "EURUSD", "M1", chunk=200)
+    # A：终端出现深历史（total 100→300，新增靠前的段）；抓取期间 B 已把
+    # 库推进到 109 根（新增靠后的段 [T0+99:30 → T0+108:30]）
+    fake_a.state["total"] = 300
+    armed["go"] = True
+    stats = backfill_series(str(tmp_path), market_a, "EURUSD", "M1", chunk=500)
+
+    final = load_bars(str(tmp_path), "EURUSD", "M1")
+    assert stats["rows"] == 309, f"B 的段被 A 的旧快照覆盖丢了（剩 {stats['rows']}）"
+    assert len(final) == 309
+    # 深段（A 新增，最老一根 now-299m）与近段（B 新增，最新一根 now-1m）都在
+    assert final["time"].iloc[0] == pd.Timestamp(fake_a.state["now"]) \
+        - pd.Timedelta(minutes=299)
+    assert final["time"].iloc[-1] == pd.Timestamp(fake_b.state["now"]) \
+        - pd.Timedelta(minutes=1)
+
+
+def test_refresh_keeps_registered_known_gaps(tmp_path, pinned_wall):
+    """H-11 失败测试：先登记 known_gaps → 再刷新 → 登记仍在（且水位前进）。"""
+    from mt5data.quality import read_known_gaps, write_known_gaps
+    from mt5data.store import read_watermark
+
+    fake, market, symbols, wall = make_gateway(total_history=100, now_min=99)
+    pinned_wall(wall())
+    backfill_series(str(tmp_path), market, "EURUSD", "M1", chunk=200)
+
+    write_known_gaps(str(tmp_path), "EURUSD", "M1", [
+        {"start": "2021-05-17T14:00:00", "end": "2021-06-14T11:00:00",
+         "reason": "终端无该段历史"}])
+
+    fake.state["now"] = BASE + timedelta(minutes=109, seconds=30)
+    fake.state["total"] = 110
+    pinned_wall(fake.state["now"])
+    stats = refresh_series(str(tmp_path), market, "EURUSD", "M1", lookback=50)
+
+    assert stats["rows"] == 109  # 刷新确实发生
+    assert read_watermark(str(tmp_path), "EURUSD", "M1")["rows"] == 109
+    assert read_known_gaps(str(tmp_path), "EURUSD", "M1") == [
+        (datetime(2021, 5, 17, 14, 0), datetime(2021, 6, 14, 11, 0))]

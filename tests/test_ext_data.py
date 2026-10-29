@@ -319,6 +319,42 @@ class TestManifest:
         with pytest.raises(ext.ExtDataError, match="rows"):
             ext.save_ext_series(str(tmp_path / "ext"), s.replace_manifest(m))
 
+    def test_save_ext_series_interleaved_writers_do_not_share_tmp(
+            self, tmp_path, monkeypatch):
+        """H-11 失败测试：两个保存者不共用同一 .tmp（ext 写入无锁，全靠唯一名）。
+
+        写者 A 落完 parquet 临时文件、尚未发布时，写者 B 对同一序列完整
+        保存一轮。固定名 data.parquet.tmp 下 B 会把 A 的半成品截断/替换
+        掉，A 随后 fsync 或 replace 直接 FileNotFoundError。唯一临时名后
+        两个写者互不相干，最终落盘版本自洽可读。
+        """
+        from mt5data import ext
+        from mt5data.ext import core as ext_core
+
+        s_a = make_ext_series(ext)
+        s_b = make_ext_series(ext).replace(  # 同序列不同行数：B 少 5 根
+            df=make_ext_series(ext).df.iloc[:-5])
+
+        calls = {"n": 0}
+        real_fsync = ext_core._fsync_file
+
+        def seam(path):
+            if calls["n"] == 0:  # A 的 parquet tmp 刚写完、还没发布
+                calls["n"] += 1
+                ext.save_ext_series(str(tmp_path / "ext"), s_b)  # B 全程完成
+            real_fsync(path)
+
+        monkeypatch.setattr(ext_core, "_fsync_file", seam)
+
+        ext.save_ext_series(str(tmp_path / "ext"), s_a)  # A 不再因共用 tmp 失败
+
+        df, manifest = ext.load_ext_series(str(tmp_path / "ext"), "histdata",
+                                           "EURUSD", "H1")
+        assert len(df) == len(s_a.df)  # A 后发布，最终版本 = A
+        assert manifest["rows"] == len(s_a.df)
+        d = tmp_path / "ext" / "histdata" / "EURUSD" / "H1"
+        assert not any(p.name.endswith(".tmp") for p in d.iterdir())
+
 
 # ================================================================ cutoff
 

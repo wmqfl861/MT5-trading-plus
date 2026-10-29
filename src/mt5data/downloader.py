@@ -21,7 +21,7 @@ import pandas as pd
 from mt5gw.errors import DataUnavailableError
 from mt5gw.market import MarketData
 from mt5data.store import (
-    TIMEFRAME_SECONDS, drop_unclosed, load_bars, merge_bars, save_bars,
+    TIMEFRAME_SECONDS, drop_unclosed, load_bars_checked, merge_bars, update_bars,
 )
 
 logger = logging.getLogger(__name__)
@@ -111,9 +111,13 @@ def backfill_series(root, market: MarketData, symbol: str, timeframe: str,
                     chunk: int = 500_000, max_chunks: int = 2000, *,
                     force: bool = False, replace: bool = False,
                     meta_info: dict | None = None) -> dict:
-    """全量回填：取尽历史 → 剔除未收盘 → 并集合并（收缩需 force）→ 原子落库。"""
+    """全量回填：取尽历史 → 剔除未收盘 → 并集合并（收缩需 force）→ 原子落库。
+
+    H-11：抓取在锁外；"读最新表→合并→校验→发布"整段经 update_bars 在
+    序列写锁内完成——并发写者新增的段不会被本次的旧快照覆盖丢。
+    """
     now = server_now(market, symbol)
-    old = load_bars(root, symbol, timeframe)
+    old = load_bars_checked(root, symbol, timeframe)
     _lineage_guard(_read_meta(root, symbol, timeframe), meta_info, symbol, timeframe)
     merged, chunks = _fetch_pages(market, symbol, timeframe, chunk, max_chunks,
                                   stop_before=None)
@@ -124,12 +128,18 @@ def backfill_series(root, market: MarketData, symbol: str, timeframe: str,
     closed = drop_unclosed(merged, timeframe, now)
     if closed is None or len(closed) == 0:
         raise DataUnavailableError(f"{symbol} {timeframe} 取到的全是未收盘 bar，异常")
-    if replace and old is not None and len(old):
-        _backup(root, symbol, timeframe)
-        target = closed  # 显式替换：旧文件已备份
-    else:
-        target = _union_guard(closed, old, symbol, timeframe, force)
-    save_bars(root, symbol, timeframe, target, **(meta_info or {}))
+
+    def _merge(latest, fetched):
+        # 锁内复检：并发写者可能已推进水位/血缘
+        _lineage_guard(_read_meta(root, symbol, timeframe), meta_info,
+                       symbol, timeframe)
+        if replace and latest is not None and len(latest):
+            _backup(root, symbol, timeframe)  # 锁内备份：备的正是将被替换的那份
+            return fetched
+        return _union_guard(fetched, latest, symbol, timeframe, force)
+
+    target = update_bars(root, symbol, timeframe, closed, merge=_merge,
+                         **(meta_info or {}))
     return {
         "symbol": symbol, "timeframe": timeframe,
         "rows": int(len(target)), "chunks_fetched": chunks,
@@ -145,8 +155,10 @@ def refresh_series(root, market: MarketData, symbol: str, timeframe: str,
     接续点之后的缺口（周末/假日休市、日内休市）属于源数据自身的序列，
     不做算术推断、不会误报；翻页取尽仍够不到旧末根才是失败。
     旧文件不存在时直接转全量回填。
+    H-11：抓取在锁外；"读最新表→合并→校验→发布"整段经 update_bars 在
+    序列写锁内完成（锁内重读最新表，两个并发刷新不互覆）。
     """
-    old = load_bars(root, symbol, timeframe)
+    old = load_bars_checked(root, symbol, timeframe)
     if old is None or len(old) == 0:
         logger.info("%s %s 无旧文件，刷新转为全量回填", symbol, timeframe)
         return backfill_series(root, market, symbol, timeframe,
@@ -168,13 +180,31 @@ def refresh_series(root, market: MarketData, symbol: str, timeframe: str,
             f"{symbol} {timeframe} 翻页取尽仍未覆盖旧末根 {old_last}，无法证明与"
             "旧数据接续（停更过久或服务端缺段）——请重跑全量回填（backfill）。"
         )
-    combined = merge_bars(old, merged)
-    closed = drop_unclosed(combined, timeframe, now)
-    if len(closed) < len(old):
-        # 时钟异常的防御分支：绝不因刷新删旧数据
-        logger.warning("%s %s 收盘裁剪反而变短（时钟异常？），保留并集", symbol, timeframe)
-        closed = combined
-    save_bars(root, symbol, timeframe, closed, **(meta_info or {}))
+
+    def _merge(latest, fetched):
+        # 锁内复检：并发写者可能已推进水位/血缘
+        _lineage_guard(_read_meta(root, symbol, timeframe), meta_info,
+                       symbol, timeframe)
+        base = latest if (latest is not None and len(latest)) else None
+        if base is not None and not fetched["time"].isin(base["time"]).any():
+            # 抓取时的接续证明对的是当时的旧末根；锁内最新表已与抓取结果
+            # 无任何重叠（并发 --replace 收缩等）→ 证明失效，拒绝发布
+            raise DataUnavailableError(
+                f"{symbol} {timeframe} 抓取结果与库内最新数据无重叠（并发写者"
+                "已改写该序列？），无法证明接续——请重试或重跑全量回填"
+                "（backfill）。"
+            )
+        combined = merge_bars(base, fetched)
+        closed = drop_unclosed(combined, timeframe, now)
+        if base is not None and len(closed) < len(base):
+            # 时钟异常的防御分支：绝不因刷新删旧数据
+            logger.warning("%s %s 收盘裁剪反而变短（时钟异常？），保留并集",
+                           symbol, timeframe)
+            closed = combined
+        return closed
+
+    closed = update_bars(root, symbol, timeframe, merged, merge=_merge,
+                         **(meta_info or {}))
     return {
         "symbol": symbol, "timeframe": timeframe,
         "rows": int(len(closed)),
