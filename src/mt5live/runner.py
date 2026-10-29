@@ -49,6 +49,14 @@ ATR_PERIOD = 14   # 与 engine_a 默认一致（Wilder ATR）
 COMPUTE_WINDOW_MIN_BARS = 1000          # 下限：至少 1000 根
 COMPUTE_WINDOW_LOOKBACK_MULTIPLE = 3    # 倍数：3 × lookback_bars
 
+# 内核字节锁（H-05 同 magic 单实例；与 mt5live.fileio 同款选择——
+# Windows msvcrt.locking / POSIX flock，互斥由内核强制）
+try:
+    import msvcrt as _msvcrt
+except ImportError:            # pragma: no cover - 非 Windows 回退
+    _msvcrt = None
+    import fcntl as _fcntl
+
 
 class MarketClosedError(RuntimeError):
     """市场休市（最新报价陈旧超过阈值）——静默跳过本网格点，不是故障。
@@ -57,6 +65,70 @@ class MarketClosedError(RuntimeError):
     抛出；SignalRunner.decide 捕获后返回 None（周末、每日维护时段都走
     这条路，不报"数据滞后"）。
     """
+
+
+class MagicInstanceLock:
+    """同账户/同 magic 的运行器所有权锁（H-05：两份运行器不得并行）。
+
+    ``data/live/runner-<magic>.lock`` 的 1 字节内核锁（Windows
+    msvcrt.locking / POSIX flock）：互斥由内核仲裁（两个进程、乃至同进程
+    两个 fd 一视同仁），持有进程崩溃/退出自动释放——不存在残锁，也不允许
+    "凭 mtime 接管"。acquire 非阻塞：他人持有立即返回 False，调用方
+    （scripts/live_runner）据此拒绝第二份运行器启动。锁文件常驻磁盘
+    （不删除——"释放即删"本身是竞态源），内容为持有者 pid（排查用）。
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._fd: int | None = None
+
+    @property
+    def held(self) -> bool:
+        """当前是否持有锁。"""
+        return self._fd is not None
+
+    def acquire(self) -> bool:
+        """尝试持锁：成功 True；已被他人持有（或内核拒绝）立即 False。"""
+        if self._fd is not None:
+            return True
+        d = os.path.dirname(self.path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        fd = os.open(self.path,
+                     os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0))
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            if _msvcrt is not None:
+                _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
+            else:                      # pragma: no cover - 非 Windows 回退
+                _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        self._fd = fd
+        try:                           # 持锁后写持有者 pid（排查用；覆盖式）
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n".encode())
+        except OSError:
+            pass                       # 内容仅排查用：写不进不影响互斥语义
+        return True
+
+    def release(self) -> None:
+        """释放（只解自己 fd 上的锁；未持有时为空操作）。"""
+        if self._fd is None:
+            return
+        try:
+            os.lseek(self._fd, 0, os.SEEK_SET)
+            if _msvcrt is not None:
+                _msvcrt.locking(self._fd, _msvcrt.LK_UNLCK, 1)
+            else:                      # pragma: no cover - 非 Windows 回退
+                _fcntl.flock(self._fd, _fcntl.LOCK_UN)
+        except OSError:
+            pass                       # 退出路径：尽力解锁，失败交内核回收
+        finally:
+            os.close(self._fd)
+            self._fd = None
 
 
 def default_compute_window_bars(lookback_bars: int) -> int:

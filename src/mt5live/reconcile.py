@@ -14,7 +14,9 @@
 - 实际：账户持仓，**按 magic 过滤**——意图中出现的 magic 才参与对账，
   手动单（magic=0）与未登记策略的持仓不纳入；
 - 差分三情形：``missing``（应有而无）、``unexpected``（有而不应）、
-  ``mismatch``（净手数不一致，含方向相反）；浮点比较带容差（默认 1e-6 手）；
+  ``mismatch``（净手数不一致，含方向相反）；另加 ``hedged``（H-04：
+  净额一致但实际总仓 > |净仓| 的多空对锁残仓——净额为零不能掩盖风险）；
+  浮点比较带容差（默认 1e-6 手）；
 - **宽限**：``status="pending"`` 且 ``now - ts < grace_s``（默认 60 秒）的
   magic 本轮整体不判——对账进程恰在"已决定、订单未回"的空档里运行时
   不误报（C1 的短暂误报场景）。
@@ -184,7 +186,7 @@ def _load_legacy(path: str, data: dict) -> list[Intent]:
 
 @dataclass(frozen=True)
 class ReconcileDiff:
-    kind: str          # "missing" / "unexpected" / "mismatch"
+    kind: str          # "missing" / "unexpected" / "mismatch" / "hedged"
     symbol: str
     magic: int
     expected_net: float  # 有符号净手数（buy 正 / sell 负）
@@ -215,7 +217,9 @@ def diff_positions(intents, actual, *, now: datetime,
 
     ``status="pending"`` 且 ``now - ts < grace_s`` 的 magic 本轮**整体不判**
     （下单在途的宽限——"已决定、订单未回"的空档里对账不误报）；其余
-    （confirmed、超时未回的 pending）按目标净额比对。
+    （confirmed、超时未回的 pending）按目标净额比对。净额一致但实际
+    持仓总量 > |净额| → 另报 ``hedged``（H-04：多空对锁残仓，净额口径
+    看不见的风险）。
     """
     now = naive_utc(now)
     in_flight: set[int] = set()
@@ -233,19 +237,32 @@ def diff_positions(intents, actual, *, now: datetime,
     managed_magics = {magic for _, magic in exp_net}
 
     act_net: dict[tuple[str, int], float] = {}
+    act_gross: dict[tuple[str, int], float] = {}   # H-04：对冲残仓检查用
     for p in actual:
         if p.magic not in managed_magics:
             continue  # 手动单（magic=0）与未声明 magic 的持仓不参与本次对账
         key = (p.symbol, p.magic)
         act_net[key] = act_net.get(key, 0.0) + _actual_net_volume(p)
+        act_gross[key] = act_gross.get(key, 0.0) + float(p.volume)
 
     diffs: list[ReconcileDiff] = []
     for key in sorted(set(exp_net) | set(act_net)):
         e = exp_net.get(key, 0.0)
         a = act_net.get(key, 0.0)
-        if abs(e - a) <= volume_tolerance:
-            continue
         symbol, magic = key
+        # H-04：净额一致也可能掩盖风险——实际总仓 > |净仓| 即多空对锁
+        #（部分成交/对冲残仓：多空各 0.08 时净额恰 0），按持仓明细另报
+        # hedged，不因净额相等判 clean
+        if abs(e - a) <= volume_tolerance:
+            if act_gross.get(key, 0.0) - abs(a) > volume_tolerance:
+                diffs.append(ReconcileDiff(
+                    kind="hedged", symbol=symbol, magic=magic,
+                    expected_net=e, actual_net=a,
+                    detail=f"hedged: {symbol} magic {magic} 意图净 "
+                    f"{e:+.2f} 手，实际净 {a:+.2f} 手但持仓总量 "
+                    f"{act_gross[key]:.2f} 手（多空对锁残仓）——净额一致"
+                    "掩盖对冲风险，须人工核对"))
+            continue
         if abs(e) <= volume_tolerance:
             kind = "unexpected"   # 有持仓而不应持有
         elif abs(a) <= volume_tolerance:

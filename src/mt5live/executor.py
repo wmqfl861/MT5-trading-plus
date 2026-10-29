@@ -95,7 +95,8 @@ class ExecutionReport:
     """一次 execute 的完整回报（对账/监控进程 T14b 的输入之一）。"""
 
     decision_id: str
-    action: str                    # duplicate/hold/open/add/reduce/reverse/close
+    action: str                    # duplicate/hold/open/add/reduce/reverse/
+                                    # reverse_pending/close
     net_before: float              # 执行前净头寸（有符号手数）
     net_after: float               # 执行后按持仓重查的净头寸
     orders: tuple[OrderOutcome, ...] = ()
@@ -140,18 +141,27 @@ class ExecutionAdapter:
         net = self._signed_volume(positions)
         target = decision.signal * (decision.volume_lots or 0.0)
 
-        if abs(target - net) <= _EPS:
+        # H-04：hold 只在"净额达标且无持仓明细"时成立——signal=0 且存在
+        # 持仓（哪怕净额恰为 0 的多空对锁）必须走清仓（按 ticket 判断，
+        # 净额为零不能掩盖对冲残仓）
+        if abs(target - net) <= _EPS and not (target == 0 and positions):
             action = "hold"
-        elif net * target < 0:                       # 反向：先平后开（target 带符号定方向）
+        elif target == 0:
+            action = "close"                    # 归零（含净零对锁）→ 逐仓全平
+            outcomes.extend(self._close_all(positions))
+        elif net * target < 0:                  # 反向：先平后开（target 带符号定方向）
             action = "reverse"
             outcomes.extend(self._close_all(positions))
-            outcomes.extend(self._open(decision, target))
+            # H-04：平仓腿未确认清零前禁止开反向仓——部分成交残仓（或期间
+            # 外部新仓）时开反向仓会形成多空对锁；只平不开（reverse_pending），
+            # 差额留给下个决策点（新 decision_id）续做反向
+            if not self._my_positions():
+                outcomes.extend(self._open(decision, target))
+            else:
+                action = "reverse_pending"
         elif net == 0:
             action = "open"
             outcomes.extend(self._open(decision, target))
-        elif target == 0:
-            action = "close"
-            outcomes.extend(self._close_all(positions))
         elif abs(target) > abs(net):                 # 同向加仓
             action = "add"
             outcomes.extend(self._open(decision, target - net))
@@ -412,6 +422,9 @@ ALERT_FLATTEN_RESIDUAL = "FLATTEN_RESIDUAL"     # C1/R6：全平部分成交残�
 #   不写完成 ack，下一轮继续平仓直到清零，归档在此之前不发生
 ALERT_DEALS_LOG_ERROR = "DEALS_LOG_ERROR"       # R10/T58（C-2）：deals 证据
 #   写入失败——fail-open 记告警不阻断交易（唯一允许 fail-open 的证据流）
+ALERT_STATE_CORRUPT = "STATE_CORRUPT"           # H-05：状态文件损坏/不可读
+#   ——保守恢复（暂停开仓+保留证据），不清空 blocked_dir/
+#   pending_external_exits 的保护，人工核对前不放开
 
 # 已解释的外部出场（服务器端保护性出场/强平）：意图可改为实际净持仓
 _EXPLAINED_REASONS = frozenset({DEAL_REASON_SL, DEAL_REASON_TP, DEAL_REASON_SO})
@@ -445,9 +458,10 @@ class RoundReport:
     """LiveExecutor.poll 一轮的结果（action 语义见 LiveExecutor.poll）。"""
 
     action: str                     # none/flatten/flatten_acked/hold/duplicate/
-                                    # open/add/reduce/reverse/close/
-                                    # blocked_reentry/blocked_external_exit/
-                                    # skipped_zero_lots/risk_rejected
+                                    # open/add/reduce/reverse/reverse_pending/
+                                    # close/blocked_reentry/blocked_external_exit/
+                                    # blocked_state_corrupt/skipped_zero_lots/
+                                    # risk_rejected
     decision_id: str | None
     net_before: float
     net_after: float
@@ -538,6 +552,17 @@ class LiveExecutor:
                 net_before=self._adapter.net_volume(),
                 net_after=self._adapter.net_volume())
 
+        # 3b) H-05：同 bar 决策去重（跨重启）——last_decision_id 已随状态
+        #     持久化，重启后同一 decision_id 的重投递一律 duplicate、零新增
+        #     请求（adapter._seen 只在内存，重启即失效是原缺陷；世界在重启
+        #     窗口已变时按过期决策继续下单等于重复下单）
+        if decision.decision_id == self._state.get("last_decision_id"):
+            self._finish(n, decision.decision_id, ())
+            return RoundReport(
+                action="duplicate", decision_id=decision.decision_id,
+                net_before=self._adapter.net_volume(),
+                net_after=self._adapter.net_volume())
+
         # 4) 禁入方向：不重入（immediate 模式 blocked 恒 0，不会走到这）
         if (self._rules.reentry == "after_signal_change"
                 and self._state["blocked_dir"] != 0
@@ -600,6 +625,23 @@ class LiveExecutor:
                 "（LiveSizer）——拒绝开仓")
         return decision.signal * lots if lots > 0 else 0.0
 
+    def _close_only_leg(self, decision, n: datetime) -> list[OrderOutcome]:
+        """把反向决策降级为"只平不开"执行（H-04：平仓不受限）。
+
+        用于反向决策的开仓腿被挡的场合（未决外部出场 / 状态损坏保守恢复 /
+        风控拒绝 / 风控取数异常）：平仓腿照常先执行，开仓腿留待防线解除后
+        的下个决策点。意图走 pending(0)→confirmed(实际) 与正常下单同契约。
+        """
+        close_only = replace(decision, signal=0, target_position=0,
+                             volume_lots=0.0)
+        self._write_pending(0.0, decision.decision_id, n)
+        try:
+            report = self._adapter.execute(close_only)
+        except Exception:
+            self._write_confirmed(decision.decision_id, n)
+            raise
+        return list(report.orders)
+
     def _plan_and_execute(self, decision, target: float, net: float,
                           n: datetime) -> RoundReport:
         eps = _EPS
@@ -617,42 +659,55 @@ class LiveExecutor:
             report = self._adapter.execute(decision)     # hold / duplicate
             return self._from_execution(report)
 
+        # H-04：needs_open_leg 只在目标非零时成立——target=0 是纯平仓
+        #（含净零对锁清仓），任何开仓防线都不得拦它（平仓不受限）
         needs_open_leg = (
-            net == 0 or net * target < 0 or abs(target) > abs(net))
+            target != 0
+            and (net == 0 or net * target < 0 or abs(target) > abs(net)))
         if needs_open_leg:
-            # C2/R6 第二道防线：存在未解释的外部出场（pending 非空）→
-            # 本 magic 停止开新仓（平仓照常），直到成交历史解释为
-            # SL/TP/SO 或 live_ack_external 人工确认——不依赖对账进程
-            # 稍后写 pause（先于对账运行也生效）。
-            pending_exits = self._state.get("pending_external_exits") or {}
-            if pending_exits:
-                reason = ("external_exit_pending: 存在未解释的外部出场"
-                          f"（tickets {sorted(pending_exits)}）——本 magic "
-                          "暂停开新仓（平仓不受影响），直到解释为 SL/TP/SO"
-                          " 或 scripts/live_ack_external.py 人工确认")
+            # 开仓腿的三道挡板：状态损坏保守恢复（H-05）→ 未决外部出场
+            #（C2/R6 第二道防线）→ 风控闸门（C1）。前两道挡开仓腿时平仓
+            # 腿照常（_close_only_leg），风控拒绝/异常同路径。
+            block_action = block_alert = block_reason = None
+            if self._state.get("state_corrupt"):
+                block_action = "blocked_state_corrupt"
+                block_alert = ALERT_STATE_CORRUPT
+                block_reason = (
+                    "state_corrupt: 状态文件损坏（证据已保留 "
+                    "state-*.corrupt-*）——暂停开新仓（平仓不受影响），"
+                    "人工核对券商实际持仓并修复/删除 state-<magic>.json "
+                    "后重启")
+            else:
+                pending_exits = self._state.get("pending_external_exits") or {}
+                if pending_exits:
+                    # C2/R6：存在未解释的外部出场（pending 非空）→ 本 magic
+                    # 停止开新仓（平仓照常），直到成交历史解释为 SL/TP/SO
+                    # 或 live_ack_external 人工确认——不依赖对账进程稍后写
+                    # pause（先于对账运行也生效）。
+                    block_action = "blocked_external_exit"
+                    block_alert = ALERT_EXTERNAL_EXIT
+                    block_reason = (
+                        "external_exit_pending: 存在未解释的外部出场"
+                        f"（tickets {sorted(pending_exits)}）——本 magic "
+                        "暂停开新仓（平仓不受影响），直到解释为 SL/TP/SO"
+                        " 或 scripts/live_ack_external.py 人工确认")
+            if block_action is not None:
                 append_alert(
-                    self._live_dir, ALERT_EXTERNAL_EXIT,
-                    f"magic {self._magic} {decision.decision_id}：{reason}", n)
+                    self._live_dir, block_alert,
+                    f"magic {self._magic} {decision.decision_id}："
+                    f"{block_reason}", n)
                 if net * target < 0:
                     # 反向：平仓腿照常（不受限），开仓腿被挡——先平后不开
-                    close_only = replace(decision, signal=0,
-                                         target_position=0,
-                                         volume_lots=0.0)
-                    self._write_pending(0.0, decision.decision_id, n)
-                    try:
-                        report = self._adapter.execute(close_only)
-                    except Exception:
-                        self._write_confirmed(decision.decision_id, n)
-                        raise
+                    orders = self._close_only_leg(decision, n)
                     return RoundReport(
-                        action="blocked_external_exit",
+                        action=block_action,
                         decision_id=decision.decision_id, net_before=net,
                         net_after=self._adapter.net_volume(),
-                        orders=tuple(report.orders), error=reason)
+                        orders=tuple(orders), error=block_reason)
                 return RoundReport(
-                    action="blocked_external_exit",
+                    action=block_action,
                     decision_id=decision.decision_id, net_before=net,
-                    net_after=self._adapter.net_volume(), error=reason)
+                    net_after=self._adapter.net_volume(), error=block_reason)
             side = "buy" if target > 0 else "sell"
             leg_lots = (abs(target) if net * target <= 0
                         else abs(target - net))
@@ -660,24 +715,23 @@ class LiveExecutor:
                 try:
                     verdict = self._gate.check_open(
                         self._symbol, side, leg_lots, self._magic, now=n)
-                except Exception as exc:   # 闸门数据故障：fail-closed 拒开仓
+                except Exception as exc:
+                    # 闸门数据故障：fail-closed 拒开仓——但平仓不受限（H-04）：
+                    # 反向决策照常执行平仓腿（与风控拒绝同路径，先平后不开），
+                    # 绝不因风控取数异常把减仓/平仓也挂起
+                    if net * target < 0:
+                        orders = self._close_only_leg(decision, n)
+                        return _rejected(
+                            f"risk_gate_error: {type(exc).__name__}: {exc}",
+                            orders=orders)
                     return _rejected(
                         f"risk_gate_error: {type(exc).__name__}: {exc}")
                 if not verdict.allowed:
                     if net * target < 0:
                         # 反向：平仓腿照常（不受限），开仓腿被拒——先平后不开
-                        close_only = replace(decision, signal=0,
-                                             target_position=0,
-                                             volume_lots=0.0)
-                        self._write_pending(0.0, decision.decision_id, n)
-                        try:
-                            report = self._adapter.execute(close_only)
-                        except Exception:
-                            self._write_confirmed(decision.decision_id, n)
-                            raise
-                        return _rejected(
-                            verdict.reason, action="risk_rejected",
-                            orders=report.orders)
+                        orders = self._close_only_leg(decision, n)
+                        return _rejected(verdict.reason, action="risk_rejected",
+                                         orders=orders)
                     return _rejected(verdict.reason)
         # 下单前（闸门已过）：意图 = 目标持仓（pending；订单未回，对账给宽限）
         self._write_pending(target, decision.decision_id, n)
@@ -803,7 +857,8 @@ class LiveExecutor:
     @staticmethod
     def _parse_known(v) -> dict:
         """known_positions 单项：{"dir": ±1, "volume": 手数}（C2/R6 起记
-        最后一次已知量）；兼容旧格式（纯方向整数，volume 缺省 0）。"""
+        最后一次已知量，H-05 出场解释按该量绑定本次事件）；兼容旧格式
+        （纯方向整数，volume 缺省 0）。"""
         if isinstance(v, dict):
             return {"dir": int(v.get("dir", 0)),
                     "volume": float(v.get("volume") or 0.0)}
@@ -841,11 +896,51 @@ class LiveExecutor:
                                                  {}).items()},
                         "pending_external_exits": self._parse_pending(
                             data.get("pending_external_exits")),
-                        "last_decision_id": data.get("last_decision_id")}
-            except (OSError, ValueError, TypeError):
-                pass    # 状态文件损坏：从零开始（保守：无禁入、无已知持仓）
+                        "last_decision_id": data.get("last_decision_id"),
+                        "state_corrupt": bool(data.get("state_corrupt",
+                                                       False))}
+            except (OSError, ValueError, TypeError) as exc:
+                # H-05：状态文件损坏/不可读 ≠ 首次启动——保守恢复：不清空
+                # blocked_dir/pending_external_exits 的保护（原文已不可信，
+                # 就按"保护仍在"处理：state_corrupt 挡开仓腿，平仓不受影响），
+                # 损坏原文抄送 *.corrupt-<时间戳> 保留证据（_save_state 稍后
+                # 会以合法内容覆盖原路径），人工核对券商实际持仓并修复/删除
+                # state 文件前不放开；封锁随新状态文件持久化、跨重启持续
+                evidence = self._preserve_corrupt_state()
+                append_alert(
+                    self._live_dir, ALERT_STATE_CORRUPT,
+                    f"magic {self._magic} 状态文件 {self._state_path} 损坏/"
+                    f"不可读（{type(exc).__name__}: {exc}）——保守恢复：暂停"
+                    "开新仓（平仓不受影响），不清空 blocked_dir/"
+                    "pending_external_exits 的保护"
+                    + (f"；损坏原文已抄送 {evidence} 保留证据"
+                       if evidence else
+                       "（证据抄送失败——请立即人工保全该文件）")
+                    + "。人工核对券商实际持仓后，修复/删除该状态文件并重启",
+                    None)
+                return {"blocked_dir": 0, "known_positions": {},
+                        "pending_external_exits": {},
+                        "last_decision_id": None, "state_corrupt": True}
         return {"blocked_dir": 0, "known_positions": {},
-                "pending_external_exits": {}, "last_decision_id": None}
+                "pending_external_exits": {}, "last_decision_id": None,
+                "state_corrupt": False}
+
+    def _preserve_corrupt_state(self) -> str | None:
+        """损坏的状态原文抄送到 state-<magic>.json.corrupt-<时间戳>（H-05
+        保留证据）；失败返回 None（告警由调用方写）。"""
+        try:
+            with open(self._state_path, "rb") as f:
+                raw = f.read()
+        except OSError:
+            return None
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+        evidence = f"{self._state_path}.corrupt-{stamp}"
+        try:
+            with open(evidence, "wb") as f:
+                f.write(raw)
+            return evidence
+        except OSError:
+            return None
 
     def _save_state(self) -> None:
         payload = {
@@ -859,35 +954,63 @@ class LiveExecutor:
                 str(k): dict(v) for k, v in
                 self._state["pending_external_exits"].items()},
             "last_decision_id": self._state.get("last_decision_id"),
+            "state_corrupt": bool(self._state.get("state_corrupt")),
         }
         write_json_atomic(self._state_path, payload)   # T33：经 fileio（重试）
 
     def _current_positions(self) -> dict[int, dict]:
-        """{ticket: {"dir": ±1, "volume": 手数}}（buy=1/sell=-1；C2/R6 起
-        记最后一次已知量，供未决出场持久化）。"""
+        """{ticket: {"dir": ±1, "volume": 手数}}（buy=1/sell=-1；C2/R6 起记
+        最后一次已知量，供未决出场持久化与 H-05 出场解释绑定本次事件）。"""
         return {p.ticket: {"dir": 1 if p.side == "buy" else -1,
                            "volume": float(p.volume)}
                 for p in self._adapter.positions()}
 
-    def _explain_exit(self, ticket: int):
-        """按持仓 id 查全部成交，找保护性出场（reason ∈ {SL,TP,SO}）。
+    def _explain_exit(self, ticket: int, *,
+                      expected_volume: float | None = None):
+        """按持仓 id 查全部成交，**绑定本次事件**找保护性出场（H-05）。
+
+        旧实现拿任意历史 SL/TP/SO 平仓 deal 解释整个仓位消失——部分 SL 早
+        把量减半、余量被人工平掉时，历史 SL deal 会"解释"一场实际是人工的
+        出场（意图被改写、防线被解除）。绑定口径（不满足按未解释处理，
+        fail-closed）：
+        - expected_volume（最后已知量）：按成交时间排序，**从最新往回
+          累计到该量为止**的那几笔才是"本次事件"——更早的部分减量属于
+          先前已观察过的历史，不再冒充本次出场的解释；
+        - 累计不足最后已知量 → 成交历史不完整，按未解释处理；
+        - 本次事件**全部**成交 reason ∈ {SL,TP,SO} 才算已解释（返回最新
+          一笔作代表）——混入 CLIENT/未知即人工参与，交给对账/人工。
 
         返回 (deal, None)（已解释）或 (None, 描述)——查无平仓成交 /
-        查询失败 / reason 不在已解释集合（人工 CLIENT、未知）都算未解释。
+        查询失败 / reason 不在已解释集合都算未解释。
         """
         try:
             deals = self._adapter.deals_for_position(ticket)
         except Exception as exc:   # 查询失败：按未解释处理（fail-closed）
             return None, f"成交查询失败 {type(exc).__name__}: {exc}"
-        closing = [d for d in deals
-                   if d.entry in _CLOSING_ENTRIES and d.volume > 0]
-        hit = next((d for d in closing if d.reason in _EXPLAINED_REASONS), None)
-        if hit is not None:
-            return hit, None
-        if closing:
-            return None, ("平仓成交 reason=" + ",".join(
-                str(d.reason) for d in closing))
-        return None, "查不到平仓成交"
+        closing = sorted(
+            (d for d in deals
+             if d.entry in _CLOSING_ENTRIES and d.volume > 0),
+            key=lambda d: naive_utc(d.time))
+        event = closing
+        if expected_volume is not None and event:
+            picked: list = []
+            acc = 0.0
+            for d in reversed(event):
+                picked.append(d)
+                acc = round(acc + d.volume, 8)
+                if acc >= expected_volume - DEFAULT_VOLUME_TOLERANCE:
+                    break
+            if acc < expected_volume - DEFAULT_VOLUME_TOLERANCE:
+                return None, (f"本次事件平仓成交累计 {acc:.2f} 手，不足最后"
+                              f"已知量 {expected_volume:.2f} 手（成交历史不"
+                              "完整？）——按未解释处理")
+            event = picked[::-1]
+        if not event:
+            return None, "查不到平仓成交"
+        if any(d.reason not in _EXPLAINED_REASONS for d in event):
+            return None, ("本次事件平仓成交 reason=" + ",".join(
+                str(d.reason) for d in event))
+        return event[-1], None      # 全部为保护性出场 → 已解释（最新一笔代表）
 
     def _read_external_ack(self):
         """读 live_ack_external 的确认绑定（N-C1/R7）：意图 confirmed 且
@@ -975,17 +1098,25 @@ class LiveExecutor:
         blocked = int(self._state["blocked_dir"])
 
         explained_deals: list[str] = []      # 本轮解释成功的 deal ticket
-        # 1) 未决出场重查（成交历史延迟可见 → 持续重查直到解释）
+        # 1) 未决出场重查（成交历史延迟可见 → 持续重查直到解释）。绑定只靠
+        #    累计数量（= 登记时的最后已知量）从最新成交往回圈定本次事件
+        #    （H-05；延迟可见的成交时间不可作过滤条件）
         for ticket in sorted(pending):
-            hit, _ = self._explain_exit(ticket)
+            hit, _ = self._explain_exit(
+                ticket,
+                expected_volume=float(pending[ticket].get("volume") or 0.0))
             if hit is not None:
                 del pending[ticket]
                 explained_deals.append(str(hit.ticket))
                 self._log_external_exit_deal(hit, n)   # R10/T58 C-2
-        # 2) 本轮新消失的持仓
+        # 2) 本轮新消失的持仓：解释绑定本次事件（H-05）——按成交时间从最新
+        #    往回累计到最后已知量为止；历史部分减量的 deal（先前轮次已观察
+        #    过量变）不再冒充本次出场的解释
         gone = sorted(set(known) - set(current))
         for ticket in gone:
-            hit, why = self._explain_exit(ticket)
+            hit, why = self._explain_exit(
+                ticket,
+                expected_volume=float(known[ticket].get("volume") or 0.0))
             if hit is not None:
                 explained_deals.append(str(hit.ticket))
                 self._log_external_exit_deal(hit, n)   # R10/T58 C-2

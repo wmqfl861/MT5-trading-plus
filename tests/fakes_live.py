@@ -164,11 +164,14 @@ class FakeBroker:
 
     def close_external(self, ticket: int, *, profit: float = 0.0,
                        comment: str = "[sl]",
-                       reason: int = DEAL_REASON_SL) -> None:
+                       reason: int = DEAL_REASON_SL,
+                       time: datetime | None = None) -> None:
         """外部平仓（SL/TP 触发或人工）：不走执行器，流水如实记账。
 
         reason 为 MT5 deal.reason（mt5gw.models.DEAL_REASON_*；真包核对的
         常量）。缺省 SL——既有调用方（含探针 P8）都模拟止损出场。
+        time：成交时刻（缺省 _T0；H-05 出场解释绑定本次事件的测试需要
+        区分"历史部分 SL"与"本次出场"的成交时间）。
         """
         pos = self._take_position(ticket)
         self._positions = [p for p in self._positions if p.ticket != ticket]
@@ -177,16 +180,18 @@ class FakeBroker:
                           side="sell" if pos.side == "buy" else "buy",
                           volume=pos.volume, price=pos.price_current,
                           profit=profit, comment=comment, magic=pos.magic,
-                          position_id=ticket, reason=reason)
+                          position_id=ticket, reason=reason, time=time)
 
     def reduce_external(self, ticket: int, volume: float, *, profit: float = 0.0,
                         comment: str = "manual",
-                        reason: int = DEAL_REASON_CLIENT) -> None:
+                        reason: int = DEAL_REASON_CLIENT,
+                        time: datetime | None = None) -> None:
         """外部部分减仓（人工）：不走执行器，余量保留同一 ticket，流水如实记账。
 
         N-C1/R7：驱动"人工减仓（ticket 仍在，不是出场事件）→ 确认 →
         再全平（ticket 消失，才是出场事件）"的复现序列。全平请用
-        close_external（volume 须严格小于持仓余量）。
+        close_external（volume 须严格小于持仓余量）。time 同
+        close_external（H-05 测试用）。
         """
         pos = self._take_position(ticket)
         vol = round(float(volume), 8)
@@ -201,7 +206,7 @@ class FakeBroker:
                           side="sell" if pos.side == "buy" else "buy",
                           volume=vol, price=exit_price, profit=profit,
                           comment=comment, magic=pos.magic,
-                          position_id=ticket, reason=reason)
+                          position_id=ticket, reason=reason, time=time)
 
     def remove_position(self, ticket: int) -> None:
         self._take_position(ticket)
