@@ -3,7 +3,7 @@
 id = "C101"
 title = "XAUUSD 整数关口的条件概率（50 美元网格）"
 mechanism_class = "price_levels"
-status = "registered"
+status = "screened_fail"  # 2026-10-29 预筛 fail（报告 §4：成本不过+检验力待数据）；解锁见 C104-C106
 symbols = ["XAUUSD"]
 holding = "H1"
 mechanism = "止盈单与止损单在整数位聚集（Osler 2003）：到整数关口容易掉头（止盈单挂单被吃），穿过之后走势容易加速（止损单串级）。送钱方是在整数位追单的散户与不设保护单的趋势追随者。"

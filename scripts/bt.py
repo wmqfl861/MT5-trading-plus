@@ -1318,7 +1318,16 @@ def _merged_costs(data_root, symbols, *, spread_fraction: float,
             research_store=True,
             swap_ref_price=(None if ref is None else float(ref)))
         versions.append(ver_i)
-        spread = costs_i.spread if spread is None else spread.merge(costs_i.spread)
+        if spread is None:
+            spread = costs_i.spread
+        elif set(symbols) <= set(spread._per_symbol):
+            # 全品种点差缓存（T97 实测：research_store 的 spread_model.json
+            # 覆盖全部品种）——逐品种模型重复包含未请求品种，merge 会因
+            # 重复抛错；首个模型已覆盖全部所需品种时直接沿用（多品种预筛
+            # 首次启用时暴露；单品种路径不经过此分支，H 线行为不变）
+            pass
+        else:
+            spread = spread.merge(costs_i.spread)
         comm_by_sym[sym] = costs_i.commission_per_lot(sym)
         rules[sym] = costs_i.swap.rule(sym)
     merged = Costs(
@@ -1385,9 +1394,44 @@ def cmd_segment_propose(args) -> int:
     return 0
 
 
+def _prob_use_merged(prob_conf) -> bool:
+    """T97 波次 2：[prob] 段任一新键（max_gap_days / cost_scenario_mult /
+    cost_scenario_reference）非 None → 概率分支改用 merged_research_series
+    （ext 前向延长 + 洞集合）；不带新键的候选/卡走原 load_series（探针
+    兼容硬约束：行为逐位不变）。prob_conf 为 ProbDeclared 或卡的 prob dict。"""
+    def _get(k):
+        if isinstance(prob_conf, dict):
+            return prob_conf.get(k)
+        return getattr(prob_conf, k, None)
+    return any(_get(k) is not None for k in
+               ("max_gap_days", "cost_scenario_mult", "cost_scenario_reference"))
+
+
+def _prob_load_bars(data_root, sym, tf, *, use_merged: bool, end=None):
+    """概率分支的序列装载（T97 波次 2）：use_merged → merged_research_series
+    四元组，返回 (bars, gap_spans|None)；否则原 load_series（gap_spans=None，
+    与 T97 之前逐位一致）。空序列与 load_series 同语义 fail-fast。
+
+    merged 路径忽略 end——合并序列的有效上界 = manifest research_cutoff 与
+    MT5 水位 last_closed_time 的更早者（mt5data.ext.merge 口径），不存在
+    "越过锁箱 cutoff"的读法。"""
+    if not use_merged:
+        return load_series(data_root, sym, tf, end), None
+    from mt5data.ext.merge import merged_research_series
+    bars, _tags, gap_spans, _bad = merged_research_series(data_root, sym, tf)
+    if bars is None or len(bars) == 0:
+        raise ValueError(f"无可用数据：{sym} {tf}（合并研究序列为空——"
+                         "检查研究库 bars/ 与 ext/ 数据）")
+    return bars, (gap_spans or None)
+
+
 def _candidate_check_prob(args, candidate, data_root, costs, active):
     """T76：概率模式候选预筛——逐品种×局面计数（不看结果）→ 发现段子集
-    → precheck_prob。分界：--split 显式给出，否则 propose_split 自动提案。"""
+    → precheck_prob。分界：--split 显式给出，否则 propose_split 自动提案。
+
+    T97 波次 2：候选带 [prob] 新键（max_gap_days 等）时改用
+    merged_research_series 取数并按 gap_spans 抑制跨洞触发；era 判定
+    （ext 触发 = 时刻 < bars meta first_time）在 precheck_prob 内部读取。"""
     from mt5quant.prob import counting as prob_counting
     from mt5quant.strategies.library.prob.actions import ActionParams
     from mt5quant.strategies.library.prob.situations import Approach
@@ -1406,14 +1450,17 @@ def _candidate_check_prob(args, candidate, data_root, costs, active):
     approach = Approach(**pdecl.approach)
     aparams = ActionParams(breakout_atr=pdecl.breakout_atr,
                            retest_window_bars=pdecl.retest_window_bars)
+    use_merged = _prob_use_merged(pdecl)
     parts = []
     for sym in candidate.symbols:
-        bars = load_series(data_root, sym, candidate.holding, None)
+        bars, gap_spans = _prob_load_bars(data_root, sym, candidate.holding,
+                                          use_merged=use_merged, end=None)
         for sit in pdecl.situations:
             grid = pdecl.level_grid.get(sym) if sit == "S1" else None
             parts.append(prob_counting.count_triggers(
                 bars, symbol=sym, situation=sit, approach=approach,
-                action_params=aparams, grid_step=grid))
+                action_params=aparams, grid_step=grid,
+                gap_spans=gap_spans))
     nonempty = [p for p in parts if len(p)]
     counted = pd.concat(nonempty, ignore_index=True) if nonempty else None
     disc = (None if counted is None
@@ -2036,10 +2083,23 @@ def cmd_prob_test(args) -> int:
             del strategy_cls          # P1 不跑策略引擎（标签经 prob.labels）
             sizes = {sym: resolve_contract_size(data_root, sym, None)
                      for sym in card.symbols}
+            # T97 波次 2：卡带 [prob] 新键时改用 merged_research_series
+            # （ext 前向延长），gap_spans 交给 run_p1_card 抑制跨洞触发、
+            # mt5_first 交给它按 era 分组用 ScenarioCosts 标注 ext 段触发。
+            use_merged = _prob_use_merged(card.prob or {})
             bars_by_sym = {}
+            gap_by_sym = {}
+            mt5_first_by_sym = {}
+            if use_merged:
+                from mt5quant.prob.gaps import mt5_first_time
             for sym in card.symbols:
-                bars_full = load_series(data_root, sym, card.timeframe,
-                                        args.end)
+                bars_full, gap_spans = _prob_load_bars(
+                    data_root, sym, card.timeframe, use_merged=use_merged,
+                    end=args.end)
+                if use_merged:
+                    gap_by_sym[sym] = gap_spans
+                    mt5_first_by_sym[sym] = mt5_first_time(
+                        data_root, sym, card.timeframe)
                 times = pd.to_datetime(bars_full["time"])
                 below = bars_full[times < split]
                 if len(below) == 0:
@@ -2068,7 +2128,10 @@ def cmd_prob_test(args) -> int:
             results = p1mod.run_p1_card(card, round_obj, bars_by_sym,
                                         costs_by_sym, sizes=sizes,
                                         policy_by_symbol=policy_by_sym,
-                                        sims=args.sims)
+                                        sims=args.sims,
+                                        gap_spans_by_symbol=(gap_by_sym or None),
+                                        mt5_first_by_symbol=(
+                                            mt5_first_by_sym or None))
         except Exception as e:
             print(f"✗ P1 运行失败：{type(e).__name__}: {e}")
             return 1

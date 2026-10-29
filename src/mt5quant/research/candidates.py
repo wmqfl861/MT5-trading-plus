@@ -156,6 +156,13 @@ class ProbDeclared:
     min_cell: int | None = None
     lb_z: float | None = None
     entry_threshold_cost_mult: float | None = None
+    # T97 数据解锁批（M2）三个可选键——缺省 None：不带新键的候选装载与
+    # precheck 行为逐位不变（探针兼容，硬约束）。cost_scenario_mult 缺省
+    # None 时调用方按 [1.0, 1.0]（恒等，旧卡/探针零变化）处理——字段本身
+    # 是 tuple（装载时从 TOML list 转换）。
+    max_gap_days: int | None = None             # 触发抑制的洞宽阈值（天数）
+    cost_scenario_mult: tuple[float, float] | None = None   # [1x 基准, 情景档]
+    cost_scenario_reference: float | None = None  # 非绑定参考档倍数（不参与判定）
 
 
 def _validate_prob(raw: object, source: str, symbols: tuple[str, ...]
@@ -170,7 +177,10 @@ def _validate_prob(raw: object, source: str, symbols: tuple[str, ...]
         # 审核四 E2：蓝图附录 A 的五个决策字段（P2 必写、P1 可选，
         # 写了即校验并与策略类常量核对）
         "features", "prior_strength", "min_cell", "lb_z",
-        "entry_threshold_cost_mult"})
+        "entry_threshold_cost_mult",
+        # T97 数据解锁批（M2）：三个可选键——出现才校验，缺省不破坏
+        # 旧候选（探针的 prob_data 不带新键，装载行为须逐位不变）
+        "max_gap_days", "cost_scenario_mult", "cost_scenario_reference"})
     if unknown:
         raise CandidateError(f"{source}：[prob] 未知字段 {unknown}")
 
@@ -276,6 +286,32 @@ def _validate_prob(raw: object, source: str, symbols: tuple[str, ...]
                               or not math.isfinite(v) or v <= 0):
             raise CandidateError(
                 f"{source}：[prob].{fname} 必须是有限正数，收到 {v!r}")
+    # ---- T97 数据解锁批（M2）：三个可选键（出现才校验；缺省 None） ----
+    mgd = raw.get("max_gap_days", None)
+    if mgd is not None and (isinstance(mgd, bool) or not isinstance(mgd, int)
+                            or mgd < 1):
+        raise CandidateError(
+            f"{source}：[prob].max_gap_days 必须是 ≥1 整数（触发抑制的"
+            f"洞宽阈值，天数——先决 4），收到 {mgd!r}")
+    csm = raw.get("cost_scenario_mult", None)
+    if csm is not None:
+        if (not isinstance(csm, list) or len(csm) != 2
+                or any(isinstance(x, bool)
+                       or not isinstance(x, (int, float))
+                       or not math.isfinite(x) or x <= 0 for x in csm)
+                or float(csm[0]) != 1.0):
+            raise CandidateError(
+                f"{source}：[prob].cost_scenario_mult 必须是二元列表、元素"
+                "为有限正数且首元素 = 1.0（1x 基准档 + 情景档；T97 保守"
+                "绑定档沿用 H 线 robustness.EARLY_YEARS_SPREAD_FACTOR），"
+                f"收到 {csm!r}")
+    csr = raw.get("cost_scenario_reference", None)
+    if csr is not None and (isinstance(csr, bool)
+                            or not isinstance(csr, (int, float))
+                            or not math.isfinite(csr) or csr <= 0):
+        raise CandidateError(
+            f"{source}：[prob].cost_scenario_reference 必须是有限正数"
+            f"（非绑定参考档倍数，只并列报告不参与判定），收到 {csr!r}")
     return ProbDeclared(
         situations=tuple(situations), hypotheses=tuple(hypotheses),
         bracket=b, level_grid=dict(level_grid), approach=ap,
@@ -289,7 +325,12 @@ def _validate_prob(raw: object, source: str, symbols: tuple[str, ...]
         lb_z=(float(raw["lb_z"]) if raw.get("lb_z") is not None else None),
         entry_threshold_cost_mult=(
             float(raw["entry_threshold_cost_mult"])
-            if raw.get("entry_threshold_cost_mult") is not None else None))
+            if raw.get("entry_threshold_cost_mult") is not None else None),
+        # T97 数据解锁批（M2）：三新键（list → tuple，缺省 None）
+        max_gap_days=(int(mgd) if mgd is not None else None),
+        cost_scenario_mult=(tuple(float(x) for x in csm)
+                            if csm is not None else None),
+        cost_scenario_reference=(float(csr) if csr is not None else None))
 
 
 @dataclass(frozen=True)
@@ -1290,6 +1331,8 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
             checks={}, events_per_year=None)
     pdecl = candidate.prob_declared
     assert pdecl is not None        # price_levels 装载层已保证带 [prob]
+    # T97 情景点差（先决 2）：era 判定读 bars meta.json 的 first_time
+    from mt5quant.prob.gaps import mt5_first_time
 
     checks: dict[str, dict] = {}
     reasons: list[str] = []
@@ -1321,6 +1364,16 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
     # 条件 3：事前成本（R 口径；审核二 Q1：逐品种检查，每个品种都要满足，
     # 等价于按成本最高的品种判断；Q2：佣金 = commission_per_lot / cs 为价格
     # 单位，再除以 (sl_atr×ATR) 换成 R）。每个条件都给出结果，不短路。
+    # T97 情景点差（先决 2）：候选声明 cost_scenario_mult 时按双档计算——
+    # era 判定 = 触发时刻 < {data_root}/bars/{品种}/{周期}/meta.json 的
+    # first_time → ext 段（precheck 内部读 meta；缺 meta → 无 ext 触发）；
+    # ext 触发的点差分别按 1x / 保守档 mult[1] / 参考档计算，
+    # cost_r_by_symbol（绑定 passed）用保守档，1x 与参考档（若有）并列
+    # 进 checks。缺省（cost_scenario_mult=None）与 T97 之前逐位相同。
+    scenario_mult = (float(pdecl.cost_scenario_mult[1])
+                     if pdecl.cost_scenario_mult is not None else None)
+    scenario_ref = (float(pdecl.cost_scenario_reference)
+                    if pdecl.cost_scenario_reference is not None else None)
     per_symbol: dict[str, dict] = {}
     for sym in candidate.symbols:
         rows = None
@@ -1331,15 +1384,32 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
             continue
         cs = _contract_size(data_root, sym)
         comm_price = cost_model.commission_per_lot(sym) / cs
-        costs_r = []
-        for r in rows.itertuples(index=False):
-            hour, price = int(r.ny_hour), float(r.close)
-            spr = cost_model.spread_p90(sym, hour, price=price)
-            slip = cost_model.slippage(sym, hour, price=price)
-            r_price = pdecl.bracket["sl_atr"] * float(r.atr)
-            costs_r.append((spr + 2.0 * slip + comm_price) / r_price)
-        per_symbol[sym] = {"n": int(len(rows)),
-                           "cost_r": float(np.mean(costs_r))}
+        first = (mt5_first_time(data_root, sym, candidate.holding)
+                 if scenario_mult is not None else None)
+        times = (pd.to_datetime(rows["time"]) if first is not None else None)
+
+        def _cost_r(ext_spread_mult: float) -> float:
+            """ext 行点差 ×ext_spread_mult（1.0 = 无情景），均值 R 口径。"""
+            vals = []
+            for k, r in enumerate(rows.itertuples(index=False)):
+                hour, price = int(r.ny_hour), float(r.close)
+                spr = cost_model.spread_p90(sym, hour, price=price)
+                slip = cost_model.slippage(sym, hour, price=price)
+                m = (ext_spread_mult
+                     if times is not None and times.iloc[k] < first else 1.0)
+                r_price = pdecl.bracket["sl_atr"] * float(r.atr)
+                vals.append((m * spr + 2.0 * slip + comm_price) / r_price)
+            return float(np.mean(vals))
+
+        entry = {"n": int(len(rows)), "cost_r": _cost_r(1.0)}
+        if scenario_mult is not None:
+            entry["cost_r_1x"] = entry["cost_r"]
+            entry["cost_r"] = _cost_r(scenario_mult)     # 保守档绑定
+            entry["ext_n"] = (int((times < first).sum())
+                              if times is not None else 0)
+            if scenario_ref is not None:
+                entry["cost_r_ref"] = _cost_r(scenario_ref)
+        per_symbol[sym] = entry
     known = {s: d["cost_r"] for s, d in per_symbol.items()
              if d["cost_r"] is not None}
     cost_ok: bool | None
@@ -1362,6 +1432,25 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
                        "的均值（Q2：佣金 commission_per_lot/cs 为价格单位）",
             "note": "已知限制：未计入隔夜费与止损越幅；基准赢率固定为 0.40"
                     "（比按止损止盈推算的 sl/(sl+tp)=1/3 保守）"}
+        if scenario_mult is not None:
+            # T97 情景点差（先决 2）：cost_r_by_symbol 已是保守档（绑定）；
+            # 1x 基准档与非绑定参考档（若有）并列报告，era 规则写明可复核。
+            checks["ex_ante_cost_prob"].update({
+                "cost_r_by_symbol_1x": {s: float(per_symbol[s]["cost_r_1x"])
+                                        for s in known},
+                "cost_scenario_mult": [1.0, scenario_mult],
+                "ext_trigger_n_by_symbol": {s: int(per_symbol[s]["ext_n"])
+                                            for s in known},
+                "era_rule": "ext 段触发 = 触发时刻 < {data_root}/bars/"
+                            "{品种}/{周期}/meta.json 的 first_time（缺 "
+                            "meta → 无 ext 触发）；ext 触发点差 × 情景档"
+                            "（其余分量不缩放），判定绑定保守档",
+            })
+            if scenario_ref is not None:
+                checks["ex_ante_cost_prob"]["cost_r_by_symbol_ref3"] = {
+                    s: float(per_symbol[s]["cost_r_ref"]) for s in known}
+                checks["ex_ante_cost_prob"]["cost_scenario_reference"] = \
+                    scenario_ref
         for s in failing:
             reasons.append(
                 f"事前成本：ΔEV {edge_ev_r:.4f}R < "

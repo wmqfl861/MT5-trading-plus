@@ -3,7 +3,7 @@
 id = "C102"
 title = "XAUUSD 前一交易日高低点处的条件概率（17:00 纽约划界）"
 mechanism_class = "price_levels"
-status = "registered"
+status = "screened_fail"  # 2026-10-29 预筛 fail（报告 §4：成本不过+检验力待数据）；解锁见 C104-C106
 symbols = ["XAUUSD"]
 holding = "H1"
 mechanism = "日内止损与止盈单集中挂在前一交易日极值（Osler 的订单聚集框架推论：分析师发布的支撑/阻力位常与近期极值重合）；送钱方是追突破而不看前日极值的短线单。"

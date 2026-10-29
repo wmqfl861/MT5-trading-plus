@@ -11,6 +11,7 @@ from __future__ import annotations
 import pandas as pd
 
 from mt5quant.backtest.engine_a import atr_series
+from mt5quant.prob.gaps import suppression_mask
 from mt5quant.strategies.library.prob.actions import (
     ActionParams, action_triggers,
 )
@@ -46,11 +47,16 @@ def level_rows_for_situation(bars: pd.DataFrame, situation: str, *,
 def count_triggers(bars: pd.DataFrame, *, symbol: str, situation: str,
                    approach: Approach, action_params: ActionParams,
                    grid_step: float | None = None,
-                   atr: pd.Series | None = None) -> pd.DataFrame:
+                   atr: pd.Series | None = None,
+                   gap_spans=None) -> pd.DataFrame:
     """数一个品种一个局面上的全部动作触发（不看结果）。
 
     返回列：time、situation、action、side、level、kind、anchor、bar、
     ny_hour、atr、close、symbol——没有任何结局列（win/loss/net_r 等）。
+
+    gap_spans（T97 波次 2，可选）：合并研究序列的洞集合
+    （mt5data.ext.merge.merged_research_series 的产出，缺省 None 行为
+    不变）——回看窗跨洞的触发按先决 4 抑制（mt5quant.prob.gaps）。
     """
     if atr is None:
         atr = atr_series(bars)
@@ -59,6 +65,10 @@ def count_triggers(bars: pd.DataFrame, *, symbol: str, situation: str,
     events = find_level_events(bars, levels, situation=situation,
                                approach=approach, atr=atr)
     trig = action_triggers(bars, events, params=action_params, atr=atr)
+    if gap_spans and len(trig):
+        keep = suppression_mask(trig["bar"], bars, gap_spans, situation,
+                                approach.lookback_bars)
+        trig = trig.iloc[[k for k, ok in enumerate(keep) if ok]]
     if len(trig) == 0:
         return trig.assign(symbol=symbol, ny_hour=pd.Series(dtype="int64"),
                            atr=pd.Series(dtype="float64"),

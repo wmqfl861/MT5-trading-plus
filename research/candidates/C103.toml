@@ -3,7 +3,7 @@
 id = "C103"
 title = "XAUUSD 20 日高低点（Donchian 通道极值）处的条件概率"
 mechanism_class = "price_levels"
-status = "registered"
+status = "screened_fail"  # 2026-10-29 预筛 fail（报告 §4：成本不过+检验力待数据）；解锁见 C104-C106
 symbols = ["XAUUSD"]
 holding = "H1"
 mechanism = "锚定效应（George & Hwang 2004）：投资者把近期极值当作锚，接近通道高点的股票/资产继续上涨的概率更高（动量延续而非逆转）；与 H002（标定样品）同一类价位，但这里只检验价位处的条件概率，不重复趋势跟随本身。送钱方是在通道极值逆势接刀/摸顶的均值回归者。"

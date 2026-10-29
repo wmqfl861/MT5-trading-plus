@@ -524,3 +524,69 @@ def test_measured_rule_monotonicity():
         vals = [cand.measured_n_required(k, dp)[0] for k in range(1, 13)]
         assert all(b >= a for a, b in zip(vals, vals[1:])), (
             f"dp={dp}：假设数 1..12 的实测样本量 {vals} 应非减")
+
+
+# ------------------------------------------- T97 数据解锁批（M2：登记与文档）
+
+from pathlib import Path  # noqa: E402  （追加节：不动上方既有模块级定义）
+
+_T97_CANDIDATES_DIR = Path(__file__).resolve().parents[1] / \
+    "research" / "candidates"
+
+
+def test_c104_loads_with_new_prob_keys():
+    """C104 装载：三新键读出正确（tuple 化）+ 逐品种网格 + D51 前驱逐字。"""
+    c = cand.load_candidate(_T97_CANDIDATES_DIR / "C104.toml")
+    assert c.id == "C104" and c.status == "screened_fail"  # T97 实运行后回填（2026-10-29）
+    assert c.symbols == ("XAUUSD", "EURUSD")
+    p = c.prob_declared
+    assert p.level_grid == {"XAUUSD": 50.0, "EURUSD": 0.0050}
+    assert p.max_gap_days == 30
+    assert p.cost_scenario_mult == (1.0, 1.5)      # list → tuple
+    assert p.cost_scenario_reference == 3.0
+    # D51：approach/bracket/Δp 与前驱 C101 逐字相同
+    p101 = cand.load_candidate(_T97_CANDIDATES_DIR / "C101.toml").prob_declared
+    assert p.approach == p101.approach
+    assert p.bracket == p101.bracket
+    assert p.breakout_atr == p101.breakout_atr
+    assert p.retest_window_bars == p101.retest_window_bars
+    assert p.expected_delta_p == p101.expected_delta_p
+
+
+def test_prob_without_new_keys_defaults_none():
+    """缺省兼容（硬约束）：不带新键的 prob_data() 候选装载后三新字段 None。"""
+    c = cand.validate_candidate(prob_data(), source="t")
+    p = c.prob_declared
+    assert p.max_gap_days is None
+    assert p.cost_scenario_mult is None
+    assert p.cost_scenario_reference is None
+
+
+def test_prob_new_key_validations():
+    """三个新键各自的非法形态被拒：max_gap_days=0 / 首元素非 1 /
+    reference=-1。"""
+    base = prob_data()["prob"]
+    with pytest.raises(cand.CandidateError, match="max_gap_days"):
+        cand.validate_candidate(
+            prob_data(prob={**base, "max_gap_days": 0}), source="t")
+    with pytest.raises(cand.CandidateError, match="cost_scenario_mult"):
+        cand.validate_candidate(
+            prob_data(prob={**base, "cost_scenario_mult": [0.5, 1.5]}),
+            source="t")
+    with pytest.raises(cand.CandidateError, match="cost_scenario_reference"):
+        cand.validate_candidate(
+            prob_data(prob={**base, "cost_scenario_reference": -1}),
+            source="t")
+
+
+def test_c101_to_c103_status_backfilled():
+    """C101–C103 状态回填守护：TOML 文本 grep screened_fail + 行内注释
+    引报告 §4；装载后 status 枚举值正确。"""
+    for cid in ("C101", "C102", "C103"):
+        text = (_T97_CANDIDATES_DIR / f"{cid}.toml").read_text(
+            encoding="utf-8")
+        assert 'status = "screened_fail"' in text, cid
+        assert "# 2026-10-29 预筛 fail（报告 §4" in text, cid
+        assert "C104-C106" in text, cid
+        assert cand.load_candidate(
+            _T97_CANDIDATES_DIR / f"{cid}.toml").status == "screened_fail"

@@ -1,0 +1,45 @@
+# C105：S2 前一交易日高低点（XAUUSD+EURUSD；T97 数据解锁批——前驱 C102 的新版本）
+# 登记时间：2026-10-29（T97/M2：登记与文档波次）
+# 前驱 id：C102（S2 前一交易日高低点，XAUUSD）——文献材料与登记预期沿前驱，本文件只登记增量
+# 增量 = HistData 解锁 + EURUSD（D53 新版本登记）：XAUUSD ext 2009-05..2021-12
+#   前向延长 + EURUSD ext 2007..2025（均 used=true 年份，第十三轮 §5 有条件批准）；
+#   approach/bracket/Δp 与 C102 逐字相同（D51），不改本批预期。
+id = "C105"
+title = "XAUUSD/EURUSD 前一交易日高低点处的条件概率（17:00 纽约划界）"
+mechanism_class = "price_levels"
+status = "screened_fail"  # 2026-10-29 T97 预筛 fail（报告 §7：成本保守档不过+检验力待数据）
+symbols = ["XAUUSD", "EURUSD"]
+holding = "H1"
+mechanism = "日内止损与止盈单集中挂在前一交易日极值（Osler 的订单聚集框架推论：分析师发布的支撑/阻力位常与近期极值重合）；送钱方是追突破而不看前日极值的短线单。"
+
+[literature]
+original = [
+  "Osler, C. L. (2000). Support for Resistance: Technical Analysis and Intraday Exchange Rates. FRBNY Economic Policy Review 6(2)——分析师发布的支撑/阻力位对日内趋势逆转有预测力，且这些位点多与近期极值重合",
+  "Osler, C. L. (2003). Intraday Technical Trading in the Foreign Exchange Market. JIMF 22 ——支撑/阻力位预测力的后续证据",
+]
+replications = [
+  "Johnsson (2019). Pivot Point Trading in the Foreign Exchange Market（Lund 大学学生论文）——支点（前日 H/L/C 线性组合）作为日内支撑/阻力的检验，结果混合；**学生论文级，非同行评审**",
+  "Curcio et al.（LSE FMG DP142）. When Support/Resistance Levels are Broken, Can Profits be Made?——突破信号在三组汇率上的可交易性检验（发布位口径，非前日极值口径）",
+]
+rebuttals = [
+  "Osler 的原始证据针对**分析师发布**的支撑/阻力位，不是机械定义的前一交易日高低点——机械口径可能没有发布位的自证效应",
+  "Neely & Weller (2011)——FX 技术规则收益整体衰减",
+]
+search_log = """检索 2026-10-29：'previous day high low intraday support resistance foreign exchange academic'（Google Scholar/web）；'pivot point foreign exchange academic'；'Osler support for resistance intraday'。同行评审的'前日极值作为支撑/阻力'直接研究未找到——最近的是支点学生论文（Johnsson 2019，混合结果）与 FMG DP142（发布位突破）。
+检索 2026-10-29（T97 EURUSD 增量）：'Osler 2000 support for resistance dollar-mark dollar-yen exchange rates'（Google Scholar/web）——Osler 2003/2000 的 S/R 与整数位证据本就来自主要货币对（dollar-mark/dollar-yen 的报价、订单与分析师位数据），EURUSD 同市场族，前驱文献覆盖新品种；'previous day high low EURUSD support resistance academic'（Google Scholar/web）仍未见同行评审直接研究（与 C102 同判）。"""
+published_effect = "Osler (2000)：发布支撑/阻力位附近日内趋势逆转频率显著更高；未发表'前日极值'机械口径的赢率差。"
+expected_effect = "预期 Δp 0.02（锚：Osler 现象级证据 + 学生论文混合结果——保守锚 0.05 × (1−0.58) ≈ 0.021，取 0.02。同行评审的直接复现缺失，若预筛判 fail 则不开卡。）"
+
+[prob]
+situations = ["S2"]
+hypotheses = ["S2:A1:follow>base", "S2:A2:follow>base", "S2:A3:fade>base", "S2:A4:fade>base"]
+bracket = { sl_atr = 1.0, tp_atr = 2.0, horizon_bars = 24 }
+level_grid = {}
+approach = { lookback_bars = 24, min_distance_atr = 1.0, touch_atr = 0.25 }
+breakout_atr = 0.25
+retest_window_bars = 6
+expected_delta_p = 0.02
+# T97 新增可选键（M2；沿 C102 的 approach/bracket/Δp 逐字不动，D51）
+max_gap_days = 30                  # 触发抑制的洞宽阈值（先决 4：>30 天的洞按局面窗口包含式判定）
+cost_scenario_mult = [1.0, 1.5]    # 情景点差双档：1x 基准 + 保守绑定档（H 线 robustness.py EARLY_YEARS_SPREAD_FACTOR 同源先例）
+cost_scenario_reference = 3.0      # 非绑定参考档（未实测的保守上界，并列报告不参与判定）
