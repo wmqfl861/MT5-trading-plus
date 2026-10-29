@@ -232,6 +232,144 @@ def test_reject_probability_card_backtest():
     assert BT._reject_probability_card_backtest(h) is None
 
 
+# ------------------------------------------------- P-08（T98 波次 2）
+
+def test_p08_slice_validation_warmup_counts_actual_bars(tmp_path):
+    """P-08：预热按**实际 bar 数**取（searchsorted+iloc）——周末/长休市下
+    日历时间差会少留（codex 复现：要求 2100 根、日历口径只留 1476）。"""
+    card_path = _validation_env(tmp_path)
+    card = rcards.load_card(card_path)
+    from mt5quant.research import rounds as rnd
+    rnd_obj = rnd.load_round(tmp_path / "rounds" / "R2.toml")
+    # FX 周末：小时 bar 剔除周六周日
+    t = pd.date_range("2019-05-01", periods=12000, freq="1h")
+    t = t[t.dayofweek < 5]
+    bars_all = pd.DataFrame({"time": t, "open": 100.0, "high": 100.5,
+                             "low": 99.5, "close": 100.0})
+    out = BT._slice_validation_eval(
+        card, rnd_obj, {"XAUUSD": bars_all}, lookback_bars=2100)
+    tt = pd.to_datetime(out["XAUUSD"]["time"])
+    split = pd.Timestamp("2019-12-01")
+    assert (tt >= split).any()                       # 分界后必有
+    n_pre = int((tt < split).sum())
+    assert n_pre == 2100                             # 实际 bar 数，非日历时差
+    assert tt.min() < split                          # 预热跨过分界
+
+
+def test_p08_slice_validation_warmup_capped_at_available(tmp_path):
+    """P-08：分界前不足 lookback 根时取全部可用（不越界）。"""
+    card_path = _validation_env(tmp_path)
+    card = rcards.load_card(card_path)
+    from mt5quant.research import rounds as rnd
+    rnd_obj = rnd.load_round(tmp_path / "rounds" / "R2.toml")
+    # 300 根在分界后 + 分界前只有 50 根
+    t_pre = pd.date_range("2019-11-29 22:00", periods=50, freq="1h")
+    t_post = pd.date_range("2019-12-01", periods=300, freq="1h")
+    times = t_pre.append(t_post)
+    bars_all = pd.DataFrame({"time": times, "open": 100.0, "high": 100.5,
+                             "low": 99.5, "close": 100.0})
+    out = BT._slice_validation_eval(
+        card, rnd_obj, {"XAUUSD": bars_all}, lookback_bars=2100)
+    assert len(out["XAUUSD"]) == 350
+
+
+class _StubSignalStrategy:
+    """P-08 探针：返回预置信号序列（透传 required_data/exit_rules）。"""
+
+    fittable = False
+
+    def __init__(self, sig):
+        self._sig = list(sig)
+
+    def generate_signals(self, bars, params):
+        return pd.Series(self._sig, index=bars.index, dtype="int64")
+
+    def validate_params(self, params):
+        return True
+
+    @property
+    def exit_rules(self):
+        return object()
+
+    @property
+    def required_data(self):
+        return None
+
+
+def _bars_at(n):
+    return pd.DataFrame({
+        "time": pd.date_range("2019-12-01", periods=n, freq="1h"),
+        "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0})
+
+
+def test_p08_zeroed_before_split_is_run_level():
+    """P-08：连续非零信号段（目标仓位 run）起点在 split 前 → 整段归零
+    （含 split 后尾巴；codex 复现：split 当根信号=1 → 修复后=0）；
+    split 后新触发的段不受影响。"""
+    n = 40
+    split = "2019-12-01 10:00"          # 第 11 根（index 10）起为分界后
+    sig = [0] * 5 + [1] * 16 + [0] * 4 + [1] * 4 + [0] * 11
+    # run1 = idx 5..20（起点 5 < split，跨过分界）→ 整段归零
+    # run2 = idx 25..28（起点 25 ≥ split）→ 保留
+    gate = BT._ZeroedBeforeSplit(_StubSignalStrategy(sig), split)
+    out = gate.generate_signals(_bars_at(n), {})
+    expect = [0] * n
+    for i in range(25, 29):
+        expect[i] = 1
+    assert list(out) == expect
+    # codex 口径：split 当根（index 10）信号必须为 0
+    assert int(out.iloc[10]) == 0
+    # split 后新触发不受影响
+    assert int(out.iloc[25]) == 1
+
+
+def test_p08_zeroed_before_split_all_runs_post_split_kept():
+    """P-08：所有 run 都在 split 后触发 → 全部保留（门不改变验证段信号）。"""
+    n = 30
+    split = "2019-12-01 10:00"
+    sig = [0] * 12 + [1] * 5 + [0] * 3 + [-1] * 4 + [0] * 6
+    gate = BT._ZeroedBeforeSplit(_StubSignalStrategy(sig), split)
+    out = gate.generate_signals(_bars_at(n), {})
+    assert list(out) == sig
+
+
+def test_p08_zeroed_before_split_sign_flip_in_pre_split_run():
+    """P-08：split 前的段内翻向（+1→−1 不归零）也属同一连续非零段——
+    起点在 split 前，整段（含翻向尾巴）归零。"""
+    n = 30
+    split = "2019-12-01 12:00"
+    sig = [0] * 5 + [1] * 6 + [-1] * 6 + [0] * 13   # 连续非零段 5..16
+    gate = BT._ZeroedBeforeSplit(_StubSignalStrategy(sig), split)
+    out = gate.generate_signals(_bars_at(n), {})
+    assert list(out) == [0] * n
+
+
+# ------------------------------------------------- P-07 bt 侧（T98）
+
+def test_p07_constants_check_rejects_symbols_mismatch():
+    """P-07 bt 侧：card.symbols 与策略类 SYMBOLS 不一致 → 拒。"""
+    d = _p1_card(strategy="x:Y")
+    d["symbols"] = ["EURUSD"]
+    d["prob"] = {**d["prob"], "level_grid": {"EURUSD": 2.0}}
+    card = rcards.validate_card(d, source="t")
+    msg = BT._check_card_strategy_constants(card, MatchDemo)
+    assert msg and "SYMBOLS" in msg
+
+
+def test_p07_constants_check_rejects_timeframe_mismatch():
+    """P-07 bt 侧：card.timeframe 与策略类 TIMEFRAME/required_data.timeframe
+    不一致 → 拒。"""
+    card = rcards.validate_card(
+        _p1_card(strategy="x:Y", timeframe="M15"), source="t")
+    msg = BT._check_card_strategy_constants(card, MatchDemo)
+    assert msg and "timeframe" in msg
+
+
+def test_p07_constants_check_symbols_timeframe_pass_on_match():
+    card = rcards.validate_card(_p1_card(strategy="x:Y"), source="t")
+    assert BT._check_card_strategy_constants(card, MatchDemo) is None
+
+
 # ------------------------------------------------- 轮次假设登记交叉校验
 
 def test_round_open_rejects_unregistered_hypothesis(tmp_path, capsys):

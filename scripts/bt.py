@@ -261,10 +261,14 @@ def _gates_hash(path=None) -> str:
 
 
 def _card_path(value: str, cards_dir: Path) -> Path:
-    """--card 接受 id（H012）或卡文件路径（.toml 结尾）。"""
-    if value.lower().endswith(".toml"):
-        return Path(value)
-    return cards_dir / f"{value}.toml"
+    """--card 接受 id（H012）或卡文件路径（.toml 结尾）。
+
+    P-05/H-09（T98）：统一返回**绝对路径**——相对 cards-dir 在 git 检查
+    （committed_at/worktree_clean）下会被解析到进程 cwd、当成仓库外文件
+    （无提交记录、恒"干净"），先卡后测被静默绕过。"""
+    p = (Path(value) if value.lower().endswith(".toml")
+         else Path(cards_dir) / f"{value}.toml")
+    return p.resolve()
 
 
 def _candidate_statuses(cards_dir: Path) -> dict[str, str]:
@@ -502,6 +506,145 @@ def _round_budget_exceeded(ledger, ctx) -> bool:
     return False
 
 
+# P-04（T98/D52）：轮次 Holm 假设族在开启时冻结、记入 rounds 行
+# evaluation_json 的保留键（H 线候选的评估方式经 [evaluation] 预注册，
+# 概率候选另带冻结族；旧轮次无此键 → 磁盘轮次文件 + sha 校验等价回退）
+_FROZEN_HYP_KEY = "__frozen_hypotheses__"
+
+
+def _d52_required(dp: float, n_tests: int) -> tuple[int | None, bool]:
+    """D52 样本量要求（T77 全轮口径）：解析 + T75 实测取严——与
+    candidates.precheck_prob 同一公式与常量，n_tests 换成全轮冻结条数。
+    返回 (n_required|None, open_ended)；None = 实测未覆盖（恒待数据）。"""
+    from mt5quant.research.candidates import measured_n_required
+    n_analytic = power.n_needed_proportion(
+        cand._PROB_BASE_RATE, dp, alpha=cand._POWER_ALPHA,
+        power=cand._POWER_MIN, n_tests=max(int(n_tests), 1))
+    n_meas, open_ended = measured_n_required(max(int(n_tests), 1), dp)
+    n_used = None if n_meas is None else max(int(n_analytic), n_meas)
+    return n_used, open_ended
+
+
+def _prob_family_freeze(ledger, round_obj, *, candidates_dir: Path):
+    """P-04/D52 开轮复核：概率候选逐条核对台账最新预筛的
+    power_prob.per_hypothesis passed → 冻结 Holm 假设族。
+
+    返回冻结块（cmd_round_open 记入 rounds 行 evaluation_json 的
+    ``__frozen_hypotheses__`` 键）：
+    - ``hypotheses``：{cid: [入轮假设]}——最终族（机械移除后）；
+    - ``dropped``：{cid: {h: 移除原因}}——预筛未过 + 全轮 D52 复核不足；
+    - ``n_bonferroni``：复核用的冻结总条数（候选口径过滤后、全轮复核
+      移除**前**——移除不递归减 N 重算）。
+
+    返回 None = 本轮没有概率候选（不冻结，评估内容原样入账）；
+    返回 False = 拒绝开启（原因已打印）：概率候选缺 [hypotheses]、台账
+    最新预筛无 per_hypothesis 数据（保守——waiting_data 假设无从剔除，
+    不得混入冻结族）、或复核后某候选族为空（不得开空轮）。
+    """
+    prob_cands = [cid for cid in round_obj.candidates
+                  if (round_obj.evaluation.get(cid) or {})
+                  .get("mode") == "probability"]
+    if not prob_cands:
+        return None
+    fam: dict[str, list[str]] = {}
+    dropped: dict[str, dict[str, str]] = {}
+    dp_by_cid: dict[str, float] = {}
+    per_by_cid: dict[str, dict] = {}
+    for cid in prob_cands:
+        listed = [h for h in (round_obj.hypotheses.get(cid) or ())]
+        if not listed:
+            print(f"✗ 候选 {cid} 评估 mode=probability 但轮次缺 "
+                  f"[hypotheses].{cid}——概率候选必须预注册假设族"
+                  "（D50/D52），拒绝开启")
+            return False
+        try:
+            registered = cand.load_candidate(
+                Path(candidates_dir) / f"{cid}.toml")
+            dp = float(registered.prob_declared.expected_delta_p)
+        except (cand.CandidateError, AttributeError, TypeError,
+                ValueError) as e:
+            print(f"✗ 候选 {cid} 登记不可装载或缺 [prob].expected_delta_p"
+                  f"（{e}）——D52 开轮复核需要候选登记的期望效应，拒绝开启")
+            return False
+        dp_by_cid[cid] = dp
+        per: dict = {}
+        rows = ledger.candidate_checks(cid)
+        if rows:
+            try:
+                result = json.loads(rows[-1]["result_json"])
+                per = (((result.get("checks") or {}).get("power_prob")
+                        or {}).get("per_hypothesis") or {})
+            except (ValueError, TypeError):
+                per = {}
+        if not per:
+            print(f"✗ 候选 {cid} 台账最新预筛无 power_prob.per_hypothesis"
+                  " 数据——开轮逐条核对无从进行（P-04 保守拒绝：先 bt "
+                  f"candidate check {cid} 补概率预筛，waiting_data 假设"
+                  "不得混入冻结族）")
+            return False
+        per_by_cid[cid] = per
+        keep = []
+        for h in listed:
+            d = per.get(h) or {}
+            if d.get("passed") is True:
+                keep.append(h)
+            else:
+                dropped.setdefault(cid, {})[h] = (
+                    f"预筛 per_hypothesis 未通过（trigger_days="
+                    f"{d.get('trigger_days')}，passed="
+                    f"{d.get('passed')}）——开轮移除（D52：不替换动作、"
+                    "不改方向）")
+        fam[cid] = keep
+    # D52 全轮复核**一次**：N=冻结族总条数（预筛按候选自己的条数
+    # Bonferroni，开轮按全轮总条数再算一遍）；不足者机械移除，
+    # 不递归减 N 重算（移除后 N 仍是本数）
+    total = sum(len(v) for v in fam.values())
+    for cid in prob_cands:
+        n_used, open_ended = _d52_required(dp_by_cid[cid], total)
+        keep = []
+        for h in fam[cid]:
+            days = int((per_by_cid[cid].get(h) or {})
+                       .get("trigger_days") or 0)
+            ok = (False if n_used is None
+                  else days > n_used if open_ended else days >= n_used)
+            if ok:
+                keep.append(h)
+            else:
+                dropped.setdefault(cid, {})[h] = (
+                    f"全轮 D52 复核不足（trigger_days={days}，按全轮 "
+                    f"{total} 条 Bonferroni 的要求 "
+                    f"{'>' if open_ended else '≥'} {n_used}）——机械移除，"
+                    "不递归减 N（T77 全轮口径）")
+        fam[cid] = keep
+    for cid in prob_cands:
+        if not fam[cid]:
+            print(f"✗ 候选 {cid} 冻结族为空——{sorted(dropped.get(cid, {}))}"
+                  " 全部在开轮复核中被移除，本轮对该候选无可检验假设；"
+                  "拒绝开启（不得开空轮；补数据后重新预筛入新轮）")
+            return False
+    return {"hypotheses": fam, "dropped": dropped, "n_bonferroni": total}
+
+
+def _round_frozen_family(round_row, round_obj) -> dict[str, list[str]]:
+    """P-04：轮次的冻结 Holm 假设族（读侧统一入口）。
+
+    新开轮次（rounds 行 evaluation_json 带 ``__frozen_hypotheses__``）
+    直接用入账冻结族；旧轮次（冻结机制之前开启，无该键）按磁盘轮次
+    文件 [hypotheses] 等价回退——调用方须先做开轮 toml_sha256 校验，
+    磁盘文件即开启时内容。返回 {cid: [hyp, ...]}。"""
+    try:
+        ev = json.loads((round_row or {}).get("evaluation_json") or "{}")
+    except (ValueError, TypeError):
+        ev = {}
+    frozen = ev.get(_FROZEN_HYP_KEY) or {}
+    hyps = frozen.get("hypotheses") if isinstance(frozen, dict) else None
+    if isinstance(hyps, dict) and hyps:
+        return {str(k): [str(h) for h in (v or [])]
+                for k, v in hyps.items()}
+    return {cid: [h for h in (round_obj.hypotheses.get(cid) or ())]
+            for cid in round_obj.hypotheses}
+
+
 def _round_power_recheck(ledger, candidates, *, n_tests: int,
                          as_of: str | None = None) -> dict[str, dict]:
     """T84（R13 §4.2 修改 4）：按本轮 N（候选数，Bonferroni α/N）复核
@@ -513,8 +656,9 @@ def _round_power_recheck(ledger, candidates, *, n_tests: int,
     （开轮时点快照：开轮后的新预筛不改开轮复核）。单次与 α/N 两档检验力
     都用 power.power_one_sided 现算（与预筛同一函数、逐位可复算）；
     预筛本身仍按单次判定（蓝图 §6.2 条件 4），α/N 只进事件模式样本量
-    规则与本复核。概率模式候选（无 checks.power，按登记假设条数
-    Bonferroni）与无预筛记录的候选如实注明，不报数字。
+    规则与本复核。概率模式候选（P-04/D52）**不再跳过**：其开轮复核按
+    假设族的触发日数口径单独执行（cmd_round_open 的 _prob_family_freeze
+    / 报告侧的冻结族节），本函数对其如实注明去向。
     """
     out: dict[str, dict] = {}
     for cid in candidates:
@@ -531,9 +675,11 @@ def _round_power_recheck(ledger, candidates, *, n_tests: int,
             sr = float(pcheck["sharpe_used"])
             yrs = float(pcheck["years"])
         except (ValueError, KeyError, TypeError):
-            out[cid] = {"note": "概率模式候选（无单次检验力记录）——按登记"
-                                "假设条数 Bonferroni（T77 全轮口径），不在"
-                                "本复核内"}
+            out[cid] = {"note": "概率模式候选（无单次夏普检验力记录）——"
+                                "开轮复核按 D52 假设族触发日数口径执行"
+                                "（P-04：逐条 per_hypothesis + 全轮冻结"
+                                "Bonferroni 总条数复核一次，冻结族随 rounds "
+                                "行入账）"}
             continue
         out[cid] = {
             "decision": rows[-1]["decision"],
@@ -609,6 +755,14 @@ def cmd_round_open(args) -> int:
                       f"{extra}——候选登记（{cid}.toml [prob].hypotheses）"
                       "是假设族上界，轮次不得加新假设（先卡后测）")
                 return 1
+        # P-04/D52（T98）：概率候选逐条核对台账最新预筛的 per_hypothesis
+        # passed → 冻结 Holm 假设族（全轮总条数复核一次，不足者机械移除、
+        # 不递归减 N）；冻结块随 evaluation_json 入 rounds 行
+        frozen = _prob_family_freeze(
+            ledger, r,
+            candidates_dir=Path(args.rounds_dir).parent / "candidates")
+        if frozen is False:
+            return 1
         used = int(ledger.conn.execute(
             "SELECT COUNT(*) n FROM lockbox_uses").fetchone()["n"])
         remaining = max(0, rnd.D16_LOCKBOX_USES_TOTAL - used)
@@ -622,19 +776,32 @@ def cmd_round_open(args) -> int:
         # T84：按本轮 N（候选数）复核每个候选的检验力（α/N，只报告）
         recheck = _round_power_recheck(ledger, r.candidates,
                                        n_tests=len(r.candidates))
+        evaluation_rec = dict(r.evaluation)
+        if frozen is not None:
+            evaluation_rec[_FROZEN_HYP_KEY] = frozen
         ledger.record_round_open(
             round_id=r.id, candidates=r.candidates,
             trial_budget=r.trial_budget,
             lockbox_uses_max=r.lockbox_uses_max,
             dsr_trial_scope=r.dsr_trial_scope, advance_rule=r.advance_rule,
             close_rule=r.close_rule, approved_by=r.approved_by,
-            evaluation=r.evaluation, toml_sha256=r.content_sha256(),
+            evaluation=evaluation_rec, toml_sha256=r.content_sha256(),
             git_commit=current_git_commit())
     print(f"✓ 轮次 {r.id} 已开启（T63/D32）：候选 {list(r.candidates)}，"
           f"试验预算 {r.trial_budget}，锁箱用量上限 {r.lockbox_uses_max}"
           f"（D16 剩余 {remaining}），批准人 {r.approved_by}；台账 "
           f"{args.ledger}（rounds 哈希链，toml_sha256="
           f"{r.content_sha256()[:12]}…）")
+    if frozen:
+        print(f"— P1 假设族冻结（P-04/D52）：Bonferroni N="
+              f"{frozen['n_bonferroni']}（冻结族总条数——复核一次，移除"
+              "不递归减 N）；开轮移除的假设不再属于本轮，卡上假设表必须"
+              "与冻结族一致")
+        for cid, hyps in frozen["hypotheses"].items():
+            print(f"    ✓ {cid}：{hyps}")
+        for cid, drops in frozen["dropped"].items():
+            for h, why in drops.items():
+                print(f"    ✗ 移除 {cid} {h}——{why}")
     print(f"— 检验力复核（α/N，N={len(r.candidates)}（本轮候选数），只报告"
           "不阻塞——预筛按单次判定，蓝图 §6.2 条件 4）：")
     for cid, d in recheck.items():
@@ -751,6 +918,27 @@ def _round_report(ledger, row) -> str:
         lines.append(
             f"| {cid} | {d['power_single_test']:.0%} | {d['power_at_n']:.0%}"
             f" | {d['sharpe_used']:.2f} | {d['years']:.1f} |")
+    # P-04：P1 假设族冻结（开轮时点快照——新轮次才有；旧轮次为空）
+    try:
+        _ev = json.loads(row["evaluation_json"] or "{}")
+    except (ValueError, TypeError):
+        _ev = {}
+    _frozen = _ev.get(_FROZEN_HYP_KEY)
+    if _frozen:
+        _hyp_s = json.dumps(_frozen.get("hypotheses"), ensure_ascii=False)
+        _drop_s = json.dumps(_frozen.get("dropped"), ensure_ascii=False)
+        lines += [
+            "",
+            "## P1 假设族冻结（P-04/D52，开轮时点）",
+            "",
+            f"- Bonferroni N={_frozen.get('n_bonferroni')}"
+            "（冻结族总条数——复核一次，移除不递归减 N）",
+            f"- 入轮族：{_hyp_s}",
+            f"- 开轮移除：{_drop_s}",
+            "",
+            "P1 报告（bt prob round-report）的 Holm 族以本冻结族为准："
+            "家族外成功运行与缺失运行均拒绝出报告。",
+        ]
     lines += [
         "",
         "## 按 advance_rule 的判定（占位，关闭时人工填写）",
@@ -1813,12 +2001,37 @@ class _FittedFactory:
 
 
 def _check_card_strategy_constants(card, strategy_cls) -> str | None:
-    """审核三 D1：卡的 [prob] 与策略类常量逐项核对——不一致返回错误信息
-    （bracket/situations/level_grid/approach/breakout_atr/retest）。
-    防止卡上登记的检验配置与实际运行的策略配置脱节。"""
+    """审核三 D1 + P-07 bt 侧（T98）：卡的 [prob] 与策略类常量逐项核对
+    ——不一致返回错误信息。先核对品种/周期（SYMBOLS/TIMEFRAME/
+    required_data.timeframe——网格与标签折算都按它们绑定，卡上写别的
+    组合就是检验配置脱节），再核对检验配置（bracket/situations/
+    level_grid/approach/breakout_atr/retest 及决策字段）。防止卡上登记
+    的检验配置与实际运行的策略配置脱节。"""
     prob = card.prob
     if prob is None:
         return None
+    # P-07 bt 侧：symbols/timeframe 与策略类实际执行配置一致（网格按
+    # SYMBOLS 绑定、标签按 TIMEFRAME 折算——审核 P-07：checker 原不核对
+    # 完整 symbols/timeframe，双品种网格品种会静默拿 SYMBOLS[0] 的网格）
+    syms_c = tuple(str(s) for s in (getattr(strategy_cls, "SYMBOLS", ())
+                                    or ()))
+    if syms_c and sorted(str(s) for s in card.symbols) != sorted(syms_c):
+        return (f"卡 symbols={list(card.symbols)} 与策略类 "
+                f"SYMBOLS={list(syms_c)} 不一致——概率策略按 SYMBOLS 绑定"
+                "网格与评估（P-07 单品种绑定），品种对不上即检验配置脱节，"
+                "拒绝运行")
+    tf_card = str(card.timeframe).upper()
+    tf_c = getattr(strategy_cls, "TIMEFRAME", None)
+    if tf_c is not None and str(tf_c).upper() != tf_card:
+        return (f"卡 timeframe={card.timeframe!r} 与策略类 "
+                f"TIMEFRAME={tf_c!r} 不一致——标签按策略类周期折算，"
+                "拒绝运行（P-07）")
+    tf_rd = getattr(getattr(strategy_cls, "required_data", None),
+                    "timeframe", None)
+    if tf_rd is not None and str(tf_rd).upper() != tf_card:
+        return (f"卡 timeframe={card.timeframe!r} 与策略类 "
+                f"required_data.timeframe={tf_rd!r} 不一致——拒绝运行"
+                "（P-07）")
     pairs = [
         ("bracket.sl_atr", prob["bracket"]["sl_atr"], "SL_ATR"),
         ("bracket.tp_atr", prob["bracket"]["tp_atr"], "TP_ATR"),
@@ -1892,39 +2105,44 @@ def _reject_probability_card_backtest(card) -> str | None:
 
 def _slice_validation_eval(card, round_obj, bars_by_sym, *,
                            lookback_bars: int) -> dict:
-    """审核四 E1：validation 卡的评估窗 = [split − lookback·周期, cutoff)。
+    """审核四 E1 + P-08（T98）：validation 卡的评估窗 = 实际 bar 数的
+    [split − lookback_bars, cutoff)。
 
     - 分界（含）之后无数据 → ValueError（"在 < split 上评估被拒"）；
-    - 从分界往前多取 lookback_bars 根作预热（ATR/SMA200/分位特征需要
-      历史），返回**新字典**（训练窗已在拟合上下文里取 < split——调用
-      顺序必须先拟合、后切评估窗）；
-    - 分界之前的信号由 _ZeroedBeforeSplit 门归零（见下），指标只按
-      分界之后入场的交易计算（信号为 0 则分界前不可能入场）。
+    - P-08：预热按**实际 bar 数**取——searchsorted 定位分界位置后
+      iloc 回取 lookback_bars 根（原实现按 lookback×周期秒数的日历时间
+      差截尾，周末/长休市下 2100 根要求只留 ~1476 根，特征窗口不足）；
+      分界前不足 lookback 根时取全部可用；
+    - 返回**新字典**（训练窗已在拟合上下文里取 < split——调用顺序必须
+      先拟合、后切评估窗）；
+    - 分界之前的信号由 _ZeroedBeforeSplit 门做 run 级归零（见下），
+      预热段只建立特征、不建立交易状态，指标里的交易全部从分界起算
+      （run 级归零后分界前不可能开仓——引擎无需过滤）。
     """
     if card.segment != "validation":
         return bars_by_sym
     split = pd.Timestamp((round_obj.segments or {})["split"])
-    from mt5data.store import TIMEFRAME_SECONDS as _TS
-    tf_s = _TS[card.timeframe.upper()]
-    warm = pd.Timedelta(seconds=tf_s * max(int(lookback_bars), 0))
+    warm = max(int(lookback_bars), 0)
     out = {}
     for sym, bars in bars_by_sym.items():
         times = pd.to_datetime(bars["time"])
-        if not (times >= split).any():
+        pos = int(times.searchsorted(split, side="left"))
+        if pos >= len(times):
             raise ValueError(
                 f"{sym} 在分界 {split} 之后没有数据——validation 卡的评估"
                 "窗是 [split, cutoff)，分界前数据不算样本外（D50；审核三 D1）")
-        keep = times >= (split - warm)
-        if not keep.any():          # 理论不可达（含分界后必有），防御
-            keep = times >= split
-        out[sym] = bars[keep].reset_index(drop=True)
+        out[sym] = bars.iloc[max(0, pos - warm):].reset_index(drop=True)
     return out
 
 
 class _ZeroedBeforeSplit:
-    """评估门（审核四 E1）：分界之前的信号一律为 0。策略在预热 bar 上
-    照常计算特征（有界窗口历史），但不出信号；分界之后透传。纯函数、
-    截断一致（掩码按绝对时刻）。"""
+    """评估门（审核四 E1 + P-08 run 级归零）：对 inner.generate_signals
+    的输出识别**连续非零信号段**（目标仓位 run）——凡 run 起点（入场
+    触发 bar）在 split 前的整段置 0（含 split 后的持有尾巴；原实现只按
+    时刻掩码，split 前触发的持仓会以 split 当根信号=1 延续成"新"入场）；
+    split 后新触发的 run 不受影响。策略在预热 bar 上照常计算特征（有界
+    窗口历史），但分界前不建立任何交易状态；段内翻向（+1→−1 不归零）属
+    同一连续非零段，起点在 split 前则整段归零。纯函数、截断一致。"""
 
     def __init__(self, inner, split):
         self._inner = inner
@@ -1934,7 +2152,28 @@ class _ZeroedBeforeSplit:
     def generate_signals(self, bars, params):
         sig = self._inner.generate_signals(bars, params)
         times = pd.to_datetime(bars["time"])
-        return sig.mask(times < self._split, 0)
+        pre = (times < self._split).to_numpy()
+        vals = sig.to_numpy(dtype="float64")
+        out = vals.copy()
+        n = len(vals)
+        i = 0
+        while i < n:
+            if vals[i] == 0.0:
+                i += 1
+                continue
+            j = i + 1
+            while j < n and vals[j] != 0.0:
+                j += 1
+            # 连续非零段 [i, j)：起点在 split 前 → 整段归零（含尾巴）
+            if pre[i]:
+                out[i:j] = 0.0
+            i = j
+        masked = pd.Series(out, index=sig.index)
+        try:
+            masked = masked.astype(sig.dtype)
+        except (ValueError, TypeError):
+            pass
+        return masked
 
     def validate_params(self, params):
         return self._inner.validate_params(params)
@@ -2118,11 +2357,17 @@ def _prob_preconditions(ledger, card, path, *, actor: str) -> tuple | None:
         print(f"✗ 轮次 {card.round} 中候选 {card.candidate} 的评估模式是 "
               f"{ev.get('mode')!r}（须 probability）")
         return None
-    listed = list(round_obj.hypotheses.get(card.candidate, ()))
+    # P-04：假设表与**冻结族**一致（开轮时已按预筛 per_hypothesis 与
+    # 全轮 D52 复核移除不达标假设——被移除的假设不得再跑；旧轮次冻结块
+    # 为空 → 磁盘 [hypotheses] 等价回退）
+    listed = list(_round_frozen_family(opened, round_obj)
+                  .get(card.candidate, ()))
     if sorted(card.prob["hypotheses"]) != sorted(listed):
-        print(f"✗ 卡的假设表与轮次 [hypotheses].{card.candidate} 不一致"
-              f"（卡 {sorted(card.prob['hypotheses'])} vs 轮次 "
-              f"{sorted(listed)}——先卡后测：改卡须新版本入新轮）")
+        print(f"✗ 卡的假设表与轮次 {card.round} 的冻结假设族不一致"
+              f"（卡 {sorted(card.prob['hypotheses'])} vs 冻结族 "
+              f"{sorted(listed)}——开轮时预筛 per_hypothesis 未通过/全轮"
+              "D52 复核不足的假设已被移除，不得上卡；先卡后测：改卡须"
+              "新版本入新轮）")
         return None
     if not (round_obj.segments or {}).get("split"):
         print(f"✗ 轮次 {card.round} 缺 [segments].split（D50）")
@@ -2136,7 +2381,12 @@ def _prob_preconditions(ledger, card, path, *, actor: str) -> tuple | None:
 
 
 def cmd_prob_test(args) -> int:
-    """T90：bt prob test --card <P###-v#>——P1 现象检验（发现段）。"""
+    """T90：bt prob test --card <P###-v#>——P1 现象检验（发现段）。
+
+    P-05（T98）：准入全部前移到任何标签计算之前（先卡后测→策略指纹
+    绑定→轮次冻结族/预算→装配），run_p1_card 异常时对全部假设整批记
+    error 行；P-06：swap 参考价/成本版本逐品种取，params.prob 带全品种
+    data_sha/cost_version 映射与 sims（试验身份）。"""
     if _reject_ops_ack(args):
         return 1
     path = _card_path(args.card, Path(args.cards_dir))
@@ -2172,6 +2422,12 @@ def cmd_prob_test(args) -> int:
                 cards.CardDirtyWorktreeError) as e:
             print(f"✗ {e}")
             return 1
+        # P-05（T98）：策略指纹绑定提前到任何标签计算之前——原实现先跑
+        # run_p1_card 再绑定，脏代码/指纹不符时标签已算完才被拒（准入
+        # 必须先于计算；审核 P-05"计算标签/拟合前完成准入"）
+        strategy_sha = _bind_strategy_sha(ledger, card, args.strategy)
+        if strategy_sha is None:
+            return 1
         pre = _prob_preconditions(ledger, card, path, actor=actor)
         if pre is None:
             return 1
@@ -2191,6 +2447,9 @@ def cmd_prob_test(args) -> int:
             # mt5_first 交给它按 era 分组用 ScenarioCosts 标注 ext 段触发。
             use_merged = _prob_use_merged(card.prob or {})
             bars_by_sym = {}
+            # P-06：逐品种保存全段序列——消灭循环尾变量复用（原实现第二
+            # 循环复用上一循环的 bars_full，所有品种都拿最后品种的参考价）
+            bars_full_by_sym = {}
             gap_by_sym = {}
             mt5_first_by_sym = {}
             if use_merged:
@@ -2199,6 +2458,7 @@ def cmd_prob_test(args) -> int:
                 bars_full, gap_spans = _prob_load_bars(
                     data_root, sym, card.timeframe, use_merged=use_merged,
                     end=args.end)
+                bars_full_by_sym[sym] = bars_full
                 if use_merged:
                     gap_by_sym[sym] = gap_spans
                     mt5_first_by_sym[sym] = mt5_first_time(
@@ -2213,21 +2473,55 @@ def cmd_prob_test(args) -> int:
             sess_policy = load_session_policy(str(SESSIONS_PATH))
             sess_sha = sessions_sha256(str(SESSIONS_PATH))
             costs_by_sym = {}
+            # P-06：成本版本/参考价逐品种入映射（试验身份含全品种指纹）
+            cost_version_by_sym = {}
             policy_by_sym = {}
             for sym in card.symbols:
-                costs_by_sym[sym], cost_version = build_costs(
+                costs_by_sym[sym], cost_version_by_sym[sym] = build_costs(
                     data_root, sym, args.spread_fraction, args.commission,
                     sessions_sha=sess_sha, research_store=store_kind == "research",
-                    # T83/K5：点数模式隔夜费相对价格基准 = 全序列最后收盘
-                    # （与 CLI 主路径同一约定；bars_full 为锁箱语义装载的全序列）
-                    swap_ref_price=float(bars_full["close"].iloc[-1]))
+                    # T83/K5：点数模式隔夜费相对价格基准 = 该品种全序列
+                    # 最后收盘（逐品种取，P-06；bars_full 为锁箱语义装载
+                    # 的该品种全序列）
+                    swap_ref_price=float(
+                        bars_full_by_sym[sym]["close"].iloc[-1]))
                 policy_by_sym[sym] = entry_policy_for(
                     costs_by_sym[sym], sym, sess_policy)
+            if len(cost_version_by_sym) == 1:
+                cost_version = next(iter(cost_version_by_sym.values()))
+            else:
+                cost_version = "|".join(
+                    f"{s}={cost_version_by_sym[s]}"
+                    for s in sorted(cost_version_by_sym))
             for sym in card.symbols:      # S8：合约大小必填，不默认 1.0
                 if sym not in sizes:
                     print(f"✗ {sym} 的合约大小未知（specs 缺失）——标签"
                           "引擎需与评估同口径，不默认 1.0")
                     return 1
+            data_sha_by_sym = {sym: data_sha256(bars_by_sym[sym])
+                               for sym in card.symbols}
+            first_sym = card.symbols[0]
+        except Exception as e:
+            print(f"✗ 装配失败（未开跑，无 runs 记录）："
+                  f"{type(e).__name__}: {e}")
+            return 1
+        # P-06：试验身份（params.prob）——prob_version/seed 随结果行补充；
+        # 全品种 data_sha/cost_version 映射 + sims 进身份（只记首品种
+        # hash/最后成本版本会漏掉第二品种的数据改动，审核 P-06/H-12）
+        prob_ident = {"candidate": card.candidate,
+                      "segment": card.segment,
+                      "split": round_obj.segments["split"],
+                      "bracket": dict(card.prob["bracket"]),
+                      "sims": int(args.sims),
+                      "data_sha256_by_symbol": data_sha_by_sym,
+                      "cost_model_version_by_symbol": cost_version_by_sym}
+        # P-05（T98）：逐假设入账。台账是 append-only 哈希链、不支持行内
+        # update——"started 行 + 终态行"会留下两条同键行，扰动成功口径与
+        # 预算（round_n_dedup/round-report 的多成功拒绝按 ok 行计）。按
+        # 备选方案实现：**每条假设恰一行终态 record_run；run_p1_card 异常
+        # 时对全部假设整批记 error 行**（失败可追溯；硬崩溃不产生行，
+        # 重跑按七元组去重不重复计数）。
+        try:
             results = p1mod.run_p1_card(card, round_obj, bars_by_sym,
                                         costs_by_sym, sizes=sizes,
                                         policy_by_symbol=policy_by_sym,
@@ -2236,18 +2530,26 @@ def cmd_prob_test(args) -> int:
                                         mt5_first_by_symbol=(
                                             mt5_first_by_sym or None))
         except Exception as e:
-            print(f"✗ P1 运行失败：{type(e).__name__}: {e}")
+            msg = f"P1 运行失败：{type(e).__name__}: {e}"
+            for h in card.prob["hypotheses"]:
+                rid = ledger.record_run(
+                    card_id=card.id, card_version=card.version,
+                    strategy=args.strategy,
+                    params={"hypothesis": h, "prob": dict(prob_ident)},
+                    symbol=first_sym, timeframe=card.timeframe,
+                    data_first=pd_iso(bars_by_sym[first_sym]["time"].iloc[0]),
+                    data_last=pd_iso(bars_by_sym[first_sym]["time"].iloc[-1]),
+                    data_sha256=data_sha_by_sym[first_sym],
+                    engine_version=ENGINE_VERSION,
+                    cost_model_version=cost_version, gates_hash=_gates_hash(),
+                    metrics=None, error=msg, actor=actor,
+                    strategy_sha=strategy_sha,
+                    run_class="research", round_id=round_obj.id)
+                print(f"✗ run#{rid} {h} -> {msg}")
             return 1
-        strategy_sha = _bind_strategy_sha(ledger, card, args.strategy)
-        if strategy_sha is None:
-            return 1                 # 策略未提交/脏/指纹绑定不符（已打印）
         for r in results:
             params = {"hypothesis": r["hypothesis"],
-                      "prob": {"candidate": card.candidate,
-                               "segment": card.segment,
-                               "split": round_obj.segments["split"],
-                               "bracket": dict(card.prob["bracket"]),
-                               "seed": r["seed"],
+                      "prob": {**prob_ident, "seed": r["seed"],
                                "prob_version": r["prob_version"]}}
             metrics = {"prob": {"prob_version": r["prob_version"],
                                 "n_triggers": r["n_triggers"],
@@ -2259,10 +2561,10 @@ def cmd_prob_test(args) -> int:
             rid = ledger.record_run(
                 card_id=card.id, card_version=card.version,
                 strategy=args.strategy, params=params,
-                symbol=card.symbols[0], timeframe=card.timeframe,
-                data_first=pd_iso(bars_by_sym[card.symbols[0]]["time"].iloc[0]),
-                data_last=pd_iso(bars_by_sym[card.symbols[0]]["time"].iloc[-1]),
-                data_sha256=data_sha256(bars_by_sym[card.symbols[0]]),
+                symbol=first_sym, timeframe=card.timeframe,
+                data_first=pd_iso(bars_by_sym[first_sym]["time"].iloc[0]),
+                data_last=pd_iso(bars_by_sym[first_sym]["time"].iloc[-1]),
+                data_sha256=data_sha_by_sym[first_sym],
                 engine_version=ENGINE_VERSION,
                 cost_model_version=cost_version, gates_hash=_gates_hash(),
                 metrics=metrics, actor=actor,
@@ -2282,12 +2584,17 @@ def cmd_prob_round_report(args) -> int:
     """T90：bt prob round-report <R#>——本轮全部假设 Holm + 推进判定。
 
     推进 = Holm 校正后 p < 0.05 **且** Δp 点估计满足事前成本要求
-    （成本取候选预筛 research/candidates/<C###>.precheck.json 的
-    ex_ante_cost_prob.cost_r_by_symbol 最大值；判定式与预筛同一公式：
+    （成本取开轮前入账的台账预筛行 ex_ante_cost_prob.cost_r_by_symbol
+    最大值——P-04 起不读磁盘 precheck.json；判定式与预筛同一公式：
     ΔEV = Δp̂ × (tp_R + 1) ≥ 3 × 成本，tp_R 取该运行 params.prob.bracket）。
     一条假设有多条成功运行 → 拒绝出报告（不允许重跑挑结果）；运行按
     （候选、假设）过滤，不只按假设字符串。
-    """
+
+    P-04（T98）：报告族 = 开启时入账 rounds 行的**冻结假设族**（新轮），
+    旧轮等价回退磁盘 [hypotheses]；磁盘轮次文件与开轮 toml_sha256 不
+    一致 → 拒（开轮后删失败假设缩小 Holm 族会被发现）；冻结族外有成功
+    运行 → 拒；成本只认开轮前入账的台账预筛行——**不再回退磁盘
+    precheck.json**（开轮后可被重写，不作数）。"""
     try:
         data_root, _store_kind = _resolve_store(args)
     except ValueError as e:
@@ -2302,41 +2609,68 @@ def cmd_prob_round_report(args) -> int:
     ledger_path = _ledger_default(args)
     from mt5quant.validation.prob_mode import holm
     with Ledger(ledger_path) as ledger:
+        round_row = ledger.round(round_obj.id)
+        if round_row is None:
+            print(f"✗ 轮次 {round_obj.id} 未在台账开启——round-report 只"
+                  "汇总已开启轮次（P-04：冻结族与成本取自 rounds 行/开轮"
+                  "前台账，不读未开启的预注册）")
+            return 1
+        # P-04/S2：磁盘轮次文件必须与开启时入账内容一致——开轮后删假设/
+        # 改分界即在此拒绝（Holm 族不可事后缩小）
+        import hashlib as _hl
+        file_sha = _hl.sha256(rnd_path.read_bytes()).hexdigest()
+        if round_row["toml_sha256"] != file_sha:
+            print(f"✗ 轮次文件 {rnd_path.name} 与开启时入账的内容不一致"
+                  f"（sha256 {file_sha[:12]}… vs 台账 "
+                  f"{round_row['toml_sha256'][:12]}…）——开启后改预注册"
+                  "无效（P-04：不得删失败假设缩小 Holm 族）；改动作为新"
+                  "轮次登记")
+            return 1
+        family = _round_frozen_family(round_row, round_obj)
         all_runs = ledger.runs_of_round(round_obj.id)
+        # P-04：冻结族之外有成功运行 → 拒绝（开轮移除的假设/别的候选的
+        # 假设跑了成功行，都不得混进本报告的 Holm 族）
+        owner: dict[str, str] = {}
+        for _cid, _hyps in family.items():
+            for _h in _hyps:
+                owner.setdefault(_h, _cid)
+        extra = []
+        for r in all_runs:
+            if not r.get("ok"):
+                continue
+            h = (r["params"] or {}).get("hypothesis")
+            rc = ((r["params"].get("prob") or {}).get("candidate"))
+            if h not in owner or (rc and rc != owner[h]):
+                extra.append(r)
+        if extra:
+            print(f"✗ 本轮有冻结假设族之外的成功运行（run#"
+                  f"{[r['run_id'] for r in extra]}，假设 "
+                  f"{[r['params'].get('hypothesis') for r in extra]}）——"
+                  "Holm 族在开轮时冻结（P-04），家族外运行不得进入报告；"
+                  "须先在轮次报告里说明取舍或作废多余运行")
+            return 1
         pvals: dict[str, float] = {}
         rows = []
-        opened_at = (ledger.round(round_obj.id) or {}).get("opened_utc", "")
-        for cid, hyps in round_obj.hypotheses.items():
-            # 审核四 E6：成本取**开轮时已入账**的预筛结论（台账
-            # candidate_checks 里 opened_utc 之前最新一行），不读磁盘上
-            # 随时可被重写的 JSON
+        opened_at = round_row.get("opened_utc", "")
+        for cid, hyps in family.items():
+            # 审核四 E6 + P-04：成本取**开轮时已入账**的预筛结论（台账
+            # candidate_checks 里 opened_utc 之前最新一行）——不读磁盘上
+            # 随时可被重写的 JSON（磁盘回退已取消）
             rows_chk = [r for r in ledger.candidate_checks(cid)
                         if r["checked_at_utc"] <= opened_at]
-            pre_json = Path(args.candidates_dir) / f"{cid}.precheck.json"
-            if rows_chk:
-                # E6：开轮时已入账的预筛结论优先（磁盘 JSON 开轮后可被
-                # 重写，不作数）
-                try:
-                    pre = json.loads(rows_chk[-1]["result_json"])
-                    cost_map = (pre["checks"]["ex_ante_cost_prob"]
-                                ["cost_r_by_symbol"])
-                except (ValueError, KeyError, TypeError) as e:
-                    print(f"✗ 候选 {cid} 开轮时的预筛记录无法解析成本"
-                          f"（{e}）")
-                    return 1
-            elif pre_json.is_file():
-                # 兼容回退：台账无开轮前记录时读磁盘 JSON（预筛从未经
-                # bt candidate check 入账的旧路径）
-                try:
-                    pre = json.loads(pre_json.read_text(encoding="utf-8"))
-                    cost_map = (pre["checks"]["ex_ante_cost_prob"]
-                                ["cost_r_by_symbol"])
-                except (ValueError, KeyError, TypeError) as e:
-                    print(f"✗ {pre_json.name} 无法解析成本（{e}）")
-                    return 1
-            else:
+            if not rows_chk:
                 print(f"✗ 候选 {cid} 在开轮（{opened_at}）前没有预筛记录"
-                      "，磁盘也无可回退的 precheck.json——成本条件无从判定")
+                      "——成本条件无从判定（P-04：不再回退磁盘 "
+                      "precheck.json——开轮前必须经 bt candidate check "
+                      "入台账，磁盘 JSON 开轮后可被重写、不作数）")
+                return 1
+            try:
+                pre = json.loads(rows_chk[-1]["result_json"])
+                cost_map = (pre["checks"]["ex_ante_cost_prob"]
+                            ["cost_r_by_symbol"])
+            except (ValueError, KeyError, TypeError) as e:
+                print(f"✗ 候选 {cid} 开轮时的预筛记录无法解析成本"
+                      f"（{e}）")
                 return 1
             if not cost_map:
                 print(f"✗ 候选 {cid} 开轮时的预筛记录 cost_r_by_symbol "
@@ -2423,8 +2757,19 @@ def _card_of(run: dict) -> str:
 
 
 def cmd_fit(args) -> int:
-    """T73A：bt fit <卡>——概率卡按分段约束拟合，模型冻结落盘并打印
-    路径与哈希（不产生 runs——模型身份随其后的 screen/gate 运行入台账）。"""
+    """T73A：bt fit <卡>——概率/P2 决策卡按分段约束拟合，模型冻结落盘并
+    打印路径与哈希（不产生 runs——模型身份随其后的 screen/gate 运行入
+    台账）。
+
+    P-05（T98）补完整准入链（原实现只查 evaluation_mode+常量，未批准/
+    未提交也能拟合）：卡 committed/clean（ensure_card_precedes_run）、
+    候选状态（withdrawn/specimen，_enforce_candidate_status）、策略指纹
+    绑定（_bind_strategy_sha）、轮次开启+approved_by+toml sha256
+    （_round_context + 开轮哈希核对）、轮次预算（**非原子**——fit 不占
+    runs 行，预算检查与后续运行的占用不构成一个事务，P-10 残留，注明）；
+    __fit__ 传 sizes/policies（真实内置策略的标签引擎需要，缺则拒）；
+    卡类型接受 probability（discovery/validation）与 standard+validation
+    的 P2 决策卡（原实现只接 probability）。"""
     path = _card_path(args.card, Path(args.cards_dir))
     try:
         card = cards.load_card(path)
@@ -2436,41 +2781,111 @@ def cmd_fit(args) -> int:
     except cards.CardStrategyMismatchError as e:
         print(f"✗ {e}")
         return 1
-    if card.evaluation_mode != "probability":
-        print("✗ bt fit 只用于 evaluation_mode = probability 的卡（T73A）")
+    if not getattr(card, "segment", ""):
+        print("✗ bt fit 只用于带 segment 的概率/P2 决策卡（discovery|"
+              "validation，D50）——旧 H 线卡不拟合")
         return 1
-    _cs = _check_card_strategy_constants(
-        card, load_strategy(args.strategy))
-    if _cs:
-        print(f"✗ {_cs}")
+    if card.evaluation_mode == "standard":
+        if card.segment != "validation":
+            print("✗ standard 卡只有 validation 段可拟合（P2 决策卡="
+                  "T92；发现段 P1 属 probability——bt prob test）")
+            return 1
+    elif card.evaluation_mode != "probability":
+        print("✗ bt fit 只用于 evaluation_mode = probability（P1）或 "
+              "standard+validation（P2 决策卡）的卡（T73A+P-05）")
+        return 1
+    if not card.round:
+        print("✗ 概率/P2 卡必须声明 round（D50：分界与假设族由轮次预注册"
+              "提供）")
+        return 1
+    actor = _enforce_candidate_status(args, card)
+    if actor is None:
         return 1
     try:
         data_root, store_kind = _resolve_store(args)
     except ValueError as e:
         print(f"✗ {e}")
         return 1
-    try:
-        strategy_cls = load_strategy(args.strategy)
-        bars_by_sym = {sym: load_series(data_root, sym, card.timeframe,
-                                        args.end)
-                       for sym in card.symbols}
-        from mt5data.sessions import load_session_policy
-        sess_policy = load_session_policy(str(SESSIONS_PATH))
-        sess_sha = sessions_sha256(str(SESSIONS_PATH))
-        costs_by_sym = {}
-        for sym in card.symbols:
-            costs_by_sym[sym], _ver = build_costs(
-                data_root, sym, args.spread_fraction, args.commission,
-                sessions_sha=sess_sha, research_store=store_kind == "research",
-                # T83/K5：与 screen/gate 同一约定——该品种装载序列最后收盘
-                swap_ref_price=float(bars_by_sym[sym]["close"].iloc[-1]))
-        fit_ctx = _prob_fit_context(card, None, bars_by_sym, costs_by_sym,
-                                    data_root)
-        _fit_and_freeze(strategy_cls, card, fit_ctx, bars_by_sym, costs_by_sym,
-                        data_root)
-    except Exception as e:
-        print(f"✗ 拟合失败：{type(e).__name__}: {e}")
+    _cs = _check_card_strategy_constants(card, load_strategy(args.strategy))
+    if _cs:
+        print(f"✗ {_cs}")
         return 1
+    ledger_path = _ledger_default(args)
+    with Ledger(ledger_path) as ledger:
+        committed = cards.committed_at(path)
+        try:
+            cards.ensure_card_precedes_run(
+                card.id, committed,
+                ledger.first_run_at(card.id, version=card.version),
+                worktree_clean=cards.worktree_clean(path))
+        except (cards.CardNotCommittedError, cards.CardLateCommitError,
+                cards.CardDirtyWorktreeError) as e:
+            print(f"✗ {e}")
+            return 1
+        strategy_sha = _bind_strategy_sha(ledger, card, args.strategy)
+        if strategy_sha is None:
+            return 1
+        # P-05：轮次准入（_prob_preconditions 的轮次部分等价）——轮次可
+        # 装载、approved_by 非空、已开启且候选在名单/screened_pass（
+        # _round_context）、开轮 toml sha256 一致、预算余量（非原子）
+        rnd_path = Path(card.path).parent.parent / "rounds" / \
+            f"{card.round}.toml"
+        try:
+            round_obj = rnd.load_round(rnd_path)
+        except rnd.RoundError as e:
+            print(f"✗ 轮次 {card.round} 不可装载：{e}")
+            return 1
+        if not round_obj.approved_by.strip():
+            print(f"✗ 轮次 {card.round} 的 approved_by 为空——轮次未获批"
+                  "（P 线审核会话批准时填写；执行会话不得代填）")
+            return 1
+        round_ctx = _round_context(ledger, card, actor=actor)
+        if round_ctx is False:
+            return 1
+        opened = ledger.round(card.round)
+        if opened is not None:
+            import hashlib as _hl
+            file_sha = _hl.sha256(rnd_path.read_bytes()).hexdigest()
+            if opened.get("toml_sha256") != file_sha:
+                print(f"✗ 轮次文件 {rnd_path.name} 与开启时入账的内容不"
+                      f"一致（sha256 {file_sha[:12]}… vs 台账 "
+                      f"{str(opened.get('toml_sha256'))[:12]}…）——开启后"
+                      "改预注册（分界/假设族/预算）无效；改动作为新轮次登记")
+                return 1
+            if round_ctx is not None and _round_budget_exceeded(
+                    ledger, round_ctx):
+                return 1
+        try:
+            strategy_cls = load_strategy(args.strategy)
+            sizes = {sym: resolve_contract_size(data_root, sym, None)
+                     for sym in card.symbols}
+            bars_by_sym = {sym: load_series(data_root, sym, card.timeframe,
+                                            args.end)
+                           for sym in card.symbols}
+            from mt5data.sessions import load_session_policy
+            sess_policy = load_session_policy(str(SESSIONS_PATH))
+            sess_sha = sessions_sha256(str(SESSIONS_PATH))
+            costs_by_sym = {}
+            policy_by_sym = {}
+            for sym in card.symbols:
+                costs_by_sym[sym], _ver = build_costs(
+                    data_root, sym, args.spread_fraction, args.commission,
+                    sessions_sha=sess_sha, research_store=store_kind == "research",
+                    # T83/K5：与 screen/gate 同一约定——该品种装载序列最后收盘
+                    swap_ref_price=float(bars_by_sym[sym]["close"].iloc[-1]))
+                policy_by_sym[sym] = entry_policy_for(
+                    costs_by_sym[sym], sym, sess_policy)
+            fit_ctx = _prob_fit_context(card, None, bars_by_sym, costs_by_sym,
+                                        data_root)
+            # P-05：__fit__.sizes/policies（真实内置策略的标签引擎需要
+            # 合约大小与禁入窗——缺则 ValueError，不默认 1.0/不限制）
+            _fit_and_freeze(strategy_cls, card, fit_ctx, bars_by_sym,
+                            costs_by_sym, data_root,
+                            fit_meta={"sizes": sizes,
+                                      "policies": policy_by_sym})
+        except Exception as e:
+            print(f"✗ 拟合失败：{type(e).__name__}: {e}")
+            return 1
     fw = (fit_ctx["model"].get("fit_window") or {})
     print(f"✓ 模型冻结：{fit_ctx['model_path']}")
     print(f"  sha256={fit_ctx['model_sha']}")
@@ -3400,7 +3815,9 @@ def build_parser() -> argparse.ArgumentParser:
     prpt.add_argument("round", help="轮次 id（R#）")
     prpt.add_argument("--rounds-dir", default="research/rounds")
     prpt.add_argument("--candidates-dir", default="research/candidates",
-                      help="候选预筛 JSON 所在目录（成本条件取数）")
+                      help="（P-04 起不再读磁盘 precheck.json——成本只认"
+                           "台账 candidate_checks 开轮前行；参数保留兼容"
+                           "旧脚本）")
     prpt.add_argument("--data-root", default=None)
     prpt.add_argument("--ledger", default=None)
     prpt.set_defaults(func=cmd_prob_round_report)
@@ -3415,6 +3832,13 @@ def build_parser() -> argparse.ArgumentParser:
                        "discovery 卡会被分界校验拦截）")
     p_fit.add_argument("--spread-fraction", type=float, default=0.1)
     p_fit.add_argument("--commission", type=float, default=0.0)
+    p_fit.add_argument("--actor", default="bt-fit",
+                       help="台账 actor 字段（P-05：fit 准入链同 screen/gate）")
+    p_fit.add_argument("--specimen", action="store_true",
+                       help="标定样品卡（status=specimen，T61/D30）的运行开关")
+    p_fit.add_argument("--ledger", default=None,
+                       help="台账路径（P-05：准入链/指纹绑定需要；缺省按"
+                            "数据根解析）")
     p_fit.set_defaults(func=cmd_fit)
 
     p_seg = sub.add_parser("segment", help="P 线发现段/验证段分界（T76/D50）")
