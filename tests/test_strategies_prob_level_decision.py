@@ -459,3 +459,203 @@ def test_e4_no_cost_key_excluded_from_decision():
     nz = np.flatnonzero(sig != 0)
     assert len(nz) == DemoSmallGrid.HORIZON_BARS
     assert sig[nz[0]] == 1              # 只剩 S1 支撑的 A3 多头
+
+
+# ------------------------------------------------- P-07（模块乙）：获准动作
+# 白名单、exit_rules 子类重建、单品种绑定与 with_model 配置核对
+
+
+class OnlyA3(DemoSmallGrid):
+    """P-07 测试：仅 A3 获准。"""
+
+    ALLOWED_HYPOTHESES = ("A3",)
+
+
+class AllAllowed(DemoSmallGrid):
+    """P-07 测试：显式空白名单 = 全部 A1–A4 照常（兼容缺省）。"""
+
+    ALLOWED_HYPOTHESES = ()
+
+
+def _two_action_model():
+    """A1 过门槛（EV≈+0.19 ≥ 2×0.02）、A3 不过（EV≈+0.70 < 2×0.5）。"""
+    rows_a3 = [("win", 1.9)] * 500 + [("loss", -1.05)] * 500
+    rows_a1 = [("win", 1.9)] * 420 + [("loss", -1.05)] * 580
+    labels = pd.DataFrame({
+        "situation": ["S1"] * (len(rows_a3) + len(rows_a1)),
+        "action": ["A3"] * len(rows_a3) + ["A1"] * len(rows_a1),
+        "outcome": [o for o, _ in rows_a3 + rows_a1],
+        "net_r": [r for _, r in rows_a3 + rows_a1],
+        "trend_sma200": "na", "atr_pct_2000": "na"})
+    tbl = ProbTable.fit(labels, group_by=["trend_sma200", "atr_pct_2000"],
+                        prior_strength=100, min_cell=100)
+    return {"prob_version": "1.0.0", "prob_table": tbl.to_dict(),
+            "bracket": {"sl_atr": 1.0, "tp_atr": 2.0, "horizon_bars": 8},
+            "cost_r_by_situation_action": {"S1|A3": 0.5, "S1|A1": 0.02}}
+
+
+def _two_action_bars():
+    """bar 40 A3（100 阻力、收盘 99.0 未站上 → 做空）；bar 41 收盘 100.3
+    突破 100+0.25×ATR → A1 做多（同 test_d2_choose 的构造）。"""
+    rows = ([(98.5, 99.0, 98.0, 98.5)] * 40 + [(99.5, 99.9, 99.0, 99.0)]
+            + [(99.6, 100.4, 99.5, 100.3)]
+            + [(98.5, 99.0, 98.0, 98.5)] * 30)
+    bars = pd.DataFrame(rows, columns=["open", "high", "low", "close"])
+    bars.insert(0, "time",
+                pd.date_range("2024-01-02", periods=len(rows), freq="1h"))
+    bars["tick_volume"], bars["spread"], bars["real_volume"] = 10, 5, 0
+    return bars[_COLUMNS]
+
+
+def test_p07_whitelist_blocks_higher_ev_a1():
+    """P-07：仅 A3 获准但 A1 EV 更高且过门槛 → 不交易 A1（generate_signals
+    候选收集过滤）；空白名单 → A1 照常（兼容）。"""
+    model = _two_action_model()
+    bars = _two_action_bars()
+    sig = OnlyA3().with_model(model).generate_signals(bars, {}).to_numpy()
+    assert (sig == 0).all()
+    # 对照：()=全部允许 → A1 入场（既有 D2 行为不变）
+    sig2 = AllAllowed().with_model(model).generate_signals(
+        bars, {}).to_numpy()
+    assert sig2[41] == 1, sig2[38:46]
+
+
+def test_p07_whitelisted_action_still_trades():
+    """P-07：白名单内的 A3 照常入场（过滤不是全灭）。"""
+    rows = [(98.5, 99.0, 98.0, 98.5)] * 40
+    rows.append((99.5, 99.9, 99.0, 99.0))     # 40：A3 空头触发
+    rows += [(98.5, 99.0, 98.0, 98.5)] * 30
+    bars = pd.DataFrame(rows, columns=["open", "high", "low", "close"])
+    bars.insert(0, "time",
+                pd.date_range("2024-01-02", periods=len(rows), freq="1h"))
+    bars["tick_volume"], bars["spread"], bars["real_volume"] = 10, 5, 0
+    sig = OnlyA3().with_model(_strong_model()).generate_signals(
+        bars[_COLUMNS], {}).to_numpy()
+    nz = np.flatnonzero(sig != 0)
+    assert len(nz) == DemoSmallGrid.HORIZON_BARS
+    assert sig[40] == -1                       # A3（阻力反转）做空
+
+
+def _model_actions(model) -> set:
+    t = model["prob_table"]
+    acts = set(t["base_rates"])
+    acts |= {p["action"] for p in t["parents"]}
+    acts |= {c["action"] for c in t["cells"]}
+    return acts
+
+
+def test_p07_fit_filters_labels_and_costs_to_whitelist(fitted):
+    """P-07：fit 的标签循环双重过滤——白名单外动作不进概率表与成本表。"""
+    bars, m_base = fitted
+    meta = {"__fit__": {"sizes": {"XAUUSD": 100.0},
+                        "policies": {"XAUUSD": PERMISSIVE}}}
+    kw = dict(train_end=pd.Timestamp("2020-06-01"), purge_bars=10)
+    m_a3 = OnlyA3().fit({"XAUUSD": bars}, {"XAUUSD": FlatCosts()}, meta, **kw)
+    assert _model_actions(m_a3) <= {"A3"}
+    assert set(m_a3["cost_r_by_situation_action"]) == {"S1|A3"}
+    # 过滤确实生效：同一数据未过滤时本就有其他动作样本
+    assert _model_actions(m_base) - {"A3"}
+    # 空白名单 = 不过滤（模型逐位一致）
+    m_all = AllAllowed().fit({"XAUUSD": bars}, {"XAUUSD": FlatCosts()},
+                             meta, **kw)
+    assert m_all == m_base
+
+
+def test_p07_subclass_sl_tp_rebuilds_exit_rules():
+    """P-07：子类覆写 SL/TP 后 exit_rules 按最终常量重建（不再停在基类
+    类体求值的 1.0/2.0）；常量未变的既有类不受影响。"""
+    class WideBracket(DemoSmallGrid):
+        SL_ATR = 2.0
+        TP_ATR = 3.0
+
+    assert WideBracket.exit_rules.stop_loss_atr == 2.0
+    assert WideBracket.exit_rules.take_profit_atr == 3.0
+    assert WideBracket.exit_rules.reentry == "after_signal_change"
+    assert WideBracket.exit_rules.time_stop_bars is None
+    assert WideBracket.exit_rules.week_close_exit is False
+    assert DemoSmallGrid.exit_rules.stop_loss_atr == 1.0
+    assert LevelDecisionS1Demo.exit_rules.take_profit_atr == 2.0
+    assert LevelDecisionV1.exit_rules.stop_loss_atr == 1.0
+
+
+def test_p07_wide_bracket_labels_and_backtest_agree():
+    """P-07：SL=2.0/TP=3.0 子类的标签 bracket 与引擎止损价都按子类常量
+    执行（标签与回测同口径）。"""
+    class WideBracket(DemoSmallGrid):
+        SL_ATR = 2.0
+        TP_ATR = 3.0
+
+    bars = synth_bars(3000, seed=7)
+    meta = {"__fit__": {"sizes": {"XAUUSD": 100.0},
+                        "policies": {"XAUUSD": PERMISSIVE}}}
+    model = WideBracket().fit({"XAUUSD": bars}, {"XAUUSD": FlatCosts()},
+                              meta, train_end=pd.Timestamp("2020-02-01"),
+                              purge_bars=10)
+    assert model["bracket"] == {"sl_atr": 2.0, "tp_atr": 3.0,
+                                "horizon_bars": 8}
+    # 引擎：anchor(40) A3 做空 → 41 开盘入场、当根 high 穿 2×ATR 止损
+    rows = [(98.5, 99.0, 98.0, 98.5)] * 40
+    rows.append((99.5, 99.9, 99.0, 99.0))          # 40：A3 空头触发
+    rows.append((99.5, 102.0, 99.4, 99.8))         # 41：开盘入、盘中穿止损
+    rows += [(98.5, 99.0, 98.0, 98.5)] * 30
+    bars2 = pd.DataFrame(rows, columns=["open", "high", "low", "close"])
+    bars2.insert(0, "time",
+                 pd.date_range("2024-01-02", periods=len(rows), freq="1h"))
+    bars2["tick_volume"], bars2["spread"], bars2["real_volume"] = 10, 5, 0
+    bars2 = bars2[_COLUMNS]
+    wide_model = dict(_strong_model(),
+                      bracket={"sl_atr": 2.0, "tp_atr": 3.0,
+                               "horizon_bars": 8})
+    strat = WideBracket().with_model(wide_model)    # bracket 一致才装得进
+    res = run_backtest(strat, bars2, FlatCosts(), symbol="XAUUSD", params={},
+                       contract_size=100.0, timeframe="H1", volume_lots=1.0)
+    stops = res.trades[res.trades["exit_reason"] == "stop"]
+    assert len(stops) == 1, res.trades
+    t = stops.iloc[0]
+    entry_atr = float(atr_series(bars2).to_numpy()[40])   # 信号 bar 的 ATR
+    # 空头止损成交价 = sl + slip（_close：bid 基准 sl−spr 再加回 spr+slip）
+    assert t["exit_price"] == pytest.approx(
+        t["entry_price"] + 2.0 * entry_atr + 0.01)
+    # 区别于 SL=1.0 的口径（确认 2.0 生效而非碰巧）
+    assert abs(t["exit_price"]
+               - (t["entry_price"] + 1.0 * entry_atr + 0.01)) > 0.5
+
+
+def test_p07_with_model_rejects_config_mismatch():
+    """P-07：with_model 核对模型 symbols/timeframe/bracket 与类常量一致
+    （模型里的值若存在且不匹配 → ValueError；缺省字段跳过）。"""
+    good = _strong_model()
+    DemoSmallGrid().with_model(good)              # 缺省字段不视为不匹配
+    DemoSmallGrid().with_model(dict(good, symbols=["XAUUSD"],
+                                    timeframe="H1"))   # 一致 → 不抛
+    with pytest.raises(ValueError, match="bracket"):
+        DemoSmallGrid().with_model(
+            dict(good, bracket={"sl_atr": 1.5, "tp_atr": 2.0,
+                                "horizon_bars": 8}))
+    with pytest.raises(ValueError, match="symbols"):
+        DemoSmallGrid().with_model(dict(good, symbols=["EURUSD"]))
+    with pytest.raises(ValueError, match="timeframe"):
+        DemoSmallGrid().with_model(dict(good, timeframe="M15"))
+
+
+def test_p07_multi_symbol_class_rejected():
+    """P-07：SYMBOLS 多品种 → fit/generate_signals 入口拒绝（单品种实例
+    绑定——generate_signals 只按 SYMBOLS[0] 的网格评估）。"""
+    class MultiSym(DemoSmallGrid):
+        SYMBOLS = ("XAUUSD", "EURUSD")
+
+    bars = synth_bars(3000, seed=5)
+    meta = {"__fit__": {"sizes": {"XAUUSD": 100.0},
+                        "policies": {"XAUUSD": PERMISSIVE}}}
+    with pytest.raises(ValueError, match="单品种"):
+        MultiSym().fit({"XAUUSD": bars}, {"XAUUSD": FlatCosts()}, meta,
+                       train_end=pd.Timestamp("2020-02-01"), purge_bars=10)
+    with pytest.raises(ValueError, match="单品种"):
+        MultiSym().with_model(_strong_model()).generate_signals(bars, {})
+
+
+def test_p07_unknown_hypothesis_rejected_at_definition():
+    """P-07：白名单含未知动作 → 类定义即抛（防手误静默禁掉全部动作）。"""
+    with pytest.raises(ValueError, match="ALLOWED_HYPOTHESES"):
+        class TypoAllowed(DemoSmallGrid):
+            ALLOWED_HYPOTHESES = ("a3",)

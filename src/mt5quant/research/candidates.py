@@ -1267,6 +1267,13 @@ _MEASURED_ANCHORS = ((0.02, 4000.0), (0.03, 2000.0), (0.05, 1000.0))
 def measured_n_required(n_hyp: int, dp: float) -> tuple[int | None, bool]:
     """T75 实测样本量规则（单位=触发日数）→ (n_required, open_ended)。
 
+    **P-03 注记（T98 审计 2026-10-29）**：锚点含义 = **名义**触发日数
+    ——旧 T75 标定因抽样单位偏差需重审（有放回**按日抽样**后再按日聚合，
+    名义 n 并非独立的实际触发日数——日聚合把同日多触发/重复抽样坍缩，
+    实际有效日数小于名义 n）；本批**不改数值/插值逻辑**（codex 确认
+    符合 T76 计划口径），以 `delta_p_test` 的 n_days_real/n_days_null
+    为记录与锚点解释口径，重标定属下一批准点。
+
     - n_required=None：dp < 0.02 未测出——该假设**恒 waiting_data**，
       不随触发日数增加改变（调用方见 None 即判不过，不与解析取 max）；
     - open_ended=True（0.02 ≤ dp ≤ 0.03）：判 pass 需 days **>** n_required

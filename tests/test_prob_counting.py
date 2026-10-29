@@ -34,6 +34,26 @@ def s1_bars():
     return make_bars(rows)
 
 
+def s1_bars_gap_after(hole_after, jump_days=31):
+    """同 s1_bars 形态，但 index hole_after→hole_after+1 的时间轴跳
+    jump_days 天（>30 天 → gap）。"""
+    from mt5data.store import _COLUMNS
+    rows = s1_bars().drop(columns=["time"])
+    times = [x if i <= hole_after else x + pd.Timedelta(days=jump_days)
+             for i, x in enumerate(
+                 pd.date_range("2026-03-02", periods=len(rows), freq="1h"))]
+    df = rows.copy()
+    df.insert(0, "time", pd.DatetimeIndex(pd.to_datetime(times)))
+    return df[_COLUMNS]
+
+
+def _count(bars, **over):
+    kw = dict(symbol="XAUUSD", situation="S1", approach=APPROACH,
+              action_params=PARAMS, grid_step=50.0)
+    kw.update(over)
+    return counting.count_triggers(bars, **kw)
+
+
 def test_count_output_has_no_outcome_columns():
     bars = s1_bars()
     out = counting.count_triggers(bars, symbol="XAUUSD", situation="S1",
@@ -102,3 +122,36 @@ def test_triggers_before_filters_by_split():
     assert (pd.to_datetime(disc["time"]) < split).all()
     # 全在分界前 → 全保留
     assert len(counting.triggers_before(out, pd.Timestamp("2026-04-01"))) == len(out)
+
+
+# ------------------------------------------------- P-09 共同可用集合（T98）
+
+class TestCountTriggerEligibility:
+    """count_triggers 经 gaps.eligibility_mask 过滤（可选三元组：预热/
+    持有/洞宽；缺省不启用，行为不变）。"""
+
+    def test_default_kwargs_keep_behavior(self):
+        bars = s1_bars_gap_after(30)
+        plain = _count(bars)
+        assert {26, 28} <= set(plain["bar"].astype(int))
+        # 只给 gap_spans（旧行为路径）：洞在触发后、回看窗不跨 → 全保留
+        t = list(pd.to_datetime(bars["time"]))
+        assert _count(bars, gap_spans=[(t[30], t[31])]).equals(plain)
+
+    def test_feature_warmup_drops_early_triggers(self):
+        bars = s1_bars()
+        plain = _count(bars)
+        plain_bars = set(plain["bar"].astype(int))
+        assert {26, 28, 29} <= plain_bars            # A3@26、A1@28、A4@29
+        warm = _count(bars, feature_warmup=27)
+        assert set(warm["bar"].astype(int)) == plain_bars - {26}
+        assert len(_count(bars, feature_warmup=30)) == 0
+
+    def test_hold_window_crossing_gap_drops_trigger(self):
+        """洞 (t30,t31)：hold_bars=3 → A3@26 的持有窗 [26,29] 干净保留、
+        A1@28 的 [28,31] 跨洞剔除；hold_bars=5 → 两个都跨洞。"""
+        bars = s1_bars_gap_after(30)
+        t = list(pd.to_datetime(bars["time"]))
+        kw = dict(gap_spans=[(t[30], t[31])], feature_warmup=0)
+        assert set(_count(bars, hold_bars=3, **kw)["bar"].astype(int)) == {26}
+        assert len(_count(bars, hold_bars=5, **kw)) == 0

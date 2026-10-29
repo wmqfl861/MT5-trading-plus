@@ -125,6 +125,53 @@ def test_run_p1_card_deterministic_and_structured():
     assert row["n_triggers"] >= row["n_trigger_days"] >= 0
 
 
+def test_run_p1_card_reports_total_usable_skipped(monkeypatch):
+    """P-11：n_total/n_usable/n_skipped 三报（n_triggers=n_total 兼容别名）；
+    real/null 赢率与 n_trigger_days 排除 skipped（与 delta_p_test 同口径）。"""
+    bars = synth_bars(6000, seed=9)
+    card = fake_card()
+    rnd = fake_round()
+    calls = []
+    real_label = p1mod.label_triggers
+
+    def stub_labels(b, trig, costs, **kw):
+        times = pd.to_datetime(trig["time"])
+        calls.append(list(times))
+        # 按行位次交替：偶位 win、奇位 skipped——可成交的全是 win
+        outcomes = ["win" if k % 2 == 0 else "skipped"
+                    for k in range(len(trig))]
+        return pd.DataFrame({
+            "time": times.to_numpy(), "outcome": outcomes,
+            "net_r": [1.9 if o == "win" else 0.0 for o in outcomes]})
+
+    monkeypatch.setattr(p1mod, "label_triggers", stub_labels)
+    from mt5data.sessions import SessionPolicy
+    res = p1mod.run_p1_card(card, rnd, {"XAUUSD": bars},
+                            {"XAUUSD": FlatCosts()},
+                            sizes={"XAUUSD": 100.0},
+                            policy_by_symbol={"XAUUSD": SessionPolicy(
+                                exempt_symbols=frozenset({"XAUUSD"}))},
+                            sims=50)
+    row = res[0]
+    real_times = calls[0]                      # 每假设首调用 = 真实触发
+    n = len(real_times)
+    assert n >= 2
+    n_skipped = sum(1 for k in range(n) if k % 2 == 1)
+    n_usable = n - n_skipped
+    assert row["n_total"] == n
+    assert row["n_triggers"] == row["n_total"]       # 兼容别名
+    assert row["n_usable"] == n_usable
+    assert row["n_skipped"] == n_skipped
+    # 旧口径把 skipped 当非赢计入：会得 0.5；usable 同口径 → 全赢 1.0
+    assert row["real_win_rate"] == pytest.approx(1.0)
+    assert row["null_win_rate"] == pytest.approx(1.0)
+    # 触发日数按可成交行计（usable 行的去重日）
+    usable_days = len({t.date() for k, t in enumerate(real_times)
+                       if k % 2 == 0})
+    assert row["n_trigger_days"] == usable_days
+    assert row["delta_p"] == pytest.approx(0.0, abs=1e-12)
+
+
 def test_hypothesis_seed_deterministic():
     a = p1mod.hypothesis_seed("P001-v1", "S1:A1:follow>base")
     assert a == p1mod.hypothesis_seed("P001-v1", "S1:A1:follow>base")

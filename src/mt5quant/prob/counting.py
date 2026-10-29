@@ -11,7 +11,7 @@ from __future__ import annotations
 import pandas as pd
 
 from mt5quant.backtest.engine_a import atr_series
-from mt5quant.prob.gaps import suppression_mask
+from mt5quant.prob.gaps import eligibility_mask
 from mt5quant.strategies.library.prob.actions import (
     ActionParams, action_triggers,
 )
@@ -47,8 +47,9 @@ def level_rows_for_situation(bars: pd.DataFrame, situation: str, *,
 def count_triggers(bars: pd.DataFrame, *, symbol: str, situation: str,
                    approach: Approach, action_params: ActionParams,
                    grid_step: float | None = None,
-                   atr: pd.Series | None = None,
-                   gap_spans=None) -> pd.DataFrame:
+                   atr: pd.Series | None = None, gap_spans=None,
+                   feature_warmup: int | None = None, hold_bars: int = 0,
+                   max_gap_days: int = 30) -> pd.DataFrame:
     """数一个品种一个局面上的全部动作触发（不看结果）。
 
     返回列：time、situation、action、side、level、kind、anchor、bar、
@@ -57,6 +58,14 @@ def count_triggers(bars: pd.DataFrame, *, symbol: str, situation: str,
     gap_spans（T97 波次 2，可选）：合并研究序列的洞集合
     （mt5data.ext.merge.merged_research_series 的产出，缺省 None 行为
     不变）——回看窗跨洞的触发按先决 4 抑制（mt5quant.prob.gaps）。
+
+    P-09 共同可用集合（T98，可选三元组；都不给 → 行为与旧 gap_spans
+    抑制一致，仅 A2/A4 的局面窗改从 anchor 根起算——audit P-09）：
+    - feature_warmup：触发根须 ≥ 该值（缺省 None=不检查；2000 =
+      atr_pct_2000 的排名窗）；
+    - hold_bars：持有窗 [触发根, +hold_bars] 不跨洞（缺省 0=不检查）；
+    - max_gap_days：持有窗的洞宽阈值（缺省 30，与 merge 的 gap_spans
+      口径一致；回看窗按先决 4 用 gap_spans 原样）。
     """
     if atr is None:
         atr = atr_series(bars)
@@ -65,9 +74,12 @@ def count_triggers(bars: pd.DataFrame, *, symbol: str, situation: str,
     events = find_level_events(bars, levels, situation=situation,
                                approach=approach, atr=atr)
     trig = action_triggers(bars, events, params=action_params, atr=atr)
-    if gap_spans and len(trig):
-        keep = suppression_mask(trig["bar"], bars, gap_spans, situation,
-                                approach.lookback_bars)
+    if len(trig) and (gap_spans or feature_warmup is not None or hold_bars):
+        keep = eligibility_mask(
+            trig, bars, gap_spans or [], situation, approach.lookback_bars,
+            feature_warmup=(0 if feature_warmup is None
+                            else int(feature_warmup)),
+            hold_bars=int(hold_bars), max_gap_days=max_gap_days)
         trig = trig.iloc[[k for k, ok in enumerate(keep) if ok]]
     if len(trig) == 0:
         return trig.assign(symbol=symbol, ny_hour=pd.Series(dtype="int64"),

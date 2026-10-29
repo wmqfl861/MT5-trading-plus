@@ -37,6 +37,8 @@ import hashlib
 PROB_VERSION = "1.0.0"
 NY_TZ = "America/New_York"
 FEATURES = ("trend_sma200", "atr_pct_2000")
+# 动作全集（mt5quant.strategies.library.prob.actions；P-07 白名单的合法值）
+ALL_HYPOTHESES: tuple[str, ...] = ("A1", "A2", "A3", "A4")
 
 
 class ModelMissingError(RuntimeError):
@@ -52,7 +54,11 @@ class DecisionPolicy:
 
 
 class LevelDecisionV1(BaseStrategy):
-    """价位决策 v1 基类：子类以类常量绑定一张卡的检验配置。"""
+    """价位决策 v1 基类：子类以类常量绑定一张卡的检验配置。
+
+    P-07：ALLOWED_HYPOTHESES 白名单限定获准动作（空=全部）；SYMBOLS 须
+    单品种（网格/评估按 SYMBOLS[0] 绑定）；子类的 exit_rules 按其最终
+    SL_ATR/TP_ATR 重建（标签与出场同口径）。"""
 
     fittable = True
     # ---- 卡绑定常量（子类覆写） ----
@@ -73,9 +79,40 @@ class LevelDecisionV1(BaseStrategy):
     POLICY: DecisionPolicy = DecisionPolicy()
     SYMBOLS: tuple[str, ...] = ("XAUUSD",)
     TIMEFRAME: str = "H1"
+    # P-07 获准动作白名单：空元组 = 全部 A1–A4 允许（向后兼容）。fit 的
+    # 标签循环与 generate_signals 的候选收集**双重过滤**——白名单外的
+    # 动作既不进模型也不参与决策。
+    ALLOWED_HYPOTHESES: tuple[str, ...] = ()
 
     exit_rules = ExitRules(stop_loss_atr=SL_ATR, take_profit_atr=TP_ATR,
                            reentry="after_signal_change")
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        bad = [a for a in getattr(cls, "ALLOWED_HYPOTHESES", ())
+               if a not in ALL_HYPOTHESES]
+        if bad:
+            raise ValueError(
+                f"{cls.__name__}.ALLOWED_HYPOTHESES 含未知动作 {bad}——"
+                f"合法动作：{ALL_HYPOTHESES}（P-07）")
+        # P-07：上面类体里的 exit_rules 按基类常量（1.0/2.0）在类定义时
+        # 求值——子类覆写 SL_ATR/TP_ATR 后不再跟随（引擎出场与标签口径
+        # 脱节）。这里按最终类常量重建；子类链上任一层**显式**覆写
+        # exit_rules（与其自身 SL/TP 常量推导值不同）时尊重之。本 hook
+        # 写进各层 __dict__ 的重建值与其常量推导值恒相等，不会被误判。
+        mro = cls.__mro__
+        chain = mro[:mro.index(LevelDecisionV1)]
+
+        def _explicit_exit_rules(k) -> bool:
+            er = k.__dict__.get("exit_rules")
+            return er is not None and er != ExitRules(
+                stop_loss_atr=k.SL_ATR, take_profit_atr=k.TP_ATR,
+                reentry="after_signal_change")
+
+        if not any(_explicit_exit_rules(k) for k in chain):
+            cls.exit_rules = ExitRules(stop_loss_atr=cls.SL_ATR,
+                                       take_profit_atr=cls.TP_ATR,
+                                       reentry="after_signal_change")
 
     def __init__(self):
         self._table: ProbTable | None = None
@@ -86,6 +123,7 @@ class LevelDecisionV1(BaseStrategy):
 
     def fit(self, bars_by_symbol: dict, costs_by_symbol: dict, params: dict,
             *, train_end, purge_bars: int) -> dict:
+        self._require_single_symbol()
         # S5：成本在 fit 内局部累计（不改实例状态——同一实例重复拟合、
         # 多品种卡都不得崩或串窗）；S8：合约大小与禁入窗必给，不默认。
         meta = params.get("__fit__") or {}
@@ -175,6 +213,14 @@ class LevelDecisionV1(BaseStrategy):
             return pd.DataFrame(columns=["situation", "action", "outcome",
                                          "net_r", *FEATURES])
         triggers = pd.concat(rows, ignore_index=True)
+        # P-07 双重过滤（fit 侧）：只给白名单内的动作打标签、累计成本
+        allowed = self._allowed_hypotheses()
+        if allowed is not None:
+            triggers = triggers[triggers["action"].isin(allowed)] \
+                .reset_index(drop=True)
+            if not len(triggers):
+                return pd.DataFrame(columns=["situation", "action",
+                                             "outcome", "net_r", *FEATURES])
         triggers["ny_hour"] = (pd.to_datetime(triggers["time"])
                                .dt.tz_localize("UTC")
                                .dt.tz_convert(NY_TZ).dt.hour.astype("int64"))
@@ -215,9 +261,57 @@ class LevelDecisionV1(BaseStrategy):
 
     # ------------------------------------------------------------- 使用
 
+    def _require_single_symbol(self) -> None:
+        """P-07：单品种实例绑定——generate_signals 只按 SYMBOLS[0] 的网格
+        评估，SYMBOLS 声明多品种即拒绝（LEVEL_GRID 只需覆盖实际服务的
+        品种）。"""
+        syms = tuple(self.SYMBOLS)
+        if len(syms) != 1:
+            raise ValueError(
+                f"{type(self).__name__}.SYMBOLS={syms!r} 须恰一个品种——"
+                "单品种实例绑定：generate_signals 只按 SYMBOLS[0] 的网格"
+                "评估（P-07）")
+
+    def _allowed_hypotheses(self) -> frozenset[str] | None:
+        """P-07 白名单：None = 全部 A1–A4 允许（缺省兼容）。"""
+        hyp = tuple(self.ALLOWED_HYPOTHESES or ())
+        return frozenset(hyp) if hyp else None
+
+    def _check_model_config(self, model: dict) -> None:
+        """P-07：模型 dict 携带的 symbols/timeframe/bracket 若与类常量
+        不一致 → ValueError（模型装错卡/策略的防呆；缺省字段跳过）。"""
+        cls = type(self)
+        syms = model.get("symbols")
+        if syms is not None:
+            got = [str(s) for s in syms]
+            if got != sorted(str(s) for s in self.SYMBOLS):
+                raise ValueError(
+                    f"模型 symbols={got!r} 与 {cls.__name__}.SYMBOLS="
+                    f"{tuple(self.SYMBOLS)!r} 不一致——模型与策略类错配"
+                    "（P-07）")
+        tf = model.get("timeframe")
+        if tf is not None and str(tf) != self.TIMEFRAME:
+            raise ValueError(
+                f"模型 timeframe={tf!r} 与 {cls.__name__}.TIMEFRAME="
+                f"{self.TIMEFRAME!r} 不一致——模型与策略类错配（P-07）")
+        bracket = model.get("bracket")
+        if bracket is not None:
+            expect = {"sl_atr": self.SL_ATR, "tp_atr": self.TP_ATR,
+                      "horizon_bars": self.HORIZON_BARS}
+            if not isinstance(bracket, dict):
+                raise ValueError(
+                    f"模型 bracket 须为 dict：{bracket!r}（P-07）")
+            for k in ("sl_atr", "tp_atr", "horizon_bars"):
+                if k in bracket and bracket[k] != expect[k]:
+                    raise ValueError(
+                        f"模型 bracket.{k}={bracket[k]!r} 与 {cls.__name__}"
+                        f" 常量 {k}={expect[k]!r} 不一致——标签口径与出场"
+                        "规则脱节（P-07）")
+
     def with_model(self, model: dict) -> "LevelDecisionV1":
         if not isinstance(model, dict) or "prob_table" not in model:
             raise ValueError("模型缺 prob_table（附录 B 格式）")
+        self._check_model_config(model)
         new = type(self)()
         new._table = ProbTable.from_dict(model["prob_table"])
         new._model_meta = dict(model)
@@ -234,6 +328,7 @@ class LevelDecisionV1(BaseStrategy):
             raise ModelMissingError(
                 f"{type(self).__name__} 未装载冻结模型——先 fit（或 "
                 "with_model）再评估（铁律 21：拟合与使用分离）")
+        self._require_single_symbol()
         n = len(bars)
         sig = [0] * n
         atr = atr_series(bars)
@@ -243,6 +338,7 @@ class LevelDecisionV1(BaseStrategy):
         aparams = ActionParams(breakout_atr=self.BREAKOUT_ATR,
                                retest_window_bars=self.RETEST_WINDOW_BARS)
         sym = self.SYMBOLS[0]
+        allowed = self._allowed_hypotheses()
         # 触发索引：bar → [(situation, action, side)]
         trig_at: dict[int, list[tuple[str, str, int]]] = {}
         for sit in self.SITUATIONS:
@@ -255,6 +351,9 @@ class LevelDecisionV1(BaseStrategy):
                                        approach=self.APPROACH, atr=atr)
             for t in action_triggers(bars, events, params=aparams,
                                      atr=atr).itertuples(index=False):
+                # P-07 双重过滤（决策侧）：白名单外的动作不进候选
+                if allowed is not None and str(t.action) not in allowed:
+                    continue
                 trig_at.setdefault(int(t.bar), []).append(
                     (str(t.situation), str(t.action), int(t.side)))
         held_until = -1          # 持仓期间新触发忽略（信号层状态机）

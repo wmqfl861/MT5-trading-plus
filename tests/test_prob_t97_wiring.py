@@ -152,6 +152,148 @@ class TestMt5FirstTime:
         assert prob_gaps.mt5_first_time(tmp_path, "TEST", "H1") is None
 
 
+# ================================================================ P-09 共同可用集合
+
+class TestEligibilityMask:
+    """T98 audit P-09：S1/S3 回看窗（A2/A4 从 anchor 根起算）+ 特征预热
+    + 持有窗——counting 与 p1 共用的合格判定。"""
+
+    def trig(self, rows, times):
+        return pd.DataFrame(
+            [{"action": a, "anchor": anc, "bar": b, "time": times[b]}
+             for a, anc, b in rows])
+
+    def test_a2_window_starts_at_anchor_not_action_bar(self):
+        """洞在 anchor 之前（t15,t16）：A2（anchor=18、bar=24）的局面窗须
+        从 anchor 起 [12,18] → 跨洞 → 不合格；同一位置改 A1 → 窗从触发根
+        起 [18,24] → 合格（audit P-09：从 action bar 回看会漏掉 anchor 前
+        窗口）。anchor 列缺失时 A2 也退回触发根。"""
+        bars = make_bars_rows([PLAT] * 30, hourly(30))
+        t = list(pd.to_datetime(bars["time"]))
+        gaps = [(t[15], t[16])]
+        trig = self.trig([("A2", 18, 24), ("A1", 18, 24)], t)
+        keep = prob_gaps.eligibility_mask(
+            trig, bars, gaps, "S1", approach_lookback=6, feature_warmup=0)
+        assert keep == [False, True]
+        keep2 = prob_gaps.eligibility_mask(
+            trig.drop(columns=["anchor"]), bars, gaps, "S1",
+            approach_lookback=6, feature_warmup=0)
+        assert keep2 == [True, True]       # anchor 缺失 → 触发根（旧行为）
+
+    def test_feature_warmup_default_2000(self):
+        bars = make_bars_rows([PLAT] * 2100, hourly(2100))
+        t = list(pd.to_datetime(bars["time"]))
+        trig = self.trig([("A3", 1999, 1999), ("A3", 2000, 2000)], t)
+        keep = prob_gaps.eligibility_mask(
+            trig, bars, [], "S1", approach_lookback=6)
+        assert keep == [False, True]       # 触发根 ≥ 2000 才合格（缺省）
+
+    def test_hold_window_crossing_gap_ineligible(self):
+        """洞在触发后（t30,t31）：hold_bars=5 → A3@26 持有窗 [26,31] 跨洞
+        → 不合格；hold_bars=3 → [26,29] 合格、A1@28 的 [28,31] 仍跨洞。"""
+        times = [x if i <= 30 else x + pd.Timedelta(days=31)
+                 for i, x in enumerate(hourly(33))]
+        bars = make_bars_rows([PLAT] * 33, times)
+        t = list(pd.to_datetime(bars["time"]))
+        gaps = [(t[30], t[31])]
+        trig = self.trig([("A3", 26, 26), ("A1", 26, 28)], t)
+        kw = dict(gap_spans=gaps, situation="S1", approach_lookback=6,
+                  feature_warmup=0)
+        assert prob_gaps.eligibility_mask(trig, bars, hold_bars=5, **kw) \
+            == [False, False]
+        assert prob_gaps.eligibility_mask(trig, bars, hold_bars=3, **kw) \
+            == [True, False]
+
+    def test_max_gap_days_threshold_applies_to_hold_window(self):
+        """持有窗的洞宽阈值（P-09）：40 天洞落在 A3@26 的持有窗 [26,32]
+        内——max_gap_days=30（缺省）算洞 → 不合格；45 不算 → 合格；不查
+        持有窗（hold_bars=0）且洞不在回看窗内 → 合格（回看窗用
+        gap_spans 原样，先决 4 口径）。"""
+        times = [x if i <= 30 else x + pd.Timedelta(days=40)
+                 for i, x in enumerate(hourly(33))]
+        bars = make_bars_rows([PLAT] * 33, times)
+        t = list(pd.to_datetime(bars["time"]))
+        gaps = [(t[30], t[31])]
+        trig = self.trig([("A3", 26, 26)], t)     # S1 回看窗 [20,26] 无洞
+        kw = dict(situation="S1", approach_lookback=6, feature_warmup=0,
+                  hold_bars=6)
+        assert prob_gaps.eligibility_mask(trig, bars, gaps,
+                                          max_gap_days=30, **kw) == [False]
+        assert prob_gaps.eligibility_mask(trig, bars, gaps,
+                                          max_gap_days=45, **kw) == [True]
+        assert prob_gaps.eligibility_mask(
+            trig, bars, gaps, situation="S1", approach_lookback=6,
+            feature_warmup=0) == [True]
+
+    def test_s3_window_uses_s3_bars(self):
+        times = [x if i <= 100 else x + pd.Timedelta(days=31)
+                 for i, x in enumerate(hourly(600))]
+        bars = make_bars_rows([PLAT] * 600, times)
+        t = list(pd.to_datetime(bars["time"]))
+        gaps = [(t[100], t[101])]
+        trig = self.trig([("A3", 500, 500)], t)
+        assert prob_gaps.eligibility_mask(
+            trig, bars, gaps, "S3", approach_lookback=6,
+            feature_warmup=0) == [False]          # 窗 [20,500] 跨洞
+        assert prob_gaps.eligibility_mask(
+            trig, bars, gaps, "S3", approach_lookback=6, s3_bars=50,
+            feature_warmup=0) == [True]           # 窗 [450,500] 干净
+
+    def test_s2_batch_matches_situation_window_start(self):
+        """eligibility 的 S2 批量窗首与 situation_window_start 逐位一致
+        （O(n) 预计算；逐 bar 调后者是 O(n²)）。"""
+        bars = make_bars_rows([PLAT] * 120, hourly(120))
+        starts = prob_gaps._s2_prev_session_starts(bars)
+        for i in (0, 5, 40, 46, 82, 119):
+            assert starts[i] == prob_gaps.situation_window_start(
+                i, "S2", bars, 24)
+
+    def test_unknown_situation_raises(self):
+        bars = make_bars_rows([PLAT] * 10, hourly(10))
+        trig = pd.DataFrame([{"action": "A3", "anchor": 5, "bar": 5}])
+        with pytest.raises(ValueError, match="局面"):
+            prob_gaps.eligibility_mask(trig, bars, [], "S9",
+                                       approach_lookback=6, feature_warmup=0)
+
+    def test_empty_triggers_returns_empty(self):
+        bars = make_bars_rows([PLAT] * 10, hourly(10))
+        empty = pd.DataFrame(columns=["action", "anchor", "bar"])
+        assert prob_gaps.eligibility_mask(
+            empty, bars, [], "S1", approach_lookback=6) == []
+
+
+class TestMt5FirstTimeFromTags:
+    """P-09：era 边界消费 merge 实测的 source_tags（不信水位）。"""
+
+    def test_prefers_merge_source_tags_over_meta(self, tmp_path):
+        root = root_with_meta(tmp_path, first="2099-01-01T00:00:00")
+        bars = make_bars_rows([PLAT] * 4, hourly(4))
+        tags = ["ext:histdata:2010", "ext:histdata:2010", "mt5", "mt5"]
+        got = prob_gaps.mt5_first_time(root, "TEST", "H1", bars=bars,
+                                       source_tags=tags)
+        assert got == pd.to_datetime(bars["time"]).iloc[2]
+
+    def test_all_ext_tags_returns_none(self, tmp_path):
+        root = root_with_meta(tmp_path, first="2015-01-01T00:00:00")
+        bars = make_bars_rows([PLAT] * 3, hourly(3))
+        got = prob_gaps.mt5_first_time(
+            root, "TEST", "H1", bars=bars,
+            source_tags=["ext:histdata:2010"] * 3)
+        assert got is None    # era 边界不可得——声明情景倍数的调用方须拒绝
+
+    def test_length_mismatch_rejects(self, tmp_path):
+        root = root_with_meta(tmp_path, first=None)
+        bars = make_bars_rows([PLAT] * 4, hourly(4))
+        with pytest.raises(ValueError, match="等长"):
+            prob_gaps.mt5_first_time(root, "TEST", "H1", bars=bars,
+                                     source_tags=["mt5"])
+
+    def test_tags_without_bars_rejects(self, tmp_path):
+        with pytest.raises(ValueError, match="bars"):
+            prob_gaps.mt5_first_time(root_with_meta(tmp_path), "TEST", "H1",
+                                     source_tags=["mt5"])
+
+
 # ================================================================ ScenarioCosts
 
 class RecordingCosts:
@@ -420,7 +562,8 @@ def fake_round(split="2026-03-20"):
 
 
 class TestRunP1CardEraSplit:
-    def _run(self, monkeypatch, card, bars, gap_spans=None):
+    def _run(self, monkeypatch, card, bars, gap_spans=None,
+             feature_warmup=0):
         from mt5data.sessions import SessionPolicy
         costs = FlatLabelCosts()
         seen = []
@@ -444,6 +587,7 @@ class TestRunP1CardEraSplit:
             policy_by_symbol={"XAUUSD": SessionPolicy(
                 exempt_symbols=frozenset({"XAUUSD"}))},
             sims=50, mt5_first_by_symbol={"XAUUSD": mt5_first},
+            feature_warmup=feature_warmup,
             gap_spans_by_symbol=({"XAUUSD": gap_spans}
                                  if gap_spans is not None else None))
         return res, seen, costs, times
@@ -493,6 +637,122 @@ class TestRunP1CardEraSplit:
         assert not any(s["is_scenario"] for s in seen)
 
 
+class TestRunP1CardEligibility:
+    """P-09：run_p1_card 的共同可用集合——真实触发过滤 + 随机对照从同一
+    合格集合抽样 + era 边界不可得时拒绝。"""
+
+    def _run(self, monkeypatch, card, bars, **over):
+        from mt5data.sessions import SessionPolicy
+        kw = dict(sizes={"XAUUSD": 100.0},
+                  policy_by_symbol={"XAUUSD": SessionPolicy(
+                      exempt_symbols=frozenset({"XAUUSD"}))},
+                  sims=50)
+        kw.update(over)
+        return p1mod.run_p1_card(
+            card, fake_round(), {"XAUUSD": bars},
+            {"XAUUSD": FlatLabelCosts()}, **kw)
+
+    def test_randomize_receives_eligible_bars(self, monkeypatch):
+        """run_p1_card 显式把合格 bar 集传给 randomize_triggers（P-09）：
+        无洞、预热 0 → 全序列合格；有预热 → 池从预热根起（真实触发同
+        口径过滤——A1@28 ≥ 27 仍在）。"""
+        import numpy as np
+        captured = []
+        real_rnd = p1mod.randomize_triggers
+
+        def spy(trig, bars, *, seed, **kw):
+            captured.append(kw.get("eligible_bars"))
+            return real_rnd(trig, bars, seed=seed, **kw)
+
+        monkeypatch.setattr(p1mod, "randomize_triggers", spy)
+        card = fake_card(hypotheses=("S1:A1:follow>base",))
+        bars = make_bars_rows(s1_pattern_rows(), hourly(33))
+        self._run(monkeypatch, card, bars, feature_warmup=0)
+        assert captured and captured[0] is not None
+        pool = np.asarray(captured[0]).astype(int)
+        assert set(pool.tolist()) == set(range(len(bars)))   # 预热 0 无洞
+        assert {26, 28} <= set(pool.tolist())                # 触发自身在池
+        captured.clear()
+        self._run(monkeypatch, card, bars, feature_warmup=27)
+        assert set(np.asarray(captured[0]).astype(int).tolist()) \
+            == set(range(27, len(bars)))
+
+    def test_feature_warmup_filters_real_triggers(self, monkeypatch):
+        """缺省预热 2000（atr_pct_2000 排名窗）：63 根合成序列的触发全部
+        被剔（真实与随机两侧一致地无触发）；预热 0 → A3@26 进标签
+        （序列补长到 63 根——horizon 24 从 26 起要完整可观察）。"""
+        seen = []
+        real = p1mod.label_triggers
+
+        def spy(b, trig, c, **kw):
+            seen.extend(pd.to_datetime(trig["time"]))
+            return real(b, trig, c, **kw)
+
+        monkeypatch.setattr(p1mod, "label_triggers", spy)
+        card = fake_card(hypotheses=("S1:A3:fade>base",))
+        bars = make_bars_rows(s1_pattern_rows() + [PLAT] * 30, hourly(63))
+        times = list(pd.to_datetime(bars["time"]))
+        res = self._run(monkeypatch, card, bars)     # 不传 → 缺省 2000
+        assert seen == []
+        assert res[0]["n_total"] == 0 and res[0]["n_triggers"] == 0
+        seen.clear()
+        res = self._run(monkeypatch, card, bars, feature_warmup=0)
+        assert times[26] in seen                     # A3@26（本假设）进标签
+        assert res[0]["n_total"] >= 1
+
+    def test_cost_scenario_without_mt5_first_raises(self, monkeypatch):
+        """卡声明 cost_scenario_mult 而 era 边界不可得 → ValueError
+        （P-09：不静默按 1× 计 ext 段）。"""
+        card = fake_card(hypotheses=("S1:A3:fade>base",),
+                         cost_scenario_mult=(1.0, 1.5))
+        bars = make_bars_rows(s1_pattern_rows(), hourly(33))
+        with pytest.raises(ValueError, match="era"):
+            self._run(monkeypatch, card, bars, feature_warmup=0,
+                      mt5_first_by_symbol=None)
+        with pytest.raises(ValueError, match="era"):
+            self._run(monkeypatch, card, bars, feature_warmup=0,
+                      mt5_first_by_symbol={})
+        # NaT 同样视为不可得
+        with pytest.raises(ValueError, match="era"):
+            self._run(monkeypatch, card, bars, feature_warmup=0,
+                      mt5_first_by_symbol={"XAUUSD": pd.NaT})
+
+    def test_cost_scenario_with_boundary_runs(self, monkeypatch):
+        """边界可得（merge 实测口径）→ 正常分 era，不抛。"""
+        card = fake_card(hypotheses=("S1:A3:fade>base",),
+                         cost_scenario_mult=(1.0, 1.5))
+        bars = make_bars_rows(s1_pattern_rows(), hourly(33))
+        mt5_first = pd.to_datetime(bars["time"]).iloc[27]
+        res = self._run(monkeypatch, card, bars, feature_warmup=0,
+                        mt5_first_by_symbol={"XAUUSD": mt5_first})
+        assert {r["hypothesis"] for r in res} == {"S1:A3:fade>base"}
+
+
+class TestCardTriggersEligibility:
+    def test_feature_warmup_and_hold_passed_through(self):
+        """card_triggers 的 P-09 三元组（预热/持有/洞宽）逐层透传。"""
+        card = fake_card()
+        bars = make_bars_rows(s1_pattern_rows(), hourly(33))
+        plain = p1mod.card_triggers(card, {"XAUUSD": bars}, approach=APPROACH,
+                                    action_params=PARAMS)
+        plain_bars = set(plain["bar"].astype(int))
+        assert {26, 28, 29} <= plain_bars           # A3@26、A1@28、A4@29
+        warm = p1mod.card_triggers(card, {"XAUUSD": bars}, approach=APPROACH,
+                                   action_params=PARAMS, feature_warmup=27)
+        assert set(warm["bar"].astype(int)) == plain_bars - {26}
+        # 持有窗跨洞：洞 (t30,t31)，hold 5 → 全部触发的持有窗都跨洞
+        times = [x if i <= 30 else x + pd.Timedelta(days=31)
+                 for i, x in enumerate(hourly(33))]
+        holed = make_bars_rows(s1_pattern_rows(), times)
+        t = list(pd.to_datetime(holed["time"]))
+        kept = p1mod.card_triggers(card, {"XAUUSD": holed}, approach=APPROACH,
+                                   action_params=PARAMS, feature_warmup=0,
+                                   hold_bars=5,
+                                   gap_spans_by_symbol={"XAUUSD": [(t[30],
+                                                                   t[31])]})
+        assert len(kept) == 0
+
+
 # ================================================================ 取数换源
 
 class TestBtLoadPath:
@@ -502,14 +762,15 @@ class TestBtLoadPath:
     def _patch_loaders(self, monkeypatch):
         import mt5data.ext.merge as merge_mod
         synth = self._plain_bars()
-        calls = {"load_series": 0, "merged": 0}
+        calls = {"load_series": 0, "merged": 0, "merged_end": None}
 
         def fake_load_series(*a, **k):
             calls["load_series"] += 1
             return synth
 
-        def fake_merged(root, sym, tf):
+        def fake_merged(root, sym, tf, *, end=None):
             calls["merged"] += 1
+            calls["merged_end"] = end
             return synth, ["mt5"] * len(synth), [], []
 
         monkeypatch.setattr(BT, "load_series", fake_load_series)
@@ -523,7 +784,7 @@ class TestBtLoadPath:
         c = cand.validate_candidate(prob_data(), source="t")
         BT._candidate_check_prob(args, c, root_with_meta(tmp_path, first=None),
                                  FlatCosts(), set())
-        assert calls == {"load_series": 1, "merged": 0}
+        assert calls["load_series"] == 1 and calls["merged"] == 0
 
     def test_candidate_check_prob_new_keys_use_merged(self, tmp_path,
                                                       monkeypatch):
@@ -534,7 +795,7 @@ class TestBtLoadPath:
         c = cand.validate_candidate(data, source="t")
         BT._candidate_check_prob(args, c, root_with_meta(tmp_path, first=None),
                                  FlatCosts(), set())
-        assert calls == {"load_series": 0, "merged": 1}
+        assert calls["load_series"] == 0 and calls["merged"] == 1
 
     def test_merged_gate_helper(self):
         assert BT._prob_use_merged({}) is False
@@ -557,12 +818,22 @@ class TestBtLoadPath:
                                         use_merged=True)
         # 无洞的合并序列：gap_spans 空表归一为 None（不过滤）
         assert gaps is None and len(bars) == 40
-        assert calls == {"load_series": 1, "merged": 1}
+        assert calls["load_series"] == 1 and calls["merged"] == 1
+        assert calls["merged_end"] is None
+
+    def test_prob_load_bars_merged_forwards_end(self, tmp_path, monkeypatch):
+        """T98/P-01：use_merged=True 时 end 不再被丢弃——原样传给
+        merged_research_series（合并上界取最严由 merge 侧负责）。"""
+        calls = self._patch_loaders(monkeypatch)
+        end = pd.Timestamp("2020-06-01T00:00:00")
+        BT._prob_load_bars(tmp_path, "TEST", "H1", use_merged=True, end=end)
+        assert calls["load_series"] == 0 and calls["merged"] == 1
+        assert calls["merged_end"] == end
 
     def test_prob_load_bars_empty_merged_raises(self, tmp_path, monkeypatch):
         import mt5data.ext.merge as merge_mod
         empty = make_bars_rows([], [])
         monkeypatch.setattr(merge_mod, "merged_research_series",
-                            lambda *a: (empty, [], [], []))
+                            lambda *a, **k: (empty, [], [], []))
         with pytest.raises(ValueError, match="无可用数据"):
             BT._prob_load_bars(tmp_path, "TEST", "H1", use_merged=True)

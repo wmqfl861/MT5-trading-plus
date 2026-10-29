@@ -243,3 +243,139 @@ def test_t75_missing_detection_rate_90pct():
         if delta_p_test(a, b, sims=400, seed=rep)["p_value"] < 0.05:
             det += 1
     assert det / reps > 0.9, det
+
+
+# ------------------------------------------------- P-09/P-11（T98 audit）
+
+def test_randomize_eligible_bars_restricts_pool():
+    """P-09：eligible_bars 限定抽样池——随机时点只落在合格 bar 上；
+    布尔掩码与下标数组同一语义（同 seed 同结果）。"""
+    bars = synth_bars(3000, seed=4)
+    start = 100
+    trig = pd.DataFrame({
+        "time": bars["time"].iloc[start::50].iloc[:58],
+        "situation": "S1", "action": "A3", "side": 1, "level": 100.0})
+    idx_arr = np.arange(start, len(bars))
+    out_idx = randomize_triggers(trig, bars, seed=7, eligible_bars=idx_arr)
+    pos = pd.Index(bars["time"]).get_indexer(pd.to_datetime(out_idx["time"]))
+    assert (pos >= start).all()
+    mask = np.zeros(len(bars), dtype=bool)
+    mask[start:] = True
+    out_mask = randomize_triggers(trig, bars, seed=7, eligible_bars=mask)
+    pd.testing.assert_frame_equal(out_idx, out_mask)
+    # 下标无需有序/去重——语义仍是集合
+    shuffled = np.random.default_rng(1).permutation(idx_arr)
+    out_shuf = randomize_triggers(trig, bars, seed=7, eligible_bars=shuffled)
+    pd.testing.assert_frame_equal(out_idx, out_shuf)
+
+
+def test_randomize_eligible_bars_default_none_is_full_domain():
+    """缺省 None = 全域（行为逐位不变——探针 03 硬约束）。"""
+    bars = synth_bars(2000, seed=3)
+    trig = pd.DataFrame({"time": bars["time"].iloc[::40][:50],
+                         "situation": "S1", "action": "A3", "side": 1,
+                         "level": 100.0})
+    a = randomize_triggers(trig, bars, seed=11)
+    b = randomize_triggers(trig, bars, seed=11, eligible_bars=None)
+    pd.testing.assert_frame_equal(a, b)
+
+
+def test_randomize_eligible_bars_input_validation():
+    bars = synth_bars(100, seed=2)
+    trig = pd.DataFrame({"time": [bars["time"].iloc[50]],
+                         "situation": "S1", "action": "A3", "side": 1,
+                         "level": 100.0})
+    with pytest.raises(ValueError, match="等长"):
+        randomize_triggers(trig, bars, seed=1,
+                           eligible_bars=np.array([True, False]))
+    with pytest.raises(ValueError, match="越界"):
+        randomize_triggers(trig, bars, seed=1, eligible_bars=[5, 101])
+    with pytest.raises(ValueError, match="一维"):
+        randomize_triggers(trig, bars, seed=1,
+                           eligible_bars=np.array([[0, 1], [2, 3]]))
+
+
+def test_randomize_eligible_bars_empty_bucket_still_rejects():
+    """池限定后桶空 → 仍拒（审核三 S3 语义不变，不退化全域抽样）。"""
+    bars = synth_bars(100, seed=2)
+    trig = pd.DataFrame({"time": [pd.Timestamp("2020-01-07 12:00")],
+                         "situation": "S1", "action": "A3", "side": 1,
+                         "level": 100.0})
+    with pytest.raises(ValueError, match="无候选"):
+        randomize_triggers(trig, bars, seed=1, eligible_bars=[0])
+
+
+def test_plant_delta_uses_positional_index_not_labels():
+    """P-11：flip 是位置数组——非 RangeIndex 上旧 .loc 会改错行/抛错；
+    修复后按位置翻转、不增行、net_r 取原 win 均值。"""
+    n = 40
+    base = pd.DataFrame({
+        "time": pd.date_range("2020-01-01", periods=n, freq="D"),
+        "outcome": ["loss"] * 25 + ["win"] * 15,
+        "net_r": [-1.05] * 25 + [1.9] * 15},
+        index=[f"r{k}" for k in range(n)])
+    planted = plant_delta(base, 0.10, seed=3)
+    assert len(planted) == n                       # 不增行
+    assert list(planted.index) == list(base.index)
+    rng = np.random.default_rng(3)
+    loss_pos = np.flatnonzero((base["outcome"] == "loss").to_numpy())
+    n_flip = min(len(loss_pos), int(round(0.10 * n)))
+    flipped = set(rng.choice(loss_pos, size=n_flip, replace=False).tolist())
+    changed = {k for k in range(n)
+               if planted["outcome"].iloc[k] != base["outcome"].iloc[k]}
+    assert changed == flipped                      # 恰好翻转选中的位置
+    r_val = float(base.loc[base["outcome"] == "win", "net_r"].mean())
+    for k in flipped:
+        assert planted["outcome"].iloc[k] == "win"
+        assert planted["net_r"].iloc[k] == pytest.approx(r_val)
+    for k in range(n):
+        if k not in flipped:
+            assert planted["outcome"].iloc[k] == base["outcome"].iloc[k]
+            assert planted["net_r"].iloc[k] == pytest.approx(
+                base["net_r"].iloc[k])
+
+
+def test_delta_p_test_rejects_bad_sims():
+    a = labels_df(30, p_win=0.5, seed=1)
+    b = labels_df(30, p_win=0.4, seed=2)
+    with pytest.raises(ValueError, match="sims"):
+        delta_p_test(a, b, sims=0, seed=1)
+    with pytest.raises(ValueError, match="sims"):
+        delta_p_test(a, b, sims=2.5, seed=1)
+    with pytest.raises(ValueError, match="sims"):
+        delta_p_test(a, b, sims=True, seed=1)
+
+
+def test_brier_skill_input_validation():
+    y = np.array([0.0, 1.0, 1.0, 0.0])
+    assert isinstance(brier_skill([0.1, 0.9, 0.9, 0.1], y, 0.5), float)
+    with pytest.raises(ValueError, match="空"):
+        brier_skill([], [], 0.5)
+    with pytest.raises(ValueError, match="形状"):
+        brier_skill([0.5, 0.5], y, 0.5)
+    with pytest.raises(ValueError, match="形状"):
+        brier_skill(np.zeros((2, 2)), y, 0.5)
+    with pytest.raises(ValueError, match="有限"):
+        brier_skill([0.5, np.nan, 1.0, 0.0], y, 0.5)
+    with pytest.raises(ValueError, match="有限"):
+        brier_skill([0.5, np.inf, 1.0, 0.0], y, 0.5)
+    with pytest.raises(ValueError, match="\[0,1\]"):
+        brier_skill([0.5, 1.2, 1.0, 0.0], y, 0.5)
+    with pytest.raises(ValueError, match="\[0,1\]"):
+        brier_skill([0.5, 0.5, 0.5, 0.5], y, 1.5)
+    with pytest.raises(ValueError, match="\[0,1\]"):
+        brier_skill([0.5, 0.5, 0.5, 0.5], y, float("nan"))
+    with pytest.raises(ValueError, match="0/1"):
+        brier_skill([0.5, 0.5, 0.5, 0.5], [0, 1, 2, 0], 0.5)
+
+
+def test_holm_input_validation():
+    assert holm({}) == {}                       # 空 dict 维持既有约定
+    with pytest.raises(ValueError, match="p"):
+        holm({"a": float("nan")})
+    with pytest.raises(ValueError, match="p"):
+        holm({"a": float("inf")})
+    with pytest.raises(ValueError, match="p"):
+        holm({"a": -0.01})
+    with pytest.raises(ValueError, match="p"):
+        holm({"a": 1.5})

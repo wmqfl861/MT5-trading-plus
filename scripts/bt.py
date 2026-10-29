@@ -1412,13 +1412,15 @@ def _prob_load_bars(data_root, sym, tf, *, use_merged: bool, end=None):
     四元组，返回 (bars, gap_spans|None)；否则原 load_series（gap_spans=None，
     与 T97 之前逐位一致）。空序列与 load_series 同语义 fail-fast。
 
-    merged 路径忽略 end——合并序列的有效上界 = manifest research_cutoff 与
-    MT5 水位 last_closed_time 的更早者（mt5data.ext.merge 口径），不存在
-    "越过锁箱 cutoff"的读法。"""
+    T98/P-01：merged 路径不再丢弃 end——end 传给 merged_research_series，
+    与全局锁箱 cutoff / ext manifest research_cutoff / 导出 source_cutoff /
+    MT5 水位一起取最严（end 比其他界晚则被支配，绝不读出锁箱段；口径见
+    mt5data.ext.merge）。"""
     if not use_merged:
         return load_series(data_root, sym, tf, end), None
     from mt5data.ext.merge import merged_research_series
-    bars, _tags, gap_spans, _bad = merged_research_series(data_root, sym, tf)
+    bars, _tags, gap_spans, _bad = merged_research_series(data_root, sym, tf,
+                                                          end=end)
     if bars is None or len(bars) == 0:
         raise ValueError(f"无可用数据：{sym} {tf}（合并研究序列为空——"
                          "检查研究库 bars/ 与 ext/ 数据）")
