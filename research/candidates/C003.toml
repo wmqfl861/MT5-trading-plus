@@ -1,0 +1,35 @@
+# C003：XAUUSD 12 个月时间序列动量（TSMOM，月度再平衡）——R2 候选探索
+# 登记 2026-10-29（文献检索+折算+bt candidate check；附录 C 模板）。
+# 只写材料、不跑数据（§6.2）；预期效应全部文献折算（铁律 17）。
+# 蓝图 §6.6 趋势类条件：必须带 Huang et al. (2020) 的"历史均值基准"对照
+# 与 always-long 对照，且多品种合并检验力测算在轮次预注册时给出（见 mechanism）。
+id = "C003"
+title = "XAUUSD 12 个月时间序列动量（月度再平衡，H1）"
+mechanism_class = "trend"
+status = "waiting_data"            # 2026-10-29 预筛（bt candidate check，台账留痕）：waiting_data——事前成本倍数 30.61（swap_free 口径 >3 过；charged 口径 0.60 不过，隔夜费敏感，按 account-profile 以 swap_free 决定）；研究段 XAUUSD/H1 合并 **15.63 年**（histdata 2009-05 起 ∪ mt5 2014 起，区间并集），σ(500×H1)=3.98% 下隐含夏普 0.185、声明 0.17（取小），单次检验力 **16% < 50%**（§6.2 条件 4）→ 待数据（铁律 18：延长研究段（T67）后重检）；机制空缺 trend（条件 5 过）。§6.6 趋势类开卡前置不变：历史均值基准对照 + always-long 对照 + 多品种合并检验力（见 mechanism）
+symbols = ["XAUUSD"]
+holding = "H1"
+observed_in_sample = "C901/H002 唐奇安通道突破（XAUUSD+BTCUSD H1 标定样品，台账 97 次运行，2026-10-27 只读查证）——同为趋势机制、同品种，其样本内结果在本项目已被查看（T61/D30 改标定样品，结果只作测量证据）；本候选（12 个月符号 TSMOM）与唐奇安突破是不同信号，但盲检已失效的影响按 K3 如实登记，确认只能靠锁箱与前向样本"
+mechanism = "时间序列动量（MOP 2012）：过去 12 个月收益为正则做多、为负则做空，持有 1 个月、每月再平衡。送钱方（MOP 的解释）：反应不足与新信息缓慢扩散下逆势提供流动性的对冲者——黄金端即矿产商/央行的对冲盘与散户摸顶抄底的慢资金；42% 折算后的残余优势为其让渡。谱系必带设计（蓝图 §6.6）：(a) Huang et al. (2020) 历史均值基准对照（逐资产 TSMOM 与历史均值策略难以区分是其核心反驳）；(b) always-long（符号恒 +1）对照（MOP 出版版：对 always-long 的 alpha 90% 为正但仅 26% 显著——趋势收益与无条件漂移大量重叠）；(c) 若同轮并入 BTCUSD 同机制候选（C004），按 §6.4 做多品种合并的事件/交易级检验与检验力测算。"
+
+[literature]
+original = ["Moskowitz, Ooi & Pedersen (2012), Time Series Momentum, Journal of Financial Economics 104(2): 228-250（原文 PDF 两版核对 2026-10-29：出版版 docs.lhpedersen.com + 50 页工作稿 elmwealth.com 镜像，pypdf 抽取）"]
+replications = [
+  "Hurst, Ooi & Pedersen (2017), A Century of Evidence on Trend-Following Investing, Journal of Portfolio Management 44(1): 15-29——1880-2016、67 市场、1/3/12 个月趋势：分散组合毛夏普≈1.0、每个十年为正（含 MOP 2012 发表后的 2012-2016 样本外段）——类级（非单资产黄金）发表后存活证据（数字取自出版说明与 SSRN/JPM 摘要核对，原文 PDF 抓取超时未逐表核对，如实标注）",
+]
+rebuttals = [
+  "Huang, Li, Wang & Zhou (2020), Time-series momentum: Is it there?, JFE 135(3): 774-794——逐资产 TSMOM 几乎没有证据、与历史均值策略表现相近（蓝图 §6.1 引为 H002 重定位依据；本候选因此必须带历史均值基准，§6.6）",
+  "Moskowitz, Ooi & Pedersen (2012) 出版版自身：58 合约对 always-long 策略的 alpha 90% 为正但仅 26% 统计显著——单资产趋势毛利与无条件均值漂移大量重叠（Huang 批评的实证源头）",
+]
+search_log = "Web 检索（聚合引擎）+ 原文下载核对，2026-10-29：（1）'time series momentum gold futures post-publication evidence after Huang 2020 trend following still profitable'——命中 mdickens.me 2026-02 博客 'Contra Time-series momentum: Is it there?'（博客级，未计作证据）、Han-Yang-Zhou 商品期货趋势（仅搜索摘要命中、原文未核对，不计入）、Hurst-Ooi-Pedersen 2017（计入复现）；（2）MOP 2012 原文：fairmodel.econ.yale.edu/ec439/jpde.pdf（出版版 23 页）与 elmwealth.com 50 页工作稿下载后 pypdf 抽取——出版版逐合约夏普为图（Fig.2 柱状图，金在列但柱高不可机读，如实注明），工作稿表 2 Panel B 商品类 k=12/h=1 alpha t=3.26、表 3 分散组合月 alpha 1.26%、附录 A 确认 Gold=COMEX；（3）CME 'Demystifying Time-Series Momentum Strategies'（逐资产表）——cmegroup.com 下载两次超时，未取得；（4）检索 'Moskowitz Ooi Pedersen Table per asset gold Sharpe' 未命中可机读逐资产数表；（5）未找到：黄金单资产 TSMOM 的发表后/样本外复现（最接近为 HOP 2017 类级证据）——故按缺复现的 −58% 默认衰减（McLean & Pontiff 2016）。paritytrading.app 转述页曾用于定位文献但不作证据来源（与 C002 先例一致）。未从本项目任何数据取预期效应值（铁律 17；σ 为品种性质由预检工具实测）。"
+published_effect = "MOP 2012（评估段 1985-2009）：58 个期货合约的 12 个月 TSMOM（1 个月持仓、月度再平衡、按波动定仓）——全部 58 个合约毛夏普为正、52 个 5% 显著（出版版正文与 Fig.2；Gold 为 24 个商品期货之一，逐合约柱高为图形式不可机读）；分散组合月 alpha 1.26%（对 MSCI World+FF 因子）、组合年化波动 9.3-12%；商品类 k=12/h=1 alpha t=3.26（工作稿表 2 Panel B，25 年样本）；对 always-long 的 alpha 90% 为正但仅 26% 显著。52 周后转为反转（回归滞后项为负）。"
+expected_effect = "折算链（全部文献折算，不取自本项目数据，铁律 17）：单资产毛夏普锚取 0.4——依据：MOP Fig.2 商品组逐合约柱高目测区间约 0.2-0.8（金的具体柱高不可机读，取中低段为保守锚），与类级口径自洽（商品类 alpha t=3.26、25 年 → 类级毛夏普≈0.65，等于逐合约均值≈0.4-0.5 配平均两两相关≈0.09 的分散化）；无黄金单资产发表后复现 → ×(1-0.58)（McLean & Pontiff 2016 默认衰减）→ 预期年化夏普≈0.17。每事件毛收益 = 0.4 × σ_1月 ÷ √12 × 0.42 ≈ 0.0022（σ_1月 为品种性质：登记时外部常识口径≈4.5%/月，2026-10-29 预检工具 window_bars=500 实测 **3.98%**——隐含夏普 0.185，检验力取 min(声明 0.17, 隐含)，以 precheck JSON 为准）。研究段 XAUUSD/H1≈15.6 年下该夏普的单次检验力实测 **16%** → 待数据；§6.6 的历史均值基准与多品种合并检验力为开卡前置（见 mechanism）。Huang (2020) 若在研究段成立（TSMOM≈历史均值），本候选应按其结论放弃——预筛数字不因该风险调整（折算已含 −58%）。"
+
+[declared]
+events_per_year = 12                # 每月一次再平衡（入场+出场各一次，事件/交易口径各 12/年）
+gross_return_per_event = 0.0022     # 0.22%/笔：单资产毛夏普锚 0.4 × σ_1月≈4.5%/√12 × 0.42（M&P −58%）——见 expected_effect
+window_bars = 500                   # 持仓 1 个月 ≈ 500 根 H1 bar（金周末休市；σ 按此窗长取，T84/K4）
+entry_hour_ny = 17                  # 月末最后交易日纽约 17:00（COMEX 场内收盘时段）入场；同时刻次月末出场
+exit_hour_ny = 17
+overnight_nights = 30.0             # 每笔持仓约 1 个日历月 → 约 30 个计费夜（保守申报；swap_free/charged 双口径由预筛自动算）
+expected_sharpe = 0.17              # 0.4 × 0.42 的文献折算年化夏普（见 expected_effect；检验力取 min(声明, 隐含)）

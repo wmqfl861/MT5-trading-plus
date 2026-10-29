@@ -1,0 +1,122 @@
+{
+  "candidate_id": "C004",
+  "decision": "waiting_data",
+  "reasons": [
+    "检验力 24% < 50%（10.90 年、折算夏普 0.29）→ 待数据（铁律 18：检验力不足不开卡，延长研究段（T67）后重检）",
+    "机制空缺：trend 是组合里还没有的类别（蓝图 §6.2 条件 5）"
+  ],
+  "events_per_year": 52.0,
+  "checks": {
+    "literature": {
+      "passed": true,
+      "original_n": 1,
+      "replications_n": 2,
+      "rebuttals_n": 3,
+      "note": "复现与折算依据见 expected_effect"
+    },
+    "holding": {
+      "passed": true,
+      "holding": "D1",
+      "seconds": 86400,
+      "min": "H1",
+      "min_seconds": 3600
+    },
+    "ex_ante_cost": {
+      "passed": true,
+      "multiple": 18.540017459505293,
+      "min": 3.0,
+      "gross_return_per_event": 0.004,
+      "binding_symbol": "BTCUSD",
+      "per_symbol": {
+        "BTCUSD": {
+          "reference_price": 110102.12,
+          "reference_timeframe": "D1",
+          "contract_size": 1.0,
+          "spread_round_trip": 0.00017979127261416708,
+          "spread_entry_frac": 0.00017979127261416708,
+          "spread_exit_frac": 0.00017979127261416708,
+          "slippage_entry": 1.7979127261416708e-05,
+          "slippage_exit": 1.7979127261416708e-05,
+          "commission": 0.0,
+          "overnight": 0.0,
+          "round_trip_cost": 0.0002157495271370005,
+          "multiple": 18.540017459505293
+        }
+      }
+    },
+    "power": {
+      "passed": false,
+      "power": 0.23978753137203207,
+      "min": 0.5,
+      "years": 10.902121834360027,
+      "expected_sharpe": 0.29,
+      "implied_sharpe": 0.36292432101089117,
+      "sharpe_used": 0.29,
+      "implied_sharpe_by_symbol": {
+        "BTCUSD": 0.36292432101089117
+      },
+      "sigma_by_symbol": {
+        "BTCUSD": 0.0751909328154226
+      },
+      "sigma_window_bars": 7,
+      "sigma_entry_hour_ny": null,
+      "sigma_method": "无条件收益波动 σ：候选声明 window_bars 根持仓周期 bar 的滚动窗口收益全体（随机时点抽样的总体极限，ddof=1，与 T66 σ_w 同一函数 validation.events.window_volatility——T84/K4：单根 bar 口径少算 √h）；日内周期按 entry_hour_ny 取同一时段起点（窗口起点=锚 bar 收盘时刻）；σ 是品种性质，与候选信号无关、不取自本项目样本内（T80/G2）。隐含夏普 =（毛收益−事前来回成本）÷σ×√每年事件数，检验力取 min(声明, 隐含)",
+      "alpha": 0.05,
+      "n_tests": 1,
+      "years_detail": {
+        "BTCUSD/D1": 10.902121834360027
+      },
+      "min_detectable_sharpe": 0.8897451303972754,
+      "coverage_segments": {
+        "BTCUSD/D1": [
+          {
+            "source": "mt5",
+            "first": "2021-06-17T00:00:00",
+            "last": "2025-10-23T00:00:00",
+            "years": 4.350444900752909,
+            "counted": true
+          },
+          {
+            "source": "cdd",
+            "first": "2014-11-28T00:00:00",
+            "last": "2025-10-23T00:00:00",
+            "years": 10.902121834360027,
+            "counted": true
+          }
+        ]
+      },
+      "coverage_merged_years": {
+        "BTCUSD/D1": 10.902121834360027
+      },
+      "coverage_merge_method": "计入段日历区间并集：相接/重叠的段合成连续跨度（min(first)..max(last)），不相接的分段各自计入——重叠不双计（T80/G3 审核修正：相加会把完全包含/部分重叠的覆盖虚增，如 fred/USTEC 39.8 年包住 mt5 4.3 年 → 合并 39.8 而非 44.1）；每段在产出侧已在 >30 天内部空洞处切开（T94/R14-L3：实测间隔+known_gaps+manifest 未启用年份，边界随段的 gaps 字段）"
+    },
+    "mechanism_gap": {
+      "blocking": false,
+      "note": "机制空缺：trend 是组合里还没有的类别（蓝图 §6.2 条件 5）",
+      "mechanism_class": "trend",
+      "active_mechanisms": [
+        "cross_asset"
+      ]
+    }
+  },
+  "cost_model_version": "tick-spread-p90[rel@NY/bar_open_m1#abed3b8f]+slip0.1-comm0-cli-swap-snapshot[3794ad8e]-relref[7e4a84bc]-no-overshoot+swapfree(account-profile)",
+  "checked_at_utc": "2026-10-29T00:47:29.174781+00:00",
+  "swap_basis": {
+    "applicable": true,
+    "account_profile": {
+      "BTCUSD": "swap_free"
+    },
+    "decision_basis": "swap_free",
+    "charged": {
+      "multiple": 2.970304534182125,
+      "power": 0.20665661119010303,
+      "decision": "fail"
+    },
+    "swap_free": {
+      "multiple": 18.540017459505293,
+      "power": 0.23978753137203207,
+      "decision": "waiting_data"
+    },
+    "swap_dependent": false
+  }
+}

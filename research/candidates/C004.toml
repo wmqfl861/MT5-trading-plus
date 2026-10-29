@@ -1,0 +1,38 @@
+# C004：BTCUSD 周度时间序列动量（1 周持仓，D1）——R2 候选探索
+# 登记 2026-10-29（文献检索+折算+bt candidate check；附录 C 模板）。
+# 任务方向原为"BTCUSD 短期反转（Nagel 2012 复现）"——检索结论：周度横距上
+# 加密市场证据是动量不是反转（Liu-Tsyvinski RFS 2021；LTW JF 2022），日内
+# 反转毛利 1.3bp/笔对 5bp 成本不可交易（arXiv 2608.21888），8-10 周反转为
+# 中市值币横截面（SSRN 6703498）——单资产 BTCUSD 上可登记的方向是周度动量。
+id = "C004"
+title = "BTCUSD 周度时间序列动量（过去 1 周收益符号，持 1 周，D1）"
+mechanism_class = "trend"
+status = "waiting_data"            # 2026-10-29 预筛（bt candidate check，台账留痕）：waiting_data——事前成本倍数 18.54（swap_free 口径 >3 过；charged 口径 2.97 差 3 一线不过，按 account-profile 以 swap_free 决定）；研究段 BTCUSD/D1 合并 **10.90 年**（cdd 2014-11 起 ∪ mt5 2021-06 起），σ(7×D1)=7.52% 下隐含夏普 0.363、声明 0.29（取小），单次检验力 **24% < 50%**（§6.2 条件 4）→ 待数据（铁律 18：延长研究段（T67）后重检）；机制空缺 trend（工具口径：组合尚无该类活跃谱系；与 C003 同类，两候选进同一轮时按 §6.2 条件 5 排序考量）
+symbols = ["BTCUSD"]
+holding = "D1"
+observed_in_sample = "C901/H002 唐奇安通道突破（XAUUSD+BTCUSD H1 标定样品，台账 97 次运行，2026-10-27 只读查证）——同为趋势机制且含 BTCUSD 腿，其样本内结果在本项目已被查看（T61/D30 改标定样品，结果只作测量证据）；本候选（周度符号 TSMOM）与其不同信号，但按 K3 如实登记盲检失效，确认只能靠锁箱与前向样本"
+mechanism = "加密市场周度时间序列动量（Liu & Tsyvinski 2021）：过去 1 周收益为正则做多、为负则做空（或平），持有 1 周、每周再平衡。送钱方：加密市场信息扩散慢（注意力驱动）下对新信息反应不足的投资者与逆势做市的流动性提供者。谱系必带设计（与 C003 同受 §6.6 约束）：(a) Huang et al. (2020) 历史均值基准对照；(b) always-long 对照（RFS 原文最低分位组也为正——动量利得多来自做多腿的时代漂移，LTW 2022 指出以 Bitcoin 替换做空腿后 1/2/4 周动量不再显著）；(c) 与 C003 同机制多品种合并检验力（§6.4）。研究段在 cdd/Bitstamp D1（D36 白名单）上评估，成本按情景倍数。"
+
+[literature]
+original = ["Liu & Tsyvinski (2021), Risks and Returns of Cryptocurrency, Review of Financial Studies 34(6): 2689-2727（数值取自 NBER WP 24877 版 PDF 下载核对 2026-10-29：比特币周收益对下周收益回归系数 0.19（t=3.73）、样本 2011-01–2018-05；无前视五分位表 17：最高组次周 +7.88%（t=2.70）、高低点差 4.53%/周——工作稿口径，出版版样本期一致至 2018-05，如实标注）"]
+replications = [
+  "Liu, Tsyvinski & Wu (2022), Common Risk Factors in Cryptocurrency, Journal of Finance 77(2): 1133-1177（NBER w25882 PDF 核对）——1/2/3/4 周横截面动量零投资组合显著（表 4：1 周动量 5-1 = +2.7%/周，t=1.99）；三因子模型动量因子取 3 周形成期",
+  "Borri, Liu, Tsyvinski & Wu (2025), Cryptocurrency as an Investable Asset Class: Coming of Age, arXiv:2510.14435（PDF 核对表 2）——过去两周收益五分位（CMOM）：全样本 5-1 = +2.6%/周（t=3.89）；**2020 年后子样本 5-1 = +2.1%/周（t=3.70）**、最高组 +2.1%/周（t=2.50）vs 市场均值组约 +1.0%/周——动量是 2020 年后仍存活的加密因子（发表后存活证据）；文内转引 Fieberg et al. (2024)：20,736 个研究设计中动量属稳健因子（转引，未核对原文）",
+]
+rebuttals = [
+  "Liu, Tsyvinski & Wu (2022) 同文（NBER w25882）：以 Bitcoin 替换做空腿的动量组合，1/2/4 周动量均值不再统计显著——比特币单口径实现弱于横截面口径（对本候选单品种实现最直接的负面证据）",
+  "Liu & Tsyvinski (2021) 原始样本 2011-01–2018-05 为泡沫主导期（2017 泡沫；周 σ 16.6%）；无前视口径点差 4.53%/周 明显低于全样本 8.62%/周——锚效应被样本期抬高",
+  "Huang, Li, Wang & Zhou (2020), Time-series momentum: Is it there?, JFE 135(3): 774-794——逐资产 TSMOM 与历史均值策略难区分（趋势类通用反驳，§6.6 基准来源；未含加密资产，适用性按类推）",
+]
+search_log = "Web 检索（聚合引擎）+ 原文下载核对，2026-10-29：（1）'short-term reversal cryptocurrency bitcoin weekly reversal liquidity provision Nagel replication'——命中：Bianchi et al. (Riksbank WP 413/JBF) 用 Nagel (2012) 短期反转收益代理加密流动性提供（横截面、多币）；SSRN 6703498（2026）加密 8-10 周反转集中在中市值币（横截面）；arXiv 2608.21888v1（2026-08，全文抓取核对）：183 个 Binance 对 15 分钟尺度反转存在（BTC AUC 0.533）但毛利峰值 1.3bp/笔 vs 5bp 来回成本不可交易、小时尺度减半、4 小时消失——**日内反转在本项目成本条件下不可行，BTCUSD 单品种周度反转无证据**；（2）'Liu Tsyvinski cryptocurrency momentum 1-4 week Sharpe'——NBER w24877 与 w25882 PDF 下载 pypdf 抽取核对（表 14/15/16/17 与表 4）；（3）'Borri Liu Tsyvinski Wu 2025 momentum after 2020'——定位 arXiv 2510.14435 并下载核对表 2 Panel B（2020 后 CMOM 5-1 = 2.1%/周，t=3.70）；转述页 paritytrading.app 只用于定位、不作证据来源（C002 先例）；（4）未找到：BTCUSD 单资产周度 TSMOM 的 2020 年后直接复现（最接近为 Borri 2025 横截面与 LTW 2022 的 Bitcoin-做空腿稳健性）；未核对：Fieberg et al. 2024 原文（转引）；Auckland ACFR 'Time-series and cross-sectional momentum under realistic assumptions'（搜索命中、未逐字核对，不计入）——现实成本敏感性按情景倍数由预筛成本模型覆盖。未从本项目任何数据取预期效应值（铁律 17；σ 为品种性质由预检工具实测）。"
+published_effect = "Liu & Tsyvinski (2021, RFS)：比特币周收益显著正预测未来 1-4 周收益（回归系数 0.19/0.22/0.21/0.09，t=3.73/4.52/4.26/1.72；样本 2011-01–2018-05，周 σ 16.64%）——1 个标准差的上周收益 → 下周 +3.16%；无前视五分位（表 17）：最高组次周 +7.88%/周（t=2.70）、SR 0.37，最高−最低点差 4.53%/周；2013 起子样本点差 4.35%/周。LTW (2022, JF)：横截面 1-4 周动量零投资组合显著（1 周 +2.7%/周 t=1.99）。Borri et al. (2025)：两周动量横截面 2020 年后 +2.1%/周（t=3.70）、最高组较市场均值组超额约 +1.1%/周。"
+expected_effect = "折算链（全部文献折算，不取自本项目数据，铁律 17）：锚 1（发表后存活）：Borri 2025 的 2020 年后动量组较市场均值超额 ≈ +1.1%/周（横截面口径）；锚 2（原始回归折算当代波动）：β=0.19 × E|r_周|（当代 BTC 周 σ≈5-6% → E|r|≈4.4%）≈ 0.84%/周（泡沫期样本、未折算）。单资产 BTC 无发表后直接复现（LTW 2022 的 Bitcoin 替代做空腿结果为不显著——最直接的负面证据）→ 取锚 1 × (1-0.58)（M&P 默认衰减，缺单资产复现）= 0.46%/周，再按 LTW 负面证据向下取整 **0.4%/周 = 0.004/笔（毛）**。年化夏普按隐含口径事前折算：(0.004 − 事前来回成本) ÷ σ_周 × √52 ≈ 0.29（σ_周 为品种性质：登记时外部常识口径≈7.5%，2026-10-29 预检工具 window_bars=7 实测 **7.52%**——隐含夏普 0.363 > 声明 0.29，检验力取小，以 precheck JSON 为准）。研究段 BTCUSD/D1≈10.9 年下该夏普的单次检验力实测 **24%** → 待数据；LTW 负面证据若在研究段成立（单口径不显著/为零），本候选应放弃——预筛数字不因该风险再调整（折算已含 −58% 与向下取整）。"
+
+[declared]
+events_per_year = 52                # 每周一次再平衡（ BTC 7×24 交易，52 周/年）
+gross_return_per_event = 0.004      # 0.4%/周：Borri 2025 动量超额锚 1.1%/周 × 0.42 后按 LTW 负面证据向下取整——见 expected_effect
+window_bars = 7                     # 持仓 1 周 = 7 根 D1 bar（BTC 7×24；σ 按此窗长取，T84/K4）
+entry_hour_ny = 20                  # Bitstamp 日线按 UTC 00:00 收/开（=纽约 19/20 时，DST 由数据源 UTC 定；研究段在 cdd 数据上评估）
+exit_hour_ny = 20
+overnight_nights = 7.0              # 每笔持仓 7 天 → 约 7 个计费夜（保守申报；swap_free/charged 双口径由预筛自动算）
+expected_sharpe = 0.29              # (0.004 − 成本) ÷ σ_周 × √52 的文献折算年化夏普（见 expected_effect；检验力取 min(声明, 隐含)）
