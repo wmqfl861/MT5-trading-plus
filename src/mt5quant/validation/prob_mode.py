@@ -122,12 +122,18 @@ def _by_day(values: pd.Series, days: pd.Series) -> pd.Series:
 def delta_p_test(real_labels: pd.DataFrame, null_labels: pd.DataFrame, *,
                  block: str = "month", sims: int, seed: int) -> dict:
     """单侧 Δp 检验：触发组日赢率均值 − 随机组日赢率均值（样本单位=
-    触发日，D52）；p 值按**月内置换**（把两组的日赢率在各自月份内随机
+    触发日，D52）；p 值按**块内置换**（把两组的日赢率在各自块内随机
     重新分组，sims 次；单侧：置换统计量 ≥ 观测 Δ 的比例，+1 修正
     (1+k)/(1+B)）。
 
-    向量化实现（与逐 sim 逐月 shuffle 同一统计过程：统计量只依赖
-    Σ月(组A子集和)，按月独立随机子集等价于逐月 shuffle；同 seed 确定）。
+    block（T101/P-02 处置）：置换块长——"month"=月内（2026-10-28
+    报告 §1 声明的方法变体）；"quarter"=日历季度内（Q-DEC：1-3/
+    4-6/7-9/10-12 月；T100 重跑发现月内置换在 7 周尺度成簇结构下
+    误报率 11%>5%，季度块为 v3 标定的候选正式方法）。季度从不拆分
+    月份——数据只落在互不同月的月份时两种块等价。
+
+    向量化实现（与逐 sim 逐块 shuffle 同一统计过程：统计量只依赖
+    Σ块(组A子集和)，按块独立随机子集等价于逐块 shuffle；同 seed 确定）。
     real_labels / null_labels：含 time、outcome 的标签表（win 计 1；
     skipped 剔除——S7）。sims 须为 ≥1 整数（T98 audit P-11：显式校验，
     不让 sims=0 静默产出 p=NaN 之类）。
@@ -135,6 +141,9 @@ def delta_p_test(real_labels: pd.DataFrame, null_labels: pd.DataFrame, *,
     if isinstance(sims, bool) or not isinstance(sims, (int, np.integer)) \
             or int(sims) < 1:
         raise ValueError(f"sims 须为 ≥1 整数，收到 {sims!r}")
+    if block not in ("month", "quarter"):
+        raise ValueError(f"block 只认 'month'/'quarter'，收到 {block!r}"
+                         "（T101：块长显式校验——其他值不得静默按月处理）")
     rng = np.random.default_rng(seed)
 
     def _day_winrates(df: pd.DataFrame) -> pd.Series:
@@ -152,8 +161,9 @@ def delta_p_test(real_labels: pd.DataFrame, null_labels: pd.DataFrame, *,
                 "n_days_real": int(len(r)), "n_days_null": int(len(nul)),
                 "block": block, "sims": int(sims)}
     r_arr, n_arr = r.to_numpy(), nul.to_numpy()
-    r_months = pd.PeriodIndex(pd.to_datetime(list(r.index)), freq="M")
-    n_months = pd.PeriodIndex(pd.to_datetime(list(nul.index)), freq="M")
+    freq = "Q" if block == "quarter" else "M"
+    r_months = pd.PeriodIndex(pd.to_datetime(list(r.index)), freq=freq)
+    n_months = pd.PeriodIndex(pd.to_datetime(list(nul.index)), freq=freq)
     obs = float(r_arr.mean() - n_arr.mean())
 
     months = sorted(set(r_months) | set(n_months))

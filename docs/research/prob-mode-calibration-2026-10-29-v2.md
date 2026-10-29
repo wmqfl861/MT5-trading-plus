@@ -5,6 +5,7 @@
 运行指纹：`t75-formal-v2`（`data/prob/t75-calibration/t75-formal-v2/summary.json`；5 相位 × 8 分片 JSON + `manifest.json` + `pool.meta.json` 同目录；标签池运行后已删，`pool.meta.json` 保留来源指纹）。本次全部数字由报告作者从两套分片 JSON（旧 `t75-formal/` 与新 `t75-formal-v2/`）独立重算得出，与 merge 汇总逐项一致。
 
 - 本报告取代 `prob-mode-calibration-2026-10-29.md`（旧报告头部已加取代注记）；旧运行产物原样保留作历史证据；
+- 2026-10-30 v3 季度块置换试验（T101，本报告 §6 选项一）：判定标准 2 仍失败（w7=8%>5%）、**未采纳**——本报告结论与现行锚点维持有效，见 `prob-mode-calibration-2026-10-29-v3.md`；
 - 重跑动因：codex 全局审核（`docs/reviews/2026-10-29-global-code-audit.md`）P-02/P-03/P-12 修正改动了标定方法与记录口径（T98 波次 1，详见 §1）；计划与预写判定标准见 `docs/superpowers/plans/2026-10-29-p-line-t100-recalibration.md`。
 
 ## 0. 判定标准（先于运行预写，抄计划，防事后挑选）

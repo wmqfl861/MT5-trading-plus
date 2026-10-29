@@ -123,7 +123,7 @@ def _patch_cluster_heavy(monkeypatch, pc, bars, trig):
     monkeypatch.setattr(pc, "_costs_and_sizes",
                         lambda swap_ref_price=None: (None, None, 1.0, "v"))
     monkeypatch.setattr(pc, "delta_p_test",
-                        lambda real, null, *, sims, seed: {
+                        lambda real, null, *, block=None, sims, seed: {
                             "p_value": 0.5, "delta_p": 0.0,
                             "n_days_real": 4, "n_days_null": 4})
     monkeypatch.setattr(
@@ -183,7 +183,7 @@ def test_phase_neg_pos_record_actual_day_counts(monkeypatch):
     monkeypatch.setattr(pc, "POS_SEEDS", 1)
     monkeypatch.setattr(pc, "B_SIMS", 3)
     monkeypatch.setattr(pc, "delta_p_test",
-                        lambda real, null, *, sims, seed: {
+                        lambda real, null, *, block=None, sims, seed: {
                             "p_value": 0.25, "delta_p": 0.01,
                             "n_days_real": 5, "n_days_null": 6})
     monkeypatch.setattr(pc, "plant_delta", lambda labels, d, seed: labels)

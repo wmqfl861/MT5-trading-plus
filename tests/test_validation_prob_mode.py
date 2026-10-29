@@ -102,6 +102,76 @@ def test_delta_p_test_deterministic():
     assert r1 == r2
 
 
+# ------------------------------------------- 季度块置换（T101/P-02 处置）
+
+def _day_labels(days):
+    """显式构造逐日一条的标签表：days = [(日期, 'win'|'loss'), ...]。"""
+    rows = [{"time": pd.Timestamp(d) + pd.Timedelta(hours=10),
+             "outcome": o, "net_r": 1.9 if o == "win" else -1.05,
+             "situation": "S1", "action": "A3", "side": 1, "level": 100.0}
+            for d, o in days]
+    return pd.DataFrame(rows)
+
+
+_Q1_MIXED_REAL = [("2021-01-04", "win"), ("2021-01-05", "loss"),
+                  ("2021-02-01", "win"), ("2021-02-02", "win")]
+_Q1_MIXED_NULL = [("2021-01-06", "loss"), ("2021-01-07", "win"),
+                  ("2021-02-03", "loss"), ("2021-02-04", "loss")]
+
+
+def test_delta_p_test_quarter_differs_from_month_on_cross_month():
+    """T101：同季跨月（1+2 月）数据上，季度块与月块的置换空间不同——
+    p 值应不同（当前实现 quarter 静默按月处理，二者相同 → 红）。"""
+    real = _day_labels(_Q1_MIXED_REAL)
+    null = _day_labels(_Q1_MIXED_NULL)
+    pm = delta_p_test(real, null, block="month", sims=500, seed=7)
+    pq = delta_p_test(real, null, block="quarter", sims=500, seed=7)
+    assert pq["p_value"] != pm["p_value"]
+
+
+def test_delta_p_test_quarter_equals_month_within_single_months():
+    """T101：季度从不拆分月份——数据只落在互不同月的月份里时，月块与
+    季度块的池逐月一一对应，结果除 block 字段外逐位相同。两个用例：
+    单月数据；1 月+4 月（不同季度、各自单月）。"""
+    for days_r, days_n in (
+            ([("2021-01-04", "win"), ("2021-01-05", "loss"),
+              ("2021-01-06", "win")],
+             [("2021-01-07", "loss"), ("2021-01-08", "loss"),
+              ("2021-01-09", "win")]),
+            ([("2021-01-04", "win"), ("2021-01-05", "loss"),
+              ("2021-04-05", "win"), ("2021-04-06", "win")],
+             [("2021-01-06", "loss"), ("2021-01-07", "win"),
+              ("2021-04-07", "loss"), ("2021-04-08", "loss")])):
+        real = _day_labels(days_r)
+        null = _day_labels(days_n)
+        pm = delta_p_test(real, null, block="month", sims=300, seed=11)
+        pq = delta_p_test(real, null, block="quarter", sims=300, seed=11)
+        assert {**pm, "block": None} == {**pq, "block": None}
+
+
+def test_delta_p_test_rejects_bad_block():
+    """T101：block 只认 month/quarter，入口校验（空标签也不得静默
+    返回 p=1.0）。"""
+    real = _day_labels(_Q1_MIXED_REAL)
+    null = _day_labels(_Q1_MIXED_NULL)
+    with pytest.raises(ValueError):
+        delta_p_test(real, null, block="bogus", sims=100, seed=1)
+    empty = pd.DataFrame(columns=["time", "outcome"])
+    with pytest.raises(ValueError):
+        delta_p_test(empty, empty, block="bogus", sims=100, seed=1)
+
+
+def test_delta_p_test_quarter_deterministic_and_echoed():
+    """T101：季度块同 seed 确定、block 字段回显。"""
+    real = _day_labels(_Q1_MIXED_REAL)
+    null = _day_labels(_Q1_MIXED_NULL)
+    r1 = delta_p_test(real, null, block="quarter", sims=200, seed=5)
+    r2 = delta_p_test(real, null, block="quarter", sims=200, seed=5)
+    assert r1 == r2
+    assert r1["block"] == "quarter"
+    assert delta_p_test(real, null, sims=100, seed=5)["block"] == "month"
+
+
 # ---------------------------------------------------------------- Holm
 
 def test_holm_matches_hand_calc():

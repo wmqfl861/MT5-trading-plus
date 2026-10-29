@@ -130,7 +130,7 @@ def capture_labels(b, trig_df, costs, **kw):
 dp_calls: list[tuple[int, pd.DataFrame, pd.DataFrame]] = []
 
 
-def fake_delta_p(real, null, *, sims, seed):
+def fake_delta_p(real, null, *, block=None, sims, seed):
     dp_calls.append((seed, real, null))
     return {"p_value": 0.5,
             "n_days_real": int(len(real)), "n_days_null": int(len(null))}

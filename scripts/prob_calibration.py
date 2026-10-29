@@ -64,6 +64,10 @@ SYMBOL = "XAUUSD"
 TF = "H1"
 DATA_ROOT = "data_research"
 B_SIMS = 10_000                       # 正式运行置换次数（+1 修正分辨率 1e-4）
+# T101（P-02 处置）：v3 标定的置换块长——季度块（T100 重跑成簇 w7 档
+# 误报 11%>5%，月内置换低估跨月成簇方差）；随 v3 报告采纳状态决定
+# 正式 P1（run_p1_card）是否同步切换
+BLOCK = "quarter"
 N_POOL = 4_200                        # 随机时点标签池大小（≥ 最大 n=4000）
 BRACKET = Bracket(sl_atr=1.0, tp_atr=2.0, horizon_bars=24)
 POOL_SEED = 20261028
@@ -97,7 +101,7 @@ def _run_fingerprint(pool_source_fp: str = "") -> str:
     for p in srcs:
         h.update(p.read_bytes())
     h.update(json.dumps({
-        "B": B_SIMS, "N_POOL": N_POOL, "bracket": vars(BRACKET) |
+        "B": B_SIMS, "N_POOL": N_POOL, "block": BLOCK, "bracket": vars(BRACKET) |
          {k: v for k, v in vars(BRACKET).items()},
         "neg": [NEG_NS, NEG_SEEDS], "pos": [POS_DELTAS, POS_NS, POS_SEEDS],
         "holm": HOLM_HYPS,
@@ -225,7 +229,7 @@ def phase_neg(pool: pd.DataFrame, shard_i: int, shard_n: int, stamp: str
     for n, seed in my:
         real = _sample_labels(pool, n, seed=900_000 + seed)
         null = _sample_labels(pool, n, seed=800_000 + seed)
-        res = delta_p_test(real, null, sims=B_SIMS, seed=seed)
+        res = delta_p_test(real, null, block=BLOCK, sims=B_SIMS, seed=seed)
         out.append({"kind": "neg_single", "n": n, "seed": seed,
                     "p": res["p_value"],
                     "n_days_real": res["n_days_real"],
@@ -242,7 +246,8 @@ def phase_neg_holm(pool: pd.DataFrame, shard_i: int, shard_n: int
         for h in range(HOLM_HYPS):
             real = _sample_labels(pool, NEG_NS[1], seed=700_000 + seed * 20 + h)
             null = _sample_labels(pool, NEG_NS[1], seed=600_000 + seed)
-            pv[f"H{h:02d}"] = delta_p_test(real, null, sims=B_SIMS,
+            pv[f"H{h:02d}"] = delta_p_test(real, null, block=BLOCK,
+                                           sims=B_SIMS,
                                            seed=seed * 20 + h)["p_value"]
         adj = holm(pv)
         out.append({"kind": "neg_holm", "n": NEG_NS[1], "seed": seed,
@@ -260,7 +265,7 @@ def phase_pos(pool: pd.DataFrame, shard_i: int, shard_n: int
         real = plant_delta(_sample_labels(pool, n, seed=500_000 + seed), d,
                            seed=seed)
         null = _sample_labels(pool, n, seed=400_000 + seed)
-        res = delta_p_test(real, null, sims=B_SIMS, seed=seed)
+        res = delta_p_test(real, null, block=BLOCK, sims=B_SIMS, seed=seed)
         out.append({"kind": "pos", "delta": d, "n": n, "seed": seed,
                     "p": res["p_value"], "dp_hat": res["delta_p"],
                     "n_days_real": res["n_days_real"],
@@ -355,7 +360,7 @@ def phase_cluster(shard_i: int, shard_n: int, stamp: str) -> list[dict]:
                 trig, times_idx, weeks=wk + extra_null, perm_state=perm_null)
             real = _labels(real_trig)
             null = _labels(null_trig)
-            res = delta_p_test(real, null, sims=B_SIMS, seed=seed)
+            res = delta_p_test(real, null, block=BLOCK, sims=B_SIMS, seed=seed)
             out.append({"kind": "cluster_neg", "weeks": wk, "seed": seed,
                         "shift_weeks_real": wk + extra_real,
                         "shift_weeks_null": wk + extra_null,
