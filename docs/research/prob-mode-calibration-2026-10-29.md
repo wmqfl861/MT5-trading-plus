@@ -2,6 +2,8 @@
 
 状态：**待审核**
 
+> 2026-10-29 起被 v2 取代（P-03 单位口径与 P-02 成簇对照重跑）：见 prob-mode-calibration-2026-10-29-v2.md（锚点数值经 v2 复核维持不变）。
+
 运行指纹：`t75-formal`（`data/prob/t75-calibration/t75-formal/summary.json`；分片 JSON 同目录，8 分片/相位；标签池运行后已删）。指纹覆盖 `prob_mode.py`/`labels.py`/`p1.py`/脚本内容与设计参数。
 
 ## 0. 判定标准（先于运行预写）
