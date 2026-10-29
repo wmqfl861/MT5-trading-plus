@@ -157,7 +157,8 @@ from mt5quant.research import candidates as cand  # noqa: E402
 from mt5quant.research import power  # noqa: E402
 from mt5quant.research import rounds as rnd  # noqa: E402
 from mt5quant.research.ledger import (  # noqa: E402
-    Ledger, LedgerTamperedError, RESERVED_ACTORS, run_class_for_actor,
+    Ledger, LedgerTamperedError, RESERVED_ACTORS, RoundTrialBudgetExceededError,
+    run_class_for_actor,
 )
 from mt5quant.validation import gates as vgate  # noqa: E402
 from mt5quant.validation import lookahead as vlook  # noqa: E402
@@ -2547,7 +2548,13 @@ def cmd_prob_test(args) -> int:
                     run_class="research", round_id=round_obj.id)
                 print(f"✗ run#{rid} {h} -> {msg}")
             return 1
-        for r in results:
+        # P-10：成功行入账带原子预算上限（检查与写入同一事务——
+        # 预检（_prob_preconditions）之后、入账之前预算被并发占满时，
+        # 在此拒绝而非超额写入）。中途耗尽：对**尚未入账的全部假设**
+        # 补记作废 error 行（P-05"每条假设恰一行终态"；error 行不占
+        # 预算——round_n_dedup 只计成功行），轮次报告按"恰一条成功行"
+        # 口径自然拒绝（fail-closed）。
+        for i, r in enumerate(results):
             params = {"hypothesis": r["hypothesis"],
                       "prob": {**prob_ident, "seed": r["seed"],
                                "prob_version": r["prob_version"]}}
@@ -2558,18 +2565,43 @@ def cmd_prob_test(args) -> int:
                                 "null_win_rate": r["null_win_rate"],
                                 "delta_p": r["delta_p"],
                                 "p_value": r["p_value"]}}
-            rid = ledger.record_run(
-                card_id=card.id, card_version=card.version,
-                strategy=args.strategy, params=params,
-                symbol=first_sym, timeframe=card.timeframe,
-                data_first=pd_iso(bars_by_sym[first_sym]["time"].iloc[0]),
-                data_last=pd_iso(bars_by_sym[first_sym]["time"].iloc[-1]),
-                data_sha256=data_sha_by_sym[first_sym],
-                engine_version=ENGINE_VERSION,
-                cost_model_version=cost_version, gates_hash=_gates_hash(),
-                metrics=metrics, actor=actor,
-                strategy_sha=strategy_sha,
-                run_class="research", round_id=round_obj.id)
+            try:
+                rid = ledger.record_run(
+                    card_id=card.id, card_version=card.version,
+                    strategy=args.strategy, params=params,
+                    symbol=first_sym, timeframe=card.timeframe,
+                    data_first=pd_iso(bars_by_sym[first_sym]["time"].iloc[0]),
+                    data_last=pd_iso(bars_by_sym[first_sym]["time"].iloc[-1]),
+                    data_sha256=data_sha_by_sym[first_sym],
+                    engine_version=ENGINE_VERSION,
+                    cost_model_version=cost_version, gates_hash=_gates_hash(),
+                    metrics=metrics, actor=actor,
+                    strategy_sha=strategy_sha,
+                    run_class="research", round_id=round_obj.id,
+                    round_trial_budget=round_obj.trial_budget)
+            except RoundTrialBudgetExceededError as e:
+                msg = f"结果作废：运行期间轮次预算被并发占满（{e}）"
+                for rr in results[i:]:
+                    voided = ledger.record_run(
+                        card_id=card.id, card_version=card.version,
+                        strategy=args.strategy,
+                        params={"hypothesis": rr["hypothesis"],
+                                "prob": {**prob_ident, "seed": rr["seed"],
+                                         "prob_version": rr["prob_version"]}},
+                        symbol=first_sym, timeframe=card.timeframe,
+                        data_first=pd_iso(
+                            bars_by_sym[first_sym]["time"].iloc[0]),
+                        data_last=pd_iso(
+                            bars_by_sym[first_sym]["time"].iloc[-1]),
+                        data_sha256=data_sha_by_sym[first_sym],
+                        engine_version=ENGINE_VERSION,
+                        cost_model_version=cost_version,
+                        gates_hash=_gates_hash(),
+                        metrics=None, error=msg, actor=actor,
+                        strategy_sha=strategy_sha,
+                        run_class="research", round_id=round_obj.id)
+                    print(f"✗ run#{voided} {rr['hypothesis']} -> {msg}")
+                return 1
             mark = "✓" if r["p_value"] < 0.05 else "·"
             print(f"{mark} run#{rid} {r['hypothesis']}：触发 "
                   f"{r['n_triggers']}（{r['n_trigger_days']} 日），Δp="
@@ -2773,8 +2805,9 @@ def cmd_fit(args) -> int:
     未提交也能拟合）：卡 committed/clean（ensure_card_precedes_run）、
     候选状态（withdrawn/specimen，_enforce_candidate_status）、策略指纹
     绑定（_bind_strategy_sha）、轮次开启+approved_by+toml sha256
-    （_round_context + 开轮哈希核对）、轮次预算（**非原子**——fit 不占
-    runs 行，预算检查与后续运行的占用不构成一个事务，P-10 残留，注明）；
+    （_round_context + 开轮哈希核对）、轮次预算（快速失败预检；P-10 起
+    预算执行的原子性在**运行入账时**——P 卡成功行 record_run 带
+    round_trial_budget，检查与写入同一事务；fit 不产生 runs、不占预算）；
     __fit__ 传 sizes/policies（真实内置策略的标签引擎需要，缺则拒）；
     卡类型接受 probability（discovery/validation）与 standard+validation
     的 P2 决策卡（原实现只接 probability）。"""
@@ -3056,7 +3089,16 @@ def cmd_screen(args) -> int:
         gates_hash = _gates_hash()
         combos = card.param_grid()
         failed = 0
+        # P-10：P 卡（probability / P2 决策卡）成功行入账带原子预算上限
+        # （检查与写入同一事务）；H 卡不带——共享路径行为逐位不变
+        _p10_budget = ((round_ctx or {}).get("trial_budget")
+                       if getattr(card, "prob", None) else None)
+        _budget_kw = ({} if _p10_budget is None
+                      else {"round_trial_budget": _p10_budget})
+        _budget_voided = False
         for sym in card.symbols:
+            if _budget_voided:
+                break
             bars = bars_by_sym[sym]
             dsha = data_sha256(bars)
             times = bars["time"]
@@ -3111,12 +3153,34 @@ def cmd_screen(args) -> int:
                         cost_model_version=cost_version, gates_hash=gates_hash,
                         metrics=rec_summary, actor=actor,
                         strategy_sha=strategy_sha, run_class=run_class,
-                        round_id=(round_ctx or {}).get("round_id"))
+                        round_id=(round_ctx or {}).get("round_id"),
+                        **_budget_kw)
                     skipped = summary.get("skipped_zero_lots") or 0
                     print(f"✓ run#{rid} {label} -> "
                           f"净利 {summary['net_profit']:.2f} "
                           f"交易 {summary['trade_count']} 笔"
                           + (f"（零手数跳过 {skipped}）" if skipped else ""))
+                except RoundTrialBudgetExceededError as e:
+                    # P-10：预检之后预算被并发占满——该组合作废记 error 行
+                    # （不占预算），剩余组合不再白算（双层循环退出）
+                    failed += 1
+                    rec_params, _ = _prob_run_fields(fit_ctx, params, None)
+                    rid = ledger.record_run(
+                        card_id=card.id, card_version=card.version,
+                        strategy=args.strategy, params=rec_params, symbol=sym,
+                        timeframe=card.timeframe, data_first=data_first,
+                        data_last=data_last, data_sha256=dsha,
+                        engine_version=ENGINE_VERSION,
+                        cost_model_version=cost_version,
+                        gates_hash=gates_hash, metrics=None,
+                        error=f"结果作废：运行期间轮次预算被并发占满（{e}）",
+                        actor=actor,
+                        strategy_sha=strategy_sha, run_class=run_class,
+                        round_id=(round_ctx or {}).get("round_id"))
+                    print(f"✗ run#{rid} {label} -> 预算被并发占满，"
+                          "剩余组合跳过")
+                    _budget_voided = True
+                    break
                 except Exception as e:  # 失败组合也进台账
                     failed += 1
                     rec_params, _ = _prob_run_fields(fit_ctx, params, None)
@@ -3464,7 +3528,22 @@ def cmd_gate(args) -> int:
                 vol_min=(vols_by_sym[symbol][0] if vols_by_sym else None),
                 vol_step=(vols_by_sym[symbol][1] if vols_by_sym else None),
                 vol_max=(vols_by_sym[symbol][2] if vols_by_sym else None))
-            run_id = ledger.record_run(metrics=summary, **common)
+            # P-10：P 卡成功行带原子预算上限（H 卡不带——共享路径行为
+            # 逐位不变）；预算在运行期间被并发占满 → 作废 error 行 + 退 1
+            _p10_budget = ((round_ctx or {}).get("trial_budget")
+                           if getattr(card, "prob", None) else None)
+            _budget_kw = ({} if _p10_budget is None
+                          else {"round_trial_budget": _p10_budget})
+            try:
+                run_id = ledger.record_run(metrics=summary, **_budget_kw,
+                                           **common)
+            except RoundTrialBudgetExceededError as e:
+                run_id = ledger.record_run(
+                    metrics=None,
+                    error=f"结果作废：运行期间轮次预算被并发占满（{e}）",
+                    **common)
+                print(f"✗ run#{run_id} 基准运行作废：{e}")
+                return 1
             print(f"— run#{run_id} {symbol} {card.timeframe} {params} -> "
                   f"净利 {summary['net_profit']:.2f} "
                   f"交易 {summary['trade_count']} 笔")

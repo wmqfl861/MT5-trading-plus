@@ -301,6 +301,14 @@ class LockboxRoundCapExceededError(LockboxReservationError):
     """本轮次（rounds.lockbox_uses_max）的 G5 次数已达上限（D16）。"""
 
 
+# P-10（全局审核 2026-10-29）：试验预算（trial_budget/round_n_dedup，
+# 成功行口径）的检查与 runs 行写入在同一个 BEGIN IMMEDIATE 事务内——
+# 与 H-03 reserve_lockbox_use 同族的"检查+占位一个事务"。仅 P 调用路径
+# 传入该上限；缺省 None 无检查（H 调用路径行为不变）。
+class RoundTrialBudgetExceededError(RuntimeError):
+    """本轮次的试验预算（trial_budget）已满——本次 runs 行不写入。"""
+
+
 def _san(obj):
     """递归把 NaN/inf 换成 None，保证 metrics_json 严格合法（同 report 口径）。"""
     if isinstance(obj, dict):
@@ -874,7 +882,8 @@ class Ledger:
                    error: str | None = None, actor: str = "bt",
                    created_utc=None, strategy_sha: str = "legacy",
                    round_id: str | None = None,
-                   run_class: str | None = None) -> int:
+                   run_class: str | None = None,
+                   round_trial_budget: int | None = None) -> int:
         """记一行运行（成功的与抛异常的 alike）；返回 run_id。
 
         metrics 与 error 二选一（有 error 时 metrics 记 None）；
@@ -888,6 +897,13 @@ class Ledger:
         卡 research；运维通道 reconcile_ab 的 actor=ops 经缺省推断为 ops）；
         缺省 None = 按 actor 推断（run_class_for_actor）；枚举外 →
         ValueError。
+        round_trial_budget（P-10，仅 P 调用路径传入）：给出且 round_id
+        非空时，试验预算检查（round_n_dedup ≥ 上限 → 
+        RoundTrialBudgetExceededError，不写任何行）与写入在同一个
+        BEGIN IMMEDIATE 事务内——两个连接竞争最后一个名额只有一个能
+        提交（与 H-03 reserve_lockbox_use 同族）。round_n_dedup 只计
+        成功行，故该检查只对成功行（error=None）生效；缺省 None /
+        round_id=None / error 非 None → 无检查，H 调用路径行为不变。
         R6/C5：写前验证链（不完整 → LedgerTamperedError，不洗链）；
         追加只延伸链（_append_chained，增量计算 row_hash）。
         R7/N-C3：验链、读链尾、写入、刷快照同一 BEGIN IMMEDIATE 事务
@@ -901,9 +917,26 @@ class Ledger:
                 f"runs.run_class 必须是 {list(RUN_CLASSES)}，收到 "
                 f"{run_class!r}（T80/G4：运行类别由 bt 按候选状态与轮次"
                 "写入，N 的研究口径只看这个字段）")
+        if round_trial_budget is not None and round_trial_budget <= 0:
+            raise ValueError(
+                f"round_trial_budget 必须为正整数，收到 "
+                f"{round_trial_budget!r}——零/负预算应由调用方不发起"
+                "运行表达，而不是写进检查里")
         payload = {"ok": error is None, "error": error, "metrics": metrics}
         with self._txn():
             self._verify_or_raise()
+            # P-10：预算检查与写入同一 BEGIN IMMEDIATE 事务（只对成功行
+            # 生效——round_n_dedup 不计失败行；并发竞争最后一个名额时
+            # 只有一个连接能提交）
+            if (round_trial_budget is not None and round_id is not None
+                    and error is None):
+                used = self.round_n_dedup(round_id)
+                if used >= round_trial_budget:
+                    raise RoundTrialBudgetExceededError(
+                        f"轮次 {round_id} 的试验预算已满"
+                        f"（{used}/{round_trial_budget}，去重口径，"
+                        "P-10：检查与写入同一事务）——本次运行不写入、"
+                        "不占预算")
             return self._append_chained("runs", {
                 "run_id": None,
                 "card_id": card_id, "card_version": card_version,

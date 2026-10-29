@@ -900,6 +900,164 @@ def test_p04_round_report_mixed_round_standard_runs_skipped(
     assert code == 0, out
 
 
+# ------------------------------------------------------------ P-10
+
+P10_ROUND = '''id = "R4"
+opened = "2026-11-02"
+candidates = ["C101"]
+trial_budget = 2
+lockbox_uses_max = 0
+dsr_trial_scope = "project"
+advance_rule = "Holm 显著且成本达标"
+close_rule = "全部假设有结论"
+approved_by = "探针"
+[segments]
+split = "2019-12-01"
+[evaluation.C101]
+mode = "probability"
+primary = "delta_p_one_sided"
+[hypotheses]
+C101 = ["S1:A1:follow>base", "S1:A3:fade>base"]
+'''
+
+
+@pytest.fixture()
+def p10_r4(round_env, monkeypatch):
+    """P-10 夹具：R4 只有 C101（A1+A3 全过预筛），预算 2，预筛行带
+    candidate_sha256 内容绑定（H-08 生效前提）。"""
+    from mt5quant.research.candidates import measured_n_required
+    req2, _ = measured_n_required(2, 0.05)
+    round_env["round"].write_text(P10_ROUND, encoding="utf-8")
+    _git(round_env["repo"], "add", ".")
+    _git(round_env["repo"], "commit", "-q", "-m", "p10-round")
+    cand = round_env["repo"] / "research" / "candidates" / "C101.toml"
+    sha = hashlib.sha256(cand.read_bytes()).hexdigest()
+    with Ledger(round_env["ledger"]) as led:
+        led.record_candidate_check("C101", decision="pass", result={
+            "candidate_sha256": sha,
+            "checks": {"power_prob": {"per_hypothesis": {
+                h: {"trigger_days": req2 + 500, "passed": True}
+                for h in ("S1:A1:follow>base", "S1:A3:fade>base")}},
+                "ex_ante_cost_prob": {
+                    "passed": True, "cost_r_by_symbol": {"XAUUSD": 0.05}}}})
+    code, out = _open_r4(round_env, monkeypatch)
+    assert code == 0, out
+    monkeypatch.setattr(BT, "_bind_strategy_sha",
+                        lambda led, card, ref: "f" * 40)
+    monkeypatch.setattr(BT, "build_costs",
+                        lambda *a, **k: (FlatCosts(), "flat-probe"))
+    return round_env
+
+
+def _h_style_run(ledger, tag):
+    """H 线风格的成功行：record_run 不带 round_trial_budget（H 调用
+    路径），七元组与 P 卡不同。"""
+    ledger.record_run(
+        card_id="H001-v1", card_version=1, strategy=f"h-{tag}",
+        params={"combo": tag}, symbol="XAUUSD", timeframe="H1",
+        data_first=None, data_last=None, data_sha256="b" * 64,
+        engine_version="e", cost_model_version="v", gates_hash="",
+        metrics={"net_profit": 1.0}, actor="bt", round_id="R4")
+
+
+def test_p10_h_occupancy_precheck_rejects_card(p10_r4, monkeypatch):
+    """P-10 验证点 1（预检侧）：H 风格运行先占 1 个名额（预算 2）——P 卡
+    还需 2 条假设 → 预检拒绝（1+2>2），不产生任何行。"""
+    with Ledger(p10_r4["ledger"]) as led:
+        _h_style_run(led, "w1")
+    _commit_card(p10_r4, CARD_R4.format(
+        ref=STRATEGY_REF,
+        hyps='"S1:A1:follow>base", "S1:A3:fade>base"'))
+    code, out = _run_prob_test_card(p10_r4, monkeypatch)
+    assert code == 1
+    assert "预算不足" in out
+    with Ledger(p10_r4["ledger"]) as led:
+        assert len(led.runs_of_round("R4")) == 1     # 只有 H 那一行
+
+
+def test_p10_midrun_budget_exhaustion_voids_rest(p10_r4, monkeypatch):
+    """P-10 验证点 1（原子执行侧）：预检通过（0+2≤2）后、入账前预算被
+    并发占 1 → 第一条假设入账成功（1<2），第二条在写入时被原子拒绝，
+    剩余假设整批作废 error 行（P-05"每条假设恰一行终态"），整体退 1。"""
+    def fake_run_p1_card(card, round_obj, bars_by_symbol, costs_by_symbol,
+                         **kwargs):
+        with Ledger(p10_r4["ledger"]) as led:   # 模拟预检后的并发写入
+            _h_style_run(led, "race")
+        return [{"hypothesis": h, "seed": i + 1, "prob_version": "1.0.0",
+                 "n_triggers": 10, "n_trigger_days": 10,
+                 "real_win_rate": 0.6, "null_win_rate": 0.5,
+                 "delta_p": 0.1, "p_value": 0.01}
+                for i, h in enumerate(("S1:A1:follow>base",
+                                       "S1:A3:fade>base"))]
+    monkeypatch.setattr("mt5quant.prob.p1.run_p1_card", fake_run_p1_card)
+    _commit_card(p10_r4, CARD_R4.format(
+        ref=STRATEGY_REF,
+        hyps='"S1:A1:follow>base", "S1:A3:fade>base"'))
+    code, out = _run_prob_test_card(p10_r4, monkeypatch)
+    assert code == 1
+    assert "作废" in out
+    with Ledger(p10_r4["ledger"]) as led:
+        rows = led.runs_of_round("R4")
+    ok = [r for r in rows if r["ok"]]
+    voided = [r for r in rows if not r["ok"] and "作废" in str(r["error"])]
+    assert len(ok) == 2                      # H 竞争行 + 假设 A1 成功行
+    assert len(voided) == 1                  # A3 作废（恰一行终态）
+    assert voided[0]["params"]["hypothesis"] == "S1:A3:fade>base"
+
+
+def test_p10_h08_candidate_tamper_rejects_prob_test(p10_r4, monkeypatch):
+    """P-10 验证点 4（H-08 准入继承）：开轮后候选登记文件被改（与预筛
+    pass 行绑定的 candidate_sha256 不一致）→ prob test 拒绝——P 路径走
+    共享 _round_context 的 _candidate_frozen_check，自动继承 H-08。"""
+    cand = p10_r4["repo"] / "research" / "candidates" / "C101.toml"
+    cand.write_text(cand.read_text(encoding="utf-8") + "\n# tampered\n",
+                    encoding="utf-8")
+    _commit_card(p10_r4, CARD_R4.format(
+        ref=STRATEGY_REF, hyps='"S1:A1:follow>base"'))
+    code, out = _run_prob_test_card(p10_r4, monkeypatch)
+    assert code == 1
+    assert "预筛通过后被改动" in out
+    with Ledger(p10_r4["ledger"]) as led:
+        assert led.runs_of_round("R4") == []
+
+
+def test_p10_p1_policy_same_source(p10_r4, monkeypatch):
+    """P-10 政策一致（P1 侧）：prob test 传给 run_p1_card 的
+    policy_by_symbol 经 load_session_policy(SESSIONS_PATH)+
+    entry_policy_for 构造——与 P2 screen/gate 同一来源同一构造
+    （test_p10_cross_line.test_p10_screen_policy_from_sessions_source
+    为 P2 侧对应断言）。"""
+    from mt5data.sessions import load_session_policy
+    cap_epf = []
+    captured_pol = {}
+    real_epf = BT.entry_policy_for
+
+    def spy_epf(costs, symbol, base):
+        out = real_epf(costs, symbol, base)
+        cap_epf.append((symbol, base, out))
+        return out
+
+    def fake_run_p1_card(card, round_obj, bars_by_symbol, costs_by_symbol,
+                         *, policy_by_symbol, **kwargs):
+        captured_pol.update(policy_by_symbol)
+        return []
+
+    monkeypatch.setattr(BT, "entry_policy_for", spy_epf)
+    monkeypatch.setattr("mt5quant.prob.p1.run_p1_card", fake_run_p1_card)
+    _commit_card(p10_r4, CARD_R4.format(
+        ref=STRATEGY_REF,
+        hyps='"S1:A1:follow>base", "S1:A3:fade>base"'))
+    code, out = _run_prob_test_card(p10_r4, monkeypatch)
+    assert code == 0, out
+    assert [s for s, _b, _o in cap_epf] == ["XAUUSD"]
+    base_expected = load_session_policy(str(BT.SESSIONS_PATH))
+    for sym, base, result in cap_epf:
+        # 桩成本无 spread 统计可并入 → 原样返回配置源政策
+        assert base == base_expected
+        assert result == base_expected
+    assert captured_pol["XAUUSD"] == base_expected
+
+
 # ---------------------------------------------------------------- P-05
 
 def test_p05_strategy_sha_bound_before_computation(cli_env, monkeypatch):
