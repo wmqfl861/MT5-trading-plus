@@ -2629,18 +2629,26 @@ def cmd_prob_round_report(args) -> int:
         family = _round_frozen_family(round_row, round_obj)
         all_runs = ledger.runs_of_round(round_obj.id)
         # P-04：冻结族之外有成功运行 → 拒绝（开轮移除的假设/别的候选的
-        # 假设跑了成功行，都不得混进本报告的 Holm 族）
-        owner: dict[str, str] = {}
-        for _cid, _hyps in family.items():
-            for _h in _hyps:
-                owner.setdefault(_h, _cid)
+        # 假设跑了成功行，都不得混进本报告的 Holm 族）。
+        # 波次 2 审核 B1：同轮两个候选登记同一假设串时，按假设字符串建
+        # owner 键会把后来候选的合法运行全判成族外而报告死锁——改为
+        # （候选, 假设）成对判定。
+        # 波次 2 审核 B2：无 hypothesis 键的成功运行是同轮 standard 模式
+        # 的 screen/gate 运行（混合评估轮），不属于概率 Holm 族，跳过而
+        # 非判族外——报告只按（候选, 假设）取行，它们进不了 Holm 族。
+        fam_pairs = {(fcid, fh) for fcid, fhyps in family.items()
+                     for fh in fhyps}
+        fam_hyps = {fh for _, fh in fam_pairs}
         extra = []
         for r in all_runs:
             if not r.get("ok"):
                 continue
             h = (r["params"] or {}).get("hypothesis")
+            if h is None:
+                continue
             rc = ((r["params"].get("prob") or {}).get("candidate"))
-            if h not in owner or (rc and rc != owner[h]):
+            in_family = (rc, h) in fam_pairs if rc else h in fam_hyps
+            if not in_family:
                 extra.append(r)
         if extra:
             print(f"✗ 本轮有冻结假设族之外的成功运行（run#"

@@ -842,6 +842,64 @@ def test_p04_round_report_no_disk_precheck_fallback(cli_env, monkeypatch,
     assert "没有预筛记录" in out.getvalue()
 
 
+def test_p04_round_report_shared_hypothesis_two_candidates(
+        round_env, monkeypatch):
+    """波次 2 审核 B1：同轮两个候选登记同一假设串——owner 按假设字符串
+    建键会把 C102 的成功运行判成族外（且家族又要求它有运行），报告死锁。
+    按（候选, 假设）成对判定后应正常出报告。"""
+    from mt5quant.research.candidates import measured_n_required
+    req2, _ = measured_n_required(2, 0.05)
+    # C102 的候选登记也包含共享假设串（开轮交叉校验：轮次 ⊆ 候选登记）
+    cand2 = round_env["repo"] / "research" / "candidates" / "C102.toml"
+    cand2.write_text(cand2.read_text(encoding="utf-8").replace(
+        'hypotheses = ["S1:A2:follow>base"]',
+        'hypotheses = ["S1:A1:follow>base"]'), encoding="utf-8")
+    p = round_env["round"]
+    p.write_text(p.read_text(encoding="utf-8").replace(
+        'C101 = ["S1:A1:follow>base", "S1:A3:fade>base"]',
+        'C101 = ["S1:A1:follow>base"]').replace(
+        'C102 = ["S1:A2:follow>base"]',
+        'C102 = ["S1:A1:follow>base"]'), encoding="utf-8")
+    _git(round_env["repo"], "add", ".")
+    _git(round_env["repo"], "commit", "-q", "-m", "shared-hyp")
+    with Ledger(round_env["ledger"]) as led:
+        for cid in ("C101", "C102"):
+            _power_precheck(led, cid, {
+                "S1:A1:follow>base": {"trigger_days": req2 + 500,
+                                      "passed": True}})
+    code, out = _open_r4(round_env, monkeypatch)
+    assert code == 0, out
+    with Ledger(round_env["ledger"]) as led:
+        _record_r4_run(led, cid="C101", hyp="S1:A1:follow>base")
+        _record_r4_run(led, cid="C102", hyp="S1:A1:follow>base", seed=2)
+    code, out = _run_round_report(round_env, monkeypatch)
+    assert code == 0, out
+
+
+def test_p04_round_report_mixed_round_standard_runs_skipped(
+        r4_open, monkeypatch):
+    """波次 2 审核 B2：混合评估轮（probability + standard 同轮）——
+    standard 卡的 screen/gate 成功运行 params 无 hypothesis 键，不属于
+    概率 Holm 族，应跳过而非判族外（否则 P1 报告永远出不来）。"""
+    with Ledger(r4_open["ledger"]) as led:
+        _record_r4_run(led, cid="C101", hyp="S1:A1:follow>base")
+        _record_r4_run(led, cid="C102", hyp="S1:A2:follow>base")
+        # 同轮 standard P2 卡的 screen 运行（_prob_run_fields：有 prob
+        # 试验身份、无 hypothesis/candidate 键）
+        led.record_run(
+            card_id="P201-v1", card_version=1, strategy=STRATEGY_REF,
+            params={"prob": {"segment": "validation",
+                             "split": "2019-12-01",
+                             "bracket": {"sl_atr": 1.0, "tp_atr": 2.0,
+                                         "horizon_bars": 8}}},
+            symbol="XAUUSD", timeframe="H1", data_first=None,
+            data_last=None, data_sha256="a" * 64, engine_version="e",
+            cost_model_version="v", gates_hash="", metrics={},
+            actor="bt", round_id="R4")
+    code, out = _run_round_report(r4_open, monkeypatch)
+    assert code == 0, out
+
+
 # ---------------------------------------------------------------- P-05
 
 def test_p05_strategy_sha_bound_before_computation(cli_env, monkeypatch):
