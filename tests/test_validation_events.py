@@ -794,3 +794,42 @@ def test_v3_event_diagnostics_reports_four_items():
     # 已知缺口注记：与 2021-03 事件窗相交 → 命中 ≥1
     assert len(diags["known_gaps"]["hits"]) >= 1
     assert diags["known_gaps"]["passed"] is True   # 注记只报告，恒不否决
+
+
+# ------------------------------------- H-07：ScaledCosts 的 swap 分量随 factor 缩放
+
+def test_h07_robustness_scaled_costs_swap_scales_overnight():
+    """H-07 失败测试：robustness.ScaledCosts 补 swap 分量——event_returns
+    直接读 costs.swap.rule，修复前 ScaledCosts 无 swap → ×1.5 后隔夜费
+    变 0（审核复现：原 0.002 → 缩放后 0）。修复后 0.002 → 0.003，
+    factor=1 逐位一致。"""
+    from mt5quant.validation import robustness as rob
+
+    rule = SwapRule(long_per_day=-0.002, short_per_day=-0.002,
+                    triple_weekdays=frozenset())
+    base = ConstCosts(spread=0.0, slippage=0.0, commission=0.0,
+                      swap=SwapModel({"TST": rule}))
+    # D1 bars，收盘恒 1.0：ref_price=1.0、contract_size=1.0 → notional=1，
+    # overnight（相对价格）= 夜数 × |费率|。窗口 (周一0点, 周二0点] 恰含
+    # 周一 17:00 NY 计费时刻 → 1 夜。
+    bars = daily_bars(pd.date_range("2024-01-01", periods=3, freq="D"),
+                      closes=[1.0, 1.0, 1.0])
+    events = [ev.EventWindow(kind="test", label="t1",
+                             entry_time=pd.Timestamp("2024-01-01"),
+                             exit_time=pd.Timestamp("2024-01-02"))]
+    kw = dict(side_fn=always_long, symbol="TST", contract_size=1.0)
+
+    frame = ev.event_returns(bars, events, costs=base, **kw)
+    assert frame["overnight"].iloc[0] == pytest.approx(0.002)
+    assert frame["nights"].iloc[0] == 1
+
+    scaled = ev.event_returns(bars, events, costs=rob.ScaledCosts(base, 1.5),
+                              **kw)
+    assert scaled["overnight"].iloc[0] == pytest.approx(0.003)   # 非 0
+    assert scaled["net"].iloc[0] == pytest.approx(
+        frame["net"].iloc[0] - 0.001)
+
+    same = ev.event_returns(bars, events, costs=rob.ScaledCosts(base, 1.0),
+                            **kw)
+    assert same["overnight"].iloc[0] == pytest.approx(0.002)      # factor=1
+    assert same["net"].iloc[0] == pytest.approx(frame["net"].iloc[0])

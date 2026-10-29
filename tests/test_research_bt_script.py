@@ -1319,6 +1319,18 @@ def test_gate_g4_round_n_when_card_in_round(tmp_path, monkeypatch, capsys):
         "[rules]", 'round = "R1"\ncandidate = "C001"\n\n[rules]')
     cards_dir = write_card(tmp_path, body)
     ledger_path = tmp_path / "ledger.sqlite"
+    # H-08：轮次以冻结快照为准——铺台账行的同时铺出内容一致的轮次文件
+    # （toml_sha256 = 文件真实哈希），否则 _round_context 按快照失联拒绝
+    import hashlib
+    rnd_dir = tmp_path / "rounds"
+    rnd_dir.mkdir(exist_ok=True)
+    rnd_body = ('id = "R1"\nopened = "2026-10-27"\ncandidates = ["C001"]\n'
+                'trial_budget = 10\nlockbox_uses_max = 1\n'
+                'dsr_trial_scope = "family"\nadvance_rule = "按 advance_rule"'
+                '\nclose_rule = "按 close_rule"\napproved_by = "user"\n'
+                '\n[evaluation]\n'
+                'C001 = { mode = "standard", primary = "dsr_v0" }\n')
+    (rnd_dir / "R1.toml").write_text(rnd_body, encoding="utf-8")
     with Ledger(ledger_path) as led:          # 直接铺轮次上下文（绕过 CLI
         led.record_candidate_check(           # 前置：候选最新 decision=pass）
             "C001", decision="pass", result={"candidate_id": "C001"})
@@ -1327,7 +1339,9 @@ def test_gate_g4_round_n_when_card_in_round(tmp_path, monkeypatch, capsys):
             lockbox_uses_max=1, dsr_trial_scope="family",
             advance_rule="按 advance_rule", close_rule="按 close_rule",
             approved_by="user", evaluation={},
-            toml_sha256="0" * 64, git_commit="0" * 40)
+            toml_sha256=hashlib.sha256(
+                (rnd_dir / "R1.toml").read_bytes()).hexdigest(),
+            git_commit="0" * 40)
     patch_card_git(monkeypatch, mod,
                    committed=datetime(2026, 10, 27, tzinfo=timezone.utc))
     rc = mod.main(

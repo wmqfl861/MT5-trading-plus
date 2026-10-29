@@ -92,6 +92,8 @@ def run_g3(spec: BacktestSpec, bars, costs, *, grid, in_sample_sharpe, cfg,
     read_known_gaps 读取的已知缺口）与某段训练∪测试窗相交 → 该段记
     sample_incomplete 并在 known_gaps_note 注明"样本不完整"——只注记，
     不改变段数与通过判定（事件研究 T66 建成后接第三个消费点）。
+    H-06：禁入政策经 spec.session_policy 随 BacktestSpec 进入全部复算
+    （训练窗选参与测试窗出样本外结果都吃同一禁入口径，与基准一致）。
     """
     strategy = spec.strategy
     lookback = max(int(getattr(strategy.required_data, "lookback_bars", 0) or 0), 0)

@@ -24,7 +24,8 @@ CUTOFF = "2026-04-01T00:00:00"
 
 
 def g3_card(led, card_id):
-    """登记一条 G3 通过记录（begin_lockbox 的前置）。"""
+    """登记一条当前通过的完整试验记录（H-02 起 begin_lockbox 的前置：
+    G3 与 V3 都通过，且试验身份 = _trial() 的绑定值）。"""
     rid = led.record_run(
         card_id=card_id, card_version=1, strategy="s:Donchian", params={},
         symbol="XAUUSD", timeframe="H1", data_first="2024-01-01",
@@ -32,7 +33,16 @@ def g3_card(led, card_id):
         engine_version="A-1.5", cost_model_version="zero-v0",
         gates_hash="", metrics={"sharpe": 1.0}, actor="test")
     led.record_gate(rid, "G3", True, {})
+    led.record_gate(rid, "V3", True, {})
     return rid
+
+
+def _trial(**over):
+    """与 g3_card 登记的试验身份一致的 LockboxTrial（H-02 绑定）。"""
+    kw = dict(params={}, data_sha256="a" * 64, cost_model_version="zero-v0",
+              strategy_sha="legacy", gates_hash="")
+    kw.update(over)
+    return vg.LockboxTrial(**kw)
 
 
 class _Card:
@@ -133,14 +143,14 @@ def test_sixth_use_refused_after_five_uses_default_budget(tmp_path):
         for i in range(1, 6):               # 5 张卡各用一次
             g3_card(led, f"H81{i}")
             vg.begin_lockbox(led, _Card(f"H81{i}"), approved_by="u",
-                             cutoff=CUTOFF)
+                             cutoff=CUTOFF, trial=_trial())
         b = led.lockbox_budget(CUTOFF)
         assert b["used"] == 5 and b["exhausted"] is True
         g3_card(led, "H816")
         with pytest.raises(vg.LockboxBudgetExhaustedError,
                            match="H816.*预算.*5"):
             vg.begin_lockbox(led, _Card("H816"), approved_by="u",
-                             cutoff=CUTOFF)
+                             cutoff=CUTOFF, trial=_trial())
         # 拒绝不烧该卡的一次性：无 started 行
         assert led.lockbox_used("H816") is False
 
@@ -153,7 +163,8 @@ def test_exhausted_budget_refuses_run_g5_direct_path(tmp_path):
     with Ledger(tmp_path / "l.sqlite") as led:
         led.lockbox_budget(CUTOFF, 1)
         g3_card(led, "H820")
-        vg.begin_lockbox(led, _Card("H820"), approved_by="u", cutoff=CUTOFF)
+        vg.begin_lockbox(led, _Card("H820"), approved_by="u", cutoff=CUTOFF,
+                         trial=_trial())
         g3_card(led, "H821")
         with pytest.raises(vg.LockboxBudgetExhaustedError, match="H821"):
             vg.run_g5(
@@ -178,7 +189,8 @@ def test_run_g5_does_not_recheck_budget_for_started_card(tmp_path):
     with Ledger(tmp_path / "l.sqlite") as led:
         led.lockbox_budget(CUTOFF, 1)
         g3_card(led, "H830")
-        vg.begin_lockbox(led, _Card("H830"), approved_by="u", cutoff=CUTOFF)
+        vg.begin_lockbox(led, _Card("H830"), approved_by="u", cutoff=CUTOFF,
+                         trial=_trial())
         assert led.lockbox_budget(CUTOFF)["exhausted"] is True
         out = vg.run_g5(
             led, _Card("H830"),
@@ -205,9 +217,11 @@ def test_run_g5_without_cutoff_skips_budget(tmp_path):
     with Ledger(tmp_path / "l.sqlite") as led:
         led.lockbox_budget(CUTOFF, 1)
         g3_card(led, "H820")
-        vg.begin_lockbox(led, _Card("H820"), approved_by="u")  # 无 cutoff
+        vg.begin_lockbox(led, _Card("H820"), approved_by="u",
+                         trial=_trial())                       # 无 cutoff
         g3_card(led, "H831")
-        vg.begin_lockbox(led, _Card("H831"), approved_by="u")  # 不受预算约束
+        vg.begin_lockbox(led, _Card("H831"), approved_by="u",
+                         trial=_trial())                       # 不受预算约束
         assert led.lockbox_used("H831") is True
 
 
@@ -266,3 +280,107 @@ def test_record_lockbox_use_accepts_cutoff(tmp_path):
         led.finish_lockbox_use("H841", result={"passed": True},
                                cutoff=CUTOFF)
         assert led.lockbox_budget(CUTOFF)["used"] == 2
+
+
+# ------------------------------------------ H-03：预算检查与占位是一个事务
+
+from concurrent.futures import ThreadPoolExecutor
+
+from mt5quant.research import ledger as _lm
+
+
+def test_h03_race_last_budget_slot_single_winner(tmp_path):
+    """H-03 失败测试：两个连接竞争最后一个额度（max_uses=1）——必须一个
+    成功一个拒绝；审核复现的 used=2/max=1 不允许再出现；链保持可验证。"""
+    p = tmp_path / "race.sqlite"
+    with Ledger(p) as led:
+        led.lockbox_budget(CUTOFF, 1)
+        g3_card(led, "H901")
+        g3_card(led, "H902")
+
+    def reserve(card_id):
+        with Ledger(p) as led:
+            try:
+                led.reserve_lockbox_use(card_id, approved_by="u",
+                                        cutoff=CUTOFF)
+                return card_id, None
+            except Exception as e:                     # noqa: BLE001
+                return card_id, type(e).__name__
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(reserve, ["H901", "H902"]))
+    ok = [c for c, e in outcomes if e is None]
+    refused = [e for _c, e in outcomes if e is not None]
+    assert len(ok) == 1, outcomes
+    assert refused == ["LockboxProjectBudgetExhaustedError"], outcomes
+    with Ledger(p) as led:
+        b = led.lockbox_budget(CUTOFF)
+        assert (b["used"], b["max_uses"]) == (1, 1)    # 绝不 used=2/max=1
+        assert led.verify_chain() == []
+
+
+def test_h03_crash_restart_does_not_double_reserve(tmp_path):
+    """H-03：占位持久（started 已入链）——"崩溃重启"后同一卡的再次占位
+    被拒，预算计数仍是 1。"""
+    p = tmp_path / "crash.sqlite"
+    with Ledger(p) as led:
+        led.lockbox_budget(CUTOFF, 2)
+        led.reserve_lockbox_use("H903", approved_by="u", cutoff=CUTOFF)
+    with Ledger(p) as led:                             # 新连接 = 重启
+        with pytest.raises(_lm.LockboxCardUsedError):
+            led.reserve_lockbox_use("H903", approved_by="u", cutoff=CUTOFF)
+        assert led.lockbox_budget(CUTOFF)["used"] == 1
+        assert led.lockbox_status("H903") == "started"
+
+
+def test_h03_same_trial_retry_is_idempotent_single_slot(tmp_path):
+    """H-03：同试验幂等重试——第二次 reserve 拒绝且不重复占位（used 与
+    started 行数都不翻倍）。"""
+    with Ledger(tmp_path / "l.sqlite") as led:
+        led.lockbox_budget(CUTOFF, 5)
+        led.reserve_lockbox_use("H904", approved_by="u", cutoff=CUTOFF)
+        for _ in range(2):
+            with pytest.raises(_lm.LockboxCardUsedError):
+                led.reserve_lockbox_use("H904", approved_by="u",
+                                        cutoff=CUTOFF)
+        assert led.lockbox_budget(CUTOFF)["used"] == 1
+        n = led.conn.execute(
+            "SELECT COUNT(*) n FROM lockbox_uses").fetchone()["n"]
+        assert n == 1
+        assert led.verify_chain() == []
+
+
+def test_h03_round_cap_enforced_inside_reservation_txn(tmp_path):
+    """H-03：轮次锁箱上限（lockbox_uses_max）在同一占位事务内复查——
+    同轮已用满 → 拒且不留 started 行（不再依赖运行前的 check-then-act）。"""
+    with Ledger(tmp_path / "l.sqlite") as led:
+        led.record_run(card_id="H905", card_version=1, strategy="s:X",
+                       params={}, symbol="XAUUSD", timeframe="H1",
+                       data_first="2024-01-01", data_last="2026-01-01",
+                       data_sha256="a" * 64, engine_version="A-1",
+                       cost_model_version="zero-v0", gates_hash="",
+                       metrics={"net": 1.0}, actor="test", round_id="R1")
+        led.record_lockbox_use("H905", approved_by="u", result={})
+        led.lockbox_budget(CUTOFF, 5)
+        with pytest.raises(_lm.LockboxRoundCapExceededError):
+            led.reserve_lockbox_use("H906", approved_by="u", cutoff=CUTOFF,
+                                    round_id="R1", round_lockbox_uses_max=1)
+        assert led.lockbox_used("H906") is False
+        assert led.lockbox_budget(CUTOFF)["used"] == 0    # 预算未扣
+
+
+def test_h03_begin_lockbox_maps_reservation_errors(tmp_path):
+    """H-03/H-02 集成：begin_lockbox 走原子占位——预算用尽映射回
+    LockboxBudgetExhaustedError（消息含卡号与计数），且不烧该卡一次性。"""
+    with Ledger(tmp_path / "l.sqlite") as led:
+        led.lockbox_budget(CUTOFF, 1)
+        g3_card(led, "H907")
+        g3_card(led, "H908")
+        vg.begin_lockbox(led, _Card("H907"), approved_by="u", cutoff=CUTOFF,
+                         trial=_trial())
+        with pytest.raises(vg.LockboxBudgetExhaustedError,
+                           match="H908.*预算.*1"):
+            vg.begin_lockbox(led, _Card("H908"), approved_by="u",
+                             cutoff=CUTOFF, trial=_trial())
+        assert led.lockbox_used("H908") is False
+        assert led.lockbox_budget(CUTOFF)["used"] == 1

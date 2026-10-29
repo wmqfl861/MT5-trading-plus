@@ -804,3 +804,89 @@ def test_round_lockbox_uses_max_capped_at_one_per_round(tmp_path):
         load_round(write_round(2))
     r = load_round(write_round(1))
     assert r.lockbox_uses_max == 1
+
+
+# ------------------------------------- H-08：轮次/候选以冻结快照为准
+
+import hashlib
+
+
+def test_h08_round_file_modified_after_open_rejects_screen(tmp_path,
+                                                           monkeypatch,
+                                                           capsys):
+    """H-08 失败测试 1：开轮后改轮次文件（预算/分界/假设表）→ 后续
+    screen 在结果计算之前拒绝（当前文件 hash 与开启轮次入账的
+    toml_sha256 不一致），不产生任何 runs。"""
+    mod = load_bt()
+    root = make_data_root(tmp_path / "data")
+    cards_dir = write_card(tmp_path)
+    ledger_path = tmp_path / "ledger.sqlite"
+    assert open_round(mod, tmp_path, ledger_path, monkeypatch) == 0
+    # 开轮后改预注册内容（trial_budget 40 → 41）
+    rpath = tmp_path / "rounds" / "R1.toml"
+    rpath.write_text(rpath.read_text(encoding="utf-8").replace(
+        "trial_budget = 40", "trial_budget = 41"), encoding="utf-8")
+    patch_strategy_fp(monkeypatch, mod)
+    rc = run_screen(mod, cards_dir, root, ledger_path)
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "R1.toml" in out and "不一致" in out
+    with Ledger(ledger_path) as led:
+        assert led.conn.execute(
+            "SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+
+
+def test_h08_candidate_modified_after_pass_requires_recheck(tmp_path,
+                                                            monkeypatch,
+                                                            capsys):
+    """H-08 失败测试 2：候选 pass 记录绑定候选内容——预筛通过后改候选
+    登记文件 → screen 拒（须重新 bt candidate check 绑定新内容）；重检
+    后才放行。"""
+    mod = load_bt()
+    root = make_data_root(tmp_path / "data")
+    cards_dir = write_card(tmp_path)
+    cdir = tmp_path / "candidates"
+    cdir.mkdir()
+    cpath = cdir / "C001.toml"
+    body = 'id = "C001"\ntitle = "月末效应"\n'
+    cpath.write_text(body, encoding="utf-8")
+    ledger_path = tmp_path / "ledger.sqlite"
+    rdir = write_round(tmp_path)
+    with Ledger(ledger_path) as led:
+        led.record_candidate_check("C001", decision="pass", result={
+            "candidate_id": "C001", "decision": "pass",
+            "candidate_sha256": hashlib.sha256(
+                cpath.read_bytes()).hexdigest()})
+    patch_git(monkeypatch, mod)
+    assert mod.main(["round", "open", "R1", "--rounds-dir", str(rdir),
+                     "--ledger", str(ledger_path)]) == 0
+    # 预筛通过后改候选登记
+    cpath.write_text(body + '# tuned after pass\n', encoding="utf-8")
+    patch_strategy_fp(monkeypatch, mod)
+    rc = run_screen(mod, cards_dir, root, ledger_path)
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "C001" in out and ("重新" in out or "candidate check" in out)
+    with Ledger(ledger_path) as led:
+        assert led.conn.execute(
+            "SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+    # 重新预筛（绑定新内容）后才放行
+    with Ledger(ledger_path) as led:
+        led.record_candidate_check("C001", decision="pass", result={
+            "candidate_id": "C001", "decision": "pass",
+            "candidate_sha256": hashlib.sha256(
+                cpath.read_bytes()).hexdigest()})
+    rc = run_screen(mod, cards_dir, root, ledger_path)
+    assert rc == 0, capsys.readouterr().out
+
+
+def test_h08_round_eval_mode_broken_file_fails_closed(tmp_path):
+    """H-08 失败测试 3：_round_eval_mode 的模式文件坏了即失败——不再
+    回退普通（bar 级）模式静默放行。"""
+    mod = load_bt()
+    cards_dir = write_card(tmp_path)
+    rdir = write_round(tmp_path)
+    (rdir / "R1.toml").write_text("id = [broken\n", encoding="utf-8")
+    card = mod.cards.load_card(cards_dir / "H100.toml")
+    with pytest.raises(RoundError):
+        mod._round_eval_mode(card)

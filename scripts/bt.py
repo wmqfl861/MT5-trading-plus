@@ -19,10 +19,14 @@
   运行约束：screen/gate 只接受属于已开启轮次的卡（卡 round/candidate
   字段对上台账轮次行且候选 screened_pass；轮次关闭后拒；台账一旦有
   轮次，不带轮次字段的卡拒——轮次制之前的旧卡仅在 rounds 空的台账上
-  运行）；本轮去重试验数达 trial_budget 拒新试验；本轮 G5 次数达
-  lockbox_uses_max 拒（标定样品运行 actor=calibration 豁免——不进轮次
-  统计）。bt round close 生成 docs/research/round-R#-<日期>.md 骨架
-  （列全部运行含失败 + 按 advance_rule 的判定占位）并关闭轮次。
+  运行）；H-08 起轮次/候选以**冻结快照**为准——当前轮次文件 sha256 须
+  与开启时入账的 toml_sha256 一致（开轮后改文件拒），候选 pass 记录
+  绑定候选内容（改候选登记须重新 bt candidate check 才生效），模式
+  文件损坏即失败不回退；本轮去重试验数达 trial_budget 拒新试验；本轮
+  G5 次数达 lockbox_uses_max 拒（占位事务内复查；标定样品运行
+  actor=calibration 豁免——不进轮次统计）。bt round close 生成
+  docs/research/round-R#-<日期>.md 骨架（列全部运行含失败 + 按
+  advance_rule 的判定占位）并关闭轮次。
 - 候选预筛（T62/D31，铁律 17/18）：bt candidate check 读附录 C 候选登记
   → precheck 五条件（文献/持仓 ≥H1/事前成本倍数 ≥3/检验力 ≥50%/机制空缺）
   → 写 research/candidates/C###.precheck.json 并记入台账 candidate_checks
@@ -61,10 +65,14 @@
   枚举：max_net_profit / max_sharpe）从同 data_sha256 + cost_model_version
   的 screen 运行里自动选参，候选数与选中 run_id 写进关卡报告与 gates 表
   details（params_selection）；显式 --params 记 selection="manual"。
-- G5 编排（T21a 协议）：_g5_orchestrate = 参照重建（G3 拼接的样本外收益，
-  只读研究段）→ begin_lockbox（读锁箱数据**之前**写 started）→
-  load_lockbox_window（cutoff 前卡策略声明的 lookback_bars 根起步）→
-  回测（交易与收益只计 cutoff 后）→ run_g5（单侧判定，写终态 done）。
+- G5 编排（T21a 协议；H-02/H-03 修订）：关卡结果随评估**即时入账**
+  （先可靠保存研究关卡结果），_g5_orchestrate = 参照重建（G3 拼接的
+  样本外收益，只读研究段）→ begin_lockbox（读锁箱数据**之前**原子占位：
+  绑定当前试验身份 LockboxTrial——参数/数据哈希/成本版本/代码指纹/
+  冻结门槛 + 当前通过的 G3 与 V3 判决，历史成功不授权；项目预算/轮次
+  上限/卡一次性的检查与 started 写入同一事务）→ load_lockbox_window
+  （cutoff 前卡策略声明的 lookback_bars 根起步）→ 回测（交易与收益
+  只计 cutoff 后）→ run_g5（单侧判定，写终态 done）。
 - G4（T21c 接线；T64/D33 取数口径）：n_trials 与试验夏普按
   (strategy, params, symbol, timeframe, data_sha256, cost_model_version,
   strategy_sha) 去重（_dedup_trial_sharpes，同参 screen+gate 只计 1），
@@ -92,7 +100,9 @@
   一切复算经 BacktestSpec.sizing 沿用同一口径。
 - 禁入窗（T20）：screen/gate 默认加载 config/sessions.toml（与 run_backtest、
   实盘风控共用），基准运行与锁箱运行按禁入窗推迟开仓；其 sha256 随
-  cost_model_version 写进台账。
+  cost_model_version 写进台账。H-06 起 G2–G5/V3 的一切关卡复算经
+  BacktestSpec.session_policy / run_g2(policies_by_symbol) 沿用同一
+  逐品种禁入政策（复算不再丢掉换日/低样本小时禁入）。
 - gates_hash：config/gates.toml 存在时取 vgate.gates_sha256（LF 归一，
   与 load_gates 同口径——探针 P7：裸字节哈希在 CRLF 检出下两侧不一致），
   否则空串（T12 起强制核对）。
@@ -121,6 +131,7 @@
   链式锚 + --verify 校验模式，R6/C5）。
 """
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -332,7 +343,55 @@ def _round_path(value: str, rounds_dir: Path) -> Path:
     return rounds_dir / f"{value}.toml"
 
 
-def _round_context(ledger, card, *, actor: str, wanted_gates=()):
+def _round_file_path(card) -> Path:
+    """卡所属轮次的预注册文件路径（cards/ 的兄弟目录 rounds/）。
+
+    卡对象无 path（替身/不完整装载）→ RoundError（fail-closed：轮次
+    以冻结快照为准，定位不到预注册文件即无从核对）。"""
+    p = getattr(card, "path", "")
+    if not p:
+        raise rnd.RoundError(
+            f"卡 {getattr(card, 'id', '?')!r} 无文件路径——轮次预注册无从"
+            "定位（H-08：轮次以冻结快照为准，定位不到文件即无从核对）")
+    return Path(p).parent.parent / "rounds" / f"{card.round}.toml"
+
+
+def _candidate_frozen_check(ledger, candidate_id: str,
+                            candidates_dir: Path) -> str | None:
+    """H-08：候选 pass 记录绑定候选内容——最新 pass 行带 candidate_sha256
+    时，当前文件 hash 须与绑定值一致；不一致 → 返回错误信息（改候选须
+    重新 bt candidate check 绑定新内容后才生效）。旧记录（无绑定键，
+    H-08 之前的预筛行）不强制——内容绑定自新记录起生效。"""
+    rows = ledger.candidate_checks(candidate_id)
+    if not rows:
+        return None                      # 无记录：由 screened_pass 前置拦
+    last = rows[-1]
+    raw = last["result_json"] if "result_json" in last.keys() else None
+    if raw is None:
+        return None                      # 无 result_json（旧形态/替身）——无绑定可核
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return (f"候选 {candidate_id} 最新预筛记录不可解析（result_json"
+                "损坏）——预筛结论不可信，须重新 bt candidate check")
+    bound = (payload or {}).get("candidate_sha256")
+    if not bound:
+        return None                      # 旧记录未绑定（H-08 前的兼容）
+    p = Path(candidates_dir) / f"{candidate_id}.toml"
+    if not p.is_file():
+        return (f"候选登记 {p} 不存在——预筛通过绑定的内容快照无从核对"
+                "（H-08：候选内容与预筛结论必须一致）")
+    cur = hashlib.sha256(p.read_bytes()).hexdigest()
+    if cur != bound:
+        return (f"候选 {candidate_id} 的登记文件在预筛通过后被改动"
+                f"（当前 sha256 {cur[:12]}… vs 预筛绑定的 {str(bound)[:12]}…，"
+                "H-08）——改动作为新候选内容须重新 bt candidate check "
+                "（重检绑定新内容）后才可在轮次内运行")
+    return None
+
+
+def _round_context(ledger, card, *, actor: str, wanted_gates=(),
+                   round_file=None):
     """T63/D32（铁律 16）：研究卡只能属于**已开启**轮次——运行约束的统一
     入口（screen/gate 共用）。返回：
 
@@ -346,6 +405,12 @@ def _round_context(ledger, card, *, actor: str, wanted_gates=()):
     与 T61 _enforce_candidate_status 协同：状态检查（withdrawn/specimen）
     在前（无台账），轮次检查在后（需台账）——两者语义都保留：撤回卡
     先被 T61 拒；轮次约束只在研究运行上生效。
+
+    H-08（全局审核 2026-10-29）：轮次以**冻结快照**为准——当前轮次文件
+    hash 必须与开启轮次入账的 toml_sha256 一致（开轮后改预算/分界/假设
+    表/候选名单无效，改动须登记新轮次）；候选 pass 记录绑定的内容 hash
+    与当前候选文件一致（改候选须重检）。round_file 显式给出时以它为
+    准（调用方已定位预注册文件的路径，如 _prob_preconditions）。
     """
     if actor == "calibration":
         return None                     # 标定样品：不进入研究轮次统计
@@ -368,6 +433,26 @@ def _round_context(ledger, card, *, actor: str, wanted_gates=()):
               "——关闭后该轮不能再运行；后续试验须预注册新轮次"
               "（research/rounds/R#.toml 提交后 bt round open）")
         return False
+    # H-08：冻结快照——开轮后改轮次文件（预算/分界/假设表/评估方式）
+    # 一律拒绝；文件缺失同样拒绝（快照无从核对）。
+    try:
+        rnd_path = (Path(round_file) if round_file is not None
+                    else _round_file_path(card))
+    except rnd.RoundError as e:
+        print(f"✗ {e}")
+        return False
+    if not rnd_path.is_file():
+        print(f"✗ 轮次文件 {rnd_path} 不存在——开启轮次时入账的预注册"
+              f"（toml_sha256={str(row['toml_sha256'])[:12]}…）无从核对"
+              "（H-08：轮次以冻结快照为准），恢复文件或登记新轮次")
+        return False
+    file_sha = hashlib.sha256(rnd_path.read_bytes()).hexdigest()
+    if file_sha != row["toml_sha256"]:
+        print(f"✗ 轮次文件 {rnd_path.name} 与开启时入账的内容不一致"
+              f"（sha256 {file_sha[:12]}… vs 台账 {str(row['toml_sha256'])[:12]}"
+              "…）——开轮后改预注册（分界/假设族/预算/评估方式）无效"
+              "（H-08：轮次以冻结快照为准）；改动作为新轮次登记")
+        return False
     candidates = json.loads(row["candidates_json"])
     if card.candidate not in candidates:
         print(f"✗ 卡 {card.id} 的候选 {card.candidate} 不在轮次 {card.round}"
@@ -380,6 +465,13 @@ def _round_context(ledger, card, *, actor: str, wanted_gates=()):
                 if latest else "台账无预筛记录（candidate_checks 空）")
         print(f"✗ 候选 {card.candidate} {what}——screened_pass（最新"
               " decision=pass）是轮次内运行的持续前置（T62/D31+T63）")
+        return False
+    # H-08：候选 pass 记录绑定候选内容（改候选须重检才生效）；候选登记
+    # 目录 = 轮次文件的兄弟目录（research/candidates）
+    frozen_err = _candidate_frozen_check(
+        ledger, card.candidate, rnd_path.parent.parent / "candidates")
+    if frozen_err is not None:
+        print(f"✗ {frozen_err}")
         return False
     if "G5" in wanted_gates:
         used = ledger.round_lockbox_uses(card.round)
@@ -905,14 +997,14 @@ _FAMILY_ID_RE = re.compile(r"^[A-Z]+\d{2,}$")
 def _round_eval_mode(card) -> str:
     """轮次预注册 [evaluation] 里该卡候选的评估 mode（T86 事件分支判定：
     mode="event" → 关卡 V3 走 [v3.event] 事件分支；其余/无轮次 → bar 级
-    标准分支）。评估方式是预注册内容（附录 D），bt 只读不改。"""
+    标准分支）。评估方式是预注册内容（附录 D），bt 只读不改。
+
+    H-08：模式文件损坏/缺失 → RoundError（fail-closed，绝不回退 bar 级
+    普通模式静默放行——评估方式是预注册约束，读不到即无从判定）。"""
     if not card.round or not card.candidate:
         return ""
-    rnd_path = Path(card.path).parent.parent / "rounds" / f"{card.round}.toml"
-    try:
-        round_obj = rnd.load_round(rnd_path)
-    except rnd.RoundError:
-        return ""
+    rnd_path = _round_file_path(card)
+    round_obj = rnd.load_round(rnd_path)      # RoundError 直接上抛（H-08）
     ev = (round_obj.evaluation or {}).get(card.candidate) or {}
     return str(ev.get("mode", "") or "")
 
@@ -1128,15 +1220,19 @@ def _v3_gate_evaluate(ledger, card, *, cfg, ctx, cards_dir, strategy, spec,
 
 def _g5_orchestrate(ledger, card, *, strategy, spec, params, base_summary,
                     bars, costs, session_policy, data_root, approved_by,
-                    cfg) -> dict:
-    """G5 编排（T21a 协议，T21e 接线）：
+                    cfg, trial, round_id=None, round_lockbox_uses_max=None
+                    ) -> dict:
+    """G5 编排（T21a 协议，T21e 接线；H-02/H-03 修订）：
 
     1. 参照重建（_g3_reference_returns，只读研究段；失败不消耗一次性）；
-    2. begin_lockbox：读锁箱数据**之前**写 started（未批准/未过 G3/已用过
-       /预算用尽（T27：cutoff 级 max_uses，默认 5）→ 如实抛
+    2. begin_lockbox：读锁箱数据**之前**原子占位——trial（H-02）绑定当前
+       试验身份（参数/数据哈希/成本版本/代码指纹/冻结门槛 + 当前通过的
+       G3/V3 判决；历史成功参数/旧成本/旧代码不授权），项目预算/轮次上限/
+       卡一次性的检查与 started 写入同一事务（H-03）。未批准/绑定不满足/
+       已用过/预算用尽（T27：cutoff 级 max_uses，默认 5）→ 如实抛
        GateApprovalError / LockboxPrerequisiteError /
        LockboxAlreadyUsedError / LockboxBudgetExhaustedError，
-       不消耗或已消耗由语义决定）；
+       不消耗或已消耗由语义决定；
     3. load_lockbox_window：cutoff 前卡策略声明的 lookback_bars 根起步
        （无预热段时信号与全史不一致，C3）；
     4. 回测（引擎 A，与基准同一装配含禁入窗）；交易与权益收益**只计
@@ -1150,13 +1246,14 @@ def _g5_orchestrate(ledger, card, *, strategy, spec, params, base_summary,
     # 1) 参照分布（G3 样本外收益；任何失败都发生在 begin_lockbox 之前）
     reference = _g3_reference_returns(
         ledger, card, spec, bars, costs, data_sha=data_sha256(bars))
-    # 2) 读锁箱数据之前写 started（中途崩溃也不允许重跑）；cutoff 与
+    # 2) 读锁箱数据之前原子占位（中途崩溃也不允许重跑）；cutoff 与
     #    load_lockbox_window 同一来源（lockbox.json），作为预算计数口径
     from mt5data.lockbox import cutoff_for, load_config
     lb_cutoff = cutoff_for(load_config(data_root), spec.symbol,
                            card.timeframe)
     vgate.begin_lockbox(ledger, card, approved_by=approved_by,
-                        cutoff=lb_cutoff)
+                        cutoff=lb_cutoff, trial=trial, round_id=round_id,
+                        round_lockbox_uses_max=round_lockbox_uses_max)
     # 3) 锁箱运行窗（带预热段）
     lookback = max(int(getattr(strategy.required_data, "lookback_bars", 0)
                        or 0), 0)
@@ -1593,6 +1690,10 @@ def cmd_candidate_check(args) -> int:
     payload = result.to_payload()
     payload["cost_model_version"] = cost_version
     payload["checked_at_utc"] = datetime.now(timezone.utc).isoformat()
+    # H-08：预筛结论绑定候选内容——pass 记录锚定登记文件的 sha256，
+    # 轮次内运行（_round_context）比对当前文件 hash：改候选须重检后才生效
+    payload["candidate_sha256"] = hashlib.sha256(
+        Path(candidate.path).read_bytes()).hexdigest()
     if candidate.status not in cand.BOOKKEEPING_STATUSES \
             and candidate.prob_declared is None:
         payload["swap_basis"] = dual_block
@@ -1996,10 +2097,10 @@ def _prob_preconditions(ledger, card, path, *, actor: str) -> tuple | None:
               "（P 线审核会话批准时填写；执行会话不得代填）")
         return None
     # S2：走与 screen/gate 同一 _round_context（轮次已开启、候选在名单、
-    # 最新预筛 pass），再核对轮次文件 sha256 与开启时入账的一致——
-    # 开启后改文件（分界/假设族）会被发现
+    # 最新预筛 pass、轮次文件 sha 与开启时入账一致——H-08 冻结快照在
+    # _round_context 内统一核对；round_file 显式给出本函数已定位的路径）
     import hashlib as _hl
-    ctx = _round_context(ledger, card, actor=actor)
+    ctx = _round_context(ledger, card, actor=actor, round_file=rnd_path)
     if ctx is False or ctx is None:
         print(f"✗ 轮次约束未过（bt prob test 与 screen/gate 同一铁律 16 "
               "口径）")
@@ -2950,7 +3051,9 @@ def cmd_gate(args) -> int:
             print(f"✗ run#{run_id} 基准运行失败：{type(e).__name__}: {e}")
             return 1
 
-        # T23：spec 带定手数口径 → G2/G3 一切复算经 run_engine 沿用同一口径
+        # T23：spec 带定手数口径 → G2/G3 一切复算经 run_engine 沿用同一口径；
+        # H-06：spec.session_policy 携带该品种禁入政策——一切关卡复算
+        # （成本放大/邻域/随机入场/G3/V3 否决/G5 参照重放）同一禁入口径
         if sizing is not None:
             spec = BacktestSpec(strategy=strategy, symbol=symbol,
                                 timeframe=card.timeframe,
@@ -2960,13 +3063,15 @@ def cmd_gate(args) -> int:
                                 sizing=sizing,
                                 vol_min=vols_by_sym[symbol][0],
                                 vol_step=vols_by_sym[symbol][1],
-                                vol_max=vols_by_sym[symbol][2])
+                                vol_max=vols_by_sym[symbol][2],
+                                session_policy=policy_by_sym[symbol])
         else:
             spec = BacktestSpec(strategy=strategy, symbol=symbol,
                                 timeframe=card.timeframe,
                                 contract_size=sizes[symbol],
                                 volume_lots=lots,
-                                initial_capital=args.initial_capital)
+                                initial_capital=args.initial_capital,
+                                session_policy=policy_by_sym[symbol])
         seed = vstats.rng_seed(card.id)
         # T79：序列 meta.json 登记的已知缺口——G2 按年分段 / G3 walk-forward
         # 读到时在关卡 details 里注明相关窗口样本不完整（只注记，不改判定）
@@ -2979,6 +3084,18 @@ def cmd_gate(args) -> int:
             except Exception as e:   # 单关卡炸掉不拖垮其余关卡
                 results[name] = {"passed": False,
                                  "error": f"{type(e).__name__}: {e}"}
+
+        # H-02：关卡结果随评估**即时入账**（先可靠保存研究关卡结果，再
+        # 占预算读锁箱）——同次 G3/V3+G5 流程里 begin_lockbox 才能绑定
+        # 本次运行的当前判决；旧实现统一在 G5 之后写账，历史 G3/V3 记录
+        # 会授权当前已失败的试验。
+        def _run_recorded(name, fn):
+            _run(name, fn)
+            details = dict(results[name])
+            # M5：参数选择过程（候选数、选中 run_id）随每个关卡落台账
+            details["params_selection"] = selection
+            ledger.record_gate(run_id, name, bool(results[name]["passed"]),
+                               details)
 
         if "G0" in wanted:
             g0_strategy = strategy
@@ -3000,20 +3117,22 @@ def cmd_gate(args) -> int:
                                           "sizing": sizing_info,
                                           "policies": policy_by_sym})
                 g0_strategy = _strategy_cls().with_model(g0_ctx["model"])
-            _run("G0", lambda: vlook.run_g0(g0_strategy, bars, params))
+            _run_recorded("G0", lambda: vlook.run_g0(g0_strategy, bars,
+                                                     params))
         if "G1" in wanted:
-            _run("G1", lambda: vgate.run_g1(base.trades,
-                                            timeframe=card.timeframe, cfg=cfg))
+            _run_recorded("G1", lambda: vgate.run_g1(
+                base.trades, timeframe=card.timeframe, cfg=cfg))
         if "G2" in wanted:
-            _run("G2", lambda: vrob.run_g2(
+            _run_recorded("G2", lambda: vrob.run_g2(
                 spec, bars, costs, params, base_result=base,
                 base_summary=summary, grid=card.params,
                 bars_by_symbol=bars_by_sym, costs_by_symbol=costs_by_sym,
                 sizes_by_symbol=sizes, cfg=cfg, seed=seed,
                 vols_by_symbol=vols_by_sym,      # T23：sizing 口径跨品种透传
+                policies_by_symbol=policy_by_sym,   # H-06：逐品种禁入政策
                 known_gaps=known_gaps))          # T79：样本不完整注记
         if "G3" in wanted:
-            _run("G3", lambda: vwf.run_g3(
+            _run_recorded("G3", lambda: vwf.run_g3(
                 spec, bars, costs, grid=combos,
                 in_sample_sharpe=summary.get("sharpe"), cfg=cfg,
                 known_gaps=known_gaps))          # T79：样本不完整注记
@@ -3051,11 +3170,11 @@ def cmd_gate(args) -> int:
                 # 现行 G4 语义不变（T86 接线 v3 主检验时作取数来源）
                 out["project_n_dedup_rounds"] = st["project_n_dedup_rounds"]
                 return out
-            _run("G4", _g4)
+            _run_recorded("G4", _g4)
         if "V3" in wanted:
             # T86 接线（T85 冻结后）：G0/G3 结果可复用（同一次运行里跑过
             # 就不再重算）；combos 供诊断的参数邻域复用
-            _run("V3", lambda: _v3_gate_evaluate(
+            _run_recorded("V3", lambda: _v3_gate_evaluate(
                 ledger, card, cfg=cfg, ctx=v3_ctx,
                 cards_dir=Path(args.cards_dir), strategy=strategy, spec=spec,
                 bars=bars, costs=costs, params=params, base=base,
@@ -3064,20 +3183,22 @@ def cmd_gate(args) -> int:
                 g3_result=results.get("G3"), data_sha=dsha, seed=seed,
                 known_gaps=known_gaps))
         if "G5" in wanted:
-            _run("G5", lambda: _g5_orchestrate(
+            # H-02：G5 准入绑定当前试验身份（本次基准运行的参数/数据哈希/
+            # 成本版本/代码指纹/冻结门槛）；H-03：轮次上限随原子占位复查
+            g5_trial = vgate.LockboxTrial(
+                params=rec_params, data_sha256=dsha,
+                cost_model_version=cost_version,
+                strategy_sha=strategy_sha, gates_hash=gsha)
+            _run_recorded("G5", lambda: _g5_orchestrate(
                 ledger, card, strategy=strategy, spec=spec, params=params,
                 base_summary=summary, bars=bars, costs=costs,
                 session_policy=policy_by_sym[symbol],
-                data_root=data_root,
+                data_root=data_root, trial=g5_trial,
+                round_id=(round_ctx or {}).get("round_id"),
+                round_lockbox_uses_max=(round_ctx or {}).get(
+                    "lockbox_uses_max"),
                 approved_by=args.approved_by or args.actor, cfg=cfg))
 
-        for gate in vgate.GATE_ORDER:
-            if gate in results:
-                details = dict(results[gate])
-                # M5：参数选择过程（候选数、选中 run_id）随每个关卡落台账
-                details["params_selection"] = selection
-                ledger.record_gate(run_id, gate, bool(results[gate]["passed"]),
-                                   details)
         report = vgate.render_gate_report(card.id, params, results)
         if selection["selection"] == "auto":
             report += (

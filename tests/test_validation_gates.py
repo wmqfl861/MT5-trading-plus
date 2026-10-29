@@ -234,7 +234,7 @@ class _Card:
 
 
 def g3_ledger(tmp_path, card_id="H777"):
-    """带一条 G3 通过记录的台账（未过 G3 的卡不允许跑 G5）。"""
+    """带一条当前通过的完整试验记录（G3+V3，H-02 起的 G5 前置）。"""
     led = Ledger(tmp_path / "l.sqlite")
     rid = led.record_run(
         card_id=card_id, card_version=1, strategy="s:Donchian", params={},
@@ -243,7 +243,16 @@ def g3_ledger(tmp_path, card_id="H777"):
         engine_version="A-1.3", cost_model_version="zero-v0",
         gates_hash="", metrics={"sharpe": 1.0}, actor="test")
     led.record_gate(rid, "G3", True, {})
+    led.record_gate(rid, "V3", True, {})
     return led
+
+
+def lockbox_trial(**over):
+    """与 g3_ledger 登记的试验身份一致的 LockboxTrial（H-02 绑定）。"""
+    kw = dict(params={}, data_sha256="a" * 64, cost_model_version="zero-v0",
+              strategy_sha="legacy", gates_hash="")
+    kw.update(over)
+    return vg.LockboxTrial(**kw)
 
 
 def ref_returns(n=30_000, drift=7.0e-5, vol=0.004, seed=5):
@@ -390,22 +399,98 @@ def test_g5_started_row_blocks_rerun(tmp_path, g5_cfg):
     崩溃重跑在 begin_lockbox 就被拒（UNIQUE + lockbox_used 双保险）。
     """
     with g3_ledger(tmp_path) as led:
-        vg.begin_lockbox(led, _Card("H777"), approved_by="user")
+        vg.begin_lockbox(led, _Card("H777"), approved_by="user",
+                         trial=lockbox_trial())
         assert led.lockbox_used("H777") is True
         assert led.lockbox_status("H777") == "started"
         with pytest.raises(vg.LockboxAlreadyUsedError, match="H777"):
-            vg.begin_lockbox(led, _Card("H777"), approved_by="user")
+            vg.begin_lockbox(led, _Card("H777"), approved_by="user",
+                             trial=lockbox_trial())
 
 
 def test_g5_begin_then_run_finishes_started_row(tmp_path, g5_cfg):
     """编排协议：begin_lockbox（started）→ 评估 → run_g5 写终态（done）。"""
     with g3_ledger(tmp_path) as led:
-        vg.begin_lockbox(led, _Card("H777"), approved_by="user")
+        vg.begin_lockbox(led, _Card("H777"), approved_by="user",
+                         trial=lockbox_trial())
         out = run_g5(led, 2.0, cfg=g5_cfg)
         assert out["passed"] is True
         assert led.lockbox_status("H777") == "done"
         row = led.conn.execute("SELECT * FROM lockbox_uses").fetchone()
         assert json.loads(row["result_json"])["passed"] is True
+
+
+# ------------------------------------------- H-02：G5 准入绑定当前通过试验
+
+CUT = "2026-04-01T00:00:00"
+
+
+def test_h02_begin_lockbox_requires_trial_binding(tmp_path, g5_cfg):
+    """H-02 失败测试 1：不带 LockboxTrial 的 begin_lockbox 一律拒绝——
+    该卡任意历史 G3 通过不再授权（历史成功参数/旧成本/旧代码不授权当前
+    试验），且不产生 started、不扣预算。"""
+    with g3_ledger(tmp_path, card_id="H880") as led:
+        with pytest.raises(vg.LockboxPrerequisiteError, match="H-02"):
+            vg.begin_lockbox(led, _Card("H880"), approved_by="user",
+                             cutoff=CUT)
+        assert led.lockbox_used("H880") is False
+        assert led.lockbox_budget(CUT)["used"] == 0
+
+
+def test_h02_current_v3_failure_blocks_g5(tmp_path, g5_cfg):
+    """H-02 失败测试 2：历史 G3/V3 成功 + 同试验身份的当前 V3 失败 →
+    G5 拒（已见 V3 失败不进入 G5），不扣预算、不烧一次性。"""
+    with g3_ledger(tmp_path, card_id="H881") as led:
+        # 同试验身份再跑一次，V3 未通过（当前判决 = 最新 V3 行）
+        rid2 = led.record_run(
+            card_id="H881", card_version=1, strategy="s:Donchian", params={},
+            symbol="XAUUSD", timeframe="H1", data_first="2024-01-01",
+            data_last="2026-06-30", data_sha256="a" * 64,
+            engine_version="A-1.3", cost_model_version="zero-v0",
+            gates_hash="", metrics={"sharpe": 1.0}, actor="test")
+        led.record_gate(rid2, "G3", True, {})
+        led.record_gate(rid2, "V3", False,
+                        {"failed_vetoes": ["primary"]})
+        with pytest.raises(vg.LockboxPrerequisiteError, match="V3"):
+            vg.begin_lockbox(led, _Card("H881"), approved_by="user",
+                             cutoff=CUT, trial=lockbox_trial())
+        assert led.lockbox_used("H881") is False
+        assert led.lockbox_budget(CUT)["used"] == 0
+
+
+def test_h02_identity_changes_rejected(tmp_path, g5_cfg):
+    """H-02 失败测试 3：参数/成本/代码指纹/冻结关卡版本任一变化 → 该
+    历史成功不授权当前试验（无匹配的当前 G3 记录 → 拒）。"""
+    with g3_ledger(tmp_path, card_id="H882") as led:
+        for over, what in (
+                (dict(params={"entry_days": 7}), "参数"),
+                (dict(cost_model_version="cost-v9"), "成本"),
+                (dict(strategy_sha="b" * 64), "代码指纹"),
+                (dict(gates_hash="c" * 64), "关卡版本")):
+            with pytest.raises(vg.LockboxPrerequisiteError,
+                               match="没有 G3 关卡记录") as ei:
+                vg.begin_lockbox(led, _Card("H882"), approved_by="user",
+                                 cutoff=CUT, trial=lockbox_trial(**over))
+            assert what in str(ei.value)
+            assert led.lockbox_used("H882") is False
+        assert led.lockbox_budget(CUT)["used"] == 0
+
+
+def test_h02_current_g3_failure_blocks_g5(tmp_path, g5_cfg):
+    """H-02：当前试验身份下最新 G3 行未通过 → 拒（历史 G3 通过不抵消）。"""
+    with g3_ledger(tmp_path, card_id="H883") as led:
+        rid2 = led.record_run(
+            card_id="H883", card_version=1, strategy="s:Donchian", params={},
+            symbol="XAUUSD", timeframe="H1", data_first="2024-01-01",
+            data_last="2026-06-30", data_sha256="a" * 64,
+            engine_version="A-1.3", cost_model_version="zero-v0",
+            gates_hash="", metrics=None, error="ValueError: 爆了",
+            actor="test")
+        led.record_gate(rid2, "G3", False, {"reason": "样本外夏普 ≤ 0"})
+        with pytest.raises(vg.LockboxPrerequisiteError, match="G3"):
+            vg.begin_lockbox(led, _Card("H883"), approved_by="user",
+                             cutoff=CUT, trial=lockbox_trial())
+        assert led.lockbox_used("H883") is False
 
 
 # ------------------------------------------------- 锁箱运行窗（预热段）
@@ -856,11 +941,17 @@ def buy_hold_spec(mod):
                             timeframe="H1", contract_size=1.0)
 
 
-def g5_kwargs(mod, bars, *, data_root="data"):
+def g5_kwargs(mod, bars, *, data_root="data", trial=None):
+    from mt5quant.backtest.report import data_sha256
     spec = buy_hold_spec(mod)
+    if trial is None:                      # H-02：编排必须带试验绑定
+        trial = vg.LockboxTrial(
+            params={}, data_sha256=data_sha256(bars),
+            cost_model_version="zero-v0", strategy_sha="legacy",
+            gates_hash="")
     return dict(strategy=spec.strategy, spec=spec, params={}, bars=bars,
                 costs=mod.ZeroCosts(), session_policy=None,
-                data_root=data_root, approved_by="user",
+                data_root=data_root, approved_by="user", trial=trial,
                 cfg=vg.load_gates()[0],
                 base_summary={"trade_count": 1})
 
@@ -911,11 +1002,12 @@ def test_g5_orchestrate_protocol_order(tmp_path, monkeypatch):
                           "params": {}},
                          {"train_range": [20, 30], "test_range": [30, 40],
                           "params": {}}]})
+        led.record_gate(rid, "V3", True, {})
     real_begin = mod.vgate.begin_lockbox
 
-    def _begin(led_, card, *, approved_by, cutoff=None):
+    def _begin(led_, card, *, approved_by, cutoff=None, **kw):
         calls.append("begin")
-        real_begin(led_, card, approved_by=approved_by, cutoff=cutoff)
+        real_begin(led_, card, approved_by=approved_by, cutoff=cutoff, **kw)
 
     window = ramp_bars(8)
     cutoff = window["time"].iloc[4]
@@ -944,6 +1036,47 @@ def test_g5_orchestrate_protocol_order(tmp_path, monkeypatch):
         assert led.lockbox_status("H001") == "started"   # run_g5 被替身顶替
 
 
+def test_h02_orchestrate_v3_failure_never_reads_lockbox(tmp_path,
+                                                         monkeypatch):
+    """H-02（编排级）：同试验身份当前 V3 失败 → begin_lockbox 拒绝，锁箱
+    loader 零调用、不扣预算（历史 G3/V3 成功不授权当前失败试验）。"""
+    mod = load_bt()
+    from mt5quant.backtest.report import data_sha256
+    bars = ramp_bars(40)
+    calls = []
+    monkeypatch.setattr(mod.vgate, "load_lockbox_window",
+                        lambda *a, **k: calls.append(1))
+    ledger_path = tmp_path / "l.sqlite"
+    segments = [{"train_range": [0, 20], "test_range": [20, 30],
+                 "params": {}},
+                {"train_range": [20, 30], "test_range": [30, 40],
+                 "params": {}}]
+    with Ledger(ledger_path) as led:
+        rid1 = led.record_run(
+            card_id="H001", card_version=1, strategy=BUY_HOLD, params={},
+            symbol="XAUUSD", timeframe="H1", data_first="", data_last="",
+            data_sha256=data_sha256(bars), engine_version="A-1.3",
+            cost_model_version="zero-v0", gates_hash="",
+            metrics={"sharpe": 1.0}, actor="test")
+        led.record_gate(rid1, "G3", True, {"segments": segments})
+        led.record_gate(rid1, "V3", True, {})
+        rid2 = led.record_run(
+            card_id="H001", card_version=1, strategy=BUY_HOLD, params={},
+            symbol="XAUUSD", timeframe="H1", data_first="", data_last="",
+            data_sha256=data_sha256(bars), engine_version="A-1.3",
+            cost_model_version="zero-v0", gates_hash="",
+            metrics=None, error="ValueError: 主检验未过", actor="test")
+        led.record_gate(rid2, "G3", True, {"segments": segments})
+        led.record_gate(rid2, "V3", False, {"failed_vetoes": ["primary"]})
+    with Ledger(ledger_path) as led:
+        with pytest.raises(vg.LockboxPrerequisiteError, match="V3"):
+            mod._g5_orchestrate(led, h001_card(mod), **g5_kwargs(mod, bars))
+        assert calls == []                     # 锁箱 loader 零调用
+        assert led.lockbox_used("H001") is False
+        assert led.conn.execute(
+            "SELECT COUNT(*) n FROM lockbox_uses").fetchone()["n"] == 0
+
+
 def test_gate_cli_g5_orchestration_started_then_done(tmp_path, monkeypatch,
                                                      capsys):
     """T21e 端到端：gate --gates G5 --approve 走新协议——锁箱窗带预热、
@@ -957,6 +1090,8 @@ def test_gate_cli_g5_orchestration_started_then_done(tmp_path, monkeypatch,
     # R6/C6：G5 只认主库——tmp 根按主库布局伪装并显式 --main-store
     patch_as_main_store(monkeypatch, mod)
     from mt5quant.backtest.report import data_sha256
+    # H-02：预登记的授权试验必须与本次 G5 请求同一试验身份——数据哈希、
+    # 成本版本、策略代码指纹与冻结门槛 sha 全部对上，且 G3/V3 当前通过
     research = bars[bars["time"] < cutoff].reset_index(drop=True)
     with Ledger(ledger) as led:
         rid = led.record_run(
@@ -965,13 +1100,16 @@ def test_gate_cli_g5_orchestration_started_then_done(tmp_path, monkeypatch,
             data_first=str(research["time"].iloc[0]),
             data_last=str(research["time"].iloc[-1]),
             data_sha256=data_sha256(research), engine_version="A-1.3",
-            cost_model_version="zero-v0", gates_hash="",
-            metrics={"sharpe": 1.0, "trade_count": 1}, actor="test")
+            cost_model_version="zero-v0", gates_hash=mod._gates_hash(),
+            metrics={"sharpe": 1.0, "trade_count": 1}, actor="test",
+            strategy_sha=mod.cards.strategy_fingerprint(
+                BUY_HOLD, mod.STRATEGY_FP_ROOT))
         led.record_gate(rid, "G3", True, {
             "segments": [{"train_range": [0, 100], "test_range": [100, 150],
                           "params": {}},
                          {"train_range": [100, 150], "test_range": [150, 200],
                           "params": {}}]})
+        led.record_gate(rid, "V3", True, {})
     rc = mod.main(gate_argv(root, cards_dir, ledger, "G5", "--main-store",
                             "--approve", "--approved-by", "user",
                             "--params", "{}"))
@@ -1462,3 +1600,32 @@ def test_t85_freeze_c4_blueprint_d34_sync():
     assert "rounds_lineage" in appendix_b
     assert "n_min = 2" in appendix_b
     assert vg.FROZEN_GATES_SHA256[:8] in appendix_b     # 新冻结指纹入册
+
+
+def test_h02_same_invocation_flow_binds_current_run(tmp_path, g5_cfg):
+    """H-02：同次 G3/V3+G5 流程——关卡结果先入账（bt gate 即时记录），
+    begin_lockbox 绑定**本次运行**的当前判决：当前运行无 G3/V3 行 → 拒；
+    同一 run_id 上 G3/V3 通过后 → 占位成功（started）。
+
+    （对照流程"仅请求 G5"由 test_gate_cli_g5_orchestration_started_then_done
+    端到端覆盖：授权来自同身份的历史通过运行。）"""
+    with g3_ledger(tmp_path, card_id="H885") as led:      # 历史完整通过
+        # 当前运行的基准行（无任何关卡行）
+        rid_now = led.record_run(
+            card_id="H885", card_version=1, strategy="s:Donchian", params={},
+            symbol="XAUUSD", timeframe="H1", data_first="2024-01-01",
+            data_last="2026-06-30", data_sha256="a" * 64,
+            engine_version="A-1.3", cost_model_version="zero-v0",
+            gates_hash="", metrics={"sharpe": 1.0}, actor="test")
+        # 当前运行 V3 失败先行入账（bt gate 即时记录）→ 已见失败不进 G5
+        led.record_gate(rid_now, "V3", False, {"failed_vetoes": ["primary"]})
+        with pytest.raises(vg.LockboxPrerequisiteError, match="V3"):
+            vg.begin_lockbox(led, _Card("H885"), approved_by="user",
+                             trial=lockbox_trial())
+        assert led.lockbox_used("H885") is False
+        # 同一 run_id 上 G3 通过 + V3 重跑通过（关卡重录语义）→ 绑定成立
+        led.record_gate(rid_now, "G3", True, {})
+        led.record_gate(rid_now, "V3", True, {})
+        vg.begin_lockbox(led, _Card("H885"), approved_by="user",
+                         trial=lockbox_trial())
+        assert led.lockbox_status("H885") == "started"

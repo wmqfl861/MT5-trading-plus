@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import tomllib
 from dataclasses import dataclass
@@ -789,6 +790,12 @@ def evaluate_v3(*, g0: dict, primary: dict, cost_scale: dict, delay: dict,
 
 
 # ---------------------------------------------------------------- G5（T21a/C3 重写）
+# H-02（全局审核 2026-10-29）：G5 准入绑定**当前通过的完整试验**——
+# LockboxTrial（参数/数据哈希/成本版本/代码指纹/冻结门槛 sha）+ 该身份下
+# 当前通过的 G3 与 V3 判决；历史成功参数/旧成本/旧代码不再授权。H-03：
+# 准入后的预算检查与 started 占位在 ledger 的单一 BEGIN IMMEDIATE 事务
+# 内（reserve_lockbox_use）。编排顺序（bt.py）：关卡结果即时入账 →
+# begin_lockbox 原子占位 → 读锁箱 → run_g5。
 
 def _card_id_of(card) -> str:
     """run_g5/begin_lockbox 的 card 参数：Card 对象或卡 id 字符串。"""
@@ -800,39 +807,147 @@ def _card_id_of(card) -> str:
     return cid
 
 
-def begin_lockbox(ledger, card, *, approved_by: str,
-                  cutoff=None) -> None:
-    """G5 编排第一步：**读锁箱数据之前**调用（T21a/C3）。
+@dataclass(frozen=True)
+class LockboxTrial:
+    """H-02（全局审核 2026-10-29）：G5 准入绑定的**当前试验身份**。
+
+    begin_lockbox 只认与这份身份完全一致的关卡记录——历史成功参数、
+    旧成本版本、旧代码指纹、旧冻结门槛都不授权当前试验：
+    - params：本次试验的参数（规范化比较，键序无关）；
+    - data_sha256 / cost_model_version / strategy_sha / gates_hash：数据、
+      成本、代码与冻结关卡版本；
+    - require_v3：D34 冻结（gates.toml = v3）后缺省 True——当前试验身份
+      下还须有**当前通过的 V3 判决**（最新 V3 行 passed=1）；已见 V3
+      失败的试验不进入 G5。
+    """
+    params: dict
+    data_sha256: str
+    cost_model_version: str
+    strategy_sha: str
+    gates_hash: str
+    require_v3: bool = True
+
+
+def _canonical_params(params) -> str:
+    """参数的规范化 JSON（键排序、紧凑分隔符）——键序无关的相等比较。"""
+    from mt5quant.research.ledger import _san
+    return json.dumps(_san(dict(params)), sort_keys=True,
+                      ensure_ascii=False, separators=(",", ":"))
+
+
+def _matching_gate_runs(ledger, cid: str, trial: LockboxTrial,
+                        gate: str) -> list[tuple[int, bool]]:
+    """与 trial 身份完全一致（参数规范化相等 + 数据/成本/代码/门槛哈希
+    相同）且带有 gate 行的 runs，按 run_id 降序——[0] 即该试验身份下
+    这道关卡的**当前判决**。"""
+    rows = ledger.conn.execute(
+        "SELECT r.run_id AS run_id, r.params_json AS pj, g.passed AS passed"
+        " FROM gates g JOIN runs r ON r.run_id = g.run_id"
+        " WHERE r.card_id=? AND r.data_sha256=? AND r.cost_model_version=?"
+        " AND r.strategy_sha=? AND r.gates_hash=? AND g.gate=?"
+        " ORDER BY r.run_id DESC",
+        (cid, trial.data_sha256, trial.cost_model_version,
+         trial.strategy_sha, trial.gates_hash, gate)).fetchall()
+    out: list[tuple[int, bool]] = []
+    want = _canonical_params(trial.params)
+    for r in rows:
+        try:
+            same = _canonical_params(json.loads(r["pj"])) == want
+        except ValueError:
+            same = False
+        if same:
+            out.append((int(r["run_id"]), bool(r["passed"])))
+    return out
+
+
+def _verify_lockbox_trial(ledger, cid: str, trial: LockboxTrial) -> None:
+    """H-02 试验绑定校验：当前试验身份下 G3 通过且（require_v3 时）最新
+    V3 判决通过；任何不满足 → LockboxPrerequisiteError（不读锁箱、不占
+    预算、不烧一次性）。"""
+    def _id_note() -> str:
+        return (f"data_sha256={trial.data_sha256[:12]}…、成本 "
+                f"{trial.cost_model_version}、代码指纹 "
+                f"{trial.strategy_sha[:12]}…、关卡版本 "
+                f"{trial.gates_hash[:12] + '…' if trial.gates_hash else '—'}、"
+                f"参数 {trial.params!r}")
+
+    g3 = _matching_gate_runs(ledger, cid, trial, "G3")
+    if not g3:
+        raise LockboxPrerequisiteError(
+            f"卡 {cid} 在当前试验身份（{_id_note()}）下没有 G3 关卡记录"
+            "——历史成功参数/旧成本/旧代码不授权当前试验（H-02）：先在"
+            "同一试验上跑 bt gate --gates G3,V3")
+    latest_run, g3_passed = g3[0]
+    if not g3_passed:
+        raise LockboxPrerequisiteError(
+            f"卡 {cid} 当前试验（run#{latest_run}）的 G3 未通过——G5 的"
+            "参照分布取自 G3 拼接的样本外收益，没有可信参照不允许跑 G5"
+            "（H-02：历史 G3 通过不抵消当前失败）")
+    if trial.require_v3:
+        v3 = _matching_gate_runs(ledger, cid, trial, "V3")
+        if not v3:
+            raise LockboxPrerequisiteError(
+                f"卡 {cid} 当前试验（G3 run#{latest_run}，{_id_note()}）"
+                "没有 V3 判决——D34 冻结后 G5 准入绑定当前通过的 V3"
+                "（H-02）：--gates G3,V3 或 --gates G3,V3,G5 同次运行")
+        v3_run, v3_passed = v3[0]
+        if not v3_passed:
+            raise LockboxPrerequisiteError(
+                f"卡 {cid} 已见 V3 失败（run#{v3_run}，当前试验身份）——"
+                "不进入 G5（H-02：当前 V3 通过判决是锁箱准入的一部分；"
+                "重跑 V3 通过前锁箱不开放）")
+
+
+def begin_lockbox(ledger, card, *, approved_by: str, cutoff=None,
+                  trial: LockboxTrial | None = None,
+                  round_id: str | None = None,
+                  round_lockbox_uses_max: int | None = None) -> None:
+    """G5 编排第一步：**读锁箱数据之前**调用（T21a/C3；H-02/H-03 修订）。
 
     - 未批准 → GateApprovalError（不消耗一次性机会）；
-    - 未过 G3 → LockboxPrerequisiteError（不消耗一次性机会）；
-    - 已有任何记录（含上次崩溃残留的 started）→ LockboxAlreadyUsedError；
-    - cutoff 给出且该锁箱预算用尽 → LockboxBudgetExhaustedError
-      （T27/M11：不消耗一次性机会，预算计数见 ledger.lockbox_budget）；
+    - trial 缺失 / 当前试验身份下 G3 未通过 / 已见 V3 失败 /
+      身份（参数/数据/成本/代码/冻结门槛）不匹配 →
+      LockboxPrerequisiteError（H-02：历史成功不授权当前试验；不消耗
+      一次性机会、不扣预算、锁箱零读取）；
+    - 卡一次性 / 项目预算（cutoff 级 max_uses，T27/M11）/ 轮次
+      lockbox_uses_max 的检查与 started 写入在 ledger 的**一个
+      BEGIN IMMEDIATE 事务**内（H-03）：已用 → LockboxAlreadyUsedError；
+      预算用尽 → LockboxBudgetExhaustedError；轮次用满 →
+      LockboxPrerequisiteError；
     - 否则写 status='started' 行——此后该卡锁箱视为已用，中途崩溃也
       不允许重跑（防多次窥视锁箱段）。
 
     编排协议（bt.py，T21e 接线）：
-    begin_lockbox → 读锁箱段（load_lockbox_window，带预热）→ 回测 →
-    run_g5（评估并把 started 行写成 done）。cutoff 由调用方从
-    data/lockbox.json 读出传入（load_lockbox_window 用同一来源）。
+    先可靠保存研究关卡结果（G3/V3 随各关卡评估即时入账），再
+    begin_lockbox（读锁箱数据**之前**原子占位）→ 读锁箱段
+    （load_lockbox_window，带预热）→ 回测 → run_g5（评估并把 started
+    行写成 done）。cutoff 由调用方从 data/lockbox.json 读出传入
+    （load_lockbox_window 用同一来源）。
     """
     cid = _card_id_of(card)
     if not approved_by:
         raise GateApprovalError(
             f"卡 {cid} 的锁箱（G5）是一次性测试，必须显式 --approve "
             "（并指定批准人）——本次未执行，一次性机会未消耗")
-    if not ledger.gate_passed(cid, "G3"):
+    if trial is None:
         raise LockboxPrerequisiteError(
-            f"卡 {cid} 未通过 G3——G5 的参照分布取自 G3 拼接的样本外收益，"
-            "没有可信参照不允许跑 G5")
-    if ledger.lockbox_used(cid):
-        raise LockboxAlreadyUsedError(
-            f"卡 {cid} 的锁箱已用过（lockbox_uses 有记录，含进行中的 "
-            "started）——第二次请求直接拒绝；一次性机会已消耗，结论以"
-            "第一次为准")
-    key = _budget_check(ledger, cid, cutoff) if cutoff is not None else None
-    ledger.record_lockbox_start(cid, approved_by=approved_by, cutoff=key)
+            f"卡 {cid} 的 G5 准入缺少当前试验绑定（H-02）：必须以 "
+            "LockboxTrial 给出本次试验的参数/数据哈希/成本版本/策略代码"
+            "指纹/冻结关卡版本，且该试验身份下有当前通过的 G3 与 V3 "
+            "判决——该卡任意历史 G3 通过不再授权")
+    _verify_lockbox_trial(ledger, cid, trial)
+    from mt5quant.research import ledger as _ledger_mod
+    try:
+        ledger.reserve_lockbox_use(
+            cid, approved_by=approved_by, cutoff=cutoff,
+            round_id=round_id,
+            round_lockbox_uses_max=round_lockbox_uses_max)
+    except _ledger_mod.LockboxProjectBudgetExhaustedError as e:
+        raise LockboxBudgetExhaustedError(str(e)) from e
+    except _ledger_mod.LockboxRoundCapExceededError as e:
+        raise LockboxPrerequisiteError(str(e)) from e
+    except _ledger_mod.LockboxCardUsedError as e:
+        raise LockboxAlreadyUsedError(str(e)) from e
 
 
 def run_g5(ledger, card, *, lockbox_result: dict, reference_returns,

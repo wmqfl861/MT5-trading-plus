@@ -656,3 +656,58 @@ def test_cost_scaling_early_years_na_without_pre2020_trades(cfg):
     out = rob.cost_scaling_check(spec_of(LongMid()), uptrend(),
                                  ConstCosts(spread=0.02), {}, cfg)
     assert out["early_years_spread_x1_5"]["applicable"] is False
+
+
+# ------------------------------------- H-06：关卡复算透传禁入政策（BacktestSpec）
+
+def _forbid_all_policy(symbol="TST"):
+    """禁入全部纽约本地小时的 SessionPolicy（基准 0 笔的复现场景）。"""
+    from mt5data.sessions import SessionPolicy
+    return SessionPolicy(forbidden_hours_ny={symbol: frozenset(range(24))})
+
+
+def test_h06_backtest_spec_carries_session_policy(cfg):
+    """H-06 失败测试：BacktestSpec/run_engine 必须携带禁入政策——修复前
+    spec 不带 session_policy，关卡复算丢掉换日/禁入小时规则（基准 0 笔、
+    复算 1 笔的口径分裂）。"""
+    from mt5quant.strategies import BuyHold
+
+    bars = uptrend(30)
+    spec_pol = rob.BacktestSpec(strategy=BuyHold(), symbol="TST",
+                                timeframe="H1", contract_size=1.0,
+                                session_policy=_forbid_all_policy())
+    r_pol = rob.run_engine(spec_pol, bars, ConstCosts(), {})
+    assert len(r_pol.trades) == 0            # 基准口径：禁入小时全挡 → 0 笔
+    r_plain = rob.run_engine(spec_of(BuyHold()), bars, ConstCosts(), {})
+    assert len(r_plain.trades) >= 1          # 旧行为（丢政策）的复算：1 笔
+    # 修复后一切关卡复算经同一 spec 口径：成本 ×1.5 复算同样 0 笔（期望
+    # None → 不通过），而不是在禁入时段里凭空做出正期望
+    out = rob.cost_scaling_check(spec_pol, bars, ConstCosts(), {}, cfg)
+    assert out["expectancy_1_5x"] is None
+
+
+def test_h06_g3_and_delay_recompute_respect_policy(cfg):
+    """H-06：G3 walk-forward 与延迟检查的复算同样吃 spec 上的禁入政策。"""
+    from mt5quant.strategies import BuyHold
+
+    bars = uptrend(40)
+    spec_pol = rob.BacktestSpec(strategy=BuyHold(), symbol="TST",
+                                timeframe="H1", contract_size=1.0,
+                                session_policy=_forbid_all_policy())
+    out = rob.delay_check(spec_pol, bars, ConstCosts(), {}, cfg)
+    assert out["net_delayed"] == 0.0 and out["net_original"] == 0.0
+
+
+def test_h06_cross_symbol_uses_per_symbol_policy(cfg):
+    """H-06 失败测试：跨品种子检查按品种各自的政策装配 spec（修复前
+    cross_symbol_check 没有 policies_by_symbol 参数）。"""
+    bars = {"AAA": uptrend(80), "BBB": make_bars([100 + 0.4 * i
+                                                  for i in range(80)])}
+    costs = {s: ConstCosts(0.05) for s in bars}
+    sizes = {s: 1.0 for s in bars}
+    policies = {"AAA": _forbid_all_policy("AAA"), "BBB": None}
+    out = rob.cross_symbol_check(LongMid(), bars, costs, sizes, {}, "H1",
+                                 1.0, 10_000.0, cfg,
+                                 policies_by_symbol=policies)
+    assert out["net_by_symbol"]["AAA"] == 0.0    # AAA 全程禁入 → 0 净利
+    assert out["net_by_symbol"]["BBB"] > 0.0     # BBB 无禁入 → 正常盈利

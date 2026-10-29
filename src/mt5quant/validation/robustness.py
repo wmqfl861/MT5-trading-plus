@@ -22,6 +22,7 @@ stats.rng_seed(card_id)，同一卡可复现。
 """
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
@@ -59,6 +60,7 @@ class BacktestSpec:
     vol_min: float | None = None
     vol_step: float | None = None
     vol_max: float | None = None
+    session_policy: object = None      # H-06：禁入政策（None=不限制，与引擎缺省同义）
 
     def __post_init__(self):
         if self.sizing is not None and self.volume_lots is not None:
@@ -82,10 +84,17 @@ class BacktestSpec:
 
 def run_engine(spec: BacktestSpec, bars: pd.DataFrame, costs, params: dict, *,
                strategy=None):
-    """按 spec 跑一次 A 层（strategy 可覆盖，如 FixedSignals / BuyHold）。"""
+    """按 spec 跑一次 A 层（strategy 可覆盖，如 FixedSignals / BuyHold）。
+
+    H-06：spec.session_policy 非空即透传给引擎——基准运行带禁入政策时，
+    关卡复算（G2 成本放大/参数邻域、G3 walk-forward、V3 否决、G5 参照
+    重放……）必须同一禁入口径，不得在复算里丢掉换日/低样本小时禁入。
+    """
     kwargs = dict(symbol=spec.symbol, params=dict(params),
                   contract_size=spec.contract_size,
                   initial_capital=spec.initial_capital, timeframe=spec.timeframe)
+    if spec.session_policy is not None:     # H-06：禁入政策透传
+        kwargs["session_policy"] = spec.session_policy
     if spec.sizing is not None:          # T23：sizing 口径透传（引擎内互斥校验）
         kwargs.update(sizing=spec.sizing, vol_min=spec.vol_min,
                       vol_step=spec.vol_step, vol_max=spec.vol_max)
@@ -101,12 +110,35 @@ class ScaledCosts:
     提供该方法 → 返回 0（与 base 行为一致，不凭空造出越幅）。
     T82：overnight_fee 透传 keyword-only price（出场侧 bar 价——点数模式
     相对口径的缩放基准；不透传会让引擎带 price 的调用直接 TypeError）。
+    H-07：swap 分量以 _ScaledSwap 暴露——事件模式（events.event_returns）
+    直接读 costs.swap.rule 的 long/short_per_day，仅缩放 overnight_fee
+    方法会让事件路径的 ×1.5 隔夜费变 0（审核复现 0.002→0）。费率 ×factor、
+    三倍日/计费时刻/相对口径字段不动（与 gate_calibration._ScaledCosts
+    同一实现口径）。
     """
 
     def __init__(self, base, factor: float):
         if not factor > 0:
             raise ValueError(f"factor 必须为正，收到 {factor!r}")
         self._base, self._factor = base, float(factor)
+
+    class _ScaledSwap:
+        """SwapModel 替身：rule(symbol) 返回费率 ×factor 的 SwapRule。"""
+
+        def __init__(self, base_swap, factor: float):
+            self._base_swap, self._f = base_swap, factor
+
+        def rule(self, symbol):
+            r = self._base_swap.rule(symbol)
+            return dataclasses.replace(
+                r, long_per_day=r.long_per_day * self._f,
+                short_per_day=r.short_per_day * self._f)
+
+    @property
+    def swap(self):
+        base_swap = getattr(self._base, "swap", None)
+        return None if base_swap is None else self._ScaledSwap(base_swap,
+                                                               self._factor)
 
     def spread_p90(self, symbol, hour_utc, *, price=None):
         return self._base.spread_p90(symbol, hour_utc, price=price) * self._factor
@@ -433,12 +465,16 @@ def buy_hold_check(spec, bars, costs, trades, base_sharpe, cfg) -> dict:
 def cross_symbol_check(strategy, bars_by_symbol, costs_by_symbol,
                        sizes_by_symbol, params, timeframe, volume_lots,
                        initial_capital, cfg, *, sizing=None,
-                       vols_by_symbol=None) -> dict:
+                       vols_by_symbol=None,
+                       policies_by_symbol: dict | None = None) -> dict:
     """同一逻辑在 ≥ cross_symbol_min 个品种上净利为正。
 
     T23：sizing 模式下各品种用自己的 vol 三元组（vols_by_symbol[sym] =
     (vol_min, vol_step, vol_max)，scripts 侧从快照读取）；缺品种即拒——
     绝不借用别的品种的手数上下限。固定手数模式沿用 volume_lots。
+    H-06：policies_by_symbol（{symbol: SessionPolicy|None}）——逐品种的
+    禁入政策随 spec 进复算（基准在哪个品种上推迟开仓，跨品种检查就在
+    同一品种上推迟，不得丢政策）；None 值 = 该品种不限制。
     """
     symbols = sorted(bars_by_symbol)
     if len(symbols) < cfg.cross_symbol_min:
@@ -447,6 +483,7 @@ def cross_symbol_check(strategy, bars_by_symbol, costs_by_symbol,
                 "note": f"仅 {len(symbols)} 个品种可用，跨品种检查不适用"}
     nets = {}
     for sym in symbols:
+        policy = (policies_by_symbol or {}).get(sym)
         if sizing is not None:
             vols = (vols_by_symbol or {}).get(sym)
             if vols is None:
@@ -459,13 +496,15 @@ def cross_symbol_check(strategy, bars_by_symbol, costs_by_symbol,
                                 volume_lots=None,
                                 initial_capital=initial_capital,
                                 sizing=sizing, vol_min=vols[0],
-                                vol_step=vols[1], vol_max=vols[2])
+                                vol_step=vols[1], vol_max=vols[2],
+                                session_policy=policy)
         else:
             spec = BacktestSpec(strategy=strategy, symbol=sym,
                                 timeframe=timeframe,
                                 contract_size=sizes_by_symbol[sym],
                                 volume_lots=volume_lots,
-                                initial_capital=initial_capital)
+                                initial_capital=initial_capital,
+                                session_policy=policy)
         nets[sym] = _net_sum(run_engine(spec, bars_by_symbol[sym],
                                         costs_by_symbol[sym], params))
     positive = sum(1 for v in nets.values() if v > 0)
@@ -606,6 +645,7 @@ def random_entry_check(spec, bars, costs, base_trades, base_sharpe, *,
 def run_g2(spec, bars, costs, params, *, base_result, base_summary, grid,
            bars_by_symbol, costs_by_symbol, sizes_by_symbol, cfg,
            seed: int, vols_by_symbol: dict | None = None,
+           policies_by_symbol: dict | None = None,
            known_gaps: list | None = None) -> dict:
     """G2 全部子检查（顺序执行，互不短路；details 全部落台账）。
 
@@ -613,6 +653,9 @@ def run_g2(spec, bars, costs, params, *, base_result, base_summary, grid,
     买入持有）经 run_engine 自动沿用同一按风险定手数口径；跨品种子检查
     需要 vols_by_symbol（各品种 vol 三元组，bt.py 装配时从快照读取）。
     T79：known_gaps 透传给按年分段（相交年份注明样本不完整，不改判定）。
+    H-06：spec.session_policy 随 spec 进一切 run_engine 复算；跨品种子检查
+    另收 policies_by_symbol（逐品种政策——缺省 None 品种不限制），与基准
+    的逐品种装配同口径。
     """
     checks: dict[str, dict] = {}
     checks["cost_scaling"] = cost_scaling_check(spec, bars, costs, params, cfg)
@@ -622,7 +665,8 @@ def run_g2(spec, bars, costs, params, *, base_result, base_summary, grid,
     checks["cross_symbol"] = cross_symbol_check(
         spec.strategy, bars_by_symbol, costs_by_symbol, sizes_by_symbol,
         params, spec.timeframe, spec.volume_lots, spec.initial_capital, cfg,
-        sizing=spec.sizing, vols_by_symbol=vols_by_symbol)
+        sizing=spec.sizing, vols_by_symbol=vols_by_symbol,
+        policies_by_symbol=policies_by_symbol)
     base_sharpe = base_summary.get("sharpe")
     checks["random_entry_benchmark"] = random_entry_check(
         spec, bars, costs, base_result.trades, base_sharpe,

@@ -19,7 +19,10 @@
 - lockbox_uses(card_id UNIQUE, used_at_utc, approved_by, result_json,
   status, cutoff, prev_hash, row_hash)——锁箱一次性：status ∈
   {"started", "done"}（T21a/C3）——G5 读锁箱数据**之前**先写
-  started（record_lockbox_start），评估结束写结果（finish_lockbox_use
+  started（H-03 起生产路径走 reserve_lockbox_use：卡一次性/项目预算/
+  轮次上限的检查与 started 写入**同一个 BEGIN IMMEDIATE 事务**；拒绝
+  类型 LockboxCardUsedError / LockboxProjectBudgetExhaustedError /
+  LockboxRoundCapExceededError），评估结束写结果（finish_lockbox_use
   → done）；已有 started 行（上次崩溃残留）同样视为已用（lockbox_used），
   第二次插入直接 sqlite3.IntegrityError。
   旧库无 status 列 → 打开时自动补列（旧行按终态 done 处理）。
@@ -276,6 +279,26 @@ class LedgerTamperedError(RuntimeError):
     含义：链上已检测到篡改/删行/绕道写入，任何正常写入都可能把证据
     重封掉，因此一律拒绝——请人工比对 docs/ops/ledger-anchors.md 的
     锚定历史后再决定处置（绝不静默修复）。"""
+
+
+# H-03（全局审核 2026-10-29）：锁箱占位事务的拒绝类型——项目预算/轮次
+# 上限/卡一次性的检查与 started 写入在同一个 BEGIN IMMEDIATE 事务内，
+# 拒绝原因按这三类抛出（调用方 mt5quant.validation.gates.begin_lockbox
+# 映射回关卡层异常；两个连接竞争最后一个额度时只有一个能提交）。
+class LockboxReservationError(RuntimeError):
+    """锁箱占位事务被拒（H-03 原子占位的基类）。"""
+
+
+class LockboxCardUsedError(LockboxReservationError):
+    """该卡的锁箱已用（含 started）——一次性已消耗，占位被拒。"""
+
+
+class LockboxProjectBudgetExhaustedError(LockboxReservationError):
+    """该锁箱（cutoff）的项目级使用预算已用尽（T27/M11/D16）。"""
+
+
+class LockboxRoundCapExceededError(LockboxReservationError):
+    """本轮次（rounds.lockbox_uses_max）的 G5 次数已达上限（D16）。"""
 
 
 def _san(obj):
@@ -952,6 +975,8 @@ class Ledger:
         R6/C5：写前验证链（锁箱行被删过 → LedgerTamperedError，一次性
         不可能靠删行重置）。
         R7/N-C3：验链与追加同一写事务。
+        H-03 起生产路径走 reserve_lockbox_use（约束检查 + 占位一个事务）；
+        本方法保留给不经预算约束的旧调用/测试直写。
         """
         with self._txn():
             self._verify_or_raise()
@@ -960,6 +985,85 @@ class Ledger:
                 "used_at_utc": datetime.now(timezone.utc).isoformat(),
                 "approved_by": approved_by, "result_json": "{}",
                 "status": "started", "cutoff": _cutoff_iso(cutoff)})
+
+    def reserve_lockbox_use(self, card_id: str, *, approved_by: str,
+                            cutoff=None, max_uses: int | None = None,
+                            round_id: str | None = None,
+                            round_lockbox_uses_max: int | None = None) -> None:
+        """H-03（全局审核 2026-10-29）：锁箱占位的**原子事务**——卡一次性、
+        项目级预算（lockbox_budget，cutoff 键）、轮次上限
+        （rounds.lockbox_uses_max）三层约束的检查与 started 行写入在
+        **同一个 BEGIN IMMEDIATE 事务**内完成。
+
+        修复前 begin_lockbox 先 lockbox_budget（一个事务）再
+        record_lockbox_start（另一个事务）：两个连接在检查与写入之间
+        受控交错，max_uses=1 的最后一个额度被占两次（审核复现
+        used=2/max=1）。BEGIN IMMEDIATE 下第二个连接在事务外排队
+        （busy_timeout=30s），提交后重读计数——只有一个占位成功。
+
+        拒绝类型（均不写任何行、预算不扣）：
+        - LockboxCardUsedError：该卡已有 lockbox_uses 行（含 started）；
+        - LockboxProjectBudgetExhaustedError：cutoff 给出且 used ≥ max_uses
+          （首见 cutoff 按 max_uses/缺省 DEFAULT_LOCKBOX_MAX_USES 登记，
+          与 lockbox_budget 同语义；cutoff=None 跳过预算检查）；
+        - LockboxRoundCapExceededError：round_id + round_lockbox_uses_max
+          给出且本轮已用满（round_lockbox_uses 同口径，含 started）。
+
+        崩溃恢复：started 已入链即持久——重启后同卡重试 LockboxCardUsedError，
+        预算计数不翻倍（同试验幂等重试同样只有一个占位）。
+        R6/C5：写前验证链；R7/N-C3：检查与写入同一事务。
+        """
+        key = _cutoff_iso(cutoff)
+        with self._txn():
+            self._verify_or_raise()
+            if self.conn.execute(
+                    "SELECT 1 FROM lockbox_uses WHERE card_id=?",
+                    (card_id,)).fetchone() is not None:
+                raise LockboxCardUsedError(
+                    f"卡 {card_id} 的锁箱已用过（lockbox_uses 有记录，含"
+                    "进行中的 started）——第二次请求直接拒绝；一次性机会"
+                    "已消耗，结论以第一次为准")
+            if key is not None:
+                row = self.conn.execute(
+                    "SELECT max_uses FROM lockbox_budget WHERE cutoff=?",
+                    (key,)).fetchone()
+                if row is None:
+                    limit = (DEFAULT_LOCKBOX_MAX_USES if max_uses is None
+                             else int(max_uses))
+                    if limit <= 0:
+                        raise ValueError(
+                            f"max_uses 必须为正整数，收到 {max_uses!r}——"
+                            "预算为零或负数应直接不登记 G5，而不是写进表里")
+                    self.conn.execute(
+                        "INSERT INTO lockbox_budget(cutoff, max_uses,"
+                        " created_utc) VALUES (?,?,?)",
+                        (key, limit,
+                         datetime.now(timezone.utc).isoformat()))
+                else:
+                    limit = int(row["max_uses"])
+                used = int(self.conn.execute(
+                    "SELECT COUNT(*) n FROM lockbox_uses WHERE cutoff=?",
+                    (key,)).fetchone()["n"])
+                if used >= limit:
+                    raise LockboxProjectBudgetExhaustedError(
+                        f"卡 {card_id} 的 G5 被拒：锁箱 cutoff={key} 的使用"
+                        f"预算已用尽（{used}/{limit}，T27/M11——多张卡各看"
+                        "一次锁箱等于在锁箱上做选择）。预算与退役规则见"
+                        "蓝图决策 D16；调整预算是管理员动作（改台账库），"
+                        "不是代码缺省")
+            if round_id is not None and round_lockbox_uses_max is not None:
+                used_r = self.round_lockbox_uses(round_id)
+                cap = int(round_lockbox_uses_max)
+                if used_r >= cap:
+                    raise LockboxRoundCapExceededError(
+                        f"轮次 {round_id} 的 G5 次数已达上限（本轮 "
+                        f"{used_r}/{cap}，lockbox_uses_max；计数=该轮内跑过"
+                        "的卡的 lockbox_uses 行数）——拒绝运行")
+            self._append_chained("lockbox_uses", {
+                "card_id": card_id,
+                "used_at_utc": datetime.now(timezone.utc).isoformat(),
+                "approved_by": approved_by, "result_json": "{}",
+                "status": "started", "cutoff": key})
 
     def finish_lockbox_use(self, card_id: str, *, result: dict,
                            approved_by: str = "bt",
