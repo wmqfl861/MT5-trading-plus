@@ -18,10 +18,20 @@
   spread_cost)，即把成交价里隐含的滑点/价差还原后的毛利。
 - 期望值：期望净利（资金）、expectancy_r（平均 R 倍数）、
   expectancy_cost_multiple（期望净利 / 单笔平均来回成本）。
-- data_sha256 算法：对 bars 的 time+open+high+low+close 五列做
-  pandas.util.hash_pandas_object(..., index=False)（逐行 uint64，不看行
-  索引），全部求和得整数 s，再对 str(s) 的 UTF-8 字节做 hashlib.sha256，
-  取 hexdigest。同数据（同列内容）必得同值。
+- data_sha256 版本化（H-12，2026-10-29）：
+  - v1（旧，data_sha256_v1 保留供对照/迁移核对）：对 bars 的
+    time+open+high+low+close 五列做 pandas.util.hash_pandas_object(
+    ..., index=False)（逐行 uint64，不看行索引），全部求和得整数 s，
+    再对 str(s) 的 UTF-8 字节做 hashlib.sha256，取 hexdigest。缺陷：
+    求和满足交换律——**丢行序**；且不含 tick_volume 等策略实际可读列。
+  - v2（现行，data_sha256）：bars 的**全部数据列**（列名排序后进头部）
+    逐行按 canonical JSON 拼接（每行 payload = [行号, 各列值...]，顺序
+    敏感；数值用最短往返表示，时间用 ISO 字符串，非有限数显式记
+    "NaN"/"Infinity"/"-Infinity"），整体 UTF-8 再 sha256。同数据（同列
+    内容同行序）必得同值；行交换、只改 volume/spread 等任何列、增删列
+    均改变身份。
+  - 返回值带版本前缀（"v1:" / "v2:"）——台账按完整字符串去重，新旧
+    指纹自动区分；旧台账裸哈希记录不迁移（重跑同数据按 v2 记新试验）。
 - git_commit：读不到（无 git、非仓库、超时、非零返回码）一律写
   "unknown"，绝不因取不到而中断报告。
 """
@@ -308,12 +318,101 @@ def current_git_commit() -> str:
         return "unknown"
 
 
-def data_sha256(bars: pd.DataFrame) -> str:
-    """数据快照哈希（算法见模块 docstring；只看 time+OHLC 内容，不看行索引）。"""
+_DATA_SHA_V1_PREFIX = "v1:"
+_DATA_SHA_V2_PREFIX = "v2:"
+
+
+def data_sha256_v1(bars: pd.DataFrame) -> str:
+    """旧版数据快照哈希（H-12 前的算法逐位复刻 + "v1:" 前缀）：
+    time+OHLC 五列逐行哈希求和再 SHA——丢行序、不含 volume 等列。
+    仅供迁移核对（旧台账裸 hex == 去掉前缀的本值）与对照测试；
+    新代码一律用 data_sha256（v2）。"""
     cols = ["time", "open", "high", "low", "close"]
     row_hashes = pd.util.hash_pandas_object(bars[cols], index=False)
     total = int(row_hashes.sum())
-    return hashlib.sha256(str(total).encode("utf-8")).hexdigest()
+    return _DATA_SHA_V1_PREFIX + hashlib.sha256(
+        str(total).encode("utf-8")).hexdigest()
+
+
+def _ts_token(v) -> str:
+    """时间值的 canonical token：UTC 纳秒整数的 ISO 字面量（带 ns 位，
+    np.datetime_as_string(unit='ns')；tz-aware 按 UTC 折算后统一表示；
+    NaT → "NaT"）。列向量路径与单格路径同值必得同 token。"""
+    ts = v if isinstance(v, pd.Timestamp) else pd.Timestamp(v)
+    if pd.isna(ts):
+        return '"NaT"'
+    s = str(np.datetime_as_string(np.datetime64(ts.value, "ns"), unit="ns"))
+    return '"' + s + '"'
+
+
+def _cell_token(v) -> str:
+    """单格值 → canonical JSON 字面量（严格 JSON：非有限数显式字符串标记
+    "NaN"/"Infinity"/"-Infinity"，保证跨平台确定性；与 json.dumps 的表示
+    逐字符一致——向量路径与单格路径同值必得同 token）。"""
+    if v is None:
+        return "null"
+    if isinstance(v, (bool, np.bool_)):
+        return "true" if bool(v) else "false"
+    if isinstance(v, np.integer):
+        return str(int(v))
+    if isinstance(v, (np.floating, float)):
+        f = float(v)
+        if math.isfinite(f):
+            return repr(f)                 # json.dumps 对 float 即 float.__repr__
+        return '"NaN"' if math.isnan(f) else ('"Infinity"' if f > 0
+                                              else '"-Infinity"')
+    if isinstance(v, (pd.Timestamp, datetime)):
+        return _ts_token(v)
+    if isinstance(v, str):
+        return json.dumps(v, ensure_ascii=False)
+    if isinstance(v, bytes):
+        return json.dumps(v.hex(), ensure_ascii=False)
+    if isinstance(v, (list, tuple)):       # 不会出现在 bars 列里，防御性展开
+        return "[" + ",".join(_cell_token(x) for x in v) + "]"
+    return json.dumps(f"{type(v).__name__}:{v!r}", ensure_ascii=False)
+
+
+def _column_tokens(s: pd.Series) -> list[str]:
+    """整列 → 逐行 canonical JSON token（按 dtype 向量化；与逐格
+    _cell_token 完全同值——大序列走快路径，语义不变）。"""
+    if len(s) == 0:
+        return []
+    if pd.api.types.is_bool_dtype(s.dtype):
+        return [("true" if x else "false") for x in s.tolist()]
+    if pd.api.types.is_integer_dtype(s.dtype):
+        return [str(x) for x in s.tolist()]
+    if pd.api.types.is_float_dtype(s.dtype):
+        out = []
+        for f in s.tolist():                # tolist() → Python float
+            if math.isfinite(f):
+                out.append(repr(f))
+            elif math.isnan(f):
+                out.append('"NaN"')
+            else:
+                out.append('"Infinity"' if f > 0 else '"-Infinity"')
+        return out
+    if pd.api.types.is_datetime64_any_dtype(s.dtype):
+        arr = (s.dt.tz_convert("UTC").dt.tz_localize(None).to_numpy()
+               if isinstance(s.dtype, pd.DatetimeTZDtype)
+               else s.to_numpy())
+        return ['"' + t + '"' for t in
+                np.datetime_as_string(arr, unit="ns").tolist()]
+    return [_cell_token(v) for v in s.tolist()]
+
+
+def data_sha256(bars: pd.DataFrame) -> str:
+    """数据快照哈希 v2（H-12；算法见模块 docstring）：**有序**逐行
+    canonical JSON（行号进哈希，行交换即变）× bars **全部数据列**
+    （tick_volume/spread/real_volume 等策略实际可读输入都进指纹），
+    返回 "v2:" + sha256 hex。旧算法见 data_sha256_v1（"v1:" 前缀）。"""
+    cols = sorted(str(c) for c in bars.columns)
+    header = json.dumps(cols, ensure_ascii=False, separators=(",", ":"))
+    tokens = [_column_tokens(bars[c]) for c in cols]
+    parts = [header]
+    for i, row in enumerate(zip(*tokens)):
+        parts.append(f"[{i},{','.join(row)}]")
+    return _DATA_SHA_V2_PREFIX + hashlib.sha256(
+        "\n".join(parts).encode("utf-8")).hexdigest()
 
 
 def _jsonable(obj):

@@ -14,6 +14,7 @@ from mt5quant.backtest.report import (
     bars_per_year,
     current_git_commit,
     data_sha256,
+    data_sha256_v1,
     render_markdown,
     summarize,
     write_report,
@@ -116,10 +117,59 @@ def test_data_sha256_reproducible_and_content_addressed():
     bars = make_bars()
     assert data_sha256(bars) == data_sha256(bars.copy())
     assert data_sha256(bars) == data_sha256(bars.set_index(
-        pd.Index(range(100, 105))))  # 只哈希 time+OHLC 内容，不看 index
+        pd.Index(range(100, 105))))  # 只哈希列内容，不看 index
     other = make_bars()
     other.loc[2, "close"] = 100.5
     assert data_sha256(other) != data_sha256(bars)
+
+
+# ------------------------------------------------- H-12：有序含 volume 指纹 v2
+
+def test_data_sha256_v2_row_swap_changes_identity():
+    """H-12 失败测试 1a：交换两行 → 身份必须变。旧算法（v1）对 OHLC/time
+    行哈希**求和**——加法交换律丢顺序，行交换不变（缺陷本体）；v2 逐行
+    有序拼接（canonical JSON，行号进哈希），顺序即身份。"""
+    bars = make_bars(4)
+    swapped = bars.iloc[[1, 0, 2, 3]].reset_index(drop=True)
+    assert data_sha256(swapped) != data_sha256(bars)          # v2：行序即身份
+    assert data_sha256_v1(swapped) == data_sha256_v1(bars)    # 旧算法确实丢顺序
+
+
+def test_data_sha256_v2_volume_column_changes_identity():
+    """H-12 失败测试 1b：只改 tick_volume 列 → 身份必须变。volume 是策略
+    实际可读输入（bars 整表进引擎），旧算法只看 time+OHLC 五列（v1 不变，
+    漏检缺陷本体）；v2 覆盖 bars 的全部数据列。"""
+    bars = make_bars()
+    other = make_bars()
+    other.loc[2, "tick_volume"] = 999
+    assert data_sha256(other) != data_sha256(bars)            # v2：volume 进指纹
+    assert data_sha256_v1(other) == data_sha256_v1(bars)      # 旧算法不含 volume
+
+
+def test_data_sha256_v2_version_prefixed_and_reproducible():
+    """H-12：指纹版本化——v2 带 "v2:" 前缀，v1（旧算法原样保留）带
+    "v1:" 前缀；台账按完整字符串去重，新旧自动区分（旧记录不迁移）。"""
+    bars = make_bars()
+    h = data_sha256(bars)
+    assert h.startswith("v2:")
+    assert data_sha256(bars.copy()) == h                       # 同输入同哈希
+    assert data_sha256(bars.set_index(
+        pd.Index(range(7, 12)))) == h                          # 不看行 index
+    old = data_sha256_v1(bars)
+    assert old.startswith("v1:")
+    assert h != old                                            # 新旧算法不同串
+
+
+def test_data_sha256_v1_prefixes_legacy_algorithm_verbatim():
+    """v1 = 旧算法逐位复刻（time+OHLC 五列行哈希求和再 SHA）加 "v1:"
+    前缀——迁移口径可核对：旧台账裸哈希 hex == v1 前缀后的部分。"""
+    import hashlib
+    bars = make_bars()
+    cols = ["time", "open", "high", "low", "close"]
+    legacy = hashlib.sha256(
+        str(int(pd.util.hash_pandas_object(bars[cols], index=False).sum()))
+        .encode("utf-8")).hexdigest()
+    assert data_sha256_v1(bars) == "v1:" + legacy
 
 
 def test_current_git_commit_falls_back_to_unknown(monkeypatch):

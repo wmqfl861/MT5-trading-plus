@@ -19,6 +19,7 @@ from mt5quant.backtest.report import (
     build_manifest,
     current_git_commit,
     data_sha256,
+    data_sha256_v1,
     make_run_dir,
     observed_bars_per_year,
     render_markdown,
@@ -31,7 +32,8 @@ __all__ = [
     "ENGINE_VERSION", "BacktestResult", "Costs", "Trade", "atr_series",
     "run_backtest", "ENGINE_VERSION_B", "TickCoverageError", "run_backtest_ticks",
     "Manifest", "annualization_factor", "bars_per_year",
-    "build_manifest", "current_git_commit", "data_sha256", "make_run_dir",
+    "build_manifest", "current_git_commit", "data_sha256",
+    "data_sha256_v1", "make_run_dir",
     "observed_bars_per_year", "render_markdown", "summarize", "write_report",
     "check_no_lookahead",
 ]

@@ -3024,8 +3024,13 @@ def cmd_screen(args) -> int:
             if args.costs == "auto":
                 costs_by_sym = {}
                 policy_by_sym = {}
+                # H-12：成本版本**逐品种**入映射——旧实现把 build_costs 的
+                # 版本写进循环尾变量，第二品种的版本会盖掉第一品种的：
+                # 每个品种的运行都被记进**最后一个**品种的成本身份（P-06
+                # 跨品种复用实例；试验七元组的 cost_model_version 串号）
+                cost_version_by_sym = {}
                 for sym in card.symbols:
-                    costs_by_sym[sym], cost_version = build_costs(
+                    costs_by_sym[sym], cost_version_by_sym[sym] = build_costs(
                         data_root, sym, args.spread_fraction,
                         args.commission, sessions_sha=sess_sha,
                         research_store=research_mode,
@@ -3037,7 +3042,7 @@ def cmd_screen(args) -> int:
                     policy_by_sym[sym] = entry_policy_for(
                         costs_by_sym[sym], sym, sess_policy)
             else:
-                cost_version = "zero-v0"
+                cost_version_by_sym = {sym: "zero-v0" for sym in card.symbols}
                 costs_by_sym = {sym: ZeroCosts() for sym in card.symbols}
                 policy_by_sym = {sym: sess_policy for sym in card.symbols}
                 # 审核三 D1：probability 卡拒绝 screen；卡/策略常量核对
@@ -3101,6 +3106,7 @@ def cmd_screen(args) -> int:
                 break
             bars = bars_by_sym[sym]
             dsha = data_sha256(bars)
+            cost_version = cost_version_by_sym[sym]   # H-12：本品种成本身份
             times = bars["time"]
             data_first = pd_iso(times.iloc[0])
             data_last = pd_iso(times.iloc[-1])
@@ -3393,8 +3399,12 @@ def cmd_gate(args) -> int:
             if args.costs == "auto":
                 costs_by_sym = {}
                 policy_by_sym = {}
+                # H-12：成本版本逐品种入映射（与 screen 同一修法）——旧实现
+                # 复用循环尾变量，基准运行只跑首品种却被记进**末品种**的
+                # 成本版本（gate 的 cost_model_version 串号）
+                cost_version_by_sym = {}
                 for sym in card.symbols:
-                    costs_by_sym[sym], cost_version = build_costs(
+                    costs_by_sym[sym], cost_version_by_sym[sym] = build_costs(
                         data_root, sym, args.spread_fraction,
                         args.commission, sessions_sha=sess_sha,
                         research_store=research_mode,
@@ -3404,7 +3414,7 @@ def cmd_gate(args) -> int:
                     policy_by_sym[sym] = entry_policy_for(
                         costs_by_sym[sym], sym, sess_policy)
             else:
-                cost_version = "zero-v0"
+                cost_version_by_sym = {sym: "zero-v0" for sym in card.symbols}
                 costs_by_sym = {sym: ZeroCosts() for sym in card.symbols}
                 policy_by_sym = {sym: sess_policy for sym in card.symbols}
         except Exception as e:
@@ -3468,6 +3478,10 @@ def cmd_gate(args) -> int:
         symbol = card.symbols[0]
         bars = bars_by_sym[symbol]
         costs = costs_by_sym[symbol]
+        # H-12：基准运行的成本版本取**本品种**的（旧实现取装配循环尾变量
+        # = 末品种版本；auto 参数选择按 cost_model_version 匹配 screen 行，
+        # 串号会错配到别的品种的成本上下文）
+        cost_version = cost_version_by_sym[symbol]
         combos = card.param_grid()      # G3 的网格内重选用
 
         # 参数选择（T21e/M5）：缺省与 "auto" 均按卡 selection_rule 从

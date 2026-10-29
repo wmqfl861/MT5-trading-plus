@@ -345,6 +345,25 @@ def test_stats_dedup_failed_runs_excluded(tmp_path):
     led.close()
 
 
+def test_stats_dedup_fingerprint_versions_distinguished(tmp_path):
+    """H-12：数据指纹版本化（"v1:"/"v2:" 前缀）——台账去重按**完整字符串**，
+    旧裸哈希 / "v1:" / "v2:" 三种同 hex 的指纹是三次不同试验（旧行不迁移，
+    新旧自动区分：N 不静默重算也不静默合并）。"""
+    led = Ledger(tmp_path / "ledger.sqlite")
+    base = dict(card_id="H001", card_version=1, strategy="s:C",
+                params={"k": 1}, symbol="XAUUSD", timeframe="H1",
+                data_first="2024-01-01", data_last="2026-01-01",
+                engine_version="A-1.3", cost_model_version="zero-v0",
+                gates_hash="", metrics={"net": 1.0}, actor="t")
+    hex64 = "a" * 64
+    led.record_run(data_sha256=hex64, **base)             # 旧台账裸哈希
+    led.record_run(data_sha256="v1:" + hex64, **base)     # v1 显式版本
+    led.record_run(data_sha256="v2:" + hex64, **base)     # v2（现行）
+    led.record_run(data_sha256="v2:" + hex64, **base)     # v2 重跑 → 去重
+    assert led.stats("H001")["n_dedup"] == 3
+    led.close()
+
+
 def test_stats_family_accumulates_card_versions(tmp_path):
     """H012-v2 是新文件：v1 跑过不影响 v2 的先卡后测；谱系 N 累计两者。"""
     from mt5quant.research import cards as rcards

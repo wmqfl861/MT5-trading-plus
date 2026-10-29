@@ -671,6 +671,7 @@ def candidate_statuses_by_card(candidates_dir=None) -> dict[str, str]:
 # ------------------------------------------------------- 代码指纹（T37/H3/D23）
 
 _LIBRARY_PKG = "mt5quant.strategies.library"
+_PROJECT_PKG = "mt5quant"                 # H-12：相对导入解析的项目包边界
 
 
 class StrategyDirtyError(RuntimeError):
@@ -691,23 +692,52 @@ def _module_file(name: str) -> Path | None:
     return Path(spec.origin).resolve()
 
 
-def _imports_within(path: Path, library_dir: Path) -> list[Path]:
-    """path 源码里 import 的、且落在 strategies/library 内的模块文件。
+def _package_parts(module_name: str, *, is_pkg: bool) -> tuple[str, ...]:
+    """模块的 `__package__`（真实 package）——普通模块去末段（a.b.c →
+    a.b）；包（__init__.py）取自身（a.b → a.b）。H-12 相对导入解析用。"""
+    parts = tuple(module_name.split("."))
+    return parts if is_pkg else parts[:-1]
 
-    认两类形式：绝对 import（`import mt5quant.strategies.library[.x]`、
-    `from mt5quant.strategies.library[.x] import y`）与 library 包内文件的
-    相对 import（level 1 → library 包、level 2 → strategies 包）；解析后
-    只保留 library_dir 之内的文件。`from mt5quant.strategies.library
-    import x` 的 x 存在同名子模块文件才算（属性导出不展开 __init__——
-    否则任何库策略的指纹都会经 __init__ 蔓延到整个策略库）。
+
+def _imports_within(path: Path, library_dir: Path, module_name: str | None = None,
+                    project_root: Path | None = None
+                    ) -> list[tuple[Path, str]]:
+    """path 源码里 import 的、落在指纹覆盖范围内的模块文件，连同模块名
+    返回 [(文件, 模块名)]（H-12 起带名——闭包继续走查时，相对导入要按
+    **该文件自己的 package** 解析，不能沿用固定前缀）。
+
+    认两类形式：
+    - 绝对 import（`import mt5quant.strategies.library[.x]`、`from
+      mt5quant.strategies.library[.x] import y`）：只认 library 前缀（T37
+      口径不变——pandas/numpy/strategies.base 等库外依赖不进指纹，由
+      git_commit + engine_version 覆盖）。
+    - 相对 import（H-12）：按导入文件的**真实 package**（module_name 的
+      `__package__` 语义，importlib 定位文件、模块名逐级上溯）解析——
+      旧实现把 level 1/2 锚死 library 根、level≥3 直接丢弃，库外文件的
+      相对导入会解析到错误前缀，漏掉 mt5quant.prob 等库外概率核心。
+      解析结果落在 library 内（旧行为）**或**项目 mt5quant 包内
+      （project_root 之下——相对导入物理上不可能越出顶层包，天然只有
+      项目代码）→ 进指纹。
+
+    `from X import y` 的 y 存在同名子模块文件才算（属性导出不展开
+    __init__——否则任何库策略的指纹都会经 __init__ 蔓延到整个策略库）。
+    module_name/project_root 缺省（旧调用方/测试探针）时无法解析相对
+    导入——保守跳过（与旧实现的收录范围一致，不误扩）。
     """
     import ast
 
     lib = _LIBRARY_PKG
-    lib_parts = tuple(lib.split("."))
-    parent_parts = lib_parts[:-1]
     targets: set[str] = set()
     tree = ast.parse(path.read_text(encoding="utf-8"))
+
+    def _in_scope(f: Path | None) -> bool:
+        if f is None:
+            return False
+        if library_dir is not None and library_dir in f.parents:
+            return True
+        return (project_root is not None
+                and project_root in f.parents)
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -717,32 +747,44 @@ def _imports_within(path: Path, library_dir: Path) -> list[Path]:
         elif isinstance(node, ast.ImportFrom):
             if node.level == 0:
                 base = node.module or ""
-            else:
-                # 相对导入只对 library 包内文件有意义（level=1 → library
-                # 包自身；level=2 → strategies 包），否则无从解析
-                anchor = lib_parts if node.level == 1 else (
-                    parent_parts if node.level == 2 else ())
-                base = ".".join(anchor + tuple((node.module or "").split(".")))
-            if base == lib:
-                for alias in node.names:
-                    cand = f"{lib}.{alias.name}"
-                    if _module_file(cand) is not None:
+                if base == lib:
+                    for alias in node.names:
+                        cand = f"{lib}.{alias.name}"
+                        if _module_file(cand) is not None:
+                            targets.add(cand)
+                elif base.startswith(lib + "."):
+                    targets.add(base)
+            elif module_name:
+                # H-12：真实 package 解析——anchor 上溯 level−1 级
+                anchor = _package_parts(
+                    module_name, is_pkg=(path.name == "__init__.py"))
+                if len(anchor) < node.level - 1:
+                    continue        # 相对层级越出顶层包（import 系统会报错）
+                anchor = anchor[: len(anchor) - (node.level - 1)]
+                extra = tuple(node.module.split(".")) if node.module else ()
+                base_parts = anchor + extra
+                base = ".".join(base_parts)
+                if not base:
+                    continue
+                cands = [base] + [f"{base}.{a.name}" for a in node.names]
+                for cand in cands:
+                    if cand in targets:
+                        continue
+                    if _in_scope(_module_file(cand)):
                         targets.add(cand)
-            elif base.startswith(lib + "."):
-                targets.add(base)
-    out: list[Path] = []
+    out: list[tuple[Path, str]] = []
     for t in sorted(targets):
         f = _module_file(t)
-        if f is not None and library_dir in f.parents:
-            out.append(f)
+        if f is not None and _in_scope(f):
+            out.append((f, t))
     return out
 
 
 def strategy_files(strategy_ref: str) -> list[Path]:
-    """指纹覆盖的文件集：策略类所在模块文件 + 它（传递）import 的
-    strategies/library 内模块文件（T37/H3/D23——台账 runs.strategy_sha
-    的哈希对象；library 外的依赖（pandas、strategies.base 等）不进指纹，
-    它们由 git_commit + engine_version 另行覆盖）。
+    """指纹覆盖的文件集：策略类所在模块文件 + 它（传递）import 的库内
+    模块与**相对导入解析到的库外项目模块**（T37/H3/D23 + H-12——台账
+    runs.strategy_sha 的哈希对象；绝对 import 的库外依赖（pandas、
+    strategies.base 等）不进指纹，由 git_commit + engine_version 覆盖）。
 
     策略模块通过 importlib 定位（不执行）；找不到模块 → ValueError
     （fail-fast：试验身份必须可计算，不能静默退化为不含代码的指纹）。
@@ -758,11 +800,13 @@ def strategy_files(strategy_ref: str) -> list[Path]:
             "——代码指纹（D23）无从计算，拒绝运行")
     lib_init = _module_file(_LIBRARY_PKG)
     library_dir = lib_init.parent if lib_init is not None else None
+    proj_init = _module_file(_PROJECT_PKG)          # H-12：项目包根
+    project_root = proj_init.parent if proj_init is not None else None
     seen: set[Path] = set()
     files: list[Path] = []
-    queue = [main]
+    queue: list[tuple[Path, str]] = [(main, mod_name)]
     while queue:
-        f = queue.pop(0)
+        f, name = queue.pop(0)
         rf = f.resolve()
         if rf in seen:
             continue
@@ -770,9 +814,10 @@ def strategy_files(strategy_ref: str) -> list[Path]:
         files.append(rf)
         if library_dir is None:
             continue
-        for dep in _imports_within(rf, library_dir):
+        for dep, dep_name in _imports_within(rf, library_dir, name,
+                                             project_root):
             if dep.resolve() not in seen:
-                queue.append(dep)
+                queue.append((dep, dep_name))
     return files
 
 

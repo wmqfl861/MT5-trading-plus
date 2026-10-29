@@ -576,8 +576,75 @@ def test_strategy_files_include_intra_library_imports(tmp_path):
         f"import {_LIB}.b1_donchian_breakout\n",
         encoding="utf-8")
     deps = cards._imports_within(probe, main.parent)
-    assert {f.name for f in deps} == {"buy_hold.py",
-                                      "b1_donchian_breakout.py"}
+    assert {f.name for f, _ in deps} == {"buy_hold.py",
+                                         "b1_donchian_breakout.py"}
+
+
+def _fake_project(tmp_path):
+    """H-12 测试用假项目树：src/mt5quant（项目包根）下 prob 与 strategies/
+    library——fake 模块表供 monkeypatch cards._module_file。"""
+    src = tmp_path / "src"
+    pkg = src / "mt5quant"
+    for sub in ("", "prob", "strategies", "strategies/library"):
+        (pkg / sub).mkdir(parents=True, exist_ok=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    lib_dir = pkg / "strategies" / "library"
+    (lib_dir / "__init__.py").write_text("", encoding="utf-8")
+    files = {"mt5quant": pkg / "__init__.py",
+             "mt5quant.strategies": pkg / "strategies" / "__init__.py",
+             _LIB: lib_dir / "__init__.py"}
+
+    def add(name, text):
+        f = pkg.joinpath(*name.split(".")[1:]).with_suffix(".py")
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text, encoding="utf-8")
+        files[name] = f
+        return f
+    return files, add
+
+
+def test_strategy_files_nested_relative_import_resolved_via_real_package(
+        tmp_path, monkeypatch):
+    """H-12 失败测试 3a：嵌套相对导入按**真实 package** 解析——库内策略
+    `from ...prob import tables`（level 3）应解析到 mt5quant.prob.tables
+    并进指纹。旧实现锚死 library 根（level≥3 无从解析→丢弃），漏掉库外
+    概率核心；传递闭包也走查（tables 自己的相对导入 counting 一并进）。"""
+    files, add = _fake_project(tmp_path)
+    add("mt5quant.prob.tables", "from . import counting\n")
+    add("mt5quant.prob.counting", "import pandas\n")
+    add(f"{_LIB}.deep", "from ...prob import tables\n")
+    monkeypatch.setattr(cards, "_module_file", lambda name: files.get(name))
+    got = cards.strategy_files(f"{_LIB}.deep:Deep")
+    assert {f.name for f in got} == {"deep.py", "tables.py", "counting.py"}
+
+
+def test_strategy_files_relative_import_from_non_library_strategy(
+        tmp_path, monkeypatch):
+    """H-12 失败测试 3b：库外策略模块（mt5quant.strategies.ztop）的
+    `from ..prob import tables`（level 2）按真实 package 解析到
+    mt5quant.prob.tables——旧实现固定锚 library 根，会错解析成
+    mt5quant.strategies.prob.tables 而丢弃。"""
+    files, add = _fake_project(tmp_path)
+    add("mt5quant.prob.tables", "import pandas\n")
+    add("mt5quant.strategies.ztop", "from ..prob import tables\n")
+    monkeypatch.setattr(cards, "_module_file", lambda name: files.get(name))
+    got = cards.strategy_files("mt5quant.strategies.ztop:ZTop")
+    assert {f.name for f in got} == {"ztop.py", "tables.py"}
+
+
+def test_strategy_files_absolute_outside_library_still_excluded(
+        tmp_path, monkeypatch):
+    """H-12 兼容口径：**绝对** import 的库外依赖（strategies.base、
+    numpy/pandas 等）仍不进指纹（T37：由 git_commit + engine_version 覆盖）
+    ——修复只针对相对导入的解析方式，不扩大绝对导入的收录范围。"""
+    files, add = _fake_project(tmp_path)
+    add("mt5quant.strategies.base", "class BaseStrategy: pass\n")
+    add(f"{_LIB}.guarded",
+        "import numpy as np\n"
+        "from mt5quant.strategies.base import BaseStrategy\n")
+    monkeypatch.setattr(cards, "_module_file", lambda name: files.get(name))
+    got = cards.strategy_files(f"{_LIB}.guarded:Guarded")
+    assert {f.name for f in got} == {"guarded.py"}
 
 
 def test_strategy_files_transitive_within_library(tmp_path, monkeypatch):

@@ -235,6 +235,143 @@ def test_screen_accepts_direct_card_path(tmp_path, monkeypatch):
     assert rc == 0
 
 
+# ------------------------------------- H-12：逐品种成本/政策上下文（P-06 实例）
+
+TWO_SYM_CARD = CARD_BODY.replace('symbols = ["XAUUSD"]',
+                                 'symbols = ["XAUUSD", "EURUSD"]')
+
+
+def make_two_symbol_data_root(tmp_path, n=6):
+    """双品种数据根：XAUUSD + EURUSD 各一段 H1 bars，specs 两品种合约大小。"""
+    root = make_data_root(tmp_path, n)
+    sdir = root / "bars" / "EURUSD" / "H1"
+    sdir.mkdir(parents=True)
+    h1_bars(n).to_parquet(sdir / "data.parquet")
+    (root / "specs" / "latest.json").write_text(
+        json.dumps({"XAUUSD": {"contract_size": 100.0, "volume_min": 0.01,
+                               "volume_step": 0.01, "volume_max": 200.0},
+                    "EURUSD": {"contract_size": 100_000.0, "volume_min": 0.01,
+                               "volume_step": 0.01, "volume_max": 100.0}}),
+        encoding="utf-8")
+    return root
+
+
+def patch_build_costs_per_symbol(monkeypatch, mod, versions):
+    """H-12：build_costs 注入——按品种返回不同成本版本串（试验身份应含
+    **本品种**的版本，而非循环尾变量复用到的最后一个品种）。"""
+    def fake(data_root, sym, spread_fraction, commission, *, sessions_sha=None,
+             research_store=False, swap_ref_price=None):
+        return mod.ZeroCosts(), versions[sym]
+    monkeypatch.setattr(mod, "build_costs", fake)
+
+
+def test_screen_records_per_symbol_cost_version(tmp_path, monkeypatch, capsys):
+    """H-12 失败测试 2a：screen 的 cost_model_version 逐品种取——只改第二
+    品种的成本版本时，第一品种的运行身份不变（旧行为：循环尾变量复用，
+    所有品种都被记成**最后一个**品种的版本，P-06 跨品种复用实例）。"""
+    mod = load_bt()
+    root = make_two_symbol_data_root(tmp_path)
+    cards_dir = write_card(tmp_path, TWO_SYM_CARD)
+    ledger_path = tmp_path / "ledger.sqlite"
+    patch_card_git(monkeypatch, mod)
+    patch_build_costs_per_symbol(monkeypatch, mod, {
+        "XAUUSD": "cv-xau-20261029", "EURUSD": "cv-eur-20261029"})
+    rc = mod.main(
+        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "auto", "--volume-lots", "0.01"])
+    assert rc == 0
+    with Ledger(ledger_path) as led:
+        rows = led.conn.execute(
+            "SELECT symbol, cost_model_version FROM runs").fetchall()
+    got = {r["symbol"]: r["cost_model_version"] for r in rows}
+    assert got == {"XAUUSD": "cv-xau-20261029",
+                   "EURUSD": "cv-eur-20261029"}
+
+
+def test_gate_base_run_uses_first_symbol_cost_version(tmp_path, monkeypatch,
+                                                      capsys):
+    """H-12 失败测试 2b：gate 基准运行只跑首品种，cost_model_version 须取
+    **该品种**的成本版本（旧行为：装配循环尾变量=末品种版本，首品种的
+    gate 运行被记进末品种的成本身份）。"""
+    mod = load_bt()
+    root = make_two_symbol_data_root(tmp_path)
+    cards_dir = write_card(tmp_path, TWO_SYM_CARD)
+    ledger_path = tmp_path / "ledger.sqlite"
+    patch_card_git(monkeypatch, mod)
+    patch_build_costs_per_symbol(monkeypatch, mod, {
+        "XAUUSD": "cv-xau-20261029", "EURUSD": "cv-eur-20261029"})
+    rc = mod.main(
+        ["gate", "--card", "H099", "--cards-dir", str(cards_dir),
+         "--data-root", str(root), "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "auto", "--volume-lots", "0.01",
+         "--gates", "G0", "--params", "{}"])
+    assert rc == 0
+    with Ledger(ledger_path) as led:
+        rows = led.conn.execute(
+            "SELECT symbol, cost_model_version FROM runs").fetchall()
+    assert rows and rows[0]["symbol"] == "XAUUSD"
+    assert rows[0]["cost_model_version"] == "cv-xau-20261029"
+
+
+def test_screen_symbol_permutation_keeps_set_identity(tmp_path, monkeypatch):
+    """H-12 失败测试 2c（兼容）：品种排列变化不改变**集合身份**——同一份
+    数据、同一组成本版本，symbols 顺序不同的两张卡产生完全相同的
+    (symbol, data_sha256, cost_model_version) 试验集合（旧行为：共享末
+    品种版本串 → 集合随排列变化）。"""
+    mod = load_bt()
+    root = make_two_symbol_data_root(tmp_path)
+    write_card(tmp_path, TWO_SYM_CARD.replace('id = "H099"', 'id = "H098"'),
+               name="H098.toml")
+    write_card(tmp_path, TWO_SYM_CARD.replace(
+        'symbols = ["XAUUSD", "EURUSD"]',
+        'symbols = ["EURUSD", "XAUUSD"]'), name="H099.toml")
+    cards_dir = tmp_path / "cards"
+    ledger_path = tmp_path / "ledger.sqlite"
+    patch_card_git(monkeypatch, mod)
+    patch_build_costs_per_symbol(monkeypatch, mod, {
+        "XAUUSD": "cv-xau-20261029", "EURUSD": "cv-eur-20261029"})
+    common = ["--cards-dir", str(cards_dir), "--data-root", str(root),
+              "--ledger", str(ledger_path),
+              "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+              "--costs", "auto", "--volume-lots", "0.01"]
+    assert mod.main(["screen", "--card", "H098", *common]) == 0
+    assert mod.main(["screen", "--card", "H099", *common]) == 0
+    with Ledger(ledger_path) as led:
+        rows = led.conn.execute(
+            "SELECT symbol, data_sha256, cost_model_version FROM runs"
+        ).fetchall()
+    ident = {(r["symbol"], r["data_sha256"], r["cost_model_version"])
+             for r in rows}
+    assert len(ident) == 2                       # 每品种恰一个集合身份
+    by_sym = {s: (s, d, c) for s, d, c in ident}
+    assert by_sym["XAUUSD"][2] == "cv-xau-20261029"
+    assert by_sym["EURUSD"][2] == "cv-eur-20261029"
+
+
+def test_screen_same_experiment_rerun_dedups_under_v2(tmp_path, monkeypatch):
+    """H-12 兼容：指纹换 v2 后**相同试验保持去重**——同数据根/同卡/同策略
+    重跑 screen 两次，runs 落 2 行但去重 N 只计 1（data_sha256 v2 确定：
+    同输入→同哈希）。"""
+    mod = load_bt()
+    root = make_data_root(tmp_path)
+    cards_dir = write_card(tmp_path)
+    ledger_path = tmp_path / "ledger.sqlite"
+    patch_card_git(monkeypatch, mod)
+    common = ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+              "--data-root", str(root), "--ledger", str(ledger_path),
+              "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+              "--costs", "zero", "--volume-lots", "0.01"]
+    assert mod.main(common) == 0
+    assert mod.main(common) == 0
+    with Ledger(ledger_path) as led:
+        st = led.stats("H099")
+    assert st["total_runs"] == 2
+    assert st["n_dedup"] == 1
+
+
 # ---------------------------------------------------------------- ledger stats
 
 def test_ledger_stats_prints_counts(tmp_path, capsys):
