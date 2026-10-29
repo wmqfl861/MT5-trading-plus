@@ -8,10 +8,13 @@
   （tick **不**导出：tick 库对研究账户拒读，研究侧成本经缓存文件提供，
   缓存新鲜度在导出时对照主库 tick 水位核验）；specs/latest.json 必须有
   （合约大小与手数上下限），calibrated.json / server_clock.json 有则复制；
-- lockbox.json **不**复制：研究库没有锁箱段，research_bars 在研究库上
-  行为与直读一致（锁箱语义自然满足）；
-- 导出后自检：研究库里任何序列 last_time 都必须早于 cutoff，越界即
-  失败退出（--verify-only 可单独跑自检）。
+- lockbox.json **不**复制：研究库没有锁箱段；H-01 起研究库的有效上界 =
+  meta.source_cutoff（research_bars 在研究库上同样拒绝越界 end）；
+- 导出后自检（H-01 强化）：枚举**真实 parquet 文件**（不只 meta 清单），
+  任何序列 last_time 都必须早于 cutoff；orphan parquet（有数据无 meta）、
+  坏 meta（非法 JSON / 缺字段 / 声明越界）一律失败（--verify-only 单独复检）；
+- H-01 暂存发布：导出先写 {dest}.staging，自检通过后原子上位；任何失败
+  清理暂存——目标目录永远只有完整快照（旧快照或新快照）。
 """
 import importlib.util
 import json
@@ -132,10 +135,14 @@ def test_export_copies_costs_cache_and_specs_not_ticks_or_lockbox(
     assert (dest / "specs" / "latest.json").is_file()
     assert not (dest / "ticks").exists()
     assert not (dest / "lockbox.json").exists()
-    # 研究库上 research_bars = 直读（无锁箱段：end 越过原 cutoff 也不报错）
-    df = research_bars(str(dest), "XAUUSD", "H1",
-                       end=pd.Timestamp("2030-01-01"))
+    # H-01：研究库的有效上界 = meta.source_cutoff（导出时记录）——end 越过
+    # 它同样 LockboxError（可信导出库不再是"无锁箱直读"）
+    from mt5data.lockbox import LockboxError
+    with pytest.raises(LockboxError):
+        research_bars(str(dest), "XAUUSD", "H1", end=pd.Timestamp("2030-01-01"))
+    df = research_bars(str(dest), "XAUUSD", "H1", end=CUTOFF)
     assert len(df) == 10
+    assert (df["time"] >= CUTOFF).sum() == 0
 
 
 # ---------------------------------------------------------------- 导出失败
@@ -260,3 +267,184 @@ def test_build_costs_works_on_research_store_without_ticks(tmp_path,
                                 allow_zero_swap=True, research_store=True)
     assert "缓存" in ver or ver.startswith("tick-spread")   # 可装配即可
     assert costs.spread.stat(8).n > 0
+
+
+# ================================================================ H-01 自检强化
+
+
+def _export_ok(mod, main_store, dest):
+    assert mod.main(["--data-root", str(main_store), "--dest",
+                     str(dest)]) == 0
+
+
+def test_verify_flags_orphan_parquet(tmp_path, main_store):
+    """【H-01 失败测试】orphan parquet（有数据无 meta，含越界数据）：
+    旧实现只遍历 meta 清单 → 零违规漏检（审核已合成复现）；必须失败。"""
+    mod = load_script("export_research_store_x", SCRIPT_PATH)
+    dest = tmp_path / "data_research"
+    _export_ok(mod, main_store, dest)
+    sdir = dest / "bars" / "EURUSD" / "H1"
+    sdir.mkdir(parents=True)
+    bars_around(n_pre=2, n_post=2).to_parquet(sdir / "data.parquet")
+    violations = mod.verify_research_store(str(dest), CUTOFF)
+    assert any("EURUSD" in v and "meta" in v for v in violations), violations
+    assert mod.main(["--data-root", str(main_store), "--dest", str(dest),
+                     "--verify-only"]) == 2
+
+
+def test_verify_flags_bad_meta_missing_fields(tmp_path, main_store):
+    """【H-01 失败测试】meta 缺 store 必需字段（坏 meta）→ 失败（旧实现
+    经 series_inventory 记成 warning 后被丢弃）。"""
+    mod = load_script("export_research_store_x", SCRIPT_PATH)
+    dest = tmp_path / "data_research"
+    _export_ok(mod, main_store, dest)
+    p = dest / "bars" / "XAUUSD" / "H1" / "meta.json"
+    meta = json.loads(p.read_text(encoding="utf-8"))
+    del meta["last_closed_time"]
+    p.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    violations = mod.verify_research_store(str(dest), CUTOFF)
+    assert any("XAUUSD" in v and "坏 meta" in v for v in violations), violations
+    assert mod.main(["--data-root", str(main_store), "--dest", str(dest),
+                     "--verify-only"]) == 2
+
+
+def test_verify_flags_corrupt_meta_json(tmp_path, main_store):
+    """【H-01 失败测试】meta.json 非法 JSON → 失败（warnings 不再被忽略）。"""
+    mod = load_script("export_research_store_x", SCRIPT_PATH)
+    dest = tmp_path / "data_research"
+    _export_ok(mod, main_store, dest)
+    (dest / "bars" / "XAUUSD" / "H1" / "meta.json").write_text(
+        "{ 不是 JSON", encoding="utf-8")
+    violations = mod.verify_research_store(str(dest), CUTOFF)
+    assert any("坏 meta" in v for v in violations), violations
+    assert mod.main(["--data-root", str(main_store), "--dest", str(dest),
+                     "--verify-only"]) == 2
+
+
+def test_verify_flags_meta_without_data(tmp_path, main_store):
+    """【H-01 失败测试】meta 在、data.parquet 缺（数据/元数据不一致）→ 失败。"""
+    mod = load_script("export_research_store_x", SCRIPT_PATH)
+    dest = tmp_path / "data_research"
+    _export_ok(mod, main_store, dest)
+    (dest / "bars" / "XAUUSD" / "H1" / "data.parquet").unlink()
+    violations = mod.verify_research_store(str(dest), CUTOFF)
+    assert any("data.parquet" in v or "无数据" in v
+               for v in violations), violations
+
+
+def test_verify_flags_source_cutoff_beyond_cutoff(tmp_path, main_store):
+    """【H-01 失败测试】meta 声明越界（source_cutoff 晚于核验 cutoff）→ 失败。"""
+    mod = load_script("export_research_store_x", SCRIPT_PATH)
+    dest = tmp_path / "data_research"
+    _export_ok(mod, main_store, dest)
+    p = dest / "bars" / "XAUUSD" / "H1" / "meta.json"
+    meta = json.loads(p.read_text(encoding="utf-8"))
+    meta["source_cutoff"] = (CUTOFF + pd.Timedelta(days=1)).isoformat()
+    p.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    violations = mod.verify_research_store(str(dest), CUTOFF)
+    assert any("source_cutoff" in v for v in violations), violations
+
+
+def test_verify_flags_data_beyond_own_source_cutoff(tmp_path, main_store):
+    """【H-01 失败测试】数据越过自身 meta.source_cutoff（坏 meta 越界）→ 失败，
+    即便 last_time 仍早于核验 cutoff。"""
+    mod = load_script("export_research_store_x", SCRIPT_PATH)
+    dest = tmp_path / "data_research"
+    _export_ok(mod, main_store, dest)
+    p = dest / "bars" / "XAUUSD" / "H1" / "meta.json"
+    meta = json.loads(p.read_text(encoding="utf-8"))
+    meta["source_cutoff"] = pd.Timestamp("2026-05-31T15:00:00").isoformat()
+    p.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    violations = mod.verify_research_store(str(dest), CUTOFF)
+    assert any("source_cutoff" in v for v in violations), violations
+
+
+def test_verify_ext_flags_orphan_ext_parquet(tmp_path, main_store):
+    """【H-01 失败测试】ext 段 orphan parquet（无 manifest）→ ext 自检失败。"""
+    mod = load_script("export_research_store_x", SCRIPT_PATH)
+    dest = tmp_path / "data_research"
+    _export_ok(mod, main_store, dest)
+    d = dest / "ext" / "histdata" / "XAUUSD" / "H1"
+    d.mkdir(parents=True)
+    bars_around(n_pre=2, n_post=2).to_parquet(d / "data.parquet")
+    violations = mod.verify_ext_research_store(str(dest), CUTOFF)
+    assert any("manifest" in v for v in violations), violations
+
+
+# ================================================================ H-01 暂存发布
+
+
+def test_failed_export_leaves_no_partial_store(tmp_path, main_store):
+    """【H-01 失败测试】导出中途失败（缓存过期在 bars 已写之后）：
+    旧实现直接写目标目录 → 留下可读的不完整快照；必须清理暂存、目标不存在。"""
+    from mt5data.ticks import save_ticks
+
+    mod = load_script("export_research_store_x", SCRIPT_PATH)
+    dest = tmp_path / "r"
+    save_ticks(str(main_store), "XAUUSD",
+               full_hour_ticks().assign(
+                   time_msc=full_hour_ticks()["time_msc"] + 86_400_000))
+    assert mod.main(["--data-root", str(main_store), "--dest",
+                     str(dest)]) == 1
+    assert not dest.exists()          # 旧实现：dest/bars/** 已写入 → RED
+    assert not (tmp_path / "r.staging").exists()
+
+
+def test_verify_failure_cleans_staging(tmp_path, main_store, monkeypatch):
+    """【H-01 失败测试】自检不通过 → 导出作废：清理暂存，目标不发布。"""
+    mod = load_script("export_research_store_x", SCRIPT_PATH)
+    monkeypatch.setattr(mod, "verify_research_store",
+                        lambda d, c: ["伪造越界：TEST/H1"])
+    assert mod.main(["--data-root", str(main_store), "--dest",
+                     str(tmp_path / "r")]) == 2
+    assert not (tmp_path / "r").exists()
+    assert not (tmp_path / "r.staging").exists()
+
+
+def test_staged_publish_replaces_stale_locked_series(tmp_path, main_store):
+    """【H-01 失败测试】收紧锁箱后旧目标序列只剩锁箱数据：
+    暂存发布 → 新快照只含仍开放的序列，旧的越界序列不得残留
+    （旧实现把新旧混写进目标 → 自检失败 rc=2 且留下可读坏快照）。"""
+    from mt5data.lockbox import write_global_cutoff
+    from mt5data.store import load_bars, read_watermark, save_bars
+    from mt5data.ticks import save_ticks, tick_watermark
+
+    mod = load_script("export_research_store_x", SCRIPT_PATH)
+    dest = tmp_path / "data_research"
+    assert mod.main(["--data-root", str(main_store), "--dest",
+                     str(dest)]) == 0
+    # 收紧全局锁箱（只许更早）：XAUUSD 开放段（05-31 10:00 起）整段落入锁箱
+    tighter = pd.Timestamp("2026-05-31T00:00:00")
+    write_global_cutoff(str(main_store), tighter, note="H-01 收紧")
+    # 新增一条收紧后仍开放的序列（含 tick 缓存水位，供成本缓存核验）
+    eur = pd.DataFrame({
+        "time": pd.date_range("2026-05-20 10:00", periods=6, freq="h"),
+        "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0,
+        "tick_volume": 10, "spread": 5, "real_volume": 0})
+    save_bars(str(main_store), "EURUSD", "H1", eur)
+    save_ticks(str(main_store), "EURUSD", full_hour_ticks())
+    cache_p = main_store / "costs" / "spread_model.json"
+    doc = json.loads(cache_p.read_text(encoding="utf-8"))
+    doc["watermarks"]["EURUSD"] = tick_watermark(str(main_store), "EURUSD")
+    cache_p.write_text(json.dumps(doc, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+    rc = mod.main(["--data-root", str(main_store), "--dest", str(dest)])
+    assert rc == 0                                   # 旧实现 rc=2 → RED
+    assert read_watermark(str(dest), "XAUUSD", "H1") is None   # 旧序列不残留
+    seg = load_bars(str(dest), "EURUSD", "H1")
+    assert seg is not None and seg["time"].max() < tighter
+    assert not Path(str(dest) + ".staging").exists()
+    assert mod.main(["--data-root", str(main_store), "--dest", str(dest),
+                     "--verify-only"]) == 0
+
+
+def test_staged_publish_success_replaces_and_cleans(tmp_path, main_store):
+    """【H-01 失败测试】成功导出：目标发布为完整快照，暂存目录消失。"""
+    mod = load_script("export_research_store_x", SCRIPT_PATH)
+    dest = tmp_path / "data_research"
+    assert mod.main(["--data-root", str(main_store), "--dest",
+                     str(dest)]) == 0
+    assert (dest / "bars" / "XAUUSD" / "H1" / "data.parquet").is_file()
+    assert (dest / "costs" / "spread_model.json").is_file()
+    assert not Path(str(dest) + ".staging").exists()
+

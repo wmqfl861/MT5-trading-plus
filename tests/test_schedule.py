@@ -63,3 +63,33 @@ def test_inventory_bad_meta_goes_to_warnings(tmp_path):
 def test_inventory_missing_bars_dir_returns_empty(tmp_path):
     inv, warnings = series_inventory(tmp_path / "nope")
     assert inv == [] and warnings == []
+
+
+# ---------------------------------------------------------------- H-01 真实文件枚举
+
+
+def test_bars_parquet_paths_enumerates_real_files(tmp_path):
+    """【H-01 失败测试】枚举真实 data.parquet（不信 meta 清单）：
+    orphan（有数据无 meta）必须可见——series_inventory 完全看不见它。"""
+    from mt5data.schedule import bars_parquet_paths
+
+    save_series(tmp_path, "XAUUSD", "H1")
+    orphan = tmp_path / "bars" / "EURUSD" / "M1"
+    orphan.mkdir(parents=True)
+    pd.DataFrame({
+        "time": pd.to_datetime(["2026-06-01T00:00:00", "2026-06-01T01:00:00"]),
+        "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+        "tick_volume": 1, "spread": 1, "real_volume": 0,
+    }).to_parquet(orphan / "data.parquet")
+
+    found = bars_parquet_paths(str(tmp_path))
+    assert [(s, t) for s, t, _ in found] == [("EURUSD", "M1"), ("XAUUSD", "H1")]
+    # orphan 在 meta 清单里不可见（对照：旧自检只遍历清单）
+    inv, _ = series_inventory(tmp_path)
+    assert ("EURUSD", "M1") not in [(r.symbol, r.timeframe) for r in inv]
+
+
+def test_bars_parquet_paths_empty_root(tmp_path):
+    from mt5data.schedule import bars_parquet_paths
+
+    assert bars_parquet_paths(str(tmp_path / "nope")) == []

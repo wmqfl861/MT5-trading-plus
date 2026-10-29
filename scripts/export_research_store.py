@@ -16,11 +16,18 @@ docs/p6/permissions.md）；研究侧一切读取改走 data_research（--resear
   水位核验移到导出时：缓存与主库 tick 水位不一致 → 拒绝导出）；
 - data_research/specs/latest.json——合约大小与手数上下限（必需要有，
   缺则拒绝导出）；costs/calibrated.json、server_clock.json 有则复制；
-- **lockbox.json 不复制**：研究库里没有锁箱段，research_bars 在研究库上
-  行为与直读一致（锁箱语义自然满足）；
-- 导出后自检（verify_research_store）：研究库里**任何**序列的 last_time
-  都必须早于 cutoff，一条越界即整体失败退出（退出码 2）；--verify-only
-  可对既有研究库单独复检。
+- **lockbox.json 不复制**：研究库里没有锁箱段；H-01 起研究库的有效上界 =
+  meta.source_cutoff（mt5data.lockbox.effective_research_bound 统一契约：
+  research_bars 在研究库上同样拒绝越界 end）；
+- 导出后自检（verify_research_store，H-01 强化）：**枚举真实 parquet 文件**
+  （schedule.bars_parquet_paths，不只 meta 清单）——任何序列 last_time
+  ≥ cutoff、orphan parquet（有数据无 meta）、坏 meta（非法 JSON / 缺必需
+  字段 / source_cutoff 声明越界 / 数据越过自身 source_cutoff）、meta 有而
+  data.parquet 缺，任一违例即整体失败退出（退出码 2，原 warnings 不再
+  被忽略）；--verify-only 可对既有研究库单独复检；
+- **暂存发布（H-01）**：导出先写 {dest}.staging → 自检（含 ext 段）全部
+  通过 → 原子上位（旧快照挪备份、暂存改名、清备份）；任何失败清理暂存，
+  目标目录永远只有完整快照（旧快照或新快照），绝不留下可读的不完整快照。
 
 外部数据（T67/D36/铁律 19，**默认不启用**）：
 - `--include-ext` 才把 data/ext/**（外部源适配后的 K 线）导出为
@@ -34,8 +41,9 @@ docs/p6/permissions.md）；研究侧一切读取改走 data_research（--resear
   （usage_restriction，只研究用/不再分发/原始数据不入公开仓库），
   缺限定或文本不一致 → 拒绝导出（fail-fast 整体失败）；
 - cutoff 纪律同样硬约束外部数据：只导出 time < 全局 cutoff 的行，
-  导出后 verify_ext_research_store 复检研究库 ext 段（manifest 必须合法、
-  last_time < cutoff，一条越界整体失败退出 2）；
+  导出后 verify_ext_research_store 复检研究库 ext 段（H-01 起同样枚举
+  真实 parquet：manifest 必须合法且带 research_cutoff、last_time <
+  cutoff、orphan ext parquet 失败，一条违例整体失败退出 2）；
 - ext 序列的 manifest 在读取与导出两侧都过 validate_manifest（缺字段
   拒绝入库/拒绝导出），并追加 research_cutoff 与 exported_at_utc。
 
@@ -128,24 +136,80 @@ def verify_cost_cache(data_root: str, cache_path: str,
 
 
 def verify_research_store(dest: str, cutoff) -> list[str]:
-    """研究库自检：任何序列 last_time ≥ cutoff → 记一条越界（T27）。
+    """研究库自检（H-01 强化）：以**真实 parquet 文件**为事实来源。
 
-    返回越界清单（空 = 通过）；越界序列的读回不经 save/merge 的内存
-    副本，而是重新 load_bars（防"写的东西与验的东西不是同一份"）。
+    旧实现只遍历 series_inventory 的 meta 清单并丢弃 warnings——orphan
+    parquet（有数据无 meta，含越界数据）完全漏检（审核已合成复现）。
+    现枚举 {dest}/bars/*/*/data.parquet 逐文件核验，违例记入返回清单
+    （空 = 通过）：
+    - orphan：有 data.parquet 无 meta.json（不在任何清单里，来源不明）；
+    - 坏 meta：非法 JSON / 缺 store 必需字段（schedule 同口径——原
+      warnings 从此不再被忽略，直接判失败）；
+    - meta 有而 data.parquet 缺（数据/元数据不是同一份）；
+    - 越界：真实 parquet 的 last_time ≥ cutoff；meta.source_cutoff 晚于
+      核验 cutoff（声明越界）；数据越过自身 source_cutoff。
+    读回直接读枚举到的 parquet 文件本身（不经 save/merge 的内存副本，
+    防"写的东西与验的东西不是同一份"）。
     """
+    from mt5data.schedule import REQUIRED_META_FIELDS, bars_parquet_paths
+
     cut = pd.Timestamp(cutoff)
     violations: list[str] = []
-    inventory, _warnings = series_inventory(dest)
-    for ref in inventory:
-        df = load_bars(dest, ref.symbol, ref.timeframe)
-        if df is None or len(df) == 0:
-            continue
-        last = pd.Timestamp(df["time"].max())
-        if last >= cut:
+    seen_dirs: set[str] = set()
+    for symbol, timeframe, pq in bars_parquet_paths(dest):
+        key = f"{symbol}/{timeframe}"
+        seen_dirs.add(str(pq.parent))
+        meta: dict | None = None
+        meta_path = pq.parent / "meta.json"
+        if not meta_path.exists():
             violations.append(
-                f"{ref.symbol}/{ref.timeframe}: last_time="
-                f"{last.isoformat()} ≥ cutoff={cut.isoformat()}"
-                "（研究库混入锁箱段，导出失败）")
+                f"{key}: 有 data.parquet 无 meta.json（orphan——不在 meta "
+                "清单里，来源与边界不明，研究库不得有无主数据）")
+        else:
+            try:
+                with open(meta_path, encoding="utf-8") as f:
+                    meta = json.load(f)
+                if not isinstance(meta, dict):
+                    raise TypeError("meta 应为 JSON 对象")
+                missing = [k for k in REQUIRED_META_FIELDS if k not in meta]
+                if missing:
+                    raise KeyError(f"缺少字段 {','.join(missing)}")
+            except (OSError, ValueError, TypeError, KeyError) as e:
+                violations.append(
+                    f"{key}: 坏 meta（{type(e).__name__}: {e}）——fail-closed")
+                meta = None  # 边界声明不可信；数据越界仍继续核
+        df = pd.read_parquet(pq)
+        last = pd.Timestamp(df["time"].max()) if len(df) else None
+        if last is not None and last >= cut:
+            violations.append(
+                f"{key}: last_time={last.isoformat()} ≥ cutoff="
+                f"{cut.isoformat()}（研究库混入锁箱段，导出失败）")
+        if meta is not None and meta.get("source_cutoff"):
+            try:
+                sc = pd.Timestamp(meta["source_cutoff"])
+            except (TypeError, ValueError):
+                violations.append(
+                    f"{key}: meta.source_cutoff 不可解析："
+                    f"{meta['source_cutoff']!r}（坏 meta，fail-closed）")
+            else:
+                if sc > cut:
+                    violations.append(
+                        f"{key}: meta.source_cutoff={sc.isoformat()} 晚于"
+                        f"核验 cutoff={cut.isoformat()}（坏 meta：声明越界）")
+                if last is not None and last >= sc:
+                    violations.append(
+                        f"{key}: last_time={last.isoformat()} ≥ 自身 "
+                        f"source_cutoff={sc.isoformat()}"
+                        "（数据越过导出时记录的边界，坏 meta）")
+    # meta 有而数据缺：清单里声称存在的序列必须有真实文件
+    bars_dir = Path(dest) / "bars"
+    for meta_path in sorted(bars_dir.glob("*/*/meta.json")):
+        if str(meta_path.parent) in seen_dirs:
+            continue
+        key = f"{meta_path.parent.parent.name}/{meta_path.parent.name}"
+        violations.append(
+            f"{key}: meta.json 在而 data.parquet 缺（数据/元数据不是"
+            "同一份，fail-closed）")
     return violations
 
 
@@ -224,32 +288,77 @@ def export_ext_series(ext_root: str, dest: str, cutoff, *,
 
 
 def verify_ext_research_store(dest: str, cutoff) -> list[str]:
-    """研究库 ext 段自检（T67）：manifest 合法 + last_time < cutoff。
+    """研究库 ext 段自检（T67；H-01 起同样枚举真实 parquet）。
 
-    与 verify_research_store 同语义：一条越界/一个坏 manifest 即记越界，
-    整体失败退出；读回不经写路径的内存副本。
+    旧实现只遍历 ext_inventory 的 manifest 清单——orphan ext parquet
+    （有数据无 manifest）不可见。现枚举 {dest}/ext/*/*/*/data.parquet
+    逐文件核验：orphan（无 manifest）、manifest 损坏/缺必需字段、缺
+    research_cutoff 边界戳、research_cutoff 晚于核验 cutoff、真实数据
+    last_time ≥ cutoff——任一违例记入清单（空 = 通过）。
     """
-    from mt5data.ext import ExtDataError, ext_inventory
+    from mt5data.ext.core import validate_manifest
 
-    ext_root = os.path.join(str(dest), "ext")
-    if not os.path.isdir(ext_root):
+    ext_root = Path(dest) / "ext"
+    if not ext_root.is_dir():
         return []
     cut = pd.Timestamp(cutoff)
     violations: list[str] = []
-    try:
-        inv = ext_inventory(ext_root)
-    except ExtDataError as e:
-        return [f"ext manifest 校验失败：{e}"]
-    for m in inv:
-        df = pd.read_parquet(os.path.join(
-            ext_root, m["source"], m["symbol"], m["timeframe"],
-            "data.parquet"))
+    for pq in sorted(ext_root.glob("*/*/*/data.parquet")):
+        rel = pq.parent
+        key = f"ext {rel.parent.parent.name}/{rel.parent.name}/{rel.name}"
+        manifest: dict | None = None
+        mp = pq.parent / "manifest.json"
+        if not mp.exists():
+            violations.append(
+                f"{key}: 有 data.parquet 无 manifest.json（orphan——"
+                "来源与边界不明，研究库不得有无主数据）")
+        else:
+            try:
+                with open(mp, encoding="utf-8") as f:
+                    manifest = json.load(f)
+                validate_manifest(manifest)
+            except (OSError, ValueError, TypeError, RuntimeError) as e:
+                violations.append(f"{key}: manifest 校验失败（{e}）")
+                manifest = None
+        if manifest is not None and not manifest.get("research_cutoff"):
+            violations.append(
+                f"{key}: manifest 缺 research_cutoff 边界戳"
+                "（研究库 ext 段必须带导出时记录的边界）")
+        elif manifest is not None:
+            if pd.Timestamp(manifest["research_cutoff"]) > cut:
+                violations.append(
+                    f"{key}: manifest.research_cutoff="
+                    f"{manifest['research_cutoff']} 晚于核验 cutoff="
+                    f"{cut.isoformat()}（声明越界）")
+        df = pd.read_parquet(pq)
         if len(df) and pd.Timestamp(df["time"].max()) >= cut:
             violations.append(
-                f"ext {m['source']}/{m['symbol']}/{m['timeframe']}: "
-                f"last_time={pd.Timestamp(df['time'].max()).isoformat()}"
+                f"{key}: last_time={pd.Timestamp(df['time'].max()).isoformat()}"
                 f" ≥ cutoff={cut.isoformat()}（外部数据混入锁箱段）")
     return violations
+
+
+def _publish_staging(staging: str, dest: str) -> None:
+    """暂存快照原子上位（H-01）：旧目标先挪备份 → 暂存改名上位 → 清备份。
+
+    上位失败回滚（目标回到旧快照）；任何时刻目标要么是旧完整快照、要么
+    是新完整快照，绝不出现可读的不完整状态。同目录改名是原子的。
+    """
+    dest = str(dest)
+    backup = dest + ".superseded"
+    had_old = os.path.exists(dest)
+    if had_old:
+        if os.path.exists(backup):
+            shutil.rmtree(backup, ignore_errors=True)
+        os.rename(dest, backup)
+    try:
+        os.rename(staging, dest)
+    except OSError:
+        if had_old:
+            os.rename(backup, dest)   # 回滚：保住旧完整快照
+        raise
+    if had_old:
+        shutil.rmtree(backup, ignore_errors=True)
 
 
 def main(argv=None) -> int:
@@ -295,11 +404,32 @@ def main(argv=None) -> int:
         for v in violations:
             print(f"✗ 越界：{v}")
         if violations:
-            print(f"研究库自检失败：{len(violations)} 条越界序列")
+            print(f"研究库自检失败：{len(violations)} 条违例")
             return 2
         print("✓ 研究库自检通过：所有序列 last_time < cutoff")
         return 0
 
+    # 暂存发布（H-01）：先写暂存目录，自检全部通过后原子上位；任何失败
+    # 清理暂存——目标目录永远只有完整快照，绝不留下可读的不完整快照
+    # （旧实现直接写目标：bars 写完才核成本缓存/自检，中途失败留下半截库）。
+    staging = str(args.dest) + ".staging"
+    if os.path.exists(staging):
+        shutil.rmtree(staging)   # 上次崩溃的遗留暂存（消费者只读 dest，可安全清除）
+    try:
+        rc = _export_snapshot(args, staging, lockbox=lockbox,
+                              global_cutoff=global_cutoff)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    if rc != 0:
+        shutil.rmtree(staging, ignore_errors=True)
+        return rc
+    _publish_staging(staging, str(args.dest))
+    return 0
+
+
+def _export_snapshot(args, dest: str, *, lockbox, global_cutoff) -> int:
+    """把完整研究库快照写进 dest（H-01 起由 main 以暂存目录调用）。"""
     inventory, warnings = series_inventory(args.data_root)
     for w in warnings:
         print(f"⚠ 坏 meta，跳过：{w}", flush=True)
@@ -328,10 +458,10 @@ def main(argv=None) -> int:
                   "为空，跳过（整段都在锁箱内）")
             skipped += 1
             continue
-        save_bars(args.dest, ref.symbol, ref.timeframe, seg,
+        save_bars(dest, ref.symbol, ref.timeframe, seg,
                   server=ref.watermark.get("server"),
                   login=ref.watermark.get("login"))
-        _merge_meta(args.dest, ref.symbol, ref.timeframe, {
+        _merge_meta(dest, ref.symbol, ref.timeframe, {
             "source_root": os.path.abspath(args.data_root),
             "source_cutoff": pd.Timestamp(cut).isoformat(),
             "data_sha256": data_sha256(seg),
@@ -358,7 +488,7 @@ def main(argv=None) -> int:
     except ValueError as e:
         print(f"✗ {e}")
         return 1
-    _copy_file(cache_src, os.path.join(args.dest, "costs",
+    _copy_file(cache_src, os.path.join(dest, "costs",
                                        "spread_model.json"))
 
     # specs 必需（合约大小/手数上下限）；calibrated 与时钟样本有则复制
@@ -367,25 +497,25 @@ def main(argv=None) -> int:
         print(f"✗ 缺 {specs_src}——研究侧 resolve_contract_size / "
               "load_volume_limits 无来源；先跑 scripts/snapshot_specs.py")
         return 1
-    _copy_file(specs_src, os.path.join(args.dest, "specs", "latest.json"))
+    _copy_file(specs_src, os.path.join(dest, "specs", "latest.json"))
     for rel in ("costs/calibrated.json", "server_clock.json"):
         src = os.path.join(args.data_root, rel)
         if os.path.exists(src):
-            _copy_file(src, os.path.join(args.dest, rel))
+            _copy_file(src, os.path.join(dest, rel))
 
     # 导出自检：研究库里任何序列 last_time 都必须早于 cutoff
     if global_cutoff is not None:
-        violations = verify_research_store(args.dest, global_cutoff)
+        violations = verify_research_store(dest, global_cutoff)
     else:
         violations = []
         for ref in inventory:
             cut = cutoff_for(lockbox, ref.symbol, ref.timeframe)
             if cut is not None:
-                violations.extend(verify_research_store(args.dest, cut))
+                violations.extend(verify_research_store(dest, cut))
     if violations:
         for v in violations:
             print(f"✗ 越界：{v}")
-        print(f"研究库自检失败：{len(violations)} 条越界序列——导出作废，"
+        print(f"研究库自检失败：{len(violations)} 条违例——导出作废，"
               "请重跑或排查写入路径")
         return 2
 
@@ -394,7 +524,7 @@ def main(argv=None) -> int:
     if args.include_ext:
         try:
             ext_exported, ext_skipped, ext_rejected = export_ext_series(
-                args.ext_root, args.dest, global_cutoff, now_iso=now_iso)
+                args.ext_root, dest, global_cutoff, now_iso=now_iso)
         except ExtDataError as e:
             print(f"✗ 外部数据导出失败：{e}")
             return 1
@@ -402,7 +532,7 @@ def main(argv=None) -> int:
             print(f"⚠ 白名单拒绝 {ext_rejected} 个未批准序列（不进研究库，"
                   "数据保留主库侧 data/ext/ 作一致性核对）")
         if global_cutoff is not None:
-            ext_violations = verify_ext_research_store(args.dest,
+            ext_violations = verify_ext_research_store(dest,
                                                        global_cutoff)
             if ext_violations:
                 for v in ext_violations:
@@ -416,10 +546,10 @@ def main(argv=None) -> int:
     print(f"摘要：导出 {exported} 个序列（跳过 {skipped}）"
           + (f"，外部数据 {ext_exported} 个序列（跳过 {ext_skipped}，"
              f"白名单拒绝 {ext_rejected}）" if args.include_ext else "")
-          + f"，成本缓存与 specs 已复制 → {args.dest}；自检通过"
+          + f"，成本缓存与 specs 已复制 → {dest}；自检通过"
             "（所有 last_time < cutoff）。tick 不导出：研究侧成本经 "
             "data_research/costs/spread_model.json 缓存提供；"
-            "lockbox.json 不复制（研究库无锁箱段）。")
+            "lockbox.json 不复制（研究库无锁箱段，边界 = meta.source_cutoff）。")
     return 0
 
 
