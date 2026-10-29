@@ -943,6 +943,268 @@ def test_t58_deals_write_failure_alerts_but_does_not_block(tmp_path,
     assert "fill" not in orders_log and '"kind": "open"' in orders_log
 
 
+# ================================================================ H-04/H-05
+# （docs/reviews/2026-10-29-global-code-audit.md）：实盘部分成交/清仓 + 状态
+# 损坏保守恢复。每项先写复现旧缺陷的失败测试（红），再修复转绿。
+
+# ---- H-04-1：反向平仓未确认清零前禁止开反向仓（部分成交 → 多空对锁）----
+
+def test_h04_reverse_partial_close_never_opens_hedge():
+    """复现：0.02 多仓反手、平仓请求只成一半（DONE_PARTIAL）→ 旧实现残仓
+    0.01 多 + 新开 0.02 空 → 多空对锁；修复后未确认残仓清零前绝不开反向仓
+    （action=reverse_pending，只平不开），下个决策点再续做反向。"""
+    b = FakeBroker()
+    pos = b.seed_position(side="buy", volume=0.02, magic=MAGIC)
+    adapter = mk_adapter(b)
+    b.partial_fill = 0.5                       # 平仓 0.02 只成 0.01
+    rep = adapter.execute(mk_decision(signal=-1, volume_lots=0.02))
+    assert rep.action == "reverse_pending"     # 旧：reverse（对锁已形成）
+    assert b.close_calls == [(pos.ticket, 0.02)]
+    assert b.market_orders == []               # 反向开仓腿被禁
+    left = b.positions()
+    assert [p.side for p in left] == ["buy"]   # 无对锁：残仓留在旧方向
+    assert left[0].volume == pytest.approx(0.01)
+
+    # 残仓确认仍在途 → 下个决策点（新 decision_id）续做反向：先平残仓、
+    # 确认清零后才开新仓
+    b.partial_fill = None
+    rep2 = adapter.execute(mk_decision(signal=-1, volume_lots=0.02,
+                                       decision_id="XAUUSD|M15|d2"))
+    assert rep2.action == "reverse"
+    kinds = [a[0] for a in b.actions]
+    assert kinds.index("close") < kinds.index("market")   # 先平后开
+    assert [p.side for p in b.positions()] == ["sell"]
+    assert rep2.net_after == pytest.approx(-0.02)
+
+
+# ---- H-04-2：signal=0 且净仓恰为 0 的对锁仓按 ticket 逐仓平掉 ----
+
+def test_h04_net_zero_hedge_closes_all_on_flat_signal():
+    """复现：signal=0、净仓 0 但有多空各 0.01 对锁 → 旧实现 hold 留两张
+    仓位；修复后清仓按持仓 ticket 判断（非净额），逐仓平掉。"""
+    b = FakeBroker()
+    p1 = b.seed_position(side="buy", volume=0.01, magic=MAGIC)
+    p2 = b.seed_position(side="sell", volume=0.01, magic=MAGIC)
+    rep = mk_adapter(b).execute(mk_decision(signal=0, volume_lots=None))
+    assert rep.action == "close"               # 旧：hold（净 0 == 目标 0）
+    assert set(t for t, _ in b.close_calls) == {p1.ticket, p2.ticket}
+    assert b.positions() == [] and b.market_orders == []
+    assert rep.net_after == 0.0
+
+
+def test_h04_live_executor_closes_net_zero_hedge(tmp_path):
+    """LiveExecutor 同口径：净 0 对锁 + signal=0 → close（旧 hold）。"""
+    b = FakeBroker()
+    b.seed_position(side="buy", volume=0.01, magic=MAGIC)
+    b.seed_position(side="sell", volume=0.01, magic=MAGIC)
+    ex = _mk_executor(b, tmp_path)
+    rr = ex.poll(mk_decision(signal=0, volume_lots=None,
+                             decision_id="XAUUSD|M15|d1"), NOW)
+    assert rr.action == "close"                # 旧：hold
+    assert b.positions() == []
+
+
+def test_h04_hedge_close_not_blocked_when_open_defense_active(tmp_path):
+    """开仓防线（pending_external_exits / 状态损坏）只挡开仓腿：signal=0
+    的净零对锁清仓属于平仓，照常执行（旧实现按净额判 hold，对锁仓留场，
+    未决出场期间永远清不掉）。"""
+    from mt5gw.models import DEAL_REASON_CLIENT
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d1"), NOW).action == "open"
+    ticket = b.positions()[0].ticket
+    b.close_external(ticket, profit=5.0, comment="manual",
+                     reason=DEAL_REASON_CLIENT)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d2"),
+                   NOW.replace(minute=15)).action == "blocked_external_exit"
+
+    b.seed_position(side="buy", volume=0.01, magic=MAGIC)   # 净零对锁残仓
+    b.seed_position(side="sell", volume=0.01, magic=MAGIC)
+    rr = ex.poll(mk_decision(signal=0, volume_lots=None,
+                             decision_id="XAUUSD|M15|d3"),
+                 NOW.replace(minute=30))
+    assert rr.action == "close"                # 旧：blocked_external_exit
+    assert b.positions() == []
+
+
+# ---- H-04-3：风控取数异常只拒开仓，平仓腿照常 ----
+
+def test_h04_risk_gate_error_reverse_still_closes(tmp_path):
+    """复现：反向决策时风控闸门 check_open 抛异常 → 旧实现直接
+    risk_rejected 返回，平仓腿也不执行（违反"平仓不受限"）；修复后异常
+    fail-closed 只拒开仓腿，平仓腿照常先平后不开。"""
+    class _BoomGate:
+        def check_open(self, *a, **kw):
+            raise RuntimeError("行情快照不可用")
+
+    b = FakeBroker()
+    b.seed_position(side="buy", volume=0.02, magic=MAGIC)
+    ex = _mk_executor(b, tmp_path, gate=_BoomGate())
+    rr = ex.poll(mk_decision(signal=-1, volume_lots=0.02,
+                             decision_id="XAUUSD|M15|d1"), NOW)
+    assert rr.action == "risk_rejected"
+    assert "risk_gate_error" in rr.error
+    assert any(o.kind == "close" for o in rr.orders)   # 旧：orders 空
+    assert b.market_orders == []                        # 开仓腿被拒（fail-closed）
+    assert b.positions() == []                          # 平仓腿已执行
+    it = read_intent(tmp_path)
+    assert it["status"] == "confirmed" and it["volume"] == 0.0
+
+    # 纯开仓（net==0）遇风控异常：拒绝且无订单（fail-closed 不变）
+    rr2 = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                              decision_id="XAUUSD|M15|d2"),
+                  NOW.replace(minute=15))
+    assert rr2.action == "risk_rejected"
+    assert rr2.orders == () and b.market_orders == []
+
+
+# ---- H-05-4：状态文件损坏 → 保守恢复（不清保护 + 保留证据 + 暂停开仓）----
+
+def test_h05_corrupt_state_recovery_is_conservative(tmp_path):
+    """复现：状态文件损坏/不可读 → 旧实现从零开始（blocked_dir/
+    pending_external_exits 的保护被清空、开仓放行）；修复后区分首次启动
+    与损坏恢复——损坏时暂停开新仓（平仓不受影响）、损坏原文抄送
+    *.corrupt-* 保留证据，人工核对前跨重启持续封锁。"""
+    from mt5gw.models import DEAL_REASON_CLIENT
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)             # 首次启动：无状态文件
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d1"), NOW).action == "open"
+    ticket = b.positions()[0].ticket
+    b.close_external(ticket, profit=5.0, comment="manual",
+                     reason=DEAL_REASON_CLIENT)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d2"),
+                   NOW.replace(minute=15)).action == "blocked_external_exit"
+
+    # 截断状态文件（损坏）——原文里有未决出场保护
+    state_path = tmp_path / f"state-{MAGIC}.json"
+    raw = state_path.read_text(encoding="utf-8")
+    truncated = raw[: max(1, len(raw) // 2)]
+    state_path.write_text(truncated, encoding="utf-8")
+
+    ex2 = _mk_executor(b, tmp_path)            # 损坏恢复启动
+    rr = ex2.poll(mk_decision(signal=1, volume_lots=0.02,
+                              decision_id="XAUUSD|M15|d3"),
+                  NOW.replace(minute=30))
+    assert rr.action == "blocked_state_corrupt"     # 旧：open（保护被清）
+    assert "state_corrupt" in rr.error
+    assert len(b.market_orders) == 1                # 没有重开
+    # 证据保留：损坏原文抄送到 state-<magic>.json.corrupt-*
+    corrupt = sorted(tmp_path.glob(f"state-{MAGIC}.json.corrupt-*"))
+    assert corrupt and truncated in \
+        corrupt[-1].read_text(encoding="utf-8")
+    assert "STATE_CORRUPT" in (tmp_path / "alerts.log").read_text(
+        encoding="utf-8")
+
+    # 平仓不受影响（允许风险降低操作）：signal=0 照常平掉
+    b.seed_position(side="buy", volume=0.03, magic=MAGIC)
+    rr_close = ex2.poll(mk_decision(signal=0, volume_lots=None,
+                                    decision_id="XAUUSD|M15|d4"),
+                        NOW.replace(minute=45))
+    assert rr_close.action == "close"
+    assert b.positions() == []
+
+    # 封锁跨重启持续（state_corrupt 随新状态文件持久化），人工修复前不放开
+    ex3 = _mk_executor(b, tmp_path)
+    rr3 = ex3.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d5"),
+                   NOW.replace(minute=50))
+    assert rr3.action == "blocked_state_corrupt"
+    assert len(b.market_orders) == 1
+
+
+# ---- H-05-5：last_decision_id 用于决策去重（同 bar 重启不重发）----
+
+def test_h05_same_bar_after_restart_not_reordered(tmp_path):
+    """复现：last_decision_id 落了盘但没参与去重（adapter._seen 只在内存）
+    ——同 bar 决策在重启后再次投递时，期间世界已变（外部又开了仓），旧实现
+    按过期决策继续下单（重发一笔平仓）；修复后同 bar 重投递一律 duplicate
+    （零新增请求），下个 bar 的新决策照常执行。"""
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    d1 = mk_decision(signal=1, volume_lots=0.02,
+                     decision_id="XAUUSD|M15|2026-10-20T18:00:00")
+    assert ex.poll(d1, NOW).action == "open"
+    d2 = mk_decision(signal=0, volume_lots=None,
+                     decision_id="XAUUSD|M15|2026-10-20T18:15:00")
+    assert ex.poll(d2, NOW.replace(minute=15)).action == "close"
+    n_closes = len(b.close_calls)
+
+    # 重启窗口期间外部又开了仓（本 magic 的净多 0.03）
+    b.seed_position(side="buy", volume=0.03, magic=MAGIC)
+
+    ex2 = _mk_executor(b, tmp_path)            # 重启：同 bar 决策再次投递
+    rr = ex2.poll(d2, NOW.replace(minute=16))
+    assert rr.action == "duplicate"            # 旧：close（按过期决策重发平仓）
+    assert len(b.close_calls) == n_closes      # 零新增请求
+    assert len(b.market_orders) == 1
+
+    # 新 bar 的决策不受去重影响：signal=0 照常平掉外部仓
+    d3 = mk_decision(signal=0, volume_lots=None,
+                     decision_id="XAUUSD|M15|2026-10-20T18:30:00")
+    rr2 = ex2.poll(d3, NOW.replace(minute=30))
+    assert rr2.action == "close"
+    assert b.positions() == []
+
+
+# ---- H-05-7：出场解释绑定本次事件（非任意历史 SL deal）----
+
+def test_h05_exit_explanation_bound_to_current_event(tmp_path):
+    """复现：0.16 仓先被 SL 部分减到 0.08（历史 deal，量变已在先前轮次
+    观察），余仓再被人工平掉 → 旧实现拿任意历史 SL deal 解释整个仓位消失
+    （改写意图 + 重开 0.16）；修复后解释绑定本次事件（成交时间 ≥ 最后已知
+    时刻、累计量 = 最后已知量、全部 reason ∈ SL/TP/SO），人工腿 CLIENT
+    未解释 → 未决出场 + 停开仓。"""
+    from mt5gw.models import DEAL_REASON_CLIENT, DEAL_REASON_SL
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.16,
+                               decision_id="XAUUSD|M15|d1"), NOW).action == "open"
+    ticket = b.positions()[0].ticket
+    # 部分 SL：0.16 → 0.08（ticket 仍在；下轮观察到量变，不是出场事件）
+    b.reduce_external(ticket, 0.08, profit=-10.0, comment="[sl]",
+                      reason=DEAL_REASON_SL,
+                      time=datetime(2026, 10, 20, 18, 5))
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.16,
+                               decision_id="XAUUSD|M15|d2"),
+                   NOW.replace(minute=15)).action == "hold"
+    assert b.positions()[0].volume == pytest.approx(0.08)   # 量变已入账
+
+    # 人工平掉残余 0.08（本次出场事件）
+    b.close_external(ticket, profit=1.0, comment="manual",
+                     reason=DEAL_REASON_CLIENT,
+                     time=datetime(2026, 10, 20, 18, 20))
+    rr = ex.poll(mk_decision(signal=1, volume_lots=0.16,
+                             decision_id="XAUUSD|M15|d3"),
+                 NOW.replace(minute=30))
+    assert rr.action == "blocked_external_exit"     # 旧：open（重开 0.16）
+    assert len(b.market_orders) == 1                # 没有重开
+    state = json.loads((tmp_path / f"state-{MAGIC}.json")
+                       .read_text(encoding="utf-8"))
+    assert str(ticket) in state["pending_external_exits"]   # 本次事件未解释
+    # deals 证据流不得出现把人工出场记成保护性出场的行
+    deals_path = tmp_path / f"deals-{MAGIC}.jsonl"
+    assert deals_path.exists()
+    lines = [json.loads(ln) for ln
+             in deals_path.read_text(encoding="utf-8").splitlines() if ln]
+    assert not any(r["event"] == "external_exit" and r["reason"] == "SL"
+                   for r in lines)
+
+    # 人工确认（绑定协议）后恢复；解释行不再产出
+    _write_ack_external_intent(tmp_path, tickets=(ticket,), net=0.0,
+                               positions=[], now=NOW.replace(minute=40))
+    rr2 = ex.poll(mk_decision(signal=1, volume_lots=0.16,
+                              decision_id="XAUUSD|M15|d4"),
+                  NOW.replace(minute=41))
+    assert rr2.action == "open"
+
+
 # ---- F 阶段停修：decision_id → MT5 安全 comment（端到端） ----
 # 首战事故：开仓 comment=decision_id（XAUUSD|M15|2026-10-28T06:30:00）被 MT5
 # 拒单（last_error=(-2, 'Invalid "comment" argument')）。开仓 comment 改为

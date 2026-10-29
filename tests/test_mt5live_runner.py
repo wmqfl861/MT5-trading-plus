@@ -527,3 +527,51 @@ def test_gateway_reconnected_not_logged_without_failure(tmp_path, monkeypatch,
                    "--gateway-config", _gw_dummy_config(tmp_path)])
     assert rc == 0
     assert "gateway_reconnected" not in capsys.readouterr().out
+
+
+# ================================================================ H-05
+# （docs/reviews/2026-10-29-global-code-audit.md）：同账户/同 magic 单实例
+# 进程锁——两份运行器并行会重复下单/互写状态，第二个启动必须拒绝。
+
+def test_h05_magic_instance_lock_second_holder_refused(tmp_path):
+    """锁互斥：第一份运行器持锁后，第二个同 magic 的锁获取立即失败；
+    释放后可再取（内核锁，进程退出自动释放）。"""
+    from mt5live.runner import MagicInstanceLock
+
+    lock1 = MagicInstanceLock(str(tmp_path / "runner-777.lock"))
+    assert lock1.acquire() is True
+    lock2 = MagicInstanceLock(str(tmp_path / "runner-777.lock"))
+    assert lock2.acquire() is False            # 第二份运行器：拒绝
+    lock1.release()
+    lock3 = MagicInstanceLock(str(tmp_path / "runner-777.lock"))
+    assert lock3.acquire() is True             # 持有者退出后可再取
+    assert lock3.held
+    lock3.release()
+    assert not lock3.held
+
+
+def test_h05_second_runner_same_magic_refused_by_lock(tmp_path, monkeypatch,
+                                                      capsys):
+    """接线（live_runner 主链路）：同 magic 第二份运行器启动即被进程锁
+    拒绝——rc=3，且拒绝发生在连接网关之前（from_config_file 被触达即失败）。"""
+    from mt5live.runner import MagicInstanceLock
+
+    mod = load_live_runner()
+
+    def _boom(p):
+        raise AssertionError("拒绝启动必须发生在连接网关之前")
+
+    monkeypatch.setattr("mt5gw.MT5Gateway.from_config_file",
+                        staticmethod(_boom))
+    lock = MagicInstanceLock(str(tmp_path / "data" / "live" /
+                                 "runner-777.lock"))
+    assert lock.acquire() is True              # 第一份运行器已持有
+    try:
+        rc = mod.main(["--config", _runner_config(tmp_path), "--once",
+                       "--no-spread-gate",
+                       "--gateway-config", _gw_dummy_config(tmp_path)])
+    finally:
+        lock.release()
+    assert rc == 3                             # 第二份：拒绝启动
+    out = capsys.readouterr().out
+    assert "拒绝" in out and "777" in out

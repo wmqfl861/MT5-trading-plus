@@ -396,3 +396,37 @@ def test_cli_reads_legacy_expected_format(tmp_path, monkeypatch):
     assert rc == 1
     assert json.loads((live / f"pause-{M1}.json").read_text(
         encoding="utf-8"))["paused"] is True
+
+
+# ---- H-04（2026-10-29 审计）：净额为零掩盖对冲残仓——按持仓明细检查 ----
+
+def test_diff_hedged_residual_flagged_even_when_net_matches():
+    """复现：多空各 0.08 对锁残仓净额恰 0，与空仓意图净额一致 → 旧实现按
+    净额判 clean（净零掩盖风险）；修复后实际总仓 > |净仓| 即报 hedged。"""
+    res = diff_positions((intent(volume=0.0),),            # 意图：空仓
+                         [pos("XAUUSD", 0.08, ticket=9001),
+                          pos("XAUUSD", 0.08, side="sell", ticket=9002)],
+                         now=NOW)
+    assert not res.ok and res.pause            # 旧：ok（净额口径漏报）
+    kinds = {d.kind for d in res.diffs}
+    assert "hedged" in kinds
+    d = next(d for d in res.diffs if d.kind == "hedged")
+    assert (d.symbol, d.magic) == ("XAUUSD", M1)
+    assert d.expected_net == 0.0 and d.actual_net == pytest.approx(0.0)
+
+
+def test_diff_hedged_residual_flagged_when_net_nonzero_matches():
+    """意图净 +0.01、实际 buy 0.02 + sell 0.01（净 +0.01）：净额一致但存在
+    对锁腿 → 同样报 hedged（总仓 0.03 > |净仓| 0.01）。"""
+    res = diff_positions((intent(volume=0.01),),
+                         [pos("XAUUSD", 0.02, ticket=9001),
+                          pos("XAUUSD", 0.01, side="sell", ticket=9002)],
+                         now=NOW)
+    assert not res.ok
+    assert {d.kind for d in res.diffs} == {"hedged"}
+
+
+def test_diff_single_side_not_flagged_hedged():
+    """单边持仓（总量 == |净额|）不误报 hedged（clean 语义不变）。"""
+    res = diff_positions((intent(),), [pos("XAUUSD", 0.2)], now=NOW)
+    assert res.ok and res.diffs == ()

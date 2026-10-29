@@ -315,10 +315,12 @@ def test_scenario_1_open_close_duplicate_and_restart(tmp_path):
     assert rr_dup.action == "duplicate"
     assert len(stack.broker.market_orders) == 1
 
-    # 进程重启（新执行器+新适配器，去重集清空）：净仓已达标 → hold，不重复下单
+    # 进程重启（新执行器+新适配器，adapter 去重集清空）：同 bar 重投递按
+    # last_decision_id 去重（H-05）→ duplicate，不重复下单（旧语义靠净仓
+    # 巧合 hold；世界在重启窗口已变时旧语义会按过期决策继续下单）
     ex2 = stack.build_executor(fresh_adapter=True)
     rr_restart = ex2.poll(d1, T1 + timedelta(seconds=60))
-    assert rr_restart.action == "hold"
+    assert rr_restart.action == "duplicate"
     assert len(stack.broker.market_orders) == 1
 
     # 平仓：信号归零

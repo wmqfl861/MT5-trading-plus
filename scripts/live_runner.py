@@ -33,6 +33,9 @@
   开仓/加仓腿先过 RiskGate.check_open（拒绝 → 不下单，原因写心跳
   last_error 与 alerts.log），平仓不受限；每次执行后写
   expected-<magic>.json（对账进程读全部）。
+- 单实例（H-05）：实跑/影子盘启动即取 {data_root}/live/runner-<magic>.lock
+  进程锁（内核字节锁，崩溃自动释放）——同 magic 第二份运行器拿不到锁
+  拒绝启动（rc=3，不连网关）；dry-run 只读不持锁。
 - 手数（M2）：volume_lots 缺省时按 risk_fraction 定手数（LiveSizer，
   mt5quant.sizing.lots_for_risk——与回测同一函数）；风控只设上限。
 - 启动校验（M1）：策略用到 time_stop_bars / week_close_exit 直接拒绝启动
@@ -74,6 +77,7 @@ from mt5live.paper import PAPER_STATE_DIR_RELPATH, PAPER_STATE_RELPATH, \
 from mt5live.riskproc import RiskConfigError, RiskProcess, load_risk_config  # noqa: E402
 from mt5live.runner import (  # noqa: E402
     HeartbeatWriter,
+    MagicInstanceLock,
     MarketClosedError,
     SignalRunner,
     TerminalBarsSource,
@@ -414,6 +418,20 @@ def main(argv=None) -> int:
     live_dir = os.path.join(cfg.data_root, "live")
     specs_path = os.path.join(cfg.data_root, "specs", "latest.json")
 
+    # H-05：同账户/同 magic 单实例——会下单的模式（实跑/影子盘）启动即取
+    # runner-<magic>.lock 进程锁，第二份运行器拿不到锁直接拒绝（rc=3），
+    # 且拒绝发生在连接网关之前；两份运行器并行会重复下单、互写状态。
+    # dry-run 不下单不持锁（只读观察可以并行）。
+    lock = None
+    if args.paper or not args.dry_run:
+        lock = MagicInstanceLock(os.path.join(
+            live_dir, f"runner-{cfg.magic}.lock"))
+        if not lock.acquire():
+            print(f"× magic={cfg.magic} 的运行器已在运行"
+                  f"（{lock.path} 被持有）——第二份运行器拒绝启动"
+                  "（H-05 同 magic 单实例；先停旧实例或换 magic）")
+            return 3
+
     gw = None
     executor = None
     paper = None
@@ -492,6 +510,8 @@ def main(argv=None) -> int:
             live_dir=live_dir, specs_path=specs_path, gw=gw,
             gate_account=gate_view)
         if executor is None:
+            if lock is not None:
+                lock.release()     # H-05：装配失败的早退同样释锁
             return 2
     elif not args.dry_run:
         # 实跑：执行器 + 风控闸门 + 定手数（C1/M2/M10 全套接线）
@@ -501,6 +521,8 @@ def main(argv=None) -> int:
             gw.trading, gw.account, market, cfg=cfg, strategy=strategy,
             args=args, live_dir=live_dir, specs_path=specs_path, gw=gw)
         if executor is None:
+            if lock is not None:
+                lock.release()     # H-05：装配失败的早退同样释锁
             return 2
 
     sizing_desc = (f"固定 {cfg.volume_lots} 手" if cfg.volume_lots is not None
@@ -592,6 +614,8 @@ def main(argv=None) -> int:
         print("收到中断，退出", flush=True)
         return 0
     finally:
+        if lock is not None:
+            lock.release()             # H-05：释放同 magic 进程锁
         if gw is not None:
             gw.shutdown()
 
