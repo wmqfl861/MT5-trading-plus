@@ -29,3 +29,7 @@
 
 （调度器 13:15 UTC 例行后填写：进程存活/--day 检查/日报/行情；演练=killSwitch 置放→拒开仓→恢复；EURUSD 校准仓平仓+calibrate_costs 实测对照。）
 
+
+## 2026-10-29（周四）· 交易日 2
+
+（调度器 13:15 UTC 例行后填写。预定演练：killSwitch 置放→确认拒开仓→恢复。校准周任务：EURUSD 平仓+calibrate_costs 实测对照。）
