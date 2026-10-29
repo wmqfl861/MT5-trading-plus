@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import re
 import subprocess
 import tomllib
@@ -497,8 +498,11 @@ def committed_at(path, *, runner=None) -> datetime | None:
 
     runner 为注入点（测试用）：runner(args, cwd) -> 带 returncode/stdout
     的对象；缺省用 subprocess.run（cwd=卡所在目录，超时 10s）。
+    路径规范化为绝对（H-09）：cwd=p.parent 时传相对完整路径给 git 相当于
+    重复目录前缀（cards/H097.toml 在 cards/ 下被解析成 cards/cards/…），
+    已提交文件会被误判未提交。绝对输入路径字符串保持不变。
     """
-    p = Path(path)
+    p = Path(os.path.abspath(str(path)))
 
     def _default_runner(args, cwd):
         return subprocess.run(args, cwd=cwd, capture_output=True,
@@ -529,9 +533,11 @@ def worktree_clean(path, *, runner=None) -> bool:
     - git 返回非零（不在仓库、仓库损坏）或超时 → False（无法证明干净，
       fail-closed 从严拒绝）；
     - 只有 git 可执行缺失（FileNotFoundError）如实抛（与 committed_at 同口径）。
+    路径规范化为绝对（H-09，与 committed_at 同因）：相对完整路径在
+    cwd=p.parent 下重复前缀，已修改文件会被误判干净。
     runner 为注入点（测试用）。
     """
-    p = Path(path)
+    p = Path(os.path.abspath(str(path)))
 
     def _default_runner(args, cwd):
         return subprocess.run(args, cwd=cwd, capture_output=True,

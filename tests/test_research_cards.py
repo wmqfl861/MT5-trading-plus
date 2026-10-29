@@ -442,6 +442,54 @@ def test_worktree_clean_real_git_lifecycle(tmp_path):
     assert cards.worktree_clean(p) is True
 
 
+# ---------------------------------- H-09：相对路径（cwd=p.parent 重复前缀）
+
+def _git_repo_with_committed_card(tmp_path, monkeypatch):
+    """真实临时 git 仓库：cards/H097.toml 已提交；进程 cwd 切到仓库根。
+
+    返回 (绝对 Path, 相对路径字符串)。被测函数 cwd=p.parent="cards"，
+    相对完整路径 "cards/H097.toml" 传给 git 即重复前缀 "cards/cards/…"——
+    H-09 修复前：已提交文件被判未提交、已修改文件被判干净。
+    """
+    import subprocess
+    repo = tmp_path / "repo"
+    cards_dir = repo / "cards"
+    cards_dir.mkdir(parents=True)
+    p = cards_dir / "H097.toml"
+    p.write_text(VALID, encoding="utf-8")
+    env = {**os.environ,
+           "GIT_AUTHOR_DATE": "2026-10-20T09:30:00+00:00",
+           "GIT_COMMITTER_DATE": "2026-10-20T09:30:00+00:00"}
+
+    def git(*args):
+        subprocess.run(["git", *args], cwd=str(repo), capture_output=True,
+                       check=True, env=env)
+
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    git("add", "cards/H097.toml")
+    git("commit", "-qm", "card")
+    monkeypatch.chdir(repo)
+    return p, os.path.join("cards", "H097.toml")
+
+
+def test_committed_at_relative_path_real_git(tmp_path, monkeypatch):
+    """H-09：相对路径的已提交文件 → committed_at 非 None（修复前误判 None）。"""
+    _, rel = _git_repo_with_committed_card(tmp_path, monkeypatch)
+    out = cards.committed_at(rel)
+    assert out is not None
+    assert out == datetime(2026, 10, 20, 9, 30, tzinfo=timezone.utc)
+
+
+def test_worktree_clean_relative_path_modified_file_real_git(tmp_path, monkeypatch):
+    """H-09：相对路径 + 未提交修改 → worktree_clean=False（修复前误判 True）。"""
+    p, rel = _git_repo_with_committed_card(tmp_path, monkeypatch)
+    assert cards.worktree_clean(rel) is True        # 对照：干净时为真
+    p.write_text(VALID + "# local edit\n", encoding="utf-8")
+    assert cards.worktree_clean(rel) is False       # 改了没提交 → 脏
+
+
 def test_p6_dirty_worktree_rejected():
     """探针 P6：卡文件改了没提交 → 先卡后测必须拒绝。"""
     committed = datetime(2026, 10, 20, tzinfo=timezone.utc)

@@ -18,6 +18,7 @@ from mt5quant.costs import (
     Costs,
     SlippageModel,
     SpreadModel,
+    SpreadStat,
     SwapModel,
     SwapRule,
 )
@@ -105,19 +106,19 @@ def test_hourly_stats_hand_computed():
         closes=[11.0, 12.0, 10.5],
     )
     stats = hourly_stats(bars, "M1")
-    assert stats.index.name == "hour_utc"
-    assert list(stats.index) == [9, 10]
-    assert stats.loc[9, "mean_range"] == pytest.approx(3.0)   # (2+4)/2
-    assert stats.loc[10, "mean_range"] == pytest.approx(1.0)
-    assert math.isnan(stats.loc[9, "atr14_median"])           # 不足 14 根 → NaN
+    assert stats.index.name == "hour_ny"          # H-10：纽约小时桶（10 月 EDT=UTC−4）
+    assert list(stats.index) == [5, 6]
+    assert stats.loc[5, "mean_range"] == pytest.approx(3.0)   # (2+4)/2
+    assert stats.loc[6, "mean_range"] == pytest.approx(1.0)
+    assert math.isnan(stats.loc[5, "atr14_median"])           # 不足 14 根 → NaN
 
 
 def test_hourly_stats_atr14_median():
-    times = [f"2026-10-19 11:{i:02d}:00" for i in range(15)]  # 同一小时 15 根
+    times = [f"2026-10-19 11:{i:02d}:00" for i in range(15)]  # 同一(纽约)小时 15 根
     bars = make_bars(times, [11.0] * 15, [10.0] * 15, [10.5] * 15)
     stats = hourly_stats(bars, "M1")
-    assert stats.loc[11, "mean_range"] == pytest.approx(1.0)
-    assert stats.loc[11, "atr14_median"] == pytest.approx(1.0)  # TR 恒 1 → ATR 恒 1
+    assert stats.loc[7, "mean_range"] == pytest.approx(1.0)   # UTC11 → 纽约 7（EDT）
+    assert stats.loc[7, "atr14_median"] == pytest.approx(1.0)  # TR 恒 1 → ATR 恒 1
 
 
 def test_hourly_stats_invalid_timeframe_and_columns():
@@ -164,11 +165,11 @@ def test_heatmap_hand_computed_both_symbols():
                       {"XAUUSD": 100.0, "EURUSD": 100000.0},
                       _vol_fixture(), ["XAUUSD", "EURUSD"], ["H1"])
     assert list(hm.index) == [("XAUUSD", "H1"), ("EURUSD", "H1")]
-    assert list(hm.columns) == [14]
+    assert list(hm.columns) == [10]   # H-10：tick 与 K 线的 UTC14:00 同落纽约 10 点桶
     # XAUUSD：(0.46 + 2×0.046 + 6/100) / 8 = 0.612/8 = 0.0765（点差每来回一次，佣金只折一次）
-    assert hm.loc[("XAUUSD", "H1"), 14] == pytest.approx(0.0765)
+    assert hm.loc[("XAUUSD", "H1"), 10] == pytest.approx(0.0765)
     # EURUSD：(0.00046 + 2×0.000046 + 3/100000) / 0.008 = 0.000582/0.008 = 0.07275
-    assert hm.loc[("EURUSD", "H1"), 14] == pytest.approx(0.07275)
+    assert hm.loc[("EURUSD", "H1"), 10] == pytest.approx(0.07275)
 
 
 def test_heatmap_missing_spread_hour_falls_back_to_daily_max():
@@ -181,10 +182,10 @@ def test_heatmap_missing_spread_hour_falls_back_to_daily_max():
     hm = cost_heatmap(spread, slip, comm,
                       {"XAUUSD": 100.0, "EURUSD": 100000.0},
                       vol, ["XAUUSD", "EURUSD"], ["H1"])
-    assert list(hm.columns) == [14, 15]  # 列=vol 小时并集
-    assert hm.loc[("XAUUSD", "H1"), 15] == pytest.approx(0.0765)  # 缺统计 → 全天最大 p90
-    assert hm.loc[("XAUUSD", "H1"), 14] == pytest.approx(0.0765)
-    assert math.isnan(hm.loc[("EURUSD", "H1"), 15])  # EURUSD 无该小时成交 → NaN 照旧
+    assert list(hm.columns) == [10, 11]  # 列=vol 小时并集（UTC15 → 纽约 11）
+    assert hm.loc[("XAUUSD", "H1"), 11] == pytest.approx(0.0765)  # 缺统计 → 全天最大 p90
+    assert hm.loc[("XAUUSD", "H1"), 10] == pytest.approx(0.0765)
+    assert math.isnan(hm.loc[("EURUSD", "H1"), 11])  # EURUSD 无该小时成交 → NaN 照旧
 
 
 def test_heatmap_fail_fast_on_bad_inputs():
@@ -246,10 +247,10 @@ def test_relative_hourly_stats_hand_computed():
         ["2026-10-19 14:00:00", "2026-10-20 14:00:00"],
         [1008.0, 504.0], [1000.0, 500.0], [1004.0, 502.0])
     st = relative_hourly_stats(bars)
-    assert st.index.name == "hour_utc"
+    assert st.index.name == "hour_ny"      # H-10：UTC14 → 纽约 10（10 月 EDT）
     assert list(st.columns) == ["mean_rel_range", "mean_close"]
-    assert st.loc[14, "mean_rel_range"] == pytest.approx((8 / 1004 + 4 / 502) / 2)
-    assert st.loc[14, "mean_close"] == pytest.approx((1004.0 + 502.0) / 2)
+    assert st.loc[10, "mean_rel_range"] == pytest.approx((8 / 1004 + 4 / 502) / 2)
+    assert st.loc[10, "mean_close"] == pytest.approx((1004.0 + 502.0) / 2)
 
 
 def test_relative_hourly_stats_rejects_missing_columns():
@@ -281,7 +282,7 @@ def test_heatmap_relative_hand_computed():
     hm = cost_heatmap(spread, slip, comm, {"XAUUSD": 100.0}, vol, ["XAUUSD"], ["H1"])
     rel = 0.2 / 100.1
     expected = (rel + 2 * 0.1 * rel) / (8 / 1004)
-    assert hm.loc[("XAUUSD", "H1"), 14] == pytest.approx(expected)
+    assert hm.loc[("XAUUSD", "H1"), 10] == pytest.approx(expected)  # H-10：纽约 10 点桶
 
 
 def test_heatmap_relative_ratio_invariant_to_price_level():
@@ -292,7 +293,7 @@ def test_heatmap_relative_ratio_invariant_to_price_level():
                        ["XAUUSD"], ["H1"])
     hm2 = cost_heatmap(spread2, slip2, comm2, {"XAUUSD": 100.0}, vol2,
                        ["XAUUSD"], ["H1"])
-    assert hm2.loc[("XAUUSD", "H1"), 14] == pytest.approx(hm1.loc[("XAUUSD", "H1"), 14])
+    assert hm2.loc[("XAUUSD", "H1"), 10] == pytest.approx(hm1.loc[("XAUUSD", "H1"), 10])
 
 
 def test_heatmap_relative_with_commission_uses_hour_mean_close():
@@ -302,7 +303,7 @@ def test_heatmap_relative_with_commission_uses_hour_mean_close():
     rel = 0.2 / 100.1
     # 佣金 6 美元/手 ÷（合约 100 × 小时均价 1004）折成相对价
     expected = (rel + 2 * 0.1 * rel + 6.0 / (100.0 * 1004.0)) / (8 / 1004)
-    assert hm.loc[("XAUUSD", "H1"), 14] == pytest.approx(expected)
+    assert hm.loc[("XAUUSD", "H1"), 10] == pytest.approx(expected)
 
 
 def test_heatmap_relative_rejects_fixed_slippage_and_missing_columns():
@@ -315,6 +316,67 @@ def test_heatmap_relative_rejects_fixed_slippage_and_missing_columns():
     with pytest.raises(ValueError, match="mean_rel_range"):
         cost_heatmap(spread, slip, comm, {"XAUUSD": 100.0}, stripped,
                      ["XAUUSD"], ["H1"])
+
+
+# ---------- H-10：波幅与点差统一纽约本地小时分桶 ----------
+
+def _ny17_spread():
+    """合成点差模型（absolute）：只在纽约 17 点变大（p90=1.0），
+    NY16/NY22 极小（p90=0.01）——覆盖"固定减五小时"会错查的 NY16。"""
+    small = SpreadStat(median=0.005, p90=0.01, p99=0.02, n=100, n_days=5)
+    big = SpreadStat(median=0.5, p90=1.0, p99=2.0, n=100, n_days=5)
+    return SpreadModel({"XAUUSD": {16: small, 17: big, 22: small}},
+                       {"XAUUSD": 0.01}, mode="absolute")
+
+
+def test_hourly_stats_buckets_by_new_york_hour_winter_and_summer():
+    """H-10：UTC 时间逐条转纽约小时再聚合——冬季 UTC22（EST−5）与夏季
+    UTC21（EDT−4）同落 NY17；混用口径曾按 UTC 22/21 分桶。"""
+    winter = make_bars(["2026-01-15 22:00:00"], [2012.0], [2000.0], [2006.0])
+    summer = make_bars(["2026-06-15 21:00:00"], [2012.0], [2000.0], [2006.0])
+    w, s = hourly_stats(winter, "H1"), hourly_stats(summer, "H1")
+    assert list(w.index) == [17] and w.index.name == "hour_ny"
+    assert list(s.index) == [17] and s.index.name == "hour_ny"
+    assert w.loc[17, "mean_range"] == pytest.approx(12.0)
+
+
+def test_relative_hourly_stats_buckets_by_new_york_hour():
+    winter = make_bars(["2026-01-15 22:00:00"], [2012.0], [2000.0], [2006.0])
+    st = relative_hourly_stats(winter)
+    assert list(st.index) == [17] and st.index.name == "hour_ny"
+    assert st.loc[17, "mean_rel_range"] == pytest.approx(12.0 / 2006.0)
+
+
+def test_heatmap_winter_utc22_aggregates_to_ny17_not_ny22():
+    """H-10 复现：合成只在 NY17 变大的点差模型，冬季（EST）UTC22 样本
+    聚合到 NY17 → 成本比率 0.1；混用口径（UTC 小时直查 NY22 小点差）得 0.001。"""
+    spread = _ny17_spread()
+    slip = SlippageModel(spread, spread_fraction=0.1)
+    comm = CommissionModel(default_per_lot=0.0)
+    bars = make_bars(["2026-01-15 22:00:00", "2026-01-16 22:00:00"],
+                     [2012.0, 2012.0], [2000.0, 2000.0], [2006.0, 2006.0])
+    vol = {("XAUUSD", "H1"): hourly_stats(bars, "H1")}
+    hm = cost_heatmap(spread, slip, comm, {"XAUUSD": 100.0}, vol,
+                      ["XAUUSD"], ["H1"])
+    assert hm.columns.name == "hour_ny"
+    assert list(hm.columns) == [17]                 # NY17 桶，不是 UTC22 桶
+    # NY17：点差 1.0 + 2×滑点 0.1 = 1.2；振幅 12 → 0.1（混用口径曾得 0.001）
+    assert hm.loc[("XAUUSD", "H1"), 17] == pytest.approx(0.1)
+
+
+def test_heatmap_dst_aware_not_constant_offset():
+    """H-10：夏季 UTC21（EDT−4）也落 NY17——按"固定减五小时"会错查
+    NY16（小点差 0.01 → 0.001），只有真时区转换才得 0.1。"""
+    spread = _ny17_spread()
+    slip = SlippageModel(spread, spread_fraction=0.1)
+    comm = CommissionModel(default_per_lot=0.0)
+    bars = make_bars(["2026-06-15 21:00:00", "2026-06-16 21:00:00"],
+                     [2012.0, 2012.0], [2000.0, 2000.0], [2006.0, 2006.0])
+    vol = {("XAUUSD", "H1"): hourly_stats(bars, "H1")}
+    hm = cost_heatmap(spread, slip, comm, {"XAUUSD": 100.0}, vol,
+                      ["XAUUSD"], ["H1"])
+    assert list(hm.columns) == [17]
+    assert hm.loc[("XAUUSD", "H1"), 17] == pytest.approx(0.1)
 
 
 # ---------- Costs 聚合体（四方法签名与 T6 Protocol 同名） ----------
@@ -395,10 +457,11 @@ def test_cost_audit_script_smoke_relative_default(tmp_path, monkeypatch):
 
     hm = pd.read_csv(out / "heatmap.csv", index_col=[0, 1])
     # 相对口径（默认）：rel=0.3/2400.15；相对振幅=16/2000；佣金 6/(100×2000)
+    # 小时=纽约本地（H-10）：tick/K 线的 UTC9:00 → 纽约 5 点（10 月 EDT）
     rel = 0.3 / 2400.15
     expected = (rel + 2 * 0.1 * rel + 6.0 / 100.0 / 2000.0) / (16.0 / 2000.0)
-    assert hm.loc[("XAUUSD", "H1"), "9"] == pytest.approx(expected)
-    assert math.isnan(hm.loc[("EURUSD", "H1"), "9"])  # EURUSD 无 tick → 全 NaN
+    assert hm.loc[("XAUUSD", "H1"), "5"] == pytest.approx(expected)
+    assert math.isnan(hm.loc[("EURUSD", "H1"), "5"])  # EURUSD 无 tick → 全 NaN
     scope = (out / "scope.md").read_text(encoding="utf-8")
     assert "无tick，跳过点差实测" in scope   # EURUSD/BTCUSD
     assert "无K线" in scope                  # BTCUSD
@@ -421,7 +484,7 @@ def test_cost_audit_script_absolute_flag_matches_legacy_ratio(tmp_path, monkeypa
 
     hm = pd.read_csv(out / "heatmap.csv", index_col=[0, 1])
     # 绝对口径与旧版逐位一致：(0.3 + 2×0.03 + 6/100) / 16 = 0.42/16 = 0.02625
-    assert hm.loc[("XAUUSD", "H1"), "9"] == pytest.approx(0.02625)
+    assert hm.loc[("XAUUSD", "H1"), "5"] == pytest.approx(0.02625)  # UTC9 → 纽约 5
 
 
 def test_cost_audit_script_graceful_when_no_data(tmp_path, monkeypatch, capsys):

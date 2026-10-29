@@ -1,10 +1,14 @@
 """成本与可交易性审计 CLI（只读本地 parquet，不连 MT5）。
 
     .venv/Scripts/python.exe scripts/cost_audit.py --symbols XAUUSD,BTCUSD
-输出 {out}/heatmap.csv（行=品种×周期，列=UTC 小时，格=来回成本/平均振幅）
+输出 {out}/heatmap.csv（行=品种×周期，列=纽约本地小时，格=来回成本/平均振幅）
 与 {out}/scope.md（纳入/排除清单及理由、禁止时段=rollover 小时、
 无 tick/无 K 线备注）。ticks 缺失的品种注明"无tick，跳过点差实测"，
 对应格为空=不可判，全部按排除处理。
+
+小时口径（H-10）：波幅与点差/滑点都按纽约本地小时（America/New_York）
+分桶——heatmap.csv 列与 scope.md 小时清单同此口径（旧报告按 UTC 小时
+聚合波幅、与点差的纽约小时混用，已失效，须重算）。
 
 点差口径（R1 / 计划 T3）：默认 --spread-mode relative——格值 = 相对成本 ÷
 相对振幅（(high−low)/close 的小时均值），各分量折成"占价格的比率"，
@@ -112,7 +116,7 @@ def _render_scope_md(decisions, rollover, notes, *, threshold, assumptions,
     lines += [f"- {a}" for a in assumptions]
     lines += ["", "## 品种备注"]
     lines += [f"- {n}" for n in notes] if notes else ["- （无）"]
-    lines += ["", "## 禁止时段（点差 p99 > 3×全体中位，UTC 整点）"]
+    lines += ["", "## 禁止时段（点差 p99 > 3×全体中位，纽约本地整点）"]
     for sym, hours, why in rollover:
         hs = "、".join(f"{h:02d}:00" for h in hours) if hours else "无"
         lines.append(f"- {sym}：{hs}{why}")
@@ -226,6 +230,7 @@ def main() -> int:
     os.makedirs(args.out, exist_ok=True)
     hm.to_csv(os.path.join(args.out, "heatmap.csv"))
     assumptions = [
+        "小时口径：纽约本地小时（America/New_York，H-10：波幅与点差同桶）",
         f"点差口径：{args.spread_mode}"
         f"（{'p90 of (ask−bid)/mid 按小时，随价格水平缩放' if args.spread_mode == 'relative' else '价格单位，旧口径'}）",
         f"佣金（计价货币/手，来回）：默认 0；按品种 {commissions if commissions else '无'}"

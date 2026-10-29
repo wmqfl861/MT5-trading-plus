@@ -19,10 +19,12 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from .volatility import ny_hour
+
 
 @dataclass(frozen=True)
 class ScopeDecision:
-    """单个 (品种, 周期, 小时) 的纳入决策。"""
+    """单个 (品种, 周期, 小时) 的纳入决策。hour 为纽约本地小时（H-10）。"""
 
     symbol: str
     timeframe: str
@@ -32,17 +34,18 @@ class ScopeDecision:
 
 
 def relative_hourly_stats(bars: pd.DataFrame) -> pd.DataFrame:
-    """按 UTC 小时聚合的相对量：mean_rel_range=mean((high−low)/close)、
+    """按纽约本地小时聚合的相对量：mean_rel_range=mean((high−low)/close)、
     mean_close=mean(close)。
 
-    index 名 hour_utc，只含有 K 线的小时；close ≤ 0/NaN 的行产出 NaN
+    index 名 hour_ny（H-10：与点差/滑点模型的纽约小时分桶同时区），只含有
+    K 线的小时；close ≤ 0/NaN 的行产出 NaN
     （由 cost_heatmap 判无数据）。相对口径热力图用它把成本与振幅都折成比率。
     """
     missing = [c for c in ("time", "high", "low", "close") if c not in bars.columns]
     if missing:
         raise ValueError(f"bars 帧缺列 {missing}")
     df = bars.sort_values("time")
-    hour = pd.to_datetime(df["time"]).dt.hour
+    hour = ny_hour(df["time"])
     high = df["high"].astype("float64")
     low = df["low"].astype("float64")
     close = df["close"].astype("float64")
@@ -51,18 +54,22 @@ def relative_hourly_stats(bars: pd.DataFrame) -> pd.DataFrame:
         "mean_rel_range": rel_range.groupby(hour).mean(),
         "mean_close": close.groupby(hour).mean(),
     }).sort_index()
-    out.index.name = "hour_utc"
+    out.index.name = "hour_ny"
     return out
 
 
 def cost_heatmap(spread, slip, commission, contract_sizes: dict[str, float],
                  vol: dict[tuple[str, str], pd.DataFrame],
                  symbols, timeframes) -> pd.DataFrame:
-    """行=symbol×timeframe（按给定顺序），列=hour_utc（vol 出现过的小时并集）。
+    """行=symbol×timeframe（按给定顺序），列=hour_ny（vol 出现过的小时并集）。
 
     口径由 spread.mode 决定（无 mode 属性按 absolute）：计算式见模块 docstring。
     relative 口径下 vol 帧须含 mean_rel_range 与 mean_close 列
     （relative_hourly_stats 产出），且不支持固定滑点（绝对价格单位）。
+
+    小时口径 = 纽约本地小时（H-10）：vol 帧由 hourly_stats /
+    relative_hourly_stats 按纽约小时聚合，点差/滑点模型也按纽约小时查询——
+    同一整数 h 同一含义（旧版波幅按 UTC 小时、点差按纽约小时，混用）。
 
     数据缺失（该小时无点差统计 / 无波幅 / 波幅 ≤ 0）→ 格为 NaN，由
     decide_scope 判排除；contract_sizes 缺品种或非正、vol 缺 (symbol, timeframe)
@@ -126,7 +133,7 @@ def cost_heatmap(spread, slip, commission, contract_sizes: dict[str, float],
                 comm_price = commission.commission_per_lot(s) / contract_sizes[s]
                 arr[i, j] = (sp + 2.0 * sl + comm_price) / mr
     hm = pd.DataFrame(arr, index=idx, columns=hours)
-    hm.columns.name = "hour_utc"
+    hm.columns.name = "hour_ny"
     return hm
 
 
