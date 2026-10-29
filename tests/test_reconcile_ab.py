@@ -97,9 +97,13 @@ def flat_bars(start, n, tf="H1", *, openc=100.0, high=100.5, low=99.5,
 
 
 def base4():
-    """4 根 H1（周一 2026-01-05 10:00 起），末根收盘 103。"""
+    """4 根 H1（周一 2026-01-05 10:00 起），末根收盘 103。
+
+    H-13：high/low 放宽到包住 open/close（103 收盘的 bar high 同步抬到
+    103.5——tick 由 ohlc_ticks 从 bar 生成，A/B 两层看到一致数据）。"""
     df = flat_bars(pd.Timestamp("2026-01-05 10:00"), 4)
     df.loc[3, "close"] = 103.0
+    df.loc[3, "high"] = 103.5
     return df
 
 

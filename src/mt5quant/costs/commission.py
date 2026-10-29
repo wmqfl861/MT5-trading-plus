@@ -1,4 +1,13 @@
 """佣金模型：计价货币/手，**来回**（开+平合计，一次性给出）。"""
+import math
+
+
+def _validate_per_lot(value, label: str) -> float:
+    """H-13：有限数 + 非负（NaN 与任何数比较均为 False，仅 <0 拦不住 NaN/Inf）。"""
+    v = float(value)
+    if not math.isfinite(v) or v < 0:
+        raise ValueError(f"{label} 须为有限数且不能为负（成本幅值），收到 {value!r}")
+    return v
 
 
 class CommissionModel:
@@ -6,13 +15,10 @@ class CommissionModel:
 
     def __init__(self, default_per_lot: float = 0.0,
                  per_symbol: dict[str, float] | None = None):
-        if default_per_lot < 0:
-            raise ValueError("default_per_lot 不能为负（成本幅值）")
-        for k, v in (per_symbol or {}).items():
-            if v < 0:
-                raise ValueError(f"{k} 佣金不能为负：{v}")
-        self.default_per_lot = float(default_per_lot)
-        self._per_symbol = {k: float(v) for k, v in (per_symbol or {}).items()}
+        self.default_per_lot = _validate_per_lot(
+            default_per_lot, "default_per_lot")
+        self._per_symbol = {
+            k: _validate_per_lot(v, f"{k} 佣金") for k, v in (per_symbol or {}).items()}
 
     @classmethod
     def from_calibrated(cls, data: dict, *,
@@ -33,9 +39,8 @@ class CommissionModel:
             comm = (info or {}).get("commission") or {}
             rt = comm.get("round_trip_per_lot")
             if isinstance(rt, (int, float)) and not isinstance(rt, bool):
-                if rt < 0:
-                    raise ValueError(f"{sym} 校准佣金不能为负：{rt}")
-                per_symbol[sym] = float(rt)
+                # H-13：校准文件里的 NaN（json.load 会照读）也在入口拦下
+                per_symbol[sym] = _validate_per_lot(rt, f"{sym} 校准佣金")
         return cls(default_per_lot=default_per_lot, per_symbol=per_symbol)
 
     def commission_per_lot(self, symbol: str) -> float:

@@ -33,8 +33,13 @@ def h1_bars(n=6, tf="H1"):
     # ATR14 从 bar13 起恒 1.0，供 T23 定手数用例做确定手数）
     closes = ([100.0, 100.0, 101.0, 102.0, 103.0, 104.0][:n]
               if n <= 6 else [100.0] * n)
+    # H-13：high/low 随 close 抬高（旧固定 100.5 在 close>100.5 后非法）；
+    # open/close/time 不动——既有手算断言的数值语义不变
+    opens = [100.0] * n
     df = pd.DataFrame({
-        "time": times, "open": 100.0, "high": 100.5, "low": 99.5,
+        "time": times, "open": opens,
+        "high": [max(o, c) + 0.5 for o, c in zip(opens, closes)],
+        "low": [min(o, c) - 0.5 for o, c in zip(opens, closes)],
         "close": closes,
         "tick_volume": 10, "spread": 5, "real_volume": 0,
     })[_COLUMNS]

@@ -585,3 +585,61 @@ def test_t82_relative_rule_holds_ref_for_identity():
     assert r.ref_price == USTEC_REF
     assert r.contract_size == 1.0
     assert r.long_per_day == pytest.approx(-PER_LOT_NIGHT)   # 绝对额原值保留
+
+
+# ---- H-13：有限数/范围校验 + mode=2 基础货币明确拒绝（2026-10-27） ----
+#
+# 审计 H-13：若干成本参数仅比较 <0，NaN/Inf 可进入模型（NaN 与任何数比较为
+# False）；swap_mode=2 按 MQL5 定义是**品种基础货币**计，旧代码用 currency_profit
+# 代理——EURUSD（base=EUR, profit=USD）的 EUR 金额会被当 USD 用。修复：
+# 构建时统一有限数校验；快照带 currency_base 时按真定义检查，基础货币 ≠ 账户
+# 货币一律 NotImplementedError（未实现换汇不代算）。
+
+def test_h13_swap_rule_nonfinite_rates_rejected():
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="long_per_day"):
+            SwapRule(long_per_day=bad, short_per_day=-2.0)
+        with pytest.raises(ValueError, match="short_per_day"):
+            SwapRule(long_per_day=-7.0, short_per_day=bad)
+
+
+def test_h13_per_lot_per_night_nonfinite_snapshot_rejected():
+    with pytest.raises(ValueError, match="swap_long"):
+        per_lot_per_night(_snap_entry(swap_long=float("nan")))
+    with pytest.raises(ValueError, match="swap_short"):
+        per_lot_per_night(_snap_entry(swap_short=float("inf")))
+    # 点数模式的换算因子也须有限正数（0/NaN × 点值会静默把隔夜费算成 0/NaN）
+    for bad in (0.0, -0.00001, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="point"):
+            per_lot_per_night(_snap_entry(point=bad))
+    for bad in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="contract_size"):
+            per_lot_per_night(_snap_entry(contract_size=bad))
+
+
+def test_h13_symbol_mode_uses_currency_base_when_present():
+    """mode=2 真定义是品种基础货币计：快照带 currency_base 时按真值检查。
+
+    EURUSD：currency_base=EUR ≠ 账户 USD——即使 currency_profit=USD（旧代理
+    恰好放行、EUR 金额被当 USD 用）也必须明确拒绝。"""
+    with pytest.raises(NotImplementedError, match="基础货币"):
+        per_lot_per_night(_snap_entry(
+            swap_mode=SWAP_MODE_CURRENCY_SYMBOL, swap_long=-2.5,
+            currency_base="EUR", currency_profit="USD"))
+    # 基础货币 = 账户货币（如 USDJPY 的 base=USD）→ 金额确为 USD，可用
+    lng, sht = per_lot_per_night(_snap_entry(
+        name="USDJPY", swap_mode=SWAP_MODE_CURRENCY_SYMBOL,
+        swap_long=-2.5, swap_short=1.0,
+        currency_base="USD", currency_profit="JPY"))
+    assert lng == pytest.approx(-2.5)
+    assert sht == pytest.approx(1.0)
+
+
+def test_h13_symbol_mode_legacy_proxy_rejects_non_account_profit():
+    """旧快照（无 currency_base）沿用计价货币代理：≠ 账户货币仍明确拒绝。
+
+    EURUSD 条目误标 currency_profit=EUR（≠USD）→ NotImplementedError，
+    不猜汇率。"""
+    with pytest.raises(NotImplementedError, match="品种货币"):
+        per_lot_per_night(_snap_entry(
+            swap_mode=SWAP_MODE_CURRENCY_SYMBOL, currency_profit="EUR"))

@@ -130,8 +130,12 @@ def patch_strategy_fp(monkeypatch, mod, sha="f" * 64):
 def h1_bars(n=6):
     times = pd.date_range("2026-01-05 10:00", periods=n, freq="h")
     closes = [100.0, 100.0, 101.0, 102.0, 103.0, 104.0][:n]
+    # H-13：high/low 随 close 抬高（旧固定 100.5 在 close>100.5 后非法）
+    opens = [100.0] * n
     return pd.DataFrame({
-        "time": times, "open": 100.0, "high": 100.5, "low": 99.5,
+        "time": times, "open": opens,
+        "high": [max(o, c) + 0.5 for o, c in zip(opens, closes)],
+        "low": [min(o, c) - 0.5 for o, c in zip(opens, closes)],
         "close": closes, "tick_volume": 10, "spread": 5, "real_volume": 0,
     })[_COLUMNS]
 

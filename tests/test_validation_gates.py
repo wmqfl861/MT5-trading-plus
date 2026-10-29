@@ -565,10 +565,15 @@ def test_render_gate_report_markdown():
 # ---------------------------------------------------------------- bt gate CLI
 
 def h1_bars(n=6):
+    # H-13：high/low 随 close 抬高（旧 100.5 固定值在 close>100.5 后非法）
+    closes = [100.0, 100.0, 101.0, 102.0, 103.0, 104.0][:n]
+    opens = [100.0] * n
     times = pd.date_range("2026-01-05 10:00", periods=n, freq="h")
     return pd.DataFrame({
-        "time": times, "open": 100.0, "high": 100.5, "low": 99.5,
-        "close": [100.0, 100.0, 101.0, 102.0, 103.0, 104.0][:n],
+        "time": times, "open": opens,
+        "high": [max(o, c) + 0.5 for o, c in zip(opens, closes)],
+        "low": [min(o, c) - 0.5 for o, c in zip(opens, closes)],
+        "close": closes,
         "tick_volume": 10, "spread": 5, "real_volume": 0,
     })
 

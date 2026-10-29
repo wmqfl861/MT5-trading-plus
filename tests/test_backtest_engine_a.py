@@ -118,11 +118,21 @@ def flat_bars(start, n, tf="H1", *, openc=100.0, high=100.5, low=99.5, close=100
     })[_COLUMNS]
 
 
+def bracket_ohlc(df):
+    """H-13：引擎校验 high≥max(open,close)、low≤min(open,close)——把改过
+    open/close 的 fixture 放宽 high/low 到合法边界（不触碰 open/close/time，
+    被测数值语义不变）。"""
+    df = df.copy()
+    df["high"] = df[["open", "high", "close"]].max(axis=1)
+    df["low"] = df[["open", "low", "close"]].min(axis=1)
+    return df
+
+
 def base4():
     """4 根 H1（周一 2026-01-05 10:00 起），末根收盘 103。"""
     df = flat_bars(pd.Timestamp("2026-01-05 10:00"), 4)
     df.loc[3, "close"] = 103.0
-    return df
+    return bracket_ohlc(df)
 
 
 def one_trade(result):
@@ -214,6 +224,7 @@ def test_signal_bar_close_does_not_affect_next_open_fill():
     a = base4()
     b = base4()
     b.loc[0, "close"] = 111.0  # 大改信号 bar 的收盘价
+    b = bracket_ohlc(b)
     ta = one_trade(run_backtest(ScriptStrategy([1], fill=1), a, FlatCosts(),
                                 symbol="XAUUSD", contract_size=1.0, params={}, timeframe="H1", volume_lots=1.0))
     tb = one_trade(run_backtest(ScriptStrategy([1], fill=1), b, FlatCosts(),
@@ -311,7 +322,7 @@ def week_bars(day):
         df.loc[i, "close"] = c
     nxt = flat_bars(pd.Timestamp(f"{day} 18:00") + pd.Timedelta(days=3, hours=6), 1)
     nxt.loc[0, "close"] = 103.0
-    return pd.concat([df, nxt], ignore_index=True)
+    return bracket_ohlc(pd.concat([df, nxt], ignore_index=True))
 
 
 def test_week_close_exit_january_est():
@@ -338,7 +349,7 @@ def test_week_close_exit_july_edt():
         df.loc[i, "close"] = c
     nxt = flat_bars(start + pd.Timedelta(days=3, hours=7), 1)
     nxt.loc[0, "close"] = 103.0
-    df = pd.concat([df, nxt], ignore_index=True)
+    df = bracket_ohlc(pd.concat([df, nxt], ignore_index=True))
     rules = ExitRules(week_close_exit=True)
     t = one_trade(run_backtest(ScriptStrategy([1, 1, 1, 0], fill=0,
                                              exit_rules=rules),
@@ -909,6 +920,7 @@ def test_ruin_stops_new_entries_and_marks_result():
     标记粘滞（time_stop 出场后权益回升也不清除）。"""
     df = flat_bars(pd.Timestamp("2026-01-05 10:00"), 10)
     df.loc[1, "close"] = 95.0    # bar1 收盘浮亏 (95−100.6)×1000 = −5600 < −本金 1000
+    df = bracket_ohlc(df)
     rules = ExitRules(time_stop_bars=2)
     res = run_backtest(ScriptStrategy([1], fill=1, exit_rules=rules), df, FlatCosts(),
                        symbol="XAUUSD", contract_size=1000.0, params={},
@@ -1164,3 +1176,79 @@ def test_t82_early_1986_prices_equity_not_ruined():
     assert old_abs / abs(t["swap"]) == pytest.approx(25097.0 / 131.0, rel=1e-9)
     assert old_abs > 10_000.0            # 旧口径足以爆掉 1 万本金
     assert res.equity.min() > 9_000.0    # 新口径权益不爆
+
+
+# ------------------------------------------------- H-13：bar OHLC 边界校验
+#
+# 审计 H-13：bar 校验缺有限值/正价/OHLC 关系约束——NaN 价格会顺着成交价/权益
+# 扩散，close>high 的数据会让 SL/TP 判定失真。校验在回测开始前一次性完成
+# （_validate_bars，engine_a/engine_b 共用），不在每 bar 循环内。
+
+def _bad_bars(**kw):
+    df = base4()
+    for col, v in kw.items():
+        df.loc[1, col] = v
+    return df
+
+
+def _run(df, strategy=None):
+    return run_backtest(strategy or ScriptStrategy([1], fill=1), df, FlatCosts(),
+                        symbol="XAUUSD", contract_size=1.0, params={},
+                        timeframe="H1", volume_lots=1.0)
+
+
+class NoSignalStrategy(ScriptStrategy):
+    """非法 bars 必须在 generate_signals 之前被拒（交易/结果写入之前）。"""
+
+    def generate_signals(self, bars, params):
+        raise AssertionError("generate_signals 不应在非法 bars 上被调用")
+
+
+def test_h13_high_below_low_rejected():
+    with pytest.raises(ValueError, match="high"):
+        _run(_bad_bars(high=99.0, low=99.5))
+
+
+def test_h13_close_above_high_rejected():
+    with pytest.raises(ValueError, match="close"):
+        _run(_bad_bars(close=101.0))   # high=100.5 < close=101
+
+
+def test_h13_open_below_low_rejected():
+    with pytest.raises(ValueError, match="open"):
+        _run(_bad_bars(open=99.0))     # low=99.5 > open=99
+
+
+def test_h13_low_above_high_rejected():
+    with pytest.raises(ValueError, match="low"):
+        _run(_bad_bars(low=101.0))     # low=101 > high=100.5（且 > close）
+
+
+def test_h13_nan_prices_rejected():
+    for col in ("open", "high", "low", "close"):
+        with pytest.raises(ValueError, match=col):
+            _run(_bad_bars(**{col: float("nan")}))
+    with pytest.raises(ValueError, match="inf"):
+        _run(_bad_bars(close=float("inf")))
+
+
+def test_h13_nonpositive_prices_rejected():
+    for col in ("open", "high", "low", "close"):
+        with pytest.raises(ValueError, match="正"):
+            _run(_bad_bars(**{col: 0.0}))
+    with pytest.raises(ValueError, match="正"):
+        _run(_bad_bars(high=-100.5))
+
+
+def test_h13_illegal_bars_rejected_before_signal_generation():
+    # 失败必须发生在交易/结果写入之前：非法 bars 连策略信号都不该生成
+    with pytest.raises(ValueError, match="high"):
+        _run(_bad_bars(close=101.0), strategy=NoSignalStrategy([1], fill=1))
+
+
+def test_h13_legal_boundary_bars_pass():
+    # high == max(open, close)（触及即极值）与 low == min(open, close) 合法
+    df = base4()
+    df.loc[1, ["open", "high", "low", "close"]] = [100.0, 100.5, 100.0, 100.5]
+    res = _run(df)
+    assert len(res.trades) >= 0   # 不抛即可

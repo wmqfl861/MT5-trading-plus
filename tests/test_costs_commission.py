@@ -66,3 +66,30 @@ def test_from_calibrated_empty_rejects():
         CommissionModel.from_calibrated({"version": 1, "symbols": {}})
     with pytest.raises(ValueError, match="calibrated"):
         CommissionModel.from_calibrated({})
+
+
+# ---- H-13：有限数校验（NaN/Inf 不进入模型——旧代码仅比较 <0，NaN 全部放行） ----
+
+def test_h13_nan_inf_default_rejected():
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="有限"):
+            CommissionModel(default_per_lot=bad)
+
+
+def test_h13_nan_inf_per_symbol_rejected():
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="XAUUSD"):
+            CommissionModel(per_symbol={"XAUUSD": bad})
+    # 回归：负值仍拒（范围校验保留）
+    with pytest.raises(ValueError, match="不能为负"):
+        CommissionModel(per_symbol={"XAUUSD": -0.1})
+
+
+def test_h13_from_calibrated_nan_rejected():
+    # json.load 会把字面 NaN 读成 float('nan')——校准文件坏了也要在边界拦下
+    bad = {"symbols": {"XAUUSD": {"commission": {"round_trip_per_lot": float("nan")}}}}
+    with pytest.raises(ValueError, match="有限"):
+        CommissionModel.from_calibrated(bad)
+    bad_inf = {"symbols": {"XAUUSD": {"commission": {"round_trip_per_lot": float("inf")}}}}
+    with pytest.raises(ValueError, match="有限"):
+        CommissionModel.from_calibrated(bad_inf)

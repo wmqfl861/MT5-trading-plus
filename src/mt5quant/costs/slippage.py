@@ -8,6 +8,8 @@
 """
 from __future__ import annotations
 
+import math
+
 from .spread import SpreadModel
 
 
@@ -22,12 +24,15 @@ class SlippageModel:
                  fixed_price: float = 0.0,
                  event_hours: frozenset[int] = frozenset(),
                  event_multiplier: float = 2.0):
-        if spread_fraction < 0 or fixed_price < 0:
-            raise ValueError("spread_fraction/fixed_price 不能为负")
+        # H-13：有限数 + 范围——NaN 与任何数比较均为 False，仅 <0 拦不住 NaN/Inf
+        for name, v in (("spread_fraction", spread_fraction),
+                        ("fixed_price", fixed_price)):
+            if not math.isfinite(v) or v < 0:
+                raise ValueError(f"{name} 须为有限数且不能为负，收到 {v!r}")
         # 显式双零（零滑点）是合法配置：零点差品种/研究者有意忽略滑点时用；
         # 报告侧应如实呈现 cost_version，而非在此处强行拦截
-        if event_multiplier <= 0:
-            raise ValueError("event_multiplier 须为正")
+        if not math.isfinite(event_multiplier) or event_multiplier <= 0:
+            raise ValueError(f"event_multiplier 须为有限正数，收到 {event_multiplier!r}")
         for h in event_hours:
             if not 0 <= int(h) <= 23:
                 raise ValueError(f"event_hours 含非法小时 {h}（须 0..23）")

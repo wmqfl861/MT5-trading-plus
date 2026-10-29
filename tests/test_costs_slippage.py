@@ -114,3 +114,27 @@ def test_relative_slippage_event_hour_multiplies():
                       event_hours=frozenset({6}), event_multiplier=3.0)
     assert m.slippage("EURUSD", 6, price=100.0) == pytest.approx(3 * 0.1 * 0.002 * 100.0)
     assert m.slippage("EURUSD", 7, price=100.0) == pytest.approx(0.1 * 0.002 * 100.0)
+
+
+# ---- H-13：有限数校验（NaN/Inf 不进入模型——NaN 与任何数比较均为 False，旧检查全放行） ----
+
+def test_h13_nan_inf_spread_fraction_rejected():
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="spread_fraction"):
+            SlippageModel(_spread_model(), spread_fraction=bad)
+    # 回归：负值仍拒
+    with pytest.raises(ValueError, match="spread_fraction"):
+        SlippageModel(_spread_model(), spread_fraction=-0.1)
+
+
+def test_h13_nan_inf_fixed_price_rejected():
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="fixed_price"):
+            SlippageModel(_spread_model(), fixed_price=bad)
+
+
+def test_h13_event_multiplier_finite_positive_required():
+    # NaN 与 0 的 <= 比较都是 False，旧检查只拦得住正的负数/零
+    for bad in (float("nan"), float("inf"), float("-inf"), 0.0, -2.0):
+        with pytest.raises(ValueError, match="event_multiplier"):
+            SlippageModel(_spread_model(), event_multiplier=bad)

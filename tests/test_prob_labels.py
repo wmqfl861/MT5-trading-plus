@@ -291,9 +291,11 @@ def _bars_with_gap(n_before, gap_hours, n_after, *, start="2026-10-16"):
     rng = np.random.default_rng(5)
     n = len(times)
     closes = 100 + np.cumsum(rng.normal(0, 0.3, size=n))
-    highs = closes + np.abs(rng.normal(0, 0.15, size=n))
-    lows = closes - np.abs(rng.normal(0, 0.15, size=n))
     opens = closes + rng.normal(0, 0.05, size=n)
+    # H-13：high/low 包住 open/close（与 synth_bars 同法——open 噪声可能
+    # 超出 close±margin，旧写法会产生 open>high 的非法 bar）
+    highs = np.maximum(opens, closes) + np.abs(rng.normal(0, 0.15, size=n))
+    lows = np.minimum(opens, closes) - np.abs(rng.normal(0, 0.15, size=n))
     return pd.DataFrame({"time": times, "open": opens, "high": highs,
                          "low": lows, "close": closes,
                          "tick_volume": 1, "spread": 5, "real_volume": 0},

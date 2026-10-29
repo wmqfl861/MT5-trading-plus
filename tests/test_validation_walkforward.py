@@ -154,7 +154,9 @@ def test_walkforward_trending_buy_hold_passes(cfg):
 
 
 def test_walkforward_declining_fails(cfg):
-    bars = make_bars([100 - 0.05 * i for i in range(2600)])
+    # H-13：价格须恒正——斜率 0.05 会在 i≈2000 后跌破 0；放缓到 0.03
+    # （末根 ≈22）保持全程单调下跌且价格合法，oos_sharpe<0 语义不变
+    bars = make_bars([100 - 0.03 * i for i in range(2600)])
     out = wf.run_g3(spec_of(BuyHold()), bars, Zero(), grid=[{}],
                     in_sample_sharpe=base_sharpe(BuyHold(), bars, {}),
                     cfg=cfg)

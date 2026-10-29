@@ -70,6 +70,16 @@ def flat_bars(start, n, tf="H1", *, openc=100.0, high=100.5, low=99.5, close=100
     })[_COLUMNS]
 
 
+def bracket_ohlc(df):
+    """H-13：引擎校验 high≥max(open,close)、low≤min(open,close)——把改过
+    open/close 的 fixture 放宽 high/low 到合法边界（不触碰 open/close/time，
+    被测数值语义不变）。"""
+    df = df.copy()
+    df["high"] = df[["open", "high", "close"]].max(axis=1)
+    df["low"] = df[["open", "low", "close"]].min(axis=1)
+    return df
+
+
 def bars_at(times, **kw):
     """按给定时间列表建 flat bars（跨周末/跨月场景）。"""
     return pd.DataFrame({
@@ -84,7 +94,7 @@ def base4():
     """4 根 H1（周一 2026-01-05 10:00 起），末根收盘 103。"""
     df = flat_bars(pd.Timestamp("2026-01-05 10:00"), 4)
     df.loc[3, "close"] = 103.0
-    return df
+    return bracket_ohlc(df)
 
 
 def sl_tp_bars():
@@ -403,6 +413,7 @@ def test_monthly_streaming_windows():
     bars = bars_at(["2026-01-31 22:00", "2026-01-31 23:00",
                     "2026-02-01 00:00", "2026-02-01 01:00"])
     bars.loc[3, "close"] = 103.0
+    bars = bracket_ohlc(bars)
     ticks = [
         tick("2026-01-31 23:00:00.001", 100.0, 100.5),
         tick("2026-01-31 23:59:59.999", 100.0, 100.5),
@@ -430,6 +441,7 @@ def test_swap_scales_with_lots():
     bars = bars_at(["2026-01-05 22:00", "2026-01-05 23:00",
                     "2026-01-06 00:00", "2026-01-06 01:00"])
     bars.loc[3, "close"] = 103.0
+    bars = bracket_ohlc(bars)
     ticks = [
         tick("2026-01-05 23:00:00.001", 100.0, 100.5),
         tick("2026-01-05 23:30:00", 100.0, 100.5),
@@ -1108,6 +1120,7 @@ def test_t82_engine_passes_exit_tick_bid_to_swap():
     bars = bars_at(["2026-01-31 22:00", "2026-01-31 23:00",
                     "2026-02-01 00:00", "2026-02-01 01:00"])
     bars.loc[3, "close"] = 103.0
+    bars = bracket_ohlc(bars)
     ticks = [
         tick("2026-01-31 23:00:00.001", 100.0, 100.5),
         tick("2026-02-01 00:00:00.001", 100.0, 100.5),

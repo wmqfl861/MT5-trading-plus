@@ -103,6 +103,7 @@ from datetime import datetime, time as dtime, timedelta
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 
 from mt5data.store import TIMEFRAME_SECONDS
@@ -268,6 +269,48 @@ def _validate_bars(bars: pd.DataFrame) -> None:
     t = pd.to_datetime(bars["time"])
     if not t.is_monotonic_increasing or bool(t.duplicated().any()):
         raise ValueError("bars.time 必须严格升序且无重复")
+    # H-13：OHLC 有限值/正价/关系校验——向量化一次完成（回测开始前，不在
+    # 每 bar 循环内）。NaN 价格会顺成交价/权益扩散；close>high 等非法关系
+    # 会让 SL/TP 判定失真。首个违例带 bar 位置与时间，便于定位坏数据。
+    ohlc = {c: bars[c].to_numpy(dtype="float64")
+            for c in ("open", "high", "low", "close")}
+    times_arr = t.to_numpy()
+
+    def _first_bad(mask: np.ndarray):
+        idx = np.flatnonzero(mask)
+        return int(idx[0]), times_arr[idx[0]]
+
+    for col, arr in ohlc.items():
+        bad = ~np.isfinite(arr)
+        if bad.any():
+            i, when = _first_bad(bad)
+            raise ValueError(
+                f"bars.{col} 含非有限值（第 {i} 根 {when}：{arr[i]!r}）")
+        bad = arr <= 0
+        if bad.any():
+            i, when = _first_bad(bad)
+            raise ValueError(
+                f"bars.{col} 含非正价格（第 {i} 根 {when}：{arr[i]!r}）——"
+                "OHLC 须全部为正数")
+    o, h, l, c = (ohlc[k] for k in ("open", "high", "low", "close"))
+    bad = h < np.maximum(o, c)
+    if bad.any():
+        i, when = _first_bad(bad)
+        raise ValueError(
+            f"bars.high < max(open, close)（第 {i} 根 {when}："
+            f"high={h[i]!r}, open={o[i]!r}, close={c[i]!r}）——OHLC 关系非法")
+    bad = l > np.minimum(o, c)
+    if bad.any():
+        i, when = _first_bad(bad)
+        raise ValueError(
+            f"bars.low > min(open, close)（第 {i} 根 {when}："
+            f"low={l[i]!r}, open={o[i]!r}, close={c[i]!r}）——OHLC 关系非法")
+    bad = h < l
+    if bad.any():
+        i, when = _first_bad(bad)
+        raise ValueError(
+            f"bars.high < bars.low（第 {i} 根 {when}："
+            f"high={h[i]!r}, low={l[i]!r}）——OHLC 关系非法")
 
 
 def _validate_signals(sig: pd.Series, bars: pd.DataFrame) -> pd.Series:

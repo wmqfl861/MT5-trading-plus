@@ -96,6 +96,11 @@ class SwapRule:
     contract_size: float | None = None            # T82：每手合约乘数（rel 分母），与 ref 成对
 
     def __post_init__(self):
+        # H-13：费率须有限（NaN/Inf 不进入模型；正负均合法——费率有方向）
+        for name in ("long_per_day", "short_per_day"):
+            v = getattr(self, name)
+            if not math.isfinite(v):
+                raise ValueError(f"{name} 须为有限数，收到 {v!r}")
         try:
             _parse_hhmm(self.charge_local)
         except ValueError as e:
@@ -165,13 +170,18 @@ def per_lot_per_night(entry: dict, *, account_currency: str = "USD") -> tuple[fl
     """单个品种的快照条目 → (多头, 空头) 每手每夜金额（账户货币）。
 
     按 swap_mode 换算：
-    - 点数（1）：金额 = swap × point × contract_size；
-    - 品种/保证金/存款货币（2/3/4）：swap 即每手金额——但 2/3 的计价货币须等于
-      账户货币（模式 2 按 MQL5 定义是品种基础货币计，快照无 currency_base，
-      用计价货币 currency_profit 做一致性代理检查），不等则不猜汇率；
+    - 点数（1）：金额 = swap × point × contract_size（point/contract_size
+      须有限正数——0/NaN 会把隔夜费静默算成 0/NaN，H-13）；
+    - 品种/保证金/存款货币（2/3/4）：swap 即每手金额——但计价货币须等于
+      账户货币：mode=2 按 MQL5 定义是**品种基础货币**计，快照带
+      currency_base 时按真定义检查（H-13：currency_profit 代理会把
+      EURUSD 的 EUR 金额当 USD 用——base=EUR ≠ 账户 USD 即拒）；旧快照
+      无 currency_base 时沿用计价货币 currency_profit 代理检查，
+      不等则不猜汇率；
     - 禁用（0）：0；
     - 利率（5/6）与重开仓（7/8）：抛 NotImplementedError（fail-fast，不猜）。
 
+    swap_long/swap_short 须为有限数（快照字段坏了在入口拦下，H-13）。
     条目缺 swap_mode / swap_rollover3days（R4 之前的旧快照）→ KeyError，
     提示重跑 scripts/snapshot_specs.py——绝不静默按 0 计。
     """
@@ -185,11 +195,21 @@ def per_lot_per_night(entry: dict, *, account_currency: str = "USD") -> tuple[fl
     swap_long = float(entry.get("swap_long", 0.0))
     swap_short = float(entry.get("swap_short", 0.0))
     name = entry.get("name", "?")
+    for v, label in ((swap_long, "swap_long"), (swap_short, "swap_short")):
+        if not math.isfinite(v):
+            raise ValueError(
+                f"{name}：{label} 须为有限数，收到 {v!r}（快照字段坏了，"
+                "重跑 scripts/snapshot_specs.py）")
     if mode == SWAP_MODE_DISABLED:
         return 0.0, 0.0
     if mode == SWAP_MODE_POINTS:
         point = float(entry["point"])
         contract = float(entry["contract_size"])
+        for v, label in ((point, "point"), (contract, "contract_size")):
+            if not math.isfinite(v) or v <= 0:
+                raise ValueError(
+                    f"{name}：点数模式 {label} 须为有限正数，收到 {v!r}"
+                    "（换算因子为 0/NaN 会把隔夜费静默算错）")
         per_point = point * contract  # 1 点（point 单位）× 1 手的账户货币金额
         return swap_long * per_point, swap_short * per_point
     if mode in (SWAP_MODE_CURRENCY_SYMBOL, SWAP_MODE_CURRENCY_MARGIN,
@@ -202,12 +222,24 @@ def per_lot_per_night(entry: dict, *, account_currency: str = "USD") -> tuple[fl
                     f"{account_currency}，不做汇率换算（fail-fast）"
                 )
         if mode == SWAP_MODE_CURRENCY_SYMBOL:
-            ccy = entry.get("currency_profit", "")
-            if ccy != account_currency:
-                raise NotImplementedError(
-                    f"{name}：swap 按品种货币计（快照以计价货币 {ccy} 代理），"
-                    f"≠ 账户货币 {account_currency}，不做汇率换算（fail-fast）"
-                )
+            base = entry.get("currency_base")
+            if base is not None:
+                # H-13：mode=2 真定义 = 品种基础货币计。快照带 currency_base
+                # 时按真值检查——EURUSD（base=EUR）即使 currency_profit=USD
+                # 也不得把 EUR 金额当 USD 用
+                if base != account_currency:
+                    raise NotImplementedError(
+                        f"{name}：swap 按品种基础货币 {base} 计（mode=2 定义），"
+                        f"≠ 账户货币 {account_currency}，不做汇率换算（fail-fast）"
+                    )
+            else:
+                # 旧快照无 currency_base：计价货币代理一致性检查（≠ 即拒）
+                ccy = entry.get("currency_profit", "")
+                if ccy != account_currency:
+                    raise NotImplementedError(
+                        f"{name}：swap 按品种货币计（快照以计价货币 {ccy} 代理），"
+                        f"≠ 账户货币 {account_currency}，不做汇率换算（fail-fast）"
+                    )
         return swap_long, swap_short  # 已是每手金额（账户货币）
     raise NotImplementedError(
         f"{name}：swap_mode={mode}（{_SWAP_MODE_NAMES.get(mode, '未知')}）"

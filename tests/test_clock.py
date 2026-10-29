@@ -160,3 +160,57 @@ def test_record_missing_keys_raises(tmp_path):
     p = write_samples(tmp_path, [{"wall_utc": NOW.isoformat()}])  # 缺 offset_s
     with pytest.raises(ValueError, match="offset_s"):
         latest_valid_sample(p, now=NOW)
+
+
+# ---- H-13：非有限数 / 未来时间检查（NaN 偏移会让 |deviation|>tol 恒 False 而放行） ----
+
+def _sample_with_offset(wall: datetime, offset_s: float) -> dict:
+    """绕开 make_sample 的 server_time 时间加法（inf/NaN 偏移做不了算术）。"""
+    rec = make_sample(wall, 0.0)
+    rec["offset_s"] = offset_s
+    return rec
+
+
+def test_h13_nan_offset_sample_rejected(tmp_path):
+    p = write_samples(tmp_path, [_sample_with_offset(
+        NOW - timedelta(minutes=5), float("nan"))])
+    with pytest.raises(ValueError, match="有限"):
+        latest_valid_sample(p, now=NOW)
+
+
+def test_h13_inf_offset_sample_rejected(tmp_path):
+    p = write_samples(tmp_path, [_sample_with_offset(
+        NOW - timedelta(minutes=5), float("inf"))])
+    with pytest.raises(ValueError, match="有限"):
+        latest_valid_sample(p, now=NOW)
+
+
+def test_h13_future_sample_rejected(tmp_path):
+    # wall_utc 晚于 now（超出取样抖动容差）= 文件时间戳不可信 → 如实报错
+    p = write_samples(tmp_path, [make_sample(NOW + timedelta(days=1), 5.0)])
+    with pytest.raises(ValueError, match="未来"):
+        latest_valid_sample(p, now=NOW)
+    p2 = write_samples(tmp_path, [
+        make_sample(NOW - timedelta(hours=1), 5.0),
+        make_sample(NOW + timedelta(hours=2), 6.0),
+    ])
+    with pytest.raises(ValueError, match="未来"):
+        latest_valid_sample(p2, now=NOW)
+
+
+def test_h13_small_future_jitter_within_grace_accepted(tmp_path):
+    # 秒级取样抖动内（< 容差 120s）的轻微超前不算坏样本
+    p = write_samples(tmp_path, [make_sample(NOW + timedelta(seconds=30), 5.0)])
+    rec = latest_valid_sample(p, now=NOW)
+    assert rec is not None and rec["offset_s"] == 5.0
+
+
+def test_h13_check_server_offset_nonfinite_args_rejected():
+    with pytest.raises(ValueError, match="有限"):
+        check_server_offset(float("nan"), 0.0)
+    with pytest.raises(ValueError, match="有限"):
+        check_server_offset(float("inf"), 0.0)
+    with pytest.raises(ValueError, match="有限"):
+        check_server_offset(0.0, float("nan"))
+    # 回归：有限参数的原有行为不变
+    check_server_offset(30.0, 0.0)
