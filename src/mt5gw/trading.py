@@ -29,19 +29,26 @@ _REQUOTE_ATTEMPTS = 3  # 10004 Requote 的有界重试（每次重取参考价�
 
 logger = logging.getLogger(__name__)
 
-# MT5 订单 comment 安全化（F 阶段停修，2026-10-28 首战事故根因）：真实 Demo
-# 下单 comment="XAUUSD|M15|2026-10-28T06:30:00" 被 MT5 校验层拒绝——
-# last_error=(-2, 'Invalid "comment" argument')（'|' 与 ISO 冒号均在被拒之
-# 列）。不猜黑名单，用保守白名单：字母数字 + 空格 _ - . ；上限取 31。
+# MT5 订单 comment 安全化（F 阶段停修 2026-10-28；T89/R14-L5 根因修正）：
+# 首战事故 comment="XAUUSD|M15|2026-10-28T06:30:00"（30 字符）被拒，
+# last_error=(-2, 'Invalid "comment" argument')。**根因是长度，不是字符**——
+# 2026-10-29 17:33 UTC 真实 Demo 终端 order_check 实测（scripts/
+# order_check_comments.py，只读校验未发单，XAUUSD 最小手数）：
+#   29 字符纯字母数字 → retcode=0 "Done"（通过）
+#   30 字符纯字母数字 → 无返回，last_error=(-2, 'Invalid "comment" argument')（被拒）
+#   短注释 "XAUUSD|M15"（10 字符含 '|'）→ retcode=0 "Done"（通过：'|' 不致拒）
+# 与公开报告一致（≥30 拒/29 过）。字符白名单仍保留（保守卫生），但上限改为
+# 25（留 4 字符余量，docs/reviews/2026-10-29-review-round14.md L5）。
 _COMMENT_UNSAFE_RE = re.compile(r"[^A-Za-z0-9 _\-.]")
-MT5_COMMENT_MAX = 31  # MT5 comment 字段普遍 32 字节上限，保守取 31
+MT5_COMMENT_MAX = 25  # 实测 ≥30 被 MT5 Python 库客户端校验拒绝，保守取 25
 
 
 def sanitize_comment(comment: str | None) -> str:
     """把 comment 安全化为 MT5 可接受形态（网关最后一道防线）。
 
-    白名单外字符逐个替换为 '_'（保对齐、不丢位），再截断至 31 字符；
-    None/空串 → ""（合法缺省）。合法 comment 原样返回。
+    白名单外字符逐个替换为 '_'（保对齐、不丢位），再截断至 25 字符
+    （实测 ≥30 被 MT5 Python 库以 -2 拒绝）；None/空串 → ""（合法缺省）。
+    合法 comment 原样返回。
     """
     if not comment:
         return ""
@@ -295,6 +302,19 @@ class TradingService:
             request, self._fuse_check, self._login_check
         )
         if result is None:
+            # T89/R14-L5 错误分类（按状态确定性，不按错误来源）：
+            # - last_error 码 -2 = **客户端**参数校验拒绝——请求根本没发出
+            #   （order_check 实测同形态：30 字符注释 → 无返回 + -2），
+            #   必然零成交零挂单，状态**确定** → TradeRejectedError，
+            #   不走"核对持仓"流程；
+            # - 其余（IPC 中断等）order_send 无返回 → 状态**未知** →
+            #   OrderResultUnknownError，必须核对持仓后再决定是否重发。
+            code = err[0] if err else None
+            if code == RETCode.INVALID_ARGUMENT:
+                raise TradeRejectedError(
+                    int(code),
+                    f"客户端参数校验拒绝（请求未发出，确定态）：{err}",
+                )
             raise OrderResultUnknownError(
                 f"order_send 无返回（IPC 中断等）：订单实际状态未知，"
                 f"请核对持仓后再决定是否重发。last_error={err}"

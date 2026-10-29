@@ -323,6 +323,47 @@ def test_order_send_none_raises_unknown_result():
         tr.market_order("EURUSD", "buy", 0.01)
 
 
+# ---- T89/R14-L5 错误分类：确定态 vs 未知态 ----
+# -2 = 客户端参数校验拒绝（请求根本没发出，last_error=(-2, ...)）——状态
+# **确定**（必然零成交零挂单）→ TradeRejectedError，绝不触发"核对持仓"。
+# IPC 中断（order_send 无返回且 last_error 非 -2）——状态**未知** →
+# OrderResultUnknownError（核对持仓路径不变）。
+
+def test_client_arg_error_minus2_is_definite_rejection():
+    """last_error=-2（客户端参数错，请求未发出）→ TradeRejectedError 确定态，
+    不是 OrderResultUnknownError（不走"核对持仓"流程）。"""
+    tr, fake = make()
+    fake.set_behavior("order_send", value=None)   # 真实形态：order_send 无返回
+    fake.last_error_value = (-2, 'Invalid "comment" argument')
+    with pytest.raises(TradeRejectedError) as ei:
+        tr.market_order("EURUSD", "buy", 0.01)
+    assert not isinstance(ei.value, OrderResultUnknownError)
+    assert ei.value.retcode == RETCode.INVALID_ARGUMENT == -2
+    assert "核对持仓" not in str(ei.value)
+    assert "Invalid" in str(ei.value)             # last_error 详情保留
+    assert fake.calls("order_send") == 1          # 确定态：不进 requote 重试
+
+
+def test_ipc_break_no_return_stays_unknown_result():
+    """order_send 无返回且 last_error 非 -2（IPC 中断等）→ 状态未知，
+    OrderResultUnknownError + 核对持仓提示（既有语义不变）。"""
+    tr, fake = make()
+    fake.set_behavior("order_send", value=None)
+    fake.last_error_value = (-6, "terminal: IPC call failed")
+    with pytest.raises(OrderResultUnknownError, match="核对持仓"):
+        tr.market_order("EURUSD", "buy", 0.01)
+
+
+def test_close_position_minus2_also_definite_rejection():
+    """平仓路径同样分类：-2 参数错是确定态被拒（TradeRejectedError）。"""
+    tr, fake = make()
+    fake.set_behavior("order_send", value=None)
+    fake.last_error_value = (-2, 'Invalid "comment" argument')
+    with pytest.raises(TradeRejectedError) as ei:
+        tr.close_position(9001)
+    assert not isinstance(ei.value, OrderResultUnknownError)
+
+
 # ---- 挂单 / 撤单 ----
 
 def test_pending_order_sends_correct_request():
@@ -485,28 +526,44 @@ def test_explicit_magic_overrides_config_everywhere():
 # ---- F 阶段停修：MT5 订单 comment 安全化 ----
 # 2026-10-28 首战真实事故：comment="XAUUSD|M15|2026-10-28T06:30:00" 被拒，
 # last_error=(-2, 'Invalid "comment" argument')（data/demo/runner-902601-
-# 20261028-143730.log.err）。不猜黑名单：保守白名单 [A-Za-z0-9 _-.] + 31 截断。
+# 20261028-143730.log.err）。不猜黑名单：保守白名单 [A-Za-z0-9 _-.]。
+# T89/R14-L5：根因是**长度**——公开实测 MetaTrader5 Python 库对 ≥30 字符
+# 注释返回 -2，29 字符通过（docs/reviews/2026-10-29-review-round14.md L5）。
+# 上限 31→25（保守余量）。
 
 _SAFE_COMMENT = re.compile(r"[A-Za-z0-9 _\-.]+")
 
 
 def test_sanitize_comment_real_incident_shape():
-    """① 真实失败形态（XAUUSD|M15|ISO 冒号时间戳，30 字符）→ ≤31 且仅白名单。"""
+    """① 真实失败形态（XAUUSD|M15|ISO 冒号时间戳，30 字符）→ 截 25 且仅白名单。"""
     from mt5gw.trading import sanitize_comment   # TDD 红→绿同形态（延迟导入）
-    raw = "XAUUSD|M15|2026-10-28T06:30:00"       # 首战原始 comment
+    raw = "XAUUSD|M15|2026-10-28T06:30:00"       # 首战原始 comment（30 字符）
     safe = sanitize_comment(raw)
-    assert len(safe) <= 31
+    assert len(safe) <= 25
     assert _SAFE_COMMENT.fullmatch(safe)
     assert "|" not in safe and ":" not in safe
     assert safe.startswith("XAUUSD_M15_")        # 非法字符替换为 '_'：信息保留
 
 
+def test_sanitize_comment_25_chars_pass_through():
+    """T89 边界：25 字符（新上限）原样通过，绝不过度截断。"""
+    from mt5gw.trading import sanitize_comment
+    ok25 = "a" * 25
+    assert sanitize_comment(ok25) == ok25
+
+
+def test_sanitize_comment_26_chars_truncated_to_25():
+    """T89 边界：26 字符 → 截到 25（≥30 被 MT5 库拒，25 是保守余量）。"""
+    from mt5gw.trading import sanitize_comment
+    assert sanitize_comment("a" * 26) == "a" * 25
+
+
 def test_sanitize_comment_35_chars_with_pipe_truncated():
-    """①补：35 字符带 '|' → 截 31 且无 '|'。"""
+    """①补：35 字符带 '|' → 截 25 且无 '|'。"""
     from mt5gw.trading import sanitize_comment
     raw = "EURUSD|" + "x" * 29                   # 35 字符、含 '|'
     safe = sanitize_comment(raw)
-    assert len(safe) == 31
+    assert len(safe) == 25
     assert _SAFE_COMMENT.fullmatch(safe)
 
 
@@ -526,7 +583,7 @@ def test_market_order_sanitizes_comment_before_send_with_warning(caplog):
     with caplog.at_level(logging.WARNING, logger="mt5gw.trading"):
         tr.market_order("EURUSD", "buy", 0.01, comment=raw)
     sent = box["req"]["comment"]
-    assert len(sent) == 31 and "|" not in sent   # 发送前已安全化
+    assert len(sent) == 25 and "|" not in sent   # 发送前已安全化（截 25）
     assert _SAFE_COMMENT.fullmatch(sent)
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert any(raw in r.getMessage() and sent in r.getMessage()

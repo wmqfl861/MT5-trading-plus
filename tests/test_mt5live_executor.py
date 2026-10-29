@@ -14,7 +14,7 @@ from datetime import datetime
 
 import pytest
 
-from mt5gw.errors import OrderResultUnknownError, TradeRejectedError
+from mt5gw.errors import RETCode, OrderResultUnknownError, TradeRejectedError
 
 from mt5live.executor import ExecutionAdapter, LiveExecutor
 
@@ -198,7 +198,7 @@ def test_rejected_propagates_without_retry():
     d = mk_decision(signal=1, volume_lots=0.01)
     with pytest.raises(TradeRejectedError):
         adapter.execute(d)
-    assert len(b.market_orders) == 1          # 执行器层零重试（Requote 重试在网关内部）
+    assert len(b.market_orders) == 1          # 非 requote 被拒零重试（requote 见下）
     # 被拒的决策不标记已执行 → 下次触发允许再试（目标仓位语义自愈）
     b.error_on_market_order = None
     rep = adapter.execute(d)
@@ -212,6 +212,57 @@ def test_unknown_result_propagates_without_retry():
     with pytest.raises(OrderResultUnknownError):
         mk_adapter(b).execute(mk_decision(signal=1, volume_lots=0.01))
     assert len(b.market_orders) == 1          # Unknown：先对账，绝不盲目重发
+
+
+# ---- T89/R14-L5：requote(10004) 是确定态拒绝（未成交）——执行器重试一次 ----
+# 2026-10-29 交易日 2 事故：平仓腿 10004 网关 3 次重试耗尽后
+# TradeRejectedError 上抛，runner 未捕获崩溃退出（docs/ops/phase-f-log.md）。
+# requote 语义=服务器给出新价、订单**确定未成交**——与 Unknown（状态未知，
+# 先对账）不同，重发安全；执行器对 TradeRejectedError(REQUOTE) 额外重试
+# 一次（网关内部重试之外的第二道防线），仍拒则原样上抛（风控停机路径照旧）。
+
+def test_requote_on_open_retried_once_and_succeeds():
+    b = FakeBroker()
+    calls = {"n": 0}
+    orig = b.market_order
+
+    def flaky(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TradeRejectedError(RETCode.REQUOTE, "Requote")
+        return orig(*a, **kw)
+
+    b.market_order = flaky
+    rep = mk_adapter(b).execute(mk_decision(signal=1, volume_lots=0.01))
+    assert rep.action == "open"               # 重试后成交，不再崩溃上抛
+    assert calls["n"] == 2
+    assert len(b.market_orders) == 1          # 第一次未成交，第二次成交
+
+
+def test_requote_on_close_retried_once_and_succeeds():
+    b = FakeBroker()
+    b.seed_position(side="buy", volume=0.01, magic=MAGIC)
+    calls = {"n": 0}
+    orig = b.close_position
+
+    def flaky(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TradeRejectedError(RETCode.REQUOTE, "Requote")
+        return orig(*a, **kw)
+
+    b.close_position = flaky
+    rep = mk_adapter(b).execute(mk_decision(signal=0, volume_lots=None))
+    assert rep.action == "close"              # 事故现场：平仓腿 requote → 重试成功
+    assert calls["n"] == 2
+
+
+def test_requote_persistent_raises_after_single_retry():
+    b = FakeBroker()
+    b.error_on_market_order = TradeRejectedError(RETCode.REQUOTE, "Requote")
+    with pytest.raises(TradeRejectedError):
+        mk_adapter(b).execute(mk_decision(signal=1, volume_lots=0.01))
+    assert len(b.market_orders) == 2          # 有界：只重试一次，仍拒原样上抛
 
 
 # ---- magic 过滤与遗留挂单 ----

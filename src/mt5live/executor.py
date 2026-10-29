@@ -13,8 +13,10 @@
   返回 duplicate；被拒/未知的决策不标记（目标仓位语义下个触发点自愈）。
   跨重启的去重属于对账进程（mt5live.reconcile，T14b）职责。
 - retcode 分类复用 mt5gw 异常：TradeRejectedError / OrderResultUnknownError /
-  LiveTradingBlockedError 原样上抛，执行器层**零重试**（Requote 的有界
-  重试在网关内部；Unknown 必须先对账再决定，绝不盲目重发）。
+  LiveTradingBlockedError 原样上抛；执行器层唯一例外是 **Requote(10004)**
+  ——确定态拒绝（订单未成交，重发安全），网关内部有界重试耗尽后仍上抛时
+  执行器再重试一次（T89/R14-L5，2026-10-29 交易日 2 平仓腿 requote 崩溃
+  事故）；其余被拒零重试；Unknown 必须先对账再决定，绝不盲目重发。
 - 部分成交（DONE_PARTIAL）如实回报（filled_volume < requested_volume），
   不追单——差额留给下个决策点或人工/风控处置。
 - 绝不 import MetaTrader5 直连；实盘保险丝语义（mt5gw.config）不在本层。
@@ -22,10 +24,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
+from mt5gw.errors import RETCode, TradeRejectedError
 from mt5gw.models import DEAL_REASON_SL, DEAL_REASON_SO, DEAL_REASON_TP
 from mt5gw.trading import sanitize_comment
 from mt5live.commands import (
@@ -51,17 +55,19 @@ from mt5quant.strategies.base import ExitRules
 
 _EPS = 1e-9
 
+logger = logging.getLogger(__name__)
+
 
 def decision_comment(decision_id: str) -> str:
     """decision_id → MT5 安全订单 comment（压缩形态，仅辅助定位）。
 
     canonical decision_id = "{symbol}|{TF}|{bar_close_iso}"（runner 与风控
-    进程的接口约定）。'|' 与 ISO 冒号触发 MT5 拒单（F 阶段首战事故，
-    last_error=(-2, 'Invalid "comment" argument')），压缩为
-    "{symbol}_{TF}_{MMDD}_{HHMM}"（白名单字符、≤31）。非 canonical 形态
-    退回 sanitize_comment 兜底安全化。完整 decision_id 恒在本地留痕
-    （expected-<magic>.json 的 cause 与 orders-<magic>.jsonl 行），
-    注释不承担还原职责。
+    进程的接口约定）。首战事故（F 阶段）原始 comment 30 字符被 MT5 Python
+    库以 -2 拒绝——**根因是长度**（T89/R14-L5 实测：≥30 拒、29 过、'|'
+    单独不致拒），压缩为 "{symbol}_{TF}_{MMDD}_{HHMM}"（白名单字符、
+    ≤20，远低于 25 上限）。非 canonical 形态退回 sanitize_comment 兜底
+    安全化。完整 decision_id 恒在本地留痕（expected-<magic>.json 的 cause
+    与 orders-<magic>.jsonl 行），注释不承担还原职责。
     """
     parts = decision_id.split("|")
     if len(parts) == 3:
@@ -225,6 +231,26 @@ class ExecutionAdapter:
 
     # ---- 开仓 / 加仓 ----
 
+    def _requote_retry_once(self, send):
+        """Requote(10004) 确定态拒绝（订单未成交，重发安全）→ 额外重试一次。
+
+        T89/R14-L5（2026-10-29 交易日 2 事故）：网关内部 3 次重取参考价重试
+        耗尽后 TradeRejectedError(REQUOTE) 上抛，runner 未捕获崩溃退出、
+        风控停机。requote 不同于 Unknown（状态未知须先对账）：服务器给了
+        新价、原单确定未成交——执行器作为第二道防线再重试一次（send 内部
+        会重取参考价）；仍 requote 则原样上抛（持续行情背离交给风控停机
+        路径，绝不无限重试）。其余异常（含其他 retcode 的被拒）不在此列。
+        """
+        try:
+            return send()
+        except TradeRejectedError as exc:
+            if exc.retcode != RETCode.REQUOTE:
+                raise
+            logger.warning(
+                "市价单 Requote(10004) 网关重试耗尽仍被拒，执行器重试一次"
+                "（确定态未成交，重发安全）：%s", exc)
+            return send()
+
     def _open(self, decision: Decision, volume: float) -> list[OrderOutcome]:
         volume = round(volume, 8)
         if abs(volume) <= _EPS:              # volume 带符号：正=buy、负=sell
@@ -241,11 +267,11 @@ class ExecutionAdapter:
                 tp = (ref + decision.tp_atr * decision.atr if side == "buy"
                       else ref - decision.tp_atr * decision.atr)
         before = {p.ticket for p in self._my_positions()}
-        res = self._trading.market_order(
+        res = self._requote_retry_once(lambda: self._trading.market_order(
             self._symbol, side, lots, sl=sl, tp=tp,
             deviation=self._deviation,
             comment=decision_comment(decision.decision_id),  # 安全压缩（F 停修）
-            magic=self._magic)
+            magic=self._magic))
         outcome = OrderOutcome(
             kind="open", ticket=res.order_ticket, side=side,
             requested_volume=res.requested_volume or lots,
@@ -323,8 +349,8 @@ class ExecutionAdapter:
     def _close_tickets(self, plan) -> list[OrderOutcome]:
         outcomes = []
         for pos, vol in plan:
-            res = self._trading.close_position(
-                pos.ticket, vol, deviation=self._deviation, magic=self._magic)
+            res = self._requote_retry_once(lambda: self._trading.close_position(
+                pos.ticket, vol, deviation=self._deviation, magic=self._magic))
             outcomes.append(OrderOutcome(
                 kind="close", ticket=pos.ticket,
                 side="sell" if pos.side == "buy" else "buy",

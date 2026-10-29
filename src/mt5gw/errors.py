@@ -35,6 +35,10 @@ class LiveTradingBlockedError(GatewayError):
 
 
 class RETCode:
+    # -2 不是 MT5 服务器 retcode，而是 MetaTrader5 Python 库 last_error 的
+    # 客户端码（T89/R14-L5）：参数校验拒绝，请求未发出、状态确定。order_send/
+    # order_check 无返回 + last_error=(-2, ...) 时网关归类为确定态被拒。
+    INVALID_ARGUMENT = -2
     REQUOTE = 10004
     REJECT = 10006
     CANCEL = 10007
@@ -53,6 +57,7 @@ class RETCode:
 
 
 _RETCODE_TEXT = {
+    RETCode.INVALID_ARGUMENT: "客户端参数校验拒绝（请求未发出，状态确定）",
     RETCode.REQUOTE: "重新报价",
     RETCode.REJECT: "请求被拒绝",
     RETCode.CANCEL: "请求被交易者取消",

@@ -63,3 +63,13 @@ def test_retcode_constant_values_match_mt5():
     assert RETCode.MARKET_CLOSED == 10018
     assert RETCode.NO_MONEY == 10019
     assert RETCode.INVALID_FILL == 10030
+
+
+# ---- T89/R14-L5：客户端参数错（last_error 码 -2）的可读映射 ----
+
+def test_invalid_argument_minus2_has_readable_text():
+    """-2 是 Python 侧参数校验拒绝（请求未发出、状态确定），不是 MT5 服务器
+    retcode，但网关把 order_send 无返回 + last_error=-2 归为确定态被拒
+    （TradeRejectedError）——文案必须可读，不出现"未知返回码"。"""
+    assert RETCode.INVALID_ARGUMENT == -2
+    assert "客户端参数" in describe_retcode(RETCode.INVALID_ARGUMENT)
