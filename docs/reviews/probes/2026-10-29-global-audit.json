@@ -1,0 +1,84 @@
+{
+  "session_policy": {
+    "base_trades": 0,
+    "gate_replay_trades": 1
+  },
+  "event_swap_scaling": {
+    "base": 0.002,
+    "scaled": 0.0
+  },
+  "partial_reverse": {
+    "open_orders_after_partial_close": 1,
+    "positions": [
+      [
+        "buy",
+        0.01
+      ],
+      [
+        "sell",
+        0.01
+      ]
+    ]
+  },
+  "hedged_flatten": {
+    "action": "hold",
+    "remaining_positions": 2
+  },
+  "merged_cutoff": {
+    "regular_max": "2024-01-01 23:00:00",
+    "merged_max": "2024-01-04 07:00:00",
+    "merged_rows_at_or_after_cutoff": 56
+  },
+  "lockbox_budget_race": {
+    "started": [
+      "SYN-A",
+      "SYN-B"
+    ],
+    "budget": {
+      "cutoff": "2024-01-02T00:00:00",
+      "max_uses": 1,
+      "used": 2,
+      "remaining": 0,
+      "exhausted": true
+    }
+  },
+  "calibration_day_count": {
+    "nominal": 4000,
+    "real": 1723,
+    "null": 1713
+  },
+  "cluster_null_uses_original": true,
+  "strategy_bracket": {
+    "declared": [
+      2.0,
+      3.0
+    ],
+    "actual_exit_rules": [
+      1.0,
+      2.0
+    ]
+  },
+  "validation_warmup": {
+    "requested_bars": 2100,
+    "actual_bars": 1476
+  },
+  "cost_heatmap_timezone": {
+    "actual_ratio": 0.001,
+    "expected_ratio": 0.1,
+    "bar_hour_utc": 22,
+    "bar_hour_ny": 17
+  },
+  "verify_orphan_parquet": {
+    "violations": []
+  },
+  "git_relative_path": {
+    "relative_committed": null,
+    "absolute_committed": "2026-10-29 12:04:06+08:00",
+    "relative_clean": true,
+    "absolute_clean": false
+  },
+  "validation_trigger_carry": {
+    "triggers_after_split": 0,
+    "signal_at_split": 1
+  }
+}
