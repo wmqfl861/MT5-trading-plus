@@ -1452,3 +1452,15 @@ def test_h2_01_ack_execution_refuses_missing_history_start_time(tmp_path):
     assert ack_execution(str(tmp_path), _GW(), MAGIC, "d-no-ts", "manual") == 2
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["execution_unknown"] is not None
+
+def test_h2_01_malformed_execution_marker_type_fails_closed(tmp_path):
+    """JSON 可解析但 execution_unknown 类型损坏时，也必须保守阻止开仓。"""
+    b = FakeBroker()
+    (tmp_path / f"state-{MAGIC}.json").write_text(
+        json.dumps({"execution_unknown": []}), encoding="utf-8")
+    ex = _mk_executor(b, tmp_path)
+    assert ex._state["execution_unknown"]["status"] == "unknown"
+    rr = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                             decision_id="XAUUSD|M15|bad-marker"), NOW)
+    assert rr.action == "blocked_execution_unknown"
+    assert b.market_orders == []
