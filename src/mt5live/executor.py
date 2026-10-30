@@ -974,11 +974,27 @@ class LiveExecutor:
                 except (TypeError, ValueError):
                     continue
                 try:
-                    out[ticket] = {"dir": int(v["dir"]),
-                                   "volume": float(v.get("volume") or 0.0),
-                                   "ts": str(v.get("ts", ""))}
+                    consumed = v.get("consumed_deal_tickets") or {}
+                    if isinstance(consumed, list):
+                        consumed = {str(t): 0.0 for t in consumed}
+                    if not isinstance(consumed, dict):
+                        consumed = {}
+                    out[ticket] = {
+                        "dir": int(v["dir"]),
+                        "volume": float(v.get("volume") or 0.0),
+                        "ts": str(v.get("ts", "")),
+                        "consumed_deal_tickets": {
+                            str(k): float(vol or 0.0) for k, vol in consumed.items()},
+                        "manual_exit_observed": bool(v.get("manual_exit_observed", False)),
+                        "position_still_open": bool(v.get("position_still_open", False)),
+                    }
                 except (KeyError, TypeError, ValueError):
-                    out[ticket] = {"dir": 0, "volume": 0.0, "ts": ""}
+                    out[ticket] = {
+                        "dir": 0, "volume": 0.0, "ts": "",
+                        "consumed_deal_tickets": {},
+                        "manual_exit_observed": True,
+                        "position_still_open": False,
+                    }
         return out
 
     def _load_state(self) -> dict:
