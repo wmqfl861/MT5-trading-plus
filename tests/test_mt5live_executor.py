@@ -1464,3 +1464,42 @@ def test_h2_01_malformed_execution_marker_type_fails_closed(tmp_path):
                              decision_id="XAUUSD|M15|bad-marker"), NOW)
     assert rr.action == "blocked_execution_unknown"
     assert b.market_orders == []
+
+def test_h2_01_ack_execution_write_order_keeps_unknown_if_state_commit_fails(tmp_path, monkeypatch):
+    """canonical intent 写入后 state 清除失败时，旧 UNKNOWN 必须仍阻止开仓。"""
+    import scripts.live_ack_execution as ack_mod
+    from scripts.live_ack_execution import ack_execution
+    from types import SimpleNamespace
+
+    state_path = tmp_path / f"state-{MAGIC}.json"
+    state_path.write_text(json.dumps({
+        "magic": MAGIC, "execution_unknown": {
+            "status": "unknown", "decision_id": "d-write-order",
+            "symbol": "XAUUSD", "ts": NOW.isoformat()}}), encoding="utf-8")
+
+    class _Account:
+        def state(self):
+            return SimpleNamespace(login=123456, server="MetaQuotes-Demo")
+        def positions(self):
+            return []
+        def pending_orders(self):
+            return []
+        def deals(self, since, to):
+            return []
+
+    class _GW:
+        account = _Account()
+
+    real_write = ack_mod.write_json_atomic
+    def fail_state_write(path, payload):
+        if str(path) == str(state_path):
+            raise OSError("simulated state commit failure")
+        return real_write(path, payload)
+    monkeypatch.setattr(ack_mod, "write_json_atomic", fail_state_write)
+    with pytest.raises(OSError, match="state commit failure"):
+        ack_execution(str(tmp_path), _GW(), MAGIC, "d-write-order", "manual review")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    intent = json.loads((tmp_path / f"expected-{MAGIC}.json").read_text(
+        encoding="utf-8"))
+    assert state["execution_unknown"]["status"] == "unknown"
+    assert intent["status"] == "confirmed" and intent["cause"] == "ack_execution"
