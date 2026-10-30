@@ -1315,3 +1315,43 @@ def test_h2_02_old_protective_deal_cannot_explain_later_manual_exit(tmp_path):
         encoding="utf-8"))
     assert state2["pending_external_exits"][str(ticket)]["manual_exit_observed"] is True
     assert len(b.market_orders) == 1
+
+def test_h2_01_ack_execution_requires_stopped_runner_and_no_pending_orders(tmp_path):
+    """UNKNOWN 解除脚本必须遵守 runner 锁，并拒绝有挂单时解除。"""
+    from scripts.live_ack_execution import ack_execution
+    from mt5live.runner import MagicInstanceLock
+
+    live_dir = str(tmp_path)
+    state_path = tmp_path / f"state-{MAGIC}.json"
+    state_path.write_text(json.dumps({
+        "magic": MAGIC, "execution_unknown": {
+            "status": "unknown", "decision_id": "d-ack",
+            "symbol": "XAUUSD", "ts": NOW.isoformat()}}), encoding="utf-8")
+
+    class _Account:
+        def __init__(self, pending):
+            self._pending = pending
+        def positions(self):
+            return []
+        def pending_orders(self):
+            return self._pending
+        def deals(self, since, to):
+            return []
+
+    class _GW:
+        def __init__(self, pending):
+            self.account = _Account(pending)
+
+    lock = MagicInstanceLock(str(tmp_path / f"runner-{MAGIC}.lock"))
+    assert lock.acquire()
+    try:
+        assert ack_execution(live_dir, _GW([]), MAGIC, "d-ack", "test") == 3
+    finally:
+        lock.release()
+
+    class _Pending:
+        magic = MAGIC
+        ticket = 99
+    assert ack_execution(live_dir, _GW([_Pending()]), MAGIC, "d-ack", "test") == 2
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["execution_unknown"] is not None
