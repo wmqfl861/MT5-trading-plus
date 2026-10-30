@@ -34,6 +34,9 @@ def _open_gateway(path: str) -> MT5Gateway:
 def ack_execution(live_dir: str, gw: MT5Gateway, magic: int, decision_id: str,
                   reason: str, *, now: datetime | None = None) -> int:
     """Acknowledge an UNKNOWN order only after explicit broker reconciliation."""
+    if not decision_id.strip() or not reason.strip():
+        print("× decision_id 与人工核对 reason 都不能为空，保持 UNKNOWN")
+        return 2
     try:
         account_state = gw.account.state()
         lock = MagicInstanceLock.for_account(account_state, magic)
@@ -56,6 +59,9 @@ def ack_execution(live_dir: str, gw: MT5Gateway, magic: int, decision_id: str,
                 state = json.load(f)
         except (OSError, ValueError) as exc:
             print(f"× state 文件缺失/损坏，拒绝自动解除：{exc}")
+            return 2
+        if not isinstance(state, dict):
+            print("× state 文件根节点不是对象，拒绝自动解除")
             return 2
         if state.get("magic") != magic:
             print("× state 文件 magic 与请求不一致，拒绝解除")
@@ -90,6 +96,8 @@ def ack_execution(live_dir: str, gw: MT5Gateway, magic: int, decision_id: str,
             with open(intent_path, encoding="utf-8") as f:
                 intent = json.load(f)
         except (OSError, ValueError):
+            intent = {}
+        if not isinstance(intent, dict):
             intent = {}
         expected_symbol = intent.get("symbol") or marker.get("symbol")
         if symbols and expected_symbol and symbols != {expected_symbol}:
