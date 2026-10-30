@@ -1,7 +1,8 @@
 """T75 概率模式正式标定（D35 已批准；蓝图 P 线 §3.2 / 计划 T75 设计）。
 
-标定对象：`mt5quant.validation.prob_mode` 的 delta_p_test / holm /
-plant_delta / brier_skill——**只用随机时点、随机化触发、成簇平移与
+标定对象：`mt5quant.validation.prob_mode` 的 cluster_permutation_test
+（T106 起的 p 值方法；v4 之前为 delta_p_test）/ holm / plant_delta /
+brier_skill——**只用随机时点、随机化触发、成簇平移与
 植入效应**，不生成任何真实局面触发的标签（蓝图 v4 §2）。随机时点的
 标签池 parquet 只放本次运行的临时目录，merge 后删除；pool.meta.json、
 manifest.json 与冻结的 cluster 输入保留（P-12/P2-07：来源与重建过程
@@ -44,12 +45,39 @@ T104 批 2 修正（2026-10-30，audit2 P2-06/P2-07）：
 标定并附成簇负对照实测。正式运行 B ≥ 10,000（+1 修正后分辨率
 1/(1+B) ≤ 0.01%）。
 
+T106 方法切换（2026-10-30，簇单位置换；预注册设计 docs/superpowers/
+plans/2026-10-30-t106-cluster-permutation.md §一——结果之前冻结，实现/
+标定不得偏离，任何相位失败不得换 seed 重跑）：
+- METHOD="cluster-permutation-v1"（prob_mode.cluster_permutation_test，
+  METHOD_REGISTRY 登记 status=not_adopted_two_stage_cp）；BLOCK 保留作历史字段
+  （≤v3 stamp 的方法标识）。统计量仍为日聚合 Δp（D52）；p 值改**整簇
+  交换** Monte Carlo 置换（簇=合并触发日按 CLUSTER_GAP_DAYS=10 日历日
+  邻接聚簇、跨月不拆；混合簇多数归属计数、平局计 real；任一组簇数
+  <MIN_CLUSTERS_PER_GROUP=5 或总簇数 <10 → 不可检验、不打碎簇）。
+- neg/neg-holm/pos/cluster 四相位全部换 cluster_permutation_test
+  （brier 与置换无关，不变）；phase_cluster 的平移机制（P2-06 修复版）
+  零改动——只换检验函数。
+- 预注册 seed 基：S_NEG=20261101、S_HOLM=20261102、S_POS=20261103、
+  S_CLU=20261104、S_BRI=20261105；种子数：NEG/HOLM/CLUSTER 首段各 500、
+  POS=100、BRIER=200。
+- **一次性两段升级规则**（预写写死，非边看边扩）：首段 500 种子；点
+  估计 ≤5% 而 CP 上界 >5% 的条件追加预定第二段至合计 1,000（neg/
+  neg-holm/cluster；pos/brier 无第二段），终局不再扩。第二段接续规则
+  （写死）：`run --stage 2` 跑种子下标 ∈ [首段, 首段+追加段)，全部派生
+  seed = 基 + SEED_STAGE_OFFSET(=10,000) + 下标（+用途偏移）——与首段
+  值域不相交、确定性可复现；第二段分片落 <phase>-st2-sIofN.json；
+  merge 只接受预注册第二段键全集内的行（超出即"多"拒绝）。
+- 不可检验行（簇太少等）：行内 testable=False + reason（p=None），merge
+  汇总的 FPR/功率只在可检验行上计算并单列 untestable 计数（不静默当
+  不拒绝、也不静默丢弃）。
+
 用法（分片；并发进程数 ≤ CPU 核数一半）：
     .venv/Scripts/python.exe scripts/prob_calibration.py pool
-    .venv/Scripts/python.exe scripts/prob_calibration.py run --phase neg  --shard 0/4 ...
-    .venv/Scripts/python.exe scripts/prob_calibration.py run --phase pos  --shard 0/4 ...
-    .venv/Scripts/python.exe scripts/prob_calibration.py run --phase cluster --shard 0/1
-    .venv/Scripts/python.exe scripts/prob_calibration.py run --phase brier --shard 0/1
+    .venv/Scripts/python.exe scripts/prob_calibration.py run --phase neg  --shard-i 0 --shard-n 16 ...
+    .venv/Scripts/python.exe scripts/prob_calibration.py run --phase pos  --shard-i 0 --shard-n 8 ...
+    .venv/Scripts/python.exe scripts/prob_calibration.py run --phase cluster --shard-i 0 --shard-n 40 ...
+    .venv/Scripts/python.exe scripts/prob_calibration.py run --phase brier --shard-i 0 --shard-n 8 ...
+    .venv/Scripts/python.exe scripts/prob_calibration.py run --phase neg --stage 2 --shard-i 0 --shard-n 16 ...   # 两段升级第二段
     .venv/Scripts/python.exe scripts/prob_calibration.py merge
 产物：data/prob/t75-calibration/<stamp>/（分片 JSON + manifest.json +
 summary.json；merge 后删 pool.parquet，保留全部 meta/manifest/冻结输入）
@@ -77,8 +105,12 @@ from mt5quant.prob.labels import Bracket, label_triggers
 from mt5quant.strategies.library.prob.actions import ActionParams
 from mt5quant.strategies.library.prob.situations import Approach
 from mt5quant.validation.prob_mode import (
-    brier_skill, delta_p_test, holm, plant_delta,
+    CLUSTER_GAP_DAYS, MIN_CLUSTERS_PER_GROUP, brier_skill,
+    cluster_permutation_test, delta_p_test, holm, plant_delta,
 )
+# 注：delta_p_test 自 T106 起不再被任何相位调用（保留导入——测试以其为
+# 桩断言"标定相位不再走旧方法"）；CLUSTER_GAP_DAYS/MIN_CLUSTERS_PER_
+# GROUP 为预注册设计常量，进 manifest 绑定。
 
 REPO = Path(__file__).resolve().parents[1]
 OUT_ROOT = REPO / "data" / "prob" / "t75-calibration"
@@ -86,24 +118,48 @@ SYMBOL = "XAUUSD"
 TF = "H1"
 DATA_ROOT = "data_research"
 B_SIMS = 10_000                       # 正式运行置换次数（+1 修正分辨率 1e-4）
-# T101（P-02 处置）：v3 标定的置换块长——季度块（T100 重跑成簇 w7 档
-# 误报 11%>5%，月内置换低估跨月成簇方差）；随 v3 报告采纳状态决定
-# 正式 P1（run_p1_card）是否同步切换。方法版本进 manifest 绑定（P2-07）
+# T106（簇单位置换）：现行方法标识——prob_mode.cluster_permutation_test
+# （METHOD_REGISTRY 登记 status=not_adopted_two_stage_cp；采纳动作另批）。BLOCK 保留作
+# 历史字段（≤v3 stamp 的方法标识），不 再 作 方 法 版 本——方法绑定以
+# method_id + 设计常量为准（manifest.bindings.method）。
+METHOD = "cluster-permutation-v1"
 BLOCK = "quarter"
 N_POOL = 4_200                        # 随机时点标签池大小（≥ 最大 n=4000）
 BRACKET = Bracket(sl_atr=1.0, tp_atr=2.0, horizon_bars=24)
 POOL_SEED = 20261028
-# 设计（报告开头写清；与计划 T75 一致）
+# 设计（报告开头写清；T106 预注册：种子数=首段 500/500/500、pos 100、
+# brier 200；两段升级各追加 500 至合计 1,000——一次性规则，非边看边扩）
 NEG_NS = (500, 1000, 2000)
-NEG_SEEDS = 200
+NEG_SEEDS = 500
+NEG_ESCALATION_SEEDS = 500            # 两段升级第二段（合计 1,000）
 POS_DELTAS = (0.02, 0.03, 0.05)
 POS_NS = (500, 1000, 2000, 4000)
 POS_SEEDS = 100
 HOLM_HYPS = 12                        # 3 局面 × 4 动作
+HOLM_SEEDS = 500
+HOLM_ESCALATION_SEEDS = 500           # 两段升级第二段（合计 1,000）
 CLUSTER_SHIFT_WEEKS = (3, 7)
-CLUSTER_SEEDS = 100
+CLUSTER_SEEDS = 500
+CLUSTER_ESCALATION_SEEDS = 500        # 两段升级第二段（合计 1,000）
 CLUSTER_EXTRA_WEEKS_MAX = 51          # 附加整周偏移抽值 0..51（P-02 宽范围）
-BRIER_SEEDS = 200                     # P2 校准否证种子数
+BRIER_SEEDS = 200                     # P2 校准否证种子数（无第二段）
+
+# ---- T106 预注册 seed 基（计划 §一：一次写定；任何相位失败不得换 seed 重跑）
+S_NEG = 20261101
+S_HOLM = 20261102
+S_POS = 20261103
+S_CLU = 20261104
+S_BRI = 20261105
+# 两段升级第二段的接续偏移（写死）：第二段全部派生 seed = 基 + 本偏移 +
+# 种子下标（+用途偏移）——与首段值域不相交
+SEED_STAGE_OFFSET = 10_000
+# 同一 job 内按用途分离的派生偏移（预写：抽样 real/null、Holm 族内假设、
+# cluster 平移、植入各用互不重叠的偏移段）
+SEED_DERIVE_SAMPLE_REAL = 1_000_000
+SEED_DERIVE_SAMPLE_NULL = 2_000_000
+SEED_DERIVE_HOLM_H = 3_000_000
+SEED_DERIVE_SHIFT = 4_000_000
+SEED_DERIVE_PLANT = 5_000_000
 
 # ---- P2-06：平移映射的预写规则常量（先于运行声明，不看标签/p 值挑变换）
 SHIFT_MAP_TOLERANCE = pd.Timedelta(hours=1)   # ±1 根 H1 bar 的有限容差
@@ -325,55 +381,139 @@ def _sample_labels(pool_days: pd.DataFrame, n: int, seed: int
 
 # ---------------------------------------------------------------- phases
 
-def phase_neg(pool: pd.DataFrame, shard_i: int, shard_n: int, stamp: str
-              ) -> list[dict]:
+def _dseed(base: int, stage: int, s: int, *, derive: int = 0) -> int:
+    """T106 预注册 seed 派生（写死规则）：job 的全部随机源由
+    (相位基, 段号, 种子下标, 用途偏移) 唯一决定。
+
+    第 1 段：base + s；第 2 段：base + SEED_STAGE_OFFSET + s（种子下标
+    本身接续首段，两段派生值域不相交）。同参数 → 同 seed（确定性）。"""
+    if stage not in (1, 2):
+        raise ValueError(f"stage 只认 1/2，收到 {stage!r}")
+    return base + (SEED_STAGE_OFFSET if stage == 2 else 0) + derive + s
+
+
+def _stage_seed_range(phase: str, stage: int) -> range:
+    """该相位该段的种子下标区间（T106 两段升级；读模块常量——测试可缩小）。
+
+    neg/neg-holm/cluster：第 1 段 [0, 首段)、第 2 段 [首段, 首段+追加段)；
+    pos/brier 只有一段。非法组合 → ValueError（不边看边扩）。"""
+    if phase == "neg":
+        first, second = NEG_SEEDS, NEG_ESCALATION_SEEDS
+    elif phase == "neg-holm":
+        first, second = HOLM_SEEDS, HOLM_ESCALATION_SEEDS
+    elif phase == "cluster":
+        first, second = CLUSTER_SEEDS, CLUSTER_ESCALATION_SEEDS
+    elif phase == "pos":
+        first, second = POS_SEEDS, 0
+    elif phase == "brier":
+        first, second = BRIER_SEEDS, 0
+    else:
+        raise ValueError(f"未知 phase {phase!r}")
+    if stage == 1:
+        return range(first)
+    if stage == 2:
+        if second <= 0:
+            raise ValueError(f"{phase} 无预注册第二段（一次性两段升级只适用"
+                             " neg/neg-holm/cluster）")
+        return range(first, first + second)
+    raise ValueError(f"stage 只认 1/2，收到 {stage!r}")
+
+
+def _cluster_audit(res: dict) -> dict:
+    """cluster_permutation_test 结果的审计子集（进相位行；§4.3 步骤 4：
+    簇数/簇大小分布/最小可达 p 可审计）。"""
+    keys = ("n_clusters", "k_real", "k_null", "min_achievable_p",
+            "cluster_size_summary", "perm_mean_days_real",
+            "perm_mean_days_null")
+    return {k: res[k] for k in keys if k in res}
+
+
+def phase_neg(pool: pd.DataFrame, shard_i: int, shard_n: int, stamp: str,
+              *, stage: int = 1) -> list[dict]:
     out = []
-    jobs = [(n, seed) for n in NEG_NS for seed in range(NEG_SEEDS)]
-    my = jobs[shard_i::shard_n]
-    for n, seed in my:
-        real = _sample_labels(pool, n, seed=900_000 + seed)
-        null = _sample_labels(pool, n, seed=800_000 + seed)
-        res = delta_p_test(real, null, block=BLOCK, sims=B_SIMS, seed=seed)
-        out.append({"kind": "neg_single", "n": n, "seed": seed,
-                    "p": res["p_value"],
-                    "n_days_real": res["n_days_real"],
-                    "n_days_null": res["n_days_null"]})
+    jobs = [(n, s) for n in NEG_NS for s in _stage_seed_range("neg", stage)]
+    for n, s in jobs[shard_i::shard_n]:
+        real = _sample_labels(pool, n, seed=_dseed(
+            S_NEG, stage, s, derive=SEED_DERIVE_SAMPLE_REAL))
+        null = _sample_labels(pool, n, seed=_dseed(
+            S_NEG, stage, s, derive=SEED_DERIVE_SAMPLE_NULL))
+        res = cluster_permutation_test(real, null, sims=B_SIMS,
+                                       seed=_dseed(S_NEG, stage, s))
+        row = {"kind": "neg_single", "n": n, "seed": s, "stage": stage,
+               "p": res["p_value"], "testable": res["testable"],
+               "n_days_real": res["n_days_real"],
+               "n_days_null": res["n_days_null"],
+               "cluster_audit": _cluster_audit(res)}
+        if not res["testable"]:
+            row["reason"] = res["reason"]
+        out.append(row)
     return out
 
 
-def phase_neg_holm(pool: pd.DataFrame, shard_i: int, shard_n: int
-                   ) -> list[dict]:
+def phase_neg_holm(pool: pd.DataFrame, shard_i: int, shard_n: int,
+                   *, stage: int = 1) -> list[dict]:
     out = []
-    seeds = range(NEG_SEEDS)
-    for seed in seeds[shard_i::shard_n]:
+    for s in _stage_seed_range("neg-holm", stage)[shard_i::shard_n]:
         pv = {}
+        untestable = []
+        audits = []
+        reason = None
         for h in range(HOLM_HYPS):
-            real = _sample_labels(pool, NEG_NS[1], seed=700_000 + seed * 20 + h)
-            null = _sample_labels(pool, NEG_NS[1], seed=600_000 + seed)
-            pv[f"H{h:02d}"] = delta_p_test(real, null, block=BLOCK,
-                                           sims=B_SIMS,
-                                           seed=seed * 20 + h)["p_value"]
-        adj = holm(pv)
-        out.append({"kind": "neg_holm", "n": NEG_NS[1], "seed": seed,
-                    "reject_any": any(v < 0.05 for v in adj.values())})
+            real = _sample_labels(pool, NEG_NS[1], seed=_dseed(
+                S_HOLM, stage, s * HOLM_HYPS + h, derive=SEED_DERIVE_HOLM_H))
+            null = _sample_labels(pool, NEG_NS[1], seed=_dseed(
+                S_HOLM, stage, s, derive=SEED_DERIVE_SAMPLE_NULL))
+            res = cluster_permutation_test(
+                real, null, sims=B_SIMS,
+                seed=_dseed(S_HOLM, stage, s * HOLM_HYPS + h))
+            audits.append(_cluster_audit(res))
+            if res["testable"]:
+                pv[f"H{h:02d}"] = res["p_value"]
+            else:
+                untestable.append(f"H{h:02d}")
+                reason = res["reason"]
+        # 族级审计：各假设的簇数/最少单位取最紧者（min n_clusters / k）
+        fam_audit = dict(audits[-1])
+        for a in audits:
+            for k in ("n_clusters", "k_real", "k_null"):
+                if k in a and k in fam_audit:
+                    fam_audit[k] = min(fam_audit[k], a[k])
+        row = {"kind": "neg_holm", "n": NEG_NS[1], "seed": s, "stage": stage,
+               "cluster_audit": fam_audit}
+        if untestable:
+            # 不可检验假设不硬造 p（holm 需数值）——整族记不可检验
+            row.update({"reject_any": None, "testable": False,
+                        "untestable_hyps": untestable, "reason": reason})
+        else:
+            adj = holm(pv)
+            row.update({"reject_any": any(v < 0.05 for v in adj.values()),
+                        "testable": True})
+        out.append(row)
     return out
 
 
-def phase_pos(pool: pd.DataFrame, shard_i: int, shard_n: int
-              ) -> list[dict]:
+def phase_pos(pool: pd.DataFrame, shard_i: int, shard_n: int,
+              *, stage: int = 1) -> list[dict]:
     out = []
-    jobs = [(d, n, seed) for d in POS_DELTAS for n in POS_NS
-            for seed in range(POS_SEEDS)]
-    my = jobs[shard_i::shard_n]
-    for d, n, seed in my:
-        real = plant_delta(_sample_labels(pool, n, seed=500_000 + seed), d,
-                           seed=seed)
-        null = _sample_labels(pool, n, seed=400_000 + seed)
-        res = delta_p_test(real, null, block=BLOCK, sims=B_SIMS, seed=seed)
-        out.append({"kind": "pos", "delta": d, "n": n, "seed": seed,
-                    "p": res["p_value"], "dp_hat": res["delta_p"],
-                    "n_days_real": res["n_days_real"],
-                    "n_days_null": res["n_days_null"]})
+    jobs = [(d, n, s) for d in POS_DELTAS for n in POS_NS
+            for s in _stage_seed_range("pos", stage)]
+    for d, n, s in jobs[shard_i::shard_n]:
+        real = plant_delta(_sample_labels(pool, n, seed=_dseed(
+            S_POS, stage, s, derive=SEED_DERIVE_SAMPLE_REAL)), d,
+            seed=_dseed(S_POS, stage, s, derive=SEED_DERIVE_PLANT))
+        null = _sample_labels(pool, n, seed=_dseed(
+            S_POS, stage, s, derive=SEED_DERIVE_SAMPLE_NULL))
+        res = cluster_permutation_test(real, null, sims=B_SIMS,
+                                       seed=_dseed(S_POS, stage, s))
+        row = {"kind": "pos", "delta": d, "n": n, "seed": s, "stage": stage,
+               "p": res["p_value"], "dp_hat": res["delta_p"],
+               "testable": res["testable"],
+               "n_days_real": res["n_days_real"],
+               "n_days_null": res["n_days_null"],
+               "cluster_audit": _cluster_audit(res)}
+        if not res["testable"]:
+            row["reason"] = res["reason"]
+        out.append(row)
     return out
 
 
@@ -566,8 +706,9 @@ def _shifted_triggers(trig: pd.DataFrame, times_idx: pd.Index, *, weeks: int,
 
 
 def phase_cluster(shard_i: int, shard_n: int, stamp: str, *,
-                  frozen=None) -> list[dict]:
-    """成簇负对照（审核三；P-02 重写；P2-06/P2-07 加固）。
+                  frozen=None, stage: int = 1) -> list[dict]:
+    """成簇负对照（审核三；P-02 重写；P2-06/P2-07 加固；T106 只换检验
+    函数——平移机制零改动）。
 
     输入（P2-07）：正式入口 cmd_run 传入 pool 阶段**一次提取并冻结**的
     (bars, S1 触发)——cluster 相位不再重读可变研究库（同一冻结快照与
@@ -579,7 +720,10 @@ def phase_cluster(shard_i: int, shard_n: int, stamp: str, *,
     星期）+ **独立**置换；映射/资格/匹配桶按 _shifted_triggers 预写规则
     R1–R4 逐项核验（内部洞/休市/末端/匹配退化 → 丢弃或拒绝变换，覆盖
     损失与桶审计随行记录）。两组重叠（同平移周时集合可相同）按预写
-    规则**记录披露**、不据此挑变换——剔除会以平移幅值为条件。"""
+    规则**记录披露**、不据此挑变换——剔除会以平移幅值为条件。
+
+    T106：p 值改 cluster_permutation_test（整簇交换；seed/平移随机源 =
+    S_CLU 基 + 段偏移 + 种子下标，第二段经 stage=2 接续）。"""
     if frozen is not None:
         bars_full, trig = frozen
     else:
@@ -602,9 +746,12 @@ def phase_cluster(shard_i: int, shard_n: int, stamp: str, *,
                                  "outcome": pd.Series(dtype="object")})
         return label_triggers(bars_full, trig_df, costs, **kw)
 
+    seeds = _stage_seed_range("cluster", stage)
     for wk in CLUSTER_SHIFT_WEEKS:
-        for seed in range(CLUSTER_SEEDS)[shard_i::shard_n]:
-            rng = np.random.default_rng(seed)
+        for s in seeds[shard_i::shard_n]:
+            job = _dseed(S_CLU, stage, s)
+            rng = np.random.default_rng(
+                _dseed(S_CLU, stage, s, derive=SEED_DERIVE_SHIFT))
             extra_real = int(rng.integers(0, CLUSTER_EXTRA_WEEKS_MAX + 1))
             extra_null = int(rng.integers(0, CLUSTER_EXTRA_WEEKS_MAX + 1))
             perm_real = int(rng.integers(0, 2**31 - 1))
@@ -617,40 +764,45 @@ def phase_cluster(shard_i: int, shard_n: int, stamp: str, *,
                 atr=atr)
             real = _labels(real_trig)
             null = _labels(null_trig)
-            res = delta_p_test(real, null, block=BLOCK, sims=B_SIMS, seed=seed)
+            res = cluster_permutation_test(real, null, sims=B_SIMS, seed=job)
             rt = set(pd.DatetimeIndex(real_trig["time"]).tolist()) \
                 if len(real_trig) else set()
             nt = set(pd.DatetimeIndex(null_trig["time"]).tolist()) \
                 if len(null_trig) else set()
-            out.append({"kind": "cluster_neg", "weeks": wk, "seed": seed,
-                        "shift_weeks_real": wk + extra_real,
-                        "shift_weeks_null": wk + extra_null,
-                        "n_real": int(len(real)), "n_null": int(len(null)),
-                        "n_days_real": res["n_days_real"],
-                        "n_days_null": res["n_days_null"],
-                        "p": res["p_value"],
-                        "n_orig_triggers": int(len(trig)),
-                        "n_overlap_real_null": int(len(rt & nt)),
-                        "sets_identical": bool(rt and rt == nt),
-                        "audit_real": a_real, "audit_null": a_null})
+            row = {"kind": "cluster_neg", "weeks": wk, "seed": s,
+                   "stage": stage,
+                   "shift_weeks_real": wk + extra_real,
+                   "shift_weeks_null": wk + extra_null,
+                   "n_real": int(len(real)), "n_null": int(len(null)),
+                   "n_days_real": res["n_days_real"],
+                   "n_days_null": res["n_days_null"],
+                   "p": res["p_value"], "testable": res["testable"],
+                   "n_orig_triggers": int(len(trig)),
+                   "n_overlap_real_null": int(len(rt & nt)),
+                   "sets_identical": bool(rt and rt == nt),
+                   "audit_real": a_real, "audit_null": a_null,
+                   "cluster_audit": _cluster_audit(res)}
+            if not res["testable"]:
+                row["reason"] = res["reason"]
+            out.append(row)
     return out
 
 
-def phase_brier(pool: pd.DataFrame, shard_i: int, shard_n: int
-                ) -> list[dict]:
+def phase_brier(pool: pd.DataFrame, shard_i: int, shard_n: int,
+                *, stage: int = 1) -> list[dict]:
     """P2 校准否决项：无信息特征下 Brier 技能分 > 0 的比例（应≈0）与
-    植入信息下的检出。技能分 = 相对基准率的 Brier 改进。"""
+    植入信息下的检出。技能分 = 相对基准率的 Brier 改进（与簇方法无耦合，
+    作为回归；T106 后仍只有一段）。"""
     out = []
-    seeds = range(BRIER_SEEDS)
-    for seed in seeds[shard_i::shard_n]:
-        rng = np.random.default_rng(seed)
+    for s in _stage_seed_range("brier", stage)[shard_i::shard_n]:
+        rng = np.random.default_rng(_dseed(S_BRI, stage, s))
         # 无信息：预测=基准率（特征不含信息）
         y = (rng.random(2000) < 0.40).astype(float)
         s_uninf = brier_skill(np.full(2000, 0.40), y, 0.40)
         # 植入信息：预测与真实相关（p 随 y 升高）
         p_pred = np.where(y == 1, 0.55, 0.25)
         s_inf = brier_skill(p_pred, y, 0.40)
-        out.append({"kind": "brier", "seed": seed,
+        out.append({"kind": "brier", "seed": s, "stage": stage,
                     "s_uninformative": s_uninf, "s_planted": s_inf})
     return out
 
@@ -675,25 +827,45 @@ def _job_key(row: dict) -> str:
 
 def _expected_jobs() -> list[str]:
     """预期 (phase, condition, seed) 完备集（P-12）：从设计常量推导的
-    本次运行应产出的全部行键。"""
+    本次运行应产出的全部行键——**首段**（stage 1；两段升级的第二段见
+    _escalation_jobs，按预写规则对未过 CP 上界的条件追加）。"""
     jobs = []
     for n in NEG_NS:
-        for s in range(NEG_SEEDS):
+        for s in _stage_seed_range("neg", 1):
             jobs.append({"kind": "neg_single", "n": int(n), "seed": int(s)})
-    for s in range(NEG_SEEDS):
+    for s in _stage_seed_range("neg-holm", 1):
         jobs.append({"kind": "neg_holm", "n": int(NEG_NS[1]),
                      "seed": int(s)})
     for dlt in POS_DELTAS:
         for n in POS_NS:
-            for s in range(POS_SEEDS):
+            for s in _stage_seed_range("pos", 1):
                 jobs.append({"kind": "pos", "delta": float(dlt),
                              "n": int(n), "seed": int(s)})
     for w in CLUSTER_SHIFT_WEEKS:
-        for s in range(CLUSTER_SEEDS):
+        for s in _stage_seed_range("cluster", 1):
             jobs.append({"kind": "cluster_neg", "weeks": int(w),
                          "seed": int(s)})
-    for s in range(BRIER_SEEDS):
+    for s in _stage_seed_range("brier", 1):
         jobs.append({"kind": "brier", "seed": int(s)})
+    return sorted(_job_key(j) for j in jobs)
+
+
+def _escalation_jobs() -> list[str]:
+    """两段升级第二段的预注册键全集（T106 验收 1-3：neg/neg-holm/cluster
+    可按预写规则追加至合计 1,000 种子；第二段行键=种子下标 ∈ [首段,
+    首段+追加段)，派生 seed 基+SEED_STAGE_OFFSET 接续）。merge 只接受
+    此集合内的第二段行——超出按"多"拒绝（不边看边扩）。"""
+    jobs = []
+    for n in NEG_NS:
+        for s in _stage_seed_range("neg", 2):
+            jobs.append({"kind": "neg_single", "n": int(n), "seed": int(s)})
+    for s in _stage_seed_range("neg-holm", 2):
+        jobs.append({"kind": "neg_holm", "n": int(NEG_NS[1]),
+                     "seed": int(s)})
+    for w in CLUSTER_SHIFT_WEEKS:
+        for s in _stage_seed_range("cluster", 2):
+            jobs.append({"kind": "cluster_neg", "weeks": int(w),
+                         "seed": int(s)})
     return sorted(_job_key(j) for j in jobs)
 
 
@@ -701,17 +873,65 @@ def _job_manifest() -> dict:
     return {"version": MANIFEST_VERSION, "jobs": _expected_jobs()}
 
 
+def _cond_flags(g: pd.DataFrame, pcol: str, rate_name: str | dict) -> dict:
+    """分条件汇总公共字段（T106）：拒绝率只在**可检验**行（结果非空）上
+    计算，untestable 单列计数（不静默当不拒绝、也不静默丢弃）；有 stage
+    列时披露第二段种子数。
+
+    rate_name 为 dict 时声明布尔判定列（v4 报告复核发现的 merge 缺陷
+    修正：neg_holm 的 reject_any 行值本身即"是否拒绝"，直接求均值；
+    旧实现把 True 当 1 与 0.05 比较恒"未拒"，汇总出未拒比例）。"""
+    is_bool = isinstance(rate_name, dict)
+    col_rate = rate_name["bool"] if is_bool else rate_name
+    ok = g[g[pcol].notna()] if pcol in g.columns else g
+    out: dict = {"seeds": int(len(g))}
+    if len(ok):
+        if is_bool:
+            out[col_rate] = float(ok[pcol].astype(bool).mean())
+        else:
+            out[col_rate] = float((ok[pcol] < 0.05).mean())
+        out["testable_seeds"] = int(len(ok))
+    else:
+        out[col_rate] = None
+    if len(g) - len(ok):
+        out["untestable"] = int(len(g) - len(ok))
+    if "stage" in g.columns:
+        s2 = int((g["stage"] == 2).sum())
+        if s2:
+            out["stage2_seeds"] = s2
+    return out
+
+
 def _manifest_bindings(pool_meta: dict, cluster_meta: dict) -> dict:
     """run manifest v2 的绑定集合（P2-07）：池内容、来源行情快照、
-    成本/政策、方法版本（BLOCK+设计常量）、依赖清单、cluster 冻结输入。"""
+    成本/政策、方法版本（T106：method_id+全部设计常量+seed 基+两段
+    规则；BLOCK 保留作历史字段）、依赖清单、cluster 冻结输入。"""
     return {
         "pool_content_sha256": pool_meta["pool_content_sha256"],
         "cost_ver": pool_meta["cost_ver"],
         "sessions_sha256": _sessions_sha(),
         "data_snapshot": _data_snapshot(),
         "method": {
-            "block": BLOCK, "B": B_SIMS, "pool_seed": POOL_SEED,
+            "method_id": METHOD,
+            "block": BLOCK,          # 历史字段（≤v3 stamp 的方法标识）
+            "cluster_gap_days": CLUSTER_GAP_DAYS,
+            "min_clusters_per_group": MIN_CLUSTERS_PER_GROUP,
+            "B": B_SIMS, "pool_seed": POOL_SEED,
             "n_pool": N_POOL,
+            "seed_bases": {"neg": S_NEG, "holm": S_HOLM, "pos": S_POS,
+                           "cluster": S_CLU, "brier": S_BRI},
+            "seed_stage_offset": SEED_STAGE_OFFSET,
+            "seed_derive": {"sample_real": SEED_DERIVE_SAMPLE_REAL,
+                            "sample_null": SEED_DERIVE_SAMPLE_NULL,
+                            "holm_h": SEED_DERIVE_HOLM_H,
+                            "shift": SEED_DERIVE_SHIFT,
+                            "plant": SEED_DERIVE_PLANT},
+            "two_stage": {"neg": [NEG_SEEDS, NEG_ESCALATION_SEEDS],
+                          "neg-holm": [HOLM_SEEDS, HOLM_ESCALATION_SEEDS],
+                          "cluster": [CLUSTER_SEEDS,
+                                      CLUSTER_ESCALATION_SEEDS],
+                          "pos": [POS_SEEDS, 0],
+                          "brier": [BRIER_SEEDS, 0]},
             "bracket": {"sl_atr": BRACKET.sl_atr, "tp_atr": BRACKET.tp_atr,
                         "horizon_bars": BRACKET.horizon_bars},
             "neg": [list(NEG_NS), NEG_SEEDS],
@@ -851,6 +1071,12 @@ def cmd_run(args) -> int:
         mpath.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
                          encoding="utf-8")
     frozen = None
+    stage = int(getattr(args, "stage", 1))
+    try:
+        _stage_seed_range(args.phase, stage)   # 非法组合（如 brier --stage 2、
+    except ValueError as e:                    # stage 0/3）→ 启动即拒
+        print(f"✗ {e}")
+        return 1
     if args.phase == "cluster":
         frozen = _load_frozen_cluster_inputs(stamp_dir)   # 已核验的冻结输入
     else:
@@ -858,19 +1084,25 @@ def cmd_run(args) -> int:
         pool_days = _day_winrate_table(pool)
     t0 = time.time()
     if args.phase == "neg":
-        rows = phase_neg(pool_days, args.shard_i, args.shard_n, stamp)
+        rows = phase_neg(pool_days, args.shard_i, args.shard_n, stamp,
+                         stage=stage)
     elif args.phase == "neg-holm":
-        rows = phase_neg_holm(pool_days, args.shard_i, args.shard_n)
+        rows = phase_neg_holm(pool_days, args.shard_i, args.shard_n,
+                              stage=stage)
     elif args.phase == "pos":
-        rows = phase_pos(pool_days, args.shard_i, args.shard_n)
+        rows = phase_pos(pool_days, args.shard_i, args.shard_n, stage=stage)
     elif args.phase == "cluster":
-        rows = phase_cluster(args.shard_i, args.shard_n, stamp, frozen=frozen)
+        rows = phase_cluster(args.shard_i, args.shard_n, stamp, frozen=frozen,
+                             stage=stage)
     elif args.phase == "brier":
-        rows = phase_brier(pool, args.shard_i, args.shard_n)
+        rows = phase_brier(pool, args.shard_i, args.shard_n, stage=stage)
     else:
         print(f"✗ 未知 phase {args.phase}")
         return 1
-    out = stamp_dir / f"{args.phase}-s{args.shard_i}of{args.shard_n}.json"
+    # 第二段分片独立命名（<phase>-st2-sIofN.json——glob 兼容且不覆写首段）
+    stage_tag = "" if stage == 1 else f"-st{stage}"
+    out = stamp_dir / (f"{args.phase}{stage_tag}"
+                       f"-s{args.shard_i}of{args.shard_n}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(
         {"phase": args.phase, "shard": [args.shard_i, args.shard_n],
@@ -912,6 +1144,8 @@ def cmd_merge(args) -> int:
         return 1
     files = sorted(stamp_dir.glob("*-s*of*.json"))
     expected_keys = set(manifest["jobs"])
+    # 两段升级第二段的预注册键全集（T106）：超出它的"多"行一律拒绝
+    escalation_keys = set(_escalation_jobs())
     rows = []
     seen: dict[str, str] = {}
     dup: list[str] = []
@@ -945,41 +1179,45 @@ def cmd_merge(args) -> int:
         return 1
     missing = sorted(expected_keys - set(seen))
     extra = sorted(set(seen) - expected_keys)
+    extra_bad = [k for k in extra if k not in escalation_keys]
     if missing:
         print(f"✗ 缺 {len(missing)} 个预期行键（前 10）：")
         for k in missing[:10]:
             print(f"    - {k}")
-    if extra:
-        print(f"✗ 多 {len(extra)} 个非预期行键（前 10）：")
-        for k in extra[:10]:
+    if extra_bad:
+        print(f"✗ 多 {len(extra_bad)} 个非预期行键（前 10；预注册第二段键"
+              "全集之外——不边看边扩）：")
+        for k in extra_bad[:10]:
             print(f"    - {k}")
-    if missing or extra:
+    if missing or extra_bad:
         return 1
+    n_stage2 = len([k for k in extra if k in escalation_keys])
     df = pd.DataFrame(rows)
-    summary: dict = {"stamp": args.stamp, "B": B_SIMS, "rows": len(df),
+    summary: dict = {"stamp": args.stamp, "method": METHOD, "B": B_SIMS,
+                     "rows": len(df),
                      "fingerprint": manifest["fingerprint"]}
+    if n_stage2:
+        summary["stage2_rows"] = n_stage2
 
     neg = df[df["kind"] == "neg_single"]
     if len(neg):
         summary["neg_single"] = {
-            f"n{n}": {"fpr": float((g["p"] < 0.05).mean()), "seeds": len(g)}
+            f"n{int(n)}": _cond_flags(g, "p", "fpr")
             for n, g in neg.groupby("n")}
     nh = df[df["kind"] == "neg_holm"]
     if len(nh):
         summary["neg_holm"] = {"n": int(nh["n"].iloc[0]) if len(nh) else None,
-                               "fpr_joint": float(nh["reject_any"].mean()),
-                               "seeds": len(nh)}
+                               **_cond_flags(nh, "reject_any", {"bool": "fpr_joint"})}
     pos = df[df["kind"] == "pos"]
     if len(pos):
         summary["pos"] = {
-            f"dp{d}-n{n}": {"power": float((g["p"] < 0.05).mean()),
-                            "dp_hat_median": float(g["dp_hat"].median()),
-                            "seeds": len(g)}
+            f"dp{d:g}-n{int(n)}": {**_cond_flags(g, "p", "power"),
+                                   "dp_hat_median": float(g["dp_hat"].median())}
             for (d, n), g in pos.groupby(["delta", "n"])}
     cl = df[df["kind"] == "cluster_neg"]
     if len(cl):
         summary["cluster_neg"] = {
-            f"w{w}": {"fpr": float((g["p"] < 0.05).mean()), "seeds": len(g)}
+            f"w{int(w)}": _cond_flags(g, "p", "fpr")
             for w, g in cl.groupby("weeks")}
     br = df[df["kind"] == "brier"]
     if len(br):
@@ -1014,6 +1252,10 @@ def main(argv=None) -> int:
     p_run.add_argument("--shard-i", type=int, default=0)
     p_run.add_argument("--shard-n", type=int, default=1)
     p_run.add_argument("--stamp", default=None)
+    p_run.add_argument("--stage", type=int, default=1,
+                       help="两段升级段号（T106 预注册：1=首段 500 种子；"
+                            "2=第二段接续至合计 1,000——只适用 neg/"
+                            "neg-holm/cluster；pos/brier 拒绝）")
     p_mrg = sub.add_parser("merge", help="合并分片并汇总")
     p_mrg.add_argument("--stamp", required=True)
     p_mrg.add_argument("--keep-pool", action="store_true")

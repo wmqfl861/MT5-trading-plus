@@ -8,6 +8,7 @@ import pytest
 
 from mt5quant.backtest.engine_a import atr_series
 from mt5quant.validation.prob_mode import (
+    CLUSTER_GAP_DAYS, MIN_CLUSTERS_PER_GROUP, cluster_permutation_test,
     brier_skill, delta_p_test, holm, plant_delta, randomize_triggers,
 )
 
@@ -472,3 +473,224 @@ def test_primary_method_approved_false_while_cluster_control_fails():
     approved, reason = primary_method_approved()
     assert approved is False
     assert "成簇" in reason and "未批准" in reason
+
+
+# ------------------------------------- T106 簇单位置换（cluster-permutation-v1）
+#
+# 预注册设计（docs/superpowers/plans/2026-10-30-t106-cluster-permutation.md
+# §一）：CLUSTER_GAP_DAYS=10 **日历日** 邻接聚簇（跨月不拆）、混合簇多数
+# 归属计数（平局计 real）、整簇交换、任一组簇数 < MIN_CLUSTERS_PER_GROUP=5
+# 或总簇数 < 10 → 不可检验（不打碎簇）、审计输出（簇数/簇大小分布/两组
+# 日数观测与置换均值/min_achievable_p）、同 seed 确定、method_id 回显。
+
+
+def _pairs_labels(rows):
+    """rows = [(日期串, 'real'|'null', 'win'|'loss'|None), ...] → 两张标签表。
+
+    None = 该组该日无触发（构造混合簇/纯簇用）。"""
+    sel = {"real": [], "null": []}
+    for d, grp, o in rows:
+        if o is not None:
+            sel[grp].append((d, o))
+    return _day_labels(sel["real"]), _day_labels(sel["null"])
+
+
+def _blocks_rows(n_clusters, days_per, spacing, *, real_days, null_days,
+                 outcome, start="2021-01-04"):
+    """n_clusters 个块（各 days_per 个连续日历日、块起点间隔 spacing 天），
+    每簇按 real_days/null_days 取该块前若干天，outcome(day, grp) 给标签。"""
+    from datetime import timedelta
+    t0 = pd.Timestamp(start)
+    rows = []
+    for c in range(n_clusters):
+        base = t0 + timedelta(days=c * spacing)
+        for j in range(days_per):
+            d = (base + timedelta(days=j)).strftime("%Y-%m-%d")
+            if j < real_days:
+                rows.append((d, "real", outcome(d, j, "real", c)))
+            if j < null_days:
+                rows.append((d, "null", outcome(d, j, "null", c)))
+    return rows
+
+
+def test_cluster_constants_preregistered():
+    """T106 §一：设计常量按预注册值（不得偏离）。"""
+    assert CLUSTER_GAP_DAYS == 10
+    assert MIN_CLUSTERS_PER_GROUP == 5
+
+
+def test_cluster_ids_calendar_days_cross_month_not_split():
+    """簇构造：排序后间隔 ≤10 **日历日** 归同簇（跨月不拆）；>10 开新簇。
+    恰好 10 日历日仍同簇（≤ 含等号）。"""
+    from mt5quant.validation.prob_mode import _cluster_ids_for_days
+    d = lambda s: pd.Timestamp(s).date()          # noqa: E731
+    # 跨 1 月末的连续触发（1/25 与 2/2 间隔 8 日历日）→ 同簇
+    assert list(_cluster_ids_for_days([d("2021-01-25"), d("2021-02-02")])) == [0, 0]
+    # 间隔恰 10 日历日 → 同簇；11 → 新簇
+    assert list(_cluster_ids_for_days([d("2021-01-01"), d("2021-01-11")])) == [0, 0]
+    assert list(_cluster_ids_for_days([d("2021-01-01"), d("2021-01-12")])) == [0, 1]
+    # 多日链式：1,5,9,13,20 —— 间隔 4,4,4 均 ≤10 同簇；13→20 间隔 7 同簇
+    # （链式按相邻间隔，非首尾距离）→ 全同簇
+    assert list(_cluster_ids_for_days(
+        [d("2021-01-01"), d("2021-01-05"), d("2021-01-09"), d("2021-01-13"),
+         d("2021-01-20")])) == [0, 0, 0, 0, 0]
+
+
+def test_cluster_cross_month_cluster_reported_and_small_n_untestable():
+    """跨月连续触发不被 GAP 拆散（n_clusters 如实=2）——簇太少 → 不可检验
+    返回（不抛异常、p=None、不打碎簇凑样本）。"""
+    rows = _blocks_rows(2, 12, 25, real_days=8, null_days=8,
+                        outcome=lambda d, j, g, c: "win" if (j % 2 == 0) else "loss")
+    # 块 0 覆盖 2021-01-04..01-15、块 1 覆盖 2021-01-29..02-09（块间隔 25 天
+    # >10 → 两簇；块 1 本身跨 1 月末）
+    real, null = _pairs_labels(rows)
+    res = cluster_permutation_test(real, null, sims=200, seed=5)
+    assert res["testable"] is False
+    assert res["p_value"] is None
+    assert res["n_clusters"] == 2              # 跨月块没有被拆
+    assert res["reason"] and "不可检验" in res["reason"]
+
+
+def test_cluster_majority_attribution_and_tie_counts_real():
+    """多数归属+平局规则：real 日数>null → real 簇；< → null；**平局计
+    real**（确定性）。12 簇 = 6 纯 real + 4 纯 null + 1 平局 + 1 null 多数
+    → k_real=7、k_null=5（可检验）。"""
+    rows = []
+    # 6 纯 real 簇（4 天）、4 纯 null 簇、1 平局簇（2+2 → 计 real）、
+    # 1 null 多数簇（1+3）
+    specs = ([(4, 0)] * 6 + [(0, 4)] * 4 + [(2, 2), (1, 3)])
+    for c, (nr, nn) in enumerate(specs):
+        base = pd.Timestamp("2021-01-04") + pd.Timedelta(days=c * 40)
+        for j in range(max(nr, nn)):
+            d = (base + pd.Timedelta(days=j)).strftime("%Y-%m-%d")
+            if j < nr:
+                rows.append((d, "real", "win" if j % 2 == 0 else "loss"))
+            if j < nn:
+                rows.append((d, "null", "loss" if j % 2 == 0 else "win"))
+    real, null = _pairs_labels(rows)
+    res = cluster_permutation_test(real, null, sims=100, seed=9)
+    assert res["testable"] is True
+    assert res["n_clusters"] == 12
+    assert res["k_real"] == 7                  # 6 纯 + 1 平局
+    assert res["k_null"] == 5                  # 4 纯 + 1 null 多数
+
+
+def test_cluster_min_group_clusters_untestable():
+    """任一组目标簇数 <5 → 不可检验（12 簇但 null 侧仅 3 簇）。"""
+    rows = []
+    for c in range(12):
+        base = pd.Timestamp("2021-01-04") + pd.Timedelta(days=c * 40)
+        nr = 4 if c < 9 else 0                 # 9 real 簇 + 3 null 簇
+        nn = 0 if c < 9 else 4
+        for j in range(4):
+            d = (base + pd.Timedelta(days=j)).strftime("%Y-%m-%d")
+            if j < nr:
+                rows.append((d, "real", "win" if j % 2 == 0 else "loss"))
+            if j < nn:
+                rows.append((d, "null", "loss" if j % 2 == 0 else "win"))
+    real, null = _pairs_labels(rows)
+    res = cluster_permutation_test(real, null, sims=100, seed=3)
+    assert res["testable"] is False
+    assert res["k_real"] == 9 and res["k_null"] == 3
+    assert res["p_value"] is None
+    assert "5" in res["reason"]                # 写明门槛
+
+
+def test_cluster_empty_side_untestable():
+    real, _ = _pairs_labels([("2021-01-04", "real", "win")])
+    empty = pd.DataFrame(columns=["time", "outcome"])
+    res = cluster_permutation_test(real, empty, sims=50, seed=1)
+    assert res["testable"] is False and res["p_value"] is None
+
+
+def _correlated_cluster_frames(rep):
+    """簇相关结构（w7 型定向构造）：40 簇（real/null 交替）× 10 连续日、
+    周期 25 天（簇间隔 15 天 > GAP → 分簇；任何 31 天月份必跨 ≥2 个相邻
+    簇 → 每月两组并存——月块 day 置换确实在打散簇）；每簇共享热/冷状态
+    （触发赢率 0.85/0.15，组内强正相关），每日 5 个触发独立取标签。
+    real 侧 20 簇中 12 热、null 侧 8 热（簇级失衡 0.2）：日级（独立日近
+    似）z≈3.6 拒绝、簇级 z≈1.26 不拒绝——day 置换 null 过窄被纠正。"""
+    rng = np.random.default_rng(5000 + rep)
+    rows_r: list[tuple] = []
+    rows_n: list[tuple] = []
+    for c in range(40):
+        grp = "real" if c % 2 == 0 else "null"
+        hot = (c // 2) < (12 if grp == "real" else 8)
+        p_win = 0.85 if hot else 0.15
+        base = pd.Timestamp("2021-01-04") + pd.Timedelta(days=c * 25)
+        for j in range(10):
+            d = base + pd.Timedelta(days=j)
+            for k in range(5):
+                win = rng.random() < p_win
+                (rows_r if grp == "real" else rows_n).append(
+                    (d + pd.Timedelta(hours=3 * k + 1),
+                     "win" if win else "loss", 1.9 if win else -1.05))
+    real = pd.DataFrame([{"time": t, "outcome": o, "net_r": nr,
+                          "situation": "S1", "action": "A3", "side": 1,
+                          "level": 100.0} for t, o, nr in rows_r])
+    null = pd.DataFrame([{"time": t, "outcome": o, "net_r": nr,
+                          "situation": "S1", "action": "A3", "side": 1,
+                          "level": 100.0} for t, o, nr in rows_n])
+    return real, null
+
+
+def test_day_permutation_overrejects_cluster_correlated_cluster_wider():
+    """定向（T106 计划二）：簇相关下 day（月块）置换 null 过窄（过度拒绝）
+    ——cluster 置换整簇交换，null 分布更宽、拒绝率回到名义附近。"""
+    rej_day = rej_clu = 0
+    reps = 10
+    for rep in range(reps):
+        real, null = _correlated_cluster_frames(rep)
+        p_day = delta_p_test(real, null, block="month", sims=300,
+                             seed=rep)["p_value"]
+        p_clu = cluster_permutation_test(real, null, sims=300,
+                                         seed=rep)["p_value"]
+        assert p_clu is not None               # 30 簇、15/15 → 可检验
+        rej_day += p_day < 0.05
+        rej_clu += p_clu < 0.05
+    assert rej_day >= 8, (rej_day, rej_clu)    # day 置换过窄 → 高拒绝
+    assert rej_clu <= 3, (rej_day, rej_clu)    # cluster 置换 null 更宽
+
+
+def test_cluster_audit_outputs_resolution_determinism_method_id():
+    """审计输出键完备（簇数/簇大小分布/两组日数观测与置换均值/
+    min_achievable_p=max(1/C(n,k), 1/(B+1))/k_real/k_null）；同 seed 确定；
+    p ≥ 1/(1+B)；method_id 回显。"""
+    rng = np.random.default_rng(21)
+    rows = []
+    for c in range(20):
+        base = pd.Timestamp("2021-01-04") + pd.Timedelta(days=c * 40)
+        real_major = c < 10                    # 10 real 多数簇 + 10 null 多数簇
+        nr, nn = (3, 2) if real_major else (2, 3)
+        for j in range(3):
+            d = (base + pd.Timedelta(days=j)).strftime("%Y-%m-%d")
+            if j < nr:
+                rows.append((d, "real", "win" if rng.random() < 0.5 else "loss"))
+            if j < nn:
+                rows.append((d, "null", "win" if rng.random() < 0.4 else "loss"))
+    real = pd.DataFrame(
+        [{"time": d, "outcome": o} for d, g, o in rows if g == "real"])
+    null = pd.DataFrame(
+        [{"time": d, "outcome": o} for d, g, o in rows if g == "null"])
+    r1 = cluster_permutation_test(real, null, sims=300, seed=7)
+    r2 = cluster_permutation_test(real, null, sims=300, seed=7)
+    assert r1 == r2                                   # 同 seed 逐位确定
+    # 审计键完备（B1 复审补断言）
+    for key in ("n_clusters", "cluster_size_summary", "n_days_real",
+                "n_days_null", "perm_mean_days_real", "perm_mean_days_null",
+                "min_achievable_p", "k_real", "k_null", "method_id"):
+        assert key in r1, key
+    assert r1["method_id"] == "cluster-permutation-v1"
+    assert r1["testable"] is True
+    # 构造：20 簇（10 real 多数 + 10 null 多数，各含对方少量日）
+    assert r1["k_real"] == 10 and r1["k_null"] == 10
+    assert r1["n_clusters"] == 20
+    # 分辨率下限 = max(1/C(n,k), 1/(B+1))；p ≥ 1/(B+1)
+    import math as _m
+    comb = _m.comb(20, 10)
+    assert r1["min_achievable_p"] == pytest.approx(
+        max(1.0 / comb, 1.0 / 301), rel=1e-12)
+    assert r1["p_value"] >= 1.0 / 301
+    # 多数归属平局计 real 的口径由簇构造间接覆盖（无平局簇：3/2 与 2/3）
+    assert r1["n_days_real"] == 3 * 10 + 2 * 10
+    assert r1["n_days_null"] == 2 * 10 + 3 * 10

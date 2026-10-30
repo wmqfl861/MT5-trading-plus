@@ -17,6 +17,13 @@
   分片指纹必须与 manifest 绑定一致）。
 - P-12 merge manifest：run 写完备集 manifest；merge 精确匹配（缺/
   多/重全拒绝）；pool.meta.json 不再被 merge 删除。
+- T106 簇单位置换：METHOD="cluster-permutation-v1"（BLOCK 保留历史字段）；
+  四相位（neg/neg-holm/pos/cluster）检验函数全部接 cluster_permutation_test
+  （brier 不用置换）；预注册 seed 基（S_NEG=20261101…S_BRI=20261105）与
+  种子数（500/500/500/100/200）；一次性两段升级的 seed 接续规则（第二段
+  = 基+10,000+种子下标，种子下标接续 [500,1000)）；manifest.method 绑定
+  method_id/CLUSTER_GAP_DAYS/MIN_CLUSTERS_PER_GROUP/分段规则；merge 接受
+  预注册第二段行键、拒绝超范围行；不可检验行不进 FPR 而是单独计数。
 """
 import hashlib
 import importlib.util
@@ -70,10 +77,12 @@ def _trig_at(times, level=100.0):
 
 @pytest.fixture
 def small_pc(monkeypatch):
-    """缩小设计常量的脚本模块（manifest/merge 测试用）。"""
+    """缩小设计常量的脚本模块（manifest/merge 测试用；T106 后 holm 用
+    HOLM_SEEDS——不再与 NEG_SEEDS 共用）。"""
     pc = load_pc()
     monkeypatch.setattr(pc, "NEG_NS", (5, 6))   # neg-holm 用 NEG_NS[1]
     monkeypatch.setattr(pc, "NEG_SEEDS", 2)
+    monkeypatch.setattr(pc, "HOLM_SEEDS", 2)
     monkeypatch.setattr(pc, "POS_DELTAS", (0.02,))
     monkeypatch.setattr(pc, "POS_NS", (5,))
     monkeypatch.setattr(pc, "POS_SEEDS", 2)
@@ -228,8 +237,12 @@ def test_shift_match_audit_rejects_degraded_transform():
 
 
 def _patch_cluster_heavy(monkeypatch, pc, bars, trig):
-    """把计数/触发/标签/检验全部换成替身；标签器为捕获式。"""
+    """把计数/触发/标签/检验全部换成替身；标签器为捕获式。
+
+    T106：检验函数换成 cluster_permutation_test 替身（相位不再调用
+    delta_p_test），替身返回可检验结果并捕获 (sims, seed) 供接线断言。"""
     calls: list[list] = []
+    test_calls: list[tuple[int, int]] = []
 
     def spy_label(bars_arg, trig_arg, costs, **kw):
         calls.append(list(pd.to_datetime(trig_arg["time"])))
@@ -240,13 +253,29 @@ def _patch_cluster_heavy(monkeypatch, pc, bars, trig):
         out["net_r"] = 1.9
         return out
 
+    def spy_test(real, null, *, sims, seed):
+        test_calls.append((sims, seed))
+        return {"testable": True, "reason": None,
+                "method_id": "cluster-permutation-v1",
+                "p_value": 0.5, "delta_p": 0.0,
+                "n_days_real": 4, "n_days_null": 4,
+                "n_clusters": 12, "k_real": 6, "k_null": 6,
+                "min_achievable_p": 1e-4,
+                "cluster_size_summary": {"min": 1, "median": 1.0,
+                                         "mean": 1.0, "max": 2},
+                "perm_mean_days_real": 4.0, "perm_mean_days_null": 4.0,
+                "sims": sims}
+
     monkeypatch.setattr(pc, "label_triggers", spy_label)
     monkeypatch.setattr(pc, "_costs_and_sizes",
                         lambda swap_ref_price=None: (None, None, 1.0, "v"))
-    monkeypatch.setattr(pc, "delta_p_test",
-                        lambda real, null, *, block=None, sims, seed: {
-                            "p_value": 0.5, "delta_p": 0.0,
-                            "n_days_real": 4, "n_days_null": 4})
+    monkeypatch.setattr(pc, "cluster_permutation_test", spy_test)
+
+    def _boom_delta(*a, **k):
+        raise AssertionError("标定相位不得再调用 delta_p_test（T106 换簇"
+                             "单位置换）")
+
+    monkeypatch.setattr(pc, "delta_p_test", _boom_delta)
     monkeypatch.setattr(
         "mt5quant.prob.counting.level_rows_for_situation",
         lambda *a, **k: pd.DataFrame())
@@ -258,7 +287,7 @@ def _patch_cluster_heavy(monkeypatch, pc, bars, trig):
         lambda *a, **k: trig)
     stub_rb = types.SimpleNamespace(load_series=lambda *a, **k: bars)
     monkeypatch.setitem(sys.modules, "run_backtest", stub_rb)
-    return calls
+    return calls, test_calls
 
 
 def test_phase_cluster_labels_only_at_shifted_times(monkeypatch):
@@ -272,12 +301,18 @@ def test_phase_cluster_labels_only_at_shifted_times(monkeypatch):
     trig = pd.DataFrame({
         "time": times.iloc[::11].iloc[:60],     # 前 660 小时（<3 周）
         "situation": "S1", "action": "A3", "side": 1, "level": 100.0})
-    calls = _patch_cluster_heavy(monkeypatch, pc, bars, trig)
+    calls, test_calls = _patch_cluster_heavy(monkeypatch, pc, bars, trig)
     monkeypatch.setattr(pc, "CLUSTER_SHIFT_WEEKS", (3,))
     monkeypatch.setattr(pc, "CLUSTER_SEEDS", 4)
     rows = pc.phase_cluster(0, 1, "unused-stamp")
     assert len(rows) == 4
     assert len(calls) == 8                      # 每 seed real+null 两次
+    # T106 接线：检验走 cluster_permutation_test，seed=相位基+种子下标，
+    # sims=B_SIMS；行带 testable/stage/簇审计
+    assert [s for _, s in test_calls] == [pc.S_CLU + s for s in range(4)]
+    assert all(sim == pc.B_SIMS for sim, _ in test_calls)
+    assert all(r["testable"] is True and r["stage"] == 1 for r in rows)
+    assert all(r["cluster_audit"]["n_clusters"] == 12 for r in rows)
     original = set(pd.to_datetime(trig["time"]))
     bar_set = set(times)
     for i, call_times in enumerate(calls):
@@ -313,7 +348,7 @@ def test_phase_cluster_internal_hole_triggers_dropped(monkeypatch):
     hole_lo, hole_hi = head[-1], tail[0]
     # 触发在第 600..639 小时：+5 周（840h）→ 全部落入洞内
     trig = _trig_at(times[600:640], level=100.0)
-    calls = _patch_cluster_heavy(monkeypatch, pc, bars, trig)
+    calls, _ = _patch_cluster_heavy(monkeypatch, pc, bars, trig)
     monkeypatch.setattr(pc, "CLUSTER_SHIFT_WEEKS", (5,))
     monkeypatch.setattr(pc, "CLUSTER_SEEDS", 2)
     monkeypatch.setattr(pc, "CLUSTER_EXTRA_WEEKS_MAX", 0)
@@ -331,7 +366,8 @@ def test_phase_cluster_internal_hole_triggers_dropped(monkeypatch):
 # ---------------------------------------------------------------- P-03 样本单位
 
 def test_phase_neg_pos_record_actual_day_counts(monkeypatch):
-    """名义 n ≠ 实际日数：记录 delta_p_test 返回的 n_days_real/null。"""
+    """名义 n ≠ 实际日数：记录 cluster_permutation_test 返回的
+    n_days_real/null（T106：相位检验函数已换簇单位置换）。"""
     pc = load_pc()
     monkeypatch.setattr(pc, "NEG_NS", (7,))
     monkeypatch.setattr(pc, "NEG_SEEDS", 1)
@@ -339,8 +375,9 @@ def test_phase_neg_pos_record_actual_day_counts(monkeypatch):
     monkeypatch.setattr(pc, "POS_NS", (7,))
     monkeypatch.setattr(pc, "POS_SEEDS", 1)
     monkeypatch.setattr(pc, "B_SIMS", 3)
-    monkeypatch.setattr(pc, "delta_p_test",
-                        lambda real, null, *, block=None, sims, seed: {
+    monkeypatch.setattr(pc, "cluster_permutation_test",
+                        lambda real, null, *, sims, seed: {
+                            "testable": True, "reason": None,
                             "p_value": 0.25, "delta_p": 0.01,
                             "n_days_real": 5, "n_days_null": 6})
     monkeypatch.setattr(pc, "plant_delta", lambda labels, d, seed: labels)
@@ -595,7 +632,7 @@ def test_cmd_run_refuses_missing_or_stale_pool_meta(monkeypatch, tmp_path,
     stamp = _mk_stamp_env(pc, tmp_path)
     d = tmp_path / stamp
     args = types.SimpleNamespace(phase="brier", shard_i=0, shard_n=1,
-                                 stamp=stamp)
+                                 stamp=stamp, stage=1)
     assert pc.cmd_run(args) == 0                 # 完整环境可运行
     (d / "manifest.json").unlink()
     (d / "pool.meta.json").unlink()
@@ -651,8 +688,9 @@ def test_cmd_run_cluster_reads_frozen_inputs_not_library(monkeypatch,
     monkeypatch.setattr(pc, "label_triggers", fake_label)
     monkeypatch.setattr(pc, "_costs_and_sizes",
                         lambda swap_ref_price=None: (None, None, 1.0, "v"))
-    monkeypatch.setattr(pc, "delta_p_test",
-                        lambda real, null, *, block=None, sims, seed: {
+    monkeypatch.setattr(pc, "cluster_permutation_test",
+                        lambda real, null, *, sims, seed: {
+                            "testable": True, "reason": None,
                             "p_value": 0.5, "delta_p": 0.0,
                             "n_days_real": len(real),
                             "n_days_null": len(null)})
@@ -660,7 +698,7 @@ def test_cmd_run_cluster_reads_frozen_inputs_not_library(monkeypatch,
     monkeypatch.setattr(pc, "CLUSTER_SEEDS", 2)
     monkeypatch.setattr(pc, "CLUSTER_EXTRA_WEEKS_MAX", 2)
     args = types.SimpleNamespace(phase="cluster", shard_i=0, shard_n=1,
-                                 stamp=stamp)
+                                 stamp=stamp, stage=1)
     assert pc.cmd_run(args) == 0
     shard = json.loads((tmp_path / stamp / "cluster-s0of1.json")
                        .read_text(encoding="utf-8"))
@@ -691,7 +729,7 @@ def test_cmd_run_cluster_rejects_tampered_frozen_inputs(monkeypatch,
     monkeypatch.setattr(pc, "phase_cluster",
                         lambda *a, **k: pytest.fail("不应跑到 cluster 相位"))
     args = types.SimpleNamespace(phase="cluster", shard_i=0, shard_n=1,
-                                 stamp=stamp)
+                                 stamp=stamp, stage=1)
     assert pc.cmd_run(args) == 1
     assert "cluster-inputs" in capsys.readouterr().out
 
@@ -710,25 +748,26 @@ def test_cmd_run_writes_idempotent_manifest(monkeypatch, tmp_path):
     stamp = _mk_stamp_env(pc, tmp_path, stamp="t1")
     got_frozen: list = []
 
-    def fake_cluster(i, n, s, *, frozen=None):
-        got_frozen.append(frozen)
-        return [{"kind": "cluster_neg", "weeks": 3, "seed": 0,
-                 "n_real": 1, "n_null": 1, "p": 0.5},
-                {"kind": "cluster_neg", "weeks": 3, "seed": 1,
-                 "n_real": 1, "n_null": 1, "p": 0.5}]
+    def fake_cluster(i, n, s, *, frozen=None, stage=1):
+        got_frozen.append((frozen, stage))
+        return [{"kind": "cluster_neg", "weeks": 3, "seed": 0, "stage": 1,
+                 "n_real": 1, "n_null": 1, "p": 0.5, "testable": True},
+                {"kind": "cluster_neg", "weeks": 3, "seed": 1, "stage": 1,
+                 "n_real": 1, "n_null": 1, "p": 0.5, "testable": True}]
 
     monkeypatch.setattr(pc, "phase_cluster", fake_cluster)
     args = types.SimpleNamespace(phase="cluster", shard_i=0, shard_n=1,
-                                 stamp=stamp)
+                                 stamp=stamp, stage=1)
     assert pc.cmd_run(args) == 0
     mpath = tmp_path / "t1" / "manifest.json"
     assert mpath.is_file()
     manifest = json.loads(mpath.read_text(encoding="utf-8"))
     assert manifest == pc._build_manifest(tmp_path / "t1")
-    # cluster 收到的是冻结输入（bars+triggers 元组，来自冻结产物）
-    assert got_frozen and got_frozen[0] is not None
-    bars_f, trig_f = got_frozen[0]
+    # cluster 收到的是冻结输入（bars+triggers 元组，来自冻结产物）+ 段号
+    assert got_frozen and got_frozen[0][0] is not None
+    bars_f, trig_f = got_frozen[0][0]
     assert len(trig_f) == 17 and len(bars_f) == 24 * 7 * 20
+    assert got_frozen[0][1] == 1
     # 重跑（manifest 一致）幂等通过；篡改 → 拒绝
     assert pc.cmd_run(args) == 0
     mpath.write_text(json.dumps({"version": 2, "jobs": ["x"]}),
@@ -817,6 +856,11 @@ def test_merge_complete_ok_and_keeps_pool_meta(small_pc, monkeypatch,
     manifest = json.loads((pool_dir / "manifest.json").read_text(
         encoding="utf-8"))
     assert summary["fingerprint"] == manifest["fingerprint"]
+    # C2（T106 复审）：neg_holm 的 fpr_joint 必须按布尔列均值汇总——
+    # 旧行为把 True 当 1 与 0.05 比较恒"未拒"，输出的是未拒比例
+    rej = sum(1 for r in rows if r["kind"] == "neg_holm" and r["reject_any"])
+    nh = summary["neg_holm"]
+    assert nh["fpr_joint"] == pytest.approx(rej / nh["seeds"])
 
 
 def test_merge_missing_job_rejected(small_pc, monkeypatch, tmp_path,
@@ -917,3 +961,272 @@ def test_merge_rejects_pool_replaced_after_run(small_pc, monkeypatch,
     rc = pc.cmd_merge(types.SimpleNamespace(stamp=stamp, keep_pool=False))
     assert rc == 1
     assert "不一致" in capsys.readouterr().out
+
+
+# ------------------------------------------------- T106 簇单位置换接线
+
+
+def _cluster_stub_ok(**over):
+    """可检验的 cluster_permutation_test 替身结果（相位行字段齐备）。"""
+    base = {"testable": True, "reason": None,
+            "method_id": "cluster-permutation-v1",
+            "p_value": 0.5, "delta_p": 0.01,
+            "n_days_real": 9, "n_days_null": 8,
+            "n_clusters": 12, "k_real": 6, "k_null": 6,
+            "min_achievable_p": 1e-4,
+            "cluster_size_summary": {"min": 1, "median": 1.0, "mean": 1.2,
+                                     "max": 3},
+            "perm_mean_days_real": 9.0, "perm_mean_days_null": 8.0}
+    base.update(over)
+    return base
+
+
+def test_preregistered_method_and_seed_constants():
+    """T106 §一：方法标识与 seed 基/种子数按预注册值（不得偏离）。
+    BLOCK 保留作历史字段（≤v3 的方法标识）。"""
+    pc = load_pc()
+    assert pc.METHOD == "cluster-permutation-v1"
+    assert pc.BLOCK == "quarter"
+    assert (pc.S_NEG, pc.S_HOLM, pc.S_POS, pc.S_CLU, pc.S_BRI) == \
+        (20261101, 20261102, 20261103, 20261104, 20261105)
+    assert (pc.NEG_SEEDS, pc.NEG_ESCALATION_SEEDS) == (500, 500)
+    assert (pc.HOLM_SEEDS, pc.HOLM_ESCALATION_SEEDS) == (500, 500)
+    assert (pc.CLUSTER_SEEDS, pc.CLUSTER_ESCALATION_SEEDS) == (500, 500)
+    assert pc.POS_SEEDS == 100
+    assert pc.BRIER_SEEDS == 200
+    assert pc.SEED_STAGE_OFFSET == 10_000
+    assert pc.CLUSTER_GAP_DAYS == 10
+    assert pc.MIN_CLUSTERS_PER_GROUP == 5
+    assert pc.B_SIMS == 10_000
+
+
+def test_two_stage_seed_continuation_rule():
+    """两段升级的 seed 接续规则（写死）：第二段种子下标 ∈ [首段, 首段+追加段)
+    且派生 seed = 基 + SEED_STAGE_OFFSET(10,000) + 下标——与首段值域不相交；
+    pos/brier 无第二段；段号只认 1/2。"""
+    pc = load_pc()
+    assert list(pc._stage_seed_range("neg", 1)) == list(range(500))
+    assert list(pc._stage_seed_range("neg", 2)) == list(range(500, 1000))
+    assert list(pc._stage_seed_range("neg-holm", 2)) == list(range(500, 1000))
+    assert list(pc._stage_seed_range("cluster", 2)) == list(range(500, 1000))
+    assert list(pc._stage_seed_range("pos", 1)) == list(range(100))
+    with pytest.raises(ValueError):
+        pc._stage_seed_range("neg", 3)
+    with pytest.raises(ValueError):
+        pc._stage_seed_range("pos", 2)
+    with pytest.raises(ValueError):
+        pc._stage_seed_range("brier", 2)
+    s1 = {pc._dseed(pc.S_NEG, 1, s) for s in range(500)}
+    s2 = {pc._dseed(pc.S_NEG, 2, s) for s in range(500, 1000)}
+    assert not (s1 & s2)
+    assert pc._dseed(pc.S_NEG, 2, 500) == pc.S_NEG + pc.SEED_STAGE_OFFSET + 500
+    assert pc._dseed(pc.S_CLU, 1, 7, derive=pc.SEED_DERIVE_SHIFT) == \
+        pc.S_CLU + 7 + pc.SEED_DERIVE_SHIFT
+
+
+def test_phases_wired_to_cluster_permutation_test(monkeypatch):
+    """接线：neg/neg-holm/pos 全走 cluster_permutation_test（sims=B_SIMS、
+    seed=相位基+种子下标、抽样 seed 用途偏移）；delta_p_test 不再被调用；
+    brier 不用置换。"""
+    pc = load_pc()
+    calls: list = []
+
+    def fake_test(real, null, *, sims, seed):
+        calls.append((sims, seed))
+        return _cluster_stub_ok(sims=sims)
+
+    monkeypatch.setattr(pc, "cluster_permutation_test", fake_test)
+
+    def _boom(*a, **k):
+        raise AssertionError("标定相位不得再调用 delta_p_test（T106）")
+
+    monkeypatch.setattr(pc, "delta_p_test", _boom)
+    sampled: list = []
+
+    def fake_sample(pool, n, seed):
+        sampled.append((n, seed))
+        return pd.DataFrame({"time": pd.date_range("2021-01-04", periods=3),
+                             "outcome": ["win", "loss", "win"]})
+
+    monkeypatch.setattr(pc, "_sample_labels", fake_sample)
+    monkeypatch.setattr(pc, "plant_delta", lambda labels, d, seed: labels)
+    monkeypatch.setattr(pc, "NEG_NS", (5, 6))    # neg-holm 用 NEG_NS[1]
+    monkeypatch.setattr(pc, "NEG_SEEDS", 2)
+    monkeypatch.setattr(pc, "HOLM_HYPS", 3)
+    monkeypatch.setattr(pc, "HOLM_SEEDS", 2)
+    monkeypatch.setattr(pc, "POS_DELTAS", (0.02,))
+    monkeypatch.setattr(pc, "POS_NS", (5,))
+    monkeypatch.setattr(pc, "POS_SEEDS", 2)
+    monkeypatch.setattr(pc, "B_SIMS", 7)
+    pool_days = pd.DataFrame({"day": [pd.Timestamp("2021-01-04").date()],
+                              "winrate": [0.4]})
+
+    neg = pc.phase_neg(pool_days, 0, 1, "t")
+    assert [(r["n"], r["seed"]) for r in neg] == [(5, 0), (5, 1), (6, 0), (6, 1)]
+    assert [c[1] for c in calls] == [pc.S_NEG + 0, pc.S_NEG + 1] * 2
+    assert all(c[0] == 7 for c in calls)
+    assert sampled[0] == (5, pc.S_NEG + pc.SEED_DERIVE_SAMPLE_REAL)
+    assert sampled[1] == (5, pc.S_NEG + pc.SEED_DERIVE_SAMPLE_NULL)
+    assert neg[0]["testable"] is True and neg[0]["stage"] == 1
+
+    calls.clear()
+    holm = pc.phase_neg_holm(pool_days, 0, 1)
+    assert len(calls) == 2 * 3 and len(holm) == 2
+    assert sorted(s for _, s in calls) == sorted(
+        pc.S_HOLM + s * 3 + h for s in range(2) for h in range(3))
+    assert all(r["reject_any"] is False for r in holm)
+
+    calls.clear()
+    pos = pc.phase_pos(pool_days, 0, 1)
+    assert [c[1] for c in calls] == [pc.S_POS + 0, pc.S_POS + 1]
+    assert pos[0]["dp_hat"] == pytest.approx(0.01)
+    assert pos[0]["cluster_audit"]["n_clusters"] == 12
+
+    calls.clear()
+    br = pc.phase_brier(_mk_pool_frame(), 0, 1)
+    assert calls == [] and len(br) == pc.BRIER_SEEDS   # brier：不用置换
+
+
+def test_phase_neg_stage2_rows_continue_seeds(monkeypatch):
+    """第二段行：种子下标接续首段之后（[NEG_SEEDS, +追加段)），行带
+    stage=2，派生 seed=基+10,000+下标（写死规则、确定性）。"""
+    pc = load_pc()
+    cap: list = []
+    monkeypatch.setattr(pc, "cluster_permutation_test",
+                        lambda real, null, *, sims, seed:
+                        cap.append(seed) or _cluster_stub_ok())
+    monkeypatch.setattr(pc, "_sample_labels",
+                        lambda pool, n, seed: pd.DataFrame(
+                            {"time": pd.date_range("2021-01-04", periods=3),
+                             "outcome": ["win", "loss", "win"]}))
+    monkeypatch.setattr(pc, "NEG_NS", (5,))
+    monkeypatch.setattr(pc, "NEG_SEEDS", 2)
+    monkeypatch.setattr(pc, "NEG_ESCALATION_SEEDS", 3)
+    pool_days = pd.DataFrame({"day": [pd.Timestamp("2021-01-04").date()],
+                              "winrate": [0.4]})
+    rows = pc.phase_neg(pool_days, 0, 1, "t", stage=2)
+    assert [r["seed"] for r in rows] == [2, 3, 4]
+    assert [r["stage"] for r in rows] == [2, 2, 2]
+    assert cap == [pc.S_NEG + pc.SEED_STAGE_OFFSET + 2,
+                   pc.S_NEG + pc.SEED_STAGE_OFFSET + 3,
+                   pc.S_NEG + pc.SEED_STAGE_OFFSET + 4]
+
+
+def test_manifest_method_section_binds_preregistered_constants(
+        small_pc, monkeypatch, tmp_path):
+    """manifest.method 段绑定 T106 预注册常量（method_id/CLUSTER_GAP_DAYS/
+    MIN_CLUSTERS_PER_GROUP/seed 基/分段规则/接续偏移）；常量变化 → 指纹变。"""
+    pc = small_pc
+    stamp = _mk_stamp_env(pc, tmp_path)
+    m = pc._build_manifest(tmp_path / stamp)
+    meth = m["bindings"]["method"]
+    assert meth["method_id"] == pc.METHOD == "cluster-permutation-v1"
+    assert meth["block"] == pc.BLOCK                  # 历史字段保留
+    assert meth["cluster_gap_days"] == 10
+    assert meth["min_clusters_per_group"] == 5
+    assert meth["seed_bases"] == {"neg": 20261101, "holm": 20261102,
+                                  "pos": 20261103, "cluster": 20261104,
+                                  "brier": 20261105}
+    assert meth["seed_stage_offset"] == 10_000
+    assert meth["two_stage"] == {
+        "neg": [pc.NEG_SEEDS, pc.NEG_ESCALATION_SEEDS],
+        "neg-holm": [pc.HOLM_SEEDS, pc.HOLM_ESCALATION_SEEDS],
+        "cluster": [pc.CLUSTER_SEEDS, pc.CLUSTER_ESCALATION_SEEDS],
+        "pos": [pc.POS_SEEDS, 0], "brier": [pc.BRIER_SEEDS, 0]}
+    fp0 = m["fingerprint"]
+    monkeypatch.setattr(pc, "CLUSTER_GAP_DAYS", 11)
+    assert pc._build_manifest(tmp_path / stamp)["fingerprint"] != fp0
+    monkeypatch.setattr(pc, "CLUSTER_GAP_DAYS", 10)
+    monkeypatch.setattr(pc, "METHOD", "bogus-v9")
+    assert pc._build_manifest(tmp_path / stamp)["fingerprint"] != fp0
+
+
+def test_cmd_run_stage2_shard_filename(monkeypatch, tmp_path):
+    """run --stage 2：第二段分片落独立文件名（<phase>-st2-sIofN.json，
+    不与首段分片同名互覆）；phase 收到 stage=2。"""
+    pc = load_pc()
+    monkeypatch.setattr(pc, "OUT_ROOT", tmp_path)
+    monkeypatch.setattr(pc, "NEG_NS", (5, 6))    # neg-holm 完备集用 NEG_NS[1]
+    monkeypatch.setattr(pc, "NEG_SEEDS", 2)
+    stamp = _mk_stamp_env(pc, tmp_path)
+    got_stage: list = []
+
+    def fake_neg(pool, i, n, stamp_, *, stage=1):
+        got_stage.append(stage)
+        return [{"kind": "neg_single", "n": 5, "seed": 2 + k, "stage": 2,
+                 "p": 0.5, "testable": True,
+                 "n_days_real": 1, "n_days_null": 1} for k in range(2)]
+
+    monkeypatch.setattr(pc, "phase_neg", fake_neg)
+    args = types.SimpleNamespace(phase="neg", shard_i=0, shard_n=1,
+                                 stamp=stamp, stage=2)
+    assert pc.cmd_run(args) == 0
+    assert got_stage == [2]
+    assert (tmp_path / stamp / "neg-st2-s0of1.json").is_file()
+    assert not (tmp_path / stamp / "neg-s0of1.json").exists()
+
+
+def test_cmd_run_rejects_stage2_for_single_stage_phases(monkeypatch, tmp_path,
+                                                        capsys):
+    """pos/brier 无预注册第二段 → --stage 2 直接拒绝（不边看边扩）。"""
+    pc = load_pc()
+    monkeypatch.setattr(pc, "OUT_ROOT", tmp_path)
+    monkeypatch.setattr(pc, "BRIER_SEEDS", 2)
+    stamp = _mk_stamp_env(pc, tmp_path)
+    monkeypatch.setattr(pc, "phase_brier",
+                        lambda *a, **k: pytest.fail("不应跑到 brier 相位"))
+    args = types.SimpleNamespace(phase="brier", shard_i=0, shard_n=1,
+                                 stamp=stamp, stage=2)
+    assert pc.cmd_run(args) == 1
+    assert "段" in capsys.readouterr().out
+
+
+def test_stage2_rows_merge_accepted_and_out_of_range_rejected(
+        small_pc, monkeypatch, tmp_path, capsys):
+    """merge：预注册第二段行键（种子下标 ∈ [首段, 首段+追加段)）可并入
+    （分条件 seeds=首段+第二段、stage2_seeds 计数）；超出预注册范围 → 按
+    "多"拒绝。"""
+    pc = small_pc
+    monkeypatch.setattr(pc, "OUT_ROOT", tmp_path)
+    rows = _mk_rows_from_manifest(pc)
+    s2 = [{"kind": "neg_single", "n": 5, "seed": 2 + k, "stage": 2,
+           "p": 0.5, "testable": True, "n_days_real": 3, "n_days_null": 4}
+          for k in range(2)]
+    stamp = _write_stamp_dir(pc, tmp_path, {"all-s0of1.json": rows + s2})
+    assert pc.cmd_merge(types.SimpleNamespace(stamp=stamp,
+                                              keep_pool=False)) == 0
+    summary = json.loads((tmp_path / stamp / "summary.json").read_text(
+        encoding="utf-8"))
+    assert summary["neg_single"]["n5"]["seeds"] == 4
+    assert summary["neg_single"]["n5"]["stage2_seeds"] == 2
+    # 超出第二段预注册范围（下标 ≥ 首段+追加段）→ 拒绝
+    bad = dict(s2[0])
+    bad["seed"] = pc.NEG_SEEDS + pc.NEG_ESCALATION_SEEDS
+    stamp2 = _write_stamp_dir(pc, tmp_path, {"all-s0of1.json": rows + [bad]},
+                              stamp="st-bad")
+    assert pc.cmd_merge(types.SimpleNamespace(stamp="st-bad",
+                                              keep_pool=False)) == 1
+    out = capsys.readouterr().out
+    assert "多" in out
+
+
+def test_merge_summary_handles_untestable_rows(small_pc, monkeypatch,
+                                               tmp_path):
+    """不可检验行（p=None）：FPR 只在可检验行上计算 + untestable 计数披露
+    （不静默当不拒绝、也不静默丢弃）。"""
+    pc = small_pc
+    monkeypatch.setattr(pc, "OUT_ROOT", tmp_path)
+    rows = _mk_rows_from_manifest(pc)
+    for r in rows:
+        if r["kind"] == "neg_single" and r["n"] == 5 and r["seed"] == 0:
+            r["p"] = None
+            r["testable"] = False
+            r["reason"] = "最少交换单位不足"
+    stamp = _write_stamp_dir(pc, tmp_path, {"all-s0of1.json": rows})
+    assert pc.cmd_merge(types.SimpleNamespace(stamp=stamp,
+                                              keep_pool=False)) == 0
+    summary = json.loads((tmp_path / stamp / "summary.json").read_text(
+        encoding="utf-8"))
+    n5 = summary["neg_single"]["n5"]
+    assert n5["seeds"] == 2 and n5["untestable"] == 1
+    assert n5["fpr"] == 0.0

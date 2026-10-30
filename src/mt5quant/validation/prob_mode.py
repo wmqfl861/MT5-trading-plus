@@ -51,9 +51,35 @@ METHOD_REGISTRY: dict[str, dict] = {
                 "（8/100）> 5%——按预写规则不采纳，未进入现行方法"
                 "（prob-mode-calibration-2026-10-29-v3.md）",
     },
+    "cluster-permutation-v1": {
+        # cluster_permutation_test（T106 预注册设计，docs/superpowers/
+        # plans/2026-10-30-t106-cluster-permutation.md §一）——audit2 §4.3
+        # 推荐的唯一主候选：交换单位=10 日历日邻接簇（整簇交换，跨月不拆）。
+        # 状态只增改不删行：全套标定（neg/neg-holm/cluster/pos/brier）通过
+        # 并经成果审核重算确认后才登记 adopted=True（采纳动作另批执行）。
+        "status": "not_adopted_two_stage_cp",
+        "adopted": False,
+        "note": "簇单位置换（CLUSTER_GAP_DAYS=10 日历日、MIN_CLUSTERS_"
+                "PER_GROUP=5、混合簇多数归属·平局计 real、B=10,000）："
+                "t75-formal-v4（T106）两段终局未达——cluster w3 合计 "
+                "29/651=4.45%、CP95 上界 6.02%>5%（硬门全过、w7=3.10%），"
+                "按预写规则不采纳（prob-mode-calibration-2026-10-30-v4.md）",
+    },
 }
 # 现行主检验方法（round-report 的 Holm p 由它产出）
 PRIMARY_METHOD = "month-within"
+
+# ---- T106 簇单位置换的设计常量（预注册，先于结果冻结；进 manifest 绑定）
+# 簇构造只看时间（不看赢输）：合并两组触发日后按**日历日**邻接聚簇，
+# 相邻日间隔 ≤ CLUSTER_GAP_DAYS 归同簇、更大开新簇（跨月不拆）。括注修正
+# （计划 §一）：10 日历日 ≈ 7 个交易日，不字面覆盖审核模拟的 10/20 交易
+# 日簇；跨簇残余相关由 cluster 相位实测。
+CLUSTER_GAP_DAYS = 10
+# 最少交换单位：任一组目标簇数 < 此值（或总簇数 < 10）→ 不可检验，
+# 不打碎簇凑样本。
+MIN_CLUSTERS_PER_GROUP = 5
+# 与上面最少单位门槛配套的总簇数下限（T106 实现模块的预写口径）
+MIN_CLUSTERS_TOTAL = 10
 
 
 def primary_method_approved() -> tuple[bool, str]:
@@ -242,6 +268,144 @@ def delta_p_test(real_labels: pd.DataFrame, null_labels: pd.DataFrame, *,
     return {"delta_p": obs, "p_value": p,
             "n_days_real": n_a, "n_days_null": n_b,
             "block": block, "sims": int(sims)}
+
+
+# ------------------------------------------------- 簇单位置换（T106）
+
+def _usable_day_winrates(df: pd.DataFrame) -> pd.Series:
+    """usable 触发按日聚合的日赢率（win=1；skipped 剔除——S7 口径）。
+
+    与 delta_p_test 内联的 _day_winrates 同一统计口径；独立一份以保证
+    delta_p_test 的缺省路径逐位不变（受保护探针 03 R6 直调后者）。"""
+    d = df[df["outcome"].isin(_USABLE_OUTCOMES)]
+    if len(d) == 0:
+        return pd.Series(dtype=float)
+    t = pd.to_datetime(d["time"])
+    win = (d["outcome"] == "win").astype(float)
+    return win.groupby(t.dt.date).mean()
+
+
+def _cluster_ids_for_days(days) -> np.ndarray:
+    """排序后的触发日按 CLUSTER_GAP_DAYS **日历日**邻接聚簇 → 簇号数组
+    （与排序后输入对齐；间隔 ≤ gap 归同簇——按相邻间隔链式，跨月不拆）。"""
+    arr = np.array(sorted(days), dtype="datetime64[D]")
+    ids = np.zeros(len(arr), dtype=np.int64)
+    if len(arr) < 2:
+        return ids
+    gaps = (arr[1:] - arr[:-1]).astype("timedelta64[D]").astype(np.int64)
+    new_cluster = np.concatenate(([True], gaps > CLUSTER_GAP_DAYS))
+    return np.cumsum(new_cluster) - 1
+
+
+def cluster_permutation_test(real_labels: pd.DataFrame,
+                             null_labels: pd.DataFrame, *,
+                             sims: int, seed: int) -> dict:
+    """簇单位置换 Δp 检验（cluster-permutation-v1；T106 预注册设计）。
+
+    统计量与 delta_p_test 相同：触发组日赢率均值 − 随机组日赢率均值
+    （日聚合 Δp，D52；usable=win/loss/time，skipped 剔除）。**交换单位=
+    簇**：把 real+null 两组合并的触发日按时间邻接聚簇（相邻间隔 ≤
+    CLUSTER_GAP_DAYS=10 个**日历日**归同簇，跨月不拆——簇构造只看时间/
+    可用性，不看赢输）；每次置换把全部簇随机重分两组，统计量按日重算
+    （簇内各日随簇走——自然带簇权重，不把不等大小簇当等权天数），单侧
+    p=(1+k)/(1+B)。
+
+    组簇数（混合簇规则，预写写死）：按簇内 real 日占比多数归属计数——
+    real 日数 > null 日数计 real 簇、< 计 null、**平局计 real**（确定性）；
+    重分时两组目标簇数 = 该计数。从簇列表随机选 k_real 个归 real 组
+    （无放回超几何式）。
+
+    最少单位：任一组目标簇数 < MIN_CLUSTERS_PER_GROUP=5 或总簇数 < 10
+    → {"testable": False, "reason": …}（不打碎簇凑样本）。
+
+    审计输出：n_clusters / cluster_size_summary（簇大小分布摘要）/
+    perm_mean_days_real|null（重分后两组日数的均值——观测计数与重分日数
+    不守恒，最大簇可占相当日数份额，按预注册披露）/ min_achievable_p
+    （组合数分辨率近似下界 1/C(n,k) 与 Monte Carlo 下界 1/(B+1) 取大者）/
+    k_real / k_null。
+
+    确定性：同 seed 同结果。sims 须为 ≥1 整数（与 delta_p_test 同校验）。
+    delta_p_test 的缺省（month/quarter）路径不受本函数影响（独立函数）。
+    """
+    if isinstance(sims, bool) or not isinstance(sims, (int, np.integer)) \
+            or int(sims) < 1:
+        raise ValueError(f"sims 须为 ≥1 整数，收到 {sims!r}")
+    r = _usable_day_winrates(real_labels)
+    nul = _usable_day_winrates(null_labels)
+    out = {"method_id": "cluster-permutation-v1",
+           "cluster_gap_days": CLUSTER_GAP_DAYS,
+           "min_clusters_per_group": MIN_CLUSTERS_PER_GROUP,
+           "sims": int(sims),
+           "n_days_real": int(len(r)), "n_days_null": int(len(nul))}
+    if len(r) == 0 or len(nul) == 0:
+        return {**out, "testable": False,
+                "reason": "real/null 至少一组无可用触发日（win/loss/time）"
+                          "——不可检验",
+                "delta_p": float("nan"), "p_value": None,
+                "n_clusters": 0, "k_real": 0, "k_null": 0}
+    rng = np.random.default_rng(seed)
+
+    # 合并两组触发日 → 时间邻接簇；簇内 real/null 日数（多数归属用）
+    merged = sorted(set(r.index) | set(nul.index))
+    cl = _cluster_ids_for_days(merged)
+    n_clusters = int(cl.max()) + 1
+    day_cluster = dict(zip(merged, (int(c) for c in cl)))
+    real_cl = np.zeros(n_clusters, dtype=np.int64)
+    null_cl = np.zeros(n_clusters, dtype=np.int64)
+    for d in r.index:
+        real_cl[day_cluster[d]] += 1
+    for d in nul.index:
+        null_cl[day_cluster[d]] += 1
+    # 平局计 real（预写确定性规则）
+    k_real = int((real_cl >= null_cl).sum())
+    k_null = int(n_clusters - k_real)
+    obs = float(r.to_numpy().mean() - nul.to_numpy().mean())
+    sizes = np.bincount(cl, minlength=n_clusters)
+    audit = {
+        "n_clusters": n_clusters, "k_real": k_real, "k_null": k_null,
+        "cluster_size_summary": {
+            "min": int(sizes.min()),
+            "median": float(np.median(sizes)),
+            "mean": float(sizes.mean()),
+            "max": int(sizes.max())},
+        "min_achievable_p": float(max(
+            1.0 / math.comb(n_clusters, k_real), 1.0 / (int(sims) + 1))),
+    }
+    if k_real < MIN_CLUSTERS_PER_GROUP or k_null < MIN_CLUSTERS_PER_GROUP \
+            or n_clusters < MIN_CLUSTERS_TOTAL:
+        return {**out, "testable": False,
+                "reason": f"最少交换单位不足：k_real={k_real}、"
+                          f"k_null={k_null}、n_clusters={n_clusters}"
+                          f"（任一组目标簇数 < {MIN_CLUSTERS_PER_GROUP} 或"
+                          f" 总簇数 < {MIN_CLUSTERS_TOTAL} 即不可检验）"
+                          "——不打碎簇凑样本",
+                "delta_p": obs, "p_value": None, **audit}
+
+    # 交换单位 = 簇；样本单位 =（组，触发日）的日赢率值——整簇随簇走，
+    # 重分后两组日数不守恒（audit 的 perm_mean_days_* 披露）。
+    unit_cluster = np.array([day_cluster[d] for d in r.index]
+                            + [day_cluster[d] for d in nul.index],
+                            dtype=np.int64)
+    unit_value = np.concatenate([r.to_numpy(), nul.to_numpy()])
+    s_sum = np.zeros(n_clusters)
+    np.add.at(s_sum, unit_cluster, unit_value)
+    m_cnt = np.zeros(n_clusters, dtype=np.int64)
+    np.add.at(m_cnt, unit_cluster, 1)
+    total_sum = float(s_sum.sum())
+    total_cnt = int(m_cnt.sum())
+    # 无放回选 k_real 个簇（随机键排序取前 k——均匀子集，超几何式）
+    mask = np.argsort(rng.random((int(sims), n_clusters)), axis=1) < k_real
+    part_sum = np.where(mask, s_sum[None, :], 0.0).sum(axis=1)
+    part_cnt = np.where(mask, m_cnt[None, :], 0).sum(axis=1)
+    stat_sim = part_sum / part_cnt - (total_sum - part_sum) / (total_cnt
+                                                               - part_cnt)
+    k_ge = int((stat_sim >= obs).sum())
+    p = float((1 + k_ge) / (1 + int(sims)))
+    return {**out, "testable": True, "reason": None, "delta_p": obs,
+            "p_value": p,
+            "perm_mean_days_real": float(part_cnt.mean()),
+            "perm_mean_days_null": float((total_cnt - part_cnt).mean()),
+            **audit}
 
 
 def holm(pvalues: dict[str, float]) -> dict[str, float]:
