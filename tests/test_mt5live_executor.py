@@ -1275,3 +1275,43 @@ def test_h2_01_pending_intent_found_on_restart_is_unknown(tmp_path):
                   NOW.replace(minute=15))
     assert rr.action == "blocked_execution_unknown"
     assert b.market_orders == []
+
+def test_h2_02_old_protective_deal_cannot_explain_later_manual_exit(tmp_path):
+    """先观察部分 SL 后，再人工平掉余仓；旧 SL ticket 不得再次解释新出场。"""
+    from mt5gw.models import DEAL_REASON_CLIENT, DEAL_REASON_SL
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|h2-02-open"), NOW).action == "open"
+    ticket = b.positions()[0].ticket
+
+    # 0.02 → 0.01：SL deal 在本轮可见，执行器必须把它记为已消费。
+    b.reduce_external(ticket, 0.01, reason=DEAL_REASON_SL, comment="[sl]")
+    ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                        decision_id="XAUUSD|M15|h2-02-partial"),
+             NOW.replace(minute=15))
+    state = json.loads((tmp_path / f"state-{MAGIC}.json").read_text(
+        encoding="utf-8"))
+    consumed = state["known_positions"][str(ticket)]["consumed_deal_tickets"]
+    assert consumed, "已观察的部分 SL deal ticket 必须持久消费"
+
+    # 新人工平仓的历史暂不可见；旧 SL 仍在历史里，但已被排除。
+    b.deals_delay_polls = 100
+    b.close_external(ticket, reason=DEAL_REASON_CLIENT, comment="manual")
+    rr = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                             decision_id="XAUUSD|M15|h2-02-manual"),
+                 NOW.replace(minute=30))
+    assert rr.action == "blocked_external_exit"
+    assert len(b.market_orders) == 1
+
+    # 即使人工成交随后变得可见，也必须保持未决，不能被旧 SL 洗白。
+    b._deal_visible_at[-1] = 0
+    rr2 = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                              decision_id="XAUUSD|M15|h2-02-visible"),
+                  NOW.replace(minute=45))
+    assert rr2.action == "blocked_external_exit"
+    state2 = json.loads((tmp_path / f"state-{MAGIC}.json").read_text(
+        encoding="utf-8"))
+    assert state2["pending_external_exits"][str(ticket)]["manual_exit_observed"] is True
+    assert len(b.market_orders) == 1
