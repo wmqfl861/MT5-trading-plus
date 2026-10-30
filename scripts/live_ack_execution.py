@@ -11,7 +11,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -99,10 +99,18 @@ def ack_execution(live_dir: str, gw: MT5Gateway, magic: int, decision_id: str,
         n = (now or datetime.now(timezone.utc).replace(tzinfo=None))
         if n.tzinfo is not None:
             n = n.astimezone(timezone.utc).replace(tzinfo=None)
+        raw_since = marker.get("ts") or intent.get("ts")
+        if not raw_since:
+            print("× UNKNOWN/intent 缺少原始时间戳，无法确定成交历史核对范围；保持 UNKNOWN")
+            return 2
         try:
-            since = parse_iso(str(marker.get("ts") or intent.get("ts")))
+            since = parse_iso(str(raw_since))
         except (TypeError, ValueError):
-            since = n - timedelta(days=2)
+            print("× UNKNOWN/intent 时间戳损坏，无法确定成交历史核对范围；保持 UNKNOWN")
+            return 2
+        if since > n:
+            print("× UNKNOWN/intent 时间戳晚于当前时间，拒绝解除")
+            return 2
         try:
             deals = [d for d in gw.account.deals(since, n) if d.magic == magic]
         except Exception as exc:
