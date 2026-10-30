@@ -1281,7 +1281,8 @@ class LiveExecutor:
             expected = (float(prior.get("volume") or 0.0)
                         + float(prior.get("unmatched_exit_volume") or 0.0))
             old_pending = pending.get(ticket) or {}
-            expected += float(old_pending.get("volume") or 0.0)
+            # pending.volume is a view of unmatched_exit_volume, not an
+            # additional quantity; do not count the same partial reduction twice.
             manual = (bool(prior.get("manual_exit_observed", False))
                       or bool(old_pending.get("manual_exit_observed", False)))
             used: dict[str, float] = {}
