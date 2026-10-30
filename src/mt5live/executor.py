@@ -788,7 +788,7 @@ class LiveExecutor:
         if self._state.get("execution_unknown") is None:
             self._state["execution_unknown"] = {
                 "status": "prepared", "decision_id": decision.decision_id,
-                "target": float(target), "ts": iso_utc(n)}
+                "symbol": self._symbol, "target": float(target), "ts": iso_utc(n)}
             self._save_state()
         self._write_pending(target, decision.decision_id, n)
         try:
@@ -982,7 +982,8 @@ class LiveExecutor:
                                                        False)),
                         "execution_unknown": (data.get("execution_unknown")
                                               if isinstance(data.get("execution_unknown"), dict)
-                                              else None)}
+                                              else None),
+                        "execution_resolution": data.get("execution_resolution")}
             except (OSError, ValueError, TypeError) as exc:
                 # H-05：状态文件损坏/不可读 ≠ 首次启动——保守恢复：不清空
                 # blocked_dir/pending_external_exits 的保护（原文已不可信，
@@ -1006,10 +1007,12 @@ class LiveExecutor:
                         "pending_external_exits": {},
                         "last_decision_id": None, "state_corrupt": True,
                         "execution_unknown": {"status": "unknown",
-                                               "reason": "state_corrupt"}}
+                                               "reason": "state_corrupt"},
+                        "execution_resolution": None}
         return {"blocked_dir": 0, "known_positions": {},
                 "pending_external_exits": {}, "last_decision_id": None,
-                "state_corrupt": False, "execution_unknown": None}
+                "state_corrupt": False, "execution_unknown": None,
+                "execution_resolution": None}
 
     def _recover_pending_execution(self) -> None:
         """恢复未完成订单意图：pending/prepared 一律视为 UNKNOWN。
@@ -1033,7 +1036,7 @@ class LiveExecutor:
         if isinstance(intent, dict) and intent.get("status") == STATUS_PENDING:
             self._state["execution_unknown"] = {
                 "status": "unknown", "decision_id": str(intent.get("cause") or ""),
-                "target_side": intent.get("side"), "target_volume": intent.get("volume"),
+                "symbol": intent.get("symbol"), "target_side": intent.get("side"), "target_volume": intent.get("volume"),
                 "ts": str(intent.get("ts") or ""),
                 "reason": "pending_intent_found_on_restart"}
             self._save_state()
@@ -1077,6 +1080,7 @@ class LiveExecutor:
             "last_decision_id": self._state.get("last_decision_id"),
             "state_corrupt": bool(self._state.get("state_corrupt")),
             "execution_unknown": self._state.get("execution_unknown"),
+            "execution_resolution": self._state.get("execution_resolution"),
         }
         write_json_atomic(self._state_path, payload)   # T33：经 fileio（重试）
 
