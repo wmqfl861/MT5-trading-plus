@@ -88,7 +88,8 @@ def account_lock_path(account_state, magic: int) -> str:
     return os.path.join(root, "mt5-trading-plus", "locks", f"{token}.lock")
 
 
-class MagicInstanceLock:    """同账户/同 magic 的运行器所有权锁（H-05：两份运行器不得并行）。
+class MagicInstanceLock:
+    """同账户/同 magic 的运行器所有权锁（H-05：两份运行器不得并行）。
 
     ``data/live/runner-<magic>.lock`` 的 1 字节内核锁（Windows
     msvcrt.locking / POSIX flock）：互斥由内核仲裁（两个进程、乃至同进程
