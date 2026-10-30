@@ -1359,3 +1359,35 @@ def test_h2_01_ack_execution_requires_stopped_runner_and_no_pending_orders(tmp_p
     assert ack_execution(live_dir, _GW([_Pending()]), MAGIC, "d-ack", "test") == 2
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["execution_unknown"] is not None
+
+def test_h2_01_ack_execution_records_reconciled_broker_snapshot(tmp_path):
+    """人工核对成功后，解除 UNKNOWN 并用 canonical Intent 写入实际净仓快照。"""
+    from scripts.live_ack_execution import ack_execution
+
+    live_dir = str(tmp_path)
+    state_path = tmp_path / f"state-{MAGIC}.json"
+    state_path.write_text(json.dumps({
+        "magic": MAGIC, "execution_unknown": {
+            "status": "unknown", "decision_id": "d-ack-ok",
+            "symbol": "XAUUSD", "ts": NOW.isoformat()}}), encoding="utf-8")
+
+    class _Account:
+        def positions(self):
+            return []
+        def pending_orders(self):
+            return []
+        def deals(self, since, to):
+            return []
+
+    class _GW:
+        account = _Account()
+
+    assert ack_execution(live_dir, _GW(), MAGIC, "d-ack-ok",
+                         "人工核对成交历史与持仓") == 0
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["execution_unknown"] is None
+    assert state["execution_resolution"]["reason"] == "人工核对成交历史与持仓"
+    intent = json.loads((tmp_path / f"expected-{MAGIC}.json").read_text(
+        encoding="utf-8"))
+    assert intent["status"] == "confirmed"
+    assert intent["cause"] == "ack_execution" and intent["volume"] == 0.0
