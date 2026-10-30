@@ -151,12 +151,15 @@ def ack_execution(live_dir: str, gw: MT5Gateway, magic: int, decision_id: str,
             "positions": snapshot, "deals_since_intent": deal_snapshot,
             "pending_orders": [],
         }
-        state["execution_unknown"] = None
-        write_json_atomic(state_path, state)
+        # 两个文件不是同一事务：先写 canonical confirmed intent，再清除
+        # state marker。若中途崩溃，旧 UNKNOWN 仍在并继续挡开仓；绝不能
+        # 先清 marker 再写 intent（那会留下可开仓的空窗）。
         write_intent(intent_path, Intent(
             symbol=symbol, magic=magic,
             side="buy" if net >= 0 else "sell", volume=abs(net),
             status=STATUS_CONFIRMED, cause="ack_execution", ts=n))
+        state["execution_unknown"] = None
+        write_json_atomic(state_path, state)
         append_alert(
             live_dir, "ACK_EXECUTION_UNKNOWN",
             f"magic {magic} 人工核对并解除 UNKNOWN（decision_id={decision_id}；"
