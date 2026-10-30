@@ -22,7 +22,7 @@ FullRow = namedtuple(
     "trade_contract_size volume_min volume_max volume_step filling_mode visible "
     "trade_stops_level swap_long swap_short trade_freeze_level "
     "trade_tick_size trade_tick_value trade_calc_mode margin_initial margin_maintenance "
-    "swap_mode swap_rollover3days",
+    "swap_mode swap_rollover3days currency_base",
 )
 # 旧式 row：无新字段（与 fakes.py 时代的 SymRow 同构，证明 getattr 兜底）
 OldRow = namedtuple(
