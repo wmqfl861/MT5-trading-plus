@@ -186,7 +186,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_scheduled_tasks.ps1
 
 解除流程必须在维护窗口执行：
 
-1. 停止该 magic 的 Runner；专用脚本会尝试获取相同的 `runner-<magic>.lock`，若 Runner 仍持锁则拒绝继续。
+1. 停止该 MT5 账户/magic 的所有 Runner（包括使用不同 data_root 的实例）；专用脚本会尝试获取按 MT5 server/login + magic 派生的 OS 用户级账户锁；实盘 Runner 在所有 data_root 之间共享此锁。若任一数据目录下该账户/magic 的 Runner 仍持锁则拒绝继续。paper/offline 使用各自 data_root 的本地锁。
 2. 在 MT5 终端核对该 decision 对应的成交历史、当前持仓和挂单；确认没有仍在途的请求。
 3. 确认当前策略 magic 下没有挂单。脚本会再次查询并在发现挂单时拒绝解除。
 4. 使用状态文件中的精确 `decision_id` 和人工核对原因执行：
