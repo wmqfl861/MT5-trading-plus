@@ -19,7 +19,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from mt5gw import GatewayConfig, MT5Gateway  # noqa: E402
 from mt5live.fileio import write_json_atomic  # noqa: E402
 from mt5live.monitor import append_alert, iso_utc, parse_iso  # noqa: E402
-from mt5live.reconcile import INTENT_FILE_FMT, STATUS_CONFIRMED  # noqa: E402
+from mt5live.reconcile import (  # noqa: E402
+    INTENT_FILE_FMT, STATUS_CONFIRMED, Intent, write_intent,
+)
 from mt5live.runner import MagicInstanceLock  # noqa: E402
 
 
@@ -109,13 +111,10 @@ def ack_execution(live_dir: str, gw: MT5Gateway, magic: int, decision_id: str,
         }
         state["execution_unknown"] = None
         write_json_atomic(state_path, state)
-        write_json_atomic(intent_path, {
-            "symbol": symbol, "magic": magic,
-            "side": "buy" if net >= 0 else "sell",
-            "volume": abs(net), "status": STATUS_CONFIRMED,
-            "cause": "ack_execution", "ts": stamp,
-            "execution_resolution": state["execution_resolution"],
-        })
+        write_intent(intent_path, Intent(
+            symbol=symbol, magic=magic,
+            side="buy" if net >= 0 else "sell", volume=abs(net),
+            status=STATUS_CONFIRMED, cause="ack_execution", ts=n))
         append_alert(
             live_dir, "ACK_EXECUTION_UNKNOWN",
             f"magic {magic} 人工核对并解除 UNKNOWN（decision_id={decision_id}；"
