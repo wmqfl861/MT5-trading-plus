@@ -1343,6 +1343,9 @@ def test_h2_01_ack_execution_requires_stopped_runner_and_no_pending_orders(tmp_p
     class _Account:
         def __init__(self, pending):
             self._pending = pending
+        def state(self):
+            from types import SimpleNamespace
+            return SimpleNamespace(login=123456, server="MetaQuotes-Demo")
         def positions(self):
             return []
         def pending_orders(self):
@@ -1354,7 +1357,7 @@ def test_h2_01_ack_execution_requires_stopped_runner_and_no_pending_orders(tmp_p
         def __init__(self, pending):
             self.account = _Account(pending)
 
-    lock = MagicInstanceLock(str(tmp_path / f"runner-{MAGIC}.lock"))
+    lock = MagicInstanceLock.for_account(_GW([]).account.state(), MAGIC)
     assert lock.acquire()
     try:
         assert ack_execution(live_dir, _GW([]), MAGIC, "d-ack", "test") == 3
@@ -1380,6 +1383,9 @@ def test_h2_01_ack_execution_records_reconciled_broker_snapshot(tmp_path):
             "symbol": "XAUUSD", "ts": NOW.isoformat()}}), encoding="utf-8")
 
     class _Account:
+        def state(self):
+            from types import SimpleNamespace
+            return SimpleNamespace(login=123456, server="MetaQuotes-Demo")
         def positions(self):
             return []
         def pending_orders(self):
