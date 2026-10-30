@@ -1259,7 +1259,26 @@ class LiveExecutor:
         for ticket in sorted(pending):
             item = pending[ticket]
             if item.get("manual_exit_observed"):
-                continue  # CLIENT/未知原因已可见：只能人工 ack，不能自动洗白
+                continue  # 完整出场的 CLIENT/未知原因：只能人工 ack
+            if item.get("position_still_open") and ticket in current:
+                # 先前观察到的部分减仓不是整仓出场事件。只要成交量覆盖
+                # 该次观察量，就消费 ticket（无论 CLIENT 还是 SL/TP）。
+                used: dict[str, float] = {}
+                self._explain_exit(
+                    ticket, expected_volume=float(item.get("volume") or 0.0),
+                    exclude_tickets=(item.get("consumed_deal_tickets") or {}).keys(),
+                    consumed_out=used)
+                if sum(used.values()) >= float(item.get("volume") or 0.0) - DEFAULT_VOLUME_TOLERANCE:
+                    del pending[ticket]
+                    if ticket in known:
+                        prior = known[ticket]
+                        prior_consumed = dict(prior.get("consumed_deal_tickets") or {})
+                        prior_consumed.update(used)
+                        prior["consumed_deal_tickets"] = prior_consumed
+                        prior["unmatched_exit_volume"] = max(
+                            0.0, float(prior.get("unmatched_exit_volume") or 0.0)
+                            - sum(used.values()))
+                continue
             used: dict[str, float] = {}
             hit, why = self._explain_exit(
                 ticket, expected_volume=float(item.get("volume") or 0.0),
