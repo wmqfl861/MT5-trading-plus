@@ -89,14 +89,13 @@ def account_lock_path(account_state, magic: int) -> str:
 
 
 class MagicInstanceLock:
-    """同账户/同 magic 的运行器所有权锁（H-05：两份运行器不得并行）。
+    """运行器所有权锁（H-05/H2-01）。
 
-    ``data/live/runner-<magic>.lock`` 的 1 字节内核锁（Windows
-    msvcrt.locking / POSIX flock）：互斥由内核仲裁（两个进程、乃至同进程
-    两个 fd 一视同仁），持有进程崩溃/退出自动释放——不存在残锁，也不允许
-    "凭 mtime 接管"。acquire 非阻塞：他人持有立即返回 False，调用方
-    （scripts/live_runner）据此拒绝第二份运行器启动。锁文件常驻磁盘
-    （不删除——"释放即删"本身是竞态源），内容为持有者 pid（排查用）。
+    实盘使用 `for_account(account_state, magic)`，锁身份为 MT5 server/login
+    + magic，锁文件位于 OS 用户级状态目录，因此不同 data_root 也互斥。
+    paper/offline 仍可使用 data_root 内的本地锁。底层为 1 字节内核锁
+    （Windows msvcrt.locking / POSIX flock）：进程崩溃/退出自动释放；
+    acquire 非阻塞；锁文件常驻磁盘且不按 mtime 接管，内容仅记录 pid。
     """
 
     @classmethod
