@@ -52,9 +52,15 @@ def ack_execution(live_dir: str, gw: MT5Gateway, magic: int, decision_id: str,
         except (OSError, ValueError) as exc:
             print(f"× state 文件缺失/损坏，拒绝自动解除：{exc}")
             return 2
+        if state.get("magic") != magic:
+            print("× state 文件 magic 与请求不一致，拒绝解除")
+            return 2
         marker = state.get("execution_unknown")
         if not isinstance(marker, dict):
             print("× 没有待确认的 execution_unknown")
+            return 2
+        if marker.get("status") not in ("prepared", "unknown"):
+            print(f"× execution_unknown 状态不允许人工解除：{marker.get('status')!r}")
             return 2
         if str(marker.get("decision_id") or "") != decision_id:
             print("× decision_id 与待确认记录不一致，拒绝解除")
@@ -80,7 +86,12 @@ def ack_execution(live_dir: str, gw: MT5Gateway, magic: int, decision_id: str,
                 intent = json.load(f)
         except (OSError, ValueError):
             intent = {}
-        symbol = next(iter(symbols), None) or intent.get("symbol") or marker.get("symbol")
+        expected_symbol = intent.get("symbol") or marker.get("symbol")
+        if symbols and expected_symbol and symbols != {expected_symbol}:
+            print(f"× 当前持仓品种 {sorted(symbols)} 与策略登记品种 "
+                  f"{expected_symbol!r} 不一致，拒绝解除")
+            return 2
+        symbol = next(iter(symbols), None) or expected_symbol
         if not symbol:
             print("× 无法确定策略品种，拒绝解除")
             return 2
@@ -98,6 +109,10 @@ def ack_execution(live_dir: str, gw: MT5Gateway, magic: int, decision_id: str,
             print(f"× 查询成交历史失败，保持 UNKNOWN：{exc}")
             return 2
 
+        foreign_deals = sorted({d.symbol for d in deals if d.symbol != symbol})
+        if foreign_deals:
+            print(f"× 该 magic 的成交历史包含其他品种 {foreign_deals}，拒绝解除")
+            return 2
         net = sum(float(p.volume) if p.side == "buy" else -float(p.volume)
                   for p in positions)
         snapshot = [{"ticket": int(p.ticket), "symbol": p.symbol,
