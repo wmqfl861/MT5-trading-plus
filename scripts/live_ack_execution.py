@@ -34,9 +34,15 @@ def _open_gateway(path: str) -> MT5Gateway:
 def ack_execution(live_dir: str, gw: MT5Gateway, magic: int, decision_id: str,
                   reason: str, *, now: datetime | None = None) -> int:
     """Acknowledge an UNKNOWN order only after explicit broker reconciliation."""
-    lock = MagicInstanceLock(os.path.join(live_dir, f"runner-{magic}.lock"))
+    try:
+        account_state = gw.account.state()
+        lock = MagicInstanceLock.for_account(account_state, magic)
+    except Exception as exc:
+        print(f"× 无法确定 MT5 账户身份，拒绝解除 UNKNOWN：{exc}")
+        return 2
     if not lock.acquire():
-        print("× runner 仍持有该 magic 的锁；先停止 runner 并完成维护窗口")
+        print("× 同一 MT5 账户/magic 的 Runner 仍持有账户级锁；"
+              "先停止所有 data_root 下该账户的 Runner")
         return 3
     try:
         state_path = os.path.join(live_dir, f"state-{magic}.json")
