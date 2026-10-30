@@ -1223,10 +1223,13 @@ class LiveExecutor:
             if item.get("manual_exit_observed"):
                 continue  # CLIENT/未知原因已可见：只能人工 ack，不能自动洗白
             used: dict[str, float] = {}
-            hit, _ = self._explain_exit(
+            hit, why = self._explain_exit(
                 ticket, expected_volume=float(item.get("volume") or 0.0),
                 exclude_tickets=(item.get("consumed_deal_tickets") or {}).keys(),
                 consumed_out=used)
+            if hit is None and why and "reason=" in why:
+                item["manual_exit_observed"] = True
+                item.setdefault("consumed_deal_tickets", {}).update(used)
             if hit is not None:
                 del pending[ticket]
                 explained_deals.extend(sorted(used))
