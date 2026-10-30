@@ -17,6 +17,10 @@ T104 批 2（audit2 P2-01/P2-02）：白名单从"动作集合"升级为**（局
 "尊重"）。generate_signals 支持**决策起点**（decision_start）：起点前只算
 特征/局面识别，不执行入场决策、不进 held_until/forced_zero 状态机——
 split 后从空状态处理新触发（bt 的输出掩码适配层由丁接线换用本原语）。
+T105 批 3（T73B，audit2 §4.1 步骤 3）：fit 的 purge_bars 真正生效——
+标签与成本过滤都按该值剔除跨界触发（bar + purge_bars ≤ 训练数据长度，
+标签最后信息 t+K+1 不越界）；新增 oos_calibration_rows 供关卡 v3 的
+P 线专属 Brier 否决（校准评价只用 OOS、基准率只用相应训练窗）。
 """
 from __future__ import annotations
 
@@ -213,8 +217,10 @@ class LevelDecisionV1(BaseStrategy):
             *, train_end, purge_bars: int) -> dict:
         self._require_single_symbol()
         self._check_exit_rules_consistency()
-        # TODO(T105/T73B)：purge_bars 目前只接收未使用——逐窗拟合的 purge
-        # 剔除在 T73B 批 3 真正生效，不在本模块（P2-01/02）改其语义。
+        # T73B（audit2 §4.1 步骤 3）：purge_bars 真正生效——训练输入严格
+        # 早于窗末（保留触发的 bar + purge_bars ≤ 训练数据长度：标签最后
+        # 信息 t+K+1 不越界），标签与成本过滤**都**应用该值（此前只把数值
+        # 写进模型，未用它改变过滤）。
         # S5：成本在 fit 内局部累计（不改实例状态——同一实例重复拟合、
         # 多品种卡都不得崩或串窗）；S8：合约大小与禁入窗必给，不默认。
         meta = params.get("__fit__") or {}
@@ -289,10 +295,10 @@ class LevelDecisionV1(BaseStrategy):
         }
         return model
 
-    def _labels_for_symbol(self, sym, bars, costs, *, contract_size,
-                           session_policy, train_end, purge_bars,
-                           cost_acc: dict) -> pd.DataFrame:
-        atr = atr_series(bars)
+    def _collect_triggers(self, sym, bars, atr) -> pd.DataFrame:
+        """触发装配（fit 与 OOS 校准同一来源）：局面→事件→动作触发 +
+        P2-01 获准集合过滤 + 特征列。返回列含 situation/action/side/bar/
+        time/ny_hour/close/trend_sma200/atr_pct_2000。"""
         aparams = ActionParams(breakout_atr=self.BREAKOUT_ATR,
                                retest_window_bars=self.RETEST_WINDOW_BARS)
         rows = []
@@ -307,9 +313,10 @@ class LevelDecisionV1(BaseStrategy):
             trig = action_triggers(bars, events, params=aparams, atr=atr)
             if len(trig):
                 rows.append(trig.assign(symbol=sym))
+        empty = pd.DataFrame(columns=["situation", "action", "outcome",
+                                      "net_r", *FEATURES])
         if not rows:
-            return pd.DataFrame(columns=["situation", "action", "outcome",
-                                         "net_r", *FEATURES])
+            return empty
         triggers = pd.concat(rows, ignore_index=True)
         # P2-01 三重过滤第一处（fit 侧）：只给获准（局面×动作）对打标签、
         # 累计成本——集合外的动作既不进模型也不累计成本（S1:A3 获准不放行
@@ -320,8 +327,7 @@ class LevelDecisionV1(BaseStrategy):
                     for s, a in zip(triggers["situation"], triggers["action"])]
             triggers = triggers[keep].reset_index(drop=True)
             if not len(triggers):
-                return pd.DataFrame(columns=["situation", "action",
-                                             "outcome", "net_r", *FEATURES])
+                return empty
         triggers["ny_hour"] = (pd.to_datetime(triggers["time"])
                                .dt.tz_localize("UTC")
                                .dt.tz_convert(NY_TZ).dt.hour.astype("int64"))
@@ -338,6 +344,26 @@ class LevelDecisionV1(BaseStrategy):
         triggers["atr_pct_2000"] = [
             v if v is not None else "na"
             for v in pct.to_numpy()[bars_idx]]
+        return triggers
+
+    def _labels_for_symbol(self, sym, bars, costs, *, contract_size,
+                           session_policy, train_end, purge_bars,
+                           cost_acc: dict) -> pd.DataFrame:
+        atr = atr_series(bars)
+        triggers = self._collect_triggers(sym, bars, atr)
+        if not len(triggers):
+            return pd.DataFrame(columns=["situation", "action", "outcome",
+                                         "net_r", *FEATURES])
+        # T73B：purge_bars 真正生效——bar 下标口径剔除（触发 bar +
+        # purge_bars > 训练数据长度的触发，其标签最后信息 t+K+1 越界/
+        # 跨入评估窗）。标签与成本累计**同一**过滤（不再只把数值写进模型）。
+        if purge_bars and int(purge_bars) > 0:
+            keep = (triggers["bar"].astype(int) + int(purge_bars)
+                    <= len(bars))
+            triggers = triggers[keep].reset_index(drop=True)
+            if not len(triggers):
+                return pd.DataFrame(columns=["situation", "action",
+                                             "outcome", "net_r", *FEATURES])
         bracket = Bracket(sl_atr=self.SL_ATR, tp_atr=self.TP_ATR,
                           horizon_bars=self.HORIZON_BARS)
         labeled = label_triggers(
@@ -359,6 +385,67 @@ class LevelDecisionV1(BaseStrategy):
             cost_acc.setdefault((str(r.situation), str(r.action)),
                                 []).append((spr + 2.0 * slip + comm) / r_price)
         return labeled
+
+    # ------------------------------------------------ T73B：OOS 校准行
+
+    def oos_calibration_rows(self, bars, costs, *, contract_size,
+                             session_policy, decision_start,
+                             volume_lots: float = 1.0) -> pd.DataFrame:
+        """关卡 v3 P 线专属 Brier 否决的评估行（T73B 条目 5，audit2 §4.1
+        步骤 4）：decision_start 之后的 OOS 触发逐条给出
+        {situation, action, p_pred, y, base_rate}——
+
+        - p_pred：**本窗冻结模型**的查表估计（与 generate_signals 同一
+          lookup 口径），不用 OOS 的 y 构造预测；
+        - y：OOS 标签（win=1，loss/time=0；skipped 不进）——标签用测试
+          切片的完整未来窗，不 purge（评估侧没有训练边界）；
+        - base_rate：相应**训练窗**的动作基准率（模型 base_rates，拟合
+          数据的边际赢率——校准评价只用 OOS、基准率只用训练窗）。
+        """
+        self._require_single_symbol()
+        self._check_exit_rules_consistency()
+        if self._table is None:
+            raise ModelMissingError(
+                f"{type(self).__name__} 未装载冻结模型——Brier 否决的 OOS "
+                "校准评价需要本窗模型（铁律 21）")
+        sym = self.SYMBOLS[0]
+        atr = atr_series(bars)
+        triggers = self._collect_triggers(sym, bars, atr)
+        if not len(triggers):
+            return pd.DataFrame(columns=["situation", "action", "p_pred",
+                                         "y", "base_rate"])
+        times = pd.to_datetime(triggers["time"])
+        start = pd.Timestamp(decision_start)
+        triggers = triggers[times >= start].reset_index(drop=True)
+        if not len(triggers):
+            return pd.DataFrame(columns=["situation", "action", "p_pred",
+                                         "y", "base_rate"])
+        bracket = Bracket(sl_atr=self.SL_ATR, tp_atr=self.TP_ATR,
+                          horizon_bars=self.HORIZON_BARS)
+        labeled = label_triggers(
+            bars, triggers, costs, symbol=sym, timeframe=self.TIMEFRAME,
+            bracket=bracket, contract_size=contract_size,
+            sizing=None, volume_lots=float(volume_lots), train_end=None,
+            session_policy=session_policy)
+        usable = labeled[labeled["outcome"].isin(("win", "loss", "time"))]
+        p_pred, ys, bases, sits, acts = [], [], [], [], []
+        for r in usable.itertuples(index=False):
+            feats = {"trend_sma200": r.trend_sma200,
+                     "atr_pct_2000": r.atr_pct_2000}
+            try:
+                est = self._table.lookup(str(r.situation), str(r.action),
+                                         feats)
+            except KeyError:
+                continue          # 模型无该动作样本——预测不存在，不进评价
+            p_pred.append(float(est.p_win))
+            ys.append(1.0 if str(r.outcome) == "win" else 0.0)
+            bases.append(float(
+                self._table.base_rate(str(r.action)).p_win))
+            sits.append(str(r.situation))
+            acts.append(str(r.action))
+        return pd.DataFrame({"situation": sits, "action": acts,
+                             "p_pred": p_pred, "y": ys,
+                             "base_rate": bases})
 
     # ------------------------------------------------------------- 使用
 
@@ -615,7 +702,9 @@ class LevelDecisionS1Demo(LevelDecisionV1):
     """S1 整数关口演示子类（XAUUSD H1）——**只供测试与审核探针**，
     真实卡各自定义子类（常量随卡写死；审核四 E4）。常量与审核探针卡
     一致（K=8、网格 2.0、approach 12/1.0/0.25、retest 4；探针 R1/R7
-    的卡-策略常量核对按此对齐）。"""
+    的卡-策略常量核对按此对齐）。批 3（批 2 复审 B1）：正式 P2 决策卡
+    的策略类白名单必须非空——本演示类显式列全四动作（裸条目 = 任意
+    局面获准，覆盖其测试/探针卡用到的动作组合）。"""
 
     SL_ATR = 1.0
     TP_ATR = 2.0
@@ -626,6 +715,10 @@ class LevelDecisionS1Demo(LevelDecisionV1):
                         touch_atr=0.25)
     BREAKOUT_ATR = 0.25
     RETEST_WINDOW_BARS = 4
+    # 批 2 复审 B1（乙修）：空白名单 = "全部兼容"不把获准集合冻结进模型
+    # 身份——正式 P2 卡不得依赖缺省全放行。演示类用旧式裸动作条目显式
+    # 列全四个动作（= 任意局面获准；其测试/探针卡用到 A1-A4 的各种组合）
+    ALLOWED_HYPOTHESES = ("A1", "A2", "A3", "A4")
     SYMBOLS = ("XAUUSD",)
     TIMEFRAME = "H1"
     required_data = RequiredData(symbols=("XAUUSD",), timeframe="H1",

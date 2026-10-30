@@ -85,6 +85,13 @@ class TwoSitBareA3Demo(LevelDecisionS1Demo):
     ALLOWED_HYPOTHESES = ("A3",)
 
 
+class NoWhitelistDemo(LevelDecisionS1Demo):
+    """显式空白名单（= 全部兼容的缺省语义）——T73B 后仅 P1 卡可用
+    （正式 P2 卡要求非空白名单，见批 2 复审 B1）。"""
+
+    ALLOWED_HYPOTHESES = ()
+
+
 class TamperedExitDemo(LevelDecisionS1Demo):
     """实例级篡改：__init__ 里塞与标签 bracket 脱节的出场规则（类常量
     一致——甲的 __init_subclass__ 拦不住，须实例级核验）。"""
@@ -110,11 +117,12 @@ def test_p201_constants_check_rejects_hypotheses_outside_whitelist():
     msg = BT._check_card_strategy_constants(
         _card_with_hyp("S1:A2:follow>base"), A3OnlyDemo)
     assert msg and "S1:A2" in msg and "ALLOWED_HYPOTHESES" in msg
-    # 白名单内的假设照常通过；空白名单（缺省）不启用子集核对（兼容）
+    # 白名单内的假设照常通过；空白名单（缺省）不启用子集核对（兼容——
+    # T73B 批 3 后显式空白名单仅 P1 卡可用，见 NoWhitelistDemo）
     assert BT._check_card_strategy_constants(
         _card_with_hyp("S1:A3:fade>base"), A3OnlyDemo) is None
     assert BT._check_card_strategy_constants(
-        _card_with_hyp("S1:A2:follow>base"), MatchDemo) is None
+        _card_with_hyp("S1:A2:follow>base"), NoWhitelistDemo) is None
 
 
 def test_p201_constants_check_whitelist_pair_vs_bare_action():

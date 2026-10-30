@@ -43,13 +43,16 @@ def synth_bars(n, *, seed, start="2020-01-02", s0=100.0):
 
 
 class DemoSmallGrid(LevelDecisionS1Demo):
-    """测试用：2.0 网格（事件密度高），K=8。"""
+    """测试用：2.0 网格（事件密度高），K=8。批 3（B1）后基类演示类显式
+    带白名单（A1-A4 裸条目）——本夹具显式清空以继续覆盖"空白名单=全部
+    兼容（缺省）"的旧路径。"""
 
     LEVEL_GRID = {"XAUUSD": 2.0}
     HORIZON_BARS = 8
     APPROACH = Approach(lookback_bars=12, min_distance_atr=1.0,
                         touch_atr=0.25)
     RETEST_WINDOW_BARS = 4
+    ALLOWED_HYPOTHESES = ()
 
 
 from mt5data.sessions import SessionPolicy   # noqa: E402

@@ -7,8 +7,8 @@
 2. P 基准/关卡政策一致——P2 决策卡经 screen 的 session 政策来自
    load_session_policy(SESSIONS_PATH) 与 entry_policy_for（与 P1/prob
    test、cmd_fit、cmd_gate 同一来源与同一构造）。
-3. fittable 策略的 G3 在 T73B 之前保留拒绝（e2e 级：gate 请求 G3 →
-   退出码 1、零 runs）。
+3. fittable 策略的 G3 走 T73B capability 白名单（e2e 级：白名单外 →
+   退出码 1、零 runs；白名单内的 P2 决策卡走 run_g3_fittable）。
 
 全部合成数据、临时 git 仓库与临时台账；不读研究库。
 """
@@ -218,6 +218,10 @@ def test_p10_screen_policy_from_sessions_source(p2_env, monkeypatch):
     与 prob test/cmd_fit/cmd_gate 的四个调用点同构）。"""
     from mt5data.sessions import load_session_policy
     captured = []
+    # 本模块的 BT 实例与 p2_env 夹具的实例不同——指纹桩打到自己实例上
+    # （与夹具对其实例的桩同构；否则 D23 策略干净检查依赖仓库工作区状态）
+    monkeypatch.setattr(BT, "_bind_strategy_sha",
+                        lambda led, card, ref: "f" * 40)
     real = BT.run_backtest
 
     def spy(strategy, bars, costs, **kwargs):
@@ -246,11 +250,17 @@ def test_p10_screen_policy_from_sessions_source(p2_env, monkeypatch):
         assert pol == base_expected
 
 
-# --------------------------------------- 3. fittable G3 保留拒绝（e2e）
+# --------------------------------------- 3. fittable G3 capability 门（e2e）
 def test_p10_fittable_g3_rejected_before_any_run(p2_env, monkeypatch):
-    """P-10：T73B 完成前 fittable 策略的 G3 一律拒绝——e2e：gate 请求
-    G3 → 退出码 1、零 runs（_reject_fittable_walkforward 在基准运行
-    之前）。"""
+    """P-10/T73B（批 3）：fittable G3 的 **capability 白名单**——白名单外
+    的 fittable 组合（此处清空白名单模拟未支持的自定义 fit 协议）拒绝在
+    基准运行之前：gate 请求 G3 → 退出码 1、零 runs
+    （_reject_fittable_walkforward 在基准运行之前）。白名单内
+    （LevelDecisionV1 子类 = P2 决策卡）放行走 run_g3_fittable 逐窗路径
+    （tests/test_t73b_walkforward.py 覆盖）。"""
+    monkeypatch.setattr(BT, "_T73B_WALKFORWARD_CAPABILITY", ())
+    monkeypatch.setattr(BT, "_bind_strategy_sha",
+                        lambda led, card, ref: "f" * 40)
     _card_path(p2_env, 1.0)
     argv = ["gate", "--card", "P002-v1", "--strategy", STRATEGY_REF,
             "--gates", "G0,G3", "--cards-dir", str(p2_env["cards"]),

@@ -64,6 +64,12 @@ _TOP_KEYS = ("id", "family", "version", "parent", "strategy",
 _EVALUATION_MODES = ("standard", "probability")
 _SEGMENTS = ("discovery", "validation")
 _P_CARD_ID = re.compile(r"^P\d+-v\d+$")
+# T73B（条目 4，audit2 §4.1 步骤 4）：standard P 卡 primary_statistic 的
+# 冻结口径 = 关卡 v3 主检验统计量（[v3].primary_test = dsr_v0，config/
+# gates.toml 冻结指纹 d0a8b2f3…——validation/gates.load_gates 同值，测试
+# 对拍）。"max_net_profit" 是训练窗选参规则（selection_rule），legacy 卡
+# 沿用时另行标注（占位字段处理：不再把选参规则当主检验）。
+_V3_PRIMARY_STATISTIC = "dsr_v0"
 
 _ROUND_ID_RE = re.compile(r"^R\d{1,4}$")
 _CANDIDATE_ID_RE = re.compile(r"^C\d{3,}$")
@@ -416,10 +422,14 @@ def validate_card(data: dict, *, source: str) -> Card:
                     f"{source}：standard P 卡带 [prob] 时 segment 必须是 "
                     f'"validation"（P2 决策卡——审核三 D1/蓝图附录 A），'
                     f"收到 {segment!r}")
-            if primary_statistic and primary_statistic != "max_net_profit":
+            if primary_statistic and primary_statistic not in (
+                    "max_net_profit", _V3_PRIMARY_STATISTIC):
                 raise CardError(
                     f"{source}：standard P 卡的 primary_statistic 按关卡 v3 "
-                    f'主检验（缺省 max_net_profit），收到 {primary_statistic!r}')
+                    f"主检验统计量（冻结 [v3].primary_test = "
+                    f"{_V3_PRIMARY_STATISTIC}，gates.toml 指纹 d0a8b2f3…）；"
+                    f'"max_net_profit" 是训练窗选参规则（selection_rule），'
+                    f"legacy 卡沿用时另行标注——收到 {primary_statistic!r}")
             from mt5quant.research.candidates import (
                 CandidateError, _validate_prob,
             )

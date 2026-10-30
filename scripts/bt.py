@@ -166,6 +166,7 @@ from mt5quant.research import cards  # noqa: E402
 from mt5quant.research import candidates as cand  # noqa: E402
 from mt5quant.research import power  # noqa: E402
 from mt5quant.research import rounds as rnd  # noqa: E402
+from mt5quant.prob.gaps import ELIGIBILITY_VERSION  # noqa: E402
 from mt5quant.research.ledger import (  # noqa: E402
     Ledger, LedgerTamperedError, RESERVED_ACTORS, RoundTrialBudgetExceededError,
     TrialBudgetExceededError, TrialReservationConsistencyError,
@@ -1304,14 +1305,37 @@ def _bind_strategy_sha(ledger, card, strategy_ref: str) -> str | None:
     return sha
 
 
-def _stitch_oos_from_segments(spec, bars, costs, segments) -> pd.Series:
-    """按 walkforward.run_g3 的同一切片/拼接口径重放各测试窗（G3 记录的
-    segments：test_range + 段内选中 params），返回拼接的样本外收益。
+def _fit_strategy_cls(spec):
+    """从 spec.strategy 解包出可 fit/with_model 的策略类（T73B 重放用）：
+    _ZeroedBeforeSplit 等门只包实例——沿 _inner 链取内层类。"""
+    st = spec.strategy
+    for _ in range(8):
+        inner = getattr(st, "_inner", None)
+        if inner is None:
+            break
+        st = inner
+    return type(st)
+
+
+def _stitch_oos_from_segments(spec, bars, costs, segments, *,
+                              window_models: dict | None = None,
+                              strategy_cls=None) -> pd.Series:
+    """按 walkforward.run_g3 / run_g3_fittable 的同一切片/拼接口径重放各
+    测试窗（G3 记录的 segments：test_range + 段内选中 params），返回拼接
+    的样本外收益。
 
     T21a（G5 参照分布）与 T86（关卡 v3 bar 级主检验的 OOS）共用同一
-    重放实现：测试窗权益收益（含测试窗首根，去预热段）。"""
+    重放实现：测试窗权益收益（含测试窗首根，去预热段）。
+
+    T73B：段带 model_sha256（fittable 逐窗拟合）→ **只用该窗冻结模型**
+    重放——模型取 window_models（同次运行内存）或段的 model_path（冻结
+    artifact，load_model 按哈希 fail-closed 核验），策略经
+    with_decision_start(测试窗首根)——预热不产生交易状态（与 G3 运行时
+    同一口径）；无 window_models/strategy_cls 时从 spec 解包（G5 参照
+    重放路径）。"""
     lookback = max(int(getattr(spec.strategy.required_data,
                                "lookback_bars", 0) or 0), 0)
+    times = pd.to_datetime(bars["time"]).reset_index(drop=True)
     rets = []
     for seg in segments:
         t1, t2 = (seg.get("test_range") or [0, 0])[:2]
@@ -1321,7 +1345,26 @@ def _stitch_oos_from_segments(spec, bars, costs, segments) -> pd.Series:
         test = bars.iloc[max(0, t1 - lookback): t2]
         if not len(test):
             continue
-        oos = vrob.run_engine(spec, test, costs, seg.get("params") or {})
+        strat_override = None
+        sha = seg.get("model_sha256")
+        if sha:
+            model = None
+            if window_models is not None and sha in window_models:
+                model = window_models[sha]
+            elif seg.get("model_path"):
+                from mt5quant.prob.artifact import load_model
+                model = load_model(seg["model_path"], expected_sha256=sha)
+            else:
+                raise ValueError(
+                    f"段 {seg.get('test_start')} 的逐窗模型 {sha[:12]}… "
+                    "无从取得（无内存模型、无 model_path）——fittable G3 的 "
+                    "OOS 重放只能用该窗冻结模型（T73B）")
+            cls = strategy_cls if strategy_cls is not None \
+                else _fit_strategy_cls(spec)
+            strat_override = cls().with_model(model).with_decision_start(
+                times.iloc[t1])
+        oos = vrob.run_engine(spec, test, costs, seg.get("params") or {},
+                              strategy=strat_override)
         # 与 run_g3 同口径：测试窗权益收益（含测试窗首根，去预热段）
         rets.append(oos.equity.astype("float64")
                     .iloc[-(t2 - t1 + 1):].pct_change().dropna())
@@ -1417,11 +1460,40 @@ def _v3_n_composition(ledger, card, cards_dir) -> dict:
     return comp
 
 
+def _merge_p_line_veto(result: dict, brier: dict | None) -> dict:
+    """T73B 条目 5：把 P 线专属 Brier 否决项并入关卡 v3 判决链（gates.py
+    的 evaluate_v3 五层冻结不动——bt 侧在判决结果上追加否决层）。"""
+    if brier is None:
+        brier = {"passed": False, "skill": None, "n_oos": 0,
+                 "reason": "V3 无逐窗 Brier 否决数据（fail-closed）——"
+                           "fittable 卡须与 G3 同批运行（逐窗拟合产出 "
+                           "brier_veto）"}
+    out = dict(result)
+    vetoes = dict(out.get("vetoes") or {})
+    checks = dict(out.get("checks") or {})
+    vetoes["brier_skill"] = brier
+    checks["brier_skill"] = {"passed": bool(brier.get("passed"))}
+    failed = list(out.get("failed_vetoes") or [])
+    if not brier.get("passed"):
+        failed.append("brier_skill")
+    out["vetoes"] = vetoes
+    out["checks"] = checks
+    out["failed_vetoes"] = failed
+    out["passed"] = bool(out.get("passed")) and bool(brier.get("passed"))
+    return out
+
+
 def _v3_gate_evaluate(ledger, card, *, cfg, ctx, cards_dir, strategy, spec,
                       bars, costs, params, base, summary, contract_size,
                       symbol, combos, g0_result, g3_result, data_sha, seed,
-                      known_gaps, trial=None) -> dict:
+                      known_gaps, trial=None, g3_window_models=None,
+                      g3_strategy_cls=None) -> dict:
     """关卡 V3 的评估体（T86 接线；bt gate 的 --gates V3 生产入口）。
+
+    T73B（批 3）：fittable（P 线）路径——OOS 重放消费逐窗冻结模型
+    （g3_window_models/g3_strategy_cls，段 model_sha256 逐窗装载），
+    并把 G3 产出的 Brier skill 否决（校准只用 OOS、基准率只用训练窗）
+    并入判决链（_merge_p_line_veto）。
 
     bar 级分支（缺省）：主检验按 [v3].primary_test 分派（冻结 = dsr_v0，
     run_primary_test 取 N_eff = max(N, n_min)）+ 三项否决（成本 ×1.5 /
@@ -1525,11 +1597,15 @@ def _v3_gate_evaluate(ledger, card, *, cfg, ctx, cards_dir, strategy, spec,
         }
 
     # ---- bar 级分支（[v3].primary_test，冻结 = dsr_v0）
+    p_line_brier = (g3_result or {}).get("brier_veto") \
+        if (g3_strategy_cls is not None or g3_window_models) else None
     oos, oos_source, oos_reason = None, None, None
     if g3_result is not None and g3_result.get("segments"):
         try:
             oos = _stitch_oos_from_segments(
-                spec, bars, costs, g3_result["segments"])
+                spec, bars, costs, g3_result["segments"],
+                window_models=g3_window_models,
+                strategy_cls=g3_strategy_cls)
             oos_source = "G3（本次运行的 segments，内存重放）"
         except ValueError as e:
             oos_reason = str(e)
@@ -1583,7 +1659,7 @@ def _v3_gate_evaluate(ledger, card, *, cfg, ctx, cards_dir, strategy, spec,
     verdict = vgate.evaluate_v3(
         g0=g0, primary=primary, cost_scale=cost_scale, delay=delay,
         buyhold=buyhold, diagnostics=diagnostics)
-    return {
+    result = {
         "passed": bool(verdict["passed"]),
         "mode": "bar",
         "primary": primary,
@@ -1600,6 +1676,12 @@ def _v3_gate_evaluate(ledger, card, *, cfg, ctx, cards_dir, strategy, spec,
                    "delay_1_bar": {"passed": bool(delay["passed"])},
                    "buyhold_excess": {"passed": bool(buyhold["passed"])}},
     }
+    # T73B 条目 5：P 线专属 Brier 否决并入判决链（fittable 路径恒评——
+    # 数据缺失按 fail-closed 否决，不给"没评就过"留缝）
+    if p_line_brier is not None or g3_strategy_cls is not None \
+            or g3_window_models:
+        result = _merge_p_line_veto(result, p_line_brier)
+    return result
 
 
 def _g5_orchestrate(ledger, card, *, strategy, spec, params, base_summary,
@@ -2117,6 +2199,12 @@ def cmd_candidate_check(args) -> int:
                 extra_reasons = []
     payload = result.to_payload()
     payload["cost_model_version"] = cost_version
+    # B2'（批 2 复审，乙修）：概率候选预筛的 checks 携带资格规则版本
+    # （ELIGIBILITY_VERSION——读侧可对出按哪个口径剔除 lookback 跨洞/
+    # 特征预热/未来窗不合格触发）
+    if getattr(candidate, "prob_declared", None) is not None:
+        payload["checks"] = {**(payload.get("checks") or {}),
+                             "eligibility_version": ELIGIBILITY_VERSION}
     payload["checked_at_utc"] = datetime.now(timezone.utc).isoformat()
     # H-08：预筛结论绑定候选内容——pass 记录锚定登记文件的 sha256，
     # 轮次内运行（_round_context）比对当前文件 hash：改候选须重检后才生效
@@ -2343,6 +2431,18 @@ def _check_card_strategy_constants(card, strategy_cls) -> str | None:
     )
     allowed_entries = tuple(getattr(strategy_cls, "ALLOWED_HYPOTHESES",
                                     ()) or ())
+    # ---- 批 2 复审 B1（乙修）：正式 P2 决策卡（standard+validation+
+    # [prob]）的获准（局面×动作）白名单必须非空——空白名单 = "全部兼容"
+    # 不把获准集合冻结进模型身份（allowed_hypotheses=[] 进哈希也不约束
+    # 任何动作），正式卡不得依赖缺省全放行。P1（probability）卡不受限
+    # （兼容：P1 不消费类白名单做决策）。
+    if (str(getattr(card, "evaluation_mode", "standard")) == "standard"
+            and str(getattr(card, "segment", "")) == "validation"
+            and not allowed_entries):
+        return (f"{getattr(strategy_cls, '__name__', strategy_cls)} 的"
+                " ALLOWED_HYPOTHESES 为空（= 全部兼容的缺省语义）——正式 "
+                "P2 决策卡的获准（局面×动作）集合必须显式非空并冻结进模型"
+                "身份（批 2 复审 B1），拒绝运行")
     if allowed_entries:
         try:
             card_pairs = parse_hypothesis_pairs(
@@ -2649,16 +2749,42 @@ def _prob_run_fields(fit_ctx, params, summary):
     return params, summary
 
 
+# T73B capability 白名单（audit2 §4.1 步骤 5：联合验收后对支持的组合放开；
+# 扩项须先实现并过 §4.1 九条验收——不是通配 fittable）
+_T73B_WALKFORWARD_CAPABILITY = ("mt5quant.strategies.library.prob."
+                                "level_decision:LevelDecisionV1",)
+
+
+def _t73b_capability_classes() -> tuple:
+    """白名单字符串 → 策略类（延迟解析，import 期零依赖）。"""
+    out = []
+    for ref in _T73B_WALKFORWARD_CAPABILITY:
+        mod_name, _, cls_name = ref.partition(":")
+        import importlib
+        out.append(getattr(importlib.import_module(mod_name), cls_name))
+    return tuple(out)
+
+
 def _reject_fittable_walkforward(strategy_cls, wanted_gates) -> str | None:
-    """T73A：拟合策略的 walk-forward（G3）与关卡 v3 主检验在 T73B（逐窗
-    拟合 + purge 接线，等 H 线审核会话批准 T65）完成前一律拒绝。"""
+    """T73A → T73B（批 3）：拟合策略的 walk-forward（G3）与关卡 v3 主检验
+    按**显式 capability 白名单**放行——本批实现并验收的逐窗拟合路径所支持
+    的策略族（LevelDecisionV1 子类：fit/with_model/with_decision_start/
+    oos_calibration_rows 协议与 run_g3_fittable 配套）；白名单外的 fittable
+    组合（自定义 fit 协议）仍拒绝——不是删拒绝函数，新增能力须先扩
+    _T73B_WALKFORWARD_CAPABILITY 并过 §4.1 验收。真实 T92 仍须 T91 有
+    获准假设（本批 T91 归档为阻塞，代码放行≠开研究轮）。"""
     if not getattr(strategy_cls, "fittable", False):
         return None
-    if "G3" in wanted_gates:
-        return ("拟合策略的 walk-forward（G3）在 T73B 之前拒绝运行——"
-                "逐窗重新拟合与 purge 接线未完成（等 H 线审核会话批准 "
-                "T65 后做 T73B）；关卡 v3 主检验同理")
-    return None
+    if "G3" not in wanted_gates and "V3" not in wanted_gates:
+        return None
+    if any(issubclass(strategy_cls, cls)
+           for cls in _t73b_capability_classes()):
+        return None
+    return ("拟合策略的 walk-forward（G3）/关卡 v3 主检验在 T73B 白名单外"
+            "拒绝运行——本批逐窗拟合路径只支持 "
+            f"{list(_T73B_WALKFORWARD_CAPABILITY)} 指名的策略族"
+            "（每窗独立 fit + purge + 冻结 artifact + 决策起点 OOS）；"
+            "白名单外的 fittable 组合未验收，不得运行（T73B capability 门）")
 
 
 def _prob_preconditions(ledger, card, path, *, actor: str) -> tuple | None:
@@ -2805,9 +2931,11 @@ def cmd_prob_test(args) -> int:
             if use_merged:
                 from mt5quant.prob.gaps import mt5_first_time
             for sym in card.symbols:
-                # 丁-4：三元组返回（source_tags 暂不消费——P1 的 era 边界
-                # 仍按 P-09 口径经 gaps.mt5_first_time（meta 路径）取，批 3
-                # 统一改 merge 实测后并入）
+                # B3（批 2 复审，乙修）：era 边界消费 merge 实测
+                # (bars, source_tags)——gaps.mt5_first_time 按数据实测取
+                # 首个 "mt5" tag 的 bar 时刻，不再走 meta 水位路径
+                # （丁-4 的 TODO 落实；tags 全 ext → None，cost_scenario_mult
+                # 卡由 run_p1_card fail-closed 拒绝）
                 bars_full, _source_tags, gap_spans = _prob_load_bars(
                     data_root, sym, card.timeframe, use_merged=use_merged,
                     end=args.end, allow_unbounded=_allow_unbounded(args))
@@ -2815,7 +2943,8 @@ def cmd_prob_test(args) -> int:
                 if use_merged:
                     gap_by_sym[sym] = gap_spans
                     mt5_first_by_sym[sym] = mt5_first_time(
-                        data_root, sym, card.timeframe)
+                        data_root, sym, card.timeframe,
+                        bars=bars_full, source_tags=_source_tags)
                 times = pd.to_datetime(bars_full["time"])
                 below = bars_full[times < split]
                 if len(below) == 0:
@@ -2961,6 +3090,10 @@ def cmd_prob_test(args) -> int:
             # run_p1_card 已产出，此处随 metrics.prob 落台账；轮次报告的
             # 可用/剔除列读侧消费）
             metrics = {"prob": {"prob_version": r["prob_version"],
+                                # B2'（批 2 复审，乙修）：资格规则版本随
+                                # metrics.prob 携带（读侧可对出按哪个
+                                # eligibility 口径剔除）
+                                "eligibility_version": ELIGIBILITY_VERSION,
                                 "n_triggers": r["n_triggers"],
                                 "n_trigger_days": r["n_trigger_days"],
                                 "n_total": r["n_total"],
@@ -3790,6 +3923,47 @@ def pd_iso(v) -> str:
 
 # ---------------------------------------------------------------- gate
 
+def _gate_eval_view(card, strategy_cls, bars_by_sym):
+    """cmd_gate 的评估窗视图（B2-gate）：与正式切片同一实现（validation
+    卡 → [split−lookback, cutoff) 切片 + OOS 起点），但**不突变**传入的
+    bars_by_sym——拟合仍须吃全量 bars（先拟合、后切评估窗的顺序约束不
+    变）。返回 (评估窗 bars_by_sym, oos_split|None)。"""
+    if getattr(card, "segment", "") != "validation":
+        return bars_by_sym, None
+    rnd_path = Path(card.path).parent.parent / "rounds" / f"{card.round}.toml"
+    round_obj_v = rnd.load_round(rnd_path)
+    lookback = int(getattr(
+        getattr(strategy_cls, "required_data", None),
+        "lookback_bars", 0) or 0)
+    return (_slice_validation_eval(card, round_obj_v, bars_by_sym,
+                                   lookback_bars=lookback),
+            pd.Timestamp(round_obj_v.segments["split"]))
+
+
+def _gate_choose_params(ledger, card, args, *, symbol, dsha, cost_version):
+    """gate 的参数选择（T21e/M5；B2-gate 起也被拟合前占位身份消费）：
+    --params 缺省或 "auto" 按卡 selection_rule 从同数据哈希/成本版本的
+    screen 运行自动选参；显式 JSON 记 manual。失败 → ValueError（调用方
+    打印并退 1）。返回 (params, selection)。"""
+    if args.params is None or args.params == "auto":
+        selection = _select_params_auto(
+            ledger, card, symbol=symbol, data_sha256=dsha,
+            cost_model_version=cost_version)
+        params = selection["params"]
+        print(f"— 参数选择（auto）：规则 {selection['rule']}"
+              f"（{selection['metric']}），候选 {selection['candidates']}"
+              f" 个 screen 运行，选中 run#{selection['selected_run_id']}"
+              f" -> {params}")
+        return params, selection
+    try:
+        params = json.loads(args.params)
+    except ValueError as e:
+        raise ValueError(f"--params 不是合法 JSON：{e}") from e
+    selection = {"selection": "manual", "params": params}
+    print(f"— 参数选择（manual）：显式 --params -> {params}")
+    return params, selection
+
+
 def cmd_gate(args) -> int:
     """关卡 G0–G5：基准运行入台账，逐关卡评估写 gates 表。"""
     if _reject_ops_ack(args):                 # R6/C6：研究命令拒绝运维豁免
@@ -4010,11 +4184,15 @@ def cmd_gate(args) -> int:
         if _cs_msg:
             print(f"✗ {_cs_msg}")
             return 1
-        # T73A：拟合策略先拟合再评估（审核四 E1：拟合用**全量** bars、
-        # 训练窗 < split，之后才切评估窗）；walk-forward（G3）与关卡 v3
-        # 主检验在 T73B 完成前一律拒绝。_strategy_cls 恒为装门前的原始类
-        # （_ZeroedBeforeSplit 只包实例，不作拟合工厂）。
+        # T73A/T73B：拟合策略先拟合再评估（审核四 E1：拟合用**全量** bars、
+        # 训练窗 < split，之后才切评估窗）。_strategy_cls 恒为装门前的原始类
+        # （_ZeroedBeforeSplit 只包实例，不作拟合工厂）。T73B：fittable 的
+        # G3/V3 走显式 capability 白名单（LevelDecisionV1 子类 = 逐窗拟合
+        # 路径）；bar 级 V3 的 OOS/Brier 都产自 G3 逐窗段——fittable 时
+        # V3 强制同批跑 G3（不回退台账参照）。
         _strategy_cls = type(strategy)
+        _fittable_wf = bool(getattr(strategy, "fittable", False)) \
+            and _reject_fittable_walkforward(_strategy_cls, ["G3"]) is None
         fit_ctx = None
         # T86：bar 级 V3 的主检验同样取自 walk-forward 拼接的 OOS——拟合
         # 策略与 G3 同拒（事件分支不经 walk-forward，不受限）
@@ -4025,16 +4203,53 @@ def cmd_gate(args) -> int:
         if _g3_msg:
             print(f"✗ {_g3_msg}")
             return 1
+        if _fittable_wf and "V3" in wanted \
+                and (v3_ctx or {}).get("mode") != "event" \
+                and "G3" not in wanted:
+            wanted = [*wanted, "G3"]     # T73B：Brier/OOS 须同批 G3 产出
+        _gate_fit_meta = {"sizes": sizes, "vols_by_sym": vols_by_sym,
+                          "sizing": sizing_info, "policies": policy_by_sym}
+        params = None
+        selection = None
+        _pre_gate_key = None
         if getattr(strategy, "fittable", False):
+            # ---- B2-gate（批 1 复审 B2 的 gate 侧，照搬 screen 的
+            # _pre_fit_key 模式）：唯一基准运行的占位**前移到拟合之前**
+            # ——预算满的轮次不付拟合计算。此刻模型 hash 未知：trial_key 用
+            # 拟合输入身份（评估窗 bars sha + 选中 params + 本品种成本版本
+            # + 策略指纹，extra=None——同一输入确定性重拟合出同一模型，
+            # 身份成立）；基准运行沿用该键（不双计）。
+            if resv is not None:
+                _ev_bars_by_sym, _ = _gate_eval_view(card, _strategy_cls,
+                                                     bars_by_sym)
+                _ev_bars = _ev_bars_by_sym[card.symbols[0]]
+                try:
+                    params, selection = _gate_choose_params(
+                        ledger, card, args, symbol=card.symbols[0],
+                        dsha=data_sha256(_ev_bars),
+                        cost_version=cost_version_by_sym[card.symbols[0]])
+                except ValueError as e:
+                    print(f"✗ {e}")
+                    return 1
+                _pre_gate_key = _trial_key(
+                    strategy=args.strategy, params=params,
+                    symbol=card.symbols[0], timeframe=card.timeframe,
+                    data_sha256=data_sha256(_ev_bars),
+                    cost_model_version=cost_version_by_sym[card.symbols[0]],
+                    strategy_sha=strategy_sha)
+                try:
+                    resv.reserve(_pre_gate_key)
+                except TrialBudgetExceededError as e:
+                    print(f"✗ 基准运行计算前占位被拒（拟合之前）：{e}"
+                          "——不执行任何拟合/回测计算，不写任何行"
+                          "（X-01 + 批 1 复审 B2：gate 占位前移到拟合前）")
+                    return 1
             try:
                 fit_ctx = _prob_fit_context(
                     card, round_ctx, bars_by_sym, costs_by_sym, data_root)
                 _fit_and_freeze(_strategy_cls, card, fit_ctx, bars_by_sym,
                                 costs_by_sym, data_root,
-                                fit_meta={"sizes": sizes,
-                                          "vols_by_sym": vols_by_sym,
-                                          "sizing": sizing_info,
-                                          "policies": policy_by_sym})
+                                fit_meta=_gate_fit_meta)
             except ValueError as e:
                 print(f"✗ {e}")
                 return 1
@@ -4067,28 +4282,17 @@ def cmd_gate(args) -> int:
 
         # 参数选择（T21e/M5）：缺省与 "auto" 均按卡 selection_rule 从
         # 同数据哈希/成本版本的 screen 运行自动选参；显式 JSON 记 manual。
+        # B2-gate：fittable+reservation 轮已在拟合前选好（占位身份需要），
+        # 此处沿用，不重复选/不重复打印。
         dsha = data_sha256(bars)
-        if args.params is None or args.params == "auto":
+        if selection is None:
             try:
-                selection = _select_params_auto(
-                    ledger, card, symbol=symbol, data_sha256=dsha,
-                    cost_model_version=cost_version)
+                params, selection = _gate_choose_params(
+                    ledger, card, args, symbol=symbol, dsha=dsha,
+                    cost_version=cost_version)
             except ValueError as e:
                 print(f"✗ {e}")
                 return 1
-            params = selection["params"]
-            print(f"— 参数选择（auto）：规则 {selection['rule']}"
-                  f"（{selection['metric']}），候选 {selection['candidates']}"
-                  f" 个 screen 运行，选中 run#{selection['selected_run_id']}"
-                  f" -> {params}")
-        else:
-            try:
-                params = json.loads(args.params)
-            except ValueError as e:
-                print(f"✗ --params 不是合法 JSON：{e}")
-                return 1
-            selection = {"selection": "manual", "params": params}
-            print(f"— 参数选择（manual）：显式 --params -> {params}")
 
         # 基准运行（引擎 A）：先入台账（失败的也记），关卡结果挂在它名下
         data_first, data_last = pd_iso(bars["time"].iloc[0]), pd_iso(bars["time"].iloc[-1])
@@ -4105,14 +4309,21 @@ def cmd_gate(args) -> int:
         # X-01：reservation 口径轮——基准回测**之前**占位（预算拒绝发生在
         # 计算之前，零回测/关卡调用）+ advance reached_primary；同 trial_key
         # 幂等（screen→gate 同身份不被已占自己的最后额度堵死）。
+        # B2-gate：fittable 卡已在拟合前用**拟合输入身份**占位——此处沿用
+        # 该键（不重复占位、不双计）；其余按完整身份（含模型 hash）占位。
         _gate_tk = None
         if resv is not None:
-            _gate_tk = _trial_key(
-                strategy=args.strategy, params=rec_params, symbol=symbol,
-                timeframe=card.timeframe, data_sha256=dsha,
-                cost_model_version=cost_version, strategy_sha=strategy_sha,
-                extra=({"model_sha256": fit_ctx["model_sha"]}
-                       if fit_ctx is not None else None))
+            if _pre_gate_key is not None:
+                _gate_tk = _pre_gate_key
+                _pre_gate_key = None      # 只消费一次
+            else:
+                _gate_tk = _trial_key(
+                    strategy=args.strategy, params=rec_params, symbol=symbol,
+                    timeframe=card.timeframe, data_sha256=dsha,
+                    cost_model_version=cost_version,
+                    strategy_sha=strategy_sha,
+                    extra=({"model_sha256": fit_ctx["model_sha"]}
+                           if fit_ctx is not None else None))
             try:
                 resv.reserve(_gate_tk)
             except TrialBudgetExceededError as e:
@@ -4221,6 +4432,9 @@ def cmd_gate(args) -> int:
         # 读到时在关卡 details 里注明相关窗口样本不完整（只注记，不改判定）
         known_gaps = read_known_gaps(data_root, symbol, card.timeframe)
         results: dict[str, dict] = {}
+        # T73B：fittable G3 的逐窗冻结模型（内存缓存——V3 同批重放消费；
+        # 不入台账，重放凭段 model_sha256/model_path 从 artifact 装载）
+        _g3_window_models: dict = {}
 
         def _run(name, fn):
             try:
@@ -4276,10 +4490,31 @@ def cmd_gate(args) -> int:
                 policies_by_symbol=policy_by_sym,   # H-06：逐品种禁入政策
                 known_gaps=known_gaps))          # T79：样本不完整注记
         if "G3" in wanted:
-            _run_recorded("G3", lambda: vwf.run_g3(
-                spec, bars, costs, grid=combos,
-                in_sample_sharpe=summary.get("sharpe"), cfg=cfg,
-                known_gaps=known_gaps))          # T79：样本不完整注记
+            # T73B：fittable（capability 白名单内）走逐窗拟合路径——每训练
+            # 窗独立 fit + purge + 冻结 artifact + 决策起点 OOS + Brier
+            # 否决数据；_window_models 不入台账（体积），V3/G5 重放经段的
+            # model_path + model_sha256 从 artifact 装载。
+
+            def _g3_fittable():
+                res = vwf.run_g3_fittable(
+                    spec, bars, costs, grid=combos,
+                    in_sample_sharpe=summary.get("sharpe"), cfg=cfg,
+                    fit_meta=_gate_fit_meta,
+                    costs_by_symbol=costs_by_sym,
+                    strategy_cls=_strategy_cls,
+                    model_root=Path(data_root) / "models" / card.id
+                    / "walkforward",
+                    known_gaps=known_gaps)      # T79：样本不完整注记
+                _g3_window_models.update(res.pop("_window_models", {}))
+                return res
+
+            if _fittable_wf:
+                _run_recorded("G3", _g3_fittable)
+            else:
+                _run_recorded("G3", lambda: vwf.run_g3(
+                    spec, bars, costs, grid=combos,
+                    in_sample_sharpe=summary.get("sharpe"), cfg=cfg,
+                    known_gaps=known_gaps))      # T79：样本不完整注记
         if "G4" in wanted:
             def _g4():
                 returns = base.equity.astype("float64").pct_change().dropna()
@@ -4326,7 +4561,8 @@ def cmd_gate(args) -> int:
             run_trial = None
         if "V3" in wanted:
             # T86 接线（T85 冻结后）：G0/G3 结果可复用（同一次运行里跑过
-            # 就不再重算）；combos 供诊断的参数邻域复用
+            # 就不再重算）；combos 供诊断的参数邻域复用。T73B：fittable
+            # 的 OOS 重放逐窗装载冻结模型 + Brier 否决并入判决链。
             _run_recorded("V3", lambda: _v3_gate_evaluate(
                 ledger, card, cfg=cfg, ctx=v3_ctx,
                 cards_dir=Path(args.cards_dir), strategy=strategy, spec=spec,
@@ -4334,7 +4570,9 @@ def cmd_gate(args) -> int:
                 summary=summary, contract_size=sizes[symbol], symbol=symbol,
                 combos=combos, g0_result=results.get("G0"),
                 g3_result=results.get("G3"), data_sha=dsha, seed=seed,
-                known_gaps=known_gaps, trial=run_trial))
+                known_gaps=known_gaps, trial=run_trial,
+                g3_window_models=(_g3_window_models or None),
+                g3_strategy_cls=(_strategy_cls if _fittable_wf else None)))
         if "G5" in wanted:
             # H-02：G5 准入绑定当前试验身份（本次基准运行的参数/数据哈希/
             # 成本版本/代码指纹/冻结门槛）；H-03：轮次上限随原子占位复查
@@ -4427,6 +4665,13 @@ def cmd_gate(args) -> int:
                 + _veto_s("cost_scale_x15", "成本 ×1.5") + "；"
                 + _veto_s("delay_1_bar", "延迟一根") + "；"
                 + _veto_s("buyhold_excess", "买入持有超额") + "\n"
+                + (f"- P 线 Brier 否决："
+                   f"{'✓' if v3['vetoes']['brier_skill']['passed'] else '✗'}"
+                   f"（skill="
+                   f"{v3['vetoes']['brier_skill'].get('skill')}，"
+                   f"OOS 触发 {v3['vetoes']['brier_skill'].get('n_oos')}"
+                   "；校准只用 OOS、基准率只用训练窗——T73B）\n"
+                   if "brier_skill" in v3["vetoes"] else "")
                 + (f"- 样本外收益来源：{v3['oos_source']}\n"
                    if v3.get("oos_source") else "")
                 + "\n### N 的组成（[g4].dsr_trial_scope = rounds_lineage，"
