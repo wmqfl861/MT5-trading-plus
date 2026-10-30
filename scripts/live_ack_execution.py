@@ -40,7 +40,12 @@ def ack_execution(live_dir: str, gw: MT5Gateway, magic: int, decision_id: str,
     except Exception as exc:
         print(f"× 无法确定 MT5 账户身份，拒绝解除 UNKNOWN：{exc}")
         return 2
-    if not lock.acquire():
+    try:
+        acquired = lock.acquire()
+    except OSError as exc:
+        print(f"× 账户级 Runner 锁不可用，保持 UNKNOWN：{exc}")
+        return 2
+    if not acquired:
         print("× 同一 MT5 账户/magic 的 Runner 仍持有账户级锁；"
               "先停止所有 data_root 下该账户的 Runner")
         return 3
