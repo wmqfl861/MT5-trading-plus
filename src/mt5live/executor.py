@@ -1211,6 +1211,11 @@ class LiveExecutor:
                 continue                # 事件时间不可判：不凭旧确认放行
             if event_ts <= confirmed_at:
                 del pending[ticket]
+                known = self._state.get("known_positions") or {}
+                if ticket in known:
+                    # 人工确认只消费这个已绑定事件；保留已消费 deal 水位，
+                    # 但不把该 ticket 的后续新出场永久标成 manual-only。
+                    known[ticket]["manual_exit_observed"] = False
 
     def _sync_external_exits(self, n: datetime) -> int:
         """每轮开头：外部出场状态机（T30/C1 + C2/R6）。
