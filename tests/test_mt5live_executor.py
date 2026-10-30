@@ -1231,3 +1231,47 @@ def test_open_comment_safe_and_decision_id_recoverable_from_logs(tmp_path):
     assert read_intent(tmp_path)["cause"] == d.decision_id
     with open(tmp_path / f"orders-{MAGIC}.jsonl", encoding="utf-8") as f:
         assert json.loads(f.readline())["decision_id"] == d.decision_id
+
+
+def test_h2_01_unknown_order_result_is_durable_and_blocks_reopen(tmp_path):
+    """Broker 已成交但 ack 丢失：不得把未知结果写成 confirmed，重启后禁止重发。"""
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    original = ex._adapter.execute
+
+    def fill_then_lose_ack(decision):
+        original(decision)
+        raise OSError("ack lost after broker fill")
+
+    ex._adapter.execute = fill_then_lose_ack
+    with pytest.raises(OSError, match="ack lost"):
+        ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                            decision_id="XAUUSD|M15|h2-01"), NOW)
+    assert len(b.market_orders) == 1
+    state_path = tmp_path / f"state-{MAGIC}.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["execution_unknown"]["status"] == "unknown"
+    assert read_intent(tmp_path)["status"] == "pending"
+
+    ex2 = _mk_executor(b, tmp_path)
+    rr = ex2.poll(mk_decision(signal=1, volume_lots=0.02,
+                              decision_id="XAUUSD|M15|h2-01"),
+                  NOW.replace(minute=15))
+    assert rr.action == "blocked_execution_unknown"
+    assert len(b.market_orders) == 1
+
+
+def test_h2_01_pending_intent_found_on_restart_is_unknown(tmp_path):
+    """进程在 pending 意图写入后崩溃，重启必须保守阻止新开仓。"""
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    ex._write_pending(0.02, "XAUUSD|M15|crash-window", NOW)
+    ex2 = _mk_executor(b, tmp_path)
+    state = json.loads((tmp_path / f"state-{MAGIC}.json").read_text(
+        encoding="utf-8"))
+    assert state["execution_unknown"]["status"] == "unknown"
+    rr = ex2.poll(mk_decision(signal=1, volume_lots=0.02,
+                              decision_id="XAUUSD|M15|next"),
+                  NOW.replace(minute=15))
+    assert rr.action == "blocked_execution_unknown"
+    assert b.market_orders == []
