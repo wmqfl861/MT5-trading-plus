@@ -1309,11 +1309,19 @@ def test_h2_02_old_protective_deal_cannot_explain_later_manual_exit(tmp_path):
     assert rr.action == "blocked_external_exit"
     assert len(b.market_orders) == 1
 
+    # 重启后 pending 的 consumed ticket / event type 仍须保留。
+    ex2 = _mk_executor(b, tmp_path)
+    rr_restart = ex2.poll(mk_decision(signal=1, volume_lots=0.02,
+                                      decision_id="XAUUSD|M15|h2-02-restart"),
+                          NOW.replace(minute=40))
+    assert rr_restart.action == "blocked_external_exit"
+    assert len(b.market_orders) == 1
+
     # 即使人工成交随后变得可见，也必须保持未决，不能被旧 SL 洗白。
     b._deal_visible_at[-1] = 0
-    rr2 = ex.poll(mk_decision(signal=1, volume_lots=0.02,
-                              decision_id="XAUUSD|M15|h2-02-visible"),
-                  NOW.replace(minute=45))
+    rr2 = ex2.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|h2-02-visible"),
+                   NOW.replace(minute=45))
     assert rr2.action == "blocked_external_exit"
     state2 = json.loads((tmp_path / f"state-{MAGIC}.json").read_text(
         encoding="utf-8"))
