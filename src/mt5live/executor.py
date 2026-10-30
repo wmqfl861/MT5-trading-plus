@@ -1316,13 +1316,14 @@ class LiveExecutor:
                 if used:
                     consumed.update(used)
                     unmatched = max(0.0, unmatched - sum(used.values()))
-                if hit is None and why and "reason=" in why:
-                    manual = True
-                if unmatched > DEFAULT_VOLUME_TOLERANCE or manual:
+                # 部分减仓（ticket 仍存在）不是整仓出场事件。即使成交原因
+                # 是 CLIENT，只要对应数量已被观察并消费，也不应永久锁定 ticket。
+                if unmatched > DEFAULT_VOLUME_TOLERANCE:
                     pending[ticket] = {
                         "dir": int(prior["dir"]), "volume": unmatched,
                         "consumed_deal_tickets": dict(consumed),
-                        "manual_exit_observed": manual, "ts": iso_utc(n)}
+                        "manual_exit_observed": False,
+                        "position_still_open": True, "ts": iso_utc(n)}
                 else:
                     pending.pop(ticket, None)
             cur["consumed_deal_tickets"] = consumed
@@ -1358,7 +1359,8 @@ class LiveExecutor:
                 "dir": int(prior["dir"]), "volume": expected,
                 "consumed_deal_tickets": dict(consumed),
                 "manual_exit_observed": manual or bool(
-                    why and "reason=" in why), "ts": iso_utc(n)}
+                    why and "reason=" in why),
+                "position_still_open": False, "ts": iso_utc(n)}
             append_alert(
                 self._live_dir, ALERT_EXTERNAL_EXIT,
                 f"magic {self._magic} 持仓 {ticket} 消失且无法解释"
@@ -1368,6 +1370,8 @@ class LiveExecutor:
         if gone and self._rules.reentry == "after_signal_change":
             for ticket in gone:
                 blocked = known[ticket]["dir"]  # 非执行器平仓 → 禁同向再入（照旧）
+        if explained_deals and not pending:
+            self._write_confirmed("external_exit:" + ",".join(sorted(set(explained_deals))), n)
         self._state["known_positions"] = current
         self._state["pending_external_exits"] = pending
         self._state["blocked_dir"] = blocked
