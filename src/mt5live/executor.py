@@ -669,6 +669,14 @@ class LiveExecutor:
         self._write_pending(0.0, decision.decision_id, n)
         try:
             report = self._adapter.execute(close_only)
+        except TradeRejectedError:
+            # 明确拒绝表示该请求未成交；可按当前券商净仓确认，不进入 UNKNOWN。
+            self._write_confirmed(decision.decision_id, n)
+            marker = self._state.get("execution_unknown")
+            if isinstance(marker, dict) and marker.get("status") == "prepared" and marker.get("decision_id") == decision.decision_id:
+                self._state["execution_unknown"] = None
+                self._save_state()
+            raise
         except Exception as exc:
             marker = self._state.get("execution_unknown")
             if isinstance(marker, dict) and marker.get("decision_id") == decision.decision_id:
@@ -793,6 +801,14 @@ class LiveExecutor:
         self._write_pending(target, decision.decision_id, n)
         try:
             report = self._adapter.execute(decision)
+        except TradeRejectedError:
+            # 明确拒绝是确定态（订单未成交），可安全确认当前实际净仓。
+            self._write_confirmed(decision.decision_id, n)
+            marker = self._state.get("execution_unknown")
+            if isinstance(marker, dict) and marker.get("status") == "prepared" and marker.get("decision_id") == decision.decision_id:
+                self._state["execution_unknown"] = None
+                self._save_state()
+            raise
         except Exception as exc:
             marker = self._state.get("execution_unknown")
             if isinstance(marker, dict) and marker.get("decision_id") == decision.decision_id:
