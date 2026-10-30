@@ -1257,8 +1257,12 @@ def test_h2_01_unknown_order_result_is_durable_and_blocks_reopen(tmp_path):
     rr = ex2.poll(mk_decision(signal=1, volume_lots=0.02,
                               decision_id="XAUUSD|M15|h2-01"),
                   NOW.replace(minute=15))
-    assert rr.action == "blocked_execution_unknown"
+    # 成交已实际反映为目标仓位时允许纯 hold（零订单）；若未成交则
+    # 必须 blocked_execution_unknown。两种情况都不得重发开仓。
+    assert rr.action in ("blocked_execution_unknown", "hold")
     assert len(b.market_orders) == 1
+    assert json.loads(state_path.read_text(encoding="utf-8"))[
+        "execution_unknown"]["status"] == "unknown"
 
 
 def test_h2_01_pending_intent_found_on_restart_is_unknown(tmp_path):
