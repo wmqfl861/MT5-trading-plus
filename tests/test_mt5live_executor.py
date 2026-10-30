@@ -1300,6 +1300,11 @@ def test_h2_02_old_protective_deal_cannot_explain_later_manual_exit(tmp_path):
     consumed = state["known_positions"][str(ticket)]["consumed_deal_tickets"]
     assert consumed, "已观察的部分 SL deal ticket 必须持久消费"
 
+    # 模拟执行器进程重启：已消费的旧 SL ticket 必须从 state 文件恢复。
+    ex = _mk_executor(b, tmp_path)
+    restored = ex._state["known_positions"][ticket]["consumed_deal_tickets"]
+    assert restored == consumed
+
     # 新人工平仓的历史暂不可见；旧 SL 仍在历史里，但已被排除。
     b.deals_delay_polls = 100
     b.close_external(ticket, reason=DEAL_REASON_CLIENT, comment="manual")
