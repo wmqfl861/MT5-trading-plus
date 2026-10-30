@@ -179,3 +179,30 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_scheduled_tasks.ps1
 `data\reports\live\daily-*.md`（每日日报）、`data\demo\*.log`（全程日志）、
 `data\demo\pids.txt`（追加式完整进程清单）、`data\live\run-manifest.json`
 （运行窗登记，追加式）、`data\live\instances.json`（进程登记）。
+
+## UNKNOWN 订单结果人工核对（H2-01）
+
+如果执行器状态文件出现 `execution_unknown`，表示订单请求可能已送达券商，但本地没有拿到可确认的最终回报。此状态下禁止自动重发开仓。
+
+解除流程必须在维护窗口执行：
+
+1. 停止该 magic 的 Runner；专用脚本会尝试获取相同的 `runner-<magic>.lock`，若 Runner 仍持锁则拒绝继续。
+2. 在 MT5 终端核对该 decision 对应的成交历史、当前持仓和挂单；确认没有仍在途的请求。
+3. 确认当前策略 magic 下没有挂单。脚本会再次查询并在发现挂单时拒绝解除。
+4. 使用状态文件中的精确 `decision_id` 和人工核对原因执行：
+
+```powershell
+.venv/Scripts/python.exe scripts/live_ack_execution.py `
+  --data-dir data `
+  --gw-config config.json `
+  --magic <MAGIC> `
+  --decision-id "<DECISION_ID>" `
+  --reason "人工核对 MT5 成交/持仓/挂单，确认该请求已终结" `
+  --confirm-broker-reconciled
+```
+
+该命令只记录券商持仓/成交快照并解除 UNKNOWN，不发送、修改或平仓任何订单。若无法证明请求已终结，**不要执行解除**；保持 UNKNOWN 并暂停新开仓，先联系维护人员。解除后再按本手册启动 Runner，并运行对账确认一致。
+
+## 风控主循环卡死 watchdog（阶段 F）
+
+`risk_process.py --loop` 增加独立 watchdog。默认主循环连续 120 秒没有进展（且超时阈值不会低于轮询间隔的两倍加 5 秒）时，写入 `halt.json` 并告警。watchdog 不提交订单，也不自动删除 halt；必须检查账户轮询、Runner/Risk/Reconcile 日志和券商状态后，按维护流程人工恢复。
