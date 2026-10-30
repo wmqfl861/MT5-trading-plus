@@ -1399,3 +1399,22 @@ def test_h2_01_ack_execution_records_reconciled_broker_snapshot(tmp_path):
         encoding="utf-8"))
     assert intent["status"] == "confirmed"
     assert intent["cause"] == "ack_execution" and intent["volume"] == 0.0
+
+def test_h2_01_normal_hold_does_not_leave_prepared_execution_marker(tmp_path):
+    """目标仓位已达成的正常 hold 不应留下 prepared/UNKNOWN 状态。"""
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    first = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                                decision_id="XAUUSD|M15|hold-open"), NOW)
+    assert first.action == "open"
+    assert len(b.market_orders) == 1
+
+    second = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                                 decision_id="XAUUSD|M15|hold-noop"),
+                     NOW.replace(minute=15))
+    assert second.action == "hold"
+    state = json.loads((tmp_path / f"state-{MAGIC}.json").read_text(
+        encoding="utf-8"))
+    assert state["execution_unknown"] is None
+    assert read_intent(tmp_path)["status"] == "confirmed"
+    assert len(b.market_orders) == 1
