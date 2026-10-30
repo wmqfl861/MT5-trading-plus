@@ -1321,7 +1321,17 @@ class LiveExecutor:
         无动作的轮次绝不改写意图——目标持仓没变，改写反而会把外部漂移
         洗白（对账就失去意义了）。
         """
-        self._state["known_positions"] = self._current_positions()
+        observed = self._current_positions()
+        previous = self._state.get("known_positions") or {}
+        for ticket, pos in observed.items():
+            prior = previous.get(ticket) or {}
+            pos["consumed_deal_tickets"] = dict(
+                prior.get("consumed_deal_tickets") or {})
+            pos["unmatched_exit_volume"] = float(
+                prior.get("unmatched_exit_volume") or 0.0)
+            pos["manual_exit_observed"] = bool(
+                prior.get("manual_exit_observed", False))
+        self._state["known_positions"] = observed
         if decision_id is not None:
             self._state["last_decision_id"] = decision_id
         self._save_state()
