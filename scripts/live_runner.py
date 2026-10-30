@@ -538,12 +538,21 @@ def main(argv=None) -> int:
             gw.shutdown()
             print(f"× 无法确定账户级单实例锁身份：{exc}")
             return 2
-        if not account_lock.acquire():
+        try:
+            acquired = account_lock.acquire()
+        except OSError as exc:
             if lock is not None:
                 lock.release()
             gw.shutdown()
-            print(f"× MT5 account={gw.account.state().server}/"
-                  f"{gw.account.state().login} magic={cfg.magic} 已有运行器"
+            print(f"× 创建账户级 Runner 锁失败：{exc}")
+            return 2
+        if not acquired:
+            account_state = gw.account.state()
+            if lock is not None:
+                lock.release()
+            gw.shutdown()
+            print(f"× MT5 account={account_state.server}/"
+                  f"{account_state.login} magic={cfg.magic} 已有运行器"
                   "持锁——跨 data_root 第二份运行器拒绝启动（rc=3）")
             return 3
 
