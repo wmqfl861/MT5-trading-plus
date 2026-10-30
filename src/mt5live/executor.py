@@ -523,6 +523,7 @@ class LiveExecutor:
             live_dir, DEALS_LOG_FMT.format(magic=magic))
         self._decision_bar: str | None = None   # 本轮决策 bar（deals 行用）
         self._state = self._load_state()
+        self._recover_pending_execution()
 
     # ---- 主入口 ----
 
@@ -695,7 +696,17 @@ class LiveExecutor:
             #（C2/R6 第二道防线）→ 风控闸门（C1）。前两道挡开仓腿时平仓
             # 腿照常（_close_only_leg），风控拒绝/异常同路径。
             block_action = block_alert = block_reason = None
-            if self._state.get("state_corrupt"):
+            if self._state.get("execution_unknown"):
+                marker = self._state["execution_unknown"]
+                block_action = "blocked_execution_unknown"
+                block_alert = ALERT_STATE_CORRUPT
+                block_reason = (
+                    "execution_unknown: 上一订单的发送/成交结果尚未完成可靠核对"
+                    f"（decision_id={marker.get('decision_id', '')}，"
+                    f"status={marker.get('status', 'unknown')}）——暂停所有新开仓；"
+                    "先核对 MT5 持仓、挂单和成交历史，再通过受控人工确认流程解除；"
+                    "平仓/减仓仍允许")
+            elif self._state.get("state_corrupt"):
                 block_action = "blocked_state_corrupt"
                 block_alert = ALERT_STATE_CORRUPT
                 block_reason = (
@@ -759,15 +770,25 @@ class LiveExecutor:
                         return _rejected(verdict.reason, action="risk_rejected",
                                          orders=orders)
                     return _rejected(verdict.reason)
-        # 下单前（闸门已过）：意图 = 目标持仓（pending；订单未回，对账给宽限）
+        # 下单前持久登记执行生命周期。prepared 在重启时必须视为 UNKNOWN。
+        if self._state.get("execution_unknown") is None:
+            self._state["execution_unknown"] = {
+                "status": "prepared", "decision_id": decision.decision_id,
+                "target": float(target), "ts": iso_utc(n)}
+            self._save_state()
         self._write_pending(target, decision.decision_id, n)
         try:
             report = self._adapter.execute(decision)
-        except Exception:
-            # 订单异常返回（被拒/未知）：如实把意图记为当前实际净持仓
-            # （confirmed）——重查持仓后写，未知结果也算"已回"（对账的职责
-            # 才刚开始）；绝不留一个永远等不到回报的 pending。
-            self._write_confirmed(decision.decision_id, n)
+        except Exception as exc:
+            marker = self._state.get("execution_unknown")
+            if isinstance(marker, dict) and marker.get("decision_id") == decision.decision_id:
+                marker["status"] = "unknown"
+                marker["reason"] = f"{type(exc).__name__}: {exc}"
+                self._save_state()
+            append_alert(self._live_dir, ALERT_STATE_CORRUPT,
+                         f"magic {self._magic} decision {decision.decision_id} 订单结果未知："
+                         f"{type(exc).__name__}: {exc}——保留 pending 意图并暂停新开仓；"
+                         "必须核对券商持仓、挂单和成交历史，禁止自动重发", n)
             raise
         return self._from_execution(report)
 
@@ -784,6 +805,11 @@ class LiveExecutor:
         if not any(o.kind in ("open", "close") for o in report.orders):
             return
         self._write_confirmed(decision.decision_id, n)
+        marker = self._state.get("execution_unknown")
+        if (isinstance(marker, dict) and marker.get("status") == "prepared"
+                and marker.get("decision_id") == decision.decision_id):
+            self._state["execution_unknown"] = None
+            self._save_state()
         if report.action in ("add", "reduce"):
             append_alert(
                 self._live_dir, ALERT_UNEXPECTED_RESIZE,
@@ -924,7 +950,10 @@ class LiveExecutor:
                             data.get("pending_external_exits")),
                         "last_decision_id": data.get("last_decision_id"),
                         "state_corrupt": bool(data.get("state_corrupt",
-                                                       False))}
+                                                       False)),
+                        "execution_unknown": (data.get("execution_unknown")
+                                              if isinstance(data.get("execution_unknown"), dict)
+                                              else None)}
             except (OSError, ValueError, TypeError) as exc:
                 # H-05：状态文件损坏/不可读 ≠ 首次启动——保守恢复：不清空
                 # blocked_dir/pending_external_exits 的保护（原文已不可信，
@@ -946,10 +975,39 @@ class LiveExecutor:
                     None)
                 return {"blocked_dir": 0, "known_positions": {},
                         "pending_external_exits": {},
-                        "last_decision_id": None, "state_corrupt": True}
+                        "last_decision_id": None, "state_corrupt": True,
+                        "execution_unknown": {"status": "unknown",
+                                               "reason": "state_corrupt"}}
         return {"blocked_dir": 0, "known_positions": {},
                 "pending_external_exits": {}, "last_decision_id": None,
-                "state_corrupt": False}
+                "state_corrupt": False, "execution_unknown": None}
+
+    def _recover_pending_execution(self) -> None:
+        """恢复未完成订单意图：pending/prepared 一律视为 UNKNOWN。
+
+        进程可能在 broker 接受请求后、写入 confirmed 前崩溃。不能把
+        pending 意图当成拒单或空仓；在人工核对券商持仓/挂单/成交历史前，
+        持久暂停所有新开仓，只允许风险降低操作。
+        """
+        marker = self._state.get("execution_unknown")
+        if isinstance(marker, dict):
+            if marker.get("status") == "prepared":
+                marker["status"] = "unknown"
+                marker["reason"] = "process_restarted_before_confirmation"
+                self._save_state()
+            return
+        try:
+            with open(self._intent_path, encoding="utf-8") as f:
+                intent = json.load(f)
+        except (OSError, ValueError):
+            return
+        if isinstance(intent, dict) and intent.get("status") == STATUS_PENDING:
+            self._state["execution_unknown"] = {
+                "status": "unknown", "decision_id": str(intent.get("cause") or ""),
+                "target_side": intent.get("side"), "target_volume": intent.get("volume"),
+                "ts": str(intent.get("ts") or ""),
+                "reason": "pending_intent_found_on_restart"}
+            self._save_state()
 
     def _preserve_corrupt_state(self) -> str | None:
         """损坏的状态原文抄送到 state-<magic>.json.corrupt-<时间戳>（H-05
@@ -981,6 +1039,7 @@ class LiveExecutor:
                 self._state["pending_external_exits"].items()},
             "last_decision_id": self._state.get("last_decision_id"),
             "state_corrupt": bool(self._state.get("state_corrupt")),
+            "execution_unknown": self._state.get("execution_unknown"),
         }
         write_json_atomic(self._state_path, payload)   # T33：经 fileio（重试）
 
