@@ -768,7 +768,7 @@ class TestBtLoadPath:
             calls["load_series"] += 1
             return synth
 
-        def fake_merged(root, sym, tf, *, end=None):
+        def fake_merged(root, sym, tf, *, end=None, allow_unbounded=False):
             calls["merged"] += 1
             calls["merged_end"] = end
             return synth, ["mt5"] * len(synth), [], []

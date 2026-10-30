@@ -558,12 +558,16 @@ def test_strategy_fingerprint_canonical_combination(tmp_path):
     assert fp == expect
 
 
-def test_strategy_files_exclude_outside_library():
-    """指纹覆盖范围：策略类所在模块必进；strategies/library **外**的依赖
-    （如 strategies.base）不进指纹。"""
+def test_strategy_files_exclude_outside_project():
+    """指纹覆盖范围（X-05 修订）：策略类所在模块必进；**项目包外**的依赖
+    （pandas/numpy 等真库外）不进指纹；项目内的 strategies.base 进指纹
+    （绝对导入按项目包边界收录——buy_hold 的 base.py 是实际基类依赖）。"""
+    from pathlib import Path
     main = cards._module_file(f"{_LIB}.buy_hold")
+    base = cards._module_file("mt5quant.strategies.base")
     files = cards.strategy_files(f"{_LIB}.buy_hold:BuyHold")
-    assert [f.resolve() for f in files] == [main.resolve()]
+    assert sorted(f.resolve() for f in files) == sorted(
+        [base.resolve(), main.resolve()])
 
 
 def test_strategy_files_include_intra_library_imports(tmp_path):
@@ -632,19 +636,38 @@ def test_strategy_files_relative_import_from_non_library_strategy(
     assert {f.name for f in got} == {"ztop.py", "tables.py"}
 
 
-def test_strategy_files_absolute_outside_library_still_excluded(
+def test_x05_strategy_files_absolute_within_project_now_included(
         tmp_path, monkeypatch):
-    """H-12 兼容口径：**绝对** import 的库外依赖（strategies.base、
-    numpy/pandas 等）仍不进指纹（T37：由 git_commit + engine_version 覆盖）
-    ——修复只针对相对导入的解析方式，不扩大绝对导入的收录范围。"""
+    """X-05（2026-10-30 审核，原 H-12 兼容口径的**错误契约**已修）：
+    **绝对** import 的**项目内**依赖（mt5quant.strategies.base、
+    mt5quant.prob.labels 等）进指纹——真实 P 策略的绝对导入是实际评估
+    依赖，改代码必须改变 strategy_sha（审核探针 dependencies：labels/
+    tables/decision 三项直接依赖曾被漏掉）。真库外（numpy/pandas）仍
+    不进指纹（T37：由 git_commit + engine_version 覆盖）。"""
     files, add = _fake_project(tmp_path)
     add("mt5quant.strategies.base", "class BaseStrategy: pass\n")
+    add("mt5quant.prob.labels", "def label_triggers(): pass\n")
     add(f"{_LIB}.guarded",
         "import numpy as np\n"
-        "from mt5quant.strategies.base import BaseStrategy\n")
+        "from mt5quant.strategies.base import BaseStrategy\n"
+        "from mt5quant.prob.labels import label_triggers\n")
     monkeypatch.setattr(cards, "_module_file", lambda name: files.get(name))
     got = cards.strategy_files(f"{_LIB}.guarded:Guarded")
-    assert {f.name for f in got} == {"guarded.py"}
+    assert {f.name for f in got} == {"guarded.py", "base.py", "labels.py"}
+
+
+def test_x05_real_prob_strategy_closure_includes_prob_core():
+    """X-05 集成：真实 P 策略（level_decision）的依赖闭包含概率核心
+    labels/tables/decision——只改这些文件也会改变 strategy_sha。"""
+    from pathlib import Path
+    from mt5quant.strategies.library.prob import level_decision as _ld
+    pkg_root = Path(_ld.__file__).resolve().parents[3]   # .../src/mt5quant
+    got = {str(f.resolve().relative_to(pkg_root)).replace("\\", "/")
+           for f in cards.strategy_files(
+               "mt5quant.strategies.library.prob.level_decision:"
+               "LevelDecisionS1Demo")}
+    for rel in ("prob/labels.py", "prob/tables.py", "prob/decision.py"):
+        assert rel in got, f"{rel} 不在依赖闭包内（X-05）"
 
 
 def test_strategy_files_transitive_within_library(tmp_path, monkeypatch):

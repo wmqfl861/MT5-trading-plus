@@ -5,6 +5,7 @@
 - 改动 config/gates.toml 后拒绝运行（test_tampered_gates_toml_refuses）。
 """
 import dataclasses
+import types as types_mod
 import importlib.util
 import json
 from datetime import datetime, timezone
@@ -635,10 +636,13 @@ def patch_card_git(monkeypatch, mod, *, committed=PAST, clean=True):
 
 
 def gate_argv(root, cards_dir, ledger, gates, *extra):
+    # X-03/X-06（2026-10-30 审核）：合成夹具声明——裸库（无声明研究上界）
+    # + 无轮次卡（关卡行为测试不测轮次制）；正式 CLI 缺省两者都拒绝。
     return ["gate", "--card", "H700", "--cards-dir", str(cards_dir),
             "--data-root", str(root), "--ledger", str(ledger),
             "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
-            "--costs", "zero", "--gates", gates, *extra]
+            "--costs", "zero", "--gates", gates,
+            "--allow-unbounded-data", "--allow-no-round", *extra]
 
 
 def patch_as_main_store(monkeypatch, mod):
@@ -804,7 +808,8 @@ def test_screen_and_gate_record_same_gates_hash_crlf(tmp_path, monkeypatch):
 
     rc_s = mod.main(["screen", "--card", "H700", "--cards-dir", str(cards_dir),
                      "--data-root", str(root), "--ledger", str(led_scr),
-                     "--strategy", BUY_HOLD, "--costs", "zero"])
+                     "--strategy", BUY_HOLD, "--costs", "zero",
+                     "--allow-no-round", "--allow-unbounded-data"])
     rc_g = mod.main(gate_argv(root, cards_dir, led_gate, "G0",
                               "--params", "{}"))
     assert (rc_s, rc_g) == (0, 0)
@@ -851,7 +856,8 @@ def test_gate_params_auto_selects_max_net_profit_run(tmp_path, monkeypatch,
 
     rc = mod.main(["gate", "--card", "H701", "--cards-dir", str(cards_dir),
                    "--data-root", str(root), "--ledger", str(ledger),
-                   "--strategy", DONCHIAN, "--costs", "zero", "--gates", "G0"])
+                   "--strategy", DONCHIAN, "--costs", "zero", "--gates", "G0",
+                   "--allow-no-round", "--allow-unbounded-data"])
     assert rc == 0
     out = capsys.readouterr().out
     assert f"run#{r2}" in out and "候选" in out
@@ -887,7 +893,8 @@ def test_gate_params_manual_selection_recorded(tmp_path, monkeypatch):
     rc = mod.main(["gate", "--card", "H701", "--cards-dir", str(cards_dir),
                    "--data-root", str(root), "--ledger", str(ledger),
                    "--strategy", DONCHIAN, "--costs", "zero", "--gates", "G0",
-                   "--params", '{"entry_days": 10, "exit_days": 2}'])
+                   "--params", '{"entry_days": 10, "exit_days": 2}',
+                   "--allow-no-round", "--allow-unbounded-data"])
     assert rc == 0
     with Ledger(ledger) as led:
         det = json.loads(led.conn.execute(
@@ -910,7 +917,8 @@ def test_gate_params_auto_unknown_selection_rule_rejected(tmp_path,
     patch_card_git(monkeypatch, mod)
     rc = mod.main(["gate", "--card", "H701", "--cards-dir", str(cards_dir),
                    "--data-root", str(root), "--ledger", str(ledger),
-                   "--strategy", DONCHIAN, "--costs", "zero", "--gates", "G0"])
+                   "--strategy", DONCHIAN, "--costs", "zero", "--gates", "G0",
+                   "--allow-no-round", "--allow-unbounded-data"])
     assert rc == 1
     assert "selection_rule" in capsys.readouterr().out
     with Ledger(ledger) as led:
@@ -927,7 +935,8 @@ def test_gate_params_auto_without_candidates_rejected(tmp_path, monkeypatch,
     patch_card_git(monkeypatch, mod)
     rc = mod.main(["gate", "--card", "H701", "--cards-dir", str(cards_dir),
                    "--data-root", str(root), "--ledger", str(ledger),
-                   "--strategy", DONCHIAN, "--costs", "zero", "--gates", "G0"])
+                   "--strategy", DONCHIAN, "--costs", "zero", "--gates", "G0",
+                   "--allow-no-round", "--allow-unbounded-data"])
     assert rc == 1
     assert "screen" in capsys.readouterr().out
     with Ledger(ledger) as led:
@@ -1041,6 +1050,101 @@ def test_g5_orchestrate_protocol_order(tmp_path, monkeypatch):
         assert led.lockbox_status("H001") == "started"   # run_g5 被替身顶替
 
 
+def test_x02_reference_replays_only_approved_trial_g3(tmp_path, monkeypatch):
+    """X-02（2026-10-30 审核）：G5 参照只消费**获准试验身份**下的 G3——
+    同卡 B（同数据、不同参数/成本、更新的 G3 通过）不得充当 A 的参照
+    （旧行为按 card_id 取最近通过的 G3、只比数据哈希——审核探针
+    g5_reference 的反例）。"""
+    mod = load_bt()
+    bars = ramp_bars(40)
+    seg_a = [{"test_range": [0, 20], "params": {"who": "A"}}]
+    seg_b = [{"test_range": [0, 20], "params": {"who": "B"}}]
+    from mt5quant.backtest.report import data_sha256
+    ledger_path = tmp_path / "l.sqlite"
+    with Ledger(ledger_path) as led:
+        run_a = led.record_run(
+            card_id="H777", card_version=1, strategy="s:D", params={"x": 1},
+            symbol="XAUUSD", timeframe="H1", data_first="", data_last="",
+            data_sha256=data_sha256(bars), engine_version="A-1.3",
+            cost_model_version="cost-a", gates_hash="", actor="test",
+            metrics={"sharpe": 1.0})
+        led.record_gate(run_a, "G3", True, {"segments": seg_a})
+        led.record_gate(run_a, "V3", True, {})
+        run_b = led.record_run(
+            card_id="H777", card_version=1, strategy="s:D", params={"x": 2},
+            symbol="XAUUSD", timeframe="H1", data_first="", data_last="",
+            data_sha256=data_sha256(bars), engine_version="A-1.3",
+            cost_model_version="cost-b", gates_hash="", actor="test",
+            metrics={"sharpe": 1.0})
+        led.record_gate(run_b, "G3", True, {"segments": seg_b})
+        led.record_gate(run_b, "V3", True, {})
+    trial = vg.LockboxTrial(params={"x": 1}, data_sha256=data_sha256(bars),
+                            cost_model_version="cost-a",
+                            strategy_sha="legacy", gates_hash="")
+    captured = []
+
+    def capture(spec, data, costs, segments):
+        captured.extend(segments)
+        return pd.Series([0.0, 0.01])
+
+    monkeypatch.setattr(mod, "_stitch_oos_from_segments", capture)
+    spec = buy_hold_spec(mod)
+    card = types_mod.SimpleNamespace(id="H777")
+    with Ledger(ledger_path) as led:
+        rets, binding = mod._g3_reference_returns(
+            led, card, spec, bars, mod.ZeroCosts(), trial=trial)
+    assert captured == seg_a                      # 只重放获准 A 的 segments
+    assert binding["g3_run_id"] == run_a          # 绑定指向 A 的 G3 行
+    assert binding["trial"]["cost_model_version"] == "cost-a"
+    # 无 trial 的调用形态已删除（X-02：不提供按 card_id 的回退）
+    with Ledger(ledger_path) as led:
+        with pytest.raises(TypeError):
+            mod._g3_reference_returns(led, card, spec, bars,
+                                      mod.ZeroCosts(),
+                                      data_sha=data_sha256(bars))
+
+
+def test_x02_begin_lockbox_rejects_mismatched_reference_before_reserve(
+        tmp_path):
+    """X-02：begin_lockbox 核对参照绑定（g3_run_id + segments 指纹）与获准
+    G3 一致——不一致在读取锁箱与扣预算**之前**拒绝（不写 lockbox_uses）。"""
+    led = g3_ledger(tmp_path)
+    rid = led.record_run(
+        card_id="H777", card_version=1, strategy="s:D", params={},
+        symbol="XAUUSD", timeframe="H1", data_first="", data_last="",
+        data_sha256="a" * 64, engine_version="A-1.3",
+        cost_model_version="zero-v0", gates_hash="", actor="test",
+        metrics={"sharpe": 1.0})
+    led.record_gate(rid, "G3", True,
+                    {"segments": [{"test_range": [0, 5]}]})
+    led.record_gate(rid, "V3", True, {})
+    trial = lockbox_trial()
+    # g3_ledger 已有一条同身份 G3/V3（details 空）——begin_lockbox 不带
+    # reference：按获准 G3（最新同身份通过行 = rid）解析并返回绑定
+    binding = vg.begin_lockbox(led, "H777", approved_by="u", trial=trial)
+    assert binding["g3_run_id"] == rid
+    assert led.lockbox_used("H777") is True       # 一致 → 占位成功
+    led.close()
+    # 绑定不一致（伪造 run_id/指纹）→ LockboxPrerequisiteError，
+    # 且发生在扣预算之前（H778 的锁箱一次性未消耗）
+    p2 = tmp_path / "l2.sqlite"
+    with Ledger(p2) as led2:
+        rid2 = led2.record_run(
+            card_id="H778", card_version=1, strategy="s:D", params={},
+            symbol="XAUUSD", timeframe="H1", data_first="", data_last="",
+            data_sha256="a" * 64, engine_version="A-1.3",
+            cost_model_version="zero-v0", gates_hash="", actor="test",
+            metrics={"sharpe": 1.0})
+        led2.record_gate(rid2, "G3", True, {"segments": []})
+        led2.record_gate(rid2, "V3", True, {})
+        with pytest.raises(vg.LockboxPrerequisiteError, match="不一致"):
+            vg.begin_lockbox(
+                led2, "H778", approved_by="u", trial=lockbox_trial(),
+                reference={"g3_run_id": 999999,
+                           "g3_segments_sha256": "deadbeefdeadbeef"})
+        assert led2.lockbox_used("H778") is False  # 扣预算之前拒绝
+
+
 def test_h02_orchestrate_v3_failure_never_reads_lockbox(tmp_path,
                                                          monkeypatch):
     """H-02（编排级）：同试验身份当前 V3 失败 → begin_lockbox 拒绝，锁箱
@@ -1074,7 +1178,10 @@ def test_h02_orchestrate_v3_failure_never_reads_lockbox(tmp_path,
         led.record_gate(rid2, "G3", True, {"segments": segments})
         led.record_gate(rid2, "V3", False, {"failed_vetoes": ["primary"]})
     with Ledger(ledger_path) as led:
-        with pytest.raises(vg.LockboxPrerequisiteError, match="V3"):
+        # X-02：参照绑定（含当前 V3 判决核对）在 begin_lockbox 之前——
+        # 同试验身份已见 V3 失败时参照解析即拒绝（ValueError），锁箱
+        # loader 零调用、不扣预算（历史 G3/V3 成功不授权当前失败试验）。
+        with pytest.raises(ValueError, match="V3"):
             mod._g5_orchestrate(led, h001_card(mod), **g5_kwargs(mod, bars))
         assert calls == []                     # 锁箱 loader 零调用
         assert led.lockbox_used("H001") is False

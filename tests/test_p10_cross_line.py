@@ -54,6 +54,37 @@ def _run_kw(**over):
     return base
 
 
+def test_t103_legacy_precheck_skips_reservation_regime(tmp_path):
+    """批 1 复审 A1（X-01）：旧预检只服务 legacy_dedup 口径轮——
+    reservation 口径轮即便旧口径计数已满也必须放行，交由 reserve_trial
+    计算前判定（同身份幂等推进 screen→gate、新身份拒绝且零计算）；
+    否则"自己占满最后一格"的卡会被堵死。"""
+    p = tmp_path / "regime.sqlite"
+    with Ledger(p) as led:
+        led.record_round_open(
+            round_id="R9", candidates=["C101"], trial_budget=1,
+            lockbox_uses_max=0, dsr_trial_scope="project",
+            advance_rule="a", close_rule="c", approved_by="u",
+            evaluation={}, toml_sha256="0" * 64, git_commit="0" * 40)
+        # 空轮先占位（此时回退计数 0/1 放行）→ completed → 写成功行
+        resv = led.reserve_trial("R9", "t-abc", actor="bt")
+        led.advance_trial_stage(resv["reservation_id"], "reached_primary")
+        led.advance_trial_stage(resv["reservation_id"], "completed")
+        led.record_run(**_run_kw())               # 旧口径计数也 1/1（已满）
+        assert led.round_n_dedup("R9") == 1
+        assert led.round_trial_regime("R9") == "reservations"
+        ctx = {"round_id": "R9", "trial_budget": 1, "lockbox_uses_max": 0}
+        assert BT._round_budget_exceeded(led, ctx) is False
+        # 同身份幂等推进不受预算影响（screen→gate 不被自己堵死）；
+        # 新身份在计算前被拒
+        again = led.reserve_trial("R9", "t-abc", actor="bt")
+        assert again["reservation_id"] == resv["reservation_id"]
+        import pytest as _pytest
+        from mt5quant.research.ledger import TrialBudgetExceededError
+        with _pytest.raises(TrialBudgetExceededError):
+            led.reserve_trial("R9", "t-new", actor="bt")
+
+
 # ------------------------------------------------------- 1. 原子试验预算
 def test_p10_race_last_trial_slot_single_winner(tmp_path):
     """P-10：两连接竞争最后一个试验名额（trial_budget=1、两个不同七元组）
@@ -107,9 +138,19 @@ def test_p10_error_row_not_checked_not_consumed(tmp_path):
         assert led.round_n_dedup("R9") == 1
 
 
-def test_p10_h_path_no_kwarg_writes_past_cap(tmp_path):
-    """P-10：不带 kwarg（H 调用路径）在预算满后仍可写——共享方法对 H
-    行为逐位不变的直接证明。"""
+def test_x01_h_path_refused_by_shared_reservation(tmp_path):
+    """X-01（2026-10-30 审核，原 test_p10_h_path_no_kwarg_writes_past_cap
+    的**错误契约**修正）：H/P 共享同一轮次预算，权威在计算前 reserve_trial
+    ——旧断言"H 成功行不带 kwarg 可越过 cap 继续写"固定的正是审核 X-01
+    指出的越限漏洞。新契约：
+    - 最后一个名额被占（无论 H 还是 P 占）后，任何新试验的占位被拒
+      （TrialBudgetExceededError，不写行、零计算调用）；
+    - 同身份成功行照常写入（screen→gate 不被自己的占位堵死）；
+    - **绕过占位**的新身份成功行由 record_run 的对账后盾拦下
+      （TrialReservationConsistencyError，事务整体回滚——防双计）。"""
+    from mt5quant.research.ledger import (
+        TrialBudgetExceededError, TrialReservationConsistencyError)
+
     p = tmp_path / "h.sqlite"
     with Ledger(p) as led:
         led.record_round_open(
@@ -117,11 +158,27 @@ def test_p10_h_path_no_kwarg_writes_past_cap(tmp_path):
             lockbox_uses_max=0, dsr_trial_scope="project",
             advance_rule="a", close_rule="c", approved_by="u",
             evaluation={}, toml_sha256="0" * 64, git_commit="0" * 40)
-        led.record_run(round_trial_budget=1, **_run_kw())
-        rid = led.record_run(**_run_kw(params={"combo": "h2"},
-                                       strategy="h2"))       # 不带 kwarg
-        assert rid > 0
-        assert led.round_n_dedup("R9") == 2
+        # P 试验占住最后一个名额（started 即计）
+        r = led.reserve_trial("R9", "trial-p", budget=1)
+        assert r["stage"] == "started"
+        # H 试验（bt 的 H 正式路径同样走 reserve_trial）在计算前被拒
+        with pytest.raises(TrialBudgetExceededError):
+            led.reserve_trial("R9", "trial-h", budget=1)
+        assert led.round_n_trials("R9") == 1
+        # 占位内的成功行放行（去重 1 ≤ 上限）；同身份再写也放行
+        rid = led.record_run(round_trial_budget=1, **_run_kw())
+        rid2 = led.record_run(round_trial_budget=1, **_run_kw())
+        assert rid > 0 and rid2 > rid
+        assert led.round_n_dedup("R9") == 1
+        # 绕过占位的新身份成功行：对账后盾拒绝、整体回滚
+        n_before = led.conn.execute("SELECT COUNT(*) n FROM runs").fetchone()["n"]
+        with pytest.raises(TrialReservationConsistencyError):
+            led.record_run(round_trial_budget=1,
+                           **_run_kw(params={"combo": "h2"}, strategy="h2"))
+        n_after = led.conn.execute("SELECT COUNT(*) n FROM runs").fetchone()["n"]
+        assert n_after == n_before
+        assert led.round_n_dedup("R9") == 1
+        assert led.verify_chain() == []
 
 
 def test_p10_round_id_none_or_budget_none_no_check(tmp_path):
@@ -173,7 +230,8 @@ def test_p10_screen_policy_from_sessions_source(p2_env, monkeypatch):
             "--cards-dir", str(p2_env["cards"]),
             "--data-root", str(p2_env["store"]),
             "--ledger", str(p2_env["ledger"]), "--costs", "zero",
-            "--volume-lots", "1.0"]
+            "--volume-lots", "1.0",
+            "--allow-unbounded-data"]   # X-03：合成裸库夹具声明
     out = io.StringIO()
     monkeypatch.chdir(p2_env["tmp"])
     try:
@@ -198,7 +256,8 @@ def test_p10_fittable_g3_rejected_before_any_run(p2_env, monkeypatch):
             "--gates", "G0,G3", "--cards-dir", str(p2_env["cards"]),
             "--data-root", str(p2_env["store"]),
             "--ledger", str(p2_env["ledger"]), "--costs", "zero",
-            "--volume-lots", "1.0", "--params", "{}"]
+            "--volume-lots", "1.0", "--params", "{}",
+            "--allow-unbounded-data"]    # X-03：合成裸库夹具声明
     out = io.StringIO()
     code = 0
     monkeypatch.chdir(p2_env["tmp"])

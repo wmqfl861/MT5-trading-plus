@@ -360,7 +360,8 @@ def test_open_records_round_row_in_chain(tmp_path, monkeypatch, capsys):
 
 def run_screen(mod, cards_dir, root, ledger_path, *, card="H100"):
     return mod.main(
-        ["screen", "--card", card, "--cards-dir", str(cards_dir),
+        ["screen", "--card", card, "--allow-unbounded-data",
+         "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero", "--volume-lots", "0.01"])
@@ -453,12 +454,24 @@ def test_screen_records_round_id_on_runs(tmp_path, monkeypatch, capsys):
         rid = led.conn.execute(
             "SELECT round_id FROM runs").fetchone()["round_id"]
     assert rid == "R1"
-    # 轮次制之前：新台账（rounds 空）+ 不带 round 字段的卡 → 照常运行
+    # X-06（2026-10-30 审核，原契约修正）：新台账（rounds 空）+ 不带
+    # round 字段的卡 → **拒绝**（空台账只表示未初始化，不表示免预注册；
+    # 换一个全新 ledger 不能回到轮次制之前的旧规则）；显式 --allow-no-round
+    # 迁移通道下照常运行且 round_id 为 NULL。
     legacy_ledger = tmp_path / "legacy.sqlite"
     legacy_cards = write_card(tmp_path, CARD_BODY, "H200.toml")
     legacy_cards.joinpath("H200.toml").write_text(
         CARD_BODY.replace('id = "H100"', 'id = "H200"'), encoding="utf-8")
     rc = run_screen(mod, legacy_cards, root, legacy_ledger, card="H200")
+    assert rc == 1, capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "已开启轮次" in out and "X-06" in out
+    rc = mod.main(
+        ["screen", "--card", "H200", "--cards-dir", str(legacy_cards),
+         "--data-root", str(root), "--ledger", str(legacy_ledger),
+         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--costs", "zero", "--volume-lots", "0.01",
+         "--allow-unbounded-data", "--allow-no-round"])
     assert rc == 0, capsys.readouterr().out
     with Ledger(legacy_ledger) as led:
         assert led.conn.execute(
@@ -485,7 +498,9 @@ def test_screen_rejects_over_trial_budget(tmp_path, monkeypatch, capsys):
     rc = run_screen(mod, cards_dir, root2, ledger_path)   # 第 2 个试验超预算
     assert rc == 1
     out = capsys.readouterr().out
-    assert "trial_budget" in out
+    # X-01 后：reservation 口径轮的拒绝来自 reserve_trial（计算前占位，
+    # 消息为"试验预算已满"）；旧口径轮仍打印 trial_budget 预检消息
+    assert "trial_budget" in out or "试验预算已满" in out
     with Ledger(ledger_path) as led:
         n = led.conn.execute(
             "SELECT COUNT(*) FROM runs WHERE round_id='R1'").fetchone()[0]

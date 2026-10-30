@@ -38,6 +38,17 @@
   ——候选预筛结论（T62/D31：bt candidate check 的产出；决策枚举
   pass/fail/waiting_data，result_json 与 research/candidates/C###.precheck.json
   同一负载）。旧库打开时自动建表并入链（空表从链首开始）。
+- trial_reservations(reservation_id, round_id, trial_key, stage,
+  identity_digest, actor, created_utc, updated_utc, prev_hash, row_hash)
+  ——**计算前共享试验占位**（X-01/D55，2026-10-30 全局审核）：键
+  (round_id, trial_key) UNIQUE；trial_key 为不透明身份串（调用方传完整
+  TrialIdentity 的 hash，台账只接受 str、不解释其内容）；stage ∈
+  {started, reached_primary, completed, failed, voided} **只进不退**——
+  started→reached_primary→completed|failed，voided 仅自 started（未达
+  主检验）——**到达主检验（reached_primary）后失败/崩溃/作废都不回收
+  N**；阶段推进经 _update_chained 归档改写（旧行完整进 ledger_events，
+  链可验证）。旧库打开时自动建表并入链（空表从链首开始；新表无历史
+  行，不触发任何重算迁移）。
 - rounds(round_id PRIMARY KEY, opened_utc, toml_sha256, candidates_json,
   trial_budget, lockbox_uses_max, dsr_trial_scope, advance_rule,
   close_rule, approved_by, evaluation_json, git_commit, status,
@@ -57,7 +68,8 @@
   自动迁移路径）。
 
 哈希链（T37/M6/D27；R6/C5 防洗链；T62 加 candidate_checks；T63 加
-rounds）：runs / gates / lockbox_uses / candidate_checks / rounds 各一条
+rounds；X-01 加 trial_reservations）：runs / gates / lockbox_uses /
+candidate_checks / rounds / trial_reservations 各一条
 按 rowid 串联的链，
 row_hash = sha256(规范化行 JSON + prev_hash)
 （规范化 = 全部内容列、键排序、紧凑分隔符；prev_hash/row_hash 自身不入
@@ -66,7 +78,8 @@ row_hash = sha256(规范化行 JSON + prev_hash)
 - **写前验证**：所有写方法（record_run / record_gate /
   record_lockbox_use / record_lockbox_start / finish_lockbox_use /
   lockbox_budget / register_card / record_round_open /
-  record_round_close）写前先 verify_chain()，不完整 →
+  record_round_close / reserve_trial / advance_trial_stage）写前先
+  verify_chain()，不完整 →
   抛 LedgerTamperedError（fail-closed，提示人工核查）——正常写入**绝不
   重算已有行**，因此篡改证据不可能被"正常 record_run 一次"洗掉；
 - **增量延伸**：合法追加只计算新行的 row_hash（prev = 当前链尾），
@@ -123,6 +136,20 @@ T85（第十三轮 §4.1）新增关卡 v3 主检验的 N 口径：project_n_ded
 （run_class=research 且 round_id 非空，全项目、跨轮累计）+ lineage_n_dedup
 (候选 continues_family 指向的历史谱系，只计轮次外)——主检验 N = 两者之和
 （primary_test_n）；轮次制之前的其余历史只报告、不进门槛。
+
+X-01（2026-10-30 全局审核）：**轮次试验预算的 N 口径分两版并存**——
+- 新口径（本轮存在任何 trial_reservations 行即生效，round_trial_regime
+  返回 "reservations"）：权威计数 = round_n_trials——**到达 started 即
+  计**（D55"每条到达主检验的假设计一次"，按审核提示词以 started 计 N、
+  reached_primary 只是阶段标记——计算前占位即烧名额，主检验后失败/崩溃
+  不回收；voided 仅限未达主检验的取消并释放名额）。record_run 的
+  round_trial_budget 在新口径轮**不再做预算拒绝**（权威在 reservation），
+  降级为对账后盾：成功行使去重计数超上限 → TrialReservationConsistencyError
+  整体回滚（防双计/防绕过占位）。
+- 旧口径（无任何 reservation 的轮次，round_trial_regime 返回
+  "legacy_dedup"）：round_n_trials 回退 round_n_dedup（成功行七元组去重，
+  T99/P-10 语义逐位保留）——迁移规则：旧轮次不补写 reservation、不重算
+  历史 N，两版以"reservation 行存在与否"显式区分，绝不静默混算。
 """
 from __future__ import annotations
 
@@ -222,6 +249,19 @@ CREATE TABLE IF NOT EXISTS lockbox_budget(
   max_uses    INTEGER NOT NULL,
   created_utc TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS trial_reservations(
+  reservation_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+  round_id        TEXT NOT NULL,
+  trial_key       TEXT NOT NULL,
+  stage           TEXT NOT NULL DEFAULT 'started',
+  identity_digest TEXT NOT NULL,
+  actor           TEXT NOT NULL,
+  created_utc     TEXT NOT NULL,
+  updated_utc     TEXT NOT NULL,
+  prev_hash       TEXT NOT NULL DEFAULT '',
+  row_hash        TEXT NOT NULL DEFAULT '',
+  UNIQUE (round_id, trial_key)
+);
 CREATE TABLE IF NOT EXISTS chain_meta(
   table_name  TEXT NOT NULL PRIMARY KEY,
   last_rowid  INTEGER NOT NULL,
@@ -267,8 +307,11 @@ def run_class_for_actor(actor: str) -> str:
 # 硬闸门，结论的事后改写必须像 runs 一样留痕。
 # T63/D32：rounds（轮次预注册开启/关闭）入链——试验预算与锁箱用量
 # 的申报值就锁在这条链上，改预算/抹轮次要能报出。
+# X-01（2026-10-30 全局审核）：trial_reservations（计算前共享试验占位）
+# 入链——阶段改写（归档式）与删行/伪造追加都走同一防洗链机制，篡改
+# reservation 阶段（如把 reached_primary 洗回 voided 以回收 N）要能报出。
 _CHAIN_TABLES = ("runs", "gates", "lockbox_uses", "candidate_checks",
-                 "rounds")
+                 "rounds", "trial_reservations")
 _SNAPSHOT_TABLES = _CHAIN_TABLES + ("ledger_events",)
 GENESIS_HASH = "0" * 64
 
@@ -307,6 +350,44 @@ class LockboxRoundCapExceededError(LockboxReservationError):
 # 传入该上限；缺省 None 无检查（H 调用路径行为不变）。
 class RoundTrialBudgetExceededError(RuntimeError):
     """本轮次的试验预算（trial_budget）已满——本次 runs 行不写入。"""
+
+
+# X-01（全局审核 2026-10-30）：计算前共享试验占位（reserve_trial）的
+# 拒绝类型。预算权威从"成功行去重计数（T99）"前移到"到达 started 的
+# reservation"——研究计算**开始之前**就烧名额，失败/崩溃不再能溜出 N。
+class TrialReservationError(RuntimeError):
+    """试验占位/阶段推进被拒的基类（X-01）。"""
+
+
+class TrialBudgetExceededError(TrialReservationError):
+    """本轮的试验预算（reservation 口径：到达 started 即计）已满——
+    占位被拒，不写任何行、不占额度。
+
+    注意与 RoundTrialBudgetExceededError（T99，成功行写入时点）是**两个
+    时点、两个口径**的拒绝：前者挡在计算之前，后者只在新口径未生效的
+    旧轮次继续生效。"""
+
+
+class TrialReservationConsistencyError(TrialReservationError):
+    """新口径轮（本轮存在 reservation）成功行写入时的**对账**失败——
+    成功行去重计数超过申报上限（防双计：reservation 已把本轮试验钉在
+    ≤上限，超了说明有成功行绕过占位写入），record_run 整体回滚。"""
+
+
+# X-01：试验占位阶段机——只进不退。started（计算前占位）→
+# reached_primary（到达主检验标记）→ completed|failed（终态）；
+# voided（取消并释放名额）仅自 started——**到达主检验后失败/崩溃/作废
+# 都不回收 N**（D55：每条到达主检验的假设计一次，按审核提示词以
+# started 计 N，reached_primary 只是阶段标记）。
+TRIAL_STAGES = ("started", "reached_primary", "completed", "failed",
+                "voided")
+_TRIAL_STAGE_FORWARD = {
+    "started": ("reached_primary", "voided"),
+    "reached_primary": ("completed", "failed"),
+    "completed": (),
+    "failed": (),
+    "voided": (),
+}
 
 
 def _san(obj):
@@ -749,7 +830,8 @@ class Ledger:
                              ("gates", ("run_id", "gate")),
                              ("lockbox_uses", ("card_id",)),
                              ("candidate_checks", ("candidate_id",)),
-                             ("rounds", ("round_id",))):
+                             ("rounds", ("round_id",)),
+                             ("trial_reservations", ("reservation_id",))):
             cols = [r["name"] for r in self.conn.execute(
                 f"PRAGMA table_info({tbl})")]
             if "row_hash" not in cols:
@@ -777,6 +859,9 @@ class Ledger:
                     label = f"candidate_checks {r['candidate_id']}"
                 elif tbl == "rounds":
                     label = f"rounds {r['round_id']}"
+                elif tbl == "trial_reservations":
+                    label = (f"trial_reservations {r['round_id']}/"
+                             f"{r['trial_key']}")
                 else:
                     label = f"lockbox_uses card={r['card_id']}"
                 if r["row_hash"] != expect:
@@ -897,13 +982,24 @@ class Ledger:
         卡 research；运维通道 reconcile_ab 的 actor=ops 经缺省推断为 ops）；
         缺省 None = 按 actor 推断（run_class_for_actor）；枚举外 →
         ValueError。
-        round_trial_budget（P-10，仅 P 调用路径传入）：给出且 round_id
-        非空时，试验预算检查（round_n_dedup ≥ 上限 → 
-        RoundTrialBudgetExceededError，不写任何行）与写入在同一个
-        BEGIN IMMEDIATE 事务内——两个连接竞争最后一个名额只有一个能
-        提交（与 H-03 reserve_lockbox_use 同族）。round_n_dedup 只计
-        成功行，故该检查只对成功行（error=None）生效；缺省 None /
-        round_id=None / error 非 None → 无检查，H 调用路径行为不变。
+        round_trial_budget（P-10/T99，调用路径传入）：给出且 round_id
+        非空时，与写入在同一个 BEGIN IMMEDIATE 事务内做预算相关处理——
+        **X-01 起按本轮口径分流**：
+        - 旧口径（本轮无任何 trial_reservations 行，round_trial_regime
+          ='legacy_dedup'）：T99 语义逐位不变——round_n_dedup ≥ 上限 →
+          RoundTrialBudgetExceededError，不写任何行（两个连接竞争最后
+          一个名额只有一个能提交；round_n_dedup 只计成功行，故该检查
+          只对成功行 error=None 生效）；
+        - 新口径（本轮存在任何 reservation，round_trial_regime
+          ='reservations'）：成功行**不再做预算拒绝**——预算权威在
+          reserve_trial（到达 started 即计，D55）；本参数降级为**对账
+          后盾**：成功行写入后去重计数 > 上限 →
+          TrialReservationConsistencyError、事务整体回滚（防双计/
+          防绕过占位——reservation 已把本轮试验钉在 ≤上限，成功行去重
+          数超限说明有试验未经占位就写成功行）。
+        缺省 None / round_id=None / error 非 None → 无检查无对账，
+        H 调用路径行为不变（模块 C 接线后新口径轮可不传本参数——
+        权威完全在 reservation）。
         R6/C5：写前验证链（不完整 → LedgerTamperedError，不洗链）；
         追加只延伸链（_append_chained，增量计算 row_hash）。
         R7/N-C3：验链、读链尾、写入、刷快照同一 BEGIN IMMEDIATE 事务
@@ -925,19 +1021,39 @@ class Ledger:
         payload = {"ok": error is None, "error": error, "metrics": metrics}
         with self._txn():
             self._verify_or_raise()
-            # P-10：预算检查与写入同一 BEGIN IMMEDIATE 事务（只对成功行
-            # 生效——round_n_dedup 不计失败行；并发竞争最后一个名额时
-            # 只有一个连接能提交）
+            # X-01：本轮是否存在任何 reservation（新口径生效标志——
+            # 与 round_trial_regime 同一判定）
+            new_regime = (round_id is not None
+                          and self._round_has_reservations(round_id))
+            # P-10/T99：预算检查与写入同一 BEGIN IMMEDIATE 事务（只对
+            # 成功行生效——round_n_dedup 不计失败行；并发竞争最后一个
+            # 名额时只有一个连接能提交）。X-01 起仅对**旧口径轮**生效；
+            # 新口径轮的预算权威在 reserve_trial，这里不做拒绝。
+            # X-01 补充（模块 C 接线，2026-10-30）：同身份成功行的**重录**
+            # （幂等重试，七元组已在现有键集内）不增 N、不被拒——审核
+            # 反例"同身份重试反被满额拒绝"（探针 budgets 第三项）在旧
+            # 口径层同样不允许复现；只有**新身份**才会被预算拒绝。
             if (round_trial_budget is not None and round_id is not None
-                    and error is None):
-                used = self.round_n_dedup(round_id)
-                if used >= round_trial_budget:
+                    and error is None and not new_regime):
+                rows = self.conn.execute(
+                    "SELECT strategy, params_json, symbol, timeframe,"
+                    " data_sha256, cost_model_version, strategy_sha,"
+                    " metrics_json, actor, run_class FROM runs"
+                    " WHERE round_id=?",
+                    (round_id,)).fetchall()
+                keys = self._dedup_keys(rows)
+                new_key = (strategy,
+                           json.dumps(_san(params), sort_keys=True,
+                                      ensure_ascii=False),
+                           symbol, timeframe, data_sha256,
+                           cost_model_version, strategy_sha)
+                if new_key not in keys and len(keys) >= round_trial_budget:
                     raise RoundTrialBudgetExceededError(
                         f"轮次 {round_id} 的试验预算已满"
-                        f"（{used}/{round_trial_budget}，去重口径，"
+                        f"（{len(keys)}/{round_trial_budget}，去重口径，"
                         "P-10：检查与写入同一事务）——本次运行不写入、"
                         "不占预算")
-            return self._append_chained("runs", {
+            rid = self._append_chained("runs", {
                 "run_id": None,
                 "card_id": card_id, "card_version": card_version,
                 "strategy": strategy,
@@ -953,6 +1069,21 @@ class Ledger:
                 "round_id": round_id,
                 "run_class": run_class,
             })
+            # X-01 对账后盾（仅新口径轮 + 成功行 + 带上限）：reservation
+            # 已把本轮试验钉在 ≤上限，成功行去重数超限 = 有试验绕过占位
+            # 写入（或两套口径被同时使用）——一致性错误，事务整体回滚
+            # （上面的 append 一并撤销，链回到写入前状态）。
+            if (round_trial_budget is not None and round_id is not None
+                    and error is None and new_regime):
+                used = self.round_n_dedup(round_id)
+                if used > round_trial_budget:
+                    raise TrialReservationConsistencyError(
+                        f"轮次 {round_id} 的成功行对账失败：成功运行去重"
+                        f"计数 {used} > 申报上限 {round_trial_budget}，而"
+                        "本轮 reservation（新口径）至多许可这么多试验——"
+                        "存在绕过 reserve_trial 的成功行或双口径并用；"
+                        "本次写入整体回滚（X-01 防双计）")
+            return rid
 
     def record_gate(self, run_id: int, gate: str, passed: bool,
                     details: dict) -> None:
@@ -1310,6 +1441,225 @@ class Ledger:
             " SELECT 1 FROM runs r WHERE r.card_id = lockbox_uses.card_id"
             " AND r.round_id = ?)", (round_id,)).fetchone()["n"])
 
+    # ------------------------------------ 试验占位（X-01，2026-10-30 审核批 1）
+
+    def _round_has_reservations(self, round_id: str) -> bool:
+        """本轮是否存在任何 trial_reservations 行（含 voided——口径版本
+        标志看"表里有无该轮的行"，不看阶段/成败）。运行在调用方事务内。"""
+        return self.conn.execute(
+            "SELECT 1 FROM trial_reservations WHERE round_id=? LIMIT 1",
+            (round_id,)).fetchone() is not None
+
+    def round_trial_regime(self, round_id: str) -> str:
+        """本轮试验预算的**口径版本标记**（X-01 迁移规则：两口径显式
+        并存，绝不静默混算）：
+        - "reservations"：新口径——本轮存在任何 trial_reservations 行；
+          权威计数 round_n_trials（到达 started 即计），record_run 的
+          round_trial_budget 降级为对账后盾；
+        - "legacy_dedup"：旧口径——无任何 reservation 行；计数与拒绝
+          都走 round_n_dedup（T99 语义逐位保留），历史 N 不重算。"""
+        return ("reservations" if self._round_has_reservations(round_id)
+                else "legacy_dedup")
+
+    def reserve_trial(self, round_id: str, trial_key: str, *,
+                      budget: int | None = None, actor: str = "bt",
+                      identity_digest: str | None = None) -> dict:
+        """X-01：**计算前共享试验占位**——预算检查与 started 写入在
+        同一个 BEGIN IMMEDIATE 事务内（与 H-03 reserve_lockbox_use 同族：
+        两个连接竞争最后一个名额只有一个能提交）。
+
+        N 口径（D55"每条到达主检验的假设计一次"，按 2026-10-30 审核提示
+        词以 started 计 N、reached_primary 只是阶段标记）：占位即烧一个
+        名额——主检验后失败/崩溃不回收（见 advance_trial_stage）；voided
+        （仅限未达主检验的取消）释放名额。
+
+        行为分支（同事务内依序判定）：
+        - budget：缺省 None → 从已注册轮次读 rounds.trial_budget（"从已
+          冻结轮次读取预算"；轮次未注册 → ValueError——占位必须有明确
+          预算来源）；显式给出须为正整数（≤0 → ValueError）且优先于表内
+          申报值（过渡期/测试直连用）。
+        - 同 (round_id, trial_key) 已存在且非 voided → **幂等返回现有行**
+          （不占新额度、不做预算检查）——崩溃重试与 screen→gate 同身份
+          推进不会被"已占自己的最后额度"堵死（审核 bug"同身份重试反被
+          满额拒绝"的修复）。
+        - 已存在但 stage=voided（名额已释放）→ 重新过预算检查，通过则
+          经归档改写复活为 started（同 reservation_id、created_utc 与
+          identity_digest 不变，旧行完整进 ledger_events）。
+        - 否则：本轮权威计数 round_n_trials ≥ budget →
+          TrialBudgetExceededError（不写任何行、不占额度）；通过则写入
+          stage='started' 行并入哈希链。
+
+        trial_key：**不透明身份串**（调用方传完整 TrialIdentity 的
+        hash），台账不解释内容、只按 (round_id, trial_key) 查重——
+        输入变化即新身份、占新额度，同身份重试幂等。identity_digest：
+        可选身份摘要（缺省 = trial_key），仅审计展示，不参与查找。
+
+        返回占位行 dict：{reservation_id, round_id, trial_key, stage,
+        identity_digest, actor, created_utc, updated_utc}。
+        R6/C5：写前验证链（reservation 行被删/改 → LedgerTamperedError，
+        洗阶段回收 N 不可能）。R7/N-C3：检查与写入同一事务。"""
+        if not isinstance(trial_key, str) or not trial_key:
+            raise ValueError(
+                f"trial_key 必须是非空字符串（不透明试验身份），收到 "
+                f"{trial_key!r}——完整 TrialIdentity 的 hash 由调用方计算"
+                "（X-05），台账只负责按 (round_id, trial_key) 查重")
+        if budget is not None and (isinstance(budget, bool)
+                                   or not isinstance(budget, int)
+                                   or budget <= 0):
+            raise ValueError(
+                f"budget 必须为正整数，收到 {budget!r}——零/负预算应由"
+                "调用方不发起试验表达，而不是写进占位检查里")
+        with self._txn():
+            self._verify_or_raise()
+            if budget is None:
+                rrow = self.conn.execute(
+                    "SELECT trial_budget FROM rounds WHERE round_id=?",
+                    (round_id,)).fetchone()
+                if rrow is None:
+                    raise ValueError(
+                        f"reserve_trial 需要 budget：轮次 {round_id} 未在"
+                        " rounds 注册，无从读取预注册的 trial_budget——"
+                        "试验占位必须有明确预算来源（X-01：从已冻结轮次"
+                        "读预算，铁律 16 预注册先行）")
+                budget = int(rrow["trial_budget"])
+            existing = self.conn.execute(
+                "SELECT reservation_id FROM trial_reservations"
+                " WHERE round_id=? AND trial_key=?",
+                (round_id, trial_key)).fetchone()
+            if existing is not None:
+                current = self.trial_reservation(round_id, trial_key)
+                if current["stage"] != "voided":
+                    return current                      # 幂等：不占新额度
+                # voided（未达主检验即取消，名额已释放）：重新过预算检查
+                used = self.round_n_trials(round_id)
+                if used >= budget:
+                    raise TrialBudgetExceededError(
+                        f"轮次 {round_id} 的试验预算已满（{used}/{budget}，"
+                        "reservation 口径：到达 started 即计）——voided 占位"
+                        f" {trial_key} 的复活被拒（X-01：释放的名额不是该"
+                        "身份的私有保留）")
+                cols = self._table_cols("trial_reservations")
+                names = ", ".join(f'"{c}"' for c in cols)
+                row = self.conn.execute(
+                    f"SELECT {names} FROM trial_reservations WHERE"
+                    " rowid=?",
+                    (existing["reservation_id"],)).fetchone()
+                content = {c: row[c] for c in cols}
+                content["stage"] = "started"
+                content["updated_utc"] = datetime.now(
+                    timezone.utc).isoformat()
+                self._update_chained(
+                    "trial_reservations",
+                    int(existing["reservation_id"]), content,
+                    row_key=f"round_id={round_id}/trial_key={trial_key}",
+                    action="voided->started")
+                return self.trial_reservation(round_id, trial_key)
+            used = self.round_n_trials(round_id)
+            if used >= budget:
+                raise TrialBudgetExceededError(
+                    f"轮次 {round_id} 的试验预算已满（{used}/{budget}，"
+                    "reservation 口径：到达 started 即计——X-01：计算前"
+                    "占位，失败/崩溃不回收）——本次占位不写入、不占额度")
+            now = datetime.now(timezone.utc).isoformat()
+            self._append_chained("trial_reservations", {
+                "reservation_id": None,
+                "round_id": round_id, "trial_key": trial_key,
+                "stage": "started",
+                "identity_digest": (trial_key if identity_digest is None
+                                    else identity_digest),
+                "actor": actor, "created_utc": now, "updated_utc": now})
+            return self.trial_reservation(round_id, trial_key)
+
+    def advance_trial_stage(self, reservation_id: int, stage: str) -> dict:
+        """X-01：试验占位阶段推进——只允许预定义前进方向（TRIAL_STAGES）：
+        started→reached_primary→completed|failed；voided 仅自 started
+        （未达主检验的取消，释放名额）。同阶段重推 = 幂等 no-op（崩溃后
+        重放安全）。
+
+        **到达主检验（reached_primary）后失败/崩溃/作废都不回收 N**：
+        reached_primary→voided 与一切回退/跳跃/终态再改 → ValueError——
+        D55"每条到达主检验的假设计一次"由阶段机钉死，不能靠 error 行或
+        作废把已烧的名额洗回来。
+
+        阶段改写经 _update_chained 归档：旧行完整进 ledger_events（审计
+        可重放"改写前是什么"），该行 row_hash 用 (prev_hash, 新内容) 重算、
+        后继联动，链保持可验证——直接改库洗阶段会被 verify_chain 报出。
+        R6/C5：写前验证链。R7/N-C3：查行/归档/改写/重算/快照同一事务。
+
+        返回更新后的占位行 dict（同 reserve_trial 的形态）。"""
+        if stage not in TRIAL_STAGES:
+            raise ValueError(
+                f"未知试验占位阶段 {stage!r}——合法阶段 {list(TRIAL_STAGES)}"
+                "（X-01 阶段机：started→reached_primary→completed|failed；"
+                "voided 仅自 started）")
+        with self._txn():
+            self._verify_or_raise()
+            cols = self._table_cols("trial_reservations")
+            names = ", ".join(f'"{c}"' for c in cols)
+            # reservation_id 是 INTEGER PRIMARY KEY（rowid 别名）——
+            # WHERE rowid=? 与按内容列取回同一行
+            row = self.conn.execute(
+                f"SELECT {names} FROM trial_reservations"
+                " WHERE rowid=?", (int(reservation_id),)).fetchone()
+            if row is None:
+                raise ValueError(
+                    f"reservation {reservation_id} 不存在（trial_"
+                    "reservations 无此行）——无从推进阶段")
+            current = row["stage"]
+            if stage != current and stage not in _TRIAL_STAGE_FORWARD[current]:
+                raise ValueError(
+                    f"试验占位 {row['round_id']}/{row['trial_key']} 的阶段"
+                    f"推进被拒：{current} → {stage} 不在允许方向（X-01："
+                    "started→reached_primary→completed|failed；voided 仅自"
+                    " started——未达主检验的取消；到达主检验后失败/崩溃"
+                    "/作废都不回收 N，D55）")
+            if stage != current:
+                content = {c: row[c] for c in cols}
+                content["stage"] = stage
+                content["updated_utc"] = datetime.now(
+                    timezone.utc).isoformat()
+                self._update_chained(
+                    "trial_reservations", int(row["reservation_id"]),
+                    content,
+                    row_key=f"round_id={row['round_id']}/"
+                            f"trial_key={row['trial_key']}",
+                    action=f"{current}->{stage}")
+            out = self.conn.execute(
+                f"SELECT {names} FROM trial_reservations WHERE rowid=?",
+                (row["reservation_id"],)).fetchone()
+            return {c: out[c] for c in cols}
+
+    def trial_reservation(self, round_id: str, trial_key: str) -> dict | None:
+        """按 (round_id, trial_key) 查占位行（崩溃恢复/调用方接线用；
+        不存在 → None）。返回形态同 reserve_trial。"""
+        row = self.conn.execute(
+            "SELECT reservation_id, round_id, trial_key, stage,"
+            " identity_digest, actor, created_utc, updated_utc FROM"
+            " trial_reservations WHERE round_id=? AND trial_key=?",
+            (round_id, trial_key)).fetchone()
+        return None if row is None else dict(row)
+
+    def round_n_trials(self, round_id: str) -> int:
+        """本轮试验次数——**新口径权威计数**（X-01）：trial_reservations
+        中该轮 stage<>'voided' 的行数。
+
+        口径（D55"每条到达主检验的假设计一次"，按 2026-10-30 审核提示词
+        以 started 计 N）：**到达 started 即计**——reached_primary /
+        completed / failed 只是阶段标记，主检验后失败/崩溃不回收；voided
+        （仅限未达主检验的取消，见 advance_trial_stage）释放名额、不计入。
+
+        迁移规则（两口径显式并存，round_trial_regime 为版本标记）：本轮
+        无任何 reservation 行 → **回退旧口径** round_n_dedup（成功行
+        七元组去重，T99 语义逐位保留）——旧轮次不补写 reservation、历史
+        N 不重算；一旦本轮出现第一行 reservation 即整体切为新口径（不
+        支持中途混算：先有成功行再开始占位的"混合轮"会让旧成功行掉出
+        口径——新轮次必须从第一次计算前就占位，这是模块 C 接线的责任）。"""
+        if self._round_has_reservations(round_id):
+            return int(self.conn.execute(
+                "SELECT COUNT(*) n FROM trial_reservations WHERE round_id=?"
+                " AND stage<>'voided'", (round_id,)).fetchone()["n"])
+        return self.round_n_dedup(round_id)
+
     # ---------------------------------------------------------------- 读
 
     def lockbox_used(self, card_id: str) -> bool:
@@ -1429,6 +1779,27 @@ class Ledger:
             " AND actor<>'migration' AND strategy_sha<>'legacy'"
             " ORDER BY run_id LIMIT 1", (card_id, version)).fetchone()
         return None if row is None else str(row["strategy_sha"])
+
+    def _dedup_keys(self, rows: list) -> set:
+        """成功运行按 (strategy, params, symbol, timeframe, data_sha256,
+        cost_model_version, strategy_sha) 七元组的键集（与 _dedup_n 同键
+        同口径；失败行/迁移行不计）。X-01：record_run 旧口径预算检查用它
+        区分"同身份幂等重录"与"新身份占新名额"。"""
+        keys: set = set()
+        for r in rows:
+            rc = r["run_class"] if "run_class" in r.keys() else None
+            if rc is None:
+                rc = run_class_for_actor(r["actor"])
+            if rc == "migration":
+                continue
+            if not json.loads(r["metrics_json"]).get("ok"):
+                continue
+            keys.add((r["strategy"],
+                      json.dumps(json.loads(r["params_json"]),
+                                 sort_keys=True, ensure_ascii=False),
+                      r["symbol"], r["timeframe"], r["data_sha256"],
+                      r["cost_model_version"], r["strategy_sha"]))
+        return keys
 
     def _dedup_n(self, rows: list, *, only_research: bool = False,
                  rounds: str | None = None) -> int:

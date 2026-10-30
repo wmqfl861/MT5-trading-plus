@@ -164,14 +164,18 @@ def test_fit_context_g0_uses_first_70pct(tmp_path):
 
 
 def test_prob_run_fields_roundtrip():
+    # X-05（2026-10-30 审核）：模型 hash 从 metrics_prob 移入 params_prob
+    # （改去重身份）——params.prob = {**params_prob, model_sha256}
     fit_ctx = {"params_prob": {"segment": "discovery",
                                "split": "2019-12-01",
                                "bracket": {"sl_atr": 1.0}},
+               "model_sha": "ab" * 32,
                "metrics_prob": {"model_sha256": "ab" * 32,
                                 "prob_version": "1.0.0",
                                 "purge_bars": 26}}
     params, summary = BT._prob_run_fields(fit_ctx, {"x": 1}, {"net": 2.0})
-    assert params == {"x": 1, "prob": fit_ctx["params_prob"]}
+    assert params == {"x": 1, "prob": {**fit_ctx["params_prob"],
+                                       "model_sha256": "ab" * 32}}
     assert summary["prob"]["model_sha256"] == "ab" * 32
     # 非概率卡 → 原样
     p2, s2 = BT._prob_run_fields(None, {"x": 1}, {"net": 2.0})
@@ -229,6 +233,7 @@ def test_prob_fields_into_ledger_chain(tmp_path):
                                "split": "2019-12-01",
                                "bracket": {"sl_atr": 1.0, "tp_atr": 2.0,
                                            "horizon_bars": 24}},
+               "model_sha": "cd" * 32,
                "metrics_prob": {"model_sha256": "cd" * 32,
                                 "prob_version": "1.0.0",
                                 "fit_start": "2013-06-01",
@@ -245,6 +250,37 @@ def test_prob_fields_into_ledger_chain(tmp_path):
         assert rid == 1
         probs = led.verify_chain()
     assert probs == []          # 哈希链校验通过（新字段进链可验）
+
+
+def test_x05_model_hash_changes_dedup_identity(tmp_path):
+    """X-05（2026-10-30 审核，原"模型 hash 只进 metrics 不进去重键"的
+    错误契约修正）：模型 sha256 进 params.prob（去重身份）——两个不同
+    模型（同七元组其余字段）的拟合运行算**两次**试验，不再被去重算 1。
+    （审核探针 dependencies 的第二反例：distinct model hashes →
+    deduplicated trials == 1。）"""
+    from mt5quant.research.ledger import Ledger
+    db = tmp_path / "x05.sqlite"
+    with Ledger(db) as led:
+        led.record_round_open(
+            round_id="R2", candidates=["C101"], trial_budget=9,
+            lockbox_uses_max=0, dsr_trial_scope="project",
+            advance_rule="a", close_rule="c", approved_by="u",
+            evaluation={}, toml_sha256="0" * 64, git_commit="0" * 40)
+        for model_sha in ("synthetic-model-a", "synthetic-model-b"):
+            fit_ctx = {"params_prob": {"segment": "validation",
+                                       "split": "2020-01-01",
+                                       "bracket": {"sl_atr": 1.0}},
+                       "model_sha": model_sha,
+                       "metrics_prob": {"model_sha256": model_sha}}
+            params, metrics = BT._prob_run_fields(fit_ctx, {}, {"n": 1})
+            led.record_run(
+                card_id="P009-v1", card_version=1, strategy="s:P",
+                params=params, symbol="XAUUSD", timeframe="H1",
+                data_first=None, data_last=None, data_sha256="a" * 64,
+                engine_version="e", cost_model_version="v", gates_hash="",
+                metrics=metrics, actor="bt", round_id="R2")
+        assert led.round_n_dedup("R2") == 2   # 不同模型 = 不同试验
+        assert led.verify_chain() == []
 
 
 # ============================================ T98 波次 2（P-05 cmd fit）
@@ -360,7 +396,8 @@ def test_p05_fit_rejects_unopened_round(fit_env, monkeypatch, capsys):
     照常拟合落盘）。"""
     import contextlib
     empty = fit_env["tmp"] / "empty-ledger.sqlite"
-    argv = ["fit", "P005-v1", "--strategy", STRATEGY_REF,
+    argv = ["fit", "P005-v1", "--allow-unbounded-data",
+            "--strategy", STRATEGY_REF,
             "--cards-dir", str(fit_env["repo"] / "research" / "cards"),
             "--data-root", str(fit_env["store"]), "--ledger", str(empty)]
     out = io.StringIO()
@@ -382,7 +419,8 @@ def test_p05_fit_rejects_uncommitted_card(fit_env, monkeypatch, capsys):
     import contextlib
     monkeypatch.setattr(BT.cards, "committed_at",
                         lambda path, runner=None: None)
-    argv = ["fit", "P005-v1", "--strategy", STRATEGY_REF,
+    argv = ["fit", "P005-v1", "--allow-unbounded-data",
+            "--strategy", STRATEGY_REF,
             "--cards-dir", str(fit_env["repo"] / "research" / "cards"),
             "--data-root", str(fit_env["store"]),
             "--ledger", str(fit_env["ledger"])]
@@ -408,7 +446,8 @@ def test_p05_fit_rejects_standard_discovery(fit_env, monkeypatch, capsys):
                  encoding="utf-8")
     _git(fit_env["repo"], "add", ".")
     _git(fit_env["repo"], "commit", "-q", "-m", "discovery-card")
-    argv = ["fit", "P005-v1", "--strategy", STRATEGY_REF,
+    argv = ["fit", "P005-v1", "--allow-unbounded-data",
+            "--strategy", STRATEGY_REF,
             "--cards-dir", str(fit_env["repo"] / "research" / "cards"),
             "--data-root", str(fit_env["store"]),
             "--ledger", str(fit_env["ledger"])]
@@ -491,7 +530,8 @@ def test_p05_fit_full_run_with_builtin_strategy(fit_env, monkeypatch,
     """P-05：真实内置策略（LevelDecisionS1Demo）fit 合成数据完整跑通
     （临时 store+git；standard+validation P2 决策卡）；训练窗止于分界。"""
     import contextlib
-    argv = ["fit", "P005-v1", "--strategy", STRATEGY_REF,
+    argv = ["fit", "P005-v1", "--allow-unbounded-data",
+            "--strategy", STRATEGY_REF,
             "--cards-dir", str(fit_env["repo"] / "research" / "cards"),
             "--data-root", str(fit_env["store"]),
             "--ledger", str(fit_env["ledger"])]
@@ -524,7 +564,8 @@ def test_p05_fit_rejects_round_toml_modified(fit_env, monkeypatch, capsys):
     p = fit_env["round"]
     p.write_text(p.read_text(encoding="utf-8").replace(
         'split = "2019-12-01"', 'split = "2020-06-01"'), encoding="utf-8")
-    argv = ["fit", "P005-v1", "--strategy", STRATEGY_REF,
+    argv = ["fit", "P005-v1", "--allow-unbounded-data",
+            "--strategy", STRATEGY_REF,
             "--cards-dir", str(fit_env["repo"] / "research" / "cards"),
             "--data-root", str(fit_env["store"]),
             "--ledger", str(fit_env["ledger"])]

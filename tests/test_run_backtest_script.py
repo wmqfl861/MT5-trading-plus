@@ -335,7 +335,8 @@ def test_cli_missing_cache_errors_with_guidance(tmp_path, monkeypatch, capsys):
         "mt5quant.strategies.library.buy_hold:BuyHold",
         "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
         "--data-root", str(root), "--out", str(tmp_path / "out"),
-        "--contract-size", "100", "--allow-zero-swap", "--risk-per-trade", "0"])
+        "--contract-size", "100", "--allow-zero-swap", "--risk-per-trade", "0",
+        "--allow-unbounded-data"])
     assert mod.main() == 1
     out = capsys.readouterr().out
     assert "spread_model.json" in out and "build_cost_model" in out
@@ -372,7 +373,8 @@ def test_cli_build_cost_model_flag_builds_cache_and_runs(tmp_path, monkeypatch,
         "mt5quant.strategies.library.buy_hold:BuyHold",
         "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
         "--data-root", str(root), "--out", str(tmp_path / "out"),
-        "--contract-size", "100", "--allow-zero-swap", "--build-cost-model"])
+        "--contract-size", "100", "--allow-zero-swap", "--build-cost-model",
+        "--allow-unbounded-data"])
     assert mod.main() == 0
     cache = root / "costs" / "spread_model.json"
     assert cache.exists()
@@ -384,7 +386,8 @@ def test_cli_build_cost_model_flag_builds_cache_and_runs(tmp_path, monkeypatch,
         "mt5quant.strategies.library.buy_hold:BuyHold",
         "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
         "--data-root", str(root), "--out", str(tmp_path / "out"),
-        "--contract-size", "100", "--allow-zero-swap"])
+        "--contract-size", "100", "--allow-zero-swap",
+        "--allow-unbounded-data"])
     assert mod.main() == 0
     assert "缓存" in capsys.readouterr().out
 
@@ -438,7 +441,8 @@ def _run_cli(mod, tmp_path, monkeypatch, root, extra):
             "mt5quant.strategies.library.buy_hold:BuyHold",
             "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
             "--data-root", str(root), "--out", str(tmp_path / "out"),
-            "--costs", "zero", "--contract-size", "100"] + list(extra)
+            "--costs", "zero", "--contract-size", "100",
+            "--allow-unbounded-data"] + list(extra)   # X-03：合成裸库声明
     monkeypatch.setattr("sys.argv", argv)
     return mod.main()
 
@@ -622,7 +626,8 @@ def test_cli_research_store_switch_uses_data_research(tmp_path, monkeypatch,
         "mt5quant.strategies.library.buy_hold:BuyHold",
         "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
         "--research-store", "--out", str(tmp_path / "out"),
-        "--volume-lots", "0.01", "--allow-zero-swap"])
+        "--volume-lots", "0.01", "--allow-zero-swap",
+        "--allow-unbounded-data"])
     assert mod.main() == 0
     out = capsys.readouterr().out
     assert "研究库" in out and "缓存" in out
@@ -645,7 +650,7 @@ def test_cli_default_reads_research_store_without_flags(tmp_path, monkeypatch,
         "mt5quant.strategies.library.buy_hold:BuyHold",
         "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
         "--volume-lots", "0.01", "--allow-zero-swap",
-        "--out", str(tmp_path / "out")])
+        "--out", str(tmp_path / "out"), "--allow-unbounded-data"])
     assert mod.main() == 0, capsys.readouterr().out
     assert "研究库" in capsys.readouterr().out
     run_dir = sorted((tmp_path / "out").iterdir())[-1]
@@ -697,7 +702,7 @@ def test_cli_missing_research_store_points_to_export(tmp_path, monkeypatch,
         "mt5quant.strategies.library.buy_hold:BuyHold",
         "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
         "--volume-lots", "0.01", "--allow-zero-swap",
-        "--out", str(tmp_path / "out")])
+        "--out", str(tmp_path / "out"), "--allow-unbounded-data"])
     assert mod.main() == 1
     out = capsys.readouterr().out
     assert "data_research" in out and "export_research_store" in out
@@ -761,7 +766,8 @@ def test_cli_research_store_missing_cache_points_to_export(tmp_path,
         "mt5quant.strategies.library.buy_hold:BuyHold",
         "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
         "--research-store", "--out", str(tmp_path / "out"),
-        "--volume-lots", "0.01", "--allow-zero-swap"])
+        "--volume-lots", "0.01", "--allow-zero-swap",
+        "--allow-unbounded-data"])
     assert mod.main() == 1
     out = capsys.readouterr().out
     assert "export_research_store" in out
@@ -1048,7 +1054,10 @@ def test_cost_version_binds_actual_swap_rates_snapshot(tmp_path):
         Path(specs, "latest.json").write_text(json.dumps({
             "XAUUSD": {"swap_mode": 2, "swap_long": swap_long,
                        "swap_short": -2.0, "swap_rollover3days": 3,
-                       "contract_size": 100, "currency_profit": "USD"}}),
+                       "contract_size": 100, "currency_profit": "USD",
+                       # H2-03：mode=2 须带基础币种（=账户货币才可用）；
+                       # 缺字段的研究侧语义已改为明确拒绝（test_costs_swap）
+                       "currency_base": "USD"}}),
             encoding="utf-8")
         return root
 

@@ -129,6 +129,15 @@
   台账不完整时一切写入 fail-closed 抛 LedgerTamperedError），链头由
   scripts/ledger_anchor.py 每日锚定进 git（docs/ops/ledger-anchors.md，
   链式锚 + --verify 校验模式，R6/C5）。
+- 计算前占位与试验身份（X-01/X-05，2026-10-30 审核）：screen/gate/
+  prob test 的主计算前 reserve_trial 占位（trial_key = 完整试验身份的
+  sha256，含 identity_version="v1"；P2 带冻结模型 hash、P1 带 evaluator
+  身份）；主检验开始 advance reached_primary，成功 completed、异常
+  failed（不回收 N）、未达主检验的取消 voided（释放名额）。旧轮次
+  （无 reservation 且已有成功行）不走占位，T99 语义逐位不变——新旧
+  口径以 round_trial_regime 显式标记并存；旧 ledger 的历史
+  strategy_sha/N 不重算（X-05 的指纹闭包扩展只影响新运行的
+  strategy_sha，旧行保留原值，identity_version 标记版本界线）。
 """
 import argparse
 import hashlib
@@ -158,6 +167,7 @@ from mt5quant.research import power  # noqa: E402
 from mt5quant.research import rounds as rnd  # noqa: E402
 from mt5quant.research.ledger import (  # noqa: E402
     Ledger, LedgerTamperedError, RESERVED_ACTORS, RoundTrialBudgetExceededError,
+    TrialBudgetExceededError, TrialReservationConsistencyError,
     run_class_for_actor,
 )
 from mt5quant.validation import gates as vgate  # noqa: E402
@@ -241,6 +251,151 @@ def _reject_ops_ack(args) -> bool:
               "（actor=ops 通道）")
         return True
     return False
+
+
+def _allow_unbounded(args) -> bool:
+    """X-03（2026-10-30 审核）：--allow-unbounded-data 的统一读取——数据
+    装载（load_series → research_bars / merged_research_series）透传
+    allow_unbounded。缺省 False：正式研究读必须能证明数据来源与研究上界，
+    裸库（无任何声明边界）不再自动直读；True 仅为合成测试夹具/数据迁移
+    的显式声明通道。"""
+    return bool(getattr(args, "allow_unbounded_data", False))
+
+
+def _allow_no_round(args) -> bool:
+    """X-06（2026-10-30 审核）：--allow-no-round 的统一读取——研究入口
+    缺省要求已开启轮次（空台账≠免预注册）；True 仅为无轮次合成夹具/
+    轮次制迁移的显式声明通道（_round_context 的 allow_no_round）。"""
+    return bool(getattr(args, "allow_no_round", False))
+
+
+# ------------------------------------------------ X-01（2026-10-30 审核）：
+# 计算前共享试验占位（reserve_trial）的接线层。台账侧（模块 A）提供
+# reserve_trial / advance_trial_stage / round_n_trials（权威口径：到达
+# started 即计 N，主检验后失败/崩溃不回收；voided 仅限未达主检验的取消）；
+# 本节把 screen / gate / prob test 的主计算接到占位上：
+# - 主计算开始前 reserve_trial（预算拒绝发生在计算之前——零计算调用）；
+# - 主检验实际开始处 advance 到 reached_primary；
+# - 成功行写入后 advance completed；异常/作废 advance failed（在
+#   reached_primary 之后——不回收 N）；
+# - T99 的"运行期间作废"路径改为 voided 仅当未达主检验；
+# - 旧轮次（无 reservation 且已有成功行）不走占位，T99 语义逐位不变。
+
+# X-05（C-4）：试验身份版本字段——批 2 P2-01 把获准白名单并入身份时递增
+# 为 "v2"（避免二次迁移；旧 ledger 的历史 strategy_sha/N 不重算，新旧
+# 口径以 identity_version 显式标记并存）。
+TRIAL_IDENTITY_VERSION = "v1"
+
+
+def _trial_key(*, strategy: str, params: dict, symbol: str, timeframe: str,
+               data_sha256: str, cost_model_version: str, strategy_sha: str,
+               extra: dict | None = None) -> str:
+    """X-01/X-05：试验身份键 = 完整试验身份的 sha256。
+
+    本模块（批 1）以现行七元组（strategy+params+symbol+timeframe+
+    data_sha256+cost_model_version+strategy_sha）为主体，外加
+    identity_version 预留版本位；P2 拟合卡把冻结模型 hash、P1 把
+    evaluator 身份（prob 核心文件 hash + 方法版本）经 extra 并入——
+    影响结果的输入变化即新身份、占新额度，同身份重试幂等只占一次。
+    params 走规范化 JSON（键序无关，与台账去重键同一口径）。"""
+    payload = {
+        "identity_version": TRIAL_IDENTITY_VERSION,
+        "strategy": strategy,
+        "params": json.dumps(params, sort_keys=True, ensure_ascii=False),
+        "symbol": symbol, "timeframe": timeframe,
+        "data_sha256": data_sha256,
+        "cost_model_version": cost_model_version,
+        "strategy_sha": strategy_sha,
+    }
+    if extra:
+        payload.update(extra)
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, ensure_ascii=False,
+        separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _p1_evaluator_sha() -> str:
+    """X-05：P1 evaluator 身份——概率核心实现的文件指纹（p1 + 其真实
+    依赖闭包里的 labels/tables/decision/counting/gaps/scenarios 等
+    mt5quant.prob 模块，经 cards._imports_within 的 AST 解析取闭包）+
+    方法版本串。进 P1 运行的 params.prob.evaluator_sha256（改去重身份：
+    换评估实现 = 新试验）与 reservation trial_key（extra）。"""
+    files = []
+    seen: set[str] = set()
+    proj_root = cards._module_file("mt5quant")
+    project_root = (proj_root.parent if proj_root is not None else None)
+    queue = ["mt5quant.prob.p1"]
+    while queue:
+        name = queue.pop(0)
+        if name in seen:
+            continue
+        seen.add(name)
+        f = cards._module_file(name)
+        if f is None:
+            continue
+        files.append(f)
+        if project_root is None:
+            continue
+        for dep, dep_name in cards._imports_within(f, project_root, name,
+                                                   project_root):
+            if (dep_name.startswith("mt5quant.prob.")
+                    and dep_name not in seen):
+                queue.append(dep_name)
+    parts = [f"{f.as_posix()}:{hashlib.sha256(f.read_bytes()).hexdigest()}"
+             for f in sorted(files, key=lambda p: p.as_posix())]
+    digest = hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+    return f"p1-v1#{digest[:16]}"
+
+
+def _use_reservations(ledger, round_ctx) -> bool:
+    """X-01 接线：本轮是否走 reservation 口径？
+
+    - 本轮已有任何 trial_reservations（round_trial_regime='reservations'）
+      → 是；
+    - 无 reservation 且 round_n_dedup==0（全新轮次，尚无成功行）→ 是
+      ——新轮次从第一次计算前就占位（模块 A 迁移规则：不支持中途混算，
+      先有成功行再占位会让旧成功行掉出口径）；
+    - 无 reservation 且已有成功行（旧轮次）→ 否：T99 语义逐位保留
+      （不补写 reservation、不重算历史 N）。
+    round_ctx 为 None（标定样品/轮次之外）→ 否。"""
+    if not round_ctx:
+        return False
+    rid = round_ctx["round_id"]
+    if ledger.round_trial_regime(rid) == "reservations":
+        return True
+    return ledger.round_n_dedup(rid) == 0
+
+
+class _TrialReserver:
+    """一次命令调用内的占位会话：reserve → reached_primary →
+    completed/failed/voided 的阶段推进壳（崩溃安全：reserve 返回行，
+    advance 幂等；TrialBudgetExceededError 不写任何行）。
+
+    同 trial_key 重跑（此前已终态 completed/failed 的占位）→ reserve 幂等
+    返回现有行、不占新额度，阶段不再推进（终态只进不退；重跑只是重放
+    同一试验，N 不变——去重口径与 reservation 口径都不重复计数）。"""
+
+    def __init__(self, ledger, round_ctx, *, actor: str):
+        self._ledger = ledger
+        self._round_id = round_ctx["round_id"]
+        self._budget = round_ctx["trial_budget"]
+        self._actor = actor
+        self._ids: dict[str, int] = {}
+        self._frozen: set[str] = set()
+
+    def reserve(self, trial_key: str) -> dict:
+        row = self._ledger.reserve_trial(
+            self._round_id, trial_key, budget=self._budget, actor=self._actor)
+        self._ids[trial_key] = int(row["reservation_id"])
+        if row["stage"] != "started":
+            self._frozen.add(trial_key)   # 已终态的重放：不推进阶段
+        return row
+
+    def advance(self, trial_key: str, stage: str) -> None:
+        rid = self._ids.get(trial_key)
+        if rid is None or trial_key in self._frozen:
+            return
+        self._ledger.advance_trial_stage(rid, stage)
 
 # 参数选择规则枚举（附录 A v2；卡定义时 bt card check 校验，非法值拒绝）
 _SELECTION_METRICS = {
@@ -396,16 +551,21 @@ def _candidate_frozen_check(ledger, candidate_id: str,
 
 
 def _round_context(ledger, card, *, actor: str, wanted_gates=(),
-                   round_file=None):
+                   round_file=None, allow_no_round: bool = False):
     """T63/D32（铁律 16）：研究卡只能属于**已开启**轮次——运行约束的统一
     入口（screen/gate 共用）。返回：
 
     - dict：轮次上下文（round_id / trial_budget / lockbox_uses_max），
       调用方把它随 record_run 落 runs.round_id 并执行预算约束；
     - None：无轮次约束（actor=calibration 的标定样品运行——不进入研究
-      轮次统计，T61；或轮次制之前——卡不带 round 字段且台账 rounds 空，
-      runs.round_id 记 NULL）；
+      轮次统计，T61；或 allow_no_round=True 的显式合成夹具/迁移通道）；
     - False：拒绝（原因已打印，调用方退出 1，不产生任何 runs）。
+
+    X-06（2026-10-30 审核）：空台账**不再**是无轮次研究的自动豁免——
+    research 入口一律要求已开启轮次（空库只表示未初始化，不表示免
+    预注册；换一个全新 ledger 不能回到轮次制之前的旧规则）。旧轮次
+    迁移/合成测试夹具走 allow_no_round=True 的**显式**通道（CLI flag
+    --allow-no-round，正式 CLI 缺省不触发豁免）。
 
     与 T61 _enforce_candidate_status 协同：状态检查（withdrawn/specimen）
     在前（无台账），轮次检查在后（需台账）——两者语义都保留：撤回卡
@@ -420,13 +580,22 @@ def _round_context(ledger, card, *, actor: str, wanted_gates=(),
     if actor == "calibration":
         return None                     # 标定样品：不进入研究轮次统计
     if not card.round:
+        if not ledger.rounds_any() and allow_no_round:
+            # X-06 显式通道：合成测试夹具/轮次制前旧卡迁移（--allow-no-round
+            # 声明；正式研究 CLI 缺省不带，空台账一律拒绝无轮次卡）
+            return None
         if ledger.rounds_any():
             print(f"✗ 卡 {card.id} 未声明所属轮次（round/candidate 字段）"
                   "——台账已有研究轮次，铁律 16：bt 拒绝运行不属于已提交"
                   "轮次的卡；请在卡文件补 round/candidate 字段（该轮名单"
                   "内候选）后提交再运行")
-            return False
-        return None                     # 轮次制之前：rounds 表为空
+        else:
+            print(f"✗ 卡 {card.id} 未声明所属轮次（round/candidate 字段）"
+                  "——研究运行一律要求已开启轮次（X-06：空台账只表示未"
+                  "初始化，不表示免预注册；预注册 research/rounds/R#.toml"
+                  " 并 bt round open 后再运行；轮次制之前的旧卡迁移走"
+                  "显式 --allow-no-round 通道）")
+        return False
     row = ledger.round(card.round)
     if row is None:
         print(f"✗ 卡 {card.id} 声明的轮次 {card.round} 未开启（rounds 表无"
@@ -494,8 +663,14 @@ def _round_budget_exceeded(ledger, ctx) -> bool:
     """本轮累计去重试验数（round_n_dedup，七元组去重口径）已达
     trial_budget → True（原因已打印；调用方退出 1，不产生任何 runs）。
     保守口径：预算满后连同参重复运行一并拒绝——重复运行不增信息，
-    预算的目的是防在同轮反复挑选。"""
+    预算的目的是防在同轮反复挑选。
+    X-01（批 1 复审 A1）：**仅旧口径轮**（round_trial_regime ==
+    legacy_dedup）使用本预检；reservation 口径轮跳过——由 reserve_trial
+    在计算前判定（同身份幂等放行支持 screen→gate 推进、新身份超限
+    拒绝且零计算）；预检的一律拒绝会把"自己占满最后一格"的卡堵死。"""
     if ctx is None:
+        return False
+    if ledger.round_trial_regime(ctx["round_id"]) == "reservations":
         return False
     used = ledger.round_n_dedup(ctx["round_id"])
     if used >= ctx["trial_budget"]:
@@ -1145,35 +1320,37 @@ def _stitch_oos_from_segments(spec, bars, costs, segments) -> pd.Series:
 
 
 def _g3_reference_returns(ledger, card, spec, bars, costs, *,
-                          data_sha: str) -> pd.Series:
-    """重建 G3 拼接的样本外收益（run_g5 的参照分布，T21a）。
+                          trial: "vgate.LockboxTrial",
+                          data_sha: str | None = None) -> tuple[pd.Series, dict]:
+    """重建 G3 拼接的样本外收益（run_g5 的参照分布，T21a；X-02 修订）。
 
-    读台账里该卡最近一次 G3 通过记录的 segments（test_range + 段内选中
-    params），按 walkforward.run_g3 的同一切片/拼接口径重放各测试窗
-    （research 段数据，不碰锁箱）。G3 记录的数据哈希与当前不符 / 无可用
-    segments → ValueError（发生在 begin_lockbox 之前，不消耗锁箱一次性）。
+    X-02（2026-10-30 审核）：参照**只消费获准试验身份下的 G3**——经
+    vgate 的资格解析取当前 trial（参数/数据哈希/成本/代码指纹/冻结门槛）
+    最新通过的 G3 行的 segments（test_range + 段内选中 params），按
+    walkforward.run_g3 的同一切片/拼接口径重放各测试窗（research 段数据，
+    不碰锁箱）。旧实现按 card_id 取"最近通过的 G3"、只比数据哈希——获准
+    试验 A 会错用 B（同数据、不同参数/成本）的选参窗作参照；该路径已
+    删除（不提供无 trial 的回退）。
+
+    返回 (拼接的样本外收益, 参照绑定)——绑定 {"g3_run_id",
+    "g3_segments_sha256", "trial": {...}} 供 begin_lockbox 核对并随
+    run_g5 写入锁箱 reservation。任何不满足（无同身份通过 G3 / segments
+    不可重建）→ ValueError，发生在 begin_lockbox 之前，不消耗锁箱一次性。
     """
-    row = ledger.conn.execute(
-        "SELECT r.data_sha256 AS dsha, g.details_json AS dj"
-        " FROM gates g JOIN runs r ON r.run_id = g.run_id"
-        " WHERE r.card_id=? AND g.gate='G3' AND g.passed=1"
-        " ORDER BY r.run_id DESC LIMIT 1", (card.id,)).fetchone()
-    if row is None:
-        raise ValueError(
-            f"卡 {card.id} 无通过的 G3 关卡记录——G5 的参照分布取自 G3 拼接"
-            "的样本外收益，没有可信参照不允许跑 G5")
-    if row["dsha"] != data_sha:
-        raise ValueError(
-            f"卡 {card.id} 的 G3 记录基于 data_sha256={row['dsha'][:12]}…，"
-            f"与当前数据 {data_sha[:12]}… 不符——参照分布已过期，先在新数据"
-            "上重跑 G3")
-    segments = (json.loads(row["dj"]) or {}).get("segments") or []
     try:
-        return _stitch_oos_from_segments(spec, bars, costs, segments)
+        binding = vgate._verify_lockbox_trial(ledger, card.id, trial)
+    except vgate.LockboxPrerequisiteError as e:
+        # 保持 T21e 以来调用方契约：参照失败在 begin_lockbox 之前以
+        # ValueError 拒绝（不读锁箱、不消耗一次性）
+        raise ValueError(f"G5 参照绑定失败：{e}") from e
+    segments = (binding["g3_details"] or {}).get("segments") or []
+    try:
+        rets = _stitch_oos_from_segments(spec, bars, costs, segments)
     except ValueError as e:
         raise ValueError(
-            f"卡 {card.id} 的 G3 记录没有可用的 segments——参照分布无从重建"
-            f"（{e}）") from e
+            f"卡 {card.id} 获准 G3（run#{binding['g3_run_id']}）没有可用的"
+            f" segments——参照分布无从重建（{e}）") from e
+    return rets, vgate._reference_binding(binding)
 
 
 # ------------------------------------------------ 关卡 v3（T86 bt 接线）
@@ -1232,15 +1409,16 @@ def _v3_n_composition(ledger, card, cards_dir) -> dict:
 def _v3_gate_evaluate(ledger, card, *, cfg, ctx, cards_dir, strategy, spec,
                       bars, costs, params, base, summary, contract_size,
                       symbol, combos, g0_result, g3_result, data_sha, seed,
-                      known_gaps) -> dict:
+                      known_gaps, trial=None) -> dict:
     """关卡 V3 的评估体（T86 接线；bt gate 的 --gates V3 生产入口）。
 
     bar 级分支（缺省）：主检验按 [v3].primary_test 分派（冻结 = dsr_v0，
     run_primary_test 取 N_eff = max(N, n_min)）+ 三项否决（成本 ×1.5 /
     延迟一根 / 纯多头相对买入持有超额）+ 诊断只报告（含台账试验夏普的
     经验方差 DSR——冻结后只进诊断）。OOS = G3 拼接的样本外收益（本次
-    运行里有 G3 用其 segments，否则读台账最近一次通过的 G3 记录——
-    与 G5 参照分布同一重放实现；两处都无 → 主检验 fail-closed）。
+    运行里有 G3 用其 segments，否则读台账**当前试验身份**（trial）下最新
+    通过的 G3 记录——X-02：与 G5 参照分布同一重放实现、同一身份绑定，
+    不再按 card_id 取最近通过记录；两处都无 → 主检验 fail-closed）。
 
     事件分支（轮次 [evaluation] mode="event"，[v3.event]/D35）：主检验 =
     随机化参照 p ≤ α/N（N 不吃 n_min——随机化检验 N=1 也精确）；否决只
@@ -1346,13 +1524,19 @@ def _v3_gate_evaluate(ledger, card, *, cfg, ctx, cards_dir, strategy, spec,
             oos_reason = str(e)
     else:
         try:
-            oos = _g3_reference_returns(ledger, card, spec, bars, costs,
-                                        data_sha=data_sha)
-            oos_source = "台账最近一次通过的 G3 记录（与 G5 参照同源）"
+            if trial is None:
+                raise ValueError(
+                    "缺少当前试验身份绑定（X-02）——V3 回退参照必须锁定到"
+                    "本次运行的 trial（参数/数据/成本/代码指纹/冻结门槛）")
+            oos, _bind = _g3_reference_returns(ledger, card, spec, bars,
+                                               costs, trial=trial)
+            oos_source = ("台账当前试验身份下最新通过的 G3 记录（X-02 与"
+                          " G5 参照同源同绑定）")
         except ValueError:
             oos_reason = (
-                f"卡 {card.id} 无（数据哈希相符且通过的）G3 关卡记录——"
-                "关卡 v3 bar 级主检验的数据源 = G3 拼接的样本外收益；"
+                f"卡 {card.id} 无当前试验身份下通过的 G3 关卡记录——"
+                "关卡 v3 bar 级主检验的数据源 = G3 拼接的样本外收益"
+                "（X-02：按试验身份绑定，不按 card_id 取最近通过记录）；"
                 "请在同一数据上以 --gates G3,V3 重跑")
     if oos is None:
         primary = {"passed": False, "test": str(cfg.primary_test),
@@ -1411,37 +1595,46 @@ def _g5_orchestrate(ledger, card, *, strategy, spec, params, base_summary,
                     bars, costs, session_policy, data_root, approved_by,
                     cfg, trial, round_id=None, round_lockbox_uses_max=None
                     ) -> dict:
-    """G5 编排（T21a 协议，T21e 接线；H-02/H-03 修订）：
+    """G5 编排（T21a 协议，T21e 接线；H-02/H-03 修订；X-02 参照绑定）：
 
-    1. 参照重建（_g3_reference_returns，只读研究段；失败不消耗一次性）；
+    1. 参照重建（_g3_reference_returns，只读研究段；**只消费获准试验身份
+       下的 G3**——X-02：不再按 card_id 取最近通过的 G3，获准试验 A 不得
+       用 B 的选参窗/成本结果作参照；失败不消耗一次性）；
     2. begin_lockbox：读锁箱数据**之前**原子占位——trial（H-02）绑定当前
        试验身份（参数/数据哈希/成本版本/代码指纹/冻结门槛 + 当前通过的
-       G3/V3 判决；历史成功参数/旧成本/旧代码不授权），项目预算/轮次上限/
-       卡一次性的检查与 started 写入同一事务（H-03）。未批准/绑定不满足/
-       已用过/预算用尽（T27：cutoff 级 max_uses，默认 5）→ 如实抛
-       GateApprovalError / LockboxPrerequisiteError /
-       LockboxAlreadyUsedError / LockboxBudgetExhaustedError，
-       不消耗或已消耗由语义决定；
+       G3 与 V3 判决；历史成功参数/旧成本/旧代码不授权），并核对参照绑定
+       （g3_run_id + segments 指纹）与获准 G3 一致（X-02：不一致在读取
+       锁箱与扣预算之前拒绝）；项目预算/轮次上限/卡一次性的检查与 started
+       写入同一事务（H-03）。未批准/绑定不满足/已用过/预算用尽（T27：
+       cutoff 级 max_uses，默认 5）→ 如实抛 GateApprovalError /
+       LockboxPrerequisiteError / LockboxAlreadyUsedError /
+       LockboxBudgetExhaustedError，不消耗或已消耗由语义决定；
     3. load_lockbox_window：cutoff 前卡策略声明的 lookback_bars 根起步
        （无预热段时信号与全史不一致，C3）；
-    4. 回测（引擎 A，与基准同一装配含禁入窗）；交易与权益收益**只计
-       cutoff 之后**（bar_count 同）；
+    4. 回测（引擎 A，与基准同一装配含禁入窗）；交易与收益**只计 cutoff
+       之后**（bar_count 同）；
     5. run_g5：期望 > 0、交易数 ≥ 预期 × 比例、锁箱夏普 ≥ 参照 p5
-       （单侧），评估完把 started 写成终态 done。
+       （单侧），评估完把 started 写成终态 done（参照绑定随 result 入
+       lockbox_uses，X-02 审计可追溯）。
 
     expected_trades = 样本内交易频率（基准运行 trade_count / 研究段 bar 数）
     × 锁箱评估窗 bar 数。
     """
-    # 1) 参照分布（G3 样本外收益；任何失败都发生在 begin_lockbox 之前）
-    reference = _g3_reference_returns(
-        ledger, card, spec, bars, costs, data_sha=data_sha256(bars))
+    # 1) 参照分布（获准 G3 的样本外收益；任何失败都发生在 begin_lockbox
+    #    之前，不消耗锁箱一次性）
+    reference, reference_binding = _g3_reference_returns(
+        ledger, card, spec, bars, costs, trial=trial,
+        data_sha=data_sha256(bars))
     # 2) 读锁箱数据之前原子占位（中途崩溃也不允许重跑）；cutoff 与
-    #    load_lockbox_window 同一来源（lockbox.json），作为预算计数口径
+    #    load_lockbox_window 同一来源（lockbox.json），作为预算计数口径。
+    #    X-02：占位事务前核对参照绑定与获准 G3 一致。
     from mt5data.lockbox import cutoff_for, load_config
     lb_cutoff = cutoff_for(load_config(data_root), spec.symbol,
                            card.timeframe)
     vgate.begin_lockbox(ledger, card, approved_by=approved_by,
-                        cutoff=lb_cutoff, trial=trial, round_id=round_id,
+                        cutoff=lb_cutoff, trial=trial,
+                        reference=reference_binding,
+                        round_id=round_id,
                         round_lockbox_uses_max=round_lockbox_uses_max)
     # 3) 锁箱运行窗（带预热段）
     lookback = max(int(getattr(strategy.required_data, "lookback_bars", 0)
@@ -1479,13 +1672,15 @@ def _g5_orchestrate(ledger, card, *, strategy, spec, params, base_summary,
         "annualization_bars_per_year": float(bpy),
         "cutoff": pd.Timestamp(cutoff).isoformat(),
     }
-    # 5) 预期交易数：样本内频率 × 锁箱评估窗长度；run_g5 写终态
+    # 5) 预期交易数：样本内频率 × 锁箱评估窗长度；run_g5 写终态（X-02：
+    #    参照绑定随 result 写入 lockbox_uses 行，审计可对出用的哪次 G3）
     in_sample_trades = float(base_summary.get("trade_count") or 0)
     expected_trades = in_sample_trades / len(bars) * lockbox_result["bar_count"]
     return vgate.run_g5(ledger, card, lockbox_result=lockbox_result,
                         reference_returns=reference,
                         expected_trades=expected_trades,
-                        approved_by=approved_by, cfg=cfg, cutoff=lb_cutoff)
+                        approved_by=approved_by, cfg=cfg, cutoff=lb_cutoff,
+                        reference_binding=reference_binding)
 
 
 # ------------------------------------------------------------ candidate check
@@ -1693,7 +1888,8 @@ def _prob_use_merged(prob_conf) -> bool:
                ("max_gap_days", "cost_scenario_mult", "cost_scenario_reference"))
 
 
-def _prob_load_bars(data_root, sym, tf, *, use_merged: bool, end=None):
+def _prob_load_bars(data_root, sym, tf, *, use_merged: bool, end=None,
+                    allow_unbounded: bool = False):
     """概率分支的序列装载（T97 波次 2）：use_merged → merged_research_series
     四元组，返回 (bars, gap_spans|None)；否则原 load_series（gap_spans=None，
     与 T97 之前逐位一致）。空序列与 load_series 同语义 fail-fast。
@@ -1701,12 +1897,16 @@ def _prob_load_bars(data_root, sym, tf, *, use_merged: bool, end=None):
     T98/P-01：merged 路径不再丢弃 end——end 传给 merged_research_series，
     与全局锁箱 cutoff / ext manifest research_cutoff / 导出 source_cutoff /
     MT5 水位一起取最严（end 比其他界晚则被支配，绝不读出锁箱段；口径见
-    mt5data.ext.merge）。"""
+    mt5data.ext.merge）。
+
+    X-03：allow_unbounded 透传两条装载路径（--allow-unbounded-data 的
+    显式合成夹具/迁移通道；缺省 False——裸库读拒绝）。"""
     if not use_merged:
-        return load_series(data_root, sym, tf, end), None
+        return load_series(data_root, sym, tf, end,
+                           allow_unbounded=allow_unbounded), None
     from mt5data.ext.merge import merged_research_series
-    bars, _tags, gap_spans, _bad = merged_research_series(data_root, sym, tf,
-                                                          end=end)
+    bars, _tags, gap_spans, _bad = merged_research_series(
+        data_root, sym, tf, end=end, allow_unbounded=allow_unbounded)
     if bars is None or len(bars) == 0:
         raise ValueError(f"无可用数据：{sym} {tf}（合并研究序列为空——"
                          "检查研究库 bars/ 与 ext/ 数据）")
@@ -2290,13 +2490,16 @@ def _fit_and_freeze(strategy_cls, card, fit_ctx, bars_by_sym, costs_by_sym,
 
 
 def _prob_run_fields(fit_ctx, params, summary):
-    """P 线字段落台账（T73A：不改 runs 表结构）：
-    params_json += {"prob": {segment, split, bracket}}（试验身份）；
+    """P 线字段落台账（T73A：不改 runs 表结构；X-05 修订）：
+    params_json += {"prob": {segment, split, bracket, **model_sha256**}}
+    （试验身份——X-05：模型 hash 从 metrics 移入 params，改去重身份；
+    两个不同模型的拟合运行不再被七元组去重算同一次试验）；
     metrics_json += {"prob": {model_sha256, prob_version, fit_start,
-    fit_end, purge_bars}}（模型身份，D43）。两处都进哈希链。"""
+    fit_end, purge_bars}}（模型身份留档，D43）。两处都进哈希链。"""
     if fit_ctx is None:
         return params, summary
-    params = {**params, "prob": fit_ctx["params_prob"]}
+    params = {**params, "prob": {**fit_ctx["params_prob"],
+                                 "model_sha256": fit_ctx["model_sha"]}}
     if summary is not None:
         summary = {**summary, "prob": fit_ctx["metrics_prob"]}
     return params, summary
@@ -2373,7 +2576,9 @@ def _prob_preconditions(ledger, card, path, *, actor: str) -> tuple | None:
     if not (round_obj.segments or {}).get("split"):
         print(f"✗ 轮次 {card.round} 缺 [segments].split（D50）")
         return None
-    used = ledger.round_n_dedup(round_obj.id)
+    # X-01：预检用 round_n_trials（reservation 口径的权威计数——到达
+    # started 即计；旧轮次自动回退 round_n_dedup，T99 语义不变）
+    used = ledger.round_n_trials(round_obj.id)
     if used + len(listed) > round_obj.trial_budget:
         print(f"✗ 轮次预算不足：已用 {used}/{round_obj.trial_budget}，"
               f"本卡还需 {len(listed)} 条假设各一行")
@@ -2458,7 +2663,7 @@ def cmd_prob_test(args) -> int:
             for sym in card.symbols:
                 bars_full, gap_spans = _prob_load_bars(
                     data_root, sym, card.timeframe, use_merged=use_merged,
-                    end=args.end)
+                    end=args.end, allow_unbounded=_allow_unbounded(args))
                 bars_full_by_sym[sym] = bars_full
                 if use_merged:
                     gap_by_sym[sym] = gap_spans
@@ -2508,14 +2713,56 @@ def cmd_prob_test(args) -> int:
             return 1
         # P-06：试验身份（params.prob）——prob_version/seed 随结果行补充；
         # 全品种 data_sha/cost_version 映射 + sims 进身份（只记首品种
-        # hash/最后成本版本会漏掉第二品种的数据改动，审核 P-06/H-12）
+        # hash/最后成本版本会漏掉第二品种的数据改动，审核 P-06/H-12）；
+        # X-05：evaluator 身份（prob 核心文件 hash + 方法版本）进身份——
+        # 换评估实现 = 新试验（不再只靠固定版本串）。
+        evaluator_sha = _p1_evaluator_sha()
         prob_ident = {"candidate": card.candidate,
                       "segment": card.segment,
                       "split": round_obj.segments["split"],
                       "bracket": dict(card.prob["bracket"]),
                       "sims": int(args.sims),
+                      "evaluator_sha256": evaluator_sha,
                       "data_sha256_by_symbol": data_sha_by_sym,
                       "cost_model_version_by_symbol": cost_version_by_sym}
+
+        def _p1_trial_key(hyp: str, ident: dict) -> str:
+            return _trial_key(
+                strategy=args.strategy,
+                params={"hypothesis": hyp, "prob": dict(ident)},
+                symbol=first_sym, timeframe=card.timeframe,
+                data_sha256=data_sha_by_sym[first_sym],
+                cost_model_version=cost_version, strategy_sha=strategy_sha)
+
+        # X-01：reservation 口径轮——run_p1_card **之前**逐假设占位（预算
+        # 拒绝发生在计算之前：零行、零标签调用；主检验实际开始处 advance
+        # reached_primary）。任一假设占位失败 → 未达主检验的全部占位
+        # voided 释放名额，整体拒绝（旧轮次 resv=None：P-10/T99 语义
+        # 逐位不变）。
+        resv = (_TrialReserver(ledger, {"round_id": round_obj.id,
+                                        "trial_budget": round_obj.trial_budget,
+                                        "lockbox_uses_max": 0},
+                               actor=actor)
+                if _use_reservations(ledger, {"round_id": round_obj.id,
+                                              "trial_budget":
+                                                  round_obj.trial_budget,
+                                              "lockbox_uses_max": 0})
+                else None)
+        resv_keys: dict[str, str] = {}
+        if resv is not None:
+            try:
+                for h in card.prob["hypotheses"]:
+                    k = _p1_trial_key(h, prob_ident)
+                    resv.reserve(k)
+                    resv_keys[h] = k
+            except TrialBudgetExceededError as e:
+                for k in resv_keys.values():
+                    resv.advance(k, "voided")   # 未达主检验 → 释放名额
+                print(f"✗ 计算前占位被拒：{e}——不执行任何标签/随机化计算，"
+                      "不写任何行（X-01）")
+                return 1
+            for h, k in resv_keys.items():
+                resv.advance(k, "reached_primary")
         # P-05（T98）：逐假设入账。台账是 append-only 哈希链、不支持行内
         # update——"started 行 + 终态行"会留下两条同键行，扰动成功口径与
         # 预算（round_n_dedup/round-report 的多成功拒绝按 ok 行计）。按
@@ -2546,14 +2793,18 @@ def cmd_prob_test(args) -> int:
                     metrics=None, error=msg, actor=actor,
                     strategy_sha=strategy_sha,
                     run_class="research", round_id=round_obj.id)
+                if resv is not None:
+                    resv.advance(resv_keys[h], "failed")  # X-01：不回收 N
                 print(f"✗ run#{rid} {h} -> {msg}")
             return 1
         # P-10：成功行入账带原子预算上限（检查与写入同一事务——
         # 预检（_prob_preconditions）之后、入账之前预算被并发占满时，
-        # 在此拒绝而非超额写入）。中途耗尽：对**尚未入账的全部假设**
+        # 在此拒绝而非超额写入）。X-01：reservation 口径轮的预算权威在
+        # 占位（run_p1_card 前已全部占好），record_run 不再做预算拒绝——
+        # 参数降级为对账后盾（绕过占位的成功行 → 一致性错误，整体回滚）。
+        # 旧口径轮（resv=None）中途耗尽路径不变：对**尚未入账的全部假设**
         # 补记作废 error 行（P-05"每条假设恰一行终态"；error 行不占
-        # 预算——round_n_dedup 只计成功行），轮次报告按"恰一条成功行"
-        # 口径自然拒绝（fail-closed）。
+        # 预算——round_n_dedup 只计成功行）。
         for i, r in enumerate(results):
             params = {"hypothesis": r["hypothesis"],
                       "prob": {**prob_ident, "seed": r["seed"],
@@ -2579,7 +2830,14 @@ def cmd_prob_test(args) -> int:
                     strategy_sha=strategy_sha,
                     run_class="research", round_id=round_obj.id,
                     round_trial_budget=round_obj.trial_budget)
+            except TrialReservationConsistencyError as e:
+                print(f"✗ 结果入账被拒（X-01 对账失败）：{e}——存在绕过"
+                      " reserve_trial 的成功行（或 H/P 双口径并用）")
+                return 1
             except RoundTrialBudgetExceededError as e:
+                if resv is not None:        # 新口径轮不应再走到这里——防御
+                    print(f"✗ 结果入账被拒：{e}")
+                    return 1
                 msg = f"结果作废：运行期间轮次预算被并发占满（{e}）"
                 for rr in results[i:]:
                     voided = ledger.record_run(
@@ -2602,6 +2860,8 @@ def cmd_prob_test(args) -> int:
                         run_class="research", round_id=round_obj.id)
                     print(f"✗ run#{voided} {rr['hypothesis']} -> {msg}")
                 return 1
+            if resv is not None:
+                resv.advance(resv_keys[r["hypothesis"]], "completed")
             mark = "✓" if r["p_value"] < 0.05 else "·"
             print(f"{mark} run#{rid} {r['hypothesis']}：触发 "
                   f"{r['n_triggers']}（{r['n_trigger_days']} 日），Δp="
@@ -2880,7 +3140,8 @@ def cmd_fit(args) -> int:
             print(f"✗ 轮次 {card.round} 的 approved_by 为空——轮次未获批"
                   "（P 线审核会话批准时填写；执行会话不得代填）")
             return 1
-        round_ctx = _round_context(ledger, card, actor=actor)
+        round_ctx = _round_context(ledger, card, actor=actor,
+                                   allow_no_round=_allow_no_round(args))
         if round_ctx is False:
             return 1
         opened = ledger.round(card.round)
@@ -2901,7 +3162,9 @@ def cmd_fit(args) -> int:
             sizes = {sym: resolve_contract_size(data_root, sym, None)
                      for sym in card.symbols}
             bars_by_sym = {sym: load_series(data_root, sym, card.timeframe,
-                                            args.end)
+                                            args.end,
+                                            allow_unbounded=(
+                                                _allow_unbounded(args)))
                            for sym in card.symbols}
             from mt5data.sessions import load_session_policy
             sess_policy = load_session_policy(str(SESSIONS_PATH))
@@ -2993,12 +3256,18 @@ def cmd_screen(args) -> int:
         ledger.register_card(card.id, card.version, str(path),
                              current_git_commit(), committed)
         # T63/D32（铁律 16）：研究卡只能属于已开启轮次（轮次上下文随
-        # record_run 落 runs.round_id；预算满拒绝新试验）
-        round_ctx = _round_context(ledger, card, actor=actor)
+        # record_run 落 runs.round_id；预算满拒绝新试验）。X-06：空台账
+        # 不再豁免——无轮次卡仅经显式 --allow-no-round（合成夹具/迁移）。
+        round_ctx = _round_context(ledger, card, actor=actor,
+                                   allow_no_round=_allow_no_round(args))
         if round_ctx is False:
             return 1
         if _round_budget_exceeded(ledger, round_ctx):
             return 1
+        # X-01：本轮走 reservation 口径时建立占位会话（screen=组合回测前
+        # 逐组合占位；旧轮次 resv=None，T99 语义逐位不变）
+        resv = (_TrialReserver(ledger, round_ctx, actor=actor)
+                if _use_reservations(ledger, round_ctx) else None)
 
         # 装配（setup 失败 = 尚无任何组合开跑，fail-fast 不记 runs）
         try:
@@ -3014,7 +3283,9 @@ def cmd_screen(args) -> int:
             else:
                 vols_by_sym = None
             bars_by_sym = {sym: load_series(data_root, sym,
-                                            card.timeframe, args.end)
+                                            card.timeframe, args.end,
+                                            allow_unbounded=(
+                                                _allow_unbounded(args)))
                            for sym in card.symbols}
             # T20：禁入窗唯一来源 config/sessions.toml（sha 进 cost_model_version）
             from mt5data.sessions import load_session_policy
@@ -3095,11 +3366,17 @@ def cmd_screen(args) -> int:
         combos = card.param_grid()
         failed = 0
         # P-10：P 卡（probability / P2 决策卡）成功行入账带原子预算上限
-        # （检查与写入同一事务）；H 卡不带——共享路径行为逐位不变
-        _p10_budget = ((round_ctx or {}).get("trial_budget")
-                       if getattr(card, "prob", None) else None)
-        _budget_kw = ({} if _p10_budget is None
-                      else {"round_trial_budget": _p10_budget})
+        # （检查与写入同一事务）；H 卡不带——共享路径行为逐位不变。
+        # X-01：reservation 口径轮（resv 非 None）H/P 一律带该上限——
+        # record_run 在新口径轮不做预算拒绝，参数降级为对账后盾（防绕过
+        # 占位的成功行，模块 A），故对 H 卡也无害。
+        if resv is not None:
+            _budget_kw = {"round_trial_budget": round_ctx["trial_budget"]}
+        else:
+            _p10_budget = ((round_ctx or {}).get("trial_budget")
+                           if getattr(card, "prob", None) else None)
+            _budget_kw = ({} if _p10_budget is None
+                          else {"round_trial_budget": _p10_budget})
         _budget_voided = False
         for sym in card.symbols:
             if _budget_voided:
@@ -3112,10 +3389,32 @@ def cmd_screen(args) -> int:
             data_last = pd_iso(times.iloc[-1])
             for params in combos:
                 label = f"{sym} {card.timeframe} {params}"
-                # T63：本轮预算满 → 该组合被拒（不执行也不记 runs）
-                if (round_ctx is not None
+                # X-01：reservation 口径——组合回测**之前**占位（预算拒绝
+                # 发生在计算之前，零回测调用）+ advance reached_primary；
+                # 同 trial_key 幂等（screen→gate 同身份不被自己堵死）。
+                _tk = None
+                if resv is not None:
+                    _tk = _trial_key(
+                        strategy=args.strategy,
+                        params=_prob_run_fields(fit_ctx, params, None)[0],
+                        symbol=sym, timeframe=card.timeframe,
+                        data_sha256=dsha, cost_model_version=cost_version,
+                        strategy_sha=strategy_sha,
+                        extra=({"model_sha256": fit_ctx["model_sha"]}
+                               if fit_ctx is not None else None))
+                    try:
+                        resv.reserve(_tk)
+                    except TrialBudgetExceededError as e:
+                        failed += 1
+                        print(f"✗ {label} -> {e}——组合被拒（计算前占位，"
+                              "不执行也不记 runs）")
+                        continue
+                    resv.advance(_tk, "reached_primary")
+                elif (round_ctx is not None
                         and ledger.round_n_dedup(round_ctx["round_id"])
                         >= round_ctx["trial_budget"]):
+                    # T63（旧口径轮）：本轮预算满 → 该组合被拒（不执行也
+                    # 不记 runs）
                     failed += 1
                     print(f"✗ {label} -> 轮次 {round_ctx['round_id']} 试验"
                           f"预算已满（trial_budget="
@@ -3161,14 +3460,16 @@ def cmd_screen(args) -> int:
                         strategy_sha=strategy_sha, run_class=run_class,
                         round_id=(round_ctx or {}).get("round_id"),
                         **_budget_kw)
+                    if resv is not None:
+                        resv.advance(_tk, "completed")   # X-01：成功行入账后
                     skipped = summary.get("skipped_zero_lots") or 0
                     print(f"✓ run#{rid} {label} -> "
                           f"净利 {summary['net_profit']:.2f} "
                           f"交易 {summary['trade_count']} 笔"
                           + (f"（零手数跳过 {skipped}）" if skipped else ""))
                 except RoundTrialBudgetExceededError as e:
-                    # P-10：预检之后预算被并发占满——该组合作废记 error 行
-                    # （不占预算），剩余组合不再白算（双层循环退出）
+                    # P-10（旧口径轮）：预检之后预算被并发占满——该组合作废
+                    # 记 error 行（不占预算），剩余组合不再白算（双层循环退出）
                     failed += 1
                     rec_params, _ = _prob_run_fields(fit_ctx, params, None)
                     rid = ledger.record_run(
@@ -3201,6 +3502,9 @@ def cmd_screen(args) -> int:
                         error=f"{type(e).__name__}: {e}", actor=actor,
                         strategy_sha=strategy_sha, run_class=run_class,
                         round_id=(round_ctx or {}).get("round_id"))
+                    if resv is not None:
+                        # X-01：已到达主检验（回测已开跑）——failed 不回收 N
+                        resv.advance(_tk, "failed")
                     print(f"✗ run#{rid} {label} -> {type(e).__name__}: {e}")
 
         st = ledger.stats(card.id)
@@ -3302,13 +3606,17 @@ def cmd_gate(args) -> int:
                              current_git_commit(), committed)
         # T63/D32（铁律 16）：研究卡只能属于已开启轮次；G5 另查本轮
         # lockbox_uses_max（在 approve/一次性/预算检查之前——轮次上限
-        # 是预注册钉死的轮次级约束）
+        # 是预注册钉死的轮次级约束）。X-06：空台账不再豁免（显式
+        # --allow-no-round 通道除外）；X-01：reservation 口径轮的占位会话。
         round_ctx = _round_context(ledger, card, actor=actor,
-                                   wanted_gates=wanted)
+                                   wanted_gates=wanted,
+                                   allow_no_round=_allow_no_round(args))
         if round_ctx is False:
             return 1
         if _round_budget_exceeded(ledger, round_ctx):
             return 1
+        resv = (_TrialReserver(ledger, round_ctx, actor=actor)
+                if _use_reservations(ledger, round_ctx) else None)
         # G5 预检：未批准 / 已用过 → 拒绝（不烧一次性，也不跑任何运行）
         if "G5" in wanted and not args.approve:
             print("✗ 锁箱（G5）是一次性测试，必须显式 --approve"
@@ -3390,7 +3698,9 @@ def cmd_gate(args) -> int:
             else:
                 vols_by_sym = None
             bars_by_sym = {sym: load_series(data_root, sym,
-                                            card.timeframe, args.end)
+                                            card.timeframe, args.end,
+                                            allow_unbounded=(
+                                                _allow_unbounded(args)))
                            for sym in card.symbols}
             # T20：禁入窗唯一来源 config/sessions.toml（sha 进 cost_model_version）
             from mt5data.sessions import load_session_policy
@@ -3521,6 +3831,24 @@ def cmd_gate(args) -> int:
             gates_hash=gsha, actor=actor, strategy_sha=strategy_sha,
             run_class=run_class,
             round_id=(round_ctx or {}).get("round_id"))
+        # X-01：reservation 口径轮——基准回测**之前**占位（预算拒绝发生在
+        # 计算之前，零回测/关卡调用）+ advance reached_primary；同 trial_key
+        # 幂等（screen→gate 同身份不被已占自己的最后额度堵死）。
+        _gate_tk = None
+        if resv is not None:
+            _gate_tk = _trial_key(
+                strategy=args.strategy, params=rec_params, symbol=symbol,
+                timeframe=card.timeframe, data_sha256=dsha,
+                cost_model_version=cost_version, strategy_sha=strategy_sha,
+                extra=({"model_sha256": fit_ctx["model_sha"]}
+                       if fit_ctx is not None else None))
+            try:
+                resv.reserve(_gate_tk)
+            except TrialBudgetExceededError as e:
+                print(f"✗ 基准运行被拒：{e}——不执行也不记 runs（X-01："
+                      "计算前占位）")
+                return 1
+            resv.advance(_gate_tk, "reached_primary")
         try:
             base_kwargs = dict(symbol=symbol, params=dict(params),
                                contract_size=sizes[symbol],
@@ -3543,21 +3871,36 @@ def cmd_gate(args) -> int:
                 vol_step=(vols_by_sym[symbol][1] if vols_by_sym else None),
                 vol_max=(vols_by_sym[symbol][2] if vols_by_sym else None))
             # P-10：P 卡成功行带原子预算上限（H 卡不带——共享路径行为
-            # 逐位不变）；预算在运行期间被并发占满 → 作废 error 行 + 退 1
-            _p10_budget = ((round_ctx or {}).get("trial_budget")
-                           if getattr(card, "prob", None) else None)
-            _budget_kw = ({} if _p10_budget is None
-                          else {"round_trial_budget": _p10_budget})
+            # 逐位不变）；预算在运行期间被并发占满 → 作废 error 行 + 退 1。
+            # X-01：reservation 口径轮 H/P 一律带该上限（record_run 在新
+            # 口径轮不拒预算，参数降级为对账后盾——模块 A）。
+            if resv is not None:
+                _budget_kw = {"round_trial_budget": round_ctx["trial_budget"]}
+            else:
+                _p10_budget = ((round_ctx or {}).get("trial_budget")
+                               if getattr(card, "prob", None) else None)
+                _budget_kw = ({} if _p10_budget is None
+                              else {"round_trial_budget": _p10_budget})
             try:
                 run_id = ledger.record_run(metrics=summary, **_budget_kw,
                                            **common)
+            except TrialReservationConsistencyError as e:
+                # X-01 对账后盾：本轮成功行去重数超上限——存在绕过占位的
+                # 成功行（或 H/P 双口径并用），整体回滚后如实报错退出
+                print(f"✗ 基准运行入账被拒（X-01 对账失败）：{e}")
+                return 1
             except RoundTrialBudgetExceededError as e:
+                if resv is not None:        # 新口径轮不应再走到这里——防御
+                    print(f"✗ 基准运行作废：{e}")
+                    return 1
                 run_id = ledger.record_run(
                     metrics=None,
                     error=f"结果作废：运行期间轮次预算被并发占满（{e}）",
                     **common)
                 print(f"✗ run#{run_id} 基准运行作废：{e}")
                 return 1
+            if resv is not None:
+                resv.advance(_gate_tk, "completed")   # X-01：成功行入账后
             print(f"— run#{run_id} {symbol} {card.timeframe} {params} -> "
                   f"净利 {summary['net_profit']:.2f} "
                   f"交易 {summary['trade_count']} 笔")
@@ -3565,6 +3908,9 @@ def cmd_gate(args) -> int:
             run_id = ledger.record_run(metrics=None,
                                        error=f"{type(e).__name__}: {e}", **common)
             print(f"✗ run#{run_id} 基准运行失败：{type(e).__name__}: {e}")
+            if resv is not None:
+                # X-01：已到达主检验（回测已开跑）——failed 不回收 N
+                resv.advance(_gate_tk, "failed")
             return 1
 
         # T23：spec 带定手数口径 → G2/G3 一切复算经 run_engine 沿用同一口径；
@@ -3687,6 +4033,15 @@ def cmd_gate(args) -> int:
                 out["project_n_dedup_rounds"] = st["project_n_dedup_rounds"]
                 return out
             _run_recorded("G4", _g4)
+        if "V3" in wanted or "G5" in wanted:
+            # X-02：本次运行的试验身份（V3 的 G3 参照回退与 G5 准入同一
+            # 绑定——参数/数据哈希/成本版本/代码指纹/冻结门槛）
+            run_trial = vgate.LockboxTrial(
+                params=rec_params, data_sha256=dsha,
+                cost_model_version=cost_version,
+                strategy_sha=strategy_sha, gates_hash=gsha)
+        else:
+            run_trial = None
         if "V3" in wanted:
             # T86 接线（T85 冻结后）：G0/G3 结果可复用（同一次运行里跑过
             # 就不再重算）；combos 供诊断的参数邻域复用
@@ -3697,19 +4052,15 @@ def cmd_gate(args) -> int:
                 summary=summary, contract_size=sizes[symbol], symbol=symbol,
                 combos=combos, g0_result=results.get("G0"),
                 g3_result=results.get("G3"), data_sha=dsha, seed=seed,
-                known_gaps=known_gaps))
+                known_gaps=known_gaps, trial=run_trial))
         if "G5" in wanted:
             # H-02：G5 准入绑定当前试验身份（本次基准运行的参数/数据哈希/
             # 成本版本/代码指纹/冻结门槛）；H-03：轮次上限随原子占位复查
-            g5_trial = vgate.LockboxTrial(
-                params=rec_params, data_sha256=dsha,
-                cost_model_version=cost_version,
-                strategy_sha=strategy_sha, gates_hash=gsha)
             _run_recorded("G5", lambda: _g5_orchestrate(
                 ledger, card, strategy=strategy, spec=spec, params=params,
                 base_summary=summary, bars=bars, costs=costs,
                 session_policy=policy_by_sym[symbol],
-                data_root=data_root, trial=g5_trial,
+                data_root=data_root, trial=run_trial,
                 round_id=(round_ctx or {}).get("round_id"),
                 round_lockbox_uses_max=(round_ctx or {}).get(
                     "lockbox_uses_max"),
@@ -3907,6 +4258,10 @@ def build_parser() -> argparse.ArgumentParser:
                       help="月内置换次数（p 值分辨率）")
     ptst.add_argument("--specimen", action="store_true")
     ptst.add_argument("--ops-ack", action="store_true")
+    ptst.add_argument("--allow-unbounded-data", action="store_true",
+                      help="X-03：显式声明数据根是无声明研究上界的裸库/"
+                           "合成测试夹具（仅测试/迁移通道，绝不用于正式"
+                           "研究结论）")
     ptst.add_argument("--actor", default="bt", help="台账 actor 字段")
     ptst.add_argument("--ledger", default=None,
                       help="台账路径（缺省按数据根解析）")
@@ -3940,6 +4295,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_fit.add_argument("--ledger", default=None,
                        help="台账路径（P-05：准入链/指纹绑定需要；缺省按"
                             "数据根解析）")
+    p_fit.add_argument("--allow-unbounded-data", action="store_true",
+                       help="X-03：显式声明数据根是无声明研究上界的裸库/"
+                            "合成测试夹具（仅测试/迁移通道，绝不用于正式"
+                            "研究结论）")
+    p_fit.add_argument("--allow-no-round", action="store_true",
+                       help="X-06：显式声明无轮次卡的合成夹具/轮次制迁移"
+                            "通道（正式 CLI 缺省要求已开启轮次）")
     p_fit.set_defaults(func=cmd_fit)
 
     p_seg = sub.add_parser("segment", help="P 线发现段/验证段分界（T76/D50）")
@@ -4006,6 +4368,13 @@ def build_parser() -> argparse.ArgumentParser:
                           help="（R6/C6 起拒绝）：运维豁免仅供 reconcile_ab/"
                                "measure 类运维命令，screen/gate 一律拒绝，"
                                "不给锁箱期数据进入研究统计的旁路")
+    p_screen.add_argument("--allow-unbounded-data", action="store_true",
+                          help="X-03：显式声明数据根是无声明研究上界的裸库/"
+                               "合成测试夹具（仅测试/迁移通道，绝不用于正式"
+                               "研究结论）")
+    p_screen.add_argument("--allow-no-round", action="store_true",
+                          help="X-06：显式声明无轮次卡的合成夹具/轮次制迁移"
+                               "通道（正式 CLI 缺省要求已开启轮次）")
     p_screen.add_argument("--ledger", default=None,
                           help="台账路径；缺省 {data-root}/research/ledger.sqlite"
                                "（--research-store 时固定 data/research/ledger.sqlite）")
@@ -4061,6 +4430,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="（R6/C6 起拒绝）：运维豁免仅供 reconcile_ab/"
                              "measure 类运维命令，gate 一律拒绝，不给锁箱期"
                              "数据进入研究关卡的旁路")
+    p_gate.add_argument("--allow-unbounded-data", action="store_true",
+                        help="X-03：显式声明数据根是无声明研究上界的裸库/"
+                             "合成测试夹具（仅测试/迁移通道，绝不用于正式"
+                             "研究结论）")
+    p_gate.add_argument("--allow-no-round", action="store_true",
+                        help="X-06：显式声明无轮次卡的合成夹具/轮次制迁移"
+                             "通道（正式 CLI 缺省要求已开启轮次）")
     p_gate.add_argument("--ledger", default=None)
     p_gate.add_argument("--costs", choices=("auto", "zero"), default="auto",
                         help="与 run_backtest 同义；测试/冒烟用 zero")

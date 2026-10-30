@@ -77,10 +77,15 @@ def write_research_store(root: Path, bars: pd.DataFrame, *,
     sdir = root / "bars" / SYMBOL / tf
     sdir.mkdir(parents=True)
     bars.to_parquet(sdir / "data.parquet")
+    # X-03（2026-10-30 审核）：研究库须有声明上界——合成夹具写
+    # source_cutoff（末根之后）＝合法导出库形态，装配/直读路径无需
+    # --allow-unbounded-data
     (sdir / "meta.json").write_text(json.dumps({
         "symbol": SYMBOL, "timeframe": tf, "rows": len(bars),
         "first_time": bars["time"].iloc[0].isoformat(),
-        "last_closed_time": bars["time"].iloc[-1].isoformat()}),
+        "last_closed_time": bars["time"].iloc[-1].isoformat(),
+        "source_cutoff": (bars["time"].iloc[-1]
+                          + pd.Timedelta(days=1)).isoformat()}),
         encoding="utf-8")
     specs = root / "specs"
     specs.mkdir(exist_ok=True)
@@ -246,7 +251,7 @@ def test_bt_gate_1986_counterexample_not_ruined(tmp_path, monkeypatch):
          "--strategy", DONCHIAN, "--costs", "auto", "--gates", "G0",
          "--params", DONCHIAN_PARAMS,
          "--volume-lots", "100", "--initial-capital", "10000",
-         "--ledger", str(ledger)])
+         "--ledger", str(ledger), "--allow-no-round"])
     assert ledger.is_file(), "基准运行须已入台账"
     from mt5quant.research.ledger import Ledger
     with Ledger(ledger) as led:
@@ -290,7 +295,7 @@ def test_bt_screen_passes_swap_ref_price(tmp_path, monkeypatch):
         ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "auto", "--volume-lots", "0.01",
-         "--ledger", str(ledger)]) == 0
+         "--ledger", str(ledger), "--allow-no-round"]) == 0
     from mt5quant.research.ledger import Ledger
     with Ledger(ledger) as led:
         ver = led.conn.execute(

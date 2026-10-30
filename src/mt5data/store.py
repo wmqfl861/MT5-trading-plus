@@ -13,9 +13,26 @@ H-11 写入纪律：
   释放、无按 mtime 接管（接管即双所有者竞态）；
 - load_bars_checked 核对 parquet 与水位：发布中途失败过的撕裂快照
   明确拒绝（StoreConsistencyError），重跑一次保存即自愈。
+
+X-04 一致性读快照（audit2 X-04）：
+- 发布协议为**可恢复两步 + generation/content hash**：先原子替换
+  data.parquet，再原子替换 meta.json；meta 记录发布代数 generation
+  （每次保存 +1）与 content_sha256（data.parquet 的字节指纹）；
+- 两步之间中断 → "新 parquet + 旧 meta"：指纹对不上 → 一致性读明确
+  拒绝（StoreConsistencyError），绝不把混版外发（重存一次自愈）；
+- load_bars_checked 从"条数/首尾"升级为**内容指纹校验**：行数/首尾
+  全同、仅中间 OHLC 被改写的快照同样被抓住；旧 meta（升级前落盘、
+  无指纹）退回条数/首尾核对，首次重新保存即带上指纹；
+- 并发发布窗口内读到的不一致自动重读（同代成功），重试仍不一致才
+  拒绝——并发读写不撕读；
+- load_bars_consistent 是研究读的一致性入口（lockbox.research_bars
+  与 mt5data.ext.merge 消费）：allow_unverified=True 且序列无 meta
+  （手写测试夹具形态）时退化为直读——显式测试/迁移通道。
 """
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 import time
@@ -244,11 +261,19 @@ def _save_bars_locked(d, symbol, timeframe, df, *, server=None, login=None):
         out[c] = out[c].astype("int64")
     out = out[_COLUMNS]
 
+    # X-04：可恢复两步发布——先 parquet，后 meta；meta 带 generation 与
+    # content_sha256（对最终 parquet 字节取指纹，rename 不改内容）。两步
+    # 之间中断 → 新 parquet 配旧 meta，指纹必对不上，一致性读明确拒绝。
     parquet_tmp = unique_tmp_path(os.path.join(d, "data.parquet"))
     out.to_parquet(parquet_tmp, index=False)
     _fsync_file(parquet_tmp)
+    content_sha256 = file_sha256(parquet_tmp)
     _atomic_replace(parquet_tmp, os.path.join(d, "data.parquet"))
 
+    try:
+        generation = int(old_meta.get("generation") or 0) + 1
+    except (TypeError, ValueError):
+        generation = 1
     wm = {
         "symbol": symbol.upper(),
         "timeframe": timeframe.upper(),
@@ -258,6 +283,8 @@ def _save_bars_locked(d, symbol, timeframe, df, *, server=None, login=None):
         "updated_at_utc": datetime.now(timezone.utc).isoformat(),
         "server": server,
         "login": login,
+        "generation": generation,           # X-04：发布代数，每次保存 +1
+        "content_sha256": content_sha256,   # X-04：data.parquet 字节指纹
     }
     if isinstance(old_meta.get("known_gaps"), list) and old_meta["known_gaps"]:
         wm["known_gaps"] = old_meta["known_gaps"]  # 审计字段：逐字保留
@@ -278,40 +305,133 @@ class StoreConsistencyError(RuntimeError):
     """data.parquet 与 meta.json 不是同一份快照（发布中途失败等）——拒绝配读。"""
 
 
+def file_sha256(path: str) -> str:
+    """文件字节指纹（分块读，供发布侧与校验侧共用同一算法）。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# 一致性读在发布窗口内的重读次数/间隔（X-04：并发读写不撕读——
+# 短暂不一致或 Windows 原子替换竞争造成的瞬态打开失败都等下一次同代
+# 读取，重试耗尽才是真撕裂/真缺元数据）
+_CONSISTENT_READ_ATTEMPTS = 8
+_CONSISTENT_READ_SLEEP = 0.05
+
+
 def load_bars_checked(root, symbol: str,
                       timeframe: str) -> pd.DataFrame | None:
-    """读 data.parquet 并核对 meta 水位（H-11：读者要么一致版本要么明确拒绝）。
+    """读 data.parquet 并核对 meta（X-04：读者要么同代一致版本要么明确拒绝）。
 
     - 无 data.parquet → None（与 load_bars 一致）；
-    - 有 data.parquet 无 meta.json、meta 坏、或 rows/first/last 与数据对
-      不上 → StoreConsistencyError：data 与 meta 分两次原子发布，中途
-      失败过的序列半新半旧，宁可明确拒绝也不给读者自相矛盾的版本
-      （后续任一次正常保存即自愈）。
+    - 有 data.parquet 无 meta.json、meta 坏、或水位与数据对不上 →
+      StoreConsistencyError：data 与 meta 分两次原子发布，中途失败过的
+      序列半新半旧，宁可明确拒绝也不给读者自相矛盾的版本（后续任一次
+      正常保存即自愈）；
+    - meta 带 content_sha256（X-04 起的发布都带）→ 与 data.parquet 实际
+      字节指纹比对：行数/首尾全同、仅中间 OHLC 改写的"同形异容"快照
+      同样拒绝。指纹一致即证明数据就是发布时那份；此时**不再**要求水位
+      三件套与数据逐位相同——last_closed_time 允许比数据保守（导出侧/
+      测试会改写它作截界，见 lockbox 收盘水位契约）；
+    - 旧 meta（无指纹，X-04 升级前落盘）→ 退回条数/首尾核对放行；
+    - 比对失败先重读（发布窗口内 parquet/meta 短暂不同代，或 Windows
+      原子替换竞争造成的瞬态打开失败，写者马上会补齐），重试耗尽仍
+      不一致 → StoreConsistencyError。
     """
     d = series_dir(root, symbol, timeframe)
-    df = load_bars(root, symbol, timeframe)
-    if df is None:
+    pq = os.path.join(d, "data.parquet")
+    meta_path = os.path.join(d, "meta.json")
+    if not os.path.exists(pq):
         return None
-    wm = read_watermark(root, symbol, timeframe)
-    if wm is None:
+    detail = ""
+    actual = (0, None, None)
+    declared = (0, None, None)
+    for _attempt in range(_CONSISTENT_READ_ATTEMPTS):
+        # 发布窗口内 parquet 与 meta 可能短暂不同代：两者都重读，直到
+        # 同代一致；重试耗尽仍不一致 = 真撕裂（发布中断），明确拒绝。
+        try:
+            wm = read_watermark(root, symbol, timeframe)
+            transient: OSError | None = None
+        except ValueError as e:
+            raise StoreConsistencyError(
+                f"{d}：meta.json 损坏（{e!r}）——拒绝读取") from e
+        except OSError as e:
+            # Windows：写者 os.replace 竞争下读者瞬态打不开 meta
+            wm = None
+            transient = e
+        if transient is None and wm is None:
+            raise StoreConsistencyError(
+                f"{d}：有 data.parquet 无 meta.json——数据与水位不是同一份，"
+                "拒绝读取（重跑一次保存可自愈）")
+        if transient is not None:
+            detail = f"发布窗口瞬态读取失败（{transient!r}）"
+            time.sleep(_CONSISTENT_READ_SLEEP)
+            continue
+        try:
+            declared = (int(wm["rows"]), pd.Timestamp(wm["first_time"]),
+                        pd.Timestamp(wm["last_closed_time"]))
+        except (KeyError, TypeError, ValueError) as e:
+            raise StoreConsistencyError(
+                f"{d}：meta 水位字段缺失或不可解析（{e!r}）——拒绝读取") from e
+        fingerprint = wm.get("content_sha256")
+
+        try:
+            with open(pq, "rb") as f:
+                raw = f.read()
+        except OSError as e:
+            detail = f"发布窗口瞬态读取失败（{e!r}）"
+            time.sleep(_CONSISTENT_READ_SLEEP)
+            continue
+        actual_fp = hashlib.sha256(raw).hexdigest()
+        df = pd.read_parquet(io.BytesIO(raw))
+        actual = (len(df), pd.Timestamp(df["time"].iloc[0]),
+                  pd.Timestamp(df["time"].iloc[-1])) if len(df) else (0, None, None)
+        if fingerprint is not None:
+            if actual_fp == fingerprint:
+                return df        # 指纹一致 = 同代发布；水位语义交给上界契约
+            detail = "内容指纹（content_sha256）不一致"
+        else:
+            # 旧 meta（无指纹）：退回条数/首尾核对
+            if declared == actual:
+                return df
+            detail = "水位不一致"
+        time.sleep(_CONSISTENT_READ_SLEEP)
+    if not os.path.exists(meta_path):
         raise StoreConsistencyError(
             f"{d}：有 data.parquet 无 meta.json——数据与水位不是同一份，"
             "拒绝读取（重跑一次保存可自愈）")
-    try:
-        declared = (int(wm["rows"]), pd.Timestamp(wm["first_time"]),
-                    pd.Timestamp(wm["last_closed_time"]))
-    except (KeyError, TypeError, ValueError) as e:
-        raise StoreConsistencyError(
-            f"{d}：meta 水位字段缺失或不可解析（{e!r}）——拒绝读取") from e
-    actual = (len(df), pd.Timestamp(df["time"].iloc[0]),
-              pd.Timestamp(df["time"].iloc[-1])) if len(df) else (0, None, None)
-    if declared != actual:
-        raise StoreConsistencyError(
-            f"{d}：data.parquet 与 meta.json 不是同一份快照"
-            f"（数据 {actual[0]} 根 [{actual[1]} → {actual[2]}]，"
-            f"meta 声明 {declared[0]} 根 [{declared[1]} → {declared[2]}]）"
-            "——发布中途失败过？拒绝读取（重跑一次保存可自愈）")
-    return df
+    raise StoreConsistencyError(
+        f"{d}：data.parquet 与 meta.json 不是同一份快照"
+        f"（{detail}；数据 {actual[0]} 根 [{actual[1]} → {actual[2]}]，"
+        f"meta 声明 {declared[0]} 根 [{declared[1]} → {declared[2]}]"
+        + ("，generation="
+           + str(wm.get("generation", "?")) if fingerprint is not None else "")
+        + "）——发布中途失败过或数据被改写？拒绝读取（重跑一次保存可自愈）")
+
+
+def load_bars_consistent(root, symbol: str, timeframe: str, *,
+                         allow_unverified: bool = False) -> pd.DataFrame | None:
+    """研究读的一致性入口（X-04）：lockbox.research_bars 与 ext 合并读取
+    经本函数取数——撕裂快照（发布中断 / 指纹不符）明确拒绝，绝不混版。
+
+    allow_unverified=True（显式测试/迁移通道，与边界契约的
+    allow_unbounded 配套）：序列**没有 meta.json**（手写测试夹具形态，
+    无指纹可核）时退化为 load_bars 直读；有 meta 仍走一致性校验。
+    无 data.parquet → None（与 load_bars 一致）。
+    """
+    pq = os.path.join(series_dir(root, symbol, timeframe), "data.parquet")
+    if not os.path.exists(pq):
+        return None
+    if allow_unverified:
+        try:
+            wm = read_watermark(root, symbol, timeframe)
+        except (OSError, ValueError):
+            wm = None
+        if wm is None:
+            return load_bars(root, symbol, timeframe)
+    return load_bars_checked(root, symbol, timeframe)
 
 
 def read_watermark(root, symbol: str, timeframe: str) -> dict | None:

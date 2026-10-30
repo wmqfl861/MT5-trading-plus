@@ -226,6 +226,11 @@ class _LedgerStub:
     def round_lockbox_uses(self, rid):
         return 0
 
+    def round_n_trials(self, rid):
+        # X-01：预检改用 round_n_trials（reservation 权威计数；桩与
+        # round_n_dedup 同值——无 reservation 的旧口径回退）
+        return self.used
+
     def round_n_dedup(self, rid):
         return self.used
 

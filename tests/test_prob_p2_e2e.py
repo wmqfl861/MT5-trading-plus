@@ -175,7 +175,8 @@ def _screen(env, lb_z, monkeypatch):
     argv = ["screen", "--card", "P002-v1", "--strategy", STRATEGY_REF,
             "--cards-dir", str(env["cards"]), "--data-root", str(env["store"]),
             "--ledger", str(env["ledger"]), "--costs", "zero",
-            "--volume-lots", "1.0"]
+            "--volume-lots", "1.0",
+            "--allow-unbounded-data"]   # X-03：合成裸库夹具声明
     out = io.StringIO()
     code = 0
     monkeypatch.chdir(env["tmp"])
@@ -217,7 +218,8 @@ def test_e1_gate_runs_validation_card(env, monkeypatch):
     argv = ["gate", "--card", "P002-v1", "--strategy", STRATEGY_REF,
             "--gates", "G0", "--cards-dir", str(env["cards"]),
             "--data-root", str(env["store"]), "--ledger", str(env["ledger"]),
-            "--costs", "zero", "--volume-lots", "1.0", "--params", "{}"]
+            "--costs", "zero", "--volume-lots", "1.0", "--params", "{}",
+            "--allow-unbounded-data"]    # X-03：合成裸库夹具声明
     out = io.StringIO()
     code = 0
     monkeypatch.chdir(env["tmp"])

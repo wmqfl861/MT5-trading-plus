@@ -707,10 +707,14 @@ def _imports_within(path: Path, library_dir: Path, module_name: str | None = Non
     **该文件自己的 package** 解析，不能沿用固定前缀）。
 
     认两类形式：
-    - 绝对 import（`import mt5quant.strategies.library[.x]`、`from
-      mt5quant.strategies.library[.x] import y`）：只认 library 前缀（T37
-      口径不变——pandas/numpy/strategies.base 等库外依赖不进指纹，由
-      git_commit + engine_version 覆盖）。
+    - 绝对 import（`import mt5quant…[.x]`、`from mt5quant…[.x] import y`）：
+      library 前缀照旧（T37 口径），**X-05（2026-10-30 审核）起项目包
+      mt5quant 内的绝对导入同样进指纹**——真实 P 策略的
+      `from mt5quant.prob.labels import …` / `tables` / `decision` 是
+      实际评估依赖，改它们必须改变 strategy_sha（旧实现只认 library
+      前缀，三个概率核心文件被漏掉——审核探针 dependencies 的反例）。
+      真库外（pandas/numpy/mt5data 等）不进指纹，由 git_commit +
+      engine_version 覆盖（T37 口径不变）。
     - 相对 import（H-12）：按导入文件的**真实 package**（module_name 的
       `__package__` 语义，importlib 定位文件、模块名逐级上溯）解析——
       旧实现把 level 1/2 锚死 library 根、level≥3 直接丢弃，库外文件的
@@ -727,6 +731,7 @@ def _imports_within(path: Path, library_dir: Path, module_name: str | None = Non
     import ast
 
     lib = _LIBRARY_PKG
+    proj = _PROJECT_PKG
     targets: set[str] = set()
     tree = ast.parse(path.read_text(encoding="utf-8"))
 
@@ -744,6 +749,11 @@ def _imports_within(path: Path, library_dir: Path, module_name: str | None = Non
                 n = alias.name
                 if n == lib or n.startswith(lib + "."):
                     targets.add(n)
+                elif (proj is not None and (n == proj
+                                            or n.startswith(proj + "."))
+                      and _in_scope(_module_file(n))):
+                    # X-05：项目内绝对 import（mt5quant.prob.labels 等）
+                    targets.add(n)
         elif isinstance(node, ast.ImportFrom):
             if node.level == 0:
                 base = node.module or ""
@@ -754,6 +764,17 @@ def _imports_within(path: Path, library_dir: Path, module_name: str | None = Non
                             targets.add(cand)
                 elif base.startswith(lib + "."):
                     targets.add(base)
+                elif (proj is not None
+                      and (base == proj or base.startswith(proj + "."))):
+                    # X-05：`from mt5quant.prob.labels import x` —— base
+                    # 模块及其 import 的同名子模块都在项目内才收录
+                    cands = [base] + [f"{base}.{a.name}" for a in node.names]
+                    for cand in cands:
+                        if cand in targets or cand == lib \
+                                or cand.startswith(lib + "."):
+                            continue        # library 分支已处理/去重
+                        if _in_scope(_module_file(cand)):
+                            targets.add(cand)
             elif module_name:
                 # H-12：真实 package 解析——anchor 上溯 level−1 级
                 anchor = _package_parts(
@@ -782,9 +803,14 @@ def _imports_within(path: Path, library_dir: Path, module_name: str | None = Non
 
 def strategy_files(strategy_ref: str) -> list[Path]:
     """指纹覆盖的文件集：策略类所在模块文件 + 它（传递）import 的库内
-    模块与**相对导入解析到的库外项目模块**（T37/H3/D23 + H-12——台账
-    runs.strategy_sha 的哈希对象；绝对 import 的库外依赖（pandas、
-    strategies.base 等）不进指纹，由 git_commit + engine_version 覆盖）。
+    模块与**相对/绝对导入解析到的项目内模块**（T37/H3/D23 + H-12 +
+    X-05——台账 runs.strategy_sha 的哈希对象；真库外依赖（pandas、numpy
+    等）不进指纹，由 git_commit + engine_version 覆盖）。
+
+    X-05（2026-10-30 审核）：绝对导入同样按**项目包边界**收录——真实
+    P 策略 `from mt5quant.prob.labels import …` 的概率核心（labels/
+    tables/decision）是实际评估依赖，落在闭包里才进指纹（旧实现只认
+    library 前缀，漏掉三个概率核心文件——审核探针 dependencies）。
 
     策略模块通过 importlib 定位（不执行）；找不到模块 → ValueError
     （fail-fast：试验身份必须可计算，不能静默退化为不含代码的指纹）。

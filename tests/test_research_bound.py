@@ -11,9 +11,11 @@
 - fail-closed：坏 meta（非法 JSON / 缺 store 必需字段）、ext 有数据无
   manifest、ext 段 manifest 缺 research_cutoff 且无锁箱声明兜底——一律
   LockboxError，绝不带着不明边界放行；
-- 无任何声明边界的主库（未设 lockbox、无 source_cutoff、无 ext）→
-  declared/strict 视情况可得（水位仍参与）；research_bars 对手写 parquet
-  （无 meta 无锁箱）保持回归兼容直读。
+- X-03：裸库（无任何声明边界且有数据）对正式研究读按"未初始化"拒绝，
+  显式测试/迁移通道 allow_unbounded=True 保持旧直读行为；完全无数据的
+  序列保持 missing → None；
+- X-04：research_bars 走一致性读（store.load_bars_consistent）——撕裂
+  快照（发布中断 / 内容指纹不符）明确拒绝，不配读混版。
 """
 import json
 from pathlib import Path
@@ -22,13 +24,15 @@ import pandas as pd
 import pytest
 
 from mt5data.ext.core import ExtSeries, save_ext_series
+from mt5data.ext.merge import merged_research_series
 from mt5data.lockbox import (
     LockboxError,
     effective_research_bound,
     research_bars,
+    write_config,
     write_global_cutoff,
 )
-from mt5data.store import save_bars
+from mt5data.store import StoreConsistencyError, save_bars
 
 SYM, TF = "XAUUSD", "H1"
 CUTOFF = pd.Timestamp("2026-06-01T00:00:00")
@@ -266,26 +270,166 @@ class TestFailClosed:
         assert b.sources == ("lockbox",)
 
 
-# ================================================================ 回归兼容
+# ================================================================ 裸库/未初始化（X-03）
 
-class TestCompat:
-    def test_bare_store_without_lockbox_reads_all(self, tmp_path):
-        """无任何声明边界的主库：research_bars 与直读一致（回归兼容）。"""
+class TestUninitializedRejection:
+    """X-03：裸库（无任何声明边界的主库）不再自动直读放行——正式研究读
+    按"未初始化"拒绝；显式测试/迁移通道 allow_unbounded=True 保持旧行为；
+    合法导出库（source_cutoff）/纯 ext 库（research_cutoff）不须 opt-in。"""
+
+    def test_bare_store_rejected_as_uninitialized(self, tmp_path):
         root = tmp_path / "data"
         save_bars(str(root), SYM, TF, bars())
-        b = effective_research_bound(str(root), SYM, TF)
-        assert b.declared is None
-        assert len(research_bars(str(root), SYM, TF)) == 16
+        with pytest.raises(LockboxError, match="未初始化"):
+            effective_research_bound(str(root), SYM, TF)
+        with pytest.raises(LockboxError, match="未初始化"):
+            research_bars(str(root), SYM, TF)
+        with pytest.raises(LockboxError, match="allow_unbounded"):
+            research_bars(str(root), SYM, TF)
 
-    def test_handwritten_parquet_without_meta_reads_all(self, tmp_path):
-        """bt 脚本测试形态：手写 parquet（无 meta 无锁箱）→ 直读全部。"""
+    def test_bare_store_explicit_channel_reads_all(self, tmp_path):
+        """显式测试/迁移通道：与旧直读行为一致（水位参与上界，无声明即全量）。"""
+        root = tmp_path / "data"
+        save_bars(str(root), SYM, TF, bars())
+        b = effective_research_bound(str(root), SYM, TF, allow_unbounded=True)
+        assert b.declared is None
+        assert len(research_bars(str(root), SYM, TF,
+                                allow_unbounded=True)) == 16
+
+    def test_handwritten_parquet_without_meta(self, tmp_path):
+        """手写 parquet（无 meta 无锁箱，bt 脚本夹具形态）：正式入口同样
+        拒绝；显式通道直读全部。"""
         root = tmp_path / "data"
         d = root / "bars" / SYM / TF
         d.mkdir(parents=True)
         bars().to_parquet(d / "data.parquet")
-        b = effective_research_bound(str(root), SYM, TF)
+        with pytest.raises(LockboxError, match="未初始化"):
+            research_bars(str(root), SYM, TF)
+        b = effective_research_bound(str(root), SYM, TF,
+                                     allow_unbounded=True)
         assert b.declared is None and b.strict is None
-        assert len(research_bars(str(root), SYM, TF)) == 16
+        assert len(research_bars(str(root), SYM, TF,
+                                allow_unbounded=True)) == 16
+
+    def test_v1_config_not_covering_series_rejected(self, tmp_path):
+        """v1 序列键未覆盖的序列 = 该序列未初始化（不能由"没有它的键"
+        自动放行——X-03 裸库规则的逐序列形态）。"""
+        root = tmp_path / "data"
+        save_bars(str(root), SYM, TF, bars())
+        write_config(str(root), {"EURUSD/M1": CUTOFF.isoformat()})
+        with pytest.raises(LockboxError, match="未初始化"):
+            research_bars(str(root), SYM, TF)
+        assert len(research_bars(str(root), SYM, TF,
+                                allow_unbounded=True)) == 16
+
+    def test_missing_series_without_any_data_returns_none(self, tmp_path):
+        """库里完全没有该序列（无数据）不属"未初始化放行"问题：
+        missing 语义保持与 load_bars 一致的 None。"""
+        root = tmp_path / "data"
+        root.mkdir(parents=True)
+        assert research_bars(str(root), "NOAUD", "M1") is None
+        assert research_bars(str(root), "NOAUD", "M1",
+                             allow_unbounded=True) is None
+
+    def test_legal_export_store_reads_without_optin(self, tmp_path):
+        """合法导出研究库（无 lockbox.json、带 source_cutoff）不须 opt-in
+        ——不得给合法导出强加主库 lockbox 文件。"""
+        root = tmp_path / "data_research"
+        save_bars(str(root), SYM, TF, bars())
+        stamp_source_cutoff(root)
+        assert not (Path(root) / "lockbox.json").exists()
+        assert len(research_bars(str(root), SYM, TF)) == 10
+
+
+# ================================================================ 入口对拍（X-03）
+
+class TestEntryParity:
+    """X-03 验证方法：同一合成库逐入口对拍——research_bars 与
+    merged_research_series 对相同情景给出一致结论。"""
+
+    def _readers(self, root, **kw):
+        return [lambda: research_bars(str(root), SYM, TF, **kw),
+                lambda: merged_research_series(str(root), SYM, TF, **kw)]
+
+    def test_bare_store_same_verdict(self, tmp_path):
+        root = tmp_path / "data"
+        save_bars(str(root), SYM, TF, bars())
+        for reader in self._readers(root):
+            with pytest.raises(LockboxError, match="未初始化"):
+                reader()
+
+    def test_end_beyond_declared_same_verdict(self, tmp_path):
+        root = tmp_path / "data"
+        save_bars(str(root), SYM, TF, bars())
+        write_global_cutoff(str(root), CUTOFF, note="t")
+        for reader in self._readers(root, end=CUTOFF + H1):
+            with pytest.raises(LockboxError, match="越过锁箱边界"):
+                reader()
+
+    def test_end_equal_to_declared_legal_both(self, tmp_path):
+        root = tmp_path / "data"
+        save_bars(str(root), SYM, TF, bars())
+        write_global_cutoff(str(root), CUTOFF, note="t")
+        df = research_bars(str(root), SYM, TF, end=CUTOFF)
+        m, *_ = merged_research_series(str(root), SYM, TF, end=CUTOFF)
+        assert len(df) == 10 and (df["time"] >= CUTOFF).sum() == 0
+        assert len(m) == 10 and (m["time"] >= CUTOFF).sum() == 0
+
+    def test_conflicting_bounds_same_verdict(self, tmp_path):
+        root = tmp_path / "data"
+        save_bars(str(root), SYM, TF, bars())
+        stamp_source_cutoff(root)
+        write_global_cutoff(str(root), CUTOFF - pd.Timedelta(days=1),
+                            note="t")
+        for reader in self._readers(root):
+            with pytest.raises(LockboxError, match="冲突"):
+                reader()
+
+    def test_legal_export_same_success_both(self, tmp_path):
+        root = tmp_path / "data_research"
+        save_bars(str(root), SYM, TF, bars())
+        stamp_source_cutoff(root)
+        df = research_bars(str(root), SYM, TF)
+        m, *_ = merged_research_series(str(root), SYM, TF)
+        assert len(df) == len(m) == 10
+        assert (df["time"] >= CUTOFF).sum() == 0
+        assert (m["time"] >= CUTOFF).sum() == 0
+
+
+# ================================================================ 一致性读（X-04）
+
+class TestConsistentRead:
+    def test_torn_publish_rejected_by_research_bars(self, tmp_path,
+                                                    monkeypatch):
+        """【X-04 失败测试】发布中断的撕裂快照（行数/首尾不变、仅改首行
+        OHLC）：research_bars 必须明确拒绝（StoreConsistencyError），
+        不得把新 parquet 配旧 meta 的混版外发给研究侧。"""
+        from mt5data import store as store_mod
+
+        root = tmp_path / "data"
+        save_bars(str(root), SYM, TF, bars())
+        write_global_cutoff(str(root), CUTOFF, note="t")
+        new = bars()
+        new.loc[0, ["open", "high", "low", "close"]] += 1.0
+
+        real_replace = store_mod._atomic_replace
+
+        def boom(src, dst):
+            if Path(dst).name == "meta.json":
+                raise OSError("注入：parquet 已发布、meta 尚未发布时崩溃")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(store_mod, "_atomic_replace", boom)
+        with pytest.raises(OSError):
+            save_bars(str(root), SYM, TF, new)
+        monkeypatch.undo()
+
+        with pytest.raises(StoreConsistencyError):
+            research_bars(str(root), SYM, TF)
+        # 重存一次自愈
+        save_bars(str(root), SYM, TF, new)
+        df = research_bars(str(root), SYM, TF)
+        assert len(df) == 10
 
 
 # ================================================================ 研究读取零越界

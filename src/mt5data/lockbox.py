@@ -11,13 +11,19 @@
 - cutoff = 研究/回测可见上限：开放段 time < cutoff，锁箱段 time >= cutoff；
 - 显式请求（end / since / until）越过 cutoff → LockboxError，绝不静默
   截断——静默截断会让研究者误以为看到了完整请求区间；
-- 无配置 → 一切行为与没有锁箱时完全一致（回归兼容；H-01 细化：坏 meta、
-  未打边界戳的 ext 段仍 fail-closed，见 effective_research_bound）；
+- X-03（audit2）：无任何声明边界**且有数据**的库（未初始化主库、无 meta
+  的手写 parquet）对正式研究读按"未初始化"拒绝——"没有 lockbox"不再
+  自动等于直读放行；显式测试/迁移通道 allow_unbounded=True 保持旧的
+  直读行为；完全无数据的序列仍按 missing → None（与 load_bars 一致）；
+  合法研究导出库（meta.source_cutoff）/纯 ext 库
+  （manifest.research_cutoff）不属裸库，不须 opt-in；
 - H-01 统一有效研究上界契约（effective_research_bound）：主库 lockbox
   cutoff、研究导出库 meta.source_cutoff、ext manifest.research_cutoff、
   显式 end、已收盘水位五类来源汇成**一个**严格上界；声明冲突/元数据
   缺损保守拒绝。research_bars 与 ext 合并读取（mt5data.ext.merge）消费
   同一契约——不存在"研究库没有 lockbox.json 就没有边界"的读法；
+- X-04（audit2）：research_bars 的取数走 store.load_bars_consistent
+  （内容指纹一致性读）——发布中断的撕裂快照明确拒绝，不配读混版；
 - tick 库豁免：tick 只有最近数周（整段落在锁箱期内），仅用于成本统计
   （点差/滑点的按小时分布），不构成回测样本、不参与信号计算；对 tick
   施加锁箱会让成本校准无数据可用，而报价微观结构统计不泄露未来行情
@@ -35,7 +41,7 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 
 from mt5data.schedule import REQUIRED_META_FIELDS
-from mt5data.store import TIMEFRAME_SECONDS, load_bars
+from mt5data.store import TIMEFRAME_SECONDS, load_bars, load_bars_consistent
 
 CONFIG_NAME = "lockbox.json"
 
@@ -298,8 +304,9 @@ class ResearchBound:
     - end：显式请求上界（含端点）；越 declared 界在构造前即 LockboxError；
     - strict：统一换算后的**严格**上界——合法研究行一律 time < strict
       （declared 原样；last_closed + 一个周期；end + 1µs——bar 时刻落在
-      周期网格上，三种口径等价不漏）。全无 → None（未设边界的主库，
-      research_bars 保持回归兼容直读）；
+      周期网格上，三种口径等价不漏）。全无 → None（X-03 起：declared
+      为 None 且有数据 = 裸库未初始化，正式研究读在构造时即拒绝，
+      仅 allow_unbounded=True 的显式测试/迁移通道能拿到 strict=None）；
     - sources：参与声明的来源标签（"lockbox" / "bars:source_cutoff" /
       "ext:{来源}"），诊断与审计用。
     """
@@ -388,8 +395,10 @@ def _ext_declared_cutoffs(root: str, symbol: str, tf: str
 def effective_research_bound(data_root, symbol: str, timeframe: str, *,
                              end=None,
                              lockbox: dict[str, datetime]
-                             | LockboxConfig | None = None) -> ResearchBound:
-    """统一有效研究上界（H-01）：research_bars 与 ext 合并读取共用本契约。
+                             | LockboxConfig | None = None,
+                             allow_unbounded: bool = False) -> ResearchBound:
+    """统一有效研究上界（H-01/X-03）：research_bars 与 ext 合并读取
+    （mt5data.ext.merge）共用的**唯一**边界契约。
 
     汇集四类来源（详见 ResearchBound docstring）：
     1. 主库 lockbox cutoff（v2 全局 / v1 序列）；
@@ -408,9 +417,12 @@ def effective_research_bound(data_root, symbol: str, timeframe: str, *,
     - ext 段 manifest 缺 research_cutoff 且无锁箱声明兜底 → LockboxError
       （主库源 manifest 不带该字段属正常——lockbox 兜底放行）。
 
-    未设任何声明边界的主库（无 lockbox、无 source_cutoff、无 ext 戳）：
-    declared=None；strict 只剩水位与 end（可能为 None）——research_bars
-    对手写 parquet（无 meta 无锁箱）保持回归兼容直读。
+    X-03：未设任何声明边界**且有数据**的库（未初始化主库、无 meta 的
+    手写 parquet）→ LockboxError（"未初始化"——正式研究必须能证明数据
+    来源与研究上界，不能由"没有 lockbox"自动直读放行）。
+    allow_unbounded=True 是显式测试/迁移通道：保持旧行为（declared=None、
+    strict 只剩水位与 end）。完全无数据的序列不触发本拒绝（missing 语义
+    由调用方按 None 处理）。
     """
     root = str(data_root)
     tf = timeframe.upper()
@@ -451,6 +463,21 @@ def effective_research_bound(data_root, symbol: str, timeframe: str, *,
             "research_cutoff，库内也没有锁箱声明兜底——外部数据没有边界，"
             "保守拒绝（fail-closed）")
 
+    # X-03：裸库（无任何声明边界）且有数据 → 未初始化，正式研究读拒绝。
+    # 完全无数据的序列不在此列（research_bars 对 missing 序列返回 None）。
+    if declared is None and not allow_unbounded:
+        has_series_data = (
+            os.path.exists(os.path.join(root, "bars", symbol, tf,
+                                        "data.parquet"))
+            or bool(ext_declared))
+        if has_series_data:
+            raise LockboxError(
+                f"{symbol}/{tf} 未初始化：库内没有任何已声明的研究上界"
+                "（lockbox cutoff / 导出 meta source_cutoff / ext manifest "
+                "research_cutoff 均缺）——正式研究读拒绝（X-03：裸库不再"
+                "自动直读；测试/迁移场景显式传 allow_unbounded=True，"
+                "或先跑 lockbox_init / 用 export_research_store 导出）")
+
     if declared is not None and end is not None \
             and pd.Timestamp(end) > pd.Timestamp(declared):
         raise LockboxError(
@@ -481,21 +508,26 @@ def effective_research_bound(data_root, symbol: str, timeframe: str, *,
 
 def research_bars(root, symbol: str, timeframe: str, *,
                   end: datetime | None = None,
-                  lockbox: dict[str, datetime] | LockboxConfig | None = None
-                  ) -> pd.DataFrame | None:
+                  lockbox: dict[str, datetime] | LockboxConfig | None = None,
+                  allow_unbounded: bool = False) -> pd.DataFrame | None:
     """研究侧 K 线加载器：只返回有效研究上界内的行（锁箱段绝不外发）。
 
-    H-01 起上界统一由 effective_research_bound 契约决定（主库 lockbox
-    cutoff / 研究导出库 source_cutoff / ext research_cutoff 冲突 fail-closed、
+    上界统一由 effective_research_bound 契约决定（主库 lockbox cutoff /
+    研究导出库 source_cutoff / ext research_cutoff 冲突 fail-closed、
     显式 end、已收盘水位取 min）：
     - 显式 end 越过声明上界 → LockboxError：显式请求禁止静默截断；
     - end == 声明上界合法，但结果仍严格 < 上界（上界时刻的 bar 属锁箱）；
-    - 无任何声明边界（未设锁箱的主库、手写 parquet）→ 与 store.load_bars
-      行为一致（回归兼容；坏 meta / 未打戳 ext 段仍 fail-closed）。
+    - X-03：无任何声明边界且有数据的库（裸库/手写 parquet）→
+      LockboxError（"未初始化"）；allow_unbounded=True 为显式测试/迁移
+      通道，保持旧的直读行为；missing 序列（无数据）返回 None；
+    - X-04：取数走 load_bars_consistent——撕裂快照（发布中断/内容指纹
+      不符）明确拒绝（StoreConsistencyError），绝不新 parquet 配旧 meta。
     """
     bound = effective_research_bound(root, symbol, timeframe,
-                                     end=end, lockbox=lockbox)
-    df = load_bars(root, symbol, timeframe)
+                                     end=end, lockbox=lockbox,
+                                     allow_unbounded=allow_unbounded)
+    df = load_bars_consistent(str(root), symbol, timeframe,
+                              allow_unverified=allow_unbounded)
     if df is None or len(df) == 0:
         return df
     if bound.strict is not None:

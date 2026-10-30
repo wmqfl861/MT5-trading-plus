@@ -173,11 +173,10 @@ def per_lot_per_night(entry: dict, *, account_currency: str = "USD") -> tuple[fl
     - 点数（1）：金额 = swap × point × contract_size（point/contract_size
       须有限正数——0/NaN 会把隔夜费静默算成 0/NaN，H-13）；
     - 品种/保证金/存款货币（2/3/4）：swap 即每手金额——但计价货币须等于
-      账户货币：mode=2 按 MQL5 定义是**品种基础货币**计，快照带
-      currency_base 时按真定义检查（H-13：currency_profit 代理会把
-      EURUSD 的 EUR 金额当 USD 用——base=EUR ≠ 账户 USD 即拒）；旧快照
-      无 currency_base 时沿用计价货币 currency_profit 代理检查，
-      不等则不猜汇率；
+      账户货币：mode=2 按 MQL5 定义是**品种基础货币**计，快照的
+      currency_base 未知（缺字段）或 ≠ 账户货币 → 拒绝（H2-03：不用
+      currency_profit 代理、不猜汇率；EURUSD 的 EUR 金额不得当 USD 用）；
+      mode=3/4 按各自货币字段检查，不等则不猜汇率；
     - 禁用（0）：0；
     - 利率（5/6）与重开仓（7/8）：抛 NotImplementedError（fail-fast，不猜）。
 
@@ -222,24 +221,28 @@ def per_lot_per_night(entry: dict, *, account_currency: str = "USD") -> tuple[fl
                     f"{account_currency}，不做汇率换算（fail-fast）"
                 )
         if mode == SWAP_MODE_CURRENCY_SYMBOL:
+            # H2-03（全局审核 2026-10-30）：mode=2 按 MQL5 定义是**品种基础
+            # 货币**计。基础币种未知（快照无 currency_base 字段）→ 明确拒绝
+            # ——不用 currency_profit 代理、不猜货币对名称：同一金额不能因
+            # 少一个字段就变成合法的账户货币金额（审核探针 currency 的
+            # 反例：EURUSD mode=2、利润币种 USD、无基础币种时 (-5,-2) 被
+            # 当作 USD 接受）。旧快照走显式迁移：补抓 currency_base
+            # （scripts/snapshot_specs.py + 网关字段，后者属 H 维护批）或
+            # 显式拒绝；未实现可靠换汇前外币 mode=2 一律拒绝。
             base = entry.get("currency_base")
-            if base is not None:
-                # H-13：mode=2 真定义 = 品种基础货币计。快照带 currency_base
-                # 时按真值检查——EURUSD（base=EUR）即使 currency_profit=USD
-                # 也不得把 EUR 金额当 USD 用
-                if base != account_currency:
-                    raise NotImplementedError(
-                        f"{name}：swap 按品种基础货币 {base} 计（mode=2 定义），"
-                        f"≠ 账户货币 {account_currency}，不做汇率换算（fail-fast）"
-                    )
-            else:
-                # 旧快照无 currency_base：计价货币代理一致性检查（≠ 即拒）
-                ccy = entry.get("currency_profit", "")
-                if ccy != account_currency:
-                    raise NotImplementedError(
-                        f"{name}：swap 按品种货币计（快照以计价货币 {ccy} 代理），"
-                        f"≠ 账户货币 {account_currency}，不做汇率换算（fail-fast）"
-                    )
+            if base is None:
+                raise NotImplementedError(
+                    f"{name}：swap_mode=2 按品种基础货币计，但快照缺 "
+                    "currency_base 字段（基础币种未知）——拒绝按 "
+                    f"currency_profit（{entry.get('currency_profit', '')!r}）"
+                    "代算（H2-03：不猜货币对、不用利润币种代理）；补抓快照"
+                    "基础币种或显式迁移后再用"
+                )
+            if base != account_currency:
+                raise NotImplementedError(
+                    f"{name}：swap 按品种基础货币 {base} 计（mode=2 定义），"
+                    f"≠ 账户货币 {account_currency}，不做汇率换算（fail-fast）"
+                )
         return swap_long, swap_short  # 已是每手金额（账户货币）
     raise NotImplementedError(
         f"{name}：swap_mode={mode}（{_SWAP_MODE_NAMES.get(mode, '未知')}）"

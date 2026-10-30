@@ -180,7 +180,7 @@ def _run_prob_test(env, monkeypatch, *, card="P001-v1", sims="200"):
     argv = ["prob", "test", "--card", card, "--strategy", STRATEGY_REF,
             "--cards-dir", str(env["repo"] / "research" / "cards"),
             "--data-root", str(env["store"]), "--ledger", str(env["ledger"]),
-            "--sims", sims]
+            "--sims", sims, "--allow-unbounded-data"]
     out = _io.StringIO()
     code = 0
     monkeypatch.chdir(env["tmp"])
@@ -665,7 +665,8 @@ def _run_prob_test_card(env, monkeypatch, *, card_path="P004-v1"):
             "--strategy", STRATEGY_REF,
             "--cards-dir", str(env["cards"]),
             "--data-root", str(env["store"]),
-            "--ledger", str(env["ledger"]), "--sims", "200"]
+            "--ledger", str(env["ledger"]), "--sims", "200",
+            "--allow-unbounded-data"]
     out = _io.StringIO()
     code = 0
     monkeypatch.chdir(env["tmp"])
@@ -975,13 +976,45 @@ def test_p10_h_occupancy_precheck_rejects_card(p10_r4, monkeypatch):
         assert len(led.runs_of_round("R4")) == 1     # 只有 H 那一行
 
 
-def test_p10_midrun_budget_exhaustion_voids_rest(p10_r4, monkeypatch):
-    """P-10 验证点 1（原子执行侧）：预检通过（0+2≤2）后、入账前预算被
-    并发占 1 → 第一条假设入账成功（1<2），第二条在写入时被原子拒绝，
-    剩余假设整批作废 error 行（P-05"每条假设恰一行终态"），整体退 1。"""
+def test_x01_budget_exhaustion_refuses_before_computation(p10_r4,
+                                                          monkeypatch):
+    """X-01（2026-10-30 审核，原 test_p10_midrun_budget_exhaustion_voids_rest
+    的**错误契约**修正）：预算权威前移到**计算前占位**——旧断言"预检后
+    预算被并发占 1 → 第一条入账、其余计算后作废"固定的正是审核 X-01 指出
+    的"先计算后补账"。新契约：占满的预算在 run_p1_card **之前**拒绝——
+    零行、零标签调用；H 风格占位（reserve_trial，started 即计）同样烧
+    名额，H/P 共享。
+    """
+    def must_not_run(*a, **k):
+        raise AssertionError("预算已满：run_p1_card 不应被调用（X-01 计算前拒绝）")
+
+    monkeypatch.setattr("mt5quant.prob.p1.run_p1_card", must_not_run)
+    # H 风格占位先把预算（2）占满：两条 H 试验 started 即计
+    with Ledger(p10_r4["ledger"]) as led:
+        led.reserve_trial("R4", "h-trial-1", budget=2)
+        led.reserve_trial("R4", "h-trial-2", budget=2)
+    _commit_card(p10_r4, CARD_R4.format(
+        ref=STRATEGY_REF,
+        hyps='"S1:A1:follow>base", "S1:A3:fade>base"'))
+    code, out = _run_prob_test_card(p10_r4, monkeypatch)
+    assert code == 1
+    # 预检即拒（round_n_trials 权威口径：2+2>2）——同样是计算前拒绝
+    assert "预算不足" in out
+    with Ledger(p10_r4["ledger"]) as led:
+        rows = led.runs_of_round("R4")
+        assert rows == []                     # 计算前拒绝：零行
+        assert led.round_n_trials("R4") == 2  # 只有 H 的两条占位
+
+
+def test_x01_midrun_concurrent_bypass_caught_by_reconciliation(p10_r4,
+                                                               monkeypatch):
+    """X-01 对账后盾：预检通过、占位完成后，run_p1_card 期间出现的
+    **绕过占位**的成功行（旧 H 调用形态：record_run 不经 reserve_trial）
+    在成功行写入时被 TrialReservationConsistencyError 拦下（防双计），
+    整体退 1——不再是"计算后作废补行"，而是失败如实报错。"""
     def fake_run_p1_card(card, round_obj, bars_by_symbol, costs_by_symbol,
                          **kwargs):
-        with Ledger(p10_r4["ledger"]) as led:   # 模拟预检后的并发写入
+        with Ledger(p10_r4["ledger"]) as led:   # 模拟绕过占位的并发写入
             _h_style_run(led, "race")
         return [{"hypothesis": h, "seed": i + 1, "prob_version": "1.0.0",
                  "n_triggers": 10, "n_trigger_days": 10,
@@ -995,14 +1028,16 @@ def test_p10_midrun_budget_exhaustion_voids_rest(p10_r4, monkeypatch):
         hyps='"S1:A1:follow>base", "S1:A3:fade>base"'))
     code, out = _run_prob_test_card(p10_r4, monkeypatch)
     assert code == 1
-    assert "作废" in out
+    assert "对账失败" in out
     with Ledger(p10_r4["ledger"]) as led:
-        rows = led.runs_of_round("R4")
-    ok = [r for r in rows if r["ok"]]
-    voided = [r for r in rows if not r["ok"] and "作废" in str(r["error"])]
-    assert len(ok) == 2                      # H 竞争行 + 假设 A1 成功行
-    assert len(voided) == 1                  # A3 作废（恰一行终态）
-    assert voided[0]["params"]["hypothesis"] == "S1:A3:fade>base"
+        # P 卡两条占位 + 绕行 H 成功行：把去重成功数推过上限的那次写入
+        # 被整体回滚（第三条假设行不存在），此前已入账的行保留
+        assert led.round_n_trials("R4") == 2
+        n_runs = led.conn.execute(
+            "SELECT COUNT(*) n FROM runs").fetchone()["n"]
+        assert n_runs == 2        # 绕行 H 行 + 第一条假设行；越限行已回滚
+        assert led.round_n_dedup("R4") == 2
+        assert led.verify_chain() == []
 
 
 def test_p10_h08_candidate_tamper_rejects_prob_test(p10_r4, monkeypatch):
@@ -1202,7 +1237,8 @@ def test_p06_per_symbol_swap_ref_price_and_identity(two_sym_env,
             "--strategy", "tests.test_prob_p1_cli:TwoSymDemo",
             "--cards-dir", str(two_sym_env["repo"] / "research" / "cards"),
             "--data-root", str(two_sym_env["store"]),
-            "--ledger", str(two_sym_env["ledger"]), "--sims", "200"]
+            "--ledger", str(two_sym_env["ledger"]), "--sims", "200",
+            "--allow-unbounded-data"]
     out = _io.StringIO()
     code = 0
     monkeypatch.chdir(two_sym_env["tmp"])

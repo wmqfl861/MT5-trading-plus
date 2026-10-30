@@ -770,12 +770,19 @@ def load_strategy(path: str):
         raise ValueError(f"无法装载策略 {path!r}：{e}") from e
 
 
-def load_series(data_root, symbol, timeframe, end, *, ops_ack: bool = False):
+def load_series(data_root, symbol, timeframe, end, *, ops_ack: bool = False,
+                allow_unbounded: bool = False):
     """读序列：默认经锁箱加载器（end 越过 cutoff 直接报错，绝不静默截断）。
 
     ops_ack=True（T38/D24，沿用 T27 的 --ops-ack 语义）：运维豁免，直接
     读库（含锁箱段行），供换日/成本/执行口径等测量——只用于运维，不产生
     研究结论；调用方负责把 ops_ack 记进 manifest/台账（bt 侧记 actor=ops）。
+
+    allow_unbounded=True（X-03，2026-10-30 审核，CLI flag
+    --allow-unbounded-data）：显式声明本库是**合成测试夹具/迁移用裸库**
+    （无任何声明研究上界），透传 research_bars(allow_unbounded=True)
+    保持旧的直读行为；缺省 False——正式研究读必须能证明数据来源与
+    研究上界，裸库不再自动放行。
 
     end 语义与 research_bars 一致：保留 time <= end 的行（含端点）——
     注意 end 时刻"开盘"的那根 bar 会整根纳入（含其整段 OHLC）；
@@ -796,7 +803,8 @@ def load_series(data_root, symbol, timeframe, end, *, ops_ack: bool = False):
                 raise ValueError(
                     f"无可用数据：{symbol} {timeframe}（--end {end} 截断后为空）")
         return df
-    df = research_bars(data_root, symbol, timeframe, end=end_ts)
+    df = research_bars(data_root, symbol, timeframe, end=end_ts,
+                       allow_unbounded=allow_unbounded)
     if df is None or len(df) == 0:
         suffix = (f"（--end {end} 截断后为空或序列不存在）" if end
                   else "（先跑 scripts/download_bars.py）")
@@ -857,6 +865,11 @@ def main() -> int:
                     help="--engine b：成交价叠加的额外不利滑点（价格单位）")
     ap.add_argument("--allow-zero-swap", action="store_true",
                     help="隔夜费推算不出时显式按 0 计（记入 manifest；默认报错）")
+    ap.add_argument("--allow-unbounded-data", action="store_true",
+                    help="X-03：显式声明本库是无声明研究上界的裸库/合成测试"
+                         "夹具——正式研究读要求可证明的数据来源与上界，裸库缺省"
+                         "拒绝；本 flag 仅供合成测试与数据迁移通道使用，绝不"
+                         "用于正式研究结论")
     ap.add_argument("--contract-size", type=float, default=None,
                     help="合约大小覆盖；缺省读 {data-root}/specs/latest.json")
     ap.add_argument("--cost-version", default=None,
@@ -933,7 +946,8 @@ def main() -> int:
             print(f"✓ 定手数：固定 {lots} 手")
         check_clock(data_root)
         bars = load_series(data_root, args.symbol, args.timeframe.upper(),
-                           args.end, ops_ack=args.ops_ack)
+                           args.end, ops_ack=args.ops_ack,
+                           allow_unbounded=args.allow_unbounded_data)
         # T20：禁入窗唯一来源 config/sessions.toml（与实盘风控共用）
         sess_policy = load_session_policy(str(SESSIONS_PATH))
         sess_sha = sessions_sha256(str(SESSIONS_PATH))
@@ -1017,6 +1031,7 @@ def main() -> int:
                    "research_store": research_mode,   # T27/T38：按数据根判定
                    "main_store": store_kind == "main",  # T38/D24
                    "ops_ack": bool(args.ops_ack),       # T38/D24：运维豁免
+                   "allow_unbounded_data": bool(args.allow_unbounded_data),
                    "data_root": str(data_root)})
     except Exception as e:  # fail-fast：任何错误如实报出
         print(f"✗ {type(e).__name__}: {e}")

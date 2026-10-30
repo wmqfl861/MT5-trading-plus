@@ -324,13 +324,18 @@ def test_per_lot_per_night_margin_currency_mode_requires_account_currency():
 
 
 def test_per_lot_per_night_symbol_currency_mode_requires_profit_usd():
-    # 品种货币模式：MQL5 定义为基础货币计，快照无 currency_base，
-    # 用计价货币（profit）做一致性检查；≠账户货币 → 不猜
+    # 品种货币模式（H2-03，2026-10-30 审核）：MQL5 定义为基础货币计——
+    # currency_base 未知（缺字段）→ 拒绝（不用 currency_profit 代理、
+    # 不猜货币对）；基础=账户货币才可用；基础≠账户 → 不猜汇率
+    with pytest.raises(NotImplementedError, match="currency_base"):
+        per_lot_per_night(_snap_entry(
+            swap_mode=SWAP_MODE_CURRENCY_SYMBOL, swap_long=-2.5,
+            currency_profit="USD"))
     lng, _ = per_lot_per_night(_snap_entry(
         swap_mode=SWAP_MODE_CURRENCY_SYMBOL, swap_long=-2.5,
-        currency_profit="USD"))
+        currency_base="USD", currency_profit="USD"))
     assert lng == pytest.approx(-2.5)
-    with pytest.raises(NotImplementedError, match="品种货币"):
+    with pytest.raises(NotImplementedError, match="基础货币"):
         per_lot_per_night(_snap_entry(
             swap_mode=SWAP_MODE_CURRENCY_SYMBOL, currency_profit="EUR"))
 
@@ -635,11 +640,13 @@ def test_h13_symbol_mode_uses_currency_base_when_present():
     assert sht == pytest.approx(1.0)
 
 
-def test_h13_symbol_mode_legacy_proxy_rejects_non_account_profit():
-    """旧快照（无 currency_base）沿用计价货币代理：≠ 账户货币仍明确拒绝。
-
-    EURUSD 条目误标 currency_profit=EUR（≠USD）→ NotImplementedError，
-    不猜汇率。"""
-    with pytest.raises(NotImplementedError, match="品种货币"):
+def test_h23_symbol_mode_missing_base_currency_rejected():
+    """H2-03（2026-10-30 审核）：旧快照（无 currency_base）不再退
+    currency_profit 代理——基础币种未知即明确拒绝（不猜货币对、不用
+    利润币种代算；同一金额不能因少一个字段就变成合法账户金额）。"""
+    with pytest.raises(NotImplementedError, match="currency_base"):
         per_lot_per_night(_snap_entry(
             swap_mode=SWAP_MODE_CURRENCY_SYMBOL, currency_profit="EUR"))
+    with pytest.raises(NotImplementedError, match="currency_base"):
+        per_lot_per_night(_snap_entry(
+            swap_mode=SWAP_MODE_CURRENCY_SYMBOL, currency_profit="USD"))

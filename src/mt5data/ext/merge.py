@@ -7,24 +7,27 @@
   实测而非水位）之前的 bar；相同 time 的重复 bar 以 MT5 为准
   （``concat_mt5_priority``）。正常路径下前向延长过滤已消除重叠，
   去重是防御性安全网（去重证明入测试）。
-- **裁 research_cutoff（有效上界 = 两者更早者）**：ext manifest 的
-  ``research_cutoff`` 字段是铁律 19 的**严格**上界（bar.time < cutoff；
-  真实库 data_research/ext/histdata/XAUUSD/H1/manifest.json 为
-  ``research_cutoff``）；MT5 水位 ``last_closed_time``
-  （data_research/bars/XAUUSD/H1/meta.json）语义是最后一根**已收盘**
-  bar，故为**含端点**上界（bar.time <= last_closed）。两条约束同时
-  施加于合并序列，实际生效的是更早者（真实库两者同界：
+- **边界（X-03 唯一契约，直接消费 lockbox.effective_research_bound）**：
+  ext manifest 的 ``research_cutoff`` 是铁律 19 的声明**严格**上界
+  （bar.time < cutoff）；MT5 水位 ``last_closed_time`` 语义是最后一根
+  **已收盘** bar（含端点）。统一契约会把声明上界 / last_closed+1 周期 /
+  end+1µs 换算为一个严格上界一次性施加于合并序列（网格数据上与旧的
+  "ext 严格 <、MT5 含端点、取更早者"逐位一致；真实库两者同界：
   research_cutoff = last_closed + 1h）。
-- **统一有效上界（T98/P-01）**：合并后对**全序列**统一施加有效上界
-  （各来源带各自的比较语义、同时施加即取最严）：全局锁箱 cutoff
-  （``mt5data.lockbox.load_config``+``cutoff_for``——data_root 下没有
-  lockbox.json 则无此界；研究导出库既有设计不带锁箱文件，H-01 明确
-  **不**要求必须有）、ext manifest 的 ``research_cutoff``（严格 <；
-  ext 数据在库却缺该字段 → ValueError 保守拒绝——主库 ext 未经导出
-  盖章即此形态）、导出 meta ``source_cutoff``（严格 <）、MT5 水位
-  ``last_closed_time``（含端点）、显式 ``end``（含端点；只收紧不放宽，
-  比其他界晚则被支配，绝不借 end 读出锁箱段）。多个已批准 ext 来源
-  同时提供同一序列 → 来源冲突，保守拒绝（不按字母序静默选边）。
+- **统一有效上界（T98/P-01 → X-03 唯一契约）**：合并读取**直接消费**
+  ``mt5data.lockbox.effective_research_bound``，本模块不再独立收集/取最严
+  （旧 ``_effective_upper_bounds``/``_apply_upper_bounds`` 已删）。统一
+  语义：全局锁箱 cutoff、ext manifest ``research_cutoff``（ext 数据在库
+  却缺该字段 → LockboxError 保守拒绝——主库 ext 未经导出盖章即此形态）、
+  导出 meta ``source_cutoff``——三者是**声明上界**，不一致即冲突
+  fail-closed（不再各自施加取最严）；显式 ``end``（含端点）越过声明上界
+  → LockboxError（与 research_bars 同一结论，不再"永不报越界"）；MT5
+  水位 ``last_closed_time``（含端点）与声明/end 换算为严格上界
+  （time < strict）一次性施加于合并后全序列。
+  X-03：裸库（有数据、无任何声明边界）→ LockboxError（"未初始化"）；
+  ``allow_unbounded=True`` 为显式测试/迁移通道。
+- **X-04 一致性读**：MT5 段取数走 ``store.load_bars_consistent``
+  （内容指纹校验）——撕裂快照明确拒绝，不配读混版。
 - **ext 年份闸门（T94/R14）**：只取 manifest.yearly_verification 里
   ``used == true`` 的自然年段；used=false 与未列年份都不进。
 - **来源优先级**：批准来源（approvals.SOURCE_APPROVALS /
@@ -55,8 +58,8 @@ import pandas as pd
 
 from mt5data.ext.approvals import approved_sources
 from mt5data.ext.core import load_ext_series
-from mt5data.lockbox import cutoff_for, load_config
-from mt5data.store import _COLUMNS, load_bars, read_watermark
+from mt5data.lockbox import effective_research_bound
+from mt5data.store import _COLUMNS, load_bars_consistent
 
 # 与 mt5quant.research.candidates._GAP_SPLIT 同口径（T94/R14-L3）：
 # 长于 30 天的内部空洞才算（恰 30 天不算）。
@@ -167,81 +170,8 @@ def _observed_gaps(times) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
 
 # ---------------------------------------------------------------- 主管线
 
-def _meta_bound(meta, key):
-    """水位 meta 的时间字段 → Timestamp；缺/空 → None；不可解析 → ValueError
-    （来源 meta 不明，保守拒绝）。"""
-    raw = (meta or {}).get(key)
-    if not raw:
-        return None
-    try:
-        return pd.Timestamp(raw)
-    except (TypeError, ValueError) as e:
-        raise ValueError(
-            f"水位字段 {key} 不可解析（来源 meta 不明，保守拒绝）：{raw!r}"
-        ) from e
-
-
-def _effective_upper_bounds(root, symbol: str, timeframe: str,
-                            meta, manifest, end):
-    """收集合并后全序列的有效上界（T98/P-01），返回 [(标签, 时刻, 严格?)]。
-
-    各来源带着各自的比较语义同时施加即"取最严"：
-
-    - 全局锁箱 cutoff（mt5data.lockbox.load_config + cutoff_for）：data_root
-      下没有 lockbox.json → 无此界（研究导出库既有设计不带锁箱文件，
-      H-01：不要求必须有，缺文件不是拒绝理由）；
-    - ext manifest research_cutoff（铁律 19，严格 <）：ext 数据在库却缺
-      该字段 → ValueError（来源上界不明，保守拒绝——主库 ext 未经
-      export_research_store 盖章即此形态）；
-    - 导出 meta source_cutoff（export_research_store 落盘，导出段
-      time < cutoff，严格 <）；
-    - MT5 水位 last_closed_time（最后一根已收盘 bar，含端点）；
-    - 显式 end（含端点，与 scripts.run_backtest.load_series 同语义）：
-      永不报"越过锁箱"——end 只会收紧合并上界，比其他界晚则被支配。
-    """
-    bounds = []
-    lb_cut = cutoff_for(load_config(str(root)), symbol, timeframe)
-    if lb_cut is not None:
-        bounds.append(("全局锁箱 cutoff", pd.Timestamp(lb_cut), True))
-    if manifest is not None:
-        raw = manifest.get("research_cutoff")
-        if not raw:
-            raise ValueError(
-                f"ext 序列 {symbol}/{timeframe.upper()} 的 manifest 缺 "
-                "research_cutoff——ext 来源上界不明，保守拒绝（T98/P-01；"
-                "主库 ext 未经过导出盖章，请改用研究导出库或补齐 manifest）")
-        try:
-            bounds.append(("ext manifest research_cutoff",
-                           pd.Timestamp(raw), True))
-        except (TypeError, ValueError) as e:
-            raise ValueError(
-                f"ext manifest research_cutoff 不可解析（保守拒绝）：{raw!r}"
-            ) from e
-    source_cutoff = _meta_bound(meta, "source_cutoff")
-    if source_cutoff is not None:
-        bounds.append(("导出 source_cutoff", source_cutoff, True))
-    last_closed = _meta_bound(meta, "last_closed_time")
-    if last_closed is not None:
-        bounds.append(("MT5 水位 last_closed_time", last_closed, False))
-    if end is not None:
-        try:
-            end_ts = pd.Timestamp(end)
-        except (TypeError, ValueError) as e:
-            raise ValueError(f"end 不可解析（保守拒绝）：{end!r}") from e
-        bounds.append(("显式 end", end_ts, False))
-    return bounds
-
-
-def _apply_upper_bounds(merged: pd.DataFrame, bounds) -> pd.DataFrame:
-    """对合并后全序列逐条施加上界（各自语义：True=严格 <，False=含端点）。"""
-    for _label, ts, strict in bounds:
-        merged = (merged[merged["time"] < ts] if strict
-                  else merged[merged["time"] <= ts])
-    return merged.reset_index(drop=True)
-
-
 def merged_research_series(data_root, symbol: str, timeframe: str, *,
-                           end=None):
+                           end=None, allow_unbounded: bool = False):
     """合并 MT5 主库与 ext 前向延长，返回研究用四元组。
 
     布局：``{data_root}/bars/{symbol}/{tf}``（MT5，mt5data.store）与
@@ -249,10 +179,15 @@ def merged_research_series(data_root, symbol: str, timeframe: str, *,
     全部语义（前向延长 / cutoff 口径 / 年份闸门 / 来源优先级 / 周日
     自检 / gap 口径）见模块 docstring。
 
-    end（T98/P-01，pd.Timestamp 可解析物或 None）：显式上界（含端点），
-    在合并后与其他上界（全局锁箱 cutoff / ext manifest research_cutoff /
-    导出 source_cutoff / MT5 水位）一起取最严——end 比其他界晚则被支配，
-    绝不因 end 越过锁箱而读出锁箱段。
+    X-03：有效上界**唯一**由 ``mt5data.lockbox.effective_research_bound``
+    决定（本函数直接消费，不再独立取最严）：声明上界冲突 → LockboxError；
+    显式 end 越过声明上界 → LockboxError（含端点语义与 research_bars 一致：
+    end == 上界合法、结果仍严格 < 上界）；裸库（有数据、无任何声明边界）
+    → LockboxError（"未初始化"）。``allow_unbounded=True`` 为显式测试/
+    迁移通道（保持旧的裸库合并行为）。
+
+    X-04：MT5 段取数走 ``store.load_bars_consistent``——撕裂快照
+    （发布中断 / 内容指纹不符）明确拒绝，绝不新 parquet 配旧 meta。
 
     返回 ``(bars, source_tags, gap_spans, bad_months)``：
     - bars：naive UTC 的仓库格式 DataFrame（store._COLUMNS），升序无重复；
@@ -266,26 +201,19 @@ def merged_research_series(data_root, symbol: str, timeframe: str, *,
     root = str(data_root)
     tf = timeframe.upper()
 
-    mt5 = load_bars(root, symbol, tf)
-    meta = read_watermark(root, symbol, tf) or {}
+    # 来源选择（多来源冲突保守拒绝）先于边界契约——多来源竞争的取数
+    # 语义属来源选择问题，不是边界问题。
     source, ext_df, manifest = _load_ext_segment(root, symbol, tf)
 
-    research_cutoff = None
-    if manifest and manifest.get("research_cutoff"):
-        research_cutoff = pd.Timestamp(manifest["research_cutoff"])
-    last_closed = None
-    if meta.get("last_closed_time"):
-        last_closed = pd.Timestamp(meta["last_closed_time"])
+    # X-03：边界唯一契约（冲突 / end 越界 / ext 未打戳 / 裸库未初始化
+    # 均在此 LockboxError，与 research_bars 同一结论）。
+    bound = effective_research_bound(root, symbol, tf, end=end,
+                                     allow_unbounded=allow_unbounded)
 
-    def _clip(df: pd.DataFrame) -> pd.DataFrame:
-        # ext 段：铁律 19 严格 < research_cutoff；MT5 段：另受水位
-        # last_closed_time 含端点约束。两条都施加，生效的是更早者。
-        # （合并前的分段防线；合并后另有统一上界，见 _apply_upper_bounds。）
-        if research_cutoff is not None:
-            df = df[df["time"] < research_cutoff]
-        if last_closed is not None:
-            df = df[df["time"] <= last_closed]
-        return df
+    # X-04：主库段走一致性读（撕裂快照明确拒绝；显式通道且无 meta 的
+    # 手写夹具退化为直读）。
+    mt5 = load_bars_consistent(root, symbol, tf,
+                               allow_unverified=allow_unbounded)
 
     used_years: set[int] = set()
     if manifest:
@@ -307,20 +235,18 @@ def merged_research_series(data_root, symbol: str, timeframe: str, *,
         ext_part = ext_df[ext_df["time"].dt.year.isin(used_years)]
         if mt5_first is not None:
             ext_part = ext_part[ext_part["time"] < mt5_first]
-        ext_part = _clip(ext_part).reset_index(drop=True)
+        ext_part = ext_part.reset_index(drop=True)
 
     mt5_part = None
     if mt5 is not None and len(mt5):
-        mt5_part = _clip(mt5).reset_index(drop=True)
+        mt5_part = mt5.reset_index(drop=True)
 
     merged = concat_mt5_priority(mt5_part, ext_part)
 
-    # T98/P-01：合并后全序列统一校验有效上界（取最严）——全局锁箱 cutoff
-    # / ext manifest research_cutoff / 导出 source_cutoff / 水位 / end。
-    # ext 数据在库却缺 research_cutoff、多个批准来源撞同一序列 → 上面
-    # _load_ext_segment / _effective_upper_bounds 已保守拒绝。
-    merged = _apply_upper_bounds(
-        merged, _effective_upper_bounds(root, symbol, tf, meta, manifest, end))
+    # X-03：统一严格上界（声明上界 / last_closed+1 周期 / end+1µs 的
+    # 最早者）一次性施加于合并后全序列——合法研究行一律 time < strict。
+    if bound.strict is not None:
+        merged = merged[merged["time"] < bound.strict].reset_index(drop=True)
 
     # source_tags：先登 ext 再被 MT5 覆盖（同刻冲突 MT5 为准）
     tag_by_time = {}

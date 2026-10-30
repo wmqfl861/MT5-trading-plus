@@ -3,7 +3,9 @@
 语义钉死（Review Focus #4——锁箱旁路）：
 - research_bars 只返回 time < cutoff 的行；
 - 显式 end > cutoff → LockboxError，绝不静默截断；
-- 无配置 → 行为与 store.load_bars 完全一致。
+- X-03：无任何声明边界且有数据的库（含无 meta 的手写 parquet）对正式
+  研究读按"未初始化"拒绝；显式通道 allow_unbounded=True 保持旧的直读
+  行为（测试/迁移专用）；完全无数据的序列保持 missing → None。
 
 T2（R2）追加：v2 全局 cutoff——所有序列共用一个值（取最保守者），
 一经写入只能更早不能更晚；v1 序列键配置继续兼容。
@@ -110,10 +112,15 @@ def test_load_config_missing_returns_none(tmp_path):
 
 # ---- research_bars：每条读取路径一条"越过即报错/约束"测试 ----
 
-def test_research_bars_no_config_returns_all(tmp_path):
+def test_research_bars_no_config_rejected_as_uninitialized(tmp_path):
+    """X-03：无任何声明边界的裸库对正式研究读按"未初始化"拒绝；
+    显式测试/迁移通道 allow_unbounded=True 保持与 store.load_bars
+    一致的直读。"""
     make_series(tmp_path)
-    df = research_bars(tmp_path, "XAUUSD", "H1")
-    assert len(df) == 48  # 无配置 → 与 store.load_bars 完全一致
+    with pytest.raises(LockboxError, match="未初始化"):
+        research_bars(tmp_path, "XAUUSD", "H1")
+    assert len(research_bars(tmp_path, "XAUUSD", "H1",
+                             allow_unbounded=True)) == 48
 
 
 def test_research_bars_returns_only_rows_before_cutoff(tmp_path):
@@ -151,15 +158,22 @@ def test_research_bars_legal_end_applies_as_upper_bound(tmp_path):
 
 
 def test_research_bars_end_without_config_filters_plainly(tmp_path):
+    """X-03：显式通道下的 end 过滤（无声明边界时 end 单独生效，含端点）。"""
     make_series(tmp_path)
-    df = research_bars(tmp_path, "XAUUSD", "H1", end=datetime(2026, 1, 1, 5, 0))
+    df = research_bars(tmp_path, "XAUUSD", "H1", end=datetime(2026, 1, 1, 5, 0),
+                       allow_unbounded=True)
     assert len(df) == 6
 
 
 def test_research_bars_only_configured_series_locked(tmp_path):
+    """v1 键按序列生效：被配置的序列受锁；未配置序列（有数据）按
+    未初始化拒绝，显式通道恢复旧直读。"""
     make_series(tmp_path)
     write_config(tmp_path, {"EURUSD/M1": "2026-01-02T00:00:00"})
-    assert len(research_bars(tmp_path, "XAUUSD", "H1")) == 48  # 键按序列生效
+    with pytest.raises(LockboxError, match="未初始化"):
+        research_bars(tmp_path, "XAUUSD", "H1")  # 键按序列生效
+    assert len(research_bars(tmp_path, "XAUUSD", "H1",
+                             allow_unbounded=True)) == 48
 
 
 def test_research_bars_accepts_explicit_lockbox_dict(tmp_path):

@@ -7,8 +7,9 @@
 - 只取 yearly_verification[*].used==true 的年份段（used=false 与未列
   年份都不进）；
 - 裁 research_cutoff：ext 段铁律 19 严格 <（manifest.research_cutoff）；
-  MT5 段另受 meta.last_closed_time 含端点约束——合并有效上界 = 两者
-  更早者（口径见 merge.py docstring）；
+  MT5 段另受 meta.last_closed_time 含端点约束——X-03 起统一由
+  mt5data.lockbox.effective_research_bound 换算（严格上界 = 声明上界、
+  last_closed+1 周期、end+1µs 三者最早），合并读取直接消费该契约；
 - 月度周日开盘小时自检（仅 ext 段，MT5 段豁免）：正常月唯一；美国 DST
   切换月允许两个相邻小时；违例月记入 bad_months、从序列剔除且两端
   记入 gap_spans；
@@ -27,6 +28,7 @@ from mt5data.ext.approvals import USAGE_RESTRICTION_HISTDATA
 from mt5data.ext.core import ExtSeries, save_ext_series
 from mt5data.ext.merge import (MAX_GAP_DAYS, concat_mt5_priority,
                                merged_research_series)
+from mt5data.lockbox import LockboxError
 from mt5data.store import _COLUMNS, save_bars
 
 SYM, TF = "XAUUSD", "H1"
@@ -209,11 +211,13 @@ class TestCutoff:
 
     def test_last_closed_bound_inclusive_on_mt5(self, tmp_path):
         """MT5 水位语义为"最后一根已收盘 bar"：恰在 last_closed_time 的
-        bar 保留（含端点），之后的剔除（防御性裁剪）。"""
+        bar 保留（含端点），之后的剔除（防御性裁剪；X-03 起统一契约
+        换算为严格 < last_closed+1 周期——网格数据等价）。"""
         root = research_root(tmp_path)
         write_mt5(root, make_bars(mondays("2011-01-03", 4)),
                   last_closed="2011-01-17T00:00:00")
-        bars, tags, gaps, bad = merged_research_series(root, SYM, TF)
+        bars, tags, gaps, bad = merged_research_series(
+            root, SYM, TF, allow_unbounded=True)
         assert list(bars["time"]) == [pd.Timestamp("2011-01-03"),
                                       pd.Timestamp("2011-01-10"),
                                       pd.Timestamp("2011-01-17")]
@@ -270,7 +274,8 @@ class TestSundayMonthlyCheck:
             hour = 22 if (d.day // 7) % 2 == 0 else 23
             times.append(d + pd.Timedelta(hours=hour))
         write_mt5(root, make_bars(times))
-        bars, tags, gaps, bad = merged_research_series(root, SYM, TF)
+        bars, tags, gaps, bad = merged_research_series(
+            root, SYM, TF, allow_unbounded=True)
         assert bad == []
         assert len(bars) == 5
 
@@ -286,7 +291,8 @@ class TestGapSpans:
             "2011-03-04 01:00",                        # 30 天 + 1 小时
             "2011-04-03 01:00",                        # 恰 30 天
         ]))
-        bars, tags, gaps, bad = merged_research_series(root, SYM, TF)
+        bars, tags, gaps, bad = merged_research_series(
+            root, SYM, TF, allow_unbounded=True)
         assert MAX_GAP_DAYS == 30
         assert gaps == [(pd.Timestamp("2011-02-02 00:00"),
                          pd.Timestamp("2011-03-04 01:00"))]
@@ -301,7 +307,8 @@ class TestGapSpans:
                  "2011-05-04 01:00"]
         root = research_root(tmp_path)
         write_mt5(root, make_bars(times))
-        _, _, gaps, _ = merged_research_series(root, SYM, TF)
+        _, _, gaps, _ = merged_research_series(root, SYM, TF,
+                                               allow_unbounded=True)
         assert list(gaps) == list(_observed_gaps(
             pd.DatetimeIndex(pd.to_datetime(times))))
 
@@ -335,11 +342,13 @@ class TestEmptyRoot:
 # ================================================================ P-01 统一上界
 
 class TestP01UnifiedUpperBound:
-    """T98/P-01：合并后全序列统一校验有效上界（取最严）——全局锁箱
-    cutoff（data_root 下有 lockbox 配置才生效，研究导出库没有属既有设计、
-    不因此拒绝——H-01）、ext manifest research_cutoff（ext 在库却缺该字段
-    → 保守拒绝）、导出 meta source_cutoff、MT5 水位 last_closed_time（含
-    端点）、显式 end（含端点；只收紧不放宽——比其他界晚则被支配）。"""
+    """T98/P-01 → X-03：合并读取的边界不再由本模块独立收集（旧
+    _effective_upper_bounds/_apply_upper_bounds 已删），统一消费
+    mt5data.lockbox.effective_research_bound——全局锁箱 cutoff / ext
+    manifest research_cutoff（ext 在库却缺该字段 → LockboxError 保守
+    拒绝）/ 导出 meta source_cutoff / MT5 水位 last_closed_time / 显式
+    end，冲突 fail-closed、end 越界 fail-closed（与 research_bars 同一
+    结论）。"""
 
     def test_main_store_lockbox_cutoff_bounds_merged(self, tmp_path):
         """主库有 lockbox 配置时 cutoff 生效：合并序列严格 < 全局 cutoff
@@ -368,12 +377,13 @@ class TestP01UnifiedUpperBound:
 
     def test_ext_manifest_without_research_cutoff_rejected(self, tmp_path):
         """ext 数据在库但 manifest 缺 research_cutoff → 来源上界不明，
-        保守拒绝（主库 ext 未经导出盖章即此形态——不静默放行）。"""
+        保守拒绝（主库 ext 未经导出盖章即此形态——不静默放行）。
+        X-03 起与 research_bars 同一结论（LockboxError）。"""
         root = research_root(tmp_path)
         write_ext(root, make_bars(mondays("2010-01-04", 13), close=100.0),
                   research_cutoff=None, yearly={"2010": {"used": True}})
         write_mt5(root, make_bars(mondays("2011-01-03", 4)))
-        with pytest.raises(ValueError, match="research_cutoff"):
+        with pytest.raises(LockboxError, match="research_cutoff"):
             merged_research_series(root, SYM, TF)
 
     def test_conflicting_ext_sources_rejected(self, tmp_path):
@@ -402,26 +412,26 @@ class TestP01UnifiedUpperBound:
         assert len(bars) == 55  # 52 ext + 3 MT5（01-03/10/17）
         assert len(tags) == len(bars)
 
-    def test_end_later_than_cutoff_dominated_by_cutoff(self, tmp_path):
-        """end 比全局 cutoff 晚 → 被更严的 cutoff 支配（合并路径 end 不
-        报"越界"，但绝不可能借 end 读出锁箱段——上界取最严）。"""
+    def test_end_later_than_cutoff_rejected(self, tmp_path):
+        """X-03：end 越过声明上界 → LockboxError（与 research_bars 同一
+        结论；旧合并实现"永不报越界、只被更严界支配"属契约分裂，已废）。"""
         root = research_root(tmp_path)
         write_mt5(root, make_bars(mondays("2011-01-03", 9)))
         write_lockbox(root, "2011-02-01T00:00:00")
-        bars, _tags, _gaps, _bad = merged_research_series(
-            root, SYM, TF, end=pd.Timestamp("2099-01-01T00:00:00"))
-        assert bars["time"].max() == pd.Timestamp("2011-01-31")
-        assert len(bars) == 5
+        with pytest.raises(LockboxError, match="越过锁箱边界"):
+            merged_research_series(root, SYM, TF,
+                                   end=pd.Timestamp("2099-01-01T00:00:00"))
 
     def test_end_none_strictest_bound_applies(self, tmp_path):
-        """end=None 时多界并存取最严：lockbox=2011-03-01、ext manifest
-        research_cutoff=2011-02-15、水位=2011-03-07 → 生效 02-15（严格 <）。"""
+        """end=None 时声明上界与水位并存取最严：ext manifest
+        research_cutoff=2011-02-15（声明）、水位 last_closed=2011-03-07
+        （含端点）→ 生效 02-15（严格 <）。X-03 起 lockbox 与 ext 戳不同值
+        属声明冲突（fail-closed），不再"各自施加取最严"。"""
         root = research_root(tmp_path)
         write_ext(root, make_bars(mondays("2010-01-04", 13), close=100.0),
                   research_cutoff="2011-02-15T00:00:00",
                   yearly={"2010": {"used": True}})
         write_mt5(root, make_bars(mondays("2011-01-03", 9)))  # 到 03-07
-        write_lockbox(root, "2011-03-01T00:00:00")
         bars, tags, gaps, bad = merged_research_series(root, SYM, TF)
         assert bars["time"].max() == pd.Timestamp("2011-02-14")
         assert (bars["time"] >= pd.Timestamp("2011-02-15")).sum() == 0
@@ -430,10 +440,12 @@ class TestP01UnifiedUpperBound:
 
     def test_distinct_bars_both_sides_of_cutoff_confined(self, tmp_path):
         """合成 cutoff 两侧插入可辨别 bar：ext（close=100）与 MT5（close=900）
-        各有界两侧的 bar，统一裁剪后开放侧两段都在、锁箱侧零泄漏。"""
+        各有界两侧的 bar，统一裁剪后开放侧两段都在、锁箱侧零泄漏。
+        混合库的声明一致（lockbox 与 ext 戳同值——真实导出库即此形态）。"""
         root = research_root(tmp_path)
         # ext：2011 年周一 30 根（跨 cutoff 两侧）；MT5：2011-05-02 起 16 根
         write_ext(root, make_bars(mondays("2011-01-03", 30), close=100.0),
+                  research_cutoff="2011-06-01T00:00:00",
                   yearly={"2011": {"used": True}})
         write_mt5(root, make_bars(mondays("2011-05-02", 16)))
         write_lockbox(root, "2011-06-01T00:00:00")
@@ -445,3 +457,92 @@ class TestP01UnifiedUpperBound:
         assert closes == {100.0, 900.0}
         # ext 前向延长只留 2011-01..04（17 根周一），MT5 只留 5 月（5 根）
         assert tags.count("mt5") == 5 and len(bars) == 22
+
+
+# ================================================================ X-03 统一边界契约
+
+class TestUnifiedBoundContract:
+    """X-03：合并读取直接消费 lockbox.effective_research_bound——冲突 /
+    end 越界 / 裸库未初始化与 research_bars 同一结论（LockboxError），
+    本模块不再独立取最严（对拍见 tests/test_research_bound.py）。"""
+
+    def test_end_beyond_declared_raises(self, tmp_path):
+        root = research_root(tmp_path)
+        write_mt5(root, make_bars(mondays("2011-01-03", 9)))  # 到 2011-03-07
+        write_lockbox(root, "2011-02-01T00:00:00")
+        with pytest.raises(LockboxError, match="越过锁箱边界"):
+            merged_research_series(root, SYM, TF, end="2011-03-01T00:00:00")
+
+    def test_end_equal_to_declared_legal_and_strict(self, tmp_path):
+        """end == 声明上界合法：结果仍严格 < 上界（上界时刻属锁箱）。"""
+        root = research_root(tmp_path)
+        write_mt5(root, make_bars(mondays("2011-01-03", 9)))
+        write_lockbox(root, "2011-02-01T00:00:00")
+        bars, _tags, _gaps, _bad = merged_research_series(
+            root, SYM, TF, end="2011-02-01T00:00:00")
+        assert bars["time"].max() == pd.Timestamp("2011-01-31")
+        assert (bars["time"] >= pd.Timestamp("2011-02-01")).sum() == 0
+
+    def test_conflicting_lockbox_vs_source_cutoff_rejected(self, tmp_path):
+        """全局 cutoff 与导出 source_cutoff 冲突 → LockboxError
+        （旧合并实现各界独立施加、静默取最严，不报冲突——已废）。"""
+        root = research_root(tmp_path)
+        write_mt5(root, make_bars(mondays("2011-01-03", 9)))
+        write_lockbox(root, "2011-02-01T00:00:00")
+        p = Path(root) / "bars" / SYM / TF / "meta.json"
+        meta = json.loads(p.read_text(encoding="utf-8"))
+        meta["source_cutoff"] = "2011-03-01T00:00:00"
+        p.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        with pytest.raises(LockboxError, match="冲突"):
+            merged_research_series(root, SYM, TF)
+
+    def test_uninitialized_bare_store_rejected(self, tmp_path):
+        """裸库（有数据、无任何声明边界）对合并研究读按"未初始化"拒绝。"""
+        root = research_root(tmp_path)
+        write_mt5(root, make_bars(mondays("2011-01-03", 9)))
+        with pytest.raises(LockboxError, match="未初始化"):
+            merged_research_series(root, SYM, TF)
+
+    def test_uninitialized_explicit_channel_merges(self, tmp_path):
+        """显式测试/迁移通道（allow_unbounded=True）：裸库恢复旧行为。"""
+        root = research_root(tmp_path)
+        write_mt5(root, make_bars(mondays("2011-01-03", 9)))
+        bars, tags, gaps, bad = merged_research_series(
+            root, SYM, TF, allow_unbounded=True)
+        assert len(bars) == 9 and tags == ["mt5"] * 9
+
+
+# ================================================================ X-04 一致性读
+
+class TestConsistentMergedRead:
+    def test_torn_mt5_publish_rejected(self, tmp_path, monkeypatch):
+        """【X-04 失败测试】主库段发布中断（parquet 已换、meta 未换）且
+        行数/首尾不变（只改价格）：合并读必须明确拒绝撕裂快照，
+        不得把新数据配旧元数据外发；重存一次自愈。"""
+        from mt5data import store as store_mod
+        from mt5data.store import StoreConsistencyError
+
+        root = research_root(tmp_path)
+        write_mt5(root, make_bars(mondays("2011-01-03", 4)))
+        write_lockbox(root, "2099-01-01T00:00:00")   # 有声明上界：
+        # 拒绝原因应是撕裂而不是"未初始化"
+        times = mondays("2011-01-03", 4)
+        new = make_bars(times, close=901.0)          # 行数/首尾相同、内容不同
+
+        real_replace = store_mod._atomic_replace
+
+        def boom(src, dst):
+            if Path(dst).name == "meta.json":
+                raise OSError("注入：parquet 已发布、meta 尚未发布时崩溃")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(store_mod, "_atomic_replace", boom)
+        with pytest.raises(OSError):
+            store_mod.save_bars(root, SYM, TF, new)
+        monkeypatch.undo()
+
+        with pytest.raises(StoreConsistencyError):
+            merged_research_series(root, SYM, TF)
+        store_mod.save_bars(root, SYM, TF, new)
+        bars, tags, _gaps, _bad = merged_research_series(root, SYM, TF)
+        assert len(bars) == 4 and set(bars["close"]) == {901.0}

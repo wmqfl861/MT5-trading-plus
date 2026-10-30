@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -183,3 +184,131 @@ def test_load_bars_checked_rejects_torn_publish(tmp_path, monkeypatch):
     # 正常保存一次即自愈
     save_bars(tmp_path, "EURUSD", "M1", bars_df([0, 1, 2, 3], [1.0, 2.0, 3.0, 4.0]))
     assert len(load_bars_checked(tmp_path, "EURUSD", "M1")) == 4
+
+
+# ------------------------------------------------ X-04：同代发布与内容指纹
+
+
+def test_save_bars_publishes_generation_and_content_fingerprint(tmp_path):
+    """【X-04 失败测试】meta 记录发布代数与内容指纹：generation 每次发布 +1；
+    content_sha256 是 data.parquet 的字节指纹，与真实文件一致、两代不同。"""
+    import hashlib
+
+    from mt5data.store import read_watermark as _rw
+
+    save_bars(tmp_path, "EURUSD", "M1", bars_df([0, 1], [1.0, 2.0]))
+    wm1 = _rw(tmp_path, "EURUSD", "M1")
+    assert wm1["generation"] == 1
+    fp1 = wm1["content_sha256"]
+    assert len(fp1) == 64
+    raw = (Path(tmp_path) / "bars" / "EURUSD" / "M1"
+           / "data.parquet").read_bytes()
+    assert fp1 == hashlib.sha256(raw).hexdigest()
+
+    save_bars(tmp_path, "EURUSD", "M1", bars_df([0, 1, 2], [1.0, 2.0, 3.0]))
+    wm2 = _rw(tmp_path, "EURUSD", "M1")
+    assert wm2["generation"] == 2
+    assert wm2["content_sha256"] != fp1
+
+
+def test_checked_reader_rejects_middle_only_price_change(tmp_path):
+    """【X-04 失败测试】行数/首尾完全不变、仅中间 OHLC 被改写：旧的
+    条数/首尾核对分辨不出，内容指纹必须拒绝。"""
+    from mt5data.store import StoreConsistencyError, load_bars_checked
+
+    df = bars_df([0, 1, 2], [1.0, 2.0, 3.0])
+    save_bars(tmp_path, "EURUSD", "M1", df)
+    tampered = df.copy()
+    tampered.loc[1, ["open", "high", "low", "close"]] = [9.0, 9.5, 8.5, 9.0]
+    tampered.to_parquet(
+        Path(tmp_path) / "bars" / "EURUSD" / "M1" / "data.parquet",
+        index=False)
+    with pytest.raises(StoreConsistencyError, match="内容指纹"):
+        load_bars_checked(tmp_path, "EURUSD", "M1")
+
+
+def test_checked_reader_rejects_torn_publish_with_same_shape(tmp_path,
+                                                             monkeypatch):
+    """【X-04 失败测试】两步发布间失败且新旧快照行数/首尾相同（只改首行
+    OHLC）：撕裂配读（新 parquet + 旧 meta）必须被内容指纹拒绝，
+    不得把半新半旧的混版当正常数据返回；重存一次自愈。"""
+    from mt5data import store
+    from mt5data.store import StoreConsistencyError, load_bars_checked
+
+    old = bars_df([0, 1, 2], [100.0, 100.0, 100.0])
+    save_bars(tmp_path, "EURUSD", "M1", old)
+    new = old.copy()
+    new.loc[0, ["open", "high", "low", "close"]] = [102.0, 102.5, 101.5, 102.0]
+
+    real_replace = store._atomic_replace
+
+    def boom(tmp, final):
+        if Path(final).name == "meta.json":
+            raise OSError("注入：parquet 已发布、meta 尚未发布时崩溃")
+        return real_replace(tmp, final)
+
+    monkeypatch.setattr(store, "_atomic_replace", boom)
+    with pytest.raises(OSError):
+        save_bars(tmp_path, "EURUSD", "M1", new)
+    monkeypatch.undo()
+
+    with pytest.raises(StoreConsistencyError):
+        load_bars_checked(tmp_path, "EURUSD", "M1")
+    save_bars(tmp_path, "EURUSD", "M1", new)
+    assert load_bars_checked(tmp_path, "EURUSD", "M1").iloc[0]["close"] == 102.0
+
+
+def test_concurrent_publish_and_read_never_tears(tmp_path):
+    """【X-04 失败测试】并发发布/读取：发布协议是两步（先 parquet 后
+    meta），读者必须拿到同代一致数据——行数与内容来自同一代发布，
+    绝不因踩进发布窗口而被撕裂拒绝或配到混版。"""
+    import threading
+
+    from mt5data.store import load_bars_checked, save_bars
+
+    base = bars_df([0, 1, 2, 3], [1.0, 1.0, 1.0, 1.0])
+    save_bars(tmp_path, "EURUSD", "M1", base)
+    pairs = {(4, 1.0)}          # (行数, close)：每代发布行数与内容同变
+    for i in range(10):
+        n = 4 + (i % 3)
+        pairs.add((n, float(i + 2)))
+
+    errors: list[Exception] = []
+    seen: list[tuple[int, float]] = []
+    stop = threading.Event()
+
+    def writer():
+        try:
+            for i in range(10):
+                n = 4 + (i % 3)
+                save_bars(tmp_path, "EURUSD", "M1",
+                          bars_df(list(range(n)), [float(i + 2)] * n))
+        except Exception as e:              # pragma: no cover - 失败即失败
+            errors.append(e)
+        finally:
+            stop.set()
+
+    def reader():
+        while not stop.is_set():
+            try:
+                df = load_bars_checked(tmp_path, "EURUSD", "M1")
+            except Exception as e:
+                errors.append(e)
+                stop.set()
+                return
+            closes = set(float(c) for c in df["close"])
+            if len(closes) != 1:            # 同代内容必须自洽
+                errors.append(AssertionError(f"混版读取：close={closes}"))
+                stop.set()
+                return
+            seen.append((len(df), closes.pop()))
+
+    wt = threading.Thread(target=writer)
+    rt = threading.Thread(target=reader)
+    wt.start()
+    rt.start()
+    wt.join(timeout=60)
+    rt.join(timeout=60)
+    assert errors == []
+    assert seen                         # 确实读到过
+    assert set(seen) <= pairs           # 每次读取都是一次真实发布的同代数据

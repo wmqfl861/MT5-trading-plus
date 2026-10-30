@@ -860,10 +860,16 @@ def _matching_gate_runs(ledger, cid: str, trial: LockboxTrial,
     return out
 
 
-def _verify_lockbox_trial(ledger, cid: str, trial: LockboxTrial) -> None:
+def _verify_lockbox_trial(ledger, cid: str, trial: LockboxTrial) -> dict:
     """H-02 试验绑定校验：当前试验身份下 G3 通过且（require_v3 时）最新
     V3 判决通过；任何不满足 → LockboxPrerequisiteError（不读锁箱、不占
-    预算、不烧一次性）。"""
+    预算、不烧一次性）。
+
+    X-02（全局审核 2026-10-30）起返回**获准 G3 的完整绑定**：
+    {"g3_run_id": int, "g3_details": dict, "trial": {...七元组身份...}}——
+    调用方（bt 的 G5 参照重放）只消费这份 run 的 segments/原上下文，
+    不允许再按 card_id 取"最近通过的 G3"（获准试验 A 不得用 B 的选参
+    窗/成本结果作参照）。"""
     def _id_note() -> str:
         return (f"data_sha256={trial.data_sha256[:12]}…、成本 "
                 f"{trial.cost_model_version}、代码指纹 "
@@ -896,12 +902,69 @@ def _verify_lockbox_trial(ledger, cid: str, trial: LockboxTrial) -> None:
                 f"卡 {cid} 已见 V3 失败（run#{v3_run}，当前试验身份）——"
                 "不进入 G5（H-02：当前 V3 通过判决是锁箱准入的一部分；"
                 "重跑 V3 通过前锁箱不开放）")
+    # X-02：取回获准 G3 的完整行（segments 等原上下文）——参照重放的唯一
+    # 合法来源；行缺失/内容损坏 → LockboxPrerequisiteError（fail-closed，
+    # 不回退"该卡最近通过的 G3"）。
+    row = ledger.conn.execute(
+        "SELECT r.run_id AS run_id, g.details_json AS dj FROM gates g"
+        " JOIN runs r ON r.run_id = g.run_id WHERE r.run_id=? AND g.gate='G3'",
+        (int(latest_run),)).fetchone()
+    if row is None:
+        raise LockboxPrerequisiteError(
+            f"卡 {cid} 获准的 G3 行（run#{latest_run}）读取失败——参照"
+            "分布无从绑定（X-02 fail-closed，不回退最近通过的 G3）")
+    try:
+        details = json.loads(row["dj"]) or {}
+    except ValueError as e:
+        raise LockboxPrerequisiteError(
+            f"卡 {cid} 获准 G3 行（run#{latest_run}）的 details 损坏"
+            f"（{e}）——参照分布无从重建（X-02 fail-closed）") from e
+    return {
+        "g3_run_id": int(latest_run),
+        "g3_details": details,
+        "trial": {
+            "params": _canonical_params(trial.params),
+            "data_sha256": trial.data_sha256,
+            "cost_model_version": trial.cost_model_version,
+            "strategy_sha": trial.strategy_sha,
+            "gates_hash": trial.gates_hash,
+        },
+    }
+
+
+def _reference_binding(binding: dict) -> dict:
+    """X-02：参照绑定的入账形态——获准 G3 的 run_id 与其 segments 的
+    内容指纹（规范化 JSON 的 sha256 前 16 位）+ 完整试验身份。写入
+    lockbox_uses（run_g5 的终态 result_json），审计可对出"这次 G5 用的
+    是哪一次 G3 的选参窗"。"""
+    seg = json.dumps(_san_json(binding.get("g3_details")),
+                     ensure_ascii=False, sort_keys=True,
+                     separators=(",", ":"))
+    return {
+        "g3_run_id": int(binding["g3_run_id"]),
+        "g3_segments_sha256": hashlib.sha256(
+            seg.encode("utf-8")).hexdigest()[:16],
+        "trial": dict(binding["trial"]),
+    }
+
+
+def _san_json(obj):
+    """JSON 可序列化化（与 research.ledger._san 同口径的本地实现，避免
+    层间反向依赖）。"""
+    if isinstance(obj, dict):
+        return {str(k): _san_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_san_json(v) for v in obj]
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    return obj
 
 
 def begin_lockbox(ledger, card, *, approved_by: str, cutoff=None,
                   trial: LockboxTrial | None = None,
+                  reference: dict | None = None,
                   round_id: str | None = None,
-                  round_lockbox_uses_max: int | None = None) -> None:
+                  round_lockbox_uses_max: int | None = None) -> dict:
     """G5 编排第一步：**读锁箱数据之前**调用（T21a/C3；H-02/H-03 修订）。
 
     - 未批准 → GateApprovalError（不消耗一次性机会）；
@@ -909,6 +972,13 @@ def begin_lockbox(ledger, card, *, approved_by: str, cutoff=None,
       身份（参数/数据/成本/代码/冻结门槛）不匹配 →
       LockboxPrerequisiteError（H-02：历史成功不授权当前试验；不消耗
       一次性机会、不扣预算、锁箱零读取）；
+    - X-02（2026-10-30 审核）：reference 给出时（调用方重建的 G3 参照
+      绑定，{"g3_run_id", "g3_segments_sha256", ...}）与资格解析得到的
+      **获准 G3**（同试验身份下最新通过的 G3 行）核对——run_id 或
+      segments 指纹不一致 → LockboxPrerequisiteError（获准试验 A 不得
+      用 B 的参照；不一致在读取锁箱与扣预算**之前**拒绝）。返回值 =
+      获准 G3 的绑定（g3_run_id / segments 指纹 / 完整试验身份），由
+      调用方随 run_g5 写入锁箱 reservation 的 result（审计可追溯）；
     - 卡一次性 / 项目预算（cutoff 级 max_uses，T27/M11）/ 轮次
       lockbox_uses_max 的检查与 started 写入在 ledger 的**一个
       BEGIN IMMEDIATE 事务**内（H-03）：已用 → LockboxAlreadyUsedError；
@@ -935,7 +1005,20 @@ def begin_lockbox(ledger, card, *, approved_by: str, cutoff=None,
             "LockboxTrial 给出本次试验的参数/数据哈希/成本版本/策略代码"
             "指纹/冻结关卡版本，且该试验身份下有当前通过的 G3 与 V3 "
             "判决——该卡任意历史 G3 通过不再授权")
-    _verify_lockbox_trial(ledger, cid, trial)
+    binding = _verify_lockbox_trial(ledger, cid, trial)
+    if reference is not None:
+        want = _reference_binding(binding)
+        got_run = reference.get("g3_run_id")
+        got_sha = reference.get("g3_segments_sha256")
+        got_run_int = int(got_run) if got_run is not None else None
+        if (got_run_int != want["g3_run_id"]
+                or got_sha != want["g3_segments_sha256"]):
+            raise LockboxPrerequisiteError(
+                f"卡 {cid} 的 G5 参照绑定与获准 G3 不一致（X-02）：获准 "
+                f"G3 run#{want['g3_run_id']}（segments 指纹 "
+                f"{want['g3_segments_sha256']}），调用方重建的参照指向 "
+                f"run#{got_run}（指纹 {got_sha!r}）——获准试验与参照分布"
+                "必须同源；在读取锁箱与扣预算之前拒绝")
     from mt5quant.research import ledger as _ledger_mod
     try:
         ledger.reserve_lockbox_use(
@@ -948,12 +1031,13 @@ def begin_lockbox(ledger, card, *, approved_by: str, cutoff=None,
         raise LockboxPrerequisiteError(str(e)) from e
     except _ledger_mod.LockboxCardUsedError as e:
         raise LockboxAlreadyUsedError(str(e)) from e
+    return _reference_binding(binding)
 
 
 def run_g5(ledger, card, *, lockbox_result: dict, reference_returns,
            expected_trades: float, approved_by: str, cfg: GatesConfig,
            bars_per_day: int | None = None,
-           cutoff=None) -> dict:
+           cutoff=None, reference_binding: dict | None = None) -> dict:
     """锁箱一次性（T21a/C3 重写）：**单侧**判定，参照策略自身的样本外分布。
 
     参照分布：reference_returns（策略 G3 拼接的样本外收益）按锁箱长度
@@ -1061,6 +1145,11 @@ def run_g5(ledger, card, *, lockbox_result: dict, reference_returns,
                       "bars_per_year": float(bpy)},
         "seed": int(seed),
     }
+    if reference_binding is not None:
+        # X-02：参照绑定（获准 G3 的 run_id/segments 指纹/试验身份）随
+        # 终态写入 lockbox_uses.result_json——这次 G5 用的是哪次 G3 的
+        # 选参窗，审计可对出。
+        result["reference_binding"] = dict(reference_binding)
     if sharpe is not None and sharpe > p95:
         result["warning"] = (f"锁箱夏普 {sharpe:.2f} 高于参照分布 "
                              f"p95（{p95:.2f}）——异常好，复核数据与前视")

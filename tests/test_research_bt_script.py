@@ -157,7 +157,7 @@ def test_screen_records_runs_and_card(tmp_path, monkeypatch, capsys):
     ledger_path = tmp_path / "ledger.sqlite"
     patch_card_git(monkeypatch, mod)
     rc = mod.main(
-        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+        ["screen", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero", "--volume-lots", "0.01"])
@@ -191,7 +191,7 @@ def test_screen_failed_combos_still_recorded(tmp_path, monkeypatch, capsys):
     ledger_path = tmp_path / "ledger.sqlite"
     patch_card_git(monkeypatch, mod)
     rc = mod.main(
-        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+        ["screen", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero"])
@@ -214,7 +214,7 @@ def test_screen_requires_contract_size_source(tmp_path, monkeypatch, capsys):
     cards_dir = write_card(tmp_path)
     patch_card_git(monkeypatch, mod)
     rc = mod.main(
-        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+        ["screen", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(tmp_path / "ledger.sqlite"),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero"])
@@ -229,7 +229,7 @@ def test_screen_accepts_direct_card_path(tmp_path, monkeypatch):
     patch_card_git(monkeypatch, mod)
     rc = mod.main(
         ["screen", "--card", str(cards_dir / "H099.toml"),
-         "--data-root", str(root), "--ledger", str(tmp_path / "l.sqlite"),
+         "--allow-unbounded-data", "--allow-no-round", "--data-root", str(root), "--ledger", str(tmp_path / "l.sqlite"),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero"])
     assert rc == 0
@@ -277,7 +277,7 @@ def test_screen_records_per_symbol_cost_version(tmp_path, monkeypatch, capsys):
     patch_build_costs_per_symbol(monkeypatch, mod, {
         "XAUUSD": "cv-xau-20261029", "EURUSD": "cv-eur-20261029"})
     rc = mod.main(
-        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+        ["screen", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "auto", "--volume-lots", "0.01"])
@@ -303,7 +303,7 @@ def test_gate_base_run_uses_first_symbol_cost_version(tmp_path, monkeypatch,
     patch_build_costs_per_symbol(monkeypatch, mod, {
         "XAUUSD": "cv-xau-20261029", "EURUSD": "cv-eur-20261029"})
     rc = mod.main(
-        ["gate", "--card", "H099", "--cards-dir", str(cards_dir),
+        ["gate", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "auto", "--volume-lots", "0.01",
@@ -337,8 +337,8 @@ def test_screen_symbol_permutation_keeps_set_identity(tmp_path, monkeypatch):
               "--ledger", str(ledger_path),
               "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
               "--costs", "auto", "--volume-lots", "0.01"]
-    assert mod.main(["screen", "--card", "H098", *common]) == 0
-    assert mod.main(["screen", "--card", "H099", *common]) == 0
+    assert mod.main(["screen", "--card", "H098", "--allow-unbounded-data", "--allow-no-round", *common]) == 0
+    assert mod.main(["screen", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", *common]) == 0
     with Ledger(ledger_path) as led:
         rows = led.conn.execute(
             "SELECT symbol, data_sha256, cost_model_version FROM runs"
@@ -360,7 +360,7 @@ def test_screen_same_experiment_rerun_dedups_under_v2(tmp_path, monkeypatch):
     cards_dir = write_card(tmp_path)
     ledger_path = tmp_path / "ledger.sqlite"
     patch_card_git(monkeypatch, mod)
-    common = ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+    common = ["screen", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", "--allow-unbounded-data", "--allow-no-round", "--cards-dir", str(cards_dir),
               "--data-root", str(root), "--ledger", str(ledger_path),
               "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
               "--costs", "zero", "--volume-lots", "0.01"]
@@ -456,7 +456,7 @@ def test_screen_legacy_card_migration_hint_printed_once(tmp_path, monkeypatch,
     cards_dir = write_card(tmp_path)            # CARD_BODY 无 strategy → 旧卡
     patch_card_git(monkeypatch, mod)
     rc = mod.main(
-        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+        ["screen", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(tmp_path / "l.sqlite"),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero"])
@@ -543,7 +543,7 @@ def test_screen_default_risk_sizing_records_metrics(tmp_path, monkeypatch,
     ledger_path = tmp_path / "ledger.sqlite"
     patch_card_git(monkeypatch, mod)
     rc = mod.main(
-        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+        ["screen", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero"])
@@ -567,7 +567,7 @@ def test_screen_risk_and_volume_conflict_rejected(tmp_path, monkeypatch,
     cards_dir = write_card(tmp_path)
     patch_card_git(monkeypatch, mod)
     rc = mod.main(
-        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+        ["screen", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(tmp_path / "l.sqlite"),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero", "--risk-per-trade", "0.006",
@@ -588,7 +588,7 @@ def test_screen_risk_mode_without_volume_bounds_fails_assembly(tmp_path,
     cards_dir = write_card(tmp_path)
     patch_card_git(monkeypatch, mod)
     rc = mod.main(
-        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+        ["screen", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(tmp_path / "l.sqlite"),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero"])
@@ -612,7 +612,7 @@ def test_gate_risk_sizing_passes_spec_through_g2(tmp_path, monkeypatch,
     ledger_path = tmp_path / "ledger.sqlite"
     patch_card_git(monkeypatch, mod)
     rc = mod.main(
-        ["gate", "--card", "H099", "--cards-dir", str(cards_dir),
+        ["gate", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero", "--gates", "G0,G2", "--params", "{}"])
@@ -662,7 +662,7 @@ def test_screen_research_store_switch(tmp_path, monkeypatch, capsys):
     patch_card_git(monkeypatch, mod)
     monkeypatch.chdir(tmp_path)            # cwd 下只有 data_research，无 data/
     rc = mod.main(
-        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+        ["screen", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", "--cards-dir", str(cards_dir),
          "--research-store",
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero", "--volume-lots", "0.01"])
@@ -684,7 +684,7 @@ def test_screen_default_reads_research_store(tmp_path, monkeypatch, capsys):
     patch_card_git(monkeypatch, mod)
     monkeypatch.chdir(tmp_path)
     rc = mod.main(
-        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+        ["screen", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", "--cards-dir", str(cards_dir),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero", "--volume-lots", "0.01"])
     assert rc == 0, capsys.readouterr().out
@@ -703,7 +703,7 @@ def test_screen_main_store_requires_explicit_flag(tmp_path, monkeypatch,
     cards_dir = write_card(tmp_path)
     patch_card_git(monkeypatch, mod)
     monkeypatch.chdir(tmp_path)
-    argv = ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+    argv = ["screen", "--card", "H099", "--allow-no-round", "--cards-dir", str(cards_dir),
             "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
             "--costs", "zero", "--volume-lots", "0.01",
             "--ledger", str(tmp_path / "l.sqlite")]
@@ -755,7 +755,7 @@ def test_screen_ops_ack_rejected_as_research_command(tmp_path, monkeypatch,
     cards_dir = write_card(tmp_path)
     patch_card_git(monkeypatch, mod)
     patch_strategy_fp(monkeypatch, mod, "a" * 64)
-    argv = ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+    argv = ["screen", "--card", "H099", "--allow-no-round", "--cards-dir", str(cards_dir),
             "--data-root", str(root), "--ledger", str(tmp_path / "l.sqlite"),
             "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
             "--costs", "zero", "--volume-lots", "0.01",
@@ -852,11 +852,14 @@ def patch_strategy_fp(monkeypatch, mod, sha):
 def run_screen(mod, cards_dir, root, ledger_path, monkeypatch, sha,
                card="H099"):
     patch_strategy_fp(monkeypatch, mod, sha)
+    # X-03/X-06（2026-10-30 审核）：合成夹具显式声明——裸库（无声明研究
+    # 上界）+ 无轮次卡；正式 CLI 缺省两者都拒绝
     return mod.main(
         ["screen", "--card", card, "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
-         "--costs", "zero", "--volume-lots", "0.01"])
+         "--costs", "zero", "--volume-lots", "0.01",
+         "--allow-unbounded-data", "--allow-no-round"])
 
 
 def test_screen_records_strategy_sha(tmp_path, monkeypatch):
@@ -994,7 +997,8 @@ def _rb_argv(root, out):
             "--symbol", "XAUUSD", "--timeframe", "H1", "--params", "{}",
             "--data-root", str(root), "--out", str(out),
             "--costs", "zero", "--contract-size", "100",
-            "--volume-lots", "0.01", "--allow-zero-swap"]
+            "--volume-lots", "0.01", "--allow-zero-swap",
+            "--allow-unbounded-data"]   # X-03：合成裸库夹具声明
 
 
 def test_run_backtest_refuses_dirty_strategy(tmp_path, monkeypatch, capsys):
@@ -1117,7 +1121,7 @@ def test_screen_specimen_actor_calibration(tmp_path, monkeypatch, capsys):
     ledger_path = tmp_path / "ledger.sqlite"
     patch_card_git(monkeypatch, mod)
     rc = mod.main(
-        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+        ["screen", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero", "--volume-lots", "0.01",
@@ -1139,7 +1143,7 @@ def test_gate_specimen_actor_calibration(tmp_path, monkeypatch, capsys):
     ledger_path = tmp_path / "ledger.sqlite"
     patch_card_git(monkeypatch, mod)
     rc = mod.main(
-        ["gate", "--card", "H099", "--cards-dir", str(cards_dir),
+        ["gate", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero", "--volume-lots", "0.01",
@@ -1391,7 +1395,7 @@ def test_screen_run_class_research_and_specimen_calibration(tmp_path,
     ledger_path = tmp_path / "ledger.sqlite"
     patch_card_git(monkeypatch, mod)
     rc = mod.main(
-        ["screen", "--card", "H099", "--cards-dir", str(cards_dir),
+        ["screen", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero", "--volume-lots", "0.01", "--specimen"])
@@ -1406,7 +1410,7 @@ def test_screen_run_class_research_and_specimen_calibration(tmp_path,
     cards_dir2 = write_card(tmp_path / "plain")
     ledger2 = tmp_path / "l2.sqlite"
     rc2 = mod.main(
-        ["screen", "--card", "H099", "--cards-dir", str(cards_dir2),
+        ["screen", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", "--cards-dir", str(cards_dir2),
          "--data-root", str(root), "--ledger", str(ledger2),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero", "--volume-lots", "0.01"])
@@ -1431,7 +1435,7 @@ def test_gate_g4_reports_three_trial_counts(tmp_path, monkeypatch, capsys):
     ledger_path = tmp_path / "ledger.sqlite"
     patch_card_git(monkeypatch, mod)
     rc = mod.main(
-        ["gate", "--card", "H099", "--cards-dir", str(cards_dir),
+        ["gate", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero", "--volume-lots", "0.01",
@@ -1487,7 +1491,7 @@ def test_gate_g4_round_n_when_card_in_round(tmp_path, monkeypatch, capsys):
     patch_card_git(monkeypatch, mod,
                    committed=datetime(2026, 10, 27, tzinfo=timezone.utc))
     rc = mod.main(
-        ["gate", "--card", "H099", "--cards-dir", str(cards_dir),
+        ["gate", "--card", "H099", "--allow-unbounded-data", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero", "--volume-lots", "0.01",
@@ -1639,7 +1643,7 @@ def test_gate_v3_event_card_skips_buyhold_and_delay_vetoes(
     monkeypatch.setattr(mod.vgate, "v3_veto_buyhold", _must_not_run)
     monkeypatch.setattr(mod.vgate, "v3_veto_delay", _must_not_run)
     rc = mod.main(
-        ["gate", "--card", "H703", "--cards-dir", str(cards_dir),
+        ["gate", "--card", "H703", "--allow-unbounded-data", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero", "--gates", "V3", "--params", "{}",
@@ -1709,7 +1713,7 @@ def test_gate_v3_bar_card_n_composition_matches_ledger_declared_lineage(
             led.record_run(card_id=f"H999-v{i + 1}", params={"x": i},
                            round_id=None, **common)
     rc = mod.main(
-        ["gate", "--card", "H703", "--cards-dir", str(cards_dir),
+        ["gate", "--card", "H703", "--allow-unbounded-data", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
          "--costs", "zero", "--gates", "V3", "--params", "{}"])
