@@ -1023,9 +1023,24 @@ class LiveExecutor:
         """
         marker = self._state.get("execution_unknown")
         if isinstance(marker, dict):
+            if not marker:
+                self._state["execution_unknown"] = {
+                    "status": "unknown", "decision_id": "unknown",
+                    "reason": "empty_execution_marker"}
+                self._save_state()
+                return
             if marker.get("status") == "prepared":
                 marker["status"] = "unknown"
                 marker["reason"] = "process_restarted_before_confirmation"
+                self._save_state()
+            elif marker.get("status") not in ("unknown",):
+                marker["status"] = "unknown"
+                marker["reason"] = "invalid_execution_marker_status"
+                marker.setdefault("decision_id", "unknown")
+                self._save_state()
+            elif not marker.get("decision_id"):
+                marker["decision_id"] = "unknown"
+                marker["reason"] = marker.get("reason") or "missing_decision_id"
                 self._save_state()
             return
         try:
@@ -1035,7 +1050,7 @@ class LiveExecutor:
             return
         if isinstance(intent, dict) and intent.get("status") == STATUS_PENDING:
             self._state["execution_unknown"] = {
-                "status": "unknown", "decision_id": str(intent.get("cause") or ""),
+                "status": "unknown", "decision_id": str(intent.get("cause") or "unknown"),
                 "symbol": intent.get("symbol"), "target_side": intent.get("side"), "target_volume": intent.get("volume"),
                 "ts": str(intent.get("ts") or ""),
                 "reason": "pending_intent_found_on_restart"}
