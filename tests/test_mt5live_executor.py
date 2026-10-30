@@ -1508,3 +1508,35 @@ def test_h2_01_ack_execution_write_order_keeps_unknown_if_state_commit_fails(tmp
         encoding="utf-8"))
     assert state["execution_unknown"]["status"] == "unknown"
     assert intent["status"] == "confirmed" and intent["cause"] == "ack_execution"
+
+def test_h2_02_pending_partial_exit_metadata_survives_restart(tmp_path):
+    """成交历史延迟时，部分减仓 pending 状态跨重启保留并只消费一次。"""
+    from mt5gw.models import DEAL_REASON_SL
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|h2-02-delay-open"), NOW).action == "open"
+    ticket = b.positions()[0].ticket
+    b.deals_delay_polls = 100
+    b.reduce_external(ticket, 0.01, reason=DEAL_REASON_SL)
+    ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                        decision_id="XAUUSD|M15|h2-02-delay-partial"),
+             NOW.replace(minute=15))
+    state = json.loads((tmp_path / f"state-{MAGIC}.json").read_text(
+        encoding="utf-8"))
+    item = state["pending_external_exits"][str(ticket)]
+    assert item["position_still_open"] is True
+    assert item["volume"] == pytest.approx(0.01)
+
+    ex2 = _mk_executor(b, tmp_path)
+    restored = ex2._state["pending_external_exits"][ticket]
+    assert restored["position_still_open"] is True
+    assert restored["volume"] == pytest.approx(0.01)
+    b._deal_visible_at[-1] = 0
+    ex2.poll(mk_decision(signal=1, volume_lots=0.02,
+                         decision_id="XAUUSD|M15|h2-02-delay-visible"),
+             NOW.replace(minute=30))
+    assert ticket not in ex2._state["pending_external_exits"]
+    assert str(b._deals[-1].ticket) in ex2._state["known_positions"][ticket][
+        "consumed_deal_tickets"]
