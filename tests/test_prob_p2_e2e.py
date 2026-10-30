@@ -204,6 +204,83 @@ def test_e1_screen_runs_validation_card(env, monkeypatch):
     assert sig_masked
 
 
+def test_p202_screen_summary_sliced_at_oos_start(env, monkeypatch):
+    """P2-02（丁-2）：P2 卡 screen 的评估 summary 以 OOS 起点切取——
+    metrics.eval_window 登记评估起点 = split（预热零收益不进统计、起点
+    资金基准明确）；预热 bar 不进时间序列分母。"""
+    code, out = _screen(env, 1.0, monkeypatch)
+    assert code == 0, out
+    with Ledger(env["ledger"]) as led:
+        rows = [r for r in led.runs_of_round("R3") if r["ok"]]
+    assert len(rows) == 1
+    ew = rows[0]["metrics"]["eval_window"]
+    assert str(ew["start"])[:10] == SPLIT
+    assert ew["warmup_excluded"] is True
+
+
+def test_b2_screen_reserves_first_combo_before_fit(env, monkeypatch):
+    """批 1 复审 B2（简易版）：reservation 口径轮 screen 的首个组合占位
+    前移到拟合之前（拟合输入身份作 trial_key）——预算满的轮次在**任何**
+    拟合计算之前拒绝（退 1，_fit_and_freeze 零调用）。"""
+    with Ledger(env["ledger"]) as led:
+        for i in range(4):            # trial_budget=4：预先占满
+            led.reserve_trial("R3", f"foreign-{i}", actor="bt")
+    calls = {"fit": 0}
+
+    def _no_fit(*a, **k):
+        calls["fit"] += 1
+        raise AssertionError(
+            "预算满的轮次不得执行拟合（B2：首组合占位前移到拟合之前）")
+
+    monkeypatch.setattr(BT, "_fit_and_freeze", _no_fit)
+    code, out = _screen(env, 1.0, monkeypatch)
+    assert code == 1
+    assert "占位" in out
+    assert calls["fit"] == 0
+
+
+def test_b2_screen_first_combo_reservation_covers_fit(env, monkeypatch):
+    """B2 对照：预算未满的正常 screen——首个组合的占位在拟合前完成且
+    只占一个名额（不因拟合后再按组合占位而双计）。"""
+    code, out = _screen(env, 1.0, monkeypatch)
+    assert code == 0, out
+    with Ledger(env["ledger"]) as led:
+        n = led.conn.execute(
+            "SELECT COUNT(*) n FROM trial_reservations"
+            " WHERE round_id='R3'").fetchone()["n"]
+        stages = [r["stage"] for r in led.conn.execute(
+            "SELECT stage FROM trial_reservations WHERE round_id='R3'"
+        ).fetchall()]
+    assert n == 1                       # 单组合卡恰一个占位（不双计）
+    assert stages == ["completed"]
+
+
+def test_b3_screen_consistency_error_graceful(env, monkeypatch):
+    """批 1 复审 B3：record_run 的 TrialReservationConsistencyError（X-01
+    对账后盾：绕过占位的成功行）在 screen 有专用出口——退 1、打印对账
+    失败原因（与 gate/prob test 一致），不裸崩、不落本卡的 error 行。"""
+    with Ledger(env["ledger"]) as led:
+        for i in range(3):            # 3 个外来占位（预算 4：留 1 给本卡）
+            led.reserve_trial("R3", f"foreign-{i}", actor="bt")
+        for i in range(4):            # 绕过占位的成功行：去重口径=预算上限
+            led.record_run(
+                card_id=f"H90{i}", card_version=1, strategy="synthetic",
+                params={"i": i}, symbol="XAUUSD", timeframe="H1",
+                data_first="2018-01-01", data_last="2020-01-01",
+                data_sha256=f"{i}" * 64, engine_version="e",
+                cost_model_version="v", gates_hash="",
+                metrics={"net_profit": 1.0}, actor="bt",
+                strategy_sha="f" * 40, run_class="research", round_id="R3")
+    code, out = _screen(env, 1.0, monkeypatch)
+    assert code == 1
+    assert "对账失败" in out
+    with Ledger(env["ledger"]) as led:
+        ours = led.conn.execute(
+            "SELECT COUNT(*) n FROM runs WHERE card_id='P002-v1'"
+        ).fetchone()["n"]
+    assert ours == 0                    # 回滚后不留本卡行
+
+
 def test_e2_lb_z_mismatch_rejected(env, monkeypatch):
     """E2：lb_z 与策略类 POLICY.z 不一致 → 拒绝运行。"""
     code, out = _screen(env, 1.5, monkeypatch)

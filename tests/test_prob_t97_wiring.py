@@ -205,13 +205,14 @@ class TestEligibilityMask:
             == [True, False]
 
     def test_max_gap_days_threshold_applies_to_hold_window(self):
-        """持有窗的洞宽阈值（P-09）：40 天洞落在 A3@26 的持有窗 [26,32]
+        """持有窗的洞宽阈值（P-09）：40 天洞落在 A3@26 的持有窗 [26,33]
         内——max_gap_days=30（缺省）算洞 → 不合格；45 不算 → 合格；不查
         持有窗（hold_bars=0）且洞不在回看窗内 → 合格（回看窗用
-        gap_spans 原样，先决 4 口径）。"""
+        gap_spans 原样，先决 4 口径）。P2-03 起未来窗须 t+K+1 完整可观察
+        （26+6+1=33 ≤ 39），序列补长到 40 根。"""
         times = [x if i <= 30 else x + pd.Timedelta(days=40)
-                 for i, x in enumerate(hourly(33))]
-        bars = make_bars_rows([PLAT] * 33, times)
+                 for i, x in enumerate(hourly(40))]
+        bars = make_bars_rows([PLAT] * 40, times)
         t = list(pd.to_datetime(bars["time"]))
         gaps = [(t[30], t[31])]
         trig = self.trig([("A3", 26, 26)], t)     # S1 回看窗 [20,26] 无洞
@@ -260,6 +261,212 @@ class TestEligibilityMask:
         empty = pd.DataFrame(columns=["action", "anchor", "bar"])
         assert prob_gaps.eligibility_mask(
             empty, bars, [], "S1", approach_lookback=6) == []
+
+
+# ================================================================ P2-03（T104）
+# audit2 §3.3：共同资格补漏——anchor→action 窗、特征窗跨洞、t+K+1 完整未来
+# 窗、逐原因剔除、EligibilityContext/eligible_bars 统一接口。失败测试先行。
+
+
+class TestEligibilityP203:
+    """P2-03：eligibility_mask 的三类漏窗（audit 探针 gaps 的对应行为）。"""
+
+    def trig(self, rows, times):
+        return pd.DataFrame(
+            [{"action": a, "anchor": anc, "bar": b, "time": times[b]}
+             for a, anc, b in rows])
+
+    def test_anchor_to_action_window_crossing_gap_ineligible(self):
+        """A2 的 anchor 在 45 天洞前、action 在洞后：局面窗（到 anchor）干净
+        但 **anchor→action 窗** [2100,2102] 跨洞 → 不合格（旧实现漏查；
+        audit 探针 gaps 第一用例）。anchor=触发根（无跨洞）→ 合格。"""
+        n = 2200
+        times = [x if i <= 2100 else x + pd.Timedelta(days=45)
+                 for i, x in enumerate(hourly(n))]
+        bars = make_bars_rows([PLAT] * n, times)
+        t = list(pd.to_datetime(bars["time"]))
+        gap = [(t[2100], t[2101])]
+        kw = dict(gap_spans=gap, situation="S1", approach_lookback=24,
+                  feature_warmup=0, hold_bars=24)
+        through = self.trig([("A2", 2100, 2102)], t)
+        assert prob_gaps.eligibility_mask(through, bars, **kw) == [False]
+        # 对照：anchor 远在洞后（局面窗/anchor→action 窗都干净）→ 合格
+        clean = self.trig([("A2", 2150, 2152)], t)
+        assert prob_gaps.eligibility_mask(clean, bars, **kw) == [True]
+
+    def test_future_window_needs_full_k_plus_one(self):
+        """未来窗须 **t+K+1 完整可观察**（labels.py:92 的实际需要：信号出场
+        在 bar t+K+1 的开盘）——最后一根/缺 t+K+1 的触发不合格（旧实现把窗
+        截到末根仍合格；audit 探针 gaps 第二用例）。t+K+1 恰为末根 → 合格。"""
+        n = 100
+        bars = make_bars_rows([PLAT] * n, hourly(n))
+        t = list(pd.to_datetime(bars["time"]))
+        kw = dict(gap_spans=[], situation="S1", approach_lookback=6,
+                  feature_warmup=0)
+        # bar = n-1、K=24 → t+K+1 不存在 → 不合格（旧口径合格）
+        tail = self.trig([("A1", n - 1, n - 1)], t)
+        assert prob_gaps.eligibility_mask(tail, bars, hold_bars=24, **kw) \
+            == [False]
+        # t+K（=bar 75+24=99 存在）而 t+K+1（100）不存在 → 仍不合格
+        almost = self.trig([("A1", 75, 75)], t)
+        assert prob_gaps.eligibility_mask(almost, bars, hold_bars=24, **kw) \
+            == [False]
+        # t+K+1 恰为末根（74+24+1=99 ≤ 99）→ 合格
+        exact = self.trig([("A1", 74, 74)], t)
+        assert prob_gaps.eligibility_mask(exact, bars, hold_bars=24, **kw) \
+            == [True]
+
+    def test_future_window_gap_check_covers_exit_open_bar(self):
+        """持有+出场开盘（t..t+K+1）整窗跨宽洞 → 不合格（洞宽阈值与旧口径
+        相同：宽 > max_gap_days 才算）。"""
+        n = 60
+        times = [x if i <= 30 else x + pd.Timedelta(days=40)
+                 for i, x in enumerate(hourly(n))]
+        bars = make_bars_rows([PLAT] * n, times)
+        t = list(pd.to_datetime(bars["time"]))
+        gap = [(t[30], t[31])]
+        kw = dict(situation="S1", approach_lookback=6, feature_warmup=0,
+                  max_gap_days=30)
+        # A3@10、K=19：窗 [10,30] 不含洞 → 合格
+        keep = self.trig([("A3", 10, 10)], t)
+        assert prob_gaps.eligibility_mask(keep, bars, gap_spans=gap,
+                                          hold_bars=19, **kw) == [True]
+        # A3@11、K=19：窗 [11,31] 跨 40 天洞 → 不合格
+        drop = self.trig([("A3", 11, 11)], t)
+        assert prob_gaps.eligibility_mask(drop, bars, gap_spans=gap,
+                                          hold_bars=19, **kw) == [False]
+
+    def test_feature_window_crossing_gap_ineligible(self):
+        """特征窗 [i−warmup, i] 跨洞 → 不合格（atr_pct_2000 的 2000 根排名
+        窗横跨洞时档位失真；旧实现只查 i≥warmup——i=250 ≥ 200 仍合格）。
+        窗缩短到不达洞 → 合格。"""
+        n = 300
+        times = [x if i <= 100 else x + pd.Timedelta(days=31)
+                 for i, x in enumerate(hourly(n))]
+        bars = make_bars_rows([PLAT] * n, times)
+        t = list(pd.to_datetime(bars["time"]))
+        gap = [(t[100], t[101])]
+        kw = dict(gap_spans=gap, situation="S1", approach_lookback=6,
+                  hold_bars=0)
+        # i=250、warmup=200：i ≥ warmup 但特征窗 [50,250] 跨洞 → 不合格
+        wide = self.trig([("A3", 250, 250)], t)
+        assert prob_gaps.eligibility_mask(wide, bars, feature_warmup=200,
+                                          **kw) == [False]
+        # 同一触发 warmup=140：窗 [110,250] 全在洞后 → 合格
+        narrow = self.trig([("A3", 250, 250)], t)
+        assert prob_gaps.eligibility_mask(narrow, bars, feature_warmup=140,
+                                          **kw) == [True]
+
+    def test_situation_window_gap_still_suppressed(self):
+        """P2-03 不放松局面回看窗（先决 4 口径保留）：窗跨洞仍不合格。"""
+        bars = make_bars_rows([PLAT] * 30, hourly(30))
+        t = list(pd.to_datetime(bars["time"]))
+        gaps = [(t[15], t[16])]
+        trig = self.trig([("A2", 18, 24)], t)
+        assert prob_gaps.eligibility_mask(
+            trig, bars, gaps, "S1", approach_lookback=6, feature_warmup=0) \
+            == [False]
+
+    def test_eligibility_reasons_per_row(self):
+        """eligibility_reasons（逐原因版本，与 mask 同口径）：每行给出首个
+        失败原因——p1 的 P2-11 逐原因剔除统计消费它（乙的重算可退役）。"""
+        n = 300
+        times = [x if i <= 100 else x + pd.Timedelta(days=31)
+                 for i, x in enumerate(hourly(n))]
+        bars = make_bars_rows([PLAT] * n, times)
+        t = list(pd.to_datetime(bars["time"]))
+        gap = [(t[100], t[101])]
+        rows = [("A3", 5, 5),      # 特征预热不足（5 < 60）
+                ("A3", 150, 150),  # 特征窗 [90,150] 跨洞
+                ("A1", 250, 250),  # 合格（未来窗 250+24+1=275 ≤ 299）
+                ("A1", 290, 290)]  # t+K+1 不存在
+        trig = self.trig(rows, t)
+        got = prob_gaps.eligibility_reasons(
+            trig, bars, gap, "S1", approach_lookback=6, feature_warmup=60,
+            hold_bars=24)
+        assert got == ["feature_warmup", "feature_gap", "",
+                       "future_window"]
+        # 与 mask 逐位一致
+        assert [r == "" for r in got] == prob_gaps.eligibility_mask(
+            trig, bars, gap, "S1", approach_lookback=6, feature_warmup=60,
+            hold_bars=24)
+
+
+class TestEligibleBarsP203:
+    """P2-03 统一资格接口（模块乙消费；签名写死）：
+    eligible_bars(bars, *, feature_warmup, hold_bars, gap_spans,
+    situation_windows=None, anchor_of=None) -> pd.Series[bool]"""
+
+    def test_full_contract_on_synthetic_series(self):
+        n = 120
+        times = [x if i <= 60 else x + pd.Timedelta(days=45)
+                 for i, x in enumerate(hourly(n))]
+        bars = make_bars_rows([PLAT] * n, times)
+        mask = prob_gaps.eligible_bars(
+            bars, feature_warmup=20, hold_bars=10,
+            gap_spans=[(times[60], times[61])],
+            situation_windows={"S1": [max(0, i - 6) for i in range(n)]})
+        assert isinstance(mask, pd.Series)
+        assert mask.dtype == bool and len(mask) == n
+        assert list(mask.index) == list(bars.index)
+        # 合格段（逐窗推导）：预热后（i ≥ 20）；洞前段特征窗/局面窗干净、
+        # 未来窗 [i,i+11] 不含洞（i ≤ 49）→ 20..49 合格；洞后段特征窗
+        # [i−20,i] 跨洞直到 i ≥ 81 → 81..108 合格（未来窗 t+10+1 ≤ 119
+        # → i ≤ 108）；50..60 的未来窗含洞、61..80 的特征窗跨洞 → 不合格
+        ok = [i for i in range(n) if mask.iloc[i]]
+        assert ok == list(range(20, 50)) + list(range(81, 109))
+
+    def test_anchor_of_window(self):
+        """anchor_of：逐 bar 的 anchor 下标（A2/A4 的 anchor→action 窗）——
+        anchor 与 bar 之间跨洞的 bar 不合格。"""
+        n = 40
+        times = [x if i <= 20 else x + pd.Timedelta(days=45)
+                 for i, x in enumerate(hourly(n))]
+        bars = make_bars_rows([PLAT] * n, times)
+        anchor_of = list(range(n))               # 缺省：anchor=自身
+        anchor_of[25] = 18                       # 25 的 anchor 在洞前
+        mask = prob_gaps.eligible_bars(
+            bars, feature_warmup=0, hold_bars=0,
+            gap_spans=[(times[20], times[21])], anchor_of=anchor_of)
+        assert not mask.iloc[25]                  # [18,25] 跨洞
+        assert mask.iloc[24] and mask.iloc[26]
+
+    def test_none_windows_skip_those_checks(self):
+        """situation_windows/anchor_of 缺省 None → 只查特征/未来窗（与
+        randomize_triggers 的逐 bar 抽样池同型——最小侵入）。"""
+        bars = make_bars_rows([PLAT] * 50, hourly(50))
+        mask = prob_gaps.eligible_bars(bars, feature_warmup=10, hold_bars=5,
+                                       gap_spans=[])
+        assert list(mask.iloc[:10]) == [False] * 10
+        assert mask.iloc[10:44].all()          # t+5+1 ≤ 49 → i ≤ 43
+        assert not mask.iloc[44:].any()        # 末端未来窗不完整
+
+    def test_context_reasons_and_era(self):
+        """EligibilityContext：逐原因剔除记录 + era 分类（数据时代/来源）；
+        require_era 而 era 边界不可得 → 全部按 era_unavailable 剔除
+        （fail-closed，与 P1 的 era 缺失拒绝同口径）。"""
+        n = 60
+        bars = make_bars_rows([PLAT] * n, hourly(n))
+        ctx = prob_gaps.EligibilityContext(
+            feature_warmup=10, hold_bars=5,
+            mt5_first_time=pd.Timestamp("2026-01-02 20:00:00"))
+        reasons = ctx.exclusion_reasons(bars)
+        assert reasons.iloc[0] == "feature_warmup"
+        assert reasons.iloc[55] == "future_window"
+        assert (reasons.iloc[12:53] == "").all()
+        era = ctx.era_of(bars["time"])
+        assert era.iloc[0] == "ext" and era.iloc[-1] == "mt5"
+        no_era = prob_gaps.EligibilityContext(
+            feature_warmup=0, hold_bars=0, require_era=True)
+        assert not no_era.eligible_bars(bars).any()
+        assert (no_era.exclusion_reasons(bars) == "era_unavailable").all()
+
+    def test_context_eligible_bars_matches_module_function(self):
+        bars = make_bars_rows([PLAT] * 80, hourly(80))
+        kw = dict(feature_warmup=15, hold_bars=8, gap_spans=[])
+        via_fn = prob_gaps.eligible_bars(bars, **kw)
+        via_ctx = prob_gaps.EligibilityContext(**kw).eligible_bars(bars)
+        assert (via_fn == via_ctx).all()
 
 
 class TestMt5FirstTimeFromTags:
@@ -352,9 +559,12 @@ class TestScenarioCosts:
 
 class TestCountTriggerSuppression:
     def _count(self, bars, gap_spans=None):
+        # P2-03：count_triggers 的 feature_warmup 缺省与 P1 相同（2000）；
+        # 本组只测回看窗抑制 → 显式关闭预热（33 根合成序列）
         return count_triggers(bars, symbol="XAUUSD", situation="S1",
                               approach=APPROACH, action_params=PARAMS,
-                              grid_step=50.0, gap_spans=gap_spans)
+                              grid_step=50.0, gap_spans=gap_spans,
+                              feature_warmup=0)
 
     def test_trigger_window_crossing_gap_suppressed(self):
         """洞 (t21, t22)：A3@26 的 S1 窗 [20,26] 跨洞 → 抑制；A1@28 的窗
@@ -448,7 +658,10 @@ class TestPrecheckScenarioCosts:
 
     - 1x 档：cost_R = 0.40/10.5 ≈ 0.0381 → 3× = 0.114 < ΔEV = 0.04×3 = 0.12 ✓
     - 保守 1.5 档（ext 行点差 ×1.5）：0.55/10.5 ≈ 0.0524 → 3× ≈ 0.157 > 0.12 ✗
-    """
+
+    T104 批 2（audit2 P2-04）：era 逐行消费 merged_research_series 的
+    source_tags（counted 行按 bar 下标对齐）——meta.first_time 不再参与；
+    声明情景档而来源标签不可得 → 拒绝该成本判定（不退 1×、不 pass）。"""
 
     def _scenario_candidate(self):
         data = prob_data()
@@ -457,24 +670,29 @@ class TestPrecheckScenarioCosts:
                         "cost_scenario_reference": 3.0}
         return cand.validate_candidate(data, source="t")
 
+    def _tags(self, n_ext, n_mt5):
+        return ["ext:histdata:2014"] * n_ext + ["mt5"] * n_mt5
+
     def test_conservative_scenario_binds_decision(self, tmp_path):
         c = self._scenario_candidate()
         rows = [("TEST", "S1", "A3", 9, 10.5, 2000.0, "2014-06-02 14:00")] * 50
         res = cand.precheck_prob(c, data_root=root_with_meta(tmp_path),
                                  cost_model=FlatCosts(),
                                  counted=counted_df(rows),
-                                 split=pd.Timestamp("2020-01-01"))
+                                 split=pd.Timestamp("2020-01-01"),
+                                 source_tags_by_symbol={
+                                     "TEST": self._tags(50, 0)})
         ec = res.checks["ex_ante_cost_prob"]
         assert ec["passed"] is False           # 1x 过、保守档不过 → fail
         assert res.decision == "fail"
         assert ec["cost_r_by_symbol_1x"]["TEST"] == pytest.approx(0.40 / 10.5)
         assert ec["cost_r_by_symbol"]["TEST"] == pytest.approx(0.55 / 10.5)
         assert ec["cost_r_by_symbol_ref3"]["TEST"] == pytest.approx(1.00 / 10.5)
+        assert ec["ext_trigger_n_by_symbol"]["TEST"] == 50
 
-    def test_mixed_era_mean_uses_meta_first_time(self, tmp_path):
-        """era 判定：触发时刻 < bars meta.json first_time → ext（点差乘档）；
-        ≥ first_time → MT5 段（1x）。50 行 ext + 50 行 MT5 → 保守档均值
-        = mean(0.55, 0.40)/10.5。"""
+    def test_mixed_era_mean_uses_row_source_tags(self, tmp_path):
+        """era 判定：逐行 source_tags（bar 下标对齐）——ext 标记行点差乘档、
+        mt5 行 1x。50 行 ext + 50 行 MT5 → 保守档均值 = mean(0.55, 0.40)/10.5。"""
         c = self._scenario_candidate()
         rows = ([("TEST", "S1", "A3", 9, 10.5, 2000.0,
                   "2014-06-02 14:00")] * 50
@@ -483,22 +701,28 @@ class TestPrecheckScenarioCosts:
         res = cand.precheck_prob(c, data_root=root_with_meta(tmp_path),
                                  cost_model=FlatCosts(),
                                  counted=counted_df(rows),
-                                 split=pd.Timestamp("2020-01-01"))
+                                 split=pd.Timestamp("2020-01-01"),
+                                 source_tags_by_symbol={
+                                     "TEST": self._tags(50, 50)})
         ec = res.checks["ex_ante_cost_prob"]
         assert ec["cost_r_by_symbol"]["TEST"] == pytest.approx(0.475 / 10.5)
         assert ec["cost_r_by_symbol_1x"]["TEST"] == pytest.approx(0.40 / 10.5)
+        assert ec["ext_trigger_n_by_symbol"]["TEST"] == 50
 
-    def test_no_meta_means_no_ext_triggers(self, tmp_path):
+    def test_missing_tags_refuse_cost_judgment(self, tmp_path):
+        """P2-04 fail-closed：声明情景档而 tags 未传（meta 在场也不算）→
+        成本判定拒绝（passed=None、绑定档不给数、不静默退 1×）。"""
         c = self._scenario_candidate()
         rows = [("TEST", "S1", "A3", 9, 10.5, 2000.0, "2014-06-02 14:00")] * 50
-        res = cand.precheck_prob(c, data_root=root_with_meta(tmp_path,
-                                                             first=None),
+        res = cand.precheck_prob(c, data_root=root_with_meta(tmp_path),
                                  cost_model=FlatCosts(),
                                  counted=counted_df(rows),
                                  split=pd.Timestamp("2020-01-01"))
         ec = res.checks["ex_ante_cost_prob"]
-        assert ec["cost_r_by_symbol"]["TEST"] == \
-            pytest.approx(ec["cost_r_by_symbol_1x"]["TEST"])
+        assert ec["passed"] is None
+        assert ec["cost_r_by_symbol"] == {}
+        assert res.decision == "waiting_data"
+        assert any("来源" in r for r in res.reasons)
 
     def test_without_new_keys_bit_compatible(self, tmp_path):
         """缺省（无新键）：checks 逐位与 T97 之前相同——不出现新键，
@@ -597,10 +821,11 @@ class TestRunP1CardEraSplit:
         A1@28（MT5 段）→ 原 costs；同一品种两组标签结果拼接。
 
         随机化桶在本合成序列里只含触发自身（小时×星期桶唯一），故真实
-        与零假设两组的匹配条目同型——全部断言为对应成本包装。"""
+        与零假设两组的匹配条目同型——全部断言为对应成本包装。序列补长到
+        63 根：P2-03 起未来窗须 t+K+1 完整可观察（卡 K=24 → 触发根 ≤ 37）。"""
         card = fake_card(hypotheses=("S1:A3:fade>base", "S1:A1:follow>base"),
                          cost_scenario_mult=(1.0, 1.5))
-        bars = make_bars_rows(s1_pattern_rows(), hourly(33))
+        bars = make_bars_rows(s1_pattern_rows() + [PLAT] * 30, hourly(63))
         res, seen, costs, times = self._run(monkeypatch, card, bars)
         a3 = [s for s in seen
               if s["actions"] == {"A3"} and s["times"] == [times[26]]]
@@ -615,9 +840,10 @@ class TestRunP1CardEraSplit:
 
     def test_gap_suppression_applies_to_card_triggers(self, monkeypatch):
         """card_triggers 抑制：洞 (t21,t22) 使 A3@26 的 S1 窗 [20,26] 跨洞
-        → 该触发在标签前已被剔除（label_triggers 收不到它）。"""
+        → 该触发在标签前已被剔除（label_triggers 收不到它）。序列补长到
+        63 根（P2-03：A1@28 的未来窗 t+K+1 须完整可观察）。"""
         card = fake_card(hypotheses=("S1:A3:fade>base", "S1:A1:follow>base"))
-        bars = make_bars_rows(s1_pattern_rows(), hourly(33))
+        bars = make_bars_rows(s1_pattern_rows() + [PLAT] * 30, hourly(63))
         times = list(pd.to_datetime(bars["time"]))
         res, seen, costs, times = self._run(
             monkeypatch, card, bars, gap_spans=[(times[21], times[22])])
@@ -628,9 +854,10 @@ class TestRunP1CardEraSplit:
     def test_without_scenario_key_all_labels_use_original_costs(
             self, monkeypatch):
         """硬约束：卡不带 cost_scenario_mult（即使 bt 传了 mt5_first）→
-        全部 label_triggers 用原 costs，无 ScenarioCosts 包装。"""
+        全部 label_triggers 用原 costs，无 ScenarioCosts 包装。序列补长到
+        63 根（P2-03：未来窗 t+K+1 须完整可观察）。"""
         card = fake_card(hypotheses=("S1:A3:fade>base", "S1:A1:follow>base"))
-        bars = make_bars_rows(s1_pattern_rows(), hourly(33))
+        bars = make_bars_rows(s1_pattern_rows() + [PLAT] * 30, hourly(63))
         res, seen, costs, times = self._run(monkeypatch, card, bars)
         assert seen, "合成形态应产生触发（A3@26 / A1@28）"
         assert all(s["is_orig"] for s in seen)
@@ -654,8 +881,9 @@ class TestRunP1CardEligibility:
 
     def test_randomize_receives_eligible_bars(self, monkeypatch):
         """run_p1_card 显式把合格 bar 集传给 randomize_triggers（P-09）：
-        无洞、预热 0 → 全序列合格；有预热 → 池从预热根起（真实触发同
-        口径过滤——A1@28 ≥ 27 仍在）。"""
+        无洞、预热 0 → 合格 bar 全入池；有预热 → 池从预热根起。P2-03 起
+        池还受**未来窗 t+K+1 完整可观察**约束（卡 K=24 → 63 根序列的池止
+        于 62−25=37；旧口径把末端截断根也算合格）。"""
         import numpy as np
         captured = []
         real_rnd = p1mod.randomize_triggers
@@ -666,16 +894,16 @@ class TestRunP1CardEligibility:
 
         monkeypatch.setattr(p1mod, "randomize_triggers", spy)
         card = fake_card(hypotheses=("S1:A1:follow>base",))
-        bars = make_bars_rows(s1_pattern_rows(), hourly(33))
+        bars = make_bars_rows(s1_pattern_rows() + [PLAT] * 30, hourly(63))
         self._run(monkeypatch, card, bars, feature_warmup=0)
         assert captured and captured[0] is not None
         pool = np.asarray(captured[0]).astype(int)
-        assert set(pool.tolist()) == set(range(len(bars)))   # 预热 0 无洞
-        assert {26, 28} <= set(pool.tolist())                # 触发自身在池
+        assert set(pool.tolist()) == set(range(38))   # 预热 0 无洞；i ≤ 37
+        assert {26, 28} <= set(pool.tolist())         # 触发自身在池
         captured.clear()
         self._run(monkeypatch, card, bars, feature_warmup=27)
         assert set(np.asarray(captured[0]).astype(int).tolist()) \
-            == set(range(27, len(bars)))
+            == set(range(27, 38))
 
     def test_feature_warmup_filters_real_triggers(self, monkeypatch):
         """缺省预热 2000（atr_pct_2000 排名窗）：63 根合成序列的触发全部
@@ -797,6 +1025,46 @@ class TestBtLoadPath:
                                  FlatCosts(), set())
         assert calls["load_series"] == 0 and calls["merged"] == 1
 
+    def test_candidate_check_prob_forwards_eligibility_kwargs(self, tmp_path,
+                                                              monkeypatch):
+        """P2-03（丁-3）：bt 预筛计数显式传 feature_warmup（=2000，与 P1
+        缺省同口径）与 hold_bars=卡 bracket 的 K——预筛与 P1 口径一致。"""
+        import mt5quant.prob.counting as pcount
+        captured = {}
+
+        def fake_count(bars, **kw):
+            captured.update(kw)
+            return pd.DataFrame(columns=["time", "situation", "action",
+                                         "side", "level", "kind", "anchor",
+                                         "bar", "symbol", "ny_hour", "atr",
+                                         "close"])
+
+        monkeypatch.setattr(pcount, "count_triggers", fake_count)
+        self._patch_loaders(monkeypatch)        # 装载走桩（无真实研究库）
+        args = types.SimpleNamespace(split="2020-01-01")
+        c = cand.validate_candidate(prob_data(), source="t")
+        BT._candidate_check_prob(args, c, root_with_meta(tmp_path, first=None),
+                                 FlatCosts(), set())
+        assert captured["feature_warmup"] == prob_gaps.FEATURE_WARMUP_BARS
+        assert captured["hold_bars"] == 24      # prob_data 的 bracket K
+
+    def test_candidate_check_prob_forwards_source_tags_and_gaps(
+            self, tmp_path, monkeypatch):
+        """P2-04（丁-4）：merged 路径的 source_tags/gap_spans 传入
+        precheck_prob——checks.source_provenance 登记品种来源标签与洞集合
+        （era 逐行消费的前提，可复核）。"""
+        calls = self._patch_loaders(monkeypatch)   # tags=["mt5"]*40、gaps=[]
+        args = types.SimpleNamespace(split="2020-01-01")
+        data = prob_data()
+        data["prob"] = {**data["prob"], "max_gap_days": 30}
+        c = cand.validate_candidate(data, source="t")
+        result = BT._candidate_check_prob(
+            args, c, root_with_meta(tmp_path, first=None), FlatCosts(), set())
+        assert calls["merged"] == 1
+        sp = result.checks["source_provenance"]
+        assert sp["symbols_with_source_tags"] == ["TEST"]
+        assert sp["gap_spans_by_symbol"] == {"TEST": 0}
+
     def test_merged_gate_helper(self):
         assert BT._prob_use_merged({}) is False
         assert BT._prob_use_merged({"max_gap_days": 30}) is True
@@ -811,13 +1079,15 @@ class TestBtLoadPath:
 
     def test_prob_load_bars_dispatch(self, tmp_path, monkeypatch):
         calls = self._patch_loaders(monkeypatch)
-        bars, gaps = BT._prob_load_bars(tmp_path, "TEST", "H1",
-                                        use_merged=False, end=None)
+        bars, tags, gaps = BT._prob_load_bars(tmp_path, "TEST", "H1",
+                                              use_merged=False, end=None)
+        assert tags is None and gaps is None and len(bars) == 40
+        bars, tags, gaps = BT._prob_load_bars(tmp_path, "TEST", "H1",
+                                              use_merged=True)
+        # 无洞的合并序列：gap_spans 空表归一为 None（不过滤）；
+        # source_tags 逐行返回（P2-04：era 逐行消费的输入）
         assert gaps is None and len(bars) == 40
-        bars, gaps = BT._prob_load_bars(tmp_path, "TEST", "H1",
-                                        use_merged=True)
-        # 无洞的合并序列：gap_spans 空表归一为 None（不过滤）
-        assert gaps is None and len(bars) == 40
+        assert list(tags) == ["mt5"] * 40
         assert calls["load_series"] == 1 and calls["merged"] == 1
         assert calls["merged_end"] is None
 

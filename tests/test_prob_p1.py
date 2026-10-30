@@ -324,3 +324,164 @@ def test_runs_of_round_returns_params_metrics(tmp_path):
         assert rows[0]["metrics"]["prob"]["p_value"] == 0.03
         assert rows[0]["run_id"] == rid
         assert led.verify_chain() == []
+
+
+# ------------------------------------------------- T104 批 2（audit2 P2-11）
+# 资格剔除诊断进入 P1 返回行：n_eligible_dropped（进入标签前）+ 逐原因
+# 计数 + null 侧同口径计数——台账写入由丁接线（bt.py）。
+
+def _card_objects(card):
+    from mt5quant.strategies.library.prob.actions import ActionParams
+    from mt5quant.strategies.library.prob.situations import Approach
+    return (Approach(**card.prob["approach"]),
+            ActionParams(breakout_atr=card.prob["breakout_atr"],
+                         retest_window_bars=card.prob["retest_window_bars"]))
+
+
+def test_run_p1_card_reports_eligibility_drops_by_reason():
+    """缺省预热 2000：触发根 < 2000 的真实触发在标签前被剔——按
+    feature_warmup 原因计入 n_eligible_dropped（与 card_triggers 过滤
+    前后差逐位一致）。"""
+    bars = synth_bars(6000, seed=9)
+    card = fake_card()
+    rnd = fake_round()
+    approach, aparams = _card_objects(card)
+    raw = p1mod.card_triggers(card, {"XAUUSD": bars}, approach=approach,
+                              action_params=aparams)   # 不滤（三元组缺省）
+    kept = p1mod.card_triggers(card, {"XAUUSD": bars}, approach=approach,
+                               action_params=aparams, feature_warmup=2000,
+                               hold_bars=24)
+    assert len(raw) > len(kept) >= 0                # 该种子确有预热期触发
+    from mt5data.sessions import SessionPolicy
+    res = p1mod.run_p1_card(card, rnd, {"XAUUSD": bars},
+                            {"XAUUSD": FlatCosts()},
+                            sizes={"XAUUSD": 100.0},
+                            policy_by_symbol={"XAUUSD": SessionPolicy(
+                                exempt_symbols=frozenset({"XAUUSD"}))},
+                            sims=50)
+    row = res[0]
+    hyp = "S1:A3:fade>base"
+    raw_n = int(len(raw[(raw["situation"] == "S1")
+                        & (raw["action"] == "A3")]))
+    kept_n = int(len(kept[(kept["situation"] == "S1")
+                          & (kept["action"] == "A3")]))
+    assert row["hypothesis"] == hyp
+    assert row["n_eligible_dropped"] == raw_n - kept_n
+    assert row["eligible_dropped_by_reason"]["feature_warmup"] \
+        == raw_n - kept_n          # 连续合成序列无洞 → 唯一原因是预热
+    # 计数守恒（进入标签前的口径）：过滤后触发数 + 剔除数 = 原始触发数
+    assert kept_n + row["n_eligible_dropped"] == raw_n
+    # 逐位确定（诊断字段不引入随机性）
+    res2 = p1mod.run_p1_card(card, rnd, {"XAUUSD": bars},
+                             {"XAUUSD": FlatCosts()},
+                             sizes={"XAUUSD": 100.0},
+                             policy_by_symbol={"XAUUSD": SessionPolicy(
+                                 exempt_symbols=frozenset({"XAUUSD"}))},
+                             sims=50)
+    assert res == res2
+
+
+def test_run_p1_card_gap_drop_reason_recorded():
+    """回看窗跨洞的触发按 lookback_crosses_gap 原因计入（t97 波形：洞
+    (t21,t22) 使 A3@26 的 S1 窗 [20,26] 跨洞 → 被剔）。序列补长到 63 根：
+    P2-03 起未来窗须 t+K+1 完整可观察（卡 K=24 → 触发根 ≤ 37），否则
+    A1@28 会被 future_window 剔除而非'保留'。"""
+    from tests.test_prob_t97_wiring import (
+        APPROACH as T97_APPROACH, PARAMS as T97_PARAMS, fake_card as t97_card,
+        make_bars_rows, s1_pattern_rows, hourly, PLAT,
+    )
+    bars = make_bars_rows(s1_pattern_rows() + [PLAT] * 30, hourly(63))
+    times = list(pd.to_datetime(bars["time"]))
+    gaps = [(times[21], times[22])]
+    card = t97_card(hypotheses=("S1:A3:fade>base", "S1:A1:follow>base"))
+    from mt5data.sessions import SessionPolicy
+    res = p1mod.run_p1_card(
+        card, fake_round(), {"XAUUSD": bars}, {"XAUUSD": FlatCosts()},
+        sizes={"XAUUSD": 100.0},
+        policy_by_symbol={"XAUUSD": SessionPolicy(
+            exempt_symbols=frozenset({"XAUUSD"}))},
+        sims=50, feature_warmup=0,
+        gap_spans_by_symbol={"XAUUSD": gaps})
+    by_hyp = {r["hypothesis"]: r for r in res}
+    a3 = by_hyp["S1:A3:fade>base"]
+    # A3@26 被跨洞剔除；A1@28 的窗 [22,28] 在洞后保留
+    assert a3["n_eligible_dropped"] == 1
+    assert a3["eligible_dropped_by_reason"]["lookback_crosses_gap"] == 1
+    a1 = by_hyp["S1:A1:follow>base"]
+    assert a1["n_eligible_dropped"] == 0
+    assert a1["eligible_dropped_by_reason"] == {}
+
+
+def test_run_p1_card_future_window_drop_reason():
+    """持有/未来窗不满足（future_window——词表对齐甲的 EligibilityContext）：
+    31 天洞 (t30,t31)、hold=5 → A3@26 的窗 [26,31] 含洞两侧 → 被剔
+    （回看窗不跨 → 原因是未来窗）。序列补长到 63 根：末端截断不参与，
+    只测跨洞这一种未来窗失败。"""
+    from tests.test_prob_t97_wiring import (
+        fake_card as t97_card, make_bars_rows, s1_pattern_rows, hourly, PLAT,
+    )
+    times = [x if i <= 30 else x + pd.Timedelta(days=31)
+             for i, x in enumerate(hourly(63))]
+    bars = make_bars_rows(s1_pattern_rows() + [PLAT] * 30, times)
+    t = list(pd.to_datetime(bars["time"]))
+    card = t97_card(hypotheses=("S1:A3:fade>base", "S1:A1:follow>base"))
+    from mt5data.sessions import SessionPolicy
+    res = p1mod.run_p1_card(
+        card, fake_round(), {"XAUUSD": bars}, {"XAUUSD": FlatCosts()},
+        sizes={"XAUUSD": 100.0},
+        policy_by_symbol={"XAUUSD": SessionPolicy(
+            exempt_symbols=frozenset({"XAUUSD"}))},
+        sims=50, feature_warmup=0, hold_bars=5,
+        gap_spans_by_symbol={"XAUUSD": [(t[30], t[31])]})
+    by_hyp = {r["hypothesis"]: r for r in res}
+    a3 = by_hyp["S1:A3:fade>base"]
+    assert a3["n_eligible_dropped"] == 1
+    assert a3["eligible_dropped_by_reason"]["future_window"] == 1
+    # A1@28 的回看窗 [22,28] 干净，但持有窗 [28,33] 含洞两侧 (t30,t31)
+    # → 同因被剔（suppress ⇔ 窗首 ≤ s 且 e ≤ 触发后端点）。
+    a1 = by_hyp["S1:A1:follow>base"]
+    assert a1["n_eligible_dropped"] == 1
+    assert a1["eligible_dropped_by_reason"]["future_window"] == 1
+
+
+def test_run_p1_card_null_side_same_caliber_counts(monkeypatch):
+    """P2-11：null 侧同口径计数——n_null_total/n_null_usable/
+    n_null_skipped/n_null_trigger_days（排除 skipped，与 real 同口径）；
+    null 从合格池抽样 → 资格剔除恒 0（同口径记录）。"""
+    bars = synth_bars(6000, seed=9)
+    card = fake_card()
+    rnd = fake_round()
+    calls = []
+    real_label = p1mod.label_triggers
+
+    def stub_labels(b, trig, costs, **kw):
+        times = pd.to_datetime(trig["time"])
+        calls.append(list(times))
+        outcomes = ["win" if k % 2 == 0 else "skipped"
+                    for k in range(len(trig))]
+        return pd.DataFrame({
+            "time": times.to_numpy(), "outcome": outcomes,
+            "net_r": [1.9 if o == "win" else 0.0 for o in outcomes]})
+
+    monkeypatch.setattr(p1mod, "label_triggers", stub_labels)
+    from mt5data.sessions import SessionPolicy
+    res = p1mod.run_p1_card(card, rnd, {"XAUUSD": bars},
+                            {"XAUUSD": FlatCosts()},
+                            sizes={"XAUUSD": 100.0},
+                            policy_by_symbol={"XAUUSD": SessionPolicy(
+                                exempt_symbols=frozenset({"XAUUSD"}))},
+                            sims=50)
+    row = res[0]
+    assert len(calls) >= 2                        # real + null（单假设）
+    null_times = calls[1]
+    n = len(null_times)
+    n_skipped = sum(1 for k in range(n) if k % 2 == 1)
+    assert row["n_null_total"] == n
+    assert row["n_null_skipped"] == n_skipped
+    assert row["n_null_usable"] == n - n_skipped
+    null_usable_days = len({t.date() for k, t in enumerate(null_times)
+                            if k % 2 == 0})
+    assert row["n_null_trigger_days"] == null_usable_days
+    assert row["n_null_eligible_dropped"] == 0    # 池已按共同可用集合预滤
+    # real 侧同口径自洽
+    assert row["n_total"] == row["n_usable"] + row["n_skipped"]

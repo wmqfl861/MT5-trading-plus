@@ -659,3 +659,268 @@ def test_p07_unknown_hypothesis_rejected_at_definition():
     with pytest.raises(ValueError, match="ALLOWED_HYPOTHESES"):
         class TypoAllowed(DemoSmallGrid):
             ALLOWED_HYPOTHESES = ("a3",)
+
+
+# ================================================ P2-01/P2-02（T104 批 2 模块甲）
+# audit2 §3.3：白名单升级（局面×动作）+ 实例真实 ExitRules 核验 + 白名单进
+# 模型身份；generate_signals 决策起点状态机。失败测试先行于实现提交。
+
+
+def test_p201_hypothesis_pairs_helper():
+    """P2-01：卡假设（S1:A3:fade>base 形式）→（局面,动作）对解析 helper
+    （bt checker 与策略共用；从本模块导出）。"""
+    from mt5quant.strategies.library.prob.level_decision import (
+        parse_hypothesis_pairs,
+    )
+    got = parse_hypothesis_pairs(["S1:A3:fade>base", "S2:A1:follow>base"])
+    assert got == frozenset({("S1", "A3"), ("S2", "A1")})
+    with pytest.raises(ValueError, match="局面"):
+        parse_hypothesis_pairs(["S9:A3:fade>base"])
+    with pytest.raises(ValueError, match="动作"):
+        parse_hypothesis_pairs(["S1:A9:fade>base"])
+    with pytest.raises(ValueError, match="形式"):
+        parse_hypothesis_pairs(["S1"])
+
+
+def test_p201_pair_whitelist_scopes_situation():
+    """P2-01：白名单条目 'S1:A3' 只放行 S1×A3——S1:A1 不放行（动作外），
+    'S2:A3' 也不放行 S1 的 A3（局面外——旧实现只比动作）。"""
+    model = _two_action_model()           # A1@41 过门槛、A3@40 不过
+    bars = _two_action_bars()
+
+    class OnlyS1A3(DemoSmallGrid):
+        ALLOWED_HYPOTHESES = ("S1:A3",)
+
+    class OnlyS2A3(DemoSmallGrid):
+        ALLOWED_HYPOTHESES = ("S2:A3",)
+
+    class OnlyS1A1(DemoSmallGrid):
+        ALLOWED_HYPOTHESES = ("S1:A1",)
+
+    sig = OnlyS1A3().with_model(model).generate_signals(bars, {}).to_numpy()
+    assert (sig == 0).all()               # A1 被（局面×动作）集合挡住
+    sig = OnlyS2A3().with_model(model).generate_signals(bars, {}).to_numpy()
+    assert (sig == 0).all()               # S2:A3 不顺带放行 S1:A3
+    sig = OnlyS1A1().with_model(model).generate_signals(bars, {}).to_numpy()
+    assert sig[41] == 1, sig[38:46]       # 白名单内的 S1:A1 照常入场
+
+
+def test_p201_legacy_action_entry_still_allowed():
+    """P2-01 兼容：旧式裸动作条目 'A3' = 任意局面下的 A3（OnlyA3 语义不
+    变——既有 P-07 测试与探针夹具依赖）。"""
+    model = _two_action_model()
+    bars = _two_action_bars()
+
+    class AnySituationA3(DemoSmallGrid):
+        ALLOWED_HYPOTHESES = ("A3",)
+
+    sig = AnySituationA3().with_model(model).generate_signals(
+        bars, {}).to_numpy()
+    assert (sig == 0).all()               # A1 仍被挡（动作外）
+    # 白名单内动作照常（test_p07_whitelisted_action_still_trades 的同型）
+
+
+def test_p201_bad_pair_rejected_at_definition():
+    """P2-01：白名单条目 'S9:A3'/'S1:a3' → 类定义即抛（局面/动作都校验）。"""
+    with pytest.raises(ValueError, match="ALLOWED_HYPOTHESES"):
+        class BadSituation(DemoSmallGrid):
+            ALLOWED_HYPOTHESES = ("S9:A3",)
+    with pytest.raises(ValueError, match="ALLOWED_HYPOTHESES"):
+        class BadAction(DemoSmallGrid):
+            ALLOWED_HYPOTHESES = ("S1:a3",)
+
+
+def test_p201_inconsistent_exit_rules_rejected_at_definition():
+    """P2-01：显式覆写 exit_rules 与自身 bracket 不一致 → 类定义即拒绝
+    （不再'尊重'——标签 bracket 与引擎出场脱节；探针 whitelist 的 WrongExit
+    即此形态）。一致覆写（与自身常量推导相等）与 time_stop/week_close 覆写
+    分别验证。"""
+    with pytest.raises(ValueError, match="exit_rules"):
+        class WrongExit(DemoSmallGrid):
+            exit_rules = ExitRules(stop_loss_atr=9.0, take_profit_atr=10.0,
+                                   reentry="after_signal_change")
+    with pytest.raises(ValueError, match="exit_rules"):
+        class TimeStopExit(DemoSmallGrid):
+            exit_rules = ExitRules(stop_loss_atr=1.0, take_profit_atr=2.0,
+                                   time_stop_bars=5,
+                                   reentry="after_signal_change")
+
+    class ConsistentExit(DemoSmallGrid):
+        SL_ATR = 2.0
+        TP_ATR = 3.0
+        exit_rules = ExitRules(stop_loss_atr=2.0, take_profit_atr=3.0,
+                               reentry="after_signal_change")
+
+    assert ConsistentExit.exit_rules.stop_loss_atr == 2.0   # 一致 → 接受
+
+
+def test_p201_instance_exit_rules_tamper_rejected():
+    """P2-01：实例层改 exit_rules（引擎实际消费的属性）与 bracket 不一致
+    → fit / generate_signals 入口拒绝（不只比类常量）。"""
+    bars = _two_action_bars()
+    strat = DemoSmallGrid().with_model(_strong_model())
+    strat.exit_rules = ExitRules(stop_loss_atr=9.0, take_profit_atr=10.0,
+                                 reentry="after_signal_change")
+    with pytest.raises(ValueError, match="exit_rules"):
+        strat.generate_signals(bars, {})
+    bars4k = synth_bars(3000, seed=17)
+    meta = {"__fit__": {"sizes": {"XAUUSD": 100.0},
+                        "policies": {"XAUUSD": PERMISSIVE}}}
+    tampered_fit = DemoSmallGrid()
+    tampered_fit.exit_rules = ExitRules(stop_loss_atr=9.0, take_profit_atr=10.0,
+                                        reentry="after_signal_change")
+    with pytest.raises(ValueError, match="exit_rules"):
+        tampered_fit.fit({"XAUUSD": bars4k}, {"XAUUSD": FlatCosts()}, meta,
+                         train_end=pd.Timestamp("2020-03-01"),
+                         purge_bars=10)
+
+
+def test_p201_model_records_allowed_pairs_and_with_model_checks():
+    """P2-01：fit 把获准（局面×动作）集合写进模型 dict（allowed_hypotheses
+    键）；with_model 核对模型集合与类常量一致——不一致（装错卡）拒绝；
+    旧模型无该键 → 按'全部'处理不拒绝（向后兼容，identity v1 冻结件）。"""
+    bars = synth_bars(4000, seed=42)
+    meta = {"__fit__": {"sizes": {"XAUUSD": 100.0},
+                        "policies": {"XAUUSD": PERMISSIVE}}}
+    kw = dict(train_end=pd.Timestamp("2020-06-01"), purge_bars=10)
+
+    class OnlyS1A3(DemoSmallGrid):
+        ALLOWED_HYPOTHESES = ("S1:A3",)
+
+    m = OnlyS1A3().fit({"XAUUSD": bars}, {"XAUUSD": FlatCosts()}, meta, **kw)
+    assert m["allowed_hypotheses"] == ["S1:A3"]
+    OnlyS1A3().with_model(m)                      # 一致 → 装载
+    m_base = DemoSmallGrid().fit({"XAUUSD": bars}, {"XAUUSD": FlatCosts()},
+                                 meta, **kw)
+    assert m_base["allowed_hypotheses"] == []     # 空白名单 = 全部（兼容值）
+    with pytest.raises(ValueError, match="allowed_hypotheses"):
+        OnlyS1A3().with_model(m_base)             # 全部 ⊅ S1:A3 → 拒绝
+    with pytest.raises(ValueError, match="allowed_hypotheses"):
+        DemoSmallGrid().with_model(m)             # S1:A3 模型装空白名单卡 → 拒绝
+    # 旧模型（批 1 冻结件）无该键 → 不拒绝（按'全部'处理并注明）
+    legacy = _strong_model()
+    assert "allowed_hypotheses" not in legacy
+    DemoSmallGrid().with_model(legacy)
+    OnlyS1A3().with_model(legacy)
+
+
+def test_p201_fit_filters_labels_by_pair():
+    """P2-01：fit 的标签/成本过滤按（局面×动作）对——S2:A3 条目不放行
+    S1 的 A3（fit 后模型无任何 S1:A3 之外的格），legacy 'A3' 仍放行 S1:A3。"""
+    bars = synth_bars(3000, seed=17)
+    meta = {"__fit__": {"sizes": {"XAUUSD": 100.0},
+                        "policies": {"XAUUSD": PERMISSIVE}}}
+    kw = dict(train_end=pd.Timestamp("2020-03-01"), purge_bars=10)
+
+    class OnlyS2A3(DemoSmallGrid):
+        ALLOWED_HYPOTHESES = ("S2:A3",)
+
+    with pytest.raises(ValueError, match="没有可用行"):
+        OnlyS2A3().fit({"XAUUSD": bars}, {"XAUUSD": FlatCosts()}, meta, **kw)
+
+    class LegacyA3(DemoSmallGrid):
+        ALLOWED_HYPOTHESES = ("A3",)
+
+    m = LegacyA3().fit({"XAUUSD": bars}, {"XAUUSD": FlatCosts()}, meta, **kw)
+    assert _model_actions(m) <= {"A3"}
+    assert m["allowed_hypotheses"] == ["*:A3"]    # 裸动作 → 任意局面
+
+
+# ------------------------------------------------------- P2-02 决策起点
+
+
+def _trigger_patched(monkeypatch, trig_bars, situation="S1", action="A3",
+                     side=1):
+    """把触发钉在给定 bar 上（掩掉局面/动作发现——P2-02 状态机单元测试）。"""
+    import mt5quant.strategies.library.prob.level_decision as ld
+    trig = pd.DataFrame({"bar": list(trig_bars),
+                         "situation": [situation] * len(trig_bars),
+                         "action": [action] * len(trig_bars),
+                         "side": [side] * len(trig_bars)})
+    monkeypatch.setattr(ld, "level_rows_for_situation", lambda *a, **k: [])
+    monkeypatch.setattr(ld, "find_level_events", lambda *a, **k: [])
+    monkeypatch.setattr(ld, "action_triggers", lambda *a, **k: trig)
+
+
+def test_p202_decision_start_fills_first_post_split_trigger(monkeypatch):
+    """P2-02（探针 boundary_state 场景的正确行为）：训练段触发（bar40）+
+    split（bar41）后第一根合法新触发（bar42）→ 该触发成交——起点前不进
+    held_until/forced_zero 状态机，bar42 是全新决策段起点（现行输出掩码
+    误杀该触发；本测试在**策略层**直接断言成交，不经 bt 掩码层）。"""
+    data = synth_bars(80, seed=1)
+    split = pd.Timestamp(data["time"].iloc[41])
+    _trigger_patched(monkeypatch, [40, 42])
+    strat = DemoSmallGrid().with_model(_strong_model())
+    sig = strat.generate_signals(data, {}, decision_start=split).to_numpy()
+    assert sig[40] == 0 and sig[41] == 0        # 起点前：只算特征，不建仓
+    k = DemoSmallGrid.HORIZON_BARS
+    assert sig[42:42 + k].tolist() == [1] * k   # bar42 新决策段恰 K 根
+    assert sig[42 + k] == 0                     # 其后归零（不链式）
+
+
+def test_p202_decision_start_only_pre_split_trigger_no_trade(monkeypatch):
+    """P2-02：split 前触发+split 后无触发 → 不交易（起点前触发不产生任何
+    持仓状态或尾巴）。"""
+    data = synth_bars(80, seed=2)
+    split = pd.Timestamp(data["time"].iloc[41])
+    _trigger_patched(monkeypatch, [40])
+    strat = DemoSmallGrid().with_model(_strong_model())
+    sig = strat.generate_signals(data, {}, decision_start=split).to_numpy()
+    assert (sig == 0).all()
+
+
+def test_p202_training_tail_state_does_not_leak(monkeypatch):
+    """P2-02：训练段尾部的持有/forced_zero 不影响验证段——bar39 触发的
+    持有本会压到 bar46、forced_zero 压 bar47；起点=bar41 后 bar47 的新触发
+    照常成交（空状态处理）。"""
+    data = synth_bars(80, seed=3)
+    split = pd.Timestamp(data["time"].iloc[41])
+    _trigger_patched(monkeypatch, [39, 47])
+    strat = DemoSmallGrid().with_model(_strong_model())
+    sig = strat.generate_signals(data, {}, decision_start=split).to_numpy()
+    assert sig[39:47].tolist() == [0] * 8       # 训练段尾巴不泄漏
+    k = DemoSmallGrid.HORIZON_BARS
+    assert sig[47:47 + k].tolist() == [1] * k   # bar47 新段（无视 forced_zero）
+
+
+def test_p202_decision_start_before_data_equals_full_history(monkeypatch):
+    """P2-02 兼容：起点早于序列首根 → 与不传起点逐位一致（全历史决策）。"""
+    data = synth_bars(80, seed=4)
+    _trigger_patched(monkeypatch, [40, 55])
+    strat = DemoSmallGrid().with_model(_strong_model())
+    plain = strat.generate_signals(data, {}).to_numpy()
+    early = strat.generate_signals(
+        data, {}, decision_start=pd.Timestamp("2019-01-01")).to_numpy()
+    assert (plain == early).all()
+    assert plain.any()                          # 夹具确有触发
+
+
+def test_p202_set_decision_start_and_reset(monkeypatch):
+    """P2-02 实例入口：set_decision_start（适配层可链式设置）与 decision_start
+    参数等价；reset_decision_state() 清回全历史语义；with_decision_start
+    返回新实例不污染原实例。"""
+    data = synth_bars(80, seed=5)
+    split = pd.Timestamp(data["time"].iloc[41])
+    _trigger_patched(monkeypatch, [40, 42])
+    strat = DemoSmallGrid().with_model(_strong_model())
+    via_kwarg = strat.generate_signals(data, {}, decision_start=split).to_numpy()
+    strat.set_decision_start(split)
+    via_setter = strat.generate_signals(data, {}).to_numpy()
+    assert (via_kwarg == via_setter).all()
+    strat.reset_decision_state()
+    plain = strat.generate_signals(data, {}).to_numpy()
+    assert plain[40] != 0                       # 全历史：bar40 照常入场
+    fresh = strat.with_decision_start(split)
+    assert (fresh.generate_signals(data, {}).to_numpy() == via_kwarg).all()
+    assert (strat.generate_signals(data, {}).to_numpy() == plain).all()
+
+
+def test_p202_generate_signals_pure_across_calls(monkeypatch):
+    """P2-02：决策状态机不跨调用泄漏——同一实例重复调用输出逐位一致
+    （引擎/G0 截断一致性依赖纯函数语义）。"""
+    data = synth_bars(80, seed=6)
+    _trigger_patched(monkeypatch, [40, 42])
+    strat = DemoSmallGrid().with_model(_strong_model())
+    a = strat.generate_signals(data, {}).to_numpy()
+    b = strat.generate_signals(data, {}).to_numpy()
+    assert (a == b).all()

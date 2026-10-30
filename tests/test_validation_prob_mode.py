@@ -449,3 +449,26 @@ def test_holm_input_validation():
         holm({"a": -0.01})
     with pytest.raises(ValueError, match="p"):
         holm({"a": 1.5})
+
+
+# ------------------------------------- T104 批 2（P2-09 方法批准门，丁-6）
+
+def test_method_registry_statuses():
+    """P2-09：方法登记——月内置换在 v2 成簇负对照失败（w7=11%>5%）→
+    failed_cluster_control；季度块为 v2 §6 预写选项一，v3 试验 w7=8%>5%
+    按预写规则不采纳 → not_adopted。两者均未获批。"""
+    from mt5quant.validation.prob_mode import METHOD_REGISTRY
+    assert METHOD_REGISTRY["month-within"]["status"] == "failed_cluster_control"
+    assert METHOD_REGISTRY["quarter"]["status"] == "not_adopted"
+    for entry in METHOD_REGISTRY.values():
+        assert entry.get("adopted") is False
+        assert entry.get("note")            # 人读依据（含报告出处）
+
+
+def test_primary_method_approved_false_while_cluster_control_fails():
+    """P2-09：主检验方法未获批 → (False, reason)——reason 写明成簇负对照
+    失败（消费方：bt prob round-report 的推进结论门）。"""
+    from mt5quant.validation.prob_mode import primary_method_approved
+    approved, reason = primary_method_approved()
+    assert approved is False
+    assert "成簇" in reason and "未批准" in reason

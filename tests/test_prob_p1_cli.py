@@ -722,6 +722,16 @@ def test_p04_prob_test_frozen_family_card_runs(r4_open, monkeypatch):
                 == "C101"]
     assert len(rows) == 1
     assert rows[0]["params"]["hypothesis"] == "S1:A1:follow>base"
+    # P2-11（丁-7）：metrics.prob 补齐诊断入账——n_total/n_usable/n_skipped/
+    # 资格剔除（逐原因）与 null 侧同口径计数
+    m = rows[0]["metrics"]["prob"]
+    for k in ("n_total", "n_usable", "n_skipped", "n_eligible_dropped",
+              "eligible_dropped_by_reason", "n_null_total", "n_null_usable",
+              "n_null_skipped", "n_null_trigger_days",
+              "n_null_eligible_dropped"):
+        assert k in m, k
+    assert m["n_total"] == m["n_usable"] + m["n_skipped"]
+    assert isinstance(m["eligible_dropped_by_reason"], dict)
 
 
 def _record_r4_run(ledger, *, cid, hyp, p_value=1e-6, delta=0.005,
@@ -901,6 +911,58 @@ def test_p04_round_report_mixed_round_standard_runs_skipped(
     assert code == 0, out
 
 
+# ------------------------------------- T104 批 2（P2-08/P2-09/P2-11，丁接线）
+
+def test_p208_round_open_lower_bound_tier_always_dropped(round_env,
+                                                         monkeypatch):
+    """P2-08（丁-5）：开轮复核授权统一走 sample_size_evidence——0.02≤Δp<
+    0.03 开区间档超记录下界**不再授权 pass**（触发日数再大也恒 waiting_data
+    → 机械移除），候选冻结族因此为空 → 拒绝开启；0.03/0.05 标定档仍按
+    days 判定（既有冻结用例维持）。"""
+    c101 = round_env["repo"] / "research" / "candidates" / "C101.toml"
+    c101.write_text(c101.read_text(encoding="utf-8").replace(
+        "expected_delta_p = 0.05", "expected_delta_p = 0.025"),
+        encoding="utf-8")
+    with Ledger(round_env["ledger"]) as led:
+        _power_precheck(led, "C101", {
+            "S1:A1:follow>base": {"trigger_days": 10 ** 6, "passed": True},
+            "S1:A3:fade>base": {"trigger_days": 10 ** 6, "passed": True}})
+        _power_precheck(led, "C102", {
+            "S1:A2:follow>base": {"trigger_days": 10 ** 6, "passed": True}})
+    code, out = _open_r4(round_env, monkeypatch)
+    assert code == 1
+    # C101 两条假设按证据三分判 waiting_data（开区间档）→ 冻结族空 → 拒开
+    assert "开区间" in out and "移除" in out
+    assert "冻结族为空" in out
+
+
+def test_p209_round_report_method_gate_and_diag_columns(r4_open,
+                                                        monkeypatch):
+    """P2-09/P2-11（丁-6/丁-7）：主检验方法未批准（月内置换成簇负对照
+    失败）——报告必须标注"不构成推进依据"、结论列一律"不推进（方法阻塞）"
+    （exit code 不变=0）；行补可用/剔除列（P2-11 诊断入账的读侧）。"""
+    with Ledger(r4_open["ledger"]) as led:
+        _record_r4_run(led, cid="C101", hyp="S1:A1:follow>base")
+        _record_r4_run(led, cid="C102", hyp="S1:A2:follow>base")
+    code, out = _run_round_report(r4_open, monkeypatch)
+    assert code == 0, out
+    reports = sorted((r4_open["tmp"] / "docs" / "research")
+                     .glob("round-R4-p1-*.md"))
+    assert len(reports) == 1
+    text = reports[0].read_text(encoding="utf-8")
+    assert "方法未批准（成簇负对照失败）——本报告不构成推进依据" in text
+    concl = [ln for ln in text.splitlines() if ln.startswith("| C10")]
+    assert len(concl) == 2
+    assert all("不推进（方法阻塞）" in ln for ln in concl)
+    assert "推进 0 / 2" in text
+    # P2-11：行补可用/剔除列（旧运行无该键 → "—" 占位不误读）
+    assert "| 可用 |" in text and "| 剔除 |" in text
+    payload = json.loads(reports[0].with_suffix(".json")
+                         .read_text(encoding="utf-8"))
+    assert payload["method_approved"] is False
+    assert "method_status" in payload
+
+
 # ------------------------------------------------------------ P-10
 
 P10_ROUND = '''id = "R4"
@@ -1018,6 +1080,11 @@ def test_x01_midrun_concurrent_bypass_caught_by_reconciliation(p10_r4,
             _h_style_run(led, "race")
         return [{"hypothesis": h, "seed": i + 1, "prob_version": "1.0.0",
                  "n_triggers": 10, "n_trigger_days": 10,
+                 "n_total": 10, "n_usable": 10, "n_skipped": 0,
+                 "n_eligible_dropped": 0, "eligible_dropped_by_reason": {},
+                 "n_null_total": 10, "n_null_usable": 10,
+                 "n_null_skipped": 0, "n_null_trigger_days": 10,
+                 "n_null_eligible_dropped": 0,
                  "real_win_rate": 0.6, "null_win_rate": 0.5,
                  "delta_p": 0.1, "p_value": 0.01}
                 for i, h in enumerate(("S1:A1:follow>base",

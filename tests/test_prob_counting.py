@@ -58,7 +58,7 @@ def test_count_output_has_no_outcome_columns():
     bars = s1_bars()
     out = counting.count_triggers(bars, symbol="XAUUSD", situation="S1",
                                   approach=APPROACH, action_params=PARAMS,
-                                  grid_step=50.0)
+                                  grid_step=50.0, feature_warmup=0)
     assert len(out) >= 1
     forbidden = {"outcome", "net_r", "exit_reason", "entry_time", "exit_time"}
     assert forbidden.isdisjoint(set(out.columns))
@@ -91,7 +91,7 @@ def test_count_ny_hour_matches_time():
     bars = s1_bars()
     out = counting.count_triggers(bars, symbol="XAUUSD", situation="S1",
                                   approach=APPROACH, action_params=PARAMS,
-                                  grid_step=50.0)
+                                  grid_step=50.0, feature_warmup=0)
     for r in out.itertuples(index=False):
         expected = (pd.Timestamp(r.time).tz_localize("UTC")
                     .tz_convert("America/New_York").hour)
@@ -107,7 +107,8 @@ def test_count_s2_and_s3_dispatch():
                                 approach=APPROACH, action_params=PARAMS)
     for sit in ("S2", "S3"):
         out = counting.count_triggers(bars, symbol="XAUUSD", situation=sit,
-                                      approach=APPROACH, action_params=PARAMS)
+                                      approach=APPROACH, action_params=PARAMS,
+                                      feature_warmup=0)
         assert len(out) == 0        # 恒定价格无事件，空表也带 symbol 列
 
 
@@ -115,7 +116,7 @@ def test_triggers_before_filters_by_split():
     bars = s1_bars()
     out = counting.count_triggers(bars, symbol="XAUUSD", situation="S1",
                                   approach=APPROACH, action_params=PARAMS,
-                                  grid_step=50.0)
+                                  grid_step=50.0, feature_warmup=0)
     split = pd.Timestamp("2026-03-03")          # 序列从 03-02 起
     disc = counting.triggers_before(out, split)
     assert len(disc) < len(out)
@@ -127,20 +128,24 @@ def test_triggers_before_filters_by_split():
 # ------------------------------------------------- P-09 共同可用集合（T98）
 
 class TestCountTriggerEligibility:
-    """count_triggers 经 gaps.eligibility_mask 过滤（可选三元组：预热/
-    持有/洞宽；缺省不启用，行为不变）。"""
+    """count_triggers 经 gaps.eligibility_mask 过滤（三元组：预热/持有/
+    洞宽）。P2-03（T104）：feature_warmup 缺省与 P1 相同（2000 =
+    atr_pct_2000 排名窗）——消除计数与 P1 的口径差；显式 None/0 关闭
+    （合成小序列用）。"""
 
     def test_default_kwargs_keep_behavior(self):
+        """缺省三元组下只查回看窗抑制（预热 0 关闭）：洞在触发后、回看窗
+        不跨 → 全保留（与无洞计数一致）。"""
         bars = s1_bars_gap_after(30)
-        plain = _count(bars)
+        plain = _count(bars, feature_warmup=0)
         assert {26, 28} <= set(plain["bar"].astype(int))
-        # 只给 gap_spans（旧行为路径）：洞在触发后、回看窗不跨 → 全保留
         t = list(pd.to_datetime(bars["time"]))
-        assert _count(bars, gap_spans=[(t[30], t[31])]).equals(plain)
+        assert _count(bars, feature_warmup=0,
+                      gap_spans=[(t[30], t[31])]).equals(plain)
 
     def test_feature_warmup_drops_early_triggers(self):
         bars = s1_bars()
-        plain = _count(bars)
+        plain = _count(bars, feature_warmup=0)
         plain_bars = set(plain["bar"].astype(int))
         assert {26, 28, 29} <= plain_bars            # A3@26、A1@28、A4@29
         warm = _count(bars, feature_warmup=27)
@@ -155,3 +160,32 @@ class TestCountTriggerEligibility:
         kw = dict(gap_spans=[(t[30], t[31])], feature_warmup=0)
         assert set(_count(bars, hold_bars=3, **kw)["bar"].astype(int)) == {26}
         assert len(_count(bars, hold_bars=5, **kw)) == 0
+
+
+# ------------------------------------------------- P2-03（T104 模块甲）
+
+class TestCountDefaultsP203:
+    """P2-03：count_triggers 的 feature_warmup 缺省与 P1 相同（2000）——
+    计数与 P1 用同一资格口径（audit P2-03：缺省 None 造成计数虚高）。"""
+
+    def test_default_warmup_is_2000_like_p1(self):
+        """缺省（不传 feature_warmup）→ 预热 2000 生效：33 根合成序列的
+        触发全部不合格；≥2000 根后的触发保留。"""
+        bars = s1_bars()
+        assert len(_count(bars)) == 0                # 全在预热窗内
+        # 前缀补 2200 根平台 → 触发形态仍在尾部（bar 2226/2228 ≥ 2000）
+        tail = [(r.open, r.high, r.low, r.close)
+                for r in bars.drop(columns=["time"]).itertuples(index=False)]
+        long_bars = make_bars([PLAT] * 2200 + tail)
+        out = _count(long_bars)
+        got = sorted(zip(out["action"], out["bar"].astype(int)))
+        assert ("A3", 2226) in got and ("A1", 2228) in got
+        assert (out["bar"].astype(int) >= 2000).all()
+
+    def test_explicit_none_disables_warmup(self):
+        """显式 None/0 关闭预热检查（合成小序列/P1 同约定）。"""
+        bars = s1_bars()
+        none = _count(bars, feature_warmup=None)
+        zero = _count(bars, feature_warmup=0)
+        assert {26, 28} <= set(none["bar"].astype(int))
+        assert none.equals(zero)

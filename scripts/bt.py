@@ -131,8 +131,9 @@
   链式锚 + --verify 校验模式，R6/C5）。
 - 计算前占位与试验身份（X-01/X-05，2026-10-30 审核）：screen/gate/
   prob test 的主计算前 reserve_trial 占位（trial_key = 完整试验身份的
-  sha256，含 identity_version="v1"；P2 带冻结模型 hash、P1 带 evaluator
-  身份）；主检验开始 advance reached_primary，成功 completed、异常
+  sha256，含 identity_version——批 2 起为 "v2"：P2-01 获准白名单并入
+  模型身份；P2 带冻结模型 hash、P1 带 evaluator 身份）；主检验开始
+  advance reached_primary，成功 completed、异常
   failed（不回收 N）、未达主检验的取消 voided（释放名额）。旧轮次
   （无 reservation 且已有成功行）不走占位，T99 语义逐位不变——新旧
   口径以 round_trial_regime 显式标记并存；旧 ledger 的历史
@@ -284,7 +285,10 @@ def _allow_no_round(args) -> bool:
 # X-05（C-4）：试验身份版本字段——批 2 P2-01 把获准白名单并入身份时递增
 # 为 "v2"（避免二次迁移；旧 ledger 的历史 strategy_sha/N 不重算，新旧
 # 口径以 identity_version 显式标记并存）。
-TRIAL_IDENTITY_VERSION = "v1"
+# T104 批 2（丁-1，P2-01）：已递增——策略类的 ALLOWED_HYPOTHESES 获准
+# （局面×动作）白名单经模型 dict 的 allowed_hypotheses 键进冻结模型哈希
+# （X-05 的 model_sha256 extra），v2 显式标记这一身份口径界线。
+TRIAL_IDENTITY_VERSION = "v2"
 
 
 def _trial_key(*, strategy: str, params: dict, symbol: str, timeframe: str,
@@ -688,17 +692,17 @@ def _round_budget_exceeded(ledger, ctx) -> bool:
 _FROZEN_HYP_KEY = "__frozen_hypotheses__"
 
 
-def _d52_required(dp: float, n_tests: int) -> tuple[int | None, bool]:
-    """D52 样本量要求（T77 全轮口径）：解析 + T75 实测取严——与
-    candidates.precheck_prob 同一公式与常量，n_tests 换成全轮冻结条数。
-    返回 (n_required|None, open_ended)；None = 实测未覆盖（恒待数据）。"""
-    from mt5quant.research.candidates import measured_n_required
-    n_analytic = power.n_needed_proportion(
-        cand._PROB_BASE_RATE, dp, alpha=cand._POWER_ALPHA,
-        power=cand._POWER_MIN, n_tests=max(int(n_tests), 1))
-    n_meas, open_ended = measured_n_required(max(int(n_tests), 1), dp)
-    n_used = None if n_meas is None else max(int(n_analytic), n_meas)
-    return n_used, open_ended
+def _d52_required(dp: float, n_tests: int, days: int | None = None
+                  ) -> tuple[str, str, str]:
+    """D52 样本量证据（T104 批 2 / 丁-5，P2-08）：开轮复核的授权判定统一
+    走 candidates.sample_size_evidence（与 precheck_prob 同一口径与数值
+    锚点；n_hyp=全轮冻结条数）→ (decision, state, detail)。
+
+    语义（证据三分）：calibrated_sufficient（Δp≥0.03）days ≥ max(解析
+    D52, T75 实测) 授权 pass；lower_bound_only（0.02≤Δp<0.03）与
+    uncalibrated（Δp<0.02）恒 waiting_data——开区间档超记录下界**不再
+    授权 pass**（T100 重跑实测 34% 功率@4000 名义只证明未知门槛未达）。"""
+    return cand.sample_size_evidence(dp, days, n_hyp=max(int(n_tests), 1))
 
 
 def _prob_family_freeze(ledger, round_obj, *, candidates_dir: Path):
@@ -773,27 +777,34 @@ def _prob_family_freeze(ledger, round_obj, *, candidates_dir: Path):
         fam[cid] = keep
     # D52 全轮复核**一次**：N=冻结族总条数（预筛按候选自己的条数
     # Bonferroni，开轮按全轮总条数再算一遍）；不足者机械移除，
-    # 不递归减 N 重算（移除后 N 仍是本数）
+    # 不递归减 N 重算（移除后 N 仍是本数）。
+    # T104 批 2（丁-5/P2-08）：授权判定统一走 sample_size_evidence 的证据
+    # 三分（与 precheck_prob 同一口径）——开区间档（0.02≤Δp<0.03）超记录
+    # 下界不再授权 pass（恒 waiting_data→移除）；标定档（Δp≥0.03）按
+    # days ≥ max(解析, 实测) 判定
     total = sum(len(v) for v in fam.values())
     for cid in prob_cands:
-        n_used, open_ended = _d52_required(dp_by_cid[cid], total)
         keep = []
         for h in fam[cid]:
             days = int((per_by_cid[cid].get(h) or {})
                        .get("trigger_days") or 0)
-            ok = (False if n_used is None
-                  else days > n_used if open_ended else days >= n_used)
-            if ok:
+            decision, _state, detail = _d52_required(
+                dp_by_cid[cid], total, days)
+            if decision == "pass":
                 keep.append(h)
             else:
                 dropped.setdefault(cid, {})[h] = (
                     f"全轮 D52 复核不足（trigger_days={days}，按全轮 "
-                    f"{total} 条 Bonferroni 的要求 "
-                    f"{'>' if open_ended else '≥'} {n_used}）——机械移除，"
-                    "不递归减 N（T77 全轮口径）")
+                    f"{total} 条 Bonferroni 的证据三分：{detail}）——"
+                    "机械移除，不递归减 N（T77 全轮口径；P2-08 授权口径="
+                    "sample_size_evidence）")
         fam[cid] = keep
     for cid in prob_cands:
         if not fam[cid]:
+            # 拒绝开启时也把逐条原因打全（可复核——成功路径的移除清单
+            # 在 cmd_round_open 尾部打印，拒绝路径此前只有假设名列表）
+            for h, why in (dropped.get(cid) or {}).items():
+                print(f"✗ 移除 {cid} {h}——{why}")
             print(f"✗ 候选 {cid} 冻结族为空——{sorted(dropped.get(cid, {}))}"
                   " 全部在开轮复核中被移除，本轮对该候选无可检验假设；"
                   "拒绝开启（不得开空轮；补数据后重新预筛入新轮）")
@@ -1890,27 +1901,33 @@ def _prob_use_merged(prob_conf) -> bool:
 
 def _prob_load_bars(data_root, sym, tf, *, use_merged: bool, end=None,
                     allow_unbounded: bool = False):
-    """概率分支的序列装载（T97 波次 2）：use_merged → merged_research_series
-    四元组，返回 (bars, gap_spans|None)；否则原 load_series（gap_spans=None，
-    与 T97 之前逐位一致）。空序列与 load_series 同语义 fail-fast。
+    """概率分支的序列装载（T97 波次 2 + T104 批 2 P2-04）：use_merged →
+    merged_research_series 四元组，返回 (bars, source_tags|None,
+    gap_spans|None)；否则原 load_series（tags/gaps 均 None，与 T97 之前
+    逐位一致）。空序列与 load_series 同语义 fail-fast。
 
     T98/P-01：merged 路径不再丢弃 end——end 传给 merged_research_series，
     与全局锁箱 cutoff / ext manifest research_cutoff / 导出 source_cutoff /
     MT5 水位一起取最严（end 比其他界晚则被支配，绝不读出锁箱段；口径见
     mt5data.ext.merge）。
 
+    P2-04（丁-4）：source_tags（与 bars 等长的逐行来源标签）一并返回——
+    供 precheck_prob 的 era 逐行消费（ext 段触发点差 × 情景档；来源不可得
+    → 拒绝该品种成本判定，fail-closed）与后续按行对齐的复核；空表归一
+    None。
+
     X-03：allow_unbounded 透传两条装载路径（--allow-unbounded-data 的
     显式合成夹具/迁移通道；缺省 False——裸库读拒绝）。"""
     if not use_merged:
-        return load_series(data_root, sym, tf, end,
-                           allow_unbounded=allow_unbounded), None
+        return (load_series(data_root, sym, tf, end,
+                            allow_unbounded=allow_unbounded), None, None)
     from mt5data.ext.merge import merged_research_series
-    bars, _tags, gap_spans, _bad = merged_research_series(
+    bars, tags, gap_spans, _bad = merged_research_series(
         data_root, sym, tf, end=end, allow_unbounded=allow_unbounded)
     if bars is None or len(bars) == 0:
         raise ValueError(f"无可用数据：{sym} {tf}（合并研究序列为空——"
                          "检查研究库 bars/ 与 ext/ 数据）")
-    return bars, (gap_spans or None)
+    return bars, (list(tags) if tags else None), (gap_spans or None)
 
 
 def _candidate_check_prob(args, candidate, data_root, costs, active):
@@ -1919,8 +1936,15 @@ def _candidate_check_prob(args, candidate, data_root, costs, active):
 
     T97 波次 2：候选带 [prob] 新键（max_gap_days 等）时改用
     merged_research_series 取数并按 gap_spans 抑制跨洞触发；era 判定
-    （ext 触发 = 时刻 < bars meta first_time）在 precheck_prob 内部读取。"""
+    （ext 触发 = 时刻 < bars meta first_time）在 precheck_prob 内部读取。
+
+    T104 批 2（丁-3/P2-03 + 丁-4/P2-04）：计数显式传 feature_warmup
+    （=gaps.FEATURE_WARMUP_BARS，与 P1 缺省同口径——甲已把 count_triggers
+    缺省对齐 2000，此处显式声明口径）与 hold_bars=卡 bracket 的 K
+    （预筛与 P1 的资格判定同一 K）；merged 路径的 source_tags /
+    gap_spans 逐品种传 precheck_prob（era 逐行消费 + 来源/洞口径随行登记）。"""
     from mt5quant.prob import counting as prob_counting
+    from mt5quant.prob.gaps import FEATURE_WARMUP_BARS
     from mt5quant.strategies.library.prob.actions import ActionParams
     from mt5quant.strategies.library.prob.situations import Approach
 
@@ -1940,19 +1964,34 @@ def _candidate_check_prob(args, candidate, data_root, costs, active):
                            retest_window_bars=pdecl.retest_window_bars)
     use_merged = _prob_use_merged(pdecl)
     parts = []
+    source_tags_by_symbol: dict[str, list | None] = {}
+    gap_spans_by_symbol: dict[str, list | None] = {}
     for sym in candidate.symbols:
-        bars, gap_spans = _prob_load_bars(data_root, sym, candidate.holding,
-                                          use_merged=use_merged, end=None)
+        bars, tags, gap_spans = _prob_load_bars(
+            data_root, sym, candidate.holding, use_merged=use_merged, end=None)
+        source_tags_by_symbol[sym] = tags
+        gap_spans_by_symbol[sym] = gap_spans
         for sit in pdecl.situations:
             grid = pdecl.level_grid.get(sym) if sit == "S1" else None
             parts.append(prob_counting.count_triggers(
                 bars, symbol=sym, situation=sit, approach=approach,
                 action_params=aparams, grid_step=grid,
-                gap_spans=gap_spans))
+                gap_spans=gap_spans,
+                # 丁-3：预筛与 P1 同一资格口径（显式声明；K=卡 bracket）
+                feature_warmup=FEATURE_WARMUP_BARS,
+                hold_bars=int(pdecl.bracket["horizon_bars"])))
     nonempty = [p for p in parts if len(p)]
     counted = pd.concat(nonempty, ignore_index=True) if nonempty else None
     disc = (None if counted is None
             else prob_counting.triggers_before(counted, split))
+    # 丁-4：只在 merged 路径传来源标签/洞集合——不带新键的候选（原
+    # load_series 路径）行为逐位不变（T97 探针兼容硬约束）
+    if use_merged:
+        return cand.precheck_prob(
+            candidate, data_root=data_root, cost_model=costs, counted=disc,
+            split=split, active_mechanisms=active,
+            source_tags_by_symbol=source_tags_by_symbol,
+            gap_spans_by_symbol=gap_spans_by_symbol)
     return cand.precheck_prob(candidate, data_root=data_root,
                               cost_model=costs, counted=disc, split=split,
                               active_mechanisms=active)
@@ -2202,12 +2241,16 @@ class _FittedFactory:
 
 
 def _check_card_strategy_constants(card, strategy_cls) -> str | None:
-    """审核三 D1 + P-07 bt 侧（T98）：卡的 [prob] 与策略类常量逐项核对
-    ——不一致返回错误信息。先核对品种/周期（SYMBOLS/TIMEFRAME/
-    required_data.timeframe——网格与标签折算都按它们绑定，卡上写别的
-    组合就是检验配置脱节），再核对检验配置（bracket/situations/
-    level_grid/approach/breakout_atr/retest 及决策字段）。防止卡上登记
-    的检验配置与实际运行的策略配置脱节。"""
+    """审核三 D1 + P-07 bt 侧（T98）+ P2-01 bt 侧（T104 批 2 丁-1）：
+    卡的 [prob] 与策略类常量逐项核对——不一致返回错误信息。先核对品种/
+    周期（SYMBOLS/TIMEFRAME/required_data.timeframe——网格与标签折算都
+    按它们绑定，卡上写别的组合就是检验配置脱节），再核对检验配置
+    （bracket/situations/level_grid/approach/breakout_atr/retest 及决策
+    字段），最后两增核（P2-01）：卡假设（局面×动作对）⊆ 策略类
+    ALLOWED_HYPOTHESES 获准集合（白名单非空时）；策略**实例真实**
+    exit_rules 与标签 bracket 推导值一致（甲的实例级核验入口——类常量
+    一致而实例被覆写也拦）。防止卡上登记的检验配置与实际运行的策略
+    配置脱节。"""
     prob = card.prob
     if prob is None:
         return None
@@ -2291,6 +2334,47 @@ def _check_card_strategy_constants(card, strategy_cls) -> str | None:
         return (f"卡 [prob].entry_threshold_cost_mult={tm!r} 与策略类 "
                 f"POLICY.threshold_mult={pol.threshold_mult!r} 不一致——"
                 "拒绝运行")
+    # ---- P2-01 增核 1（丁-1）：卡假设 ⊆ 策略类获准（局面×动作）集合。
+    # 白名单非空时，集合外的假设不得上卡（fit/with_model/generate_signals
+    # 三处过滤会静默丢弃它们——卡上登记的检验与实际检验的假设族脱节；
+    # 探针 whitelist 的形态之一）。空白名单 = 全部兼容（缺省，不核对）。
+    from mt5quant.strategies.library.prob.level_decision import (
+        _allowed_in, _parse_allowed_entries, parse_hypothesis_pairs,
+    )
+    allowed_entries = tuple(getattr(strategy_cls, "ALLOWED_HYPOTHESES",
+                                    ()) or ())
+    if allowed_entries:
+        try:
+            card_pairs = parse_hypothesis_pairs(
+                prob.get("hypotheses") or ())
+        except ValueError as e:
+            return (f"卡 [prob].hypotheses 解析失败：{e}——P2-01 假设条目"
+                    "须为 'S:A:…'（局面×动作）形式，解析失败即拒绝")
+        cls_allowed = _parse_allowed_entries(allowed_entries)
+        outside = sorted(f"{s}:{a}" for s, a in card_pairs
+                         if not _allowed_in(cls_allowed, s, a))
+        if outside:
+            return (f"卡 [prob].hypotheses 含未获准（局面×动作）对 "
+                    f"{outside}——策略类 ALLOWED_HYPOTHESES="
+                    f"{list(allowed_entries)} 之外的假设不得上卡（P2-01："
+                    "fit/模型/决策三处同一获准集合过滤，卡上登记集合外的"
+                    "假设会被静默丢弃，检验配置脱节），拒绝运行")
+    # ---- P2-01 增核 2（丁-1）：实例真实 exit_rules 与标签 bracket 一致。
+    # 甲的实例级核验入口（_check_exit_rules_consistency：实例覆写优先于
+    # 类——运行期 instance.exit_rules=… 的篡改也拦）。构造实例失败的
+    # 工厂/包装类跳过（引擎侧 generate_signals 内还有同一检查兜底）。
+    inst = None
+    try:
+        inst = strategy_cls()
+    except Exception:
+        inst = None
+    check_exit = getattr(inst, "_check_exit_rules_consistency", None)
+    if callable(check_exit):
+        try:
+            check_exit()
+        except ValueError as e:
+            return (f"{e}（P2-01 bt 侧常量核：卡 {getattr(card, 'id', '?')} "
+                    "绑定的策略实例出场规则与标签 bracket 脱节，拒绝运行）")
     return None
 
 
@@ -2316,9 +2400,11 @@ def _slice_validation_eval(card, round_obj, bars_by_sym, *,
       分界前不足 lookback 根时取全部可用；
     - 返回**新字典**（训练窗已在拟合上下文里取 < split——调用顺序必须
       先拟合、后切评估窗）；
-    - 分界之前的信号由 _ZeroedBeforeSplit 门做 run 级归零（见下），
-      预热段只建立特征、不建立交易状态，指标里的交易全部从分界起算
-      （run 级归零后分界前不可能开仓——引擎无需过滤）。
+    - 分界之前的信号由 _ZeroedBeforeSplit 门处理（P2-02 起优先走策略
+      决策起点原语，见下），预热段只建立特征、不建立交易状态，指标里的
+      交易全部从分界起算（分界前不可能开仓——引擎无需过滤）；summary
+      的时间序列指标经 _OosSlicedResult 从 split 起切取（预热零收益不进
+      统计）。
     """
     if card.segment != "validation":
         return bars_by_sym
@@ -2337,13 +2423,23 @@ def _slice_validation_eval(card, round_obj, bars_by_sym, *,
 
 
 class _ZeroedBeforeSplit:
-    """评估门（审核四 E1 + P-08 run 级归零）：对 inner.generate_signals
-    的输出识别**连续非零信号段**（目标仓位 run）——凡 run 起点（入场
-    触发 bar）在 split 前的整段置 0（含 split 后的持有尾巴；原实现只按
-    时刻掩码，split 前触发的持仓会以 split 当根信号=1 延续成"新"入场）；
-    split 后新触发的 run 不受影响。策略在预热 bar 上照常计算特征（有界
-    窗口历史），但分界前不建立任何交易状态；段内翻向（+1→−1 不归零）属
-    同一连续非零段，起点在 split 前则整段归零。纯函数、截断一致。"""
+    """评估门（审核四 E1 + P-08 + T104 批 2 P2-02）：validation 段的分界门。
+
+    P2-02（丁-2）起**优先走策略原生的决策起点原语**（甲的
+    with_decision_start / generate_signals(decision_start=…)）：起点前只算
+    特征/局面识别、不建任何交易状态，split 后从**空状态**处理新触发——
+    训练段触发的持有不再经持有尾巴压掉验证段首根合法新触发（探针
+    boundary_state 复现的旧缺陷：输出掩码会把"split 前触发+split 后仍在
+    持有"整段抹掉，而"split 后首根的新触发"不受影响，但旧实现没有
+    状态机，训练段 held_until 直接压掉验证段首触发）。输出侧保留兜底
+    断言：split 前出现任何非零信号 → ValueError（决策起点语义被破坏时
+    硬拒，不让预热段虚拟持仓漏进评估）。
+
+    无该原语的策略（非 level_decision 策略/测试桩）：回退 P-08 的
+    run 级输出掩码——识别 inner 输出的**连续非零信号段**（目标仓位
+    run），凡 run 起点（入场触发 bar）在 split 前的整段置 0（含 split
+    后的持有尾巴）；段内翻向（+1→−1 不归零）属同一连续非零段。纯函数、
+    截断一致。"""
 
     def __init__(self, inner, split):
         self._inner = inner
@@ -2351,6 +2447,22 @@ class _ZeroedBeforeSplit:
         self.fittable = False
 
     def generate_signals(self, bars, params):
+        # P2-02：决策起点原语优先（状态在策略内不建，而不是事后抹输出）
+        ws = getattr(self._inner, "with_decision_start", None)
+        if callable(ws):
+            primed = self._inner.with_decision_start(self._split)
+            sig = primed.generate_signals(bars, params)
+            times = pd.to_datetime(bars["time"])
+            pre = (times < self._split).to_numpy()
+            if pre.any():
+                vals = sig.to_numpy()
+                if (vals != 0)[pre].any():
+                    raise ValueError(
+                        "决策起点语义被破坏：split（"
+                        f"{self._split}）前出现非零信号（P2-02：起点前"
+                        "只算特征/局面识别、不建任何交易状态——预热段的"
+                        "虚拟持仓不得漏进验证段评估），拒绝运行")
+            return sig
         sig = self._inner.generate_signals(bars, params)
         times = pd.to_datetime(bars["time"])
         pre = (times < self._split).to_numpy()
@@ -2386,6 +2498,38 @@ class _ZeroedBeforeSplit:
     @property
     def required_data(self):
         return self._inner.required_data
+
+
+class _OosSlicedResult:
+    """P2-02（丁-2）：评估 summary 的 OOS 起点切取视图（**不改引擎**）。
+
+    summarize(result) 的时间序列指标（return/sharpe/sortino/max_drawdown/
+    time_in_market/年化口径）都从 bars/equity 全窗算——validation 卡的评估
+    窗含 lookback 根预热（决策起点保证预热段零收益、权益平直），全窗口径
+    会把预热零收益摊进波动率/分母（sharpe 被稀释、time_in_market 被低估）。
+    本视图把 bars/equity 从 split 位置起切、trades 只留 split 后入场的
+    （兜底：决策起点下本来不可能有 split 前入场），起点资金基准 = split
+    当根权益（= 初始资金，预热段无交易）。trades/params 等其余字段透传。
+    """
+
+    def __init__(self, result, split):
+        ts = pd.Timestamp(split)
+        times = pd.to_datetime(result.bars["time"])
+        pos = int(times.searchsorted(ts, side="left"))
+        self.bars = result.bars.iloc[pos:].reset_index(drop=True)
+        self.equity = result.equity.iloc[pos:].reset_index(drop=True)
+        trades = result.trades
+        if len(trades):
+            trades = trades[
+                pd.to_datetime(trades["entry_time"]) >= ts]
+        self.trades = trades.reset_index(drop=True)
+        for k in ("params", "symbol", "timeframe", "contract_size",
+                  "volume_lots", "initial_capital"):
+            setattr(self, k, getattr(result, k, None))
+        self.ruined = bool(getattr(result, "ruined", False))
+        self.ruined_at = getattr(result, "ruined_at", None)
+        self.skipped_zero_lots = int(getattr(result, "skipped_zero_lots",
+                                             0) or 0)
 
 
 class _GatedFactory:
@@ -2661,7 +2805,10 @@ def cmd_prob_test(args) -> int:
             if use_merged:
                 from mt5quant.prob.gaps import mt5_first_time
             for sym in card.symbols:
-                bars_full, gap_spans = _prob_load_bars(
+                # 丁-4：三元组返回（source_tags 暂不消费——P1 的 era 边界
+                # 仍按 P-09 口径经 gaps.mt5_first_time（meta 路径）取，批 3
+                # 统一改 merge 实测后并入）
+                bars_full, _source_tags, gap_spans = _prob_load_bars(
                     data_root, sym, card.timeframe, use_merged=use_merged,
                     end=args.end, allow_unbounded=_allow_unbounded(args))
                 bars_full_by_sym[sym] = bars_full
@@ -2809,9 +2956,27 @@ def cmd_prob_test(args) -> int:
             params = {"hypothesis": r["hypothesis"],
                       "prob": {**prob_ident, "seed": r["seed"],
                                "prob_version": r["prob_version"]}}
+            # P2-11（丁-7）：诊断入账——n_total/n_usable/n_skipped、进入
+            # 标签前的资格剔除（逐原因）与 null 侧同口径计数（乙的
+            # run_p1_card 已产出，此处随 metrics.prob 落台账；轮次报告的
+            # 可用/剔除列读侧消费）
             metrics = {"prob": {"prob_version": r["prob_version"],
                                 "n_triggers": r["n_triggers"],
                                 "n_trigger_days": r["n_trigger_days"],
+                                "n_total": r["n_total"],
+                                "n_usable": r["n_usable"],
+                                "n_skipped": r["n_skipped"],
+                                "n_eligible_dropped":
+                                    r["n_eligible_dropped"],
+                                "eligible_dropped_by_reason":
+                                    r["eligible_dropped_by_reason"],
+                                "n_null_total": r["n_null_total"],
+                                "n_null_usable": r["n_null_usable"],
+                                "n_null_skipped": r["n_null_skipped"],
+                                "n_null_trigger_days":
+                                    r["n_null_trigger_days"],
+                                "n_null_eligible_dropped":
+                                    r["n_null_eligible_dropped"],
                                 "real_win_rate": r["real_win_rate"],
                                 "null_win_rate": r["null_win_rate"],
                                 "delta_p": r["delta_p"],
@@ -2886,7 +3051,13 @@ def cmd_prob_round_report(args) -> int:
     旧轮等价回退磁盘 [hypotheses]；磁盘轮次文件与开轮 toml_sha256 不
     一致 → 拒（开轮后删失败假设缩小 Holm 族会被发现）；冻结族外有成功
     运行 → 拒；成本只认开轮前入账的台账预筛行——**不再回退磁盘
-    precheck.json**（开轮后可被重写，不作数）。"""
+    precheck.json**（开轮后可被重写，不作数）。
+
+    T104 批 2：P2-09 方法批准门（丁-6）——主检验方法未获批（月内置换
+    在 v2/v3 成簇负对照失败）时报告照常生成（诊断），但标注"方法未批准
+    ——本报告不构成推进依据"、结论列一律"不推进（方法阻塞）"（exit code
+    不变）；P2-11（丁-7）行补可用/剔除列（metrics.prob 的 n_usable /
+    n_eligible_dropped 诊断入账的读侧，旧运行无键 → "—"）。"""
     try:
         data_root, _store_kind = _resolve_store(args)
     except ValueError as e:
@@ -2899,7 +3070,11 @@ def cmd_prob_round_report(args) -> int:
         print(f"✗ {e}")
         return 1
     ledger_path = _ledger_default(args)
-    from mt5quant.validation.prob_mode import holm
+    # P2-09（丁-6）：方法批准门——主检验方法（月内置换）在 v2/v3 成簇
+    # 负对照失败、未获批准：运行/报告照常（诊断），但推进结论一律阻塞
+    # 并显式标注"本报告不构成推进依据"（exit code 不变）
+    from mt5quant.validation.prob_mode import holm, primary_method_approved
+    method_approved, method_reason = primary_method_approved()
     with Ledger(ledger_path) as ledger:
         round_row = ledger.round(round_obj.id)
         if round_row is None:
@@ -3005,9 +3180,16 @@ def cmd_prob_round_report(args) -> int:
                 edge = delta * (tp_r + 1.0)
                 cost_ok = edge >= 3.0 * cost_r
                 pvals[key] = p_raw
+                # P2-11（丁-7）：可用/剔除列——n_usable（可成交行数）与
+                # n_eligible_dropped（进入标签前的资格剔除）；旧运行无该
+                # 键 → None（报告列示 "—"）
                 rows.append({"candidate": cid, "hypothesis": h,
                              "p_value": p_raw, "delta_p": delta,
                              "n_trigger_days": m.get("n_trigger_days"),
+                             "n_usable": m.get("n_usable"),
+                             "n_eligible_dropped": m.get("n_eligible_dropped"),
+                             "eligible_dropped_by_reason":
+                                 m.get("eligible_dropped_by_reason"),
                              "cost_r": cost_r, "edge_ev_r": edge,
                              "cost_ok": cost_ok})
         adjusted = holm(pvals)
@@ -3020,34 +3202,55 @@ def cmd_prob_round_report(args) -> int:
                  "状态：待审核", "",
                  "推进规则（预写，轮次文件 advance_rule）：Holm 校正后 "
                  "p < 0.05 **且** ΔEV = Δp̂×(tp_R+1) ≥ 3×预筛成本"
-                 "（成本取候选预筛 cost_r_by_symbol 最大值）。", "",
-                 "| 候选 | 假设 | 触发日数 | Δp | 原始 p | Holm p | Holm 显著 |"
-                 " ΔEV(R) | 3×成本(R) | 成本条件 | 结论 |",
-                 "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+                 "（成本取候选预筛 cost_r_by_symbol 最大值）。", ""]
+        if not method_approved:
+            lines += ["⚠ 方法未批准（成簇负对照失败）——本报告不构成推进依据"
+                      f"（P2-09：{method_reason}；运行/报告仅作诊断，推进结论"
+                      "一律阻塞，待新方法完整标定并获批后解除）。", ""]
+        lines += ["| 候选 | 假设 | 触发日数 | 可用 | 剔除 | Δp | 原始 p |"
+                  " Holm p | Holm 显著 | ΔEV(R) | 3×成本(R) | 成本条件 | 结论 |",
+                  "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+                  " --- | --- | --- | --- |"]
+
+        def _num(v):
+            return "—" if v is None else str(int(v))
+
         verdicts = []
         for r in rows:
             key = f"{r['candidate']}:{r['hypothesis']}"
             adj = adjusted[key]
             holm_ok = adj < 0.05
             advance = holm_ok and r["cost_ok"]
-            concl = "推进" if advance else "不推进"
+            # P2-09：方法未批准 → 结论一律"不推进（方法阻塞）"（统计与
+            # 成本列照常给出供诊断；exit code 不变）
+            if advance and not method_approved:
+                advance = False
+            concl = ("推进" if advance else
+                     "不推进（方法阻塞）" if not method_approved else "不推进")
             verdicts.append(advance)
             lines.append(
                 f"| {r['candidate']} | {r['hypothesis']} | "
-                f"{r['n_trigger_days']} | {r['delta_p']:+.4f} | "
+                f"{_num(r['n_trigger_days'])} | {_num(r['n_usable'])} | "
+                f"{_num(r['n_eligible_dropped'])} | {r['delta_p']:+.4f} | "
                 f"{r['p_value']:.4f} | {adj:.4f} | {'✓' if holm_ok else '✗'} | "
                 f"{r['edge_ev_r']:+.4f} | {3 * r['cost_r']:.4f} | "
                 f"{'✓' if r['cost_ok'] else '✗'} | {concl} |")
-        lines += ["", f"推进 {sum(verdicts)} / {len(verdicts)} 条假设。",
+        lines += ["", f"推进 {sum(verdicts)} / {len(verdicts)} 条假设。"
+                  + ("（方法未批准——推进被阻塞，见上方标注）"
+                     if not method_approved else ""),
                   "", "（本报告由 bt prob round-report 生成；方法变更与对照"
                   "见 T75 标定报告。）"]
         md.write_text("\n".join(lines) + "\n", encoding="utf-8")
         js.write_text(json.dumps({"round": round_obj.id,
                                   "status": "待审核",
+                                  "method_approved": method_approved,
+                                  "method_status": method_reason,
                                   "rows": rows, "holm": adjusted},
                                  ensure_ascii=False, indent=2),
                       encoding="utf-8")
-        print(f"✓ 报告：{md}（同 JSON）——交 P 线审核会话")
+        print(f"✓ 报告：{md}（同 JSON）——交 P 线审核会话"
+              + ("（⚠ 方法未批准——本报告不构成推进依据，P2-09）"
+                 if not method_approved else ""))
         return 0
 
 
@@ -3325,6 +3528,34 @@ def cmd_screen(args) -> int:
             if _cs_msg:
                 print(f"✗ {_cs_msg}")
                 return 1
+            # ---- 批 1 复审 B2（简易版，丁-8）：fittable 卡的**首个组合**
+            # 占位前移到拟合之前——拟合本身是计算（预算满的轮次不应白付）。
+            # trial_key 用**拟合输入身份**（此刻模型 hash 未知：strategy+
+            # 首组合 params+首品种+周期+全量 bars sha+成本版本+策略指纹，
+            # extra=None——同一输入确定性重拟合出同一模型，身份成立）；
+            # 拟合后的组合循环里首组合沿用该键（不重复占位、不双计），
+            # 其余组合仍按带 model_sha256 的完整身份占位。
+            _pre_fit_key = None
+            _pre_fit_sym = None
+            _pre_fit_params = None
+            if resv is not None and getattr(strategy_cls, "fittable", False):
+                _combos_pre = card.param_grid()
+                if _combos_pre:
+                    _pre_fit_sym = card.symbols[0]
+                    _pre_fit_params = _combos_pre[0]
+                    _pre_fit_key = _trial_key(
+                        strategy=args.strategy, params=_pre_fit_params,
+                        symbol=_pre_fit_sym, timeframe=card.timeframe,
+                        data_sha256=data_sha256(bars_by_sym[_pre_fit_sym]),
+                        cost_model_version=cost_version_by_sym[_pre_fit_sym],
+                        strategy_sha=strategy_sha)
+                    try:
+                        resv.reserve(_pre_fit_key)
+                    except TrialBudgetExceededError as e:
+                        print(f"✗ 首组合计算前占位被拒（拟合之前）：{e}"
+                              "——不执行任何拟合/回测计算，不写任何行"
+                              "（X-01 + 批 1 复审 B2：占位前移到拟合前）")
+                        return 1
             # 审核四 E1：先拟合（训练窗 < split，用**全量** bars），再切
             # 评估窗（含预热）——顺序反了会让训练窗变空
             fit_ctx = None
@@ -3344,6 +3575,7 @@ def cmd_screen(args) -> int:
                 strategy_cls = _FittedFactory(strategy_cls, fit_ctx["model"])
                 print(f"— 概率卡拟合：模型 {fit_ctx['model_sha'][:12]}… -> "
                       f"{fit_ctx['model_path']}")
+            _oos_split = None      # P2-02：非空 = summary 按 OOS 起点切取
             if getattr(card, "segment", "") == "validation":
                 rnd_path = Path(card.path).parent.parent / "rounds" / \
                     f"{card.round}.toml"
@@ -3356,8 +3588,10 @@ def cmd_screen(args) -> int:
                     lookback_bars=lookback)
                 split_v = round_obj_v.segments["split"]
                 strategy_cls = _GatedFactory(strategy_cls, split_v)
+                _oos_split = pd.Timestamp(split_v)
                 print(f"— validation 评估窗：分界 {split_v} 前留 "
-                      f"{lookback} 根预热，分界前信号为 0")
+                      f"{lookback} 根预热，分界前不决策（决策起点），"
+                      "summary 自分界起算（P2-02）")
         except Exception as e:
             print(f"✗ 装配失败（未开跑，无 runs 记录）：{type(e).__name__}: {e}")
             return 1
@@ -3392,23 +3626,31 @@ def cmd_screen(args) -> int:
                 # X-01：reservation 口径——组合回测**之前**占位（预算拒绝
                 # 发生在计算之前，零回测调用）+ advance reached_primary；
                 # 同 trial_key 幂等（screen→gate 同身份不被自己堵死）。
+                # B2（批 1 复审）：fittable 卡的**首个组合**已在拟合前用
+                # 拟合输入身份占位——此处沿用该键（不重复占位、不双计）。
                 _tk = None
+                _tk_pre = (_pre_fit_key is not None and sym == _pre_fit_sym
+                           and params == _pre_fit_params)
                 if resv is not None:
-                    _tk = _trial_key(
-                        strategy=args.strategy,
-                        params=_prob_run_fields(fit_ctx, params, None)[0],
-                        symbol=sym, timeframe=card.timeframe,
-                        data_sha256=dsha, cost_model_version=cost_version,
-                        strategy_sha=strategy_sha,
-                        extra=({"model_sha256": fit_ctx["model_sha"]}
-                               if fit_ctx is not None else None))
-                    try:
-                        resv.reserve(_tk)
-                    except TrialBudgetExceededError as e:
-                        failed += 1
-                        print(f"✗ {label} -> {e}——组合被拒（计算前占位，"
-                              "不执行也不记 runs）")
-                        continue
+                    if _tk_pre:
+                        _tk = _pre_fit_key
+                        _pre_fit_key = None     # 只消费一次
+                    else:
+                        _tk = _trial_key(
+                            strategy=args.strategy,
+                            params=_prob_run_fields(fit_ctx, params, None)[0],
+                            symbol=sym, timeframe=card.timeframe,
+                            data_sha256=dsha, cost_model_version=cost_version,
+                            strategy_sha=strategy_sha,
+                            extra=({"model_sha256": fit_ctx["model_sha"]}
+                                   if fit_ctx is not None else None))
+                        try:
+                            resv.reserve(_tk)
+                        except TrialBudgetExceededError as e:
+                            failed += 1
+                            print(f"✗ {label} -> {e}——组合被拒（计算前占位，"
+                                  "不执行也不记 runs）")
+                            continue
                     resv.advance(_tk, "reached_primary")
                 elif (round_ctx is not None
                         and ledger.round_n_dedup(round_ctx["round_id"])
@@ -3441,7 +3683,22 @@ def cmd_screen(args) -> int:
                             initial_capital=args.initial_capital,
                             timeframe=card.timeframe,
                             session_policy=policy_by_sym[sym])
-                    summary = summarize(result, cost_version=cost_version)
+                    # P2-02（丁-2）：P2 卡（validation 段）的评估 summary 以
+                    # OOS 起点切取——预热零收益不进统计（收益/时间序列从
+                    # split 起算、起点资金基准 = split 当根权益）；eval_window
+                    # 随 metrics 落台账供复核。H 卡/非 validation 不变。
+                    if _oos_split is not None:
+                        summary = summarize(
+                            _OosSlicedResult(result, _oos_split),
+                            cost_version=cost_version)
+                        summary["eval_window"] = {
+                            "start": str(_oos_split),
+                            "warmup_excluded": True,
+                            "note": "P2-02：OOS 起点切取——预热段零收益不进"
+                                    " 统计，收益/时间序列自分界起算，起点"
+                                    "资金基准 = 分界当根权益（= 初始资金）"}
+                    else:
+                        summary = summarize(result, cost_version=cost_version)
                     summary["sizing"] = dict(   # T23：定手数方式随 metrics 落台账
                         sizing_info,
                         vol_min=vols_by_sym[sym][0] if vols_by_sym else None,
@@ -3467,6 +3724,18 @@ def cmd_screen(args) -> int:
                           f"净利 {summary['net_profit']:.2f} "
                           f"交易 {summary['trade_count']} 笔"
                           + (f"（零手数跳过 {skipped}）" if skipped else ""))
+                except TrialReservationConsistencyError as e:
+                    # 批 1 复审 B3（丁-8）：X-01 对账后盾在 screen 的专用
+                    # 出口（与 gate/prob test 一致）——本轮成功行去重数超
+                    # 上限 = 存在绕过 reserve_trial 的成功行（或双口径并用），
+                    # 事务已整体回滚：如实报错退 1，不落 error 行（绕过占位
+                    # 的写入不该再留痕）、不把对账异常混进"失败组合"口径。
+                    failed += 1
+                    print(f"✗ {label} -> 结果入账被拒（X-01 对账失败）：{e}"
+                          "——存在绕过 reserve_trial 的成功行（或 H/P 双口径"
+                          "并用），本次写入已整体回滚")
+                    _budget_voided = True
+                    break
                 except RoundTrialBudgetExceededError as e:
                     # P-10（旧口径轮）：预检之后预算被并发占满——该组合作废
                     # 记 error 行（不占预算），剩余组合不再白算（双层循环退出）
@@ -3772,6 +4041,7 @@ def cmd_gate(args) -> int:
             strategy = strategy.with_model(fit_ctx["model"])
             print(f"— 概率卡拟合：模型 {fit_ctx['model_sha'][:12]}… -> "
                   f"{fit_ctx['model_path']}")
+        _oos_split = None        # P2-02（丁-2）：非空 = 基准 summary 按 OOS 切取
         if getattr(card, "segment", "") == "validation":
             rnd_path = Path(card.path).parent.parent / "rounds" /                 f"{card.round}.toml"
             round_obj_v = rnd.load_round(rnd_path)
@@ -3782,8 +4052,9 @@ def cmd_gate(args) -> int:
                 card, round_obj_v, bars_by_sym, lookback_bars=lookback)
             strategy = _ZeroedBeforeSplit(
                 strategy, round_obj_v.segments["split"])
+            _oos_split = pd.Timestamp(round_obj_v.segments["split"])
             print(f"— validation 评估窗：分界前留 {lookback} 根预热，"
-                  "分界前信号为 0")
+                  "分界前不决策（决策起点），summary 自分界起算（P2-02）")
 
         symbol = card.symbols[0]
         bars = bars_by_sym[symbol]
@@ -3863,7 +4134,18 @@ def cmd_gate(args) -> int:
             else:
                 base_kwargs["volume_lots"] = lots
             base = run_backtest(strategy, bars, costs, **base_kwargs)
-            summary = summarize(base, cost_version=cost_version)
+            # P2-02（丁-2）：P2 卡（validation 段）的基准 summary 以 OOS
+            # 起点切取（与 screen 同一口径——预热零收益不进统计）
+            if _oos_split is not None:
+                summary = summarize(_OosSlicedResult(base, _oos_split),
+                                    cost_version=cost_version)
+                summary["eval_window"] = {
+                    "start": str(_oos_split), "warmup_excluded": True,
+                    "note": "P2-02：OOS 起点切取——预热段零收益不进统计，"
+                            "收益/时间序列自分界起算，起点资金基准 = 分界"
+                            "当根权益（= 初始资金）"}
+            else:
+                summary = summarize(base, cost_version=cost_version)
             _, summary = _prob_run_fields(fit_ctx, params, summary)
             summary["sizing"] = dict(
                 sizing_info,

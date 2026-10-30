@@ -26,6 +26,54 @@ NY_TZ = "America/New_York"
 # S7：skipped（未成交/截尾）只计数不进概率（T72 约定）
 _USABLE_OUTCOMES = {"win", "loss", "time"}
 
+# ---------------------------------------------------------------- 方法登记
+# T104 批 2（audit2 P2-09）：Δp 检验主方法的**批准状态登记**——月内置换在
+# t75-formal-v2 的成簇负对照（P-02：real 与 null 均独立整周平移）失败期间，
+# 其产出（Holm p、推进判定）不得作为推进依据：运行仍可（诊断），但
+# bt prob round-report 的推进结论被方法批准门阻塞（消费方：scripts/bt.py）。
+# 状态只增改不删行（历史判定可复核）；批准 = 新方法完整标定且成簇对照
+# 通过后，在此登记 adopted=True 并更新 PRIMARY_METHOD。
+METHOD_REGISTRY: dict[str, dict] = {
+    "month-within": {
+        # delta_p_test(block="month")——2026-10-28 报告 §1 声明的现行变体
+        "status": "failed_cluster_control",
+        "adopted": False,
+        "note": "月内置换：t75-formal-v2 成簇负对照 w7 档误报率 11% > 5%"
+                "（w3 档 4% 通过）——判定标准 2 未通过，方法未获批准"
+                "（prob-mode-calibration-2026-10-29-v2.md §3）",
+    },
+    "quarter": {
+        # delta_p_test(block="quarter")——v2 §6 预写升级选项一（T101 全套
+        # 试验）；块长参数已进 delta_p_test，方法本身未进现行口径
+        "status": "not_adopted",
+        "adopted": False,
+        "note": "季度内置换：t75-formal-v3（T101）w3=4% 通过、w7=8%"
+                "（8/100）> 5%——按预写规则不采纳，未进入现行方法"
+                "（prob-mode-calibration-2026-10-29-v3.md）",
+    },
+}
+# 现行主检验方法（round-report 的 Holm p 由它产出）
+PRIMARY_METHOD = "month-within"
+
+
+def primary_method_approved() -> tuple[bool, str]:
+    """主检验方法是否获批 → (approved, reason)。
+
+    P2-09：PRIMARY_METHOD 在 METHOD_REGISTRY 的条目 adopted=False（现行
+    月内置换在 v2/v3 成簇负对照失败）→ (False, 原因)；获批 → (True, "")。
+    reason 直接进 round-report 的方法阻塞标注（不构成推进依据的声明）。
+    未知方法名 / 缺条目 → 同样不批准（fail-closed：登记缺失不是放行理由）。
+    """
+    entry = METHOD_REGISTRY.get(PRIMARY_METHOD)
+    if entry is None:
+        return False, (f"主检验方法 {PRIMARY_METHOD!r} 不在 METHOD_REGISTRY"
+                       "——登记缺失按未批准处理（P2-09 fail-closed）")
+    if not entry.get("adopted"):
+        return False, (f"主检验方法 {PRIMARY_METHOD!r} 未批准"
+                       f"（{entry.get('status')}：成簇负对照失败）——"
+                       f"{entry.get('note')}")
+    return True, ""
+
 
 # ---------------------------------------------------------------- 随机化
 

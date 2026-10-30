@@ -13,6 +13,13 @@ eligibility_mask：局面回看窗——A2/A4 从 anchor 根起算、特征预�
 n_total 的兼容别名），real/null 赢率与触发日数排除 skipped（与
 delta_p_test 的 usable 同口径）。
 
+T104 批 2（audit2 P2-11）：返回行补齐**资格剔除诊断**——n_eligible_dropped
+（进入标签前的剔除量）与 eligible_dropped_by_reason（逐原因；现按
+gaps.eligibility_mask 同三条件独立重算，TODO：甲的 gaps.EligibilityContext
+.exclusion_reasons 就绪后改为消费其逐原因记录）+ null 侧同口径计数
+（n_null_total/n_null_usable/n_null_skipped/n_null_trigger_days/
+n_null_eligible_dropped）。台账/轮次报告写入由丁接线（bt.py）。
+
 **真实局面触发上的运行属 T91，须等 T77 轮次草案获 P 线审核会话批准**
 （蓝图 v4 §2）；本模块的测试只用合成数据。
 """
@@ -60,11 +67,78 @@ def _filter_eligible(trig, bars, gaps, situation, approach_lookback,
     return trig
 
 
+# T104 批 2（audit2 P2-11）：逐原因剔除键——与 gaps.eligibility_mask 的
+# 三条件对应，命名对齐甲的 gaps.EligibilityContext.exclusion_reasons 词表
+# （其 "future_window" = 持有/未来窗不满足——跨洞或末端 K+1 不可观察）。
+# TODO(甲/丁接线)：EligibilityContext 逐原因记录就绪后改为消费其产出，
+# 本重算退役（届时 "lookback_crosses_gap" 并入其局面窗 reason）。
+_ELIGIBILITY_REASONS = ("lookback_crosses_gap", "feature_warmup",
+                        "future_window")
+
+
+def _eligibility_drop_reasons(trig, bars, gaps, situation, approach_lookback,
+                              feature_warmup, hold_bars, max_gap_days
+                              ) -> list[dict | None]:
+    """被共同可用集合剔除的行 → 逐原因计数（P2-11；与 _filter_eligible /
+    gaps.eligibility_mask 同三条件独立重算，返回与 trig 等长的
+    {原因: 1} 字典列表；合格行为 None）。一行可同时违反多个条件（计数
+    非互斥——审计口径：逐原因剔除量，不为凑互斥而掩盖复合违例）。"""
+    fw = 0 if feature_warmup is None else int(feature_warmup)
+    if not len(trig) or not (gaps or fw or hold_bars):
+        return [None] * len(trig)
+    kw = dict(gap_spans=gaps or [], situation=situation,
+              approach_lookback=approach_lookback, max_gap_days=max_gap_days)
+    full = eligibility_mask(trig, bars, feature_warmup=fw,
+                            hold_bars=int(hold_bars), **kw)
+    lb_only = eligibility_mask(trig, bars, feature_warmup=0, hold_bars=0,
+                               **kw)
+    with_hold = (eligibility_mask(trig, bars, feature_warmup=0,
+                                  hold_bars=int(hold_bars), **kw)
+                 if hold_bars else lb_only)
+    bars_col = trig["bar"].astype(int).to_numpy()
+    out: list[dict | None] = []
+    for k, ok in enumerate(full):
+        if ok:
+            out.append(None)
+            continue
+        reasons: dict[str, int] = {}
+        if not lb_only[k]:
+            reasons["lookback_crosses_gap"] = 1     # 局面回看窗跨洞（先决 4）
+        if fw and int(bars_col[k]) < fw:
+            reasons["feature_warmup"] = 1           # 特征预热不足（2000 根）
+        if hold_bars and lb_only[k] and not with_hold[k]:
+            reasons["future_window"] = 1            # 持有/未来窗不满足（跨洞
+            # 或末端 K+1 不可观察——词表对齐甲的 EligibilityContext）
+        out.append(reasons or {"unknown": 1})
+    return out
+
+
+def _record_eligibility_drops(drop_stats, trig, sym, sit, bars, gaps,
+                              approach_lookback, feature_warmup, hold_bars,
+                              max_gap_days) -> None:
+    """把 _eligibility_drop_reasons 聚到 drop_stats[(sym, sit, action)]：
+    {"n": 剔除行数, "reasons": {原因: 行数}}（P2-11；card_triggers 在过滤
+    **前**记录——进入标签前的逐原因剔除量）。"""
+    why = _eligibility_drop_reasons(
+        trig, bars, gaps, sit, approach_lookback, feature_warmup,
+        hold_bars, max_gap_days)
+    for k, reasons in enumerate(why):
+        if reasons is None:
+            continue
+        act = str(trig["action"].iloc[k])
+        rec = drop_stats.setdefault((sym, sit, act),
+                                    {"n": 0, "reasons": {}})
+        rec["n"] += 1
+        for r in reasons:
+            rec["reasons"][r] = rec["reasons"].get(r, 0) + 1
+
+
 def card_triggers(card, bars_by_symbol: dict, *, approach: Approach,
                   action_params: ActionParams,
                   gap_spans_by_symbol: dict | None = None,
                   feature_warmup: int | None = None, hold_bars: int = 0,
-                  max_gap_days: int = 30) -> pd.DataFrame:
+                  max_gap_days: int = 30,
+                  drop_stats: dict | None = None) -> pd.DataFrame:
     """卡的全部（局面×动作）触发（不看结果），带特征列。
 
     gap_spans_by_symbol（T97 波次 2，可选）：品种 → 合并序列洞集合；
@@ -73,6 +147,12 @@ def card_triggers(card, bars_by_symbol: dict, *, approach: Approach,
     P-09 共同可用集合（T98，可选三元组，缺省不启用）：feature_warmup /
     hold_bars / max_gap_days 透传 gaps.eligibility_mask（A2/A4 的局面窗
     从 anchor 根起算）。
+
+    drop_stats（T104 批 2 / audit2 P2-11，可选 dict）：给出时按
+    (symbol, situation, action) 记录**进入标签前**的资格剔除——
+    {"n": 剔除行数, "reasons": {原因: 行数}}；不影响返回值（过滤仍在
+    eligibility_mask 同一口径下进行——TODO：甲的 EligibilityContext
+    逐原因记录就绪后改为消费其产出）。
     """
     parts = []
     for sym, bars in bars_by_symbol.items():
@@ -87,6 +167,11 @@ def card_triggers(card, bars_by_symbol: dict, *, approach: Approach,
             events = find_level_events(bars, levels, situation=sit,
                                        approach=approach, atr=atr)
             trig = action_triggers(bars, events, params=action_params, atr=atr)
+            if drop_stats is not None and len(trig):
+                _record_eligibility_drops(
+                    drop_stats, trig, sym, sit, bars, gaps,
+                    approach.lookback_bars, feature_warmup, hold_bars,
+                    max_gap_days)
             trig = _filter_eligible(trig, bars, gaps, sit,
                                     approach.lookback_bars, feature_warmup,
                                     hold_bars, max_gap_days)
@@ -134,7 +219,20 @@ def run_p1_card(card, round_obj, bars_by_symbol: dict, costs_by_symbol: dict,
     n_triggers（= n_total 的兼容别名）, n_trigger_days, real_win_rate,
     null_win_rate, delta_p, p_value, prob_version}——赢率/日数按可成交
     行（win/loss/time）计，skipped 只计数（P-11，与 delta_p_test 同
-    口径）。只读发现段（调用方保证 bars 的 time < split）；标签
+    口径）。
+
+    T104 批 2（audit2 P2-11）增补诊断键（台账写入由丁接线）：
+    - n_eligible_dropped / eligible_dropped_by_reason：进入标签**前**的
+      资格剔除量与逐原因计数（lookback_crosses_gap / feature_warmup /
+      future_window——与 eligibility_mask 同三条件独立重算；
+      TODO：甲的 gaps.EligibilityContext.exclusion_reasons 就绪后改为
+      消费其逐原因记录）；分母口径：n_total 是过滤后的标签输入，
+      剔除量单独披露（n_total + n_eligible_dropped = 过滤前触发数）；
+    - n_null_total / n_null_usable / n_null_skipped / n_null_trigger_days
+      / n_null_eligible_dropped：null 侧同口径计数（随机对照从共同
+      可用集合抽样 → 资格剔除结构性为 0，如实记录）。
+
+    只读发现段（调用方保证 bars 的 time < split）；标签
     train_end=split；禁入窗与 bt 同一来源（policy_by_symbol[sym]——
     审核三 S8/E6：蓝图 §2.3 标签与引擎同口径，**必填**，缺品种 →
     ValueError，不按"不限制"处理）；sizes 缺品种 → ValueError（不默认
@@ -173,11 +271,13 @@ def run_p1_card(card, round_obj, bars_by_symbol: dict, costs_by_symbol: dict,
     eff_warmup = 0 if feature_warmup is None else int(feature_warmup)
     eff_hold = (int(card.prob["bracket"]["horizon_bars"])
                 if hold_bars is None else int(hold_bars))
+    drop_stats: dict[tuple[str, str, str], dict] = {}   # P2-11：逐原因剔除
     triggers = card_triggers(card, bars_by_symbol, approach=approach,
                              action_params=aparams,
                              gap_spans_by_symbol=gap_spans_by_symbol,
                              feature_warmup=feature_warmup,
-                             hold_bars=eff_hold, max_gap_days=max_gap_days)
+                             hold_bars=eff_hold, max_gap_days=max_gap_days,
+                             drop_stats=drop_stats)
     # T97：卡声明了情景倍数才分 era 标注（缺省 None → 全组原 costs）
     csm = (card.prob or {}).get("cost_scenario_mult")
     scenario_mult = float(csm[1]) if csm is not None else None
@@ -268,6 +368,29 @@ def run_p1_card(card, round_obj, bars_by_symbol: dict, costs_by_symbol: dict,
                 real_all.loc[usable, "time"]).dt.date.nunique())
         else:
             n_usable, n_skipped, days = 0, 0, 0
+        # ---- P2-11：资格剔除诊断（real 侧，进入标签前；TODO：甲的
+        # gaps.EligibilityContext 逐原因记录就绪后替换 card_triggers 的
+        # 独立重算，此处聚合口径不变）----
+        n_dropped = 0
+        dropped_reasons: dict[str, int] = {}
+        for sym in bars_by_symbol:
+            rec = drop_stats.get((sym, sit, act))
+            if not rec:
+                continue
+            n_dropped += int(rec["n"])
+            for r, m in rec["reasons"].items():
+                dropped_reasons[r] = dropped_reasons.get(r, 0) + int(m)
+        # ---- P2-11：null 侧同口径计数（随机对照从共同可用集合抽样 →
+        # 资格剔除结构性为 0，同口径如实记录）----
+        n_null_total = int(len(null_all))
+        if n_null_total:
+            usable_n = null_all["outcome"].isin(_USABLE_OUTCOMES)
+            n_null_usable = int(usable_n.sum())
+            n_null_skipped = int((null_all["outcome"] == "skipped").sum())
+            null_days = int(pd.to_datetime(
+                null_all.loc[usable_n, "time"]).dt.date.nunique())
+        else:
+            n_null_usable, n_null_skipped, null_days = 0, 0, 0
         results.append({
             "hypothesis": hyp,
             "seed": seed,
@@ -276,6 +399,17 @@ def run_p1_card(card, round_obj, bars_by_symbol: dict, costs_by_symbol: dict,
             "n_skipped": n_skipped,
             "n_triggers": n_total,     # P-11：兼容别名（bt/探针读它）
             "n_trigger_days": days,
+            # P2-11：进入标签前的资格剔除（逐原因；与 n_total 的分母
+            # 不同——n_total 是过滤后的标签输入，剔除量单独披露）
+            "n_eligible_dropped": n_dropped,
+            "eligible_dropped_by_reason": dropped_reasons,
+            # P2-11：null 侧同口径（usable/skipped/日数排除 skipped；
+            # 剔除恒 0——池已按共同可用集合预滤）
+            "n_null_total": n_null_total,
+            "n_null_usable": n_null_usable,
+            "n_null_skipped": n_null_skipped,
+            "n_null_trigger_days": null_days,
+            "n_null_eligible_dropped": 0,
             "real_win_rate": _day_winrate(real_all),
             "null_win_rate": _day_winrate(null_all),
             "delta_p": test["delta_p"],

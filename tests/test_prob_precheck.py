@@ -456,25 +456,12 @@ def test_analytic_stricter_in_extrapolation_region(data_root):
     assert res.decision == "pass"
 
 
-def test_open_ended_interval_requires_strictly_more(data_root):
-    """开区间档（Δp=0.02 端继承开区间语义）：4 假设 4000×1.856=7424、
-    open_ended=True——days=7424 不算过（须 >），days=7425 过。"""
-    c = _prob_candidate(expected_delta_p=0.02)
-    kwargs = dict(data_root=data_root, cost_model=FlatCosts(),
-                  split=pd.Timestamp("2025-01-01"))
-    res_7424 = cand.precheck_prob(
-        c, counted=counted_df(_rows_for_days("A3", 7424, atr=100.0)), **kwargs)
-    pp = res_7424.checks["power_prob"]
-    assert pp["open_ended"] is True
-    assert pp["n_required_measured"] == 7424     # 4000×(2.241/1.645)²=7423.6→7424
-    assert pp["n_required_used"] == 7424         # 解析 3014（D52）不敌实测
-    assert pp["per_hypothesis"]["S1:A3:fade>base"]["passed"] is False
-    assert res_7424.decision == "waiting_data"
-    res_7425 = cand.precheck_prob(
-        c, counted=counted_df(_rows_for_days("A3", 7425, atr=100.0)), **kwargs)
-    assert res_7425.checks["power_prob"][
-        "per_hypothesis"]["S1:A3:fade>base"]["passed"] is True
-    assert res_7425.decision == "pass"
+# T104 批 2（audit2 P2-08）删除旧契约 test_open_ended_interval_requires_
+# strictly_more（"days>7424 即过"）——0.02 档只测到 34% 功率@4000 名义，
+# 严格大于下界不构成充分性证据；新契约见文件末尾
+# test_open_ended_lower_bound_no_longer_authorizes_pass（7424/7425 一律
+# waiting_data，直至批 4 标定闭合）；数值锚点断言保留在
+# test_measured_rule_numeric_self_checks（锚点不动）。
 
 
 def test_measured_none_below_calibration_propagates_waiting(data_root):
@@ -590,3 +577,367 @@ def test_c101_to_c103_status_backfilled():
         assert "C104-C106" in text, cid
         assert cand.load_candidate(
             _T97_CANDIDATES_DIR / f"{cid}.toml").status == "screened_fail"
+
+
+# ============================== T104 批 2（audit2 P2-04/P2-05/P2-08）失败测试先行
+# docs/reviews/2026-10-30-global-code-audit-2.md §3.3：
+# - P2-04：预筛的外部成本时代消费**逐行来源标签**（merged_research_series
+#   的 source_tags），不再用 meta.first_time 猜 era；来源不可得 → 拒绝该
+#   成本判定（fail-closed，不退 1×）；
+# - P2-05：预筛成本边界全量校验有限值/正分母——NaN/±Inf/零分母穿过
+#   edge<3×cost 比较判 pass 的路径必须翻转为不通过；
+# - P2-08：样本量证据三分（calibrated_sufficient / lower_bound_only /
+#   uncalibrated）——开区间档（0.02≤Δp<0.03）超记录下界不再授权 pass。
+
+
+def _scenario_candidate(delta_p=0.04, **prob_over):
+    """带 [1.0, 1.5] 情景档 + 3.0 参考档的候选（P2-04 测试公用）。"""
+    data = prob_data()
+    data["prob"] = {**data["prob"],
+                    "expected_delta_p": delta_p,
+                    "cost_scenario_mult": [1.0, 1.5],
+                    "cost_scenario_reference": 3.0}
+    data["prob"].update(prob_over)
+    return cand.validate_candidate(data, source="t")
+
+
+def _rows(n=4, atr=10.0, start="2018-01-02 14:00"):
+    """n 行同形态触发（bar=0..n-1，供 tags 下标对齐）。"""
+    return [("TEST", "S1", "A3", 9, atr, 2000.0,
+             start if n == 1 else f"2018-01-{2 + k:02d} 14:00")
+            for k in range(n)]
+
+
+def _tags(pattern):
+    """pattern 例 "ee mm"/"e"*4 → 与 counted.bar 对齐的来源标签列表。"""
+    out = []
+    for ch in pattern.replace(" ", ""):
+        out.append("mt5" if ch == "m" else f"ext:histdata:201{len(out) % 10}")
+    return out
+
+
+class TestPrecheckEraFromSourceTags:
+    """P2-04：era 逐行消费 source_tags_by_symbol（与 bars 等长、按行 bar
+    对齐）；meta.first_time 不再参与；tags 不可得 → 拒绝成本判定。"""
+
+    def test_all_ext_tags_use_conservative_mult_hand_calc(self, data_root):
+        # 保守档 = (1.5×0.30 + 2×0.05)/10 = 0.055R；3×0.055=0.165 > ΔEV 0.12
+        c = _scenario_candidate()
+        res = cand.precheck_prob(
+            c, data_root=data_root, cost_model=FlatCosts(),
+            counted=counted_df(_rows(4)), split=pd.Timestamp("2025-01-01"),
+            source_tags_by_symbol={"TEST": _tags("eeee")})
+        ec = res.checks["ex_ante_cost_prob"]
+        assert ec["cost_r_by_symbol"]["TEST"] == pytest.approx(0.055)
+        assert ec["cost_r_by_symbol_1x"]["TEST"] == pytest.approx(0.040)
+        assert ec["cost_r_by_symbol_ref3"]["TEST"] == pytest.approx(0.100)
+        assert ec["ext_trigger_n_by_symbol"]["TEST"] == 4
+        assert ec["passed"] is False and res.decision == "fail"
+
+    def test_mixed_tags_mean_hand_calc(self, data_root):
+        # 2 ext + 2 mt5：保守档 = mean(0.055, 0.040) = 0.0475R
+        c = _scenario_candidate()
+        res = cand.precheck_prob(
+            c, data_root=data_root, cost_model=FlatCosts(),
+            counted=counted_df(_rows(4)), split=pd.Timestamp("2025-01-01"),
+            source_tags_by_symbol={"TEST": _tags("eemm")})
+        ec = res.checks["ex_ante_cost_prob"]
+        assert ec["cost_r_by_symbol"]["TEST"] == pytest.approx(0.0475)
+        assert ec["cost_r_by_symbol_1x"]["TEST"] == pytest.approx(0.040)
+        assert ec["ext_trigger_n_by_symbol"]["TEST"] == 2
+
+    def test_all_mt5_tags_match_1x(self, data_root):
+        c = _scenario_candidate()
+        res = cand.precheck_prob(
+            c, data_root=data_root, cost_model=FlatCosts(),
+            counted=counted_df(_rows(4)), split=pd.Timestamp("2025-01-01"),
+            source_tags_by_symbol={"TEST": _tags("mmmm")})
+        ec = res.checks["ex_ante_cost_prob"]
+        assert ec["cost_r_by_symbol"]["TEST"] == pytest.approx(0.040)
+        assert ec["ext_trigger_n_by_symbol"]["TEST"] == 0
+        assert ec["passed"] is True      # ΔEV 0.12 ≥ 3×0.04（成本条件本身过）
+
+    def test_tags_beat_meta_first_time(self, data_root):
+        """数据首时刻与 meta 不同：meta 写 2010 年（时间口径全部 ≥ meta →
+        旧口径判全 MT5/1×），tags 标记 ext → 逐行 tags 优先，保守档生效。"""
+        meta_dir = data_root / "bars" / "TEST" / "H1"
+        meta_dir.mkdir(parents=True)
+        (meta_dir / "meta.json").write_text(json.dumps(
+            {"first_time": "2010-01-01T00:00:00",
+             "last_closed_time": "2025-01-01T00:00:00"}), encoding="utf-8")
+        c = _scenario_candidate()
+        res = cand.precheck_prob(
+            c, data_root=data_root, cost_model=FlatCosts(),
+            counted=counted_df(_rows(4)), split=pd.Timestamp("2025-01-01"),
+            source_tags_by_symbol={"TEST": _tags("eeee")})
+        ec = res.checks["ex_ante_cost_prob"]
+        assert ec["cost_r_by_symbol"]["TEST"] == pytest.approx(0.055)
+        assert ec["ext_trigger_n_by_symbol"]["TEST"] == 4
+
+    def test_missing_tags_refuse_cost_judgment_not_pass(self, data_root):
+        """声明情景档而 tags 未传 → 成本判定拒绝（不退 1×、不 pass）：
+        passed=None → waiting_data（待数据：补 merge 实测来源后重检）。"""
+        c = _scenario_candidate()
+        res = cand.precheck_prob(
+            c, data_root=data_root, cost_model=FlatCosts(),
+            counted=counted_df(_rows(4)), split=pd.Timestamp("2025-01-01"))
+        ec = res.checks["ex_ante_cost_prob"]
+        assert ec["passed"] is None
+        assert ec["cost_r_by_symbol"] == {}          # 绑定档不给可误读的数
+        assert res.decision == "waiting_data"
+        assert any("来源" in r for r in res.reasons)
+        assert any("1×" in r or "1x" in r for r in res.reasons)
+
+    def test_tags_missing_symbol_refuse(self, data_root):
+        c = _scenario_candidate()
+        res = cand.precheck_prob(
+            c, data_root=data_root, cost_model=FlatCosts(),
+            counted=counted_df(_rows(4)), split=pd.Timestamp("2025-01-01"),
+            source_tags_by_symbol={"OTHER": _tags("eeee")})
+        assert res.checks["ex_ante_cost_prob"]["passed"] is None
+        assert res.decision == "waiting_data"
+
+    def test_unknown_tag_value_refuses(self, data_root):
+        """既非 "mt5" 也非 "ext:*" 的标签 → 来源不可证明 → 拒绝。"""
+        c = _scenario_candidate()
+        res = cand.precheck_prob(
+            c, data_root=data_root, cost_model=FlatCosts(),
+            counted=counted_df(_rows(2)), split=pd.Timestamp("2025-01-01"),
+            source_tags_by_symbol={"TEST": ["mystery", "mt5"]})
+        assert res.checks["ex_ante_cost_prob"]["passed"] is None
+        assert res.decision == "waiting_data"
+
+    def test_tags_shorter_than_bars_refuses(self, data_root):
+        """标签与行 bar 对不上（越界）→ 拒绝该品种成本判定。"""
+        c = _scenario_candidate()
+        res = cand.precheck_prob(
+            c, data_root=data_root, cost_model=FlatCosts(),
+            counted=counted_df(_rows(4)), split=pd.Timestamp("2025-01-01"),
+            source_tags_by_symbol={"TEST": ["mt5"]})
+        assert res.checks["ex_ante_cost_prob"]["passed"] is None
+        assert res.decision == "waiting_data"
+
+    def test_scenario_report_names_tag_rule(self, data_root):
+        """era 规则字段写明逐行 tags 口径（可复核），不再写 meta 语义。"""
+        c = _scenario_candidate()
+        res = cand.precheck_prob(
+            c, data_root=data_root, cost_model=FlatCosts(),
+            counted=counted_df(_rows(2)), split=pd.Timestamp("2025-01-01"),
+            source_tags_by_symbol={"TEST": _tags("em")})
+        rule = res.checks["ex_ante_cost_prob"]["era_rule"]
+        assert "source_tags" in rule
+        assert "first_time" not in rule
+
+
+class TestPrecheckFiniteCostValidation:
+    """P2-05：预筛成本边界全量校验——NaN/±Inf/零分母 → 该品种成本判定
+    失败（cost_ok=False → fail），绝不默认 pass。"""
+
+    def _check(self, data_root, counted):
+        c = cand.validate_candidate(prob_data(), source="t")
+        return cand.precheck_prob(
+            c, data_root=data_root, cost_model=FlatCosts(), counted=counted,
+            split=pd.Timestamp("2025-01-01"))
+
+    def test_all_nan_atr_not_pass(self, data_root):
+        """audit2 探针场景：1600 合成日全 NaN ATR——旧口径 NaN 比较判 pass，
+        必须翻转为不通过。"""
+        rows = [("TEST", "S1", "A3", 9, 20.0, 2000.0, str(d))
+                for d in pd.date_range("2018-01-01", periods=1600, freq="1D")]
+        counted = counted_df(rows)
+        counted["atr"] = float("nan")
+        res = self._check(data_root, counted)
+        assert res.decision != "pass"
+        assert res.decision == "fail"
+        ec = res.checks["ex_ante_cost_prob"]
+        assert ec["passed"] is False
+        assert any("ATR" in r for r in res.reasons)
+
+    @pytest.mark.parametrize("atr", [float("inf"), float("-inf"), 0.0, -3.0])
+    def test_nonfinite_or_nonpositive_atr_fails(self, data_root, atr):
+        counted = counted_df(_rows(4, atr=atr) if atr != 20.0 else _rows(4))
+        counted["atr"] = atr
+        res = self._check(data_root, counted)
+        assert res.decision == "fail"
+        assert res.checks["ex_ante_cost_prob"]["passed"] is False
+
+    @pytest.mark.parametrize("close", [float("nan"), float("inf"), 0.0, -1.0])
+    def test_bad_price_fails(self, data_root, close):
+        counted = counted_df(_rows(4))
+        counted["close"] = close
+        res = self._check(data_root, counted)
+        assert res.decision == "fail"
+        assert res.checks["ex_ante_cost_prob"]["passed"] is False
+
+    def test_nan_commission_fails(self, data_root):
+        class NaNComm(FlatCosts):
+            def commission_per_lot(self, symbol):
+                return float("nan")
+
+        c = cand.validate_candidate(prob_data(), source="t")
+        res = cand.precheck_prob(
+            c, data_root=data_root, cost_model=NaNComm(),
+            counted=counted_df(_rows(4)), split=pd.Timestamp("2025-01-01"))
+        assert res.decision == "fail"
+        assert res.checks["ex_ante_cost_prob"]["passed"] is False
+
+    def test_nan_spread_component_fails(self, data_root):
+        class NaNSpread(FlatCosts):
+            def spread_p90(self, symbol, hour_ny, *, price=None):
+                return float("inf")
+
+        c = cand.validate_candidate(prob_data(), source="t")
+        res = cand.precheck_prob(
+            c, data_root=data_root, cost_model=NaNSpread(),
+            counted=counted_df(_rows(4)), split=pd.Timestamp("2025-01-01"))
+        assert res.decision == "fail"
+
+    @pytest.mark.parametrize("cs", [0.0, float("nan"), -100.0])
+    def test_bad_contract_size_fails_not_raises(self, tmp_path, cs):
+        """坏合约大小 → 该品种成本判定失败（不抛异常、不默认 pass）。"""
+        (tmp_path / "specs").mkdir()
+        (tmp_path / "specs" / "latest.json").write_text(
+            json.dumps({"TEST": {"contract_size": cs}}), encoding="utf-8")
+        c = cand.validate_candidate(prob_data(), source="t")
+        res = cand.precheck_prob(
+            c, data_root=tmp_path, cost_model=FlatCosts(),
+            counted=counted_df(_rows(4)), split=pd.Timestamp("2025-01-01"))
+        assert res.decision == "fail"
+        assert res.checks["ex_ante_cost_prob"]["passed"] is False
+
+    def test_multi_symbol_one_bad_one_good_fails(self, tmp_path):
+        """一坏一好：坏品种使整体 fail，好品种成本照常可复核地给出。"""
+        (tmp_path / "specs").mkdir()
+        (tmp_path / "specs" / "latest.json").write_text(
+            json.dumps({"GOOD": {"contract_size": 100.0},
+                        "BAD": {"contract_size": 100.0}}), encoding="utf-8")
+        data = prob_data(symbols=["GOOD", "BAD"])
+        data["prob"] = {**data["prob"],
+                        "level_grid": {"GOOD": 50.0, "BAD": 50.0}}
+        c = cand.validate_candidate(data, source="t")
+        rows = ([("GOOD", "S1", "A3", 9, 10.0, 2000.0, "2018-01-02 14:00")] * 2
+                + [("BAD", "S1", "A3", 9, float("nan"), 2000.0,
+                    "2018-01-03 14:00")] * 2)
+        counted = counted_df(rows)
+        res = cand.precheck_prob(
+            c, data_root=tmp_path, cost_model=FlatCosts(), counted=counted,
+            split=pd.Timestamp("2025-01-01"))
+        ec = res.checks["ex_ante_cost_prob"]
+        assert res.decision == "fail"
+        assert ec["passed"] is False
+        assert ec["cost_r_by_symbol"]["GOOD"] == pytest.approx(0.040)
+        assert ec["invalid_symbols"] == ["BAD"]
+
+    def test_payload_has_no_nan_success_metrics(self, data_root):
+        """JSON 不写入不可复核的 NaN 成本指标（allow_nan=False 可序列化）。"""
+        counted = counted_df(_rows(4))
+        counted["atr"] = float("nan")
+        res = self._check(data_root, counted)
+        json.dumps(res.to_payload(), allow_nan=False)   # NaN → ValueError
+
+    def test_normal_inputs_hand_calc_unchanged(self, data_root):
+        """正常合成输入逐行手算一致（P2-05 验证项：不误伤合法输入）。"""
+        c = cand.validate_candidate(prob_data(), source="t")
+        rows = [("TEST", "S1", "A3", 9, 10.0, 2000.0, "2018-01-02 14:00"),
+                ("TEST", "S1", "A3", 10, 20.0, 1000.0, "2018-01-03 14:00")]
+        res = cand.precheck_prob(
+            c, data_root=data_root, cost_model=FlatCosts(),
+            counted=counted_df(rows), split=pd.Timestamp("2025-01-01"))
+        ec = res.checks["ex_ante_cost_prob"]
+        # 手算：0.40/10=0.04、0.40/20=0.02 → 均值 0.03
+        assert ec["cost_r_by_symbol"]["TEST"] == pytest.approx(0.03)
+
+
+# ----------------------------- P2-08：样本量证据状态三分
+
+class TestSampleSizeEvidence:
+    """sample_size_evidence(dp, days, n_hyp) → (decision, state, detail)。"""
+
+    def test_uncalibrated_below_02(self):
+        d, s, detail = cand.sample_size_evidence(0.015, 10 ** 6)
+        assert (d, s) == ("waiting_data", "uncalibrated")
+        assert "0.02" in detail
+
+    def test_lower_bound_only_never_authorizes_pass(self):
+        for dp in (0.02, 0.025, 0.0299):
+            d, s, detail = cand.sample_size_evidence(dp, 10 ** 9)
+            assert (d, s) == ("waiting_data", "lower_bound_only"), dp
+            assert "4000" in detail and "1732" in detail
+            assert "未标定" in detail
+
+    def test_calibrated_0_03_segment(self):
+        # 4 假设 Δp=0.03：n_used = 3712（T75 实测 2000×1.856 更严）
+        d, s, _ = cand.sample_size_evidence(0.03, 3712, n_hyp=4)
+        assert (d, s) == ("pass", "calibrated_sufficient")
+        d2, s2, _ = cand.sample_size_evidence(0.03, 3711, n_hyp=4)
+        assert (d2, s2) == ("waiting_data", "calibrated_sufficient")
+
+    def test_calibrated_0_05_and_extrapolation(self):
+        d, s, _ = cand.sample_size_evidence(0.05, 10 ** 6)
+        assert (d, s) == ("pass", "calibrated_sufficient")
+        # >0.05 沿 0.03→0.05 段斜率外推（解析 D52 主导）→ 仍是标定档
+        d2, s2, _ = cand.sample_size_evidence(0.20, 31, n_hyp=4)
+        assert (d2, s2) == ("pass", "calibrated_sufficient")
+        d3, s3, _ = cand.sample_size_evidence(0.20, 30, n_hyp=4)
+        assert d3 == "waiting_data"
+
+    def test_no_days_is_waiting(self):
+        for dp in (0.015, 0.02, 0.04):
+            d, s, _ = cand.sample_size_evidence(dp, None)
+            assert d == "waiting_data"
+
+    def test_anchor_numbers_unchanged(self):
+        """数值锚点不动：measured_n_required 契约（n, open_ended）原样。"""
+        assert cand.measured_n_required(1, 0.02) == (4000, True)
+        assert cand.measured_n_required(4, 0.03) == (3712, True)
+        assert cand.measured_n_required(1, 0.015) == (None, False)
+
+
+def test_open_ended_lower_bound_no_longer_authorizes_pass(data_root):
+    """P2-08（改写 :459 旧契约）：Δp=0.02 开区间档只测到 34% 功率 @4000
+    名义（≈1732 实际日）——7424 与 7425 个触发日都**不再授权 pass**，
+    恒 waiting_data 直至批 4 新方法标定闭合。"""
+    c = _prob_candidate(expected_delta_p=0.02)
+    kwargs = dict(data_root=data_root, cost_model=FlatCosts(),
+                  split=pd.Timestamp("2025-01-01"))
+    for n_days in (7424, 7425, 20000):
+        res = cand.precheck_prob(
+            c, counted=counted_df(_rows_for_days("A3", n_days, atr=100.0)),
+            **kwargs)
+        pp = res.checks["power_prob"]
+        assert pp["n_required_used"] == 7424
+        ph = pp["per_hypothesis"]["S1:A3:fade>base"]
+        assert ph["passed"] is False, n_days
+        assert ph["evidence_state"] == "lower_bound_only"
+        assert res.decision == "waiting_data"
+    pp = res.checks["power_prob"]
+    assert "4000" in pp["evidence_note"] and "1732" in pp["evidence_note"]
+    assert any("未标定" in r for r in res.reasons)
+
+
+def test_c101_to_c106_lower_bound_outcome_unchanged():
+    """C101–C106 全部 Δp=0.02（lower_bound_only）——语义修正后仍不授权
+    pass：登记的 screened_fail 不会被任何触发日数翻转（audit2 P2-08
+    "现有 C101～C106 远低于门槛，纠正语义不会把它们变为可运行"）。"""
+    for cid in ("C101", "C102", "C103", "C104", "C105", "C106"):
+        p = cand.load_candidate(
+            _T97_CANDIDATES_DIR / f"{cid}.toml").prob_declared
+        assert p.expected_delta_p == 0.02, cid
+        d, s, _ = cand.sample_size_evidence(
+            p.expected_delta_p, 10 ** 9, n_hyp=len(p.hypotheses))
+        assert (d, s) == ("waiting_data", "lower_bound_only"), cid
+
+
+def test_calibrated_segment_still_passes_at_threshold(data_root):
+    """0.03 档（实测 53% 功率）保持"达标即过"：4 假设 3712 触发日 → pass
+    （calibrated_sufficient：days ≥ n_used；样本量锚点未下调）。"""
+    c = _prob_candidate(expected_delta_p=0.03)
+    res = cand.precheck_prob(
+        c, counted=counted_df(_rows_for_days("A3", 3712, atr=100.0)),
+        data_root=data_root, cost_model=FlatCosts(),
+        split=pd.Timestamp("2025-01-01"))
+    pp = res.checks["power_prob"]
+    assert pp["evidence_state"] == "calibrated_sufficient"
+    assert pp["per_hypothesis"]["S1:A3:fade>base"]["passed"] is True
+    assert res.decision in ("pass", "waiting_data")   # 成本可能另判
+    assert pp["passed"] is True

@@ -50,6 +50,7 @@ import numpy as np
 import pandas as pd
 
 from mt5data.store import TIMEFRAME_SECONDS, load_bars
+from mt5quant.prob.scenarios import ScenarioCosts
 from mt5quant.research import cards
 from mt5quant.research import power
 
@@ -59,7 +60,7 @@ __all__ = [
     "BOOKKEEPING_STATUSES", "PRECHECK_DECISIONS", "load_candidate",
     "coverage_years", "coverage_segments", "merged_coverage_years",
     "unconditional_volatility", "precheck", "precheck_prob", "propose_split",
-    "measured_n_required",
+    "measured_n_required", "sample_size_evidence",
 ]
 
 # 附录 C：机制类别七分类（蓝图 v4 §6.2 预筛条件 5）+ P 线价位类（D45/T76）
@@ -1280,10 +1281,14 @@ def measured_n_required(n_hyp: int, dp: float) -> tuple[int | None, bool]:
 
     - n_required=None：dp < 0.02 未测出——该假设**恒 waiting_data**，
       不随触发日数增加改变（调用方见 None 即判不过，不与解析取 max）；
-    - open_ended=True（0.02 ≤ dp ≤ 0.03）：判 pass 需 days **>** n_required
-      （0.02 端 ">4,000" 锚点的开区间语义随插值段继承）；其余档位 ≥ 即过。
-    取严（n_required = max(解析 D52, 实测)）由调用方 precheck_prob 做，
-    单假设值 × (z_α(n_hyp)/z_α(1))² 在本函数内完成。
+    - open_ended=True（0.02 ≤ dp ≤ 0.03）：**T104/P2-08 起该档只作下界
+      记录**——判 pass 的语义由 sample_size_evidence 接管（开区间档超
+      下界不再授权 pass；此标志保留供报告/兼容，不再是"days > 即过"
+      的授权依据）。
+
+    数值锚点不动（不下调不调整）；取严（n_required = max(解析 D52,
+    实测)）在 _sample_size_numbers/sample_size_evidence 内做，单假设值
+    × (z_α(n_hyp)/z_α(1))² 在本函数内完成。
     """
     if isinstance(n_hyp, bool) or not isinstance(n_hyp, int) or n_hyp < 1:
         raise ValueError(f"n_hyp 必须是 ≥1 整数，收到 {n_hyp!r}")
@@ -1307,15 +1312,154 @@ def measured_n_required(n_hyp: int, dp: float) -> tuple[int | None, bool]:
     return math.ceil(single * (z_h / z1) ** 2 - 1e-9), open_ended
 
 
+def _sample_size_numbers(dp: float, n_hyp: int
+                         ) -> tuple[int, int | None, int | None, bool]:
+    """(n_analytic, n_meas, n_used, open_ended)——解析 D52 与 T75 实测
+    取严（precheck_prob 与 sample_size_evidence 共用的单一数字来源；
+    数值锚点见 measured_n_required，不动）。"""
+    n_analytic = power.n_needed_proportion(
+        _PROB_BASE_RATE, dp, alpha=_POWER_ALPHA, power=_POWER_MIN,
+        n_tests=n_hyp)
+    n_meas, open_ended = measured_n_required(n_hyp, dp)
+    n_used = None if n_meas is None else max(int(n_analytic), n_meas)
+    return int(n_analytic), n_meas, n_used, open_ended
+
+
+# P2-08：开区间档（0.02 ≤ Δp < 0.03）的下界记录——T75 标定 v2：0.02 档
+# 4000 **名义**触发日只测到 34% 功率（< 50% 目标），对应 ≈1732 实际日；
+# 已测最大格 power<50% 只能证明未知门槛尚未达到，不能证明下界+1 达到 50%。
+_LOWER_BOUND_NOTE = "下界记录 4000 名义/1732 实际，充分门槛未标定"
+
+# 证据状态枚举（T104/P2-08 三分；报告/台账披露口径）
+SAMPLE_EVIDENCE_STATES = ("calibrated_sufficient", "lower_bound_only",
+                          "uncalibrated")
+
+
+def sample_size_evidence(dp: float, days: int | None, *, n_hyp: int = 1
+                         ) -> tuple[str, str, str]:
+    """样本量证据状态三分 → (decision, state, detail)（T104/P2-08）。
+
+    precheck_prob 与 bt 开轮复核（scripts/bt.py 的 _d52_required/
+    _prob_family_freeze——由丁接线）共用同一判定；数值锚点不动
+    （measured_n_required 原样），只改"开区间档超下界 = pass"的旧语义：
+
+    - **calibrated_sufficient**（dp ≥ 0.03）：0.03/0.05 档实测功率 ≥50%
+      （2000@53%、1000@70%；档间插值与 >0.05 沿段斜率外推）——
+      days ≥ max(解析 D52, T75 实测) 授权 pass，不足 waiting_data；
+    - **lower_bound_only**（0.02 ≤ dp < 0.03）：0.02 锚点只测到 34% 功率
+      @4000 名义（≈1732 实际日）——**超记录下界不再授权 pass**：无论
+      days 多少恒 waiting_data（批 4 新方法完整标定且充分门槛闭合后按
+      批准版本更新；本函数是 precheck 与开轮复核的同一授权口径）；
+    - **uncalibrated**（dp < 0.02）：未测出，恒 waiting_data（不外推）。
+
+    days=None（无触发日数）→ 恒 waiting_data。decision ∈ {pass,
+    waiting_data}（样本量不足不是 fail——铁律 18）；detail 为人读依据
+    （含数字，写进 checks/报告供复核）。
+    """
+    if isinstance(dp, bool) or not isinstance(dp, (int, float)) \
+            or not math.isfinite(dp) or dp <= 0.0:
+        raise ValueError(f"dp 必须为有限正数，收到 {dp!r}")
+    if isinstance(n_hyp, bool) or not isinstance(n_hyp, int) or n_hyp < 1:
+        raise ValueError(f"n_hyp 必须是 ≥1 整数，收到 {n_hyp!r}")
+    n_analytic, n_meas, n_used, _open = _sample_size_numbers(dp, n_hyp)
+    days_txt = "无触发日数" if days is None else f"{int(days)} 触发日"
+    if dp < _MEASURED_ANCHORS[0][0]:
+        state = "uncalibrated"
+        detail = (f"T75 实测规则未覆盖（Δp={dp:g} < 标定下界 0.02，"
+                  f"不外推）；解析 D52={n_analytic} 日仅供参考，不授权"
+                  f" pass；{days_txt}")
+        return "waiting_data", state, detail
+    if dp < _MEASURED_ANCHORS[1][0]:
+        state = "lower_bound_only"
+        detail = (f"开区间档（0.02≤Δp<{_MEASURED_ANCHORS[1][0]:g}）："
+                  f"{_LOWER_BOUND_NOTE}；记录下界 max(解析 {n_analytic}, "
+                  f"T75 实测 {n_meas}) = {n_used} 日，实际 {days_txt}——"
+                  "超过记录下界不授权 pass（P2-08：充分门槛未标定前恒 "
+                  "waiting_data，批 4 标定闭合后按批准版本更新）")
+        return "waiting_data", state, detail
+    state = "calibrated_sufficient"
+    ok = days is not None and int(days) >= int(n_used or 0)
+    detail = (f"标定档（Δp≥0.03：0.03/0.05 档实测功率 ≥50%——2000@53%、"
+              f"1000@70%）：需 days ≥ max(解析 {n_analytic}, T75 实测 "
+              f"{n_meas}) = {n_used} 日，实际 {days_txt}")
+    return ("pass" if ok else "waiting_data"), state, detail
+
+
+def _row_ext_mask(rows, tags) -> tuple[list[bool] | None, str | None]:
+    """counted 行 → 逐行 ext 布尔掩码（T104 批 2 / audit2 P2-04）。
+
+    tags = merged_research_series 返回的 source_tags（与 bars 等长的
+    逐行来源标签），按 counted 行的 **bar 下标**对齐："mt5" → MT5 段
+    （False）、"ext:*" → ext 段（True）。tags 缺失/为空/行 bar 对不上/
+    未知标签 → (None, 原因)——来源不可证明，调用方拒绝该品种的成本
+    判定（fail-closed，不静默退 1×、不用 meta.first_time 猜）。
+    """
+    if tags is None:
+        return None, ("source_tags 未传入（需要 merged_research_series 的"
+                      " 逐行来源标签）")
+    tag_list = list(tags)
+    if not tag_list:
+        return None, "source_tags 为空"
+    out: list[bool] = []
+    for k, r in enumerate(rows.itertuples(index=False)):
+        b = getattr(r, "bar", None)
+        try:
+            bi = int(b)
+        except (TypeError, ValueError):
+            return None, f"第 {k} 行 bar 下标不可用（{b!r}）"
+        if not 0 <= bi < len(tag_list):
+            return None, (f"第 {k} 行 bar={bi} 越界（source_tags 长度 "
+                          f"{len(tag_list)}——按行 bar 下标对齐失败）")
+        tag = tag_list[bi]
+        if tag == "mt5":
+            out.append(False)
+        elif isinstance(tag, str) and tag.startswith("ext:"):
+            out.append(True)
+        else:
+            return None, (f"第 {k} 行来源标签未知（{tag!r}；合法取值 "
+                          '"mt5" 或 "ext:*"）')
+    return out, None
+
+
+def _finite_or_none(name: str, v, *, positive: bool) -> tuple[float | None,
+                                                               str | None]:
+    """P2-05 数值校验：有限数（positive=True 再要求严格 >0）→ (值, None)；
+    非法 → (None, 错误描述)。"""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None, f"{name}={v!r} 非数值"
+    if not math.isfinite(x):
+        return None, f"{name}={v!r} 非有限数（NaN/±Inf）"
+    if positive and not x > 0.0:
+        return None, f"{name}={v!r} 须严格为正"
+    return x, None
+
+
 def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
-                  split, active_mechanisms=None) -> PrecheckResult:
+                  split, active_mechanisms=None,
+                  source_tags_by_symbol: dict | None = None,
+                  gap_spans_by_symbol: dict | None = None) -> PrecheckResult:
     """概率模式预筛五条件（计划 T76；蓝图 v4 §6.2 在概率模式上的具体化）。
 
     输入：
     - counted：计数工具（mt5quant.prob.counting）的发现段子集（时间 <
-      split），列含 symbol/situation/action/side/time/ny_hour/atr/close；
-      None = 无计数（检验力无从算 → waiting_data）；
-    - split：发现段/验证段分界（bt segment propose 的产出，D50）。
+      split），列含 symbol/situation/action/side/time/ny_hour/atr/close/
+      bar；None = 无计数（检验力无从算 → waiting_data）；
+    - split：发现段/验证段分界（bt segment propose 的产出，D50）；
+    - source_tags_by_symbol（T104 批 2 / audit2 P2-04，可选）：品种 →
+      merged_research_series 返回的 source_tags（与 bars 等长的逐行
+      来源标签），由调用方（bt candidate check——丁接线）传入；era
+      **逐行**消费（counted 行按 bar 下标对齐）：`"mt5"` → MT5 段、
+      `"ext:*"` → ext 段（点差 × 情景档）。候选声明
+      [prob].cost_scenario_mult 而来源标签不可得（缺品种/越界/未知标签）
+      → **拒绝该品种的成本判定**（fail-closed：不静默退 1×、不再用
+      meta.first_time 猜 era；判 waiting_data——数据/接线缺失属"待
+      数据"，与无触发计数同因）。不声明情景档时不消费 tags（行为与
+      T97 之前逐位相同）；
+    - gap_spans_by_symbol（可选）：品种 → 合并序列洞集合——计数侧的
+      跨洞抑制由 count_triggers 消费（甲接线），预筛只登记进 checks
+      供复核（不在此重复过滤）。
 
     条件（与 H 线 precheck 平行；只做事前计算，不看任何结局）：
     1. 文献：同 H 线；
@@ -1324,14 +1468,22 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
        3×来回成本(R)——每个品种都要满足（等价于按成本最高的品种判断）。
        成本 = 触发纽约小时的（点差 + 双腿滑点 + 佣金/合约大小）÷
        (sl_atr×ATR) 按触发均值（佣金 commission_per_lot/cs 为价格单位）；
-       触发小时分布来自计数（不看结果）；
+       触发小时分布来自计数（不看结果）。**T104 批 2（P2-05）：成本
+       边界全量校验**——ATR、价格、合约大小、逐项费用（点差/滑点/
+       佣金）与最终 R 均须为有限数，风险分母（sl_atr×ATR）严格为正；
+       NaN/±Inf/零分母 → 该品种成本判定**失败**（fail，不默认 pass、
+       不写不可复核的 NaN 指标）。声明情景档时 ext 行点差经
+       ScenarioCosts（mt5quant.prob.scenarios——与 P1 标签路径**同一
+       装配**：只乘点差、滑点/佣金原样透传），判定绑定保守档 mult[1]，
+       1x 与参考档（若有）并列进 checks；
     4. 检验力（审核二 Q3/Q6，D52）：样本单位为发现段内的**触发日数**
        （同一天多次触发记 1）；Bonferroni 条数 = 候选登记的假设条数；
        **逐条判定**——不足的假设判 waiting_data 并列出（开轮时移出），
-       候选至少一条通过才算通过；样本量取解析 D52 与 **T75 实测规则**
-       （measured_n_required，月内置换标定 2026-10-29 批准）的**更严者**：
-       实测未覆盖（Δp<0.02）→ 恒 waiting_data；开区间档（0.02≤Δp≤0.03）
-       判 pass 需 days > n_required（见 checks["power_prob"]）；
+       候选至少一条通过才算通过；授权判定统一走 **sample_size_evidence**
+       （T104/P2-08 证据三分：calibrated_sufficient（Δp≥0.03）days ≥
+       max(解析 D52, T75 实测) 即过；lower_bound_only（0.02≤Δp<0.03）
+       与 uncalibrated（Δp<0.02）恒 waiting_data——开区间档超记录下界
+       **不再授权 pass**）；数值锚点不动（measured_n_required 原样）；
     5. 机制空缺：price_levels 是新类别（D45）——排序类理由，不阻塞。
     """
     if candidate.status in BOOKKEEPING_STATUSES:
@@ -1342,8 +1494,6 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
             checks={}, events_per_year=None)
     pdecl = candidate.prob_declared
     assert pdecl is not None        # price_levels 装载层已保证带 [prob]
-    # T97 情景点差（先决 2）：era 判定读 bars meta.json 的 first_time
-    from mt5quant.prob.gaps import mt5_first_time
 
     checks: dict[str, dict] = {}
     reasons: list[str] = []
@@ -1375,12 +1525,11 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
     # 条件 3：事前成本（R 口径；审核二 Q1：逐品种检查，每个品种都要满足，
     # 等价于按成本最高的品种判断；Q2：佣金 = commission_per_lot / cs 为价格
     # 单位，再除以 (sl_atr×ATR) 换成 R）。每个条件都给出结果，不短路。
-    # T97 情景点差（先决 2）：候选声明 cost_scenario_mult 时按双档计算——
-    # era 判定 = 触发时刻 < {data_root}/bars/{品种}/{周期}/meta.json 的
-    # first_time → ext 段（precheck 内部读 meta；缺 meta → 无 ext 触发）；
-    # ext 触发的点差分别按 1x / 保守档 mult[1] / 参考档计算，
-    # cost_r_by_symbol（绑定 passed）用保守档，1x 与参考档（若有）并列
-    # 进 checks。缺省（cost_scenario_mult=None）与 T97 之前逐位相同。
+    # T104 批 2（audit2 P2-04/P2-05）：
+    # - era 逐行消费 source_tags（见 docstring）——meta.first_time 不再
+    #   参与预筛 era 判定；来源不可得 → 拒绝成本判定（不退 1×）；
+    # - 成本边界全量校验有限值/正分母——NaN/±Inf/零分母 → 该品种成本
+    #   判定失败（fail），绝不默认 pass。
     scenario_mult = (float(pdecl.cost_scenario_mult[1])
                      if pdecl.cost_scenario_mult is not None else None)
     scenario_ref = (float(pdecl.cost_scenario_reference)
@@ -1393,38 +1542,156 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
         if rows is None or len(rows) == 0:
             per_symbol[sym] = {"n": 0, "cost_r": None}
             continue
-        cs = _contract_size(data_root, sym)
-        comm_price = cost_model.commission_per_lot(sym) / cs
-        first = (mt5_first_time(data_root, sym, candidate.holding)
-                 if scenario_mult is not None else None)
-        times = (pd.to_datetime(rows["time"]) if first is not None else None)
-
-        def _cost_r(ext_spread_mult: float) -> float:
-            """ext 行点差 ×ext_spread_mult（1.0 = 无情景），均值 R 口径。"""
-            vals = []
-            for k, r in enumerate(rows.itertuples(index=False)):
-                hour, price = int(r.ny_hour), float(r.close)
-                spr = cost_model.spread_p90(sym, hour, price=price)
-                slip = cost_model.slippage(sym, hour, price=price)
-                m = (ext_spread_mult
-                     if times is not None and times.iloc[k] < first else 1.0)
-                r_price = pdecl.bracket["sl_atr"] * float(r.atr)
-                vals.append((m * spr + 2.0 * slip + comm_price) / r_price)
-            return float(np.mean(vals))
-
-        entry = {"n": int(len(rows)), "cost_r": _cost_r(1.0)}
+        entry: dict = {"n": int(len(rows))}
+        # —— P2-05：合约大小（坏值不再抛异常中断——按品种判失败并披露）
+        try:
+            cs = _contract_size(data_root, sym)
+        except CandidateError as e:
+            per_symbol[sym] = {**entry, "cost_r": None,
+                               "invalid_reason": f"合约大小不可用：{e}"}
+            continue
+        # —— P2-05：佣金（价格单位 = commission_per_lot / cs）
+        comm_lot, err = _finite_or_none(
+            f"{sym} commission_per_lot", cost_model.commission_per_lot(sym),
+            positive=False)
+        if err is not None:
+            per_symbol[sym] = {**entry, "cost_r": None,
+                               "invalid_reason": f"佣金非法（{err}）"}
+            continue
+        comm_price = comm_lot / cs
+        # —— P2-04：era 逐行来源标签（只对声明情景档的候选生效）
+        ext_mask: list[bool] | None = None
+        if scenario_mult is not None:
+            ext_mask, era_err = _row_ext_mask(
+                rows, (source_tags_by_symbol or {}).get(sym))
+            if ext_mask is None:
+                per_symbol[sym] = {**entry, "cost_r": None,
+                                   "era_refused": era_err}
+                continue
+        # —— 逐行成本装配（单趟；三档共用同一组输入）
+        sl_denom = float(pdecl.bracket["sl_atr"])
+        ext_costs_bind = (ScenarioCosts(cost_model, scenario_mult)
+                          if scenario_mult is not None else None)
+        ext_costs_ref = (ScenarioCosts(cost_model, scenario_ref)
+                         if (scenario_mult is not None
+                             and scenario_ref is not None) else None)
+        vals_1x: list[float] = []
+        vals_bind: list[float] = []
+        vals_ref: list[float] = []
+        bad: list[str] = []
+        for k, r in enumerate(rows.itertuples(index=False)):
+            bar_id = getattr(r, "bar", "?")
+            atr, e_atr = _finite_or_none(f"bar{bar_id} ATR", r.atr,
+                                         positive=True)
+            price, e_price = _finite_or_none(f"bar{bar_id} close", r.close,
+                                             positive=True)
+            problems = [e for e in (e_atr, e_price) if e is not None]
+            if problems:
+                bad.extend(problems)
+                continue
+            r_price = sl_denom * atr
+            if not (math.isfinite(r_price) and r_price > 0.0):
+                bad.append(f"bar{bar_id} 风险分母 sl_atr×ATR={r_price!r} "
+                           "须为有限正数")
+                continue
+            try:
+                hour = int(r.ny_hour)
+            except (TypeError, ValueError):
+                bad.append(f"bar{bar_id} ny_hour={r.ny_hour!r} 非整数")
+                continue
+            spr, e_spr = _finite_or_none(
+                f"bar{bar_id} spread_p90",
+                cost_model.spread_p90(sym, hour, price=price), positive=False)
+            slip, e_slip = _finite_or_none(
+                f"bar{bar_id} slippage",
+                cost_model.slippage(sym, hour, price=price), positive=False)
+            problems = [e for e in (e_spr, e_slip) if e is not None]
+            if problems:
+                bad.extend(problems)
+                continue
+            cost_1x = spr + 2.0 * slip + comm_price
+            if not math.isfinite(cost_1x):
+                bad.append(f"bar{bar_id} 来回成本非有限数"
+                           f"（spread={spr!r} slippage={slip!r} "
+                           f"commission={comm_price!r}）")
+                continue
+            vals_1x.append(cost_1x / r_price)
+            if ext_costs_bind is not None:
+                # P1 同一情景装配：ext 行点差经 ScenarioCosts × 档
+                # （其余分量不缩放）；MT5 行原模型
+                spr_bind = (ext_costs_bind.spread_p90(sym, hour, price=price)
+                            if ext_mask[k] else spr)
+                cost_bind = spr_bind + 2.0 * slip + comm_price
+                if not math.isfinite(cost_bind):
+                    bad.append(f"bar{bar_id} 情景档成本非有限数"
+                               f"（spread×{scenario_mult:g}={spr_bind!r}）")
+                    continue
+                vals_bind.append(cost_bind / r_price)
+                if ext_costs_ref is not None:
+                    spr_ref = (ext_costs_ref.spread_p90(sym, hour, price=price)
+                               if ext_mask[k] else spr)
+                    vals_ref.append((spr_ref + 2.0 * slip + comm_price)
+                                    / r_price)
+        if bad:
+            head = "；".join(bad[:3]) + (f"（另 {len(bad) - 3} 项）"
+                                        if len(bad) > 3 else "")
+            per_symbol[sym] = {**entry, "cost_r": None,
+                               "invalid_reason": head,
+                               "invalid_rows": len(bad)}
+            continue
+        entry["cost_r"] = float(np.mean(vals_1x)) if vals_1x else None
         if scenario_mult is not None:
             entry["cost_r_1x"] = entry["cost_r"]
-            entry["cost_r"] = _cost_r(scenario_mult)     # 保守档绑定
-            entry["ext_n"] = (int((times < first).sum())
-                              if times is not None else 0)
+            entry["cost_r"] = (float(np.mean(vals_bind))
+                               if vals_bind else None)
+            entry["ext_n"] = int(sum(ext_mask))
             if scenario_ref is not None:
-                entry["cost_r_ref"] = _cost_r(scenario_ref)
+                entry["cost_r_ref"] = (float(np.mean(vals_ref))
+                                       if vals_ref else None)
         per_symbol[sym] = entry
     known = {s: d["cost_r"] for s, d in per_symbol.items()
              if d["cost_r"] is not None}
+    invalid = {s: d["invalid_reason"] for s, d in per_symbol.items()
+               if d.get("invalid_reason")}
+    era_refused = {s: d["era_refused"] for s, d in per_symbol.items()
+                   if d.get("era_refused")}
     cost_ok: bool | None
-    if len(known) == len(candidate.symbols):
+    if invalid:
+        # P2-05：数值非法（NaN/±Inf/零分母/坏合约）→ 该品种成本判定失败
+        # ——fail（不是 waiting_data：行已过计数资格，非法数值是数据质量
+        # 硬违例，重新排队不能修），好品种的成本照常给出供复核。
+        failing = sorted(s for s, v in known.items()
+                         if edge_ev_r < _COST_MULTIPLE_MIN * v)
+        cost_ok = False
+        dearest = max(known, key=lambda s: known[s]) if known else None
+        checks["ex_ante_cost_prob"] = {
+            "passed": False, "edge_ev_r": edge_ev_r,
+            "expected_delta_p": pdecl.expected_delta_p, "tp_r": tp_r,
+            "binding_symbol": dearest,
+            "cost_r_by_symbol": {s: float(v) for s, v in known.items()},
+            "failing_symbols": failing,
+            "invalid_symbols": sorted(invalid),
+            "invalid_detail": {s: invalid[s] for s in sorted(invalid)},
+            "min": _COST_MULTIPLE_MIN,
+            "formula": "逐品种：ΔEV_R = Δp×(tp_R+1) ≥ 3×来回成本(R) 须对每个"
+                       "品种成立（等价于按成本最高品种判断，Q1）；成本 = 触发"
+                       "纽约小时（点差+双腿滑点+佣金/合约大小）÷ (sl_atr×ATR)"
+                       "的均值（Q2：佣金 commission_per_lot/cs 为价格单位）",
+            "note": "P2-05：成本边界全量校验——ATR/价格/合约大小/逐项费用/"
+                    "最终 R 须为有限数且风险分母严格为正；非法品种的成本"
+                    "判定失败（不默认 pass，不写 NaN 指标）。已知限制：未计"
+                    "入隔夜费与止损越幅；基准赢率固定为 0.40"}
+        for s in sorted(invalid):
+            reasons.append(
+                f"事前成本：{s} 的成本输入非法（{invalid[s]}）→ 该品种"
+                "成本判定失败（预筛条件 3；P2-05：NaN/±Inf/零分母不默认"
+                " 通过）")
+        for s in failing:
+            reasons.append(
+                f"事前成本：ΔEV {edge_ev_r:.4f}R < "
+                f"{_COST_MULTIPLE_MIN:g}×{known[s]:.4f}R（{s}——逐品种检查，"
+                "预筛条件 3：折算 Δp 覆盖不了该品种的 3 倍成本）")
+    elif len(known) == len(candidate.symbols):
         # 逐品种判定（Q1）：任一品种 ΔEV < 3×cost → 不通过
         failing = sorted(s for s, v in known.items()
                          if edge_ev_r < _COST_MULTIPLE_MIN * v)
@@ -1445,17 +1712,21 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
                     "（比按止损止盈推算的 sl/(sl+tp)=1/3 保守）"}
         if scenario_mult is not None:
             # T97 情景点差（先决 2）：cost_r_by_symbol 已是保守档（绑定）；
-            # 1x 基准档与非绑定参考档（若有）并列报告，era 规则写明可复核。
+            # 1x 基准档与非绑定参考档（若有）并列报告，era 规则写明可复核
+            # （T104 批 2：era 逐行按 source_tags——见 era_rule）。
             checks["ex_ante_cost_prob"].update({
                 "cost_r_by_symbol_1x": {s: float(per_symbol[s]["cost_r_1x"])
                                         for s in known},
                 "cost_scenario_mult": [1.0, scenario_mult],
                 "ext_trigger_n_by_symbol": {s: int(per_symbol[s]["ext_n"])
                                             for s in known},
-                "era_rule": "ext 段触发 = 触发时刻 < {data_root}/bars/"
-                            "{品种}/{周期}/meta.json 的 first_time（缺 "
-                            "meta → 无 ext 触发）；ext 触发点差 × 情景档"
-                            "（其余分量不缩放），判定绑定保守档",
+                "era_rule": "ext 段触发 = 该行 source_tags"
+                            "（merged_research_series 的逐行来源标签，按 "
+                            'counted.bar 下标对齐）为 "ext:*"（"mt5" = MT5 '
+                            "段）；ext 触发点差经 ScenarioCosts × 情景档"
+                            "（与 P1 标签路径同一装配：只乘点差、其余分量"
+                            "不缩放），判定绑定保守档；来源标签不可得 → "
+                            "拒绝该品种成本判定（不退 1×）",
             })
             if scenario_ref is not None:
                 checks["ex_ante_cost_prob"]["cost_r_by_symbol_ref3"] = {
@@ -1467,27 +1738,65 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
                 f"事前成本：ΔEV {edge_ev_r:.4f}R < "
                 f"{_COST_MULTIPLE_MIN:g}×{known[s]:.4f}R（{s}——逐品种检查，"
                 "预筛条件 3：折算 Δp 覆盖不了该品种的 3 倍成本）")
+    elif era_refused:
+        # P2-04 fail-closed：声明情景档而来源标签不可得 → 拒绝该成本判定
+        # （cost_ok=None → waiting_data：数据/接线缺失属"待数据"，补
+        # merged_research_series 的 source_tags 重跑 bt candidate check；
+        # 绝不静默退 1×、绝不用 meta.first_time 猜 era）。
+        cost_ok = None
+        checks["ex_ante_cost_prob"] = {
+            "passed": None, "edge_ev_r": edge_ev_r,
+            "expected_delta_p": pdecl.expected_delta_p, "tp_r": tp_r,
+            "cost_r_by_symbol": {},
+            "era_refused_symbols": sorted(era_refused),
+            "era_refused_detail": {s: era_refused[s]
+                                   for s in sorted(era_refused)},
+            "min": _COST_MULTIPLE_MIN,
+            "cost_scenario_mult": [1.0, scenario_mult],
+            "note": "候选声明 [prob].cost_scenario_mult 而逐行来源标签"
+                    "（source_tags）不可得——ext/Mt5 时代无从逐行证明，"
+                    "拒绝该成本判定（audit2 P2-04 fail-closed：不静默退 "
+                    "1×、不用 meta.first_time 猜 era）→ 待数据（用 "
+                    "merged_research_series 的 source_tags 重跑 bt "
+                    "candidate check）"}
+        for s in sorted(era_refused):
+            reasons.append(
+                f"事前成本：{s} 的 ext/Mt5 时代来源标签不可得"
+                f"（{era_refused[s]}）——情景档成本无从装配，拒绝该成本"
+                "判定（不退 1×，P2-04 fail-closed）→ 待数据（补 "
+                "merged_research_series 的逐行 source_tags 后重检）")
     else:
         cost_ok = None      # 无计数 → 条件如实给出"无法计算"，不视为通过
         checks["ex_ante_cost_prob"] = {
             "passed": None, "edge_ev_r": edge_ev_r,
             "note": "无触发计数——成本无从按小时分布计算（与检验力同因）"}
+    if source_tags_by_symbol is not None or gap_spans_by_symbol is not None:
+        # T104 批 2：来源/洞口径随行登记（可复核；计数侧抑制由
+        # count_triggers 消费 gap_spans——甲接线，预筛不重复过滤）。
+        checks["source_provenance"] = {
+            "symbols_with_source_tags": sorted(
+                s for s in (source_tags_by_symbol or {})),
+            "gap_spans_by_symbol": {
+                s: len(v or []) for s, v in (gap_spans_by_symbol or
+                                             {}).items()},
+            "era_source": "merged_research_series source_tags（逐行，按 "
+                          "counted.bar 对齐；P2-04）"}
 
     # 条件 4：检验力（审核二 Q3/Q6，D52）——样本单位为发现段内的**触发
     # 日数**（同一天多次触发记 1，与 P1 主检验的按日聚合一致）；Bonferroni
     # 条数 = 候选登记的假设条数；逐条判定：不足的假设机械判 waiting_data
     # 并列出（开轮时从本轮移除，不替换动作、不改方向），候选至少一条通过
-    # 才算通过；开轮复核按全轮假设条数再算一遍（T77 用同一函数的全轮口径）。
-    # T76 收尾接线：样本量 = max(解析 D52, T75 实测)——实测规则见
-    # measured_n_required；实测 None（Δp<0.02 未测出）不参与 max，
-    # 该假设恒 waiting_data；开区间档（0.02≤Δp≤0.03）须严格大于。
+    # 才算通过；开轮复核按全轮假设条数再算一遍（同一授权口径）。
+    # T104 批 2（audit2 P2-08）：授权判定统一走 sample_size_evidence 的
+    # 证据三分——数值锚点不动（measured_n_required 原样），只改"开区间
+    # 档（0.02≤Δp<0.03）超记录下界 = pass"的旧语义为恒 waiting_data
+    # （已测最大格 power<50% 只能证明未知门槛尚未达到；批 4 新方法标定
+    # 闭合后按批准版本更新）。
     n_hyp = len(pdecl.hypotheses)
-    n_required = power.n_needed_proportion(
-        _PROB_BASE_RATE, pdecl.expected_delta_p,
-        alpha=_POWER_ALPHA, power=_POWER_MIN, n_tests=n_hyp)
-    n_meas, open_ended = measured_n_required(n_hyp, pdecl.expected_delta_p)
-    n_used = (None if n_meas is None
-              else max(int(n_required), n_meas))
+    n_required, n_meas, n_used, open_ended = _sample_size_numbers(
+        pdecl.expected_delta_p, n_hyp)
+    _ev_dec, ev_state, _ev_detail = sample_size_evidence(
+        pdecl.expected_delta_p, None, n_hyp=n_hyp)
     per_hypothesis: dict[str, dict] = {}
     insufficient: list[str] = []
     if counted is None or len(counted) == 0:
@@ -1501,15 +1810,16 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
             sit, act = h.split(":")[0], h.split(":")[1]
             n_days = int(sub.loc[(sub["situation"] == sit)
                                  & (sub["action"] == act), "day"].nunique())
-            if n_used is None:              # 实测未覆盖 → 恒 waiting_data
-                ok_h = False
-            elif open_ended:                # 开区间档：须 days > n_required
-                ok_h = n_days > n_used
-            else:
-                ok_h = n_days >= n_used
+            # P2-08：逐条授权 = 同一 sample_size_evidence（precheck 与
+            # bt 开轮复核共用；丁接线 bt.py 的 _d52_required）
+            dec_h, state_h, detail_h = sample_size_evidence(
+                pdecl.expected_delta_p, n_days, n_hyp=n_hyp)
+            ok_h = dec_h == "pass"
             per_hypothesis[h] = {"trigger_days": n_days,
                                  "required_days": n_used,
-                                 "passed": bool(ok_h)}
+                                 "passed": bool(ok_h),
+                                 "evidence_state": state_h,
+                                 "evidence_detail": detail_h}
             if not ok_h:
                 insufficient.append(h)
         power_ok = len(per_hypothesis) > len(insufficient)
@@ -1520,8 +1830,19 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
         "n_required_analytic": int(n_required),
         "n_required_measured": n_meas,   # None = T75 实测未覆盖（Δp<0.02）
         "n_required_used": n_used,       # max(解析, 实测)；None = 恒待数据
-        "open_ended": open_ended,
+        "open_ended": open_ended,        # 记录用（0.02 端开区间标志；不再授权）
         "rule_source": "t75-measured+z2",
+        "evidence_state": ev_state,      # P2-08 候选级证据状态
+        "evidence_note": (
+            "P2-08 证据三分（授权口径 = sample_size_evidence，precheck 与"
+            "开轮复核共用）：calibrated_sufficient（Δp≥0.03：T75 实测 "
+            "0.03/0.05 档功率 ≥50%——2000@53%、1000@70%，档间插值与 >0.05 "
+            "沿段斜率外推）：days ≥ max(解析 D52, T75 实测) 即过；"
+            "lower_bound_only（0.02≤Δp<0.03）：只测到 34% 功率@4000 名义"
+            "（≈1732 实际日）——下界记录 4000 名义/1732 实际，充分门槛"
+            "未标定：超记录下界不再授权 pass，恒 waiting_data（批 4 新方法"
+            "完整标定且充分门槛闭合后按批准版本更新）；uncalibrated"
+            "（Δp<0.02）：未测出，恒 waiting_data（不外推）"),
         "per_hypothesis": per_hypothesis,
         "insufficient": insufficient,
         "passing_count": len(per_hypothesis) - len(insufficient),
@@ -1535,20 +1856,29 @@ def precheck_prob(candidate: Candidate, *, data_root, cost_model, counted,
                  "=候选登记假设数；样本量取解析 D52 与 T75 实测规则"
                  "（rule_source=t75-measured+z2：单假设锚点 4000@0.02（开）/"
                  "2000@0.03/1000@0.05 插值、>0.05 沿段斜率外推 max(0,·)，"
-                 "假设数按 (z_α(n)/z_α(1))² 换算）的更严者——实测未覆盖"
-                 "（Δp<0.02）恒待数据，开区间档（0.02≤Δp≤0.03）判 pass 需 "
-                 "days > n_required；不足的假设判 waiting_data（开轮时移出，"
-                 "不替换不改向），候选至少一条通过才算通过；开轮复核用同一"
-                 "函数按全轮假设条数（T77）")}
+                 "假设数按 (z_α(n)/z_α(1))² 换算）的更严者——授权按 P2-08 "
+                 "证据三分（evidence_note）：实测未覆盖（Δp<0.02）恒待数据，"
+                 "开区间档（0.02≤Δp<0.03）超记录下界不再授权 pass；不足的"
+                 "假设判 waiting_data（开轮时移出，不替换不改向），候选至少"
+                 "一条通过才算通过；开轮复核用同一 sample_size_evidence 按"
+                 "全轮假设条数")}
     if counted is not None and len(counted) > 0:
         for h in insufficient:
             d = per_hypothesis[h]
-            if d["required_days"] is None:
+            if d["evidence_state"] == "uncalibrated":
                 reasons.append(
                     f"检验力：假设 {h} 的 T75 实测规则未覆盖"
                     f"（Δp={pdecl.expected_delta_p:g} < 标定下界 0.02——"
                     "开区间下界未测出，不外推）→ 该假设恒待数据"
                     "（铁律 18；延长标定覆盖前不随触发日数增加改变）")
+            elif d["evidence_state"] == "lower_bound_only":
+                reasons.append(
+                    f"检验力：假设 {h} 发现段触发日数 {d['trigger_days']}"
+                    f"（记录下界 {d['required_days']} 日）——开区间档"
+                    f"（Δp={pdecl.expected_delta_p:g}）{_LOWER_BOUND_NOTE}"
+                    "：超过记录下界不授权 pass（P2-08：已测最大格功率 "
+                    "34%<50% 只能证明未知门槛尚未达到；批 4 新方法标定"
+                    "闭合前恒待数据，不随触发日数增加改变）")
             else:
                 reasons.append(
                     f"检验力：假设 {h} 发现段触发日数 {d['trigger_days']} < "
