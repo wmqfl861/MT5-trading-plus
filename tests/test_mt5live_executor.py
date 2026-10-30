@@ -1231,3 +1231,312 @@ def test_open_comment_safe_and_decision_id_recoverable_from_logs(tmp_path):
     assert read_intent(tmp_path)["cause"] == d.decision_id
     with open(tmp_path / f"orders-{MAGIC}.jsonl", encoding="utf-8") as f:
         assert json.loads(f.readline())["decision_id"] == d.decision_id
+
+
+def test_h2_01_unknown_order_result_is_durable_and_blocks_reopen(tmp_path):
+    """Broker 已成交但 ack 丢失：不得把未知结果写成 confirmed，重启后禁止重发。"""
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    original = ex._adapter.execute
+
+    def fill_then_lose_ack(decision):
+        original(decision)
+        raise OSError("ack lost after broker fill")
+
+    ex._adapter.execute = fill_then_lose_ack
+    with pytest.raises(OSError, match="ack lost"):
+        ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                            decision_id="XAUUSD|M15|h2-01"), NOW)
+    assert len(b.market_orders) == 1
+    state_path = tmp_path / f"state-{MAGIC}.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["execution_unknown"]["status"] == "unknown"
+    assert read_intent(tmp_path)["status"] == "pending"
+
+    ex2 = _mk_executor(b, tmp_path)
+    rr = ex2.poll(mk_decision(signal=1, volume_lots=0.02,
+                              decision_id="XAUUSD|M15|h2-01"),
+                  NOW.replace(minute=15))
+    # 成交已实际反映为目标仓位时允许纯 hold（零订单）；若未成交则
+    # 必须 blocked_execution_unknown。两种情况都不得重发开仓。
+    assert rr.action in ("blocked_execution_unknown", "hold")
+    assert len(b.market_orders) == 1
+    assert json.loads(state_path.read_text(encoding="utf-8"))[
+        "execution_unknown"]["status"] == "unknown"
+
+
+def test_h2_01_pending_intent_found_on_restart_is_unknown(tmp_path):
+    """进程在 pending 意图写入后崩溃，重启必须保守阻止新开仓。"""
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    ex._write_pending(0.02, "XAUUSD|M15|crash-window", NOW)
+    ex2 = _mk_executor(b, tmp_path)
+    state = json.loads((tmp_path / f"state-{MAGIC}.json").read_text(
+        encoding="utf-8"))
+    assert state["execution_unknown"]["status"] == "unknown"
+    rr = ex2.poll(mk_decision(signal=1, volume_lots=0.02,
+                              decision_id="XAUUSD|M15|next"),
+                  NOW.replace(minute=15))
+    assert rr.action == "blocked_execution_unknown"
+    assert b.market_orders == []
+
+def test_h2_02_old_protective_deal_cannot_explain_later_manual_exit(tmp_path):
+    """先观察部分 SL 后，再人工平掉余仓；旧 SL ticket 不得再次解释新出场。"""
+    from mt5gw.models import DEAL_REASON_CLIENT, DEAL_REASON_SL
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|h2-02-open"), NOW).action == "open"
+    ticket = b.positions()[0].ticket
+
+    # 0.02 → 0.01：SL deal 在本轮可见，执行器必须把它记为已消费。
+    b.reduce_external(ticket, 0.01, reason=DEAL_REASON_SL, comment="[sl]")
+    ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                        decision_id="XAUUSD|M15|h2-02-partial"),
+             NOW.replace(minute=15))
+    state = json.loads((tmp_path / f"state-{MAGIC}.json").read_text(
+        encoding="utf-8"))
+    consumed = state["known_positions"][str(ticket)]["consumed_deal_tickets"]
+    assert consumed, "已观察的部分 SL deal ticket 必须持久消费"
+
+    # 模拟执行器进程重启：已消费的旧 SL ticket 必须从 state 文件恢复。
+    ex = _mk_executor(b, tmp_path)
+    restored = ex._state["known_positions"][ticket]["consumed_deal_tickets"]
+    assert restored == consumed
+
+    # 新人工平仓的历史暂不可见；旧 SL 仍在历史里，但已被排除。
+    b.deals_delay_polls = 100
+    b.close_external(ticket, reason=DEAL_REASON_CLIENT, comment="manual")
+    rr = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                             decision_id="XAUUSD|M15|h2-02-manual"),
+                 NOW.replace(minute=30))
+    assert rr.action == "blocked_external_exit"
+    assert len(b.market_orders) == 1
+
+    # 重启后 pending 的 consumed ticket / event type 仍须保留。
+    ex2 = _mk_executor(b, tmp_path)
+    rr_restart = ex2.poll(mk_decision(signal=1, volume_lots=0.02,
+                                      decision_id="XAUUSD|M15|h2-02-restart"),
+                          NOW.replace(minute=40))
+    assert rr_restart.action == "blocked_external_exit"
+    assert len(b.market_orders) == 1
+
+    # 即使人工成交随后变得可见，也必须保持未决，不能被旧 SL 洗白。
+    b._deal_visible_at[-1] = 0
+    rr2 = ex2.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|h2-02-visible"),
+                   NOW.replace(minute=45))
+    assert rr2.action == "blocked_external_exit"
+    state2 = json.loads((tmp_path / f"state-{MAGIC}.json").read_text(
+        encoding="utf-8"))
+    assert state2["pending_external_exits"][str(ticket)]["manual_exit_observed"] is True
+    assert len(b.market_orders) == 1
+
+def test_h2_01_ack_execution_requires_stopped_runner_and_no_pending_orders(tmp_path):
+    """UNKNOWN 解除脚本必须遵守 runner 锁，并拒绝有挂单时解除。"""
+    from scripts.live_ack_execution import ack_execution
+    from mt5live.runner import MagicInstanceLock
+
+    live_dir = str(tmp_path)
+    state_path = tmp_path / f"state-{MAGIC}.json"
+    state_path.write_text(json.dumps({
+        "magic": MAGIC, "execution_unknown": {
+            "status": "unknown", "decision_id": "d-ack",
+            "symbol": "XAUUSD", "ts": NOW.isoformat()}}), encoding="utf-8")
+
+    class _Account:
+        def __init__(self, pending):
+            self._pending = pending
+        def state(self):
+            from types import SimpleNamespace
+            return SimpleNamespace(login=123456, server="MetaQuotes-Demo")
+        def positions(self):
+            return []
+        def pending_orders(self):
+            return self._pending
+        def deals(self, since, to):
+            return []
+
+    class _GW:
+        def __init__(self, pending):
+            self.account = _Account(pending)
+
+    lock = MagicInstanceLock.for_account(_GW([]).account.state(), MAGIC)
+    assert lock.acquire()
+    try:
+        assert ack_execution(live_dir, _GW([]), MAGIC, "d-ack", "test") == 3
+    finally:
+        lock.release()
+
+    class _Pending:
+        magic = MAGIC
+        ticket = 99
+    assert ack_execution(live_dir, _GW([_Pending()]), MAGIC, "d-ack", "test") == 2
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["execution_unknown"] is not None
+
+def test_h2_01_ack_execution_records_reconciled_broker_snapshot(tmp_path):
+    """人工核对成功后，解除 UNKNOWN 并用 canonical Intent 写入实际净仓快照。"""
+    from scripts.live_ack_execution import ack_execution
+
+    live_dir = str(tmp_path)
+    state_path = tmp_path / f"state-{MAGIC}.json"
+    state_path.write_text(json.dumps({
+        "magic": MAGIC, "execution_unknown": {
+            "status": "unknown", "decision_id": "d-ack-ok",
+            "symbol": "XAUUSD", "ts": NOW.isoformat()}}), encoding="utf-8")
+
+    class _Account:
+        def state(self):
+            from types import SimpleNamespace
+            return SimpleNamespace(login=123456, server="MetaQuotes-Demo")
+        def positions(self):
+            return []
+        def pending_orders(self):
+            return []
+        def deals(self, since, to):
+            return []
+
+    class _GW:
+        account = _Account()
+
+    assert ack_execution(live_dir, _GW(), MAGIC, "d-ack-ok",
+                         "人工核对成交历史与持仓") == 0
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["execution_unknown"] is None
+    assert state["execution_resolution"]["reason"] == "人工核对成交历史与持仓"
+    intent = json.loads((tmp_path / f"expected-{MAGIC}.json").read_text(
+        encoding="utf-8"))
+    assert intent["status"] == "confirmed"
+    assert intent["cause"] == "ack_execution" and intent["volume"] == 0.0
+
+def test_h2_01_normal_hold_does_not_leave_prepared_execution_marker(tmp_path):
+    """目标仓位已达成的正常 hold 不应留下 prepared/UNKNOWN 状态。"""
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    first = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                                decision_id="XAUUSD|M15|hold-open"), NOW)
+    assert first.action == "open"
+    assert len(b.market_orders) == 1
+
+    second = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                                 decision_id="XAUUSD|M15|hold-noop"),
+                     NOW.replace(minute=15))
+    assert second.action == "hold"
+    state = json.loads((tmp_path / f"state-{MAGIC}.json").read_text(
+        encoding="utf-8"))
+    assert state["execution_unknown"] is None
+    assert read_intent(tmp_path)["status"] == "confirmed"
+    assert len(b.market_orders) == 1
+
+def test_h2_01_ack_execution_refuses_missing_history_start_time(tmp_path):
+    """缺少可靠历史起点时不能用任意时间窗清除 UNKNOWN。"""
+    from scripts.live_ack_execution import ack_execution
+    from types import SimpleNamespace
+
+    state_path = tmp_path / f"state-{MAGIC}.json"
+    state_path.write_text(json.dumps({
+        "magic": MAGIC, "execution_unknown": {
+            "status": "unknown", "decision_id": "d-no-ts",
+            "symbol": "XAUUSD"}}), encoding="utf-8")
+
+    class _Account:
+        def state(self):
+            return SimpleNamespace(login=123456, server="MetaQuotes-Demo")
+        def positions(self):
+            return []
+        def pending_orders(self):
+            return []
+        def deals(self, since, to):
+            raise AssertionError("deals must not be queried without a trustworthy start")
+
+    class _GW:
+        account = _Account()
+
+    assert ack_execution(str(tmp_path), _GW(), MAGIC, "d-no-ts", "manual") == 2
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["execution_unknown"] is not None
+
+def test_h2_01_malformed_execution_marker_type_fails_closed(tmp_path):
+    """JSON 可解析但 execution_unknown 类型损坏时，也必须保守阻止开仓。"""
+    b = FakeBroker()
+    (tmp_path / f"state-{MAGIC}.json").write_text(
+        json.dumps({"execution_unknown": []}), encoding="utf-8")
+    ex = _mk_executor(b, tmp_path)
+    assert ex._state["execution_unknown"]["status"] == "unknown"
+    rr = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                             decision_id="XAUUSD|M15|bad-marker"), NOW)
+    assert rr.action == "blocked_execution_unknown"
+    assert b.market_orders == []
+
+def test_h2_01_ack_execution_write_order_keeps_unknown_if_state_commit_fails(tmp_path, monkeypatch):
+    """canonical intent 写入后 state 清除失败时，旧 UNKNOWN 必须仍阻止开仓。"""
+    import scripts.live_ack_execution as ack_mod
+    from scripts.live_ack_execution import ack_execution
+    from types import SimpleNamespace
+
+    state_path = tmp_path / f"state-{MAGIC}.json"
+    state_path.write_text(json.dumps({
+        "magic": MAGIC, "execution_unknown": {
+            "status": "unknown", "decision_id": "d-write-order",
+            "symbol": "XAUUSD", "ts": NOW.isoformat()}}), encoding="utf-8")
+
+    class _Account:
+        def state(self):
+            return SimpleNamespace(login=123456, server="MetaQuotes-Demo")
+        def positions(self):
+            return []
+        def pending_orders(self):
+            return []
+        def deals(self, since, to):
+            return []
+
+    class _GW:
+        account = _Account()
+
+    real_write = ack_mod.write_json_atomic
+    def fail_state_write(path, payload):
+        if str(path) == str(state_path):
+            raise OSError("simulated state commit failure")
+        return real_write(path, payload)
+    monkeypatch.setattr(ack_mod, "write_json_atomic", fail_state_write)
+    with pytest.raises(OSError, match="state commit failure"):
+        ack_execution(str(tmp_path), _GW(), MAGIC, "d-write-order", "manual review")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    intent = json.loads((tmp_path / f"expected-{MAGIC}.json").read_text(
+        encoding="utf-8"))
+    assert state["execution_unknown"]["status"] == "unknown"
+    assert intent["status"] == "confirmed" and intent["cause"] == "ack_execution"
+
+def test_h2_02_pending_partial_exit_metadata_survives_restart(tmp_path):
+    """成交历史延迟时，部分减仓 pending 状态跨重启保留并只消费一次。"""
+    from mt5gw.models import DEAL_REASON_SL
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|h2-02-delay-open"), NOW).action == "open"
+    ticket = b.positions()[0].ticket
+    b.deals_delay_polls = 100
+    b.reduce_external(ticket, 0.01, reason=DEAL_REASON_SL)
+    ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                        decision_id="XAUUSD|M15|h2-02-delay-partial"),
+             NOW.replace(minute=15))
+    state = json.loads((tmp_path / f"state-{MAGIC}.json").read_text(
+        encoding="utf-8"))
+    item = state["pending_external_exits"][str(ticket)]
+    assert item["position_still_open"] is True
+    assert item["volume"] == pytest.approx(0.01)
+
+    ex2 = _mk_executor(b, tmp_path)
+    restored = ex2._state["pending_external_exits"][ticket]
+    assert restored["position_still_open"] is True
+    assert restored["volume"] == pytest.approx(0.01)
+    b._deal_visible_at[-1] = 0
+    ex2.poll(mk_decision(signal=1, volume_lots=0.02,
+                         decision_id="XAUUSD|M15|h2-02-delay-visible"),
+             NOW.replace(minute=30))
+    assert ticket not in ex2._state["pending_external_exits"]
+    assert str(b._deals[-1].ticket) in ex2._state["known_positions"][ticket][
+        "consumed_deal_tickets"]

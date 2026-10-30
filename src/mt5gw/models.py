@@ -59,6 +59,9 @@ class SymbolSpec:
     # 4=存款货币 5=年利率(现价) 6=年利率(开仓价) 7=重开仓(现价) 8=重开仓(Bid)
     swap_mode: int = 0
     swap_rollover3days: int = 3   # 三倍隔夜费星期（MT5 枚举周日=0…周六=6；3=周三）
+    # H2-03：MT5 SYMBOL_CURRENCY_BASE；旧终端/旧快照缺失时保持 None，
+    # 不得用 currency_profit 冒充基础币种参与 mode=2 隔夜费换算。
+    currency_base: str | None = None
 
 
 @dataclass(frozen=True)

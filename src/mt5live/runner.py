@@ -29,9 +29,11 @@
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import time as _time
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -67,16 +69,39 @@ class MarketClosedError(RuntimeError):
     """
 
 
-class MagicInstanceLock:
-    """同账户/同 magic 的运行器所有权锁（H-05：两份运行器不得并行）。
+def account_lock_path(account_state, magic: int) -> str:
+    """同一 OS 用户下按 MT5 account(server, login)+magic 派生稳定锁路径。
 
-    ``data/live/runner-<magic>.lock`` 的 1 字节内核锁（Windows
-    msvcrt.locking / POSIX flock）：互斥由内核仲裁（两个进程、乃至同进程
-    两个 fd 一视同仁），持有进程崩溃/退出自动释放——不存在残锁，也不允许
-    "凭 mtime 接管"。acquire 非阻塞：他人持有立即返回 False，调用方
-    （scripts/live_runner）据此拒绝第二份运行器启动。锁文件常驻磁盘
-    （不删除——"释放即删"本身是竞态源），内容为持有者 pid（排查用）。
+    不依赖 data_root，因此同账户同 magic 即使使用不同数据目录也互斥。
+    不把密码、终端路径或完整配置写入文件名/锁文件。
     """
+    login = getattr(account_state, "login", None)
+    server = str(getattr(account_state, "server", "") or "").strip()
+    if isinstance(login, bool) or not isinstance(login, int) or login <= 0 or not server:
+        raise ValueError("无法从 MT5 account state 确定稳定锁身份（需要 login/server）")
+    identity = f"{server.casefold()}|{login}|{int(magic)}"
+    token = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    if os.name == "nt":
+        root = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    else:
+        root = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return os.path.join(root, "mt5-trading-plus", "locks", f"{token}.lock")
+
+
+class MagicInstanceLock:
+    """运行器所有权锁（H-05/H2-01）。
+
+    实盘使用 `for_account(account_state, magic)`，锁身份为 MT5 server/login
+    + magic，锁文件位于 OS 用户级状态目录，因此不同 data_root 也互斥。
+    paper/offline 仍可使用 data_root 内的本地锁。底层为 1 字节内核锁
+    （Windows msvcrt.locking / POSIX flock）：进程崩溃/退出自动释放；
+    acquire 非阻塞；锁文件常驻磁盘且不按 mtime 接管，内容仅记录 pid。
+    """
+
+    @classmethod
+    def for_account(cls, account_state, magic: int) -> "MagicInstanceLock":
+        """建立跨 data_root 的账户级锁（account server/login + magic）。"""
+        return cls(account_lock_path(account_state, magic))
 
     def __init__(self, path: str):
         self.path = path

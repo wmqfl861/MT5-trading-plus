@@ -2,14 +2,15 @@
 import json
 import time
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from mt5live.config import LiveConfig
-from mt5live.runner import (Decision, SignalRunner, default_heartbeat_path,
-                            write_heartbeat)
+from mt5live.runner import (Decision, MagicInstanceLock, SignalRunner,
+                            default_heartbeat_path, write_heartbeat)
 from mt5quant.backtest.engine_a import atr_series
 from mt5quant.strategies.base import BaseStrategy
 from mt5quant.strategies.library.buy_hold import BuyHold
@@ -575,3 +576,23 @@ def test_h05_second_runner_same_magic_refused_by_lock(tmp_path, monkeypatch,
     assert rc == 3                             # 第二份：拒绝启动
     out = capsys.readouterr().out
     assert "拒绝" in out and "777" in out
+
+
+def test_account_lock_is_shared_across_data_roots_for_same_mt5_identity():
+    """不同 data_root 的运行器仍按 server/login/magic 争用同一账户锁。"""
+    state = SimpleNamespace(login=123456, server="MetaQuotes-Demo")
+    first = MagicInstanceLock.for_account(state, 20261101)
+    second = MagicInstanceLock.for_account(state, 20261101)
+    other_login = MagicInstanceLock.for_account(
+        SimpleNamespace(login=654321, server="MetaQuotes-Demo"), 20261101)
+    other_magic = MagicInstanceLock.for_account(state, 20261102)
+    assert first.path == second.path
+    assert first.path != other_login.path
+    assert first.path != other_magic.path
+    assert first.acquire()
+    try:
+        assert not second.acquire()
+        assert other_login.acquire()
+        other_login.release()
+    finally:
+        first.release()

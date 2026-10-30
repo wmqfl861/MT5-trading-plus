@@ -523,6 +523,7 @@ class LiveExecutor:
             live_dir, DEALS_LOG_FMT.format(magic=magic))
         self._decision_bar: str | None = None   # 本轮决策 bar（deals 行用）
         self._state = self._load_state()
+        self._recover_pending_execution()
 
     # ---- 主入口 ----
 
@@ -660,11 +661,33 @@ class LiveExecutor:
         """
         close_only = replace(decision, signal=0, target_position=0,
                              volume_lots=0.0)
+        if self._state.get("execution_unknown") is None:
+            self._state["execution_unknown"] = {
+                "status": "prepared", "decision_id": decision.decision_id,
+                "target": 0.0, "symbol": self._symbol, "ts": iso_utc(n)}
+            self._save_state()
         self._write_pending(0.0, decision.decision_id, n)
         try:
             report = self._adapter.execute(close_only)
-        except Exception:
+        except TradeRejectedError:
+            # 明确拒绝表示该请求未成交；可按当前券商净仓确认，不进入 UNKNOWN。
             self._write_confirmed(decision.decision_id, n)
+            marker = self._state.get("execution_unknown")
+            if isinstance(marker, dict) and marker.get("status") == "prepared" and marker.get("decision_id") == decision.decision_id:
+                self._state["execution_unknown"] = None
+                self._save_state()
+            raise
+        except Exception as exc:
+            marker = self._state.get("execution_unknown")
+            if isinstance(marker, dict) and marker.get("decision_id") == decision.decision_id:
+                marker["status"] = "unknown"
+                marker["reason"] = f"{type(exc).__name__}: {exc}"
+                self._save_state()
+            append_alert(
+                self._live_dir, ALERT_STATE_CORRUPT,
+                f"magic {self._magic} decision {decision.decision_id} 平仓结果未知："
+                f"{type(exc).__name__}: {exc}——保留 pending 意图并暂停新开仓；"
+                "必须核对券商持仓、挂单和成交历史，禁止自动重发", n)
             raise
         return list(report.orders)
 
@@ -703,6 +726,16 @@ class LiveExecutor:
                     "state-*.corrupt-*）——暂停开新仓（平仓不受影响），"
                     "人工核对券商实际持仓并修复/删除 state-<magic>.json "
                     "后重启")
+            elif self._state.get("execution_unknown"):
+                marker = self._state["execution_unknown"]
+                block_action = "blocked_execution_unknown"
+                block_alert = ALERT_STATE_CORRUPT
+                block_reason = (
+                    "execution_unknown: 上一订单的发送/成交结果尚未完成可靠核对"
+                    f"（decision_id={marker.get('decision_id', '')}，"
+                    f"status={marker.get('status', 'unknown')}）——暂停所有新开仓；"
+                    "先核对 MT5 持仓、挂单和成交历史，再通过受控人工确认流程解除；"
+                    "平仓/减仓仍允许")
             else:
                 pending_exits = self._state.get("pending_external_exits") or {}
                 if pending_exits:
@@ -759,15 +792,33 @@ class LiveExecutor:
                         return _rejected(verdict.reason, action="risk_rejected",
                                          orders=orders)
                     return _rejected(verdict.reason)
-        # 下单前（闸门已过）：意图 = 目标持仓（pending；订单未回，对账给宽限）
+        # 下单前持久登记执行生命周期。prepared 在重启时必须视为 UNKNOWN。
+        if self._state.get("execution_unknown") is None:
+            self._state["execution_unknown"] = {
+                "status": "prepared", "decision_id": decision.decision_id,
+                "symbol": self._symbol, "target": float(target), "ts": iso_utc(n)}
+            self._save_state()
         self._write_pending(target, decision.decision_id, n)
         try:
             report = self._adapter.execute(decision)
-        except Exception:
-            # 订单异常返回（被拒/未知）：如实把意图记为当前实际净持仓
-            # （confirmed）——重查持仓后写，未知结果也算"已回"（对账的职责
-            # 才刚开始）；绝不留一个永远等不到回报的 pending。
+        except TradeRejectedError:
+            # 明确拒绝是确定态（订单未成交），可安全确认当前实际净仓。
             self._write_confirmed(decision.decision_id, n)
+            marker = self._state.get("execution_unknown")
+            if isinstance(marker, dict) and marker.get("status") == "prepared" and marker.get("decision_id") == decision.decision_id:
+                self._state["execution_unknown"] = None
+                self._save_state()
+            raise
+        except Exception as exc:
+            marker = self._state.get("execution_unknown")
+            if isinstance(marker, dict) and marker.get("decision_id") == decision.decision_id:
+                marker["status"] = "unknown"
+                marker["reason"] = f"{type(exc).__name__}: {exc}"
+                self._save_state()
+            append_alert(self._live_dir, ALERT_STATE_CORRUPT,
+                         f"magic {self._magic} decision {decision.decision_id} 订单结果未知："
+                         f"{type(exc).__name__}: {exc}——保留 pending 意图并暂停新开仓；"
+                         "必须核对券商持仓、挂单和成交历史，禁止自动重发", n)
             raise
         return self._from_execution(report)
 
@@ -782,8 +833,22 @@ class LiveExecutor:
         无订单的轮次（hold/duplicate/被拒/跳过）绝不改写意图（防洗白）。
         """
         if not any(o.kind in ("open", "close") for o in report.orders):
+            # Hold / duplicate / 仅撤单没有待确认的市价成交。若本轮曾登记
+            # prepared，必须将当前净仓确认为最终状态并清除 marker，
+            # 否则会把无订单的正常轮次误判为 UNKNOWN。
+            marker = self._state.get("execution_unknown")
+            if (isinstance(marker, dict) and marker.get("status") == "prepared"
+                    and marker.get("decision_id") == decision.decision_id):
+                self._write_confirmed(decision.decision_id, n)
+                self._state["execution_unknown"] = None
+                self._save_state()
             return
         self._write_confirmed(decision.decision_id, n)
+        marker = self._state.get("execution_unknown")
+        if (isinstance(marker, dict) and marker.get("status") == "prepared"
+                and marker.get("decision_id") == decision.decision_id):
+            self._state["execution_unknown"] = None
+            self._save_state()
         if report.action in ("add", "reduce"):
             append_alert(
                 self._live_dir, ALERT_UNEXPECTED_RESIZE,
@@ -886,9 +951,24 @@ class LiveExecutor:
         最后一次已知量，H-05 出场解释按该量绑定本次事件）；兼容旧格式
         （纯方向整数，volume 缺省 0）。"""
         if isinstance(v, dict):
+            consumed = v.get("consumed_deal_tickets") or {}
+            if isinstance(consumed, list):
+                consumed = {str(t): 0.0 for t in consumed}
+            if not isinstance(consumed, dict):
+                consumed = {}
             return {"dir": int(v.get("dir", 0)),
-                    "volume": float(v.get("volume") or 0.0)}
-        return {"dir": int(v), "volume": 0.0}
+                    "volume": float(v.get("volume") or 0.0),
+                    "consumed_deal_tickets": {
+                        str(k): float(vol or 0.0)
+                        for k, vol in consumed.items()},
+                    "unmatched_exit_volume": float(
+                        v.get("unmatched_exit_volume") or 0.0),
+                    "manual_exit_observed": bool(
+                        v.get("manual_exit_observed", False))}
+        return {"dir": int(v), "volume": 0.0,
+                "consumed_deal_tickets": {},
+                "unmatched_exit_volume": 0.0,
+                "manual_exit_observed": False}
 
     @staticmethod
     def _parse_pending(data) -> dict:
@@ -903,11 +983,27 @@ class LiveExecutor:
                 except (TypeError, ValueError):
                     continue
                 try:
-                    out[ticket] = {"dir": int(v["dir"]),
-                                   "volume": float(v.get("volume") or 0.0),
-                                   "ts": str(v.get("ts", ""))}
+                    consumed = v.get("consumed_deal_tickets") or {}
+                    if isinstance(consumed, list):
+                        consumed = {str(t): 0.0 for t in consumed}
+                    if not isinstance(consumed, dict):
+                        consumed = {}
+                    out[ticket] = {
+                        "dir": int(v["dir"]),
+                        "volume": float(v.get("volume") or 0.0),
+                        "ts": str(v.get("ts", "")),
+                        "consumed_deal_tickets": {
+                            str(k): float(vol or 0.0) for k, vol in consumed.items()},
+                        "manual_exit_observed": bool(v.get("manual_exit_observed", False)),
+                        "position_still_open": bool(v.get("position_still_open", False)),
+                    }
                 except (KeyError, TypeError, ValueError):
-                    out[ticket] = {"dir": 0, "volume": 0.0, "ts": ""}
+                    out[ticket] = {
+                        "dir": 0, "volume": 0.0, "ts": "",
+                        "consumed_deal_tickets": {},
+                        "manual_exit_observed": True,
+                        "position_still_open": False,
+                    }
         return out
 
     def _load_state(self) -> dict:
@@ -924,7 +1020,15 @@ class LiveExecutor:
                             data.get("pending_external_exits")),
                         "last_decision_id": data.get("last_decision_id"),
                         "state_corrupt": bool(data.get("state_corrupt",
-                                                       False))}
+                                                       False)),
+                        "execution_unknown": (
+                            data.get("execution_unknown")
+                            if isinstance(data.get("execution_unknown"), dict)
+                            else (None if data.get("execution_unknown") is None
+                                  else {"status": "unknown",
+                                        "decision_id": "unknown",
+                                        "reason": "invalid_execution_marker_type"})),
+                        "execution_resolution": data.get("execution_resolution")}
             except (OSError, ValueError, TypeError) as exc:
                 # H-05：状态文件损坏/不可读 ≠ 首次启动——保守恢复：不清空
                 # blocked_dir/pending_external_exits 的保护（原文已不可信，
@@ -946,10 +1050,56 @@ class LiveExecutor:
                     None)
                 return {"blocked_dir": 0, "known_positions": {},
                         "pending_external_exits": {},
-                        "last_decision_id": None, "state_corrupt": True}
+                        "last_decision_id": None, "state_corrupt": True,
+                        "execution_unknown": {"status": "unknown",
+                                               "reason": "state_corrupt"},
+                        "execution_resolution": None}
         return {"blocked_dir": 0, "known_positions": {},
                 "pending_external_exits": {}, "last_decision_id": None,
-                "state_corrupt": False}
+                "state_corrupt": False, "execution_unknown": None,
+                "execution_resolution": None}
+
+    def _recover_pending_execution(self) -> None:
+        """恢复未完成订单意图：pending/prepared 一律视为 UNKNOWN。
+
+        进程可能在 broker 接受请求后、写入 confirmed 前崩溃。不能把
+        pending 意图当成拒单或空仓；在人工核对券商持仓/挂单/成交历史前，
+        持久暂停所有新开仓，只允许风险降低操作。
+        """
+        marker = self._state.get("execution_unknown")
+        if isinstance(marker, dict):
+            if not marker:
+                self._state["execution_unknown"] = {
+                    "status": "unknown", "decision_id": "unknown",
+                    "reason": "empty_execution_marker"}
+                self._save_state()
+                return
+            if marker.get("status") == "prepared":
+                marker["status"] = "unknown"
+                marker["reason"] = "process_restarted_before_confirmation"
+                self._save_state()
+            elif marker.get("status") not in ("unknown",):
+                marker["status"] = "unknown"
+                marker["reason"] = "invalid_execution_marker_status"
+                marker.setdefault("decision_id", "unknown")
+                self._save_state()
+            elif not marker.get("decision_id"):
+                marker["decision_id"] = "unknown"
+                marker["reason"] = marker.get("reason") or "missing_decision_id"
+                self._save_state()
+            return
+        try:
+            with open(self._intent_path, encoding="utf-8") as f:
+                intent = json.load(f)
+        except (OSError, ValueError):
+            return
+        if isinstance(intent, dict) and intent.get("status") == STATUS_PENDING:
+            self._state["execution_unknown"] = {
+                "status": "unknown", "decision_id": str(intent.get("cause") or "unknown"),
+                "symbol": intent.get("symbol"), "target_side": intent.get("side"), "target_volume": intent.get("volume"),
+                "ts": str(intent.get("ts") or ""),
+                "reason": "pending_intent_found_on_restart"}
+            self._save_state()
 
     def _preserve_corrupt_state(self) -> str | None:
         """损坏的状态原文抄送到 state-<magic>.json.corrupt-<时间戳>（H-05
@@ -974,25 +1124,40 @@ class LiveExecutor:
             "updated_at_utc": iso_utc(datetime.now(timezone.utc)),
             "blocked_dir": int(self._state["blocked_dir"]),
             "known_positions": {
-                str(k): {"dir": int(v["dir"]), "volume": float(v["volume"])}
+                str(k): {
+                    "dir": int(v["dir"]), "volume": float(v["volume"]),
+                    "consumed_deal_tickets": dict(
+                        v.get("consumed_deal_tickets") or {}),
+                    "unmatched_exit_volume": float(
+                        v.get("unmatched_exit_volume") or 0.0),
+                    "manual_exit_observed": bool(
+                        v.get("manual_exit_observed", False)),
+                }
                 for k, v in self._state["known_positions"].items()},
             "pending_external_exits": {
                 str(k): dict(v) for k, v in
                 self._state["pending_external_exits"].items()},
             "last_decision_id": self._state.get("last_decision_id"),
             "state_corrupt": bool(self._state.get("state_corrupt")),
+            "execution_unknown": self._state.get("execution_unknown"),
+            "execution_resolution": self._state.get("execution_resolution"),
         }
         write_json_atomic(self._state_path, payload)   # T33：经 fileio（重试）
 
     def _current_positions(self) -> dict[int, dict]:
         """{ticket: {"dir": ±1, "volume": 手数}}（buy=1/sell=-1；C2/R6 起记
         最后一次已知量，供未决出场持久化与 H-05 出场解释绑定本次事件）。"""
-        return {p.ticket: {"dir": 1 if p.side == "buy" else -1,
-                           "volume": float(p.volume)}
-                for p in self._adapter.positions()}
+        return {p.ticket: {
+                    "dir": 1 if p.side == "buy" else -1,
+                    "volume": float(p.volume),
+                    "consumed_deal_tickets": {},
+                    "unmatched_exit_volume": 0.0,
+                    "manual_exit_observed": False,
+                } for p in self._adapter.positions()}
 
     def _explain_exit(self, ticket: int, *,
-                      expected_volume: float | None = None):
+                      expected_volume: float | None = None,
+                      exclude_tickets=(), consumed_out: dict | None = None):
         """按持仓 id 查全部成交，**绑定本次事件**找保护性出场（H-05）。
 
         旧实现拿任意历史 SL/TP/SO 平仓 deal 解释整个仓位消失——部分 SL 早
@@ -1013,9 +1178,11 @@ class LiveExecutor:
             deals = self._adapter.deals_for_position(ticket)
         except Exception as exc:   # 查询失败：按未解释处理（fail-closed）
             return None, f"成交查询失败 {type(exc).__name__}: {exc}"
+        excluded = {int(t) for t in (exclude_tickets or ())}
         closing = sorted(
             (d for d in deals
-             if d.entry in _CLOSING_ENTRIES and d.volume > 0),
+             if d.entry in _CLOSING_ENTRIES and d.volume > 0
+             and int(d.ticket) not in excluded),
             key=lambda d: naive_utc(d.time))
         event = closing
         if expected_volume is not None and event:
@@ -1032,7 +1199,9 @@ class LiveExecutor:
                               "完整？）——按未解释处理")
             event = picked[::-1]
         if not event:
-            return None, "查不到平仓成交"
+            return None, "查不到尚未消费的平仓成交"
+        if consumed_out is not None:
+            consumed_out.update({str(d.ticket): float(d.volume) for d in event})
         if any(d.reason not in _EXPLAINED_REASONS for d in event):
             return None, ("本次事件平仓成交 reason=" + ",".join(
                 str(d.reason) for d in event))
@@ -1102,6 +1271,11 @@ class LiveExecutor:
                 continue                # 事件时间不可判：不凭旧确认放行
             if event_ts <= confirmed_at:
                 del pending[ticket]
+                known = self._state.get("known_positions") or {}
+                if ticket in known:
+                    # 人工确认只消费这个已绑定事件；保留已消费 deal 水位，
+                    # 但不把该 ticket 的后续新出场永久标成 manual-only。
+                    known[ticket]["manual_exit_observed"] = False
 
     def _sync_external_exits(self, n: datetime) -> int:
         """每轮开头：外部出场状态机（T30/C1 + C2/R6）。
@@ -1128,42 +1302,121 @@ class LiveExecutor:
         #    累计数量（= 登记时的最后已知量）从最新成交往回圈定本次事件
         #    （H-05；延迟可见的成交时间不可作过滤条件）
         for ticket in sorted(pending):
-            hit, _ = self._explain_exit(
-                ticket,
-                expected_volume=float(pending[ticket].get("volume") or 0.0))
+            item = pending[ticket]
+            if item.get("manual_exit_observed"):
+                continue  # 完整出场的 CLIENT/未知原因：只能人工 ack
+            if item.get("position_still_open") and ticket in current:
+                # 先前观察到的部分减仓不是整仓出场事件。只要成交量覆盖
+                # 该次观察量，就消费 ticket（无论 CLIENT 还是 SL/TP）。
+                used: dict[str, float] = {}
+                self._explain_exit(
+                    ticket, expected_volume=float(item.get("volume") or 0.0),
+                    exclude_tickets=(item.get("consumed_deal_tickets") or {}).keys(),
+                    consumed_out=used)
+                if sum(used.values()) >= float(item.get("volume") or 0.0) - DEFAULT_VOLUME_TOLERANCE:
+                    del pending[ticket]
+                    if ticket in known:
+                        prior = known[ticket]
+                        prior_consumed = dict(prior.get("consumed_deal_tickets") or {})
+                        prior_consumed.update(used)
+                        prior["consumed_deal_tickets"] = prior_consumed
+                        prior["unmatched_exit_volume"] = max(
+                            0.0, float(prior.get("unmatched_exit_volume") or 0.0)
+                            - sum(used.values()))
+                continue
+            used: dict[str, float] = {}
+            hit, why = self._explain_exit(
+                ticket, expected_volume=float(item.get("volume") or 0.0),
+                exclude_tickets=(item.get("consumed_deal_tickets") or {}).keys(),
+                consumed_out=used)
+            if hit is None and why and "reason=" in why:
+                item["manual_exit_observed"] = True
+                item.setdefault("consumed_deal_tickets", {}).update(used)
             if hit is not None:
                 del pending[ticket]
-                explained_deals.append(str(hit.ticket))
+                explained_deals.extend(sorted(used))
                 self._log_external_exit_deal(hit, n)   # R10/T58 C-2
-        # 2) 本轮新消失的持仓：解释绑定本次事件（H-05）——按成交时间从最新
-        #    往回累计到最后已知量为止；历史部分减量的 deal（先前轮次已观察
-        #    过量变）不再冒充本次出场的解释
+                if ticket in known:
+                    prior = known[ticket]
+                    prior_consumed = dict(prior.get("consumed_deal_tickets") or {})
+                    prior_consumed.update(used)
+                    prior["consumed_deal_tickets"] = prior_consumed
+                    prior["unmatched_exit_volume"] = max(
+                        0.0, float(prior.get("unmatched_exit_volume") or 0.0)
+                        - sum(used.values()))
+        # 2) 对仍存在的 ticket，先消费已观察到的部分减仓成交。
+        # unmatched_exit_volume 记录仓位已减少但成交历史尚未可见的数量；
+        # 已消费 deal ticket 永久排除，迟到的旧 SL 不会解释后续人工平仓。
+        for ticket in sorted(set(known) & set(current)):
+            prior, cur = known[ticket], current[ticket]
+            delta = max(0.0, float(prior["volume"]) - float(cur["volume"]))
+            unmatched = float(prior.get("unmatched_exit_volume") or 0.0) + delta
+            consumed = dict(prior.get("consumed_deal_tickets") or {})
+            manual = bool(prior.get("manual_exit_observed", False))
+            if unmatched > DEFAULT_VOLUME_TOLERANCE and not manual:
+                used: dict[str, float] = {}
+                hit, why = self._explain_exit(
+                    ticket, expected_volume=unmatched,
+                    exclude_tickets=consumed.keys(), consumed_out=used)
+                if used:
+                    consumed.update(used)
+                    unmatched = max(0.0, unmatched - sum(used.values()))
+                # 部分减仓（ticket 仍存在）不是整仓出场事件。即使成交原因
+                # 是 CLIENT，只要对应数量已被观察并消费，也不应永久锁定 ticket。
+                if unmatched > DEFAULT_VOLUME_TOLERANCE:
+                    pending[ticket] = {
+                        "dir": int(prior["dir"]), "volume": unmatched,
+                        "consumed_deal_tickets": dict(consumed),
+                        "manual_exit_observed": False,
+                        "position_still_open": True, "ts": iso_utc(n)}
+                else:
+                    pending.pop(ticket, None)
+            cur["consumed_deal_tickets"] = consumed
+            cur["unmatched_exit_volume"] = unmatched
+            cur["manual_exit_observed"] = manual
+
+        # 3) 完全消失的 ticket：只允许未消费成交解释本次余量；此前观察到
+        # 的部分减仓量计入总观察量，避免旧 SL 再次冒充本次人工/新出场。
         gone = sorted(set(known) - set(current))
         for ticket in gone:
-            hit, why = self._explain_exit(
-                ticket,
-                expected_volume=float(known[ticket].get("volume") or 0.0))
+            prior = known[ticket]
+            consumed = dict(prior.get("consumed_deal_tickets") or {})
+            expected = (float(prior.get("volume") or 0.0)
+                        + float(prior.get("unmatched_exit_volume") or 0.0))
+            old_pending = pending.get(ticket) or {}
+            # pending.volume is a view of unmatched_exit_volume, not an
+            # additional quantity; do not count the same partial reduction twice.
+            manual = (bool(prior.get("manual_exit_observed", False))
+                      or bool(old_pending.get("manual_exit_observed", False)))
+            used: dict[str, float] = {}
+            if manual:
+                hit, why = None, "此前已观察到人工/未知原因出场"
+            else:
+                hit, why = self._explain_exit(
+                    ticket, expected_volume=expected,
+                    exclude_tickets=consumed.keys(), consumed_out=used)
             if hit is not None:
-                explained_deals.append(str(hit.ticket))
+                explained_deals.extend(sorted(used))
                 self._log_external_exit_deal(hit, n)   # R10/T58 C-2
+                pending.pop(ticket, None)
                 continue
             pending[ticket] = {
-                "dir": int(known[ticket]["dir"]),
-                "volume": float(known[ticket]["volume"]),
-                "ts": iso_utc(n)}
+                "dir": int(prior["dir"]), "volume": expected,
+                "consumed_deal_tickets": dict(consumed),
+                "manual_exit_observed": manual or bool(
+                    why and "reason=" in why),
+                "position_still_open": False, "ts": iso_utc(n)}
             append_alert(
                 self._live_dir, ALERT_EXTERNAL_EXIT,
                 f"magic {self._magic} 持仓 {ticket} 消失且无法解释"
                 f"（{why}，须 ∈ SL/TP/SO）——已记入未决出场（暂停开新仓），"
                 "不改意图，交给对账进程（人工核对后 "
                 "scripts/live_ack_external.py）", n)
-        # 3) 意图：本轮有解释成功且未决已清空 → 意图=实际净持仓
-        if explained_deals and not pending:
-            self._write_confirmed(
-                "external_exit:" + ",".join(sorted(explained_deals)), n)
         if gone and self._rules.reentry == "after_signal_change":
             for ticket in gone:
                 blocked = known[ticket]["dir"]  # 非执行器平仓 → 禁同向再入（照旧）
+        if explained_deals and not pending:
+            self._write_confirmed("external_exit:" + ",".join(sorted(set(explained_deals))), n)
         self._state["known_positions"] = current
         self._state["pending_external_exits"] = pending
         self._state["blocked_dir"] = blocked
@@ -1178,7 +1431,17 @@ class LiveExecutor:
         无动作的轮次绝不改写意图——目标持仓没变，改写反而会把外部漂移
         洗白（对账就失去意义了）。
         """
-        self._state["known_positions"] = self._current_positions()
+        observed = self._current_positions()
+        previous = self._state.get("known_positions") or {}
+        for ticket, pos in observed.items():
+            prior = previous.get(ticket) or {}
+            pos["consumed_deal_tickets"] = dict(
+                prior.get("consumed_deal_tickets") or {})
+            pos["unmatched_exit_volume"] = float(
+                prior.get("unmatched_exit_volume") or 0.0)
+            pos["manual_exit_observed"] = bool(
+                prior.get("manual_exit_observed", False))
+        self._state["known_positions"] = observed
         if decision_id is not None:
             self._state["last_decision_id"] = decision_id
         self._save_state()

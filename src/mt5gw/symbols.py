@@ -31,6 +31,8 @@ def _to_spec(row) -> SymbolSpec:
         trade_mode=row.trade_mode,
         currency_profit=row.currency_profit,
         currency_margin=row.currency_margin,
+        # H2-03：旧式 row / 终端缺字段时保留 None，由成本层 fail-closed。
+        currency_base=getattr(row, "currency_base", None),
         contract_size=row.trade_contract_size,  # 包内字段名为 trade_contract_size
         volume_min=row.volume_min,
         volume_max=row.volume_max,

@@ -28,6 +28,7 @@ import argparse
 import os
 import sys
 import time
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,7 +36,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mt5gw import GatewayConfig, MT5Gateway  # noqa: E402
 from mt5gw.errors import DataUnavailableError  # noqa: E402
-from mt5live.monitor import ALERT_ACCOUNT_POLL_ERROR, append_alert  # noqa: E402
+from mt5live.fileio import write_json_atomic  # noqa: E402
+from mt5live.monitor import (  # noqa: E402
+    ALERT_ACCOUNT_POLL_ERROR, ALERT_RISK_HALT, append_alert, iso_utc,
+)
 from mt5live.paper import PaperStateGateway  # noqa: E402（T34 --paper-state）
 from mt5live.riskproc import (  # noqa: E402
     AccountSnapshot,
@@ -99,6 +103,35 @@ def run_one_cycle(risk: RiskProcess, gw) -> CycleResult:
     return res
 
 
+def _write_stall_halt(live_dir: str, stalled_for_s: float, timeout_s: float, *,
+                       now: datetime | None = None) -> bool:
+    """独立 watchdog 检测风控主循环卡死；仅追加 fail-closed halt，不下单。"""
+    if stalled_for_s <= timeout_s:
+        return False
+    halt_path = os.path.join(live_dir, "halt.json")
+    if os.path.exists(halt_path):
+        return False  # 首次原因优先，不覆盖已有停机原因
+    n = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    write_json_atomic(halt_path, {
+        "reason": "risk_process_stalled", "ts": iso_utc(n),
+        "stalled_for_s": float(stalled_for_s),
+        "watchdog_timeout_s": float(timeout_s),
+    })
+    append_alert(live_dir, ALERT_RISK_HALT,
+                 f"风控主循环无进度 {stalled_for_s:.1f}s（阈值 {timeout_s:.1f}s）"
+                 "——独立 watchdog 已写 halt.json；需人工检查账户/Runner/Risk 状态后恢复", n)
+    return True
+
+
+def _risk_watchdog(live_dir: str, progress: list[float], stop: threading.Event,
+                   timeout_s: float) -> None:
+    """与账户轮询分离的 watchdog 线程；主循环阻塞时仍能写入开仓熔断文件。"""
+    while not stop.wait(1.0):
+        stalled = time.monotonic() - progress[0]
+        if _write_stall_halt(live_dir, stalled, timeout_s):
+            return
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="独立风控主循环（只读账户，不下单）")
     ap.add_argument("--config", default="config/risk.toml", help="风控配置 TOML")
@@ -112,6 +145,8 @@ def main(argv=None) -> int:
     ap.add_argument("--once", action="store_true", help="单轮后退出（默认行为）")
     ap.add_argument("--loop", action="store_true", help="常驻轮询")
     ap.add_argument("--interval", type=float, default=10.0, help="轮询间隔（秒）")
+    ap.add_argument("--watchdog-timeout", type=float, default=120.0,
+                    help="独立 watchdog 主循环无进度超时（秒，默认 120）")
     ap.add_argument("--heartbeat-timeout", type=float, default=120.0,
                     help="心跳超时判定（秒）")
     args = ap.parse_args(argv)
@@ -146,13 +181,29 @@ def main(argv=None) -> int:
         append_alert(risk.live_dir, ALERT_ACCOUNT_POLL_ERROR, str(e), now)
         print(f"× {now:%H:%M:%S} 账户轮询失败：{e}")
 
+    watchdog_stop = threading.Event()
+    watchdog_thread = None
+    progress = [time.monotonic()]
+    watchdog_timeout = max(float(args.watchdog_timeout),
+                           float(args.interval) * 2.0 + 5.0)
+    if args.loop:
+        watchdog_thread = threading.Thread(
+            target=_risk_watchdog,
+            args=(risk.live_dir, progress, watchdog_stop, watchdog_timeout),
+            name="risk-progress-watchdog", daemon=True)
+        watchdog_thread.start()
+
+
     try:
         if args.loop:
             while True:
+                progress[0] = time.monotonic()
                 try:
                     run_one_cycle(risk, gw)
                 except DataUnavailableError as e:
                     _poll_failed(e)  # 瞬时失败：告警后下一轮重试
+                finally:
+                    progress[0] = time.monotonic()
                 time.sleep(args.interval)
         try:
             run_one_cycle(risk, gw)
@@ -167,6 +218,9 @@ def main(argv=None) -> int:
         print(f"× {e}")
         return 2
     finally:
+        watchdog_stop.set()
+        if watchdog_thread is not None:
+            watchdog_thread.join(timeout=2.0)
         gw.shutdown()
 
 

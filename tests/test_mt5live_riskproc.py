@@ -799,3 +799,18 @@ def test_script_missing_config_fails(tmp_path, monkeypatch, capsys):
                    str(tmp_path), "--once"])
     assert rc == 2
     assert "nope.toml" in capsys.readouterr().out
+
+
+def test_script_stall_watchdog_writes_fail_closed_halt_and_preserves_first_cause(tmp_path):
+    mod = load_script()
+    live = tmp_path / "live"
+    now = datetime(2026, 10, 30, 15, 0)
+    assert mod._write_stall_halt(str(live), 10.0, 20.0, now=now) is False
+    assert mod._write_stall_halt(str(live), 21.0, 20.0, now=now) is True
+    halt = json.loads((live / "halt.json").read_text(encoding="utf-8"))
+    assert halt["reason"] == "risk_process_stalled"
+    assert halt["stalled_for_s"] == 21.0
+    assert mod._write_stall_halt(str(live), 99.0, 20.0, now=now) is False
+    halt2 = json.loads((live / "halt.json").read_text(encoding="utf-8"))
+    assert halt2 == halt  # 首次停机原因/证据不可被 watchdog 覆盖
+    assert "RISK_HALT" in (live / "alerts.log").read_text(encoding="utf-8")
