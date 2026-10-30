@@ -696,7 +696,15 @@ class LiveExecutor:
             #（C2/R6 第二道防线）→ 风控闸门（C1）。前两道挡开仓腿时平仓
             # 腿照常（_close_only_leg），风控拒绝/异常同路径。
             block_action = block_alert = block_reason = None
-            if self._state.get("execution_unknown"):
+            if self._state.get("state_corrupt"):
+                block_action = "blocked_state_corrupt"
+                block_alert = ALERT_STATE_CORRUPT
+                block_reason = (
+                    "state_corrupt: 状态文件损坏（证据已保留 "
+                    "state-*.corrupt-*）——暂停开新仓（平仓不受影响），"
+                    "人工核对券商实际持仓并修复/删除 state-<magic>.json "
+                    "后重启")
+            elif self._state.get("execution_unknown"):
                 marker = self._state["execution_unknown"]
                 block_action = "blocked_execution_unknown"
                 block_alert = ALERT_STATE_CORRUPT
@@ -706,14 +714,6 @@ class LiveExecutor:
                     f"status={marker.get('status', 'unknown')}）——暂停所有新开仓；"
                     "先核对 MT5 持仓、挂单和成交历史，再通过受控人工确认流程解除；"
                     "平仓/减仓仍允许")
-            elif self._state.get("state_corrupt"):
-                block_action = "blocked_state_corrupt"
-                block_alert = ALERT_STATE_CORRUPT
-                block_reason = (
-                    "state_corrupt: 状态文件损坏（证据已保留 "
-                    "state-*.corrupt-*）——暂停开新仓（平仓不受影响），"
-                    "人工核对券商实际持仓并修复/删除 state-<magic>.json "
-                    "后重启")
             else:
                 pending_exits = self._state.get("pending_external_exits") or {}
                 if pending_exits:
