@@ -1021,9 +1021,13 @@ class LiveExecutor:
                         "last_decision_id": data.get("last_decision_id"),
                         "state_corrupt": bool(data.get("state_corrupt",
                                                        False)),
-                        "execution_unknown": (data.get("execution_unknown")
-                                              if isinstance(data.get("execution_unknown"), dict)
-                                              else None),
+                        "execution_unknown": (
+                            data.get("execution_unknown")
+                            if isinstance(data.get("execution_unknown"), dict)
+                            else (None if data.get("execution_unknown") is None
+                                  else {"status": "unknown",
+                                        "decision_id": "unknown",
+                                        "reason": "invalid_execution_marker_type"})),
                         "execution_resolution": data.get("execution_resolution")}
             except (OSError, ValueError, TypeError) as exc:
                 # H-05：状态文件损坏/不可读 ≠ 首次启动——保守恢复：不清空
