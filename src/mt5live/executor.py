@@ -661,11 +661,25 @@ class LiveExecutor:
         """
         close_only = replace(decision, signal=0, target_position=0,
                              volume_lots=0.0)
+        if self._state.get("execution_unknown") is None:
+            self._state["execution_unknown"] = {
+                "status": "prepared", "decision_id": decision.decision_id,
+                "target": 0.0, "symbol": self._symbol, "ts": iso_utc(n)}
+            self._save_state()
         self._write_pending(0.0, decision.decision_id, n)
         try:
             report = self._adapter.execute(close_only)
-        except Exception:
-            self._write_confirmed(decision.decision_id, n)
+        except Exception as exc:
+            marker = self._state.get("execution_unknown")
+            if isinstance(marker, dict) and marker.get("decision_id") == decision.decision_id:
+                marker["status"] = "unknown"
+                marker["reason"] = f"{type(exc).__name__}: {exc}"
+                self._save_state()
+            append_alert(
+                self._live_dir, ALERT_STATE_CORRUPT,
+                f"magic {self._magic} decision {decision.decision_id} 平仓结果未知："
+                f"{type(exc).__name__}: {exc}——保留 pending 意图并暂停新开仓；"
+                "必须核对券商持仓、挂单和成交历史，禁止自动重发", n)
             raise
         return list(report.orders)
 
