@@ -433,6 +433,7 @@ def main(argv=None) -> int:
             return 3
 
     gw = None
+    account_lock = None
     executor = None
     paper = None
     market = None
@@ -525,6 +526,27 @@ def main(argv=None) -> int:
                 lock.release()     # H-05：装配失败的早退同样释锁
             return 2
 
+    # H2-01：除 data_root 内的本地锁外，实盘再持有跨 data_root 的
+    # account(server/login)+magic 锁；在首个决策/订单前完成互斥仲裁。
+    if not args.paper and not args.dry_run and gw is not None:
+        try:
+            account_lock = MagicInstanceLock.for_account(
+                gw.account.state(), cfg.magic)
+        except Exception as exc:
+            if lock is not None:
+                lock.release()
+            gw.shutdown()
+            print(f"× 无法确定账户级单实例锁身份：{exc}")
+            return 2
+        if not account_lock.acquire():
+            if lock is not None:
+                lock.release()
+            gw.shutdown()
+            print(f"× MT5 account={gw.account.state().server}/"
+                  f"{gw.account.state().login} magic={cfg.magic} 已有运行器"
+                  "持锁——跨 data_root 第二份运行器拒绝启动（rc=3）")
+            return 3
+
     sizing_desc = (f"固定 {cfg.volume_lots} 手" if cfg.volume_lots is not None
                    else f"按风险 {cfg.risk_fraction}")
     if args.paper:
@@ -614,8 +636,10 @@ def main(argv=None) -> int:
         print("收到中断，退出", flush=True)
         return 0
     finally:
+        if account_lock is not None:
+            account_lock.release()    # H2-01：释放跨 data_root 账户级锁
         if lock is not None:
-            lock.release()             # H-05：释放同 magic 进程锁
+            lock.release()             # H-05：释放本地 paper/data_root 进程锁
         if gw is not None:
             gw.shutdown()
 
