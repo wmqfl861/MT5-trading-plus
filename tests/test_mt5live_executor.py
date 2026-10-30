@@ -1424,3 +1424,31 @@ def test_h2_01_normal_hold_does_not_leave_prepared_execution_marker(tmp_path):
     assert state["execution_unknown"] is None
     assert read_intent(tmp_path)["status"] == "confirmed"
     assert len(b.market_orders) == 1
+
+def test_h2_01_ack_execution_refuses_missing_history_start_time(tmp_path):
+    """缺少可靠历史起点时不能用任意时间窗清除 UNKNOWN。"""
+    from scripts.live_ack_execution import ack_execution
+    from types import SimpleNamespace
+
+    state_path = tmp_path / f"state-{MAGIC}.json"
+    state_path.write_text(json.dumps({
+        "magic": MAGIC, "execution_unknown": {
+            "status": "unknown", "decision_id": "d-no-ts",
+            "symbol": "XAUUSD"}}), encoding="utf-8")
+
+    class _Account:
+        def state(self):
+            return SimpleNamespace(login=123456, server="MetaQuotes-Demo")
+        def positions(self):
+            return []
+        def pending_orders(self):
+            return []
+        def deals(self, since, to):
+            raise AssertionError("deals must not be queried without a trustworthy start")
+
+    class _GW:
+        account = _Account()
+
+    assert ack_execution(str(tmp_path), _GW(), MAGIC, "d-no-ts", "manual") == 2
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["execution_unknown"] is not None
