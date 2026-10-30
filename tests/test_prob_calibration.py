@@ -479,7 +479,16 @@ def _mk_pool_frame(n=12):
 def _mk_stamp_env(pc, tmp_path, *, stamp="st", pool=None, cost_ver="vtest",
                   cluster_bars=None, cluster_triggers=None):
     """构造一个可被 cmd_run/cmd_merge 校验通过的 stamp 目录（pool +
-    meta + 冻结 cluster 输入）。"""
+    meta + 冻结 cluster 输入）。
+
+    P2-07 快照绑定会读研究库 bars meta——CI 克隆无本机 data_research，
+    统一指到合成 meta（load_pc 每测试新装载模块，直接设属性无泄漏）。"""
+    synth = tmp_path / "data_research" / "bars" / pc.SYMBOL / pc.TF
+    synth.mkdir(parents=True, exist_ok=True)
+    (synth / "meta.json").write_text(json.dumps(
+        {"content_sha256": "e" * 64, "generation": 7, "rows": 4200,
+         "source_cutoff": "2030-01-01T00:00:00+00:00"}), encoding="utf-8")
+    pc.DATA_ROOT = str(tmp_path / "data_research")
     d = tmp_path / stamp
     d.mkdir(parents=True, exist_ok=True)
     pool = _mk_pool_frame() if pool is None else pool
