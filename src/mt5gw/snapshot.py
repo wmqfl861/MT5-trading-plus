@@ -28,7 +28,7 @@ from mt5gw.models import SymbolSpec
 # 只导出可 JSON 化的标量字段（raw 不进 JSON）
 _SPEC_JSON_FIELDS = (
     "name", "description", "digits", "point", "spread", "trade_mode",
-    "currency_profit", "currency_margin", "contract_size",
+    "currency_profit", "currency_margin", "currency_base", "contract_size",
     "volume_min", "volume_max", "volume_step", "filling_mode",
     "trade_stops_level",
     "swap_long", "swap_short", "trade_freeze_level",

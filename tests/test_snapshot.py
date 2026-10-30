@@ -41,7 +41,7 @@ def full(sym="XAUUSD"):
         trade_stops_level=30, swap_long=-18.4, swap_short=9.2,
         trade_freeze_level=15, trade_tick_size=0.01, trade_tick_value=1.0,
         trade_calc_mode=1, margin_initial=0.005, margin_maintenance=0.0025,
-        swap_mode=1, swap_rollover3days=3,
+        swap_mode=1, swap_rollover3days=3, currency_base="XAU",
     )
 
 
@@ -72,7 +72,7 @@ ALL_PARAM_FIELDS = [
     "swap_long", "swap_short",
     "tick_size", "tick_value", "trade_calc_mode",
     "margin_initial", "margin_maintenance",
-    "swap_mode", "swap_rollover3days",
+    "swap_mode", "swap_rollover3days", "currency_base",
 ]
 
 
@@ -91,6 +91,7 @@ def test_snapshot_contains_all_contract_param_fields():
     assert entry["margin_initial"] == 0.005 and entry["margin_maintenance"] == 0.0025
     assert entry["swap_mode"] == 1          # T5：计费口径（1=点数）
     assert entry["swap_rollover3days"] == 3  # T5：三倍日（MT5 星期枚举，周三=3）
+    assert entry["currency_base"] == "XAU"
     assert entry["captured_at_utc"]  # 抓取时刻必填
     assert "raw" not in entry  # 原始对象不进 JSON
 
@@ -111,6 +112,7 @@ def test_snapshot_old_row_missing_new_fields_falls_back_to_defaults():
     assert e["margin_initial"] == 0.0 and e["margin_maintenance"] == 0.0
     # T5：旧式 row 缺 swap 字段 → getattr 兜底（0=禁用 / 3=MT5 周三）
     assert e["swap_mode"] == 0 and e["swap_rollover3days"] == 3
+    assert e["currency_base"] is None  # 旧快照显式未知，不伪造为利润币种
     assert e["contract_size"] == 100000.0  # 旧字段照常映射
 
 
@@ -163,7 +165,7 @@ def test_spec_to_json_excludes_raw_only_whitelist_scalars():
         "trade_stops_level", "swap_long", "swap_short", "trade_freeze_level",
         "tick_size", "tick_value", "trade_calc_mode",
         "margin_initial", "margin_maintenance", "captured_at_utc",
-        "swap_mode", "swap_rollover3days",
+        "swap_mode", "swap_rollover3days", "currency_base",
     }
     json.dumps(entry)  # 全部可 JSON 化（raw 对象进 JSON 会当场炸）
 
