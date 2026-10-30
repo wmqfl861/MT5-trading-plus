@@ -833,6 +833,15 @@ class LiveExecutor:
         无订单的轮次（hold/duplicate/被拒/跳过）绝不改写意图（防洗白）。
         """
         if not any(o.kind in ("open", "close") for o in report.orders):
+            # Hold / duplicate / 仅撤单没有待确认的市价成交。若本轮曾登记
+            # prepared，必须将当前净仓确认为最终状态并清除 marker，
+            # 否则会把无订单的正常轮次误判为 UNKNOWN。
+            marker = self._state.get("execution_unknown")
+            if (isinstance(marker, dict) and marker.get("status") == "prepared"
+                    and marker.get("decision_id") == decision.decision_id):
+                self._write_confirmed(decision.decision_id, n)
+                self._state["execution_unknown"] = None
+                self._save_state()
             return
         self._write_confirmed(decision.decision_id, n)
         marker = self._state.get("execution_unknown")
