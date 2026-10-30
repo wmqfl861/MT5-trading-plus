@@ -912,9 +912,24 @@ class LiveExecutor:
         最后一次已知量，H-05 出场解释按该量绑定本次事件）；兼容旧格式
         （纯方向整数，volume 缺省 0）。"""
         if isinstance(v, dict):
+            consumed = v.get("consumed_deal_tickets") or {}
+            if isinstance(consumed, list):
+                consumed = {str(t): 0.0 for t in consumed}
+            if not isinstance(consumed, dict):
+                consumed = {}
             return {"dir": int(v.get("dir", 0)),
-                    "volume": float(v.get("volume") or 0.0)}
-        return {"dir": int(v), "volume": 0.0}
+                    "volume": float(v.get("volume") or 0.0),
+                    "consumed_deal_tickets": {
+                        str(k): float(vol or 0.0)
+                        for k, vol in consumed.items()},
+                    "unmatched_exit_volume": float(
+                        v.get("unmatched_exit_volume") or 0.0),
+                    "manual_exit_observed": bool(
+                        v.get("manual_exit_observed", False))}
+        return {"dir": int(v), "volume": 0.0,
+                "consumed_deal_tickets": {},
+                "unmatched_exit_volume": 0.0,
+                "manual_exit_observed": False}
 
     @staticmethod
     def _parse_pending(data) -> dict:
@@ -1032,7 +1047,15 @@ class LiveExecutor:
             "updated_at_utc": iso_utc(datetime.now(timezone.utc)),
             "blocked_dir": int(self._state["blocked_dir"]),
             "known_positions": {
-                str(k): {"dir": int(v["dir"]), "volume": float(v["volume"])}
+                str(k): {
+                    "dir": int(v["dir"]), "volume": float(v["volume"]),
+                    "consumed_deal_tickets": dict(
+                        v.get("consumed_deal_tickets") or {}),
+                    "unmatched_exit_volume": float(
+                        v.get("unmatched_exit_volume") or 0.0),
+                    "manual_exit_observed": bool(
+                        v.get("manual_exit_observed", False)),
+                }
                 for k, v in self._state["known_positions"].items()},
             "pending_external_exits": {
                 str(k): dict(v) for k, v in
@@ -1046,12 +1069,17 @@ class LiveExecutor:
     def _current_positions(self) -> dict[int, dict]:
         """{ticket: {"dir": ±1, "volume": 手数}}（buy=1/sell=-1；C2/R6 起记
         最后一次已知量，供未决出场持久化与 H-05 出场解释绑定本次事件）。"""
-        return {p.ticket: {"dir": 1 if p.side == "buy" else -1,
-                           "volume": float(p.volume)}
-                for p in self._adapter.positions()}
+        return {p.ticket: {
+                    "dir": 1 if p.side == "buy" else -1,
+                    "volume": float(p.volume),
+                    "consumed_deal_tickets": {},
+                    "unmatched_exit_volume": 0.0,
+                    "manual_exit_observed": False,
+                } for p in self._adapter.positions()}
 
     def _explain_exit(self, ticket: int, *,
-                      expected_volume: float | None = None):
+                      expected_volume: float | None = None,
+                      exclude_tickets=(), consumed_out: dict | None = None):
         """按持仓 id 查全部成交，**绑定本次事件**找保护性出场（H-05）。
 
         旧实现拿任意历史 SL/TP/SO 平仓 deal 解释整个仓位消失——部分 SL 早
@@ -1072,9 +1100,11 @@ class LiveExecutor:
             deals = self._adapter.deals_for_position(ticket)
         except Exception as exc:   # 查询失败：按未解释处理（fail-closed）
             return None, f"成交查询失败 {type(exc).__name__}: {exc}"
+        excluded = {int(t) for t in (exclude_tickets or ())}
         closing = sorted(
             (d for d in deals
-             if d.entry in _CLOSING_ENTRIES and d.volume > 0),
+             if d.entry in _CLOSING_ENTRIES and d.volume > 0
+             and int(d.ticket) not in excluded),
             key=lambda d: naive_utc(d.time))
         event = closing
         if expected_volume is not None and event:
@@ -1091,7 +1121,9 @@ class LiveExecutor:
                               "完整？）——按未解释处理")
             event = picked[::-1]
         if not event:
-            return None, "查不到平仓成交"
+            return None, "查不到尚未消费的平仓成交"
+        if consumed_out is not None:
+            consumed_out.update({str(d.ticket): float(d.volume) for d in event})
         if any(d.reason not in _EXPLAINED_REASONS for d in event):
             return None, ("本次事件平仓成交 reason=" + ",".join(
                 str(d.reason) for d in event))
@@ -1187,39 +1219,91 @@ class LiveExecutor:
         #    累计数量（= 登记时的最后已知量）从最新成交往回圈定本次事件
         #    （H-05；延迟可见的成交时间不可作过滤条件）
         for ticket in sorted(pending):
+            item = pending[ticket]
+            if item.get("manual_exit_observed"):
+                continue  # CLIENT/未知原因已可见：只能人工 ack，不能自动洗白
+            used: dict[str, float] = {}
             hit, _ = self._explain_exit(
-                ticket,
-                expected_volume=float(pending[ticket].get("volume") or 0.0))
+                ticket, expected_volume=float(item.get("volume") or 0.0),
+                exclude_tickets=(item.get("consumed_deal_tickets") or {}).keys(),
+                consumed_out=used)
             if hit is not None:
                 del pending[ticket]
-                explained_deals.append(str(hit.ticket))
+                explained_deals.extend(sorted(used))
                 self._log_external_exit_deal(hit, n)   # R10/T58 C-2
-        # 2) 本轮新消失的持仓：解释绑定本次事件（H-05）——按成交时间从最新
-        #    往回累计到最后已知量为止；历史部分减量的 deal（先前轮次已观察
-        #    过量变）不再冒充本次出场的解释
+                if ticket in known:
+                    prior = known[ticket]
+                    prior_consumed = dict(prior.get("consumed_deal_tickets") or {})
+                    prior_consumed.update(used)
+                    prior["consumed_deal_tickets"] = prior_consumed
+                    prior["unmatched_exit_volume"] = max(
+                        0.0, float(prior.get("unmatched_exit_volume") or 0.0)
+                        - sum(used.values()))
+        # 2) 对仍存在的 ticket，先消费已观察到的部分减仓成交。
+        # unmatched_exit_volume 记录仓位已减少但成交历史尚未可见的数量；
+        # 已消费 deal ticket 永久排除，迟到的旧 SL 不会解释后续人工平仓。
+        for ticket in sorted(set(known) & set(current)):
+            prior, cur = known[ticket], current[ticket]
+            delta = max(0.0, float(prior["volume"]) - float(cur["volume"]))
+            unmatched = float(prior.get("unmatched_exit_volume") or 0.0) + delta
+            consumed = dict(prior.get("consumed_deal_tickets") or {})
+            manual = bool(prior.get("manual_exit_observed", False))
+            if unmatched > DEFAULT_VOLUME_TOLERANCE and not manual:
+                used: dict[str, float] = {}
+                hit, why = self._explain_exit(
+                    ticket, expected_volume=unmatched,
+                    exclude_tickets=consumed.keys(), consumed_out=used)
+                if used:
+                    consumed.update(used)
+                    unmatched = max(0.0, unmatched - sum(used.values()))
+                if hit is None and why and "reason=" in why:
+                    manual = True
+                if unmatched > DEFAULT_VOLUME_TOLERANCE or manual:
+                    pending[ticket] = {
+                        "dir": int(prior["dir"]), "volume": unmatched,
+                        "consumed_deal_tickets": dict(consumed),
+                        "manual_exit_observed": manual, "ts": iso_utc(n)}
+                else:
+                    pending.pop(ticket, None)
+            cur["consumed_deal_tickets"] = consumed
+            cur["unmatched_exit_volume"] = unmatched
+            cur["manual_exit_observed"] = manual
+
+        # 3) 完全消失的 ticket：只允许未消费成交解释本次余量；此前观察到
+        # 的部分减仓量计入总观察量，避免旧 SL 再次冒充本次人工/新出场。
         gone = sorted(set(known) - set(current))
         for ticket in gone:
-            hit, why = self._explain_exit(
-                ticket,
-                expected_volume=float(known[ticket].get("volume") or 0.0))
+            prior = known[ticket]
+            consumed = dict(prior.get("consumed_deal_tickets") or {})
+            expected = (float(prior.get("volume") or 0.0)
+                        + float(prior.get("unmatched_exit_volume") or 0.0))
+            old_pending = pending.get(ticket) or {}
+            expected += float(old_pending.get("volume") or 0.0)
+            manual = (bool(prior.get("manual_exit_observed", False))
+                      or bool(old_pending.get("manual_exit_observed", False)))
+            used: dict[str, float] = {}
+            if manual:
+                hit, why = None, "此前已观察到人工/未知原因出场"
+            else:
+                hit, why = self._explain_exit(
+                    ticket, expected_volume=expected,
+                    exclude_tickets=consumed.keys(), consumed_out=used)
             if hit is not None:
-                explained_deals.append(str(hit.ticket))
+                explained_deals.extend(sorted(used))
                 self._log_external_exit_deal(hit, n)   # R10/T58 C-2
+                pending.pop(ticket, None)
                 continue
             pending[ticket] = {
-                "dir": int(known[ticket]["dir"]),
-                "volume": float(known[ticket]["volume"]),
-                "ts": iso_utc(n)}
+                "dir": int(prior["dir"]), "volume": expected,
+                "consumed_deal_tickets": dict(consumed),
+                "manual_exit_observed": manual or bool(
+                    why and "reason=" in why), "ts": iso_utc(n)}
             append_alert(
                 self._live_dir, ALERT_EXTERNAL_EXIT,
                 f"magic {self._magic} 持仓 {ticket} 消失且无法解释"
                 f"（{why}，须 ∈ SL/TP/SO）——已记入未决出场（暂停开新仓），"
                 "不改意图，交给对账进程（人工核对后 "
                 "scripts/live_ack_external.py）", n)
-        # 3) 意图：本轮有解释成功且未决已清空 → 意图=实际净持仓
-        if explained_deals and not pending:
-            self._write_confirmed(
-                "external_exit:" + ",".join(sorted(explained_deals)), n)
         if gone and self._rules.reentry == "after_signal_change":
             for ticket in gone:
                 blocked = known[ticket]["dir"]  # 非执行器平仓 → 禁同向再入（照旧）
