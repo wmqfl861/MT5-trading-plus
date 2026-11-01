@@ -33,9 +33,12 @@
   开仓/加仓腿先过 RiskGate.check_open（拒绝 → 不下单，原因写心跳
   last_error 与 alerts.log），平仓不受限；每次执行后写
   expected-<magic>.json（对账进程读全部）。
-- 单实例（H-05）：实跑/影子盘启动即取 {data_root}/live/runner-<magic>.lock
-  进程锁（内核字节锁，崩溃自动释放）——同 magic 第二份运行器拿不到锁
-  拒绝启动（rc=3，不连网关）；dry-run 只读不持锁。
+- 单实例（H-05 + H2-01/1C）：会下单的模式启动即取进程锁（内核字节锁，
+  崩溃自动释放），第二份运行器拿不到锁拒绝启动（rc=3，首道拒绝不连
+  网关）。实跑锁按**身份** sha256(server|login|magic)[:16] 落 OS 状态目录
+  %LOCALAPPDATA% 的 mt5-trading-plus/locks 子目录（跨数据目录互斥；连接前
+  先取 magic-only 临时锁防双启动竞速，连接后升级身份锁）；影子盘无账户
+  身份，沿用 {data_root}/live/runner-<magic>.lock；dry-run 只读不持锁。
 - 手数（M2）：volume_lots 缺省时按 risk_fraction 定手数（LiveSizer，
   mt5quant.sizing.lots_for_risk——与回测同一函数）；风控只设上限。
 - 启动校验（M1）：策略用到 time_stop_bars / week_close_exit 直接拒绝启动
@@ -83,6 +86,9 @@ from mt5live.runner import (  # noqa: E402
     TerminalBarsSource,
     default_compute_window_bars,
     default_heartbeat_path,
+    instance_lock_key,
+    magic_lock_key,
+    runner_lock_path,
     terminal_bars_loader,
 )
 from mt5quant.costs.spread import (  # noqa: E402
@@ -418,18 +424,32 @@ def main(argv=None) -> int:
     live_dir = os.path.join(cfg.data_root, "live")
     specs_path = os.path.join(cfg.data_root, "specs", "latest.json")
 
-    # H-05：同账户/同 magic 单实例——会下单的模式（实跑/影子盘）启动即取
-    # runner-<magic>.lock 进程锁，第二份运行器拿不到锁直接拒绝（rc=3），
-    # 且拒绝发生在连接网关之前；两份运行器并行会重复下单、互写状态。
-    # dry-run 不下单不持锁（只读观察可以并行）。
-    lock = None
+    # H-05 + H2-01（1C，R6）：会下单的模式启动即取进程锁，第二份运行器
+    # 拿不到锁直接拒绝（rc=3），且第一道拒绝发生在连接网关之前。锁按
+    # **身份**互斥（审计 H2-01：锁随 live_dir 定位不足以证明不同数据目录
+    # 下的同账户同 magic 互斥）：
+    # - 实跑：连接前先取 magic-only 临时锁（OS 状态目录
+    #   %LOCALAPPDATA%\mt5-trading-plus\locks，防同 magic 双启动竞速）；
+    #   网关连接读到 server/login 后升级为 sha256(server|login|magic)[:16]
+    #   身份锁并释放临时锁——不同数据目录的同账户同 magic 在此互斥；
+    # - 影子盘（--paper）：不下真实单、无账户身份——沿用数据目录内
+    #   runner-<magic>.lock（防同目录双开写坏 paper 状态）；
+    # - dry-run 不下单不持锁（只读观察可以并行）。
+    lock = None          # 身份锁（实跑）/ 目录锁（影子盘）
+    temp_lock = None     # 实跑连接前的 magic-only 临时锁
     if args.paper or not args.dry_run:
-        lock = MagicInstanceLock(os.path.join(
-            live_dir, f"runner-{cfg.magic}.lock"))
-        if not lock.acquire():
+        if args.paper:
+            lock = MagicInstanceLock(os.path.join(
+                live_dir, f"runner-{cfg.magic}.lock"))
+            temp = lock
+        else:
+            temp_lock = MagicInstanceLock(
+                runner_lock_path(magic_lock_key(cfg.magic)))
+            temp = temp_lock
+        if not temp.acquire():
             print(f"× magic={cfg.magic} 的运行器已在运行"
-                  f"（{lock.path} 被持有）——第二份运行器拒绝启动"
-                  "（H-05 同 magic 单实例；先停旧实例或换 magic）")
+                  f"（{temp.path} 被持有）——第二份运行器拒绝启动"
+                  "（同 magic 单实例；先停旧实例或换 magic）")
             return 3
 
     gw = None
@@ -456,6 +476,27 @@ def main(argv=None) -> int:
         gw = MT5Gateway.from_config_file(
             find_gateway_config(args.gateway_config))
         gw.connect()
+        if not args.dry_run and not args.paper:
+            # H2-01（1C，R6）：连接后升级身份锁（server|login|magic）——
+            # 不同数据目录的同账户同 magic 在此互斥；拿不到即拒绝启动。
+            # 账户状态读不出（fail-closed）同样拒绝：无身份不交易。
+            try:
+                acct = gw.account.state()
+            except Exception as e:
+                print(f"× 账户状态读取失败，无法取得身份锁：{e}")
+                gw.shutdown()
+                return 3
+            lock = MagicInstanceLock(runner_lock_path(
+                instance_lock_key(acct.server, acct.login, cfg.magic)))
+            if not lock.acquire():
+                print(f"× 账户 {acct.server}/{acct.login} magic={cfg.magic} "
+                      f"的运行器已在运行（{lock.path} 被持有）——第二份运行器"
+                      "拒绝启动（H2-01 跨数据目录身份互斥；先停旧实例）")
+                gw.shutdown()
+                return 3
+            print(f"身份锁已取得：{lock.path}")
+            temp_lock.release()
+            temp_lock = None
         # R10/T58（C-4）：行情服务包重连记账——quote/bars 每轮必经的网关
         # 调用失败后，下一次成功调用记 gateway_reconnected 日志行
         reconnect = GatewayReconnectWatch()
@@ -512,6 +553,8 @@ def main(argv=None) -> int:
         if executor is None:
             if lock is not None:
                 lock.release()     # H-05：装配失败的早退同样释锁
+            if temp_lock is not None:
+                temp_lock.release()
             return 2
     elif not args.dry_run:
         # 实跑：执行器 + 风控闸门 + 定手数（C1/M2/M10 全套接线）
@@ -523,6 +566,8 @@ def main(argv=None) -> int:
         if executor is None:
             if lock is not None:
                 lock.release()     # H-05：装配失败的早退同样释锁
+            if temp_lock is not None:
+                temp_lock.release()
             return 2
 
     sizing_desc = (f"固定 {cfg.volume_lots} 手" if cfg.volume_lots is not None
@@ -615,7 +660,9 @@ def main(argv=None) -> int:
         return 0
     finally:
         if lock is not None:
-            lock.release()             # H-05：释放同 magic 进程锁
+            lock.release()             # H-05/H2-01：释放身份/目录进程锁
+        if temp_lock is not None:
+            temp_lock.release()        # H2-01：早退路径的临时锁兜底释放
         if gw is not None:
             gw.shutdown()
 

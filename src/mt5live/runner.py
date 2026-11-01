@@ -29,6 +29,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import time as _time
@@ -70,12 +71,15 @@ class MarketClosedError(RuntimeError):
 class MagicInstanceLock:
     """同账户/同 magic 的运行器所有权锁（H-05：两份运行器不得并行）。
 
-    ``data/live/runner-<magic>.lock`` 的 1 字节内核锁（Windows
-    msvcrt.locking / POSIX flock）：互斥由内核仲裁（两个进程、乃至同进程
-    两个 fd 一视同仁），持有进程崩溃/退出自动释放——不存在残锁，也不允许
-    "凭 mtime 接管"。acquire 非阻塞：他人持有立即返回 False，调用方
-    （scripts/live_runner）据此拒绝第二份运行器启动。锁文件常驻磁盘
-    （不删除——"释放即删"本身是竞态源），内容为持有者 pid（排查用）。
+    1 字节内核锁（Windows msvcrt.locking / POSIX flock），锁文件路径由
+    调用方给定（H2-01/1C 起实跑用 :func:`runner_lock_path` 的**身份键**
+    路径——``%LOCALAPPDATA%\\mt5-trading-plus\\locks\\runner-<hash>.lock``，
+    跨数据目录互斥；影子盘沿用数据目录内 ``runner-<magic>.lock``）：
+    互斥由内核仲裁（两个进程、乃至同进程两个 fd 一视同仁），持有进程
+    崩溃/退出自动释放——不存在残锁，也不允许"凭 mtime 接管"。acquire
+    非阻塞：他人持有立即返回 False，调用方（scripts/live_runner）据此
+    拒绝第二份运行器启动。锁文件常驻磁盘（不删除——"释放即删"本身是
+    竞态源），内容为持有者 pid（排查用）。
     """
 
     def __init__(self, path: str):
@@ -129,6 +133,40 @@ class MagicInstanceLock:
         finally:
             os.close(self._fd)
             self._fd = None
+
+
+# ---- H2-01（1C，R6）：跨数据目录的运行器身份锁 ----
+# 审计 H2-01：锁随 live_dir 定位（data/live/runner-<magic>.lock）不足以
+# 证明不同数据目录下的同账户同 magic 互斥——两份运行器各持各的目录锁
+# 并行，重复下单、互写状态。锁键改按**账户身份**（server+login+magic，
+# login 跨券商可撞号必须带上 server），锁文件放 OS 状态目录（所有数据
+# 目录共享）。网关连接前读不到 server/login：先取 magic-only 临时锁防
+# 双启动竞速，连接后升级身份锁并释放临时锁。
+
+def instance_lock_key(server: str, login: int, magic: int) -> str:
+    """身份锁键：sha256(server|login|magic)[:16]（16 hex，文件名安全）。"""
+    return hashlib.sha256(
+        f"{server}|{login}|{magic}".encode("utf-8")).hexdigest()[:16]
+
+
+def magic_lock_key(magic: int) -> str:
+    """连接前临时锁键（magic-only，与任何身份键不撞）。"""
+    return hashlib.sha256(
+        f"magic-only|{magic}".encode("utf-8")).hexdigest()[:16]
+
+
+def runner_locks_dir() -> str:
+    """锁文件目录：Windows ``%LOCALAPPDATA%\\mt5-trading-plus\\locks``（R6：
+    OS 状态目录，跨数据目录共享）；非 Windows 退回 XDG 数据目录。"""
+    base = os.environ.get("LOCALAPPDATA")
+    if not base:                              # pragma: no cover - 非 Windows
+        base = os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(base, "mt5-trading-plus", "locks")
+
+
+def runner_lock_path(key: str) -> str:
+    """键 → 锁文件全路径（runner-<key>.lock）。"""
+    return os.path.join(runner_locks_dir(), f"runner-{key}.lock")
 
 
 def default_compute_window_bars(lookback_bars: int) -> int:
