@@ -1250,9 +1250,10 @@ class LiveExecutor:
     def _journal_verdict(self, entry: dict, n: datetime) -> tuple[str, str]:
         """核对券商裁决一项未决决策：(verdict, 详情)。
 
-        - confirmed 证据：发送时刻之后本 magic 的任意成交（请求已真实到达
-          并执行），或 state 未知的新持仓 ticket（成交归档延迟时的第二
-          证据）；
+        - confirmed 证据：成交必须关联到本决策的 broker order_ticket；
+          只有单腿 open/add 且尚无 order_ticket（sent 行未写）时，才允许
+          用 journal 预先持久化的唯一 request comment 关联成交；
+          同 magic/symbol 的其他成交或新持仓本身不构成证据；
         - 空成交/空持仓/空挂单不是拒单的正面证据：历史归档可能延迟，
           且订单可能已成交后又平仓；此情形保持 unknown，只能由明确拒单
           retcode 或 live_ack_execution 人工仲裁落 rejected。
