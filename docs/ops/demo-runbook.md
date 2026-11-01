@@ -88,6 +88,14 @@ trade_mode=0）在**启动前**把过一道关；但预检通过与 runner 实�
 4. 验证口径：假网关账户 `trade_mode=2` → runner 拒绝进入循环且零下单；
    `trade_mode=0` → 正常启动；账户状态不可读 → 同 REAL 处理（fail-closed）。
 
+5. 实跑单实例锁按 `server|login|magic` 哈希，存放于
+   `%LOCALAPPDATA%\mt5-trading-plus\locks\runner-<hash>.lock`，不随
+   `data_root` 改变；连接前另有 magic-only 临时锁，防启动竞速。
+6. **跨版本升级保护**：新 runner 同时取得身份锁与旧版
+   `data\live\runner-<magic>.lock`。若旧版进程仍持有目录锁，新版拒绝
+   启动并提示先停止旧进程；不得手工删除锁文件来绕过内核锁。退出时内核
+   自动释放锁，锁文件本身常驻磁盘。不同数据目录的并发实例由身份锁阻止。
+
 ## 2. 每日检查（每个交易日，5 分钟；两档口径）
 
 ```powershell
