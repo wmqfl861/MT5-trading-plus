@@ -486,6 +486,14 @@ def main(argv=None) -> int:
                 print(f"× 账户状态读取失败，无法取得身份锁：{e}")
                 gw.shutdown()
                 return 3
+            # 3B（F1）：runner 启动时二次确认 trade_mode=0（模拟盘）——
+            # 防止 demo_run.ps1 预检后 gateway.json 被换；非 DEMO → 零下单退出
+            if getattr(acct, "trade_mode", None) != 0:
+                print(f"× 账户 trade_mode={getattr(acct, 'trade_mode', '?')}"
+                      "≠0（非模拟盘）——runner 启动时二次确认失败，零下单退出"
+                      "（3B/runbook §1a）")
+                gw.shutdown()
+                return 3
             lock = MagicInstanceLock(runner_lock_path(
                 instance_lock_key(acct.server, acct.login, cfg.magic)))
             if not lock.acquire():

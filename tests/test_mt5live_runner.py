@@ -643,3 +643,99 @@ trigger_delay_s = 5.0
         assert "拒绝" in out and "777" in out
     finally:
         holder.release()
+
+
+def test_runner_startup_trade_mode_check_rejects_non_demo(tmp_path, monkeypatch):
+    """3B/F1：runner 启动时二次确认 trade_mode=0——非 DEMO → rc=3。"""
+    from tests.fakes_live import FakeBroker, bars_from_df, boundary_open, grid_bars
+    from datetime import datetime
+    mod = load_live_runner()
+    now = datetime(2026, 10, 30, 10, 0, 7)
+    broker = FakeBroker("XAUUSD")
+    broker.trade_mode = 2  # real
+    broker.set_bars("XAUUSD", "M15",
+                    bars_from_df(grid_bars(boundary_open(now), last="up")))
+    broker.quote_time = now
+    _wire_fake_gateway(monkeypatch, mod, broker, now)
+    cfg = _runner_config(tmp_path)
+    gw_cfg = _gw_dummy_config(tmp_path)
+    rc = mod.main(["--config", cfg, "--gateway-config", str(gw_cfg),
+                   "--once", "--no-spread-gate"])
+    assert rc == 3
+
+
+def test_runner_startup_trade_mode_unreadable_rejects(tmp_path, monkeypatch):
+    """3B/F1：trade_mode=None → 同样拒绝（fail-closed）。"""
+    from tests.fakes_live import FakeBroker, bars_from_df, boundary_open, grid_bars
+    from datetime import datetime
+    mod = load_live_runner()
+    now = datetime(2026, 10, 30, 10, 0, 7)
+    broker = FakeBroker("XAUUSD")
+    broker.trade_mode = None  # 读不到
+    broker.set_bars("XAUUSD", "M15",
+                    bars_from_df(grid_bars(boundary_open(now), last="up")))
+    broker.quote_time = now
+    _wire_fake_gateway(monkeypatch, mod, broker, now)
+    cfg = _runner_config(tmp_path)
+    gw_cfg = _gw_dummy_config(tmp_path)
+    rc = mod.main(["--config", cfg, "--gateway-config", str(gw_cfg),
+                   "--once", "--no-spread-gate"])
+    assert rc == 3
+
+
+def test_runner_startup_trade_mode_unreadable_rejects(tmp_path, monkeypatch):
+    """3B/F1：trade_mode 读不到（None）→ 同样拒绝（fail-closed）。"""
+    from tests.fakes_live import FakeBroker, bars_from_df, boundary_open,         grid_bars
+    from datetime import datetime
+
+    mod = load_live_runner()
+    now = datetime(2026, 10, 30, 10, 0, 7)
+    broker = FakeBroker("XAUUSD")
+    broker.trade_mode = None
+    broker.set_bars("XAUUSD", "M15",
+                    bars_from_df(grid_bars(boundary_open(now), last="up")))
+    broker.quote_time = now
+    _wire_fake_gateway(monkeypatch, mod, broker, now)
+    cfg = _runner_config(tmp_path)
+    gw_cfg = _gw_dummy_config(tmp_path)
+    rc = mod.main(["--config", cfg, "--gateway-config", str(gw_cfg),
+                   "--once", "--no-spread-gate"])
+    assert rc == 3
+def test_runner_startup_trade_mode_check_rejects_non_demo(tmp_path, monkeypatch):
+    """3B/F1：runner 启动时二次确认 trade_mode=0——非 DEMO → 零下单+rc=3。"""
+    from tests.fakes_live import FakeBroker, bars_from_df, boundary_open,         grid_bars
+    from datetime import datetime
+
+    mod = load_live_runner()
+    now = datetime(2026, 10, 30, 10, 0, 7)
+    broker = FakeBroker("XAUUSD")
+    broker.trade_mode = 2  # real
+    broker.set_bars("XAUUSD", "M15",
+                    bars_from_df(grid_bars(boundary_open(now), last="up")))
+    broker.quote_time = now
+    _wire_fake_gateway(monkeypatch, mod, broker, now)
+    cfg = _runner_config(tmp_path)
+    gw_cfg = _gw_dummy_config(tmp_path)
+    rc = mod.main(["--config", cfg, "--gateway-config", str(gw_cfg),
+                   "--once", "--no-spread-gate"])
+    assert rc == 3
+
+
+def test_runner_startup_trade_mode_unreadable_rejects(tmp_path, monkeypatch):
+    """3B/F1：trade_mode 读不到（None）→ 同样拒绝（fail-closed）。"""
+    from tests.fakes_live import FakeBroker, bars_from_df, boundary_open,         grid_bars
+    from datetime import datetime
+
+    mod = load_live_runner()
+    now = datetime(2026, 10, 30, 10, 0, 7)
+    broker = FakeBroker("XAUUSD")
+    broker.trade_mode = None
+    broker.set_bars("XAUUSD", "M15",
+                    bars_from_df(grid_bars(boundary_open(now), last="up")))
+    broker.quote_time = now
+    _wire_fake_gateway(monkeypatch, mod, broker, now)
+    cfg = _runner_config(tmp_path)
+    gw_cfg = _gw_dummy_config(tmp_path)
+    rc = mod.main(["--config", cfg, "--gateway-config", str(gw_cfg),
+                   "--once", "--no-spread-gate"])
+    assert rc == 3
