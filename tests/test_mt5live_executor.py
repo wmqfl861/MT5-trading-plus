@@ -1300,10 +1300,9 @@ def _finals(tmp_path, status: str) -> list:
     return [r for r in _journal_records(tmp_path) if r.get("status") == status]
 
 
-def test_h201_1_crash_before_send_rejected_and_recovered(tmp_path):
-    """注入 1：发送前 journal 已写、order_send 未调即崩溃 → 重启核对券商
-    （无仓、无挂单、窗口覆盖且无成交）→ rejected + 恢复；重投被幂等跳过，
-    新决策照常开仓。"""
+def test_h201_1_crash_before_send_remains_unknown_without_positive_evidence(tmp_path):
+    """注入 1：journal pending 后、order_send 前崩溃，与发送后 ACK 丢失
+    无法仅凭空历史区分；必须保持 unknown，等待明确券商证据/人工仲裁。"""
     b = FakeBroker()
     d = mk_decision(signal=1, volume_lots=0.02)
     _journal_seed_pending(tmp_path, d.decision_id)
@@ -1311,19 +1310,17 @@ def test_h201_1_crash_before_send_rejected_and_recovered(tmp_path):
 
     ex = _mk_executor(b, tmp_path)                       # 重启
     rr = ex.poll(d, RESTART_LATE)
-    assert rr.action == "duplicate"                      # journal 幂等跳过
-    assert "journal 幂等跳过" in rr.error
+    assert rr.action == "blocked_execution_unknown"
     assert b.positions() == []                           # 零新增请求
-    rejected = _finals(tmp_path, "rejected")
-    assert rejected and rejected[-1]["decision_id"] == d.decision_id
-    it = read_intent(tmp_path)                           # 恢复 expected=实际
-    assert it["status"] == "confirmed" and it["volume"] == 0.0
+    assert not _finals(tmp_path, "rejected")
+    it = read_intent(tmp_path)
+    assert it["status"] == "pending"                     # 不洗成 confirmed
 
-    # 恢复完成：新决策照常开仓（未被未决项长期封锁）
-    b.error_on_market_order = None
+    # 无正面证据时，新决策仍被阻断；需人工仲裁后才能解除。
     d2 = mk_decision(signal=1, volume_lots=0.01,
                      decision_id="XAUUSD|M15|2026-10-20T18:15:00")
-    assert ex.poll(d2, RESTART_LATE.replace(minute=25)).action == "open"
+    assert ex.poll(d2, RESTART_LATE.replace(minute=25)).action == \
+        "blocked_execution_unknown"
 
 
 def test_h201_2_crash_after_fill_before_sent_line_confirmed(tmp_path):
