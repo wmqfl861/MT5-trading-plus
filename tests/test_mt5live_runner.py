@@ -650,7 +650,9 @@ def test_h201_upgrade_refuses_while_legacy_data_dir_lock_held(
     """升级保护：旧版 runner 仍持有 data/live/runner-<magic>.lock 时，
     新版即使取得身份锁也必须拒绝启动，防止跨版本双实例。"""
     from datetime import datetime
-    from mt5live.runner import MagicInstanceLock
+    from mt5live.runner import (
+        MagicInstanceLock, magic_lock_key, runner_lock_path,
+    )
     from tests.fakes_live import (
         FakeBroker, bars_from_df, boundary_open, grid_bars,
     )
@@ -681,6 +683,10 @@ def test_h201_upgrade_refuses_while_legacy_data_dir_lock_held(
         out = capsys.readouterr().out
         assert "旧版/并行 runner" in out
         assert broker.market_orders == []
+        # 拒绝启动也必须释放连接前临时锁，避免后续合法重启被永久挡住。
+        retry_lock = MagicInstanceLock(runner_lock_path(magic_lock_key(777)))
+        assert retry_lock.acquire() is True
+        retry_lock.release()
     finally:
         old_process_lock.release()
 
