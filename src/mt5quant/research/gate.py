@@ -113,8 +113,12 @@ def acceptance_snapshot() -> dict:
         mod = importlib.import_module(name)
         f = Path(getattr(mod, "__file__", "") or "")
         if f.is_file():
-            sources[_rel_key(f)] = hashlib.sha256(
-                f.read_bytes()).hexdigest()
+            # Git checkouts on Windows may materialize CRLF while the
+            # repository blob is LF. Hash normalized UTF-8 source text so the
+            # frozen semantic identity is platform-independent.
+            normalized = f.read_text(encoding="utf-8").replace("\r\n", "\n") \
+                .replace("\r", "\n").encode("utf-8")
+            sources[_rel_key(f)] = hashlib.sha256(normalized).hexdigest()
     source_drift = sorted(
         path for path, expected in EXPECTED_ACCEPTANCE_SOURCE_SHA256.items()
         if sources.get(path) != expected)
