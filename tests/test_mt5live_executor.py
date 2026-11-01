@@ -1330,10 +1330,14 @@ def test_h201_1_crash_before_send_remains_unknown_without_positive_evidence(tmp_
 def test_h201_2_crash_after_fill_before_sent_line_confirmed(tmp_path):
     """注入 2：order_send 已成交（券商有仓+成交）但 journal "sent" 行未写即
     崩溃 → 重启核对券商有成交 → confirmed + expected 恢复为实际持仓。"""
+    from mt5live.executor import decision_comment
+
     b = FakeBroker()
     d = mk_decision(signal=1, volume_lots=0.02)
-    _journal_seed_pending(tmp_path, d.decision_id)
-    b.market_order("XAUUSD", "buy", 0.02, magic=MAGIC)   # 券商侧已成交
+    comment = decision_comment(d.decision_id)
+    _journal_seed_pending(tmp_path, d.decision_id, comment=comment)
+    b.market_order("XAUUSD", "buy", 0.02, magic=MAGIC,
+                   comment=comment)                     # 券商侧已成交
     _seed_pending_intent(tmp_path, d.decision_id)
 
     ex = _mk_executor(b, tmp_path)                       # 重启
