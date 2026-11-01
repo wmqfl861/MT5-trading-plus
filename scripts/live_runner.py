@@ -485,6 +485,9 @@ def main(argv=None) -> int:
                 acct = gw.account.state()
             except Exception as e:
                 print(f"× 账户状态读取失败，无法取得身份锁：{e}")
+                if temp_lock is not None:
+                    temp_lock.release()
+                    temp_lock = None
                 gw.shutdown()
                 return 3
             # 3B（F1）：runner 启动时二次确认 trade_mode=0（模拟盘）——
@@ -493,6 +496,9 @@ def main(argv=None) -> int:
                 print(f"× 账户 trade_mode={getattr(acct, 'trade_mode', '?')}"
                       "≠0（非模拟盘）——runner 启动时二次确认失败，零下单退出"
                       "（3B/runbook §1a）")
+                if temp_lock is not None:
+                    temp_lock.release()
+                    temp_lock = None
                 gw.shutdown()
                 return 3
             lock = MagicInstanceLock(runner_lock_path(
@@ -501,6 +507,9 @@ def main(argv=None) -> int:
                 print(f"× 账户 {acct.server}/{acct.login} magic={cfg.magic} "
                       f"的运行器已在运行（{lock.path} 被持有）——第二份运行器"
                       "拒绝启动（H2-01 跨数据目录身份互斥；先停旧实例）")
+                if temp_lock is not None:
+                    temp_lock.release()
+                    temp_lock = None
                 gw.shutdown()
                 return 3
             print(f"身份锁已取得：{lock.path}")
@@ -515,6 +524,9 @@ def main(argv=None) -> int:
                       f"{legacy_lock.path}——拒绝升级启动，请先停止旧进程")
                 lock.release()
                 lock = None
+                if temp_lock is not None:
+                    temp_lock.release()
+                    temp_lock = None
                 gw.shutdown()
                 return 3
             temp_lock.release()
