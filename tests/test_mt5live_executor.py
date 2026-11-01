@@ -1393,6 +1393,39 @@ def test_h201_4_order_send_unknown_intent_pending_restart_confirmed(tmp_path):
     assert len(b.market_orders) == 1                     # 不重开
 
 
+def test_h201_placed_order_volume_is_not_treated_as_fill(tmp_path):
+    """PLACED is accepted but not filled: even if result.volume is nonzero,
+    it must leave the journal unknown and keep the open-order safety gate."""
+    from mt5gw.models import OrderResult
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    d = mk_decision(signal=1, volume_lots=0.02)
+
+    def placed_without_fill(symbol, side, volume, **kwargs):
+        order = b.seed_pending(magic=MAGIC, volume=volume)
+        # Deliberately return a nonzero volume with filled=False to ensure the
+        # adapter trusts the explicit fill flag, not the raw volume field.
+        return OrderResult(
+            ok=True, filled=False, partial=False, retcode=10008,
+            comment="placed", order_ticket=order.ticket, deal_ticket=None,
+            deal_price=None, requested_volume=volume, volume=volume)
+
+    b.market_order = placed_without_fill
+    rr = ex.poll(d, NOW)
+    assert rr.action == "execution_pending"
+    assert read_intent(tmp_path)["status"] == "pending"
+    assert _journal_records(tmp_path)[-1]["status"] == "unknown"
+    assert not _finals(tmp_path, "confirmed")
+
+    # Even after the negative-history margin, the live pending order means
+    # the original request can still fill; do not classify it as rejected.
+    rr2 = ex.poll(d, NOW + timedelta(minutes=3))
+    assert rr2.action == "blocked_execution_unknown"
+    assert not _finals(tmp_path, "rejected")
+    assert b.pending_orders("XAUUSD")
+
+
 def test_h201_5_unknown_no_fill_blocked_until_history_window_covers(tmp_path):
     """注入 5：order_send 回报丢失且实际未成交 → 重启（历史窗口尚未覆盖发送
     时刻）→ 保持 unknown + 暂停开仓（不误判 rejected）；窗口覆盖后 → rejected
