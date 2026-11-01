@@ -3206,8 +3206,14 @@ def cmd_prob_round_report(args) -> int:
     # P2-09（丁-6）：方法批准门——主检验方法（月内置换）在 v2/v3 成簇
     # 负对照失败、未获批准：运行/报告照常（诊断），但推进结论一律阻塞
     # 并显式标注"本报告不构成推进依据"（exit code 不变）
-    from mt5quant.validation.prob_mode import holm, primary_method_approved
+    from mt5quant.validation.prob_mode import (holm, primary_method_approved,
+                                               PRIMARY_METHOD)
     method_approved, method_reason = primary_method_approved()
+    # T107 模块 A：研究门禁四态（读侧单点）——在方法门标注旁并列输出一行
+    # （不改 exit code/推进语义；方法未获批时 FAIL 按优先序先于样本量判定）
+    from mt5quant.research.gate import research_gate
+    research_gate_line = research_gate(
+        method_id=PRIMARY_METHOD).describe()
     with Ledger(ledger_path) as ledger:
         round_row = ledger.round(round_obj.id)
         if round_row is None:
@@ -3340,6 +3346,9 @@ def cmd_prob_round_report(args) -> int:
             lines += ["⚠ 方法未批准（成簇负对照失败）——本报告不构成推进依据"
                       f"（P2-09：{method_reason}；运行/报告仅作诊断，推进结论"
                       "一律阻塞，待新方法完整标定并获批后解除）。", ""]
+        # T107：研究门禁四态一行（与方法门标注并列；脚本成功≠研究通过——
+        # CLI exit 0 不构成 PASS，以本行为准）
+        lines += [research_gate_line, ""]
         lines += ["| 候选 | 假设 | 触发日数 | 可用 | 剔除 | Δp | 原始 p |"
                   " Holm p | Holm 显著 | ΔEV(R) | 3×成本(R) | 成本条件 | 结论 |",
                   "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
@@ -3381,6 +3390,7 @@ def cmd_prob_round_report(args) -> int:
                                   "rows": rows, "holm": adjusted},
                                  ensure_ascii=False, indent=2),
                       encoding="utf-8")
+        print(research_gate_line)
         print(f"✓ 报告：{md}（同 JSON）——交 P 线审核会话"
               + ("（⚠ 方法未批准——本报告不构成推进依据，P2-09）"
                  if not method_approved else ""))
