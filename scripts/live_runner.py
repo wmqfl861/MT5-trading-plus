@@ -436,6 +436,7 @@ def main(argv=None) -> int:
     #   runner-<magic>.lock（防同目录双开写坏 paper 状态）；
     # - dry-run 不下单不持锁（只读观察可以并行）。
     lock = None          # 身份锁（实跑）/ 目录锁（影子盘）
+    legacy_lock = None   # 实跑兼容旧版 data/live/runner-<magic>.lock
     temp_lock = None     # 实跑连接前的 magic-only 临时锁
     if args.paper or not args.dry_run:
         if args.paper:
@@ -503,6 +504,19 @@ def main(argv=None) -> int:
                 gw.shutdown()
                 return 3
             print(f"身份锁已取得：{lock.path}")
+            # 跨版本升级保护：旧版 runner 只持有 data/live/runner-<magic>.lock，
+            # 不知道 OS 身份锁。新版本同时取得旧路径锁，确保同一 data_root
+            # 上仍运行的旧进程会阻止升级后的第二实例；不同 data_root 则由
+            # 上面的 server|login|magic 身份锁互斥。
+            legacy_lock = MagicInstanceLock(os.path.join(
+                live_dir, f"runner-{cfg.magic}.lock"))
+            if not legacy_lock.acquire():
+                print(f"× 检测到同一数据目录仍有旧版/并行 runner 持锁："
+                      f"{legacy_lock.path}——拒绝升级启动，请先停止旧进程")
+                lock.release()
+                lock = None
+                gw.shutdown()
+                return 3
             temp_lock.release()
             temp_lock = None
         # R10/T58（C-4）：行情服务包重连记账——quote/bars 每轮必经的网关
@@ -669,6 +683,8 @@ def main(argv=None) -> int:
     finally:
         if lock is not None:
             lock.release()             # H-05/H2-01：释放身份/目录进程锁
+        if legacy_lock is not None:
+            legacy_lock.release()      # H2-01：释放兼容旧版的目录锁
         if temp_lock is not None:
             temp_lock.release()        # H2-01：早退路径的临时锁兜底释放
         if gw is not None:
