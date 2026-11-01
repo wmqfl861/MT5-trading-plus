@@ -33,7 +33,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mt5gw import GatewayConfig, MT5Gateway  # noqa: E402
-from mt5gw.errors import DataUnavailableError  # noqa: E402
 from mt5live.executor import JOURNAL_FILE_FMT  # noqa: E402
 from mt5live.fileio import append_jsonl  # noqa: E402
 from mt5live.monitor import append_alert, iso_utc, naive_utc  # noqa: E402
@@ -126,8 +125,9 @@ def ack(live_dir: str, gw: MT5Gateway, magic: int, decision_id: str,
     # 消耗仲裁机会；若后续意图写入失败，同一 arbitrated 结论可幂等重试。
     try:
         actual = gw.account.positions()
-    except DataUnavailableError as e:
-        print(f"× 持仓查询失败（未写入 journal 终态，可重试）：{e}")
+    except Exception as e:
+        print(f"× 持仓查询失败（未写入 journal 终态，可重试）："
+              f"{type(e).__name__}: {e}")
         return 2
     mine = [p for p in actual if p.magic == magic]
     symbols = {p.symbol for p in mine}
