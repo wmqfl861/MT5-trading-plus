@@ -1581,7 +1581,8 @@ def test_h201_arbitration_tool_resolves_permanent_unknown(tmp_path,
                         staticmethod(lambda p: _ToolGW(b)))
     rc = tool.main(["--live-dir", str(tmp_path), "--magic", str(MAGIC),
                     "--decision-id", d.decision_id, "--status", "rejected",
-                    "--reason", "人工核对：订单确未到达服务器"])
+                    "--reason", "人工核对：订单确未到达服务器",
+                    "--symbol", "XAUUSD"])
     assert rc == 0
     rejected = _finals(tmp_path, "rejected")
     assert rejected and rejected[-1]["detail"].startswith("arbitrated")
