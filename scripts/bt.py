@@ -3209,11 +3209,6 @@ def cmd_prob_round_report(args) -> int:
     from mt5quant.validation.prob_mode import (holm, primary_method_approved,
                                                PRIMARY_METHOD)
     method_approved, method_reason = primary_method_approved()
-    # T107 模块 A：研究门禁四态（读侧单点）——在方法门标注旁并列输出一行
-    # （不改 exit code/推进语义；方法未获批时 FAIL 按优先序先于样本量判定）
-    from mt5quant.research.gate import research_gate
-    research_gate_line = research_gate(
-        method_id=PRIMARY_METHOD).describe()
     with Ledger(ledger_path) as ledger:
         round_row = ledger.round(round_obj.id)
         if round_row is None:
@@ -3332,6 +3327,56 @@ def cmd_prob_round_report(args) -> int:
                              "cost_r": cost_r, "edge_ev_r": edge,
                              "cost_ok": cost_ok})
         adjusted = holm(pvals)
+
+        # T107 P0: ResearchGate is an actual per-hypothesis advancement gate,
+        # not merely a diagnostic line. Bind dp to pre-registered expected_delta_p,
+        # days to observed trigger days, and n_hyp to the frozen round family.
+        # Missing or unverifiable inputs fail closed.
+        from mt5quant.research.gate import research_gate
+        candidates_dir = Path(args.rounds_dir).parent / "candidates"
+        n_hyp_gate = max(sum(len(hyps) for hyps in family.values()), 1)
+        for gate_row in rows:
+            cid = gate_row["candidate"]
+            try:
+                frozen_error = _candidate_frozen_check(
+                    ledger, cid, candidates_dir)
+                if frozen_error:
+                    gate_row["research_gate_status"] = "FAIL"
+                    gate_row["research_gate_reason"] = frozen_error
+                    continue
+                registered = cand.load_candidate(
+                    candidates_dir / f"{cid}.toml")
+                pdecl = getattr(registered, "prob_declared", None)
+                if pdecl is None or pdecl.expected_delta_p is None:
+                    raise ValueError("候选缺少预注册 prob.expected_delta_p")
+                gate_result = research_gate(
+                    method_id=PRIMARY_METHOD,
+                    dp=float(pdecl.expected_delta_p),
+                    days=gate_row.get("n_trigger_days"),
+                    n_hyp=n_hyp_gate)
+                gate_row["research_gate_status"] = gate_result.status
+                gate_row["research_gate_reason"] = "；".join(
+                    gate_result.reasons)
+            except (cand.CandidateError, AttributeError, TypeError,
+                    ValueError, OSError) as exc:
+                gate_row["research_gate_status"] = "NOT_RUN"
+                gate_row["research_gate_reason"] = (
+                    f"无法建立可验证的研究门禁输入：{type(exc).__name__}: {exc}")
+        gate_statuses = [r["research_gate_status"] for r in rows]
+        if not gate_statuses or "NOT_RUN" in gate_statuses:
+            research_gate_status = "NOT_RUN"
+        elif "FAIL" in gate_statuses:
+            research_gate_status = "FAIL"
+        elif "INSUFFICIENT_DATA" in gate_statuses:
+            research_gate_status = "INSUFFICIENT_DATA"
+        elif all(s == "PASS" for s in gate_statuses):
+            research_gate_status = "PASS"
+        else:
+            research_gate_status = "NOT_RUN"
+        research_gate_line = (
+            f"研究门禁：{research_gate_status}——逐候选使用预注册 "
+            "expected_delta_p、触发日数与冻结假设族判定；只有 PASS 可推进")
+
         out_dir = Path("docs/research")
         out_dir.mkdir(parents=True, exist_ok=True)
         stamp = pd.Timestamp.now().strftime("%Y-%m-%d")
