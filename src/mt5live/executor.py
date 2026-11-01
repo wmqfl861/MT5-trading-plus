@@ -1204,6 +1204,7 @@ class LiveExecutor:
             if status == "pending" and did not in finals:
                 undecided[did] = {
                     "decision_id": did, "status": "pending",
+                    "action": rec.get("action"),
                     "send_ts": self._journal_entry_ts(rec.get("ts")),
                     "order_ticket": rec.get("order_ticket"),
                     "comment": rec.get("comment"),
@@ -1284,7 +1285,8 @@ class LiveExecutor:
         matched = [
             d for d in deals
             if ((order_ticket is not None and d.order == order_ticket)
-                or (request_comment and d.comment == request_comment))
+                or (entry.get("action") in ("open", "add")
+                    and request_comment and d.comment == request_comment))
         ]
         if matched:
             return "confirmed", (
