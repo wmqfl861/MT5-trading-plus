@@ -963,6 +963,37 @@ def test_p209_round_report_method_gate_and_diag_columns(r4_open,
     assert "method_status" in payload
 
 
+def test_t107_research_gate_fail_blocks_even_if_method_approved(
+        r4_open, monkeypatch):
+    """T107 P0：ResearchGate 不是展示项；FAIL 必须压过 Holm+成本推进。"""
+    from types import SimpleNamespace
+
+    with Ledger(r4_open["ledger"]) as led:
+        _record_r4_run(led, cid="C101", hyp="S1:A1:follow>base")
+        _record_r4_run(led, cid="C102", hyp="S1:A2:follow>base")
+
+    # 模拟旧方法批准门已通过，但逐候选 ResearchGate 仍 FAIL。
+    monkeypatch.setattr(
+        "mt5quant.validation.prob_mode.primary_method_approved",
+        lambda: (True, "approved for isolated regression test"))
+    monkeypatch.setattr(
+        "mt5quant.research.gate.research_gate",
+        lambda **kwargs: SimpleNamespace(
+            status="FAIL", reasons=("forced acceptance drift",)))
+
+    code, out = _run_round_report(r4_open, monkeypatch)
+    assert code == 0, out  # 报告可生成，但不能推进
+    reports = sorted((r4_open["tmp"] / "docs" / "research")
+                     .glob("round-R4-p1-*.md"))
+    assert len(reports) == 1
+    text = reports[0].read_text(encoding="utf-8")
+    concl = [ln for ln in text.splitlines() if ln.startswith("| C10")]
+    assert len(concl) == 2
+    assert all("不推进（研究门禁 FAIL）" in ln for ln in concl)
+    assert "推进 0 / 2" in text
+    assert "研究门禁：FAIL" in text
+
+
 # ------------------------------------------------------------ P-10
 
 P10_ROUND = '''id = "R4"
