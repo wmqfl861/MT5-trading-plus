@@ -1393,6 +1393,29 @@ def test_h201_4_order_send_unknown_intent_pending_restart_confirmed(tmp_path):
     assert len(b.market_orders) == 1                     # 不重开
 
 
+def test_h201_unjournaled_pending_order_blocks_new_open_but_not_close(
+        tmp_path):
+    """Legacy/manual broker pending orders without a journal entry still
+    block risk-increasing opens; risk-reducing closes remain available."""
+    b = FakeBroker()
+    b.seed_pending(magic=MAGIC, volume=0.02)
+    ex = _mk_executor(b, tmp_path)
+    d_open = mk_decision(signal=1, volume_lots=0.02)
+    rr = ex.poll(d_open, NOW)
+    assert rr.action == "blocked_broker_pending"
+    assert b.market_orders == []
+    assert "BROKER_PENDING_ORDER" in _alerts_text(tmp_path)
+
+    # The safety gate is specifically for new risk: flattening remains live.
+    b.seed_position(side="buy", volume=0.02, magic=MAGIC)
+    d_close = mk_decision(signal=0, volume_lots=None,
+                          decision_id="XAUUSD|M15|2026-10-20T18:15:00")
+    rr_close = ex.poll(d_close, NOW.replace(minute=15))
+    assert rr_close.action == "close"
+    assert b.positions() == []
+    assert b.pending_orders("XAUUSD") == []
+
+
 def test_h201_placed_order_volume_is_not_treated_as_fill(tmp_path):
     """PLACED is accepted but not filled: even if result.volume is nonzero,
     it must leave the journal unknown and keep the open-order safety gate."""
