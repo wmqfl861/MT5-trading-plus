@@ -195,7 +195,8 @@ def test_symbol_select_failure_raises():
         mkt.bars("EURUSD", "M1", 10)
 
 
-# ---- SymbolSpec 新增合约参数字段（P0）+ swap 计费口径字段（T5/R4）----
+# ---- SymbolSpec 新增合约参数字段（P0）+ swap 计费口径字段（T5/R4）
+#      + 基础币种字段（3A/H2-03）----
 
 FullSymRow = namedtuple(
     "FullSymRow",
@@ -203,7 +204,7 @@ FullSymRow = namedtuple(
     "trade_contract_size volume_min volume_max volume_step filling_mode visible "
     "trade_stops_level swap_long swap_short trade_freeze_level "
     "trade_tick_size trade_tick_value trade_calc_mode margin_initial margin_maintenance "
-    "swap_mode swap_rollover3days",
+    "swap_mode swap_rollover3days currency_base",
 )
 
 
@@ -217,7 +218,7 @@ def test_full_row_maps_new_spec_fields():
         trade_stops_level=30, swap_long=-18.4, swap_short=9.2,
         trade_freeze_level=15, trade_tick_size=0.01, trade_tick_value=1.0,
         trade_calc_mode=1, margin_initial=0.005, margin_maintenance=0.0025,
-        swap_mode=4, swap_rollover3days=3,
+        swap_mode=4, swap_rollover3days=3, currency_base="XAU",
     ))
     spec = cat.get("XAUUSD")
     assert spec.swap_long == -18.4 and spec.swap_short == 9.2
@@ -228,6 +229,27 @@ def test_full_row_maps_new_spec_fields():
     # T5：swap 计费口径与三倍日（MT5 星期枚举：周日=0…周六=6）
     assert spec.swap_mode == 4           # 按存款货币计
     assert spec.swap_rollover3days == 3  # MT5 周三
+    # 3A（H2-03）：包内常量名 currency_base（MT5 SYMBOL_CURRENCY_BASE），
+    # mode=2 隔夜费按它校验——必须原值进 SymbolSpec，不得用利润币种代理
+    assert spec.currency_base == "XAU"
+
+
+def test_eurusd_row_maps_currency_base():
+    # 3A：EURUSD 基础货币 EUR ≠ 利润货币 USD——审核探针 currency 的反例品种，
+    # 快照导出该字段后 mode=2 校验才有真值可用
+    conn, cat, _, fake = make()
+    fake.set_behavior("symbol_info", value=FullSymRow(
+        name="EURUSD", description="Euro vs US Dollar", digits=5, point=0.00001,
+        spread=12, trade_mode=4, currency_profit="USD", currency_margin="USD",
+        trade_contract_size=100000.0, volume_min=0.01, volume_max=100.0,
+        volume_step=0.01, filling_mode=1, visible=True,
+        trade_stops_level=0, swap_long=-5.0, swap_short=2.0,
+        trade_freeze_level=0, trade_tick_size=0.00001, trade_tick_value=1.0,
+        trade_calc_mode=1, margin_initial=0.0, margin_maintenance=0.0,
+        swap_mode=2, swap_rollover3days=3, currency_base="EUR",
+    ))
+    spec = cat.get("EURUSD")
+    assert spec.currency_base == "EUR" and spec.currency_profit == "USD"
 
 
 def test_old_style_row_falls_back_to_default_new_fields():
@@ -242,3 +264,6 @@ def test_old_style_row_falls_back_to_default_new_fields():
     assert spec.margin_initial == 0.0 and spec.margin_maintenance == 0.0
     # T5：缺 swap_mode → 0（禁用）、缺 rollover → 3（MT5 周三，FX 惯例）
     assert spec.swap_mode == 0 and spec.swap_rollover3days == 3
+    # 3A：缺 currency_base → None（"未知"），快照如实导出 null；
+    # swap mode=2 据此拒绝（H2-03：不退 currency_profit 代理）
+    assert spec.currency_base is None

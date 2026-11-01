@@ -50,6 +50,9 @@ def _to_spec(row) -> SymbolSpec:
         # T5（R4）：隔夜费计费口径与三倍日；旧式 row 缺 → 兜底 0(禁用)/3(MT5 周三)
         swap_mode=getattr(row, "swap_mode", 0),
         swap_rollover3days=getattr(row, "swap_rollover3days", 3),
+        # 3A（H2-03）：品种基础货币（包内常量值 currency_base）；旧式 row /
+        # 低版本包缺 → None（未知），swap mode=2 校验据此拒绝
+        currency_base=getattr(row, "currency_base", None),
     )
 
 

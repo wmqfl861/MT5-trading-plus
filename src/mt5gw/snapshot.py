@@ -36,6 +36,9 @@ _SPEC_JSON_FIELDS = (
     "margin_initial", "margin_maintenance",
     # T5（R4）：隔夜费计费口径与三倍日（券商改口径要被 diff 第一时间抓到）
     "swap_mode", "swap_rollover3days",
+    # 3A（H2-03）：品种基础货币——swap mode=2 的计费币种；None=未知（旧式
+    # row / 旧快照），swap.per_lot_per_night 据此拒绝（不用利润币种代理）
+    "currency_base",
 )
 # 参与比对的字段：白名单去掉 name（即键名）与 captured_at_utc（抓取时间戳）
 _DIFF_FIELDS = tuple(f for f in _SPEC_JSON_FIELDS if f != "name")
