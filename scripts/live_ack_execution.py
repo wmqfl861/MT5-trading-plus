@@ -63,7 +63,7 @@ def _journal_state(live_dir: str, magic: int) -> dict:
     """读 journal 的终态/未决两张表（与执行器 _journal_refresh 同规则；
     撕裂行同样按合成未决项列出，供 --list 与人工仲裁取 id）。"""
     path = os.path.join(live_dir, JOURNAL_FILE_FMT.format(magic=magic))
-    finals: dict[str, str] = {}
+    finals: dict[str, dict] = {}
     undecided: dict[str, str] = {}
     if not os.path.exists(path):
         return {"finals": finals, "undecided": undecided, "path": path}
@@ -86,7 +86,7 @@ def _journal_state(live_dir: str, magic: int) -> dict:
         elif status in ("sent", "unknown") and did in undecided:
             undecided[did] = status
         elif status in ("confirmed", "rejected"):
-            finals[did] = status
+            finals[did] = {"status": status, "detail": rec.get("detail")}
             undecided.pop(did, None)
     return {"finals": finals, "undecided": undecided, "path": path}
 
@@ -97,25 +97,37 @@ def ack(live_dir: str, gw: MT5Gateway, magic: int, decision_id: str,
     """落 journal 终态行 + 意图恢复（实际净持仓 confirmed）。"""
     n = naive_utc(now if now is not None
                   else datetime.now(timezone.utc).replace(tzinfo=None))
-    state = _journal_state(live_dir, magic)
-    if decision_id in state["finals"]:
-        print(f"× 决策 {decision_id} 已有终态 "
-              f"{state['finals'][decision_id]}——无需重复仲裁（拒绝改写终态）")
+    if status not in ("confirmed", "rejected"):
+        print(f"× 非法仲裁状态：{status!r}")
         return 2
-    if not state["undecided"].get(decision_id):
+    if not isinstance(reason, str) or not reason.strip():
+        print("× 仲裁原因不能为空")
+        return 2
+
+    state = _journal_state(live_dir, magic)
+    existing = state["finals"].get(decision_id)
+    already_arbitrated = False
+    if existing is not None:
+        # 仲裁终态已落但意图写入失败时，允许同一结论幂等重试，
+        # 只补修意图；普通执行终态或不同结论绝不允许改写。
+        if (existing.get("status") != status
+                or not str(existing.get("detail") or "").startswith(
+                    "arbitrated:")):
+            print(f"× 决策 {decision_id} 已有终态 "
+                  f"{existing.get('status')}——拒绝重复/反向仲裁")
+            return 2
+        already_arbitrated = True
+    elif not state["undecided"].get(decision_id):
         print(f"× 决策 {decision_id} 不在未决表中（journal 未决项："
               f"{sorted(state['undecided']) or '无'}）——先核对 --decision-id")
         return 2
-    # journal 终态行（执行器下一轮刷新即出清未决、解除开仓暂停）
-    append_jsonl(state["path"], {
-        "ts": iso_utc(n), "decision_id": decision_id, "status": status,
-        "detail": f"arbitrated: {reason}"})
-    # 意图恢复：按当前实际净持仓写 confirmed（对账不再对崩溃留下的
-    # pending 意图误报）
+
+    # 先读券商并完成意图构造/校验，再落 journal 终态。查询失败时不
+    # 消耗仲裁机会；若后续意图写入失败，同一 arbitrated 结论可幂等重试。
     try:
         actual = gw.account.positions()
     except DataUnavailableError as e:
-        print(f"× 持仓查询失败（journal 终态已落，意图未恢复）：{e}")
+        print(f"× 持仓查询失败（未写入 journal 终态，可重试）：{e}")
         return 2
     mine = [p for p in actual if p.magic == magic]
     symbols = {p.symbol for p in mine}
@@ -141,8 +153,17 @@ def ack(live_dir: str, gw: MT5Gateway, magic: int, decision_id: str,
                     side="buy" if net >= 0 else "sell", volume=abs(net),
                     status=STATUS_CONFIRMED,
                     cause=f"ack_execution:{decision_id}", ts=n)
-    write_intent(os.path.join(live_dir, INTENT_FILE_FMT.format(magic=magic)),
-                 intent)
+    if not already_arbitrated:
+        append_jsonl(state["path"], {
+            "ts": iso_utc(n), "decision_id": decision_id, "status": status,
+            "detail": f"arbitrated: {reason}"})
+    try:
+        write_intent(os.path.join(live_dir, INTENT_FILE_FMT.format(magic=magic)),
+                     intent)
+    except Exception as e:
+        print(f"× 意图恢复写入失败（仲裁终态已落；可用相同 status/reason "
+              f"重试修复）：{type(e).__name__}: {e}")
+        return 2
     append_alert(live_dir, ALERT_ACK_EXECUTION,
                  f"magic {magic} 人工仲裁 execution journal 未决项：决策 "
                  f"{decision_id} → {status}（{reason}）——意图恢复为实际净"
