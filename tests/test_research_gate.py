@@ -228,11 +228,26 @@ def test_acceptance_snapshot_source_hashes():
     src = ACCEPTANCE_CONSTANTS["sources"]
     assert set(src) >= {
         "src/mt5quant/strategies/library/prob/level_decision.py",
-        "src/mt5quant/prob/tables.py"}
+        "src/mt5quant/prob/tables.py",
+        "src/mt5quant/prob/decision.py"}
+    from mt5quant.research import gate
+    assert src == gate.EXPECTED_ACCEPTANCE_SOURCE_SHA256
+    assert ACCEPTANCE_CONSTANTS["source_drift"] == []
     for rel, digest in src.items():
         p = REPO / rel
         assert p.is_file(), rel
         assert digest == hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def test_acceptance_snapshot_detects_semantic_source_drift(monkeypatch):
+    """EV 下界/概率估计语义文件变化，即使常量不变也必须触发漂移。"""
+    from mt5quant.research import gate
+    path = "src/mt5quant/prob/decision.py"
+    monkeypatch.setitem(gate.EXPECTED_ACCEPTANCE_SOURCE_SHA256, path,
+                        "0" * 64)
+    snap = gate.acceptance_snapshot()
+    assert path in snap["source_drift"]
+    assert f"source:{path}" in snap["drift"]
 
 
 # ---------------------------------------------------------------- 指纹
