@@ -1219,11 +1219,10 @@ class LiveExecutor:
         - confirmed 证据：发送时刻之后本 magic 的任意成交（请求已真实到达
           并执行），或 state 未知的新持仓 ticket（成交归档延迟时的第二
           证据）；
-        - rejected 证据（R3）：持仓/挂单/成交历史核对**全部成功**、无任何
-          新成交/新仓，且 now−send_ts ≥ 覆盖裕量（成交历史窗口确已覆盖
-          发送时刻）→ 确定未成交；
-        - 其余（查询失败/窗口未覆盖）→ ""（保持 unknown，下轮重查——绝不
-          误判 rejected：误判后重放即重复开仓）。
+        - 空成交/空持仓/空挂单不是拒单的正面证据：历史归档可能延迟，
+          且订单可能已成交后又平仓；此情形保持 unknown，只能由明确拒单
+          retcode 或 live_ack_execution 人工仲裁落 rejected。
+        - 查询失败或仍有挂单同样保持 unknown（fail-closed）。
         """
         send_ts = entry.get("send_ts")
         try:
