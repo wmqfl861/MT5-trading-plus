@@ -727,7 +727,7 @@ class LiveExecutor:
 
         # 6) 差分计划 + 开仓腿过闸门（平仓腿不受限）+ 意图（pending→confirmed）
         report = self._plan_and_execute(decision, target, net, n)
-        self._after_orders(decision, report, n)
+        report = self._after_orders(decision, report, n)
         self._finish(n, decision.decision_id, report.orders)
         return report
 
@@ -912,21 +912,44 @@ class LiveExecutor:
         return self._from_execution(report)
 
     def _after_orders(self, decision, report: RoundReport,
-                      n: datetime) -> None:
-        """订单返回后（本轮真下了单）：意图 = 实际净持仓（confirmed）；
-        部分成交如实记录（意图=成交量）并写告警；出现加/减仓腿（T31 后
-        正常轮次不该有）写告警。
+                      n: datetime) -> RoundReport:
+        """订单返回后区分真实成交与仅被券商接受的请求。
 
-        依据 orders 里有无开/平腿判定，而不是 action——反向被拒轮也会
-        执行平仓腿（risk_rejected + close orders），意图同样要如实确认。
-        无订单的轮次（hold/duplicate/被拒/跳过）绝不改写意图（防洗白）。
+        PLACED/无成交量不等于 fill：意图保持 pending；journal 保持
+        unknown，直到后续成交、挂单终态或人工仲裁。若反向操作已有平仓
+        成交但开仓腿仍 pending，expected 按已发生的真实净持仓更新，
+        journal 仍保持 unknown，防止下一决策重复增加风险。
         """
-        if not any(o.kind in ("open", "close") for o in report.orders):
-            return
+        legs = [o for o in report.orders if o.kind in ("open", "close")]
+        if not legs:
+            return report
+        filled = [o for o in legs
+                  if o.filled_volume is not None and o.filled_volume > _EPS]
+        unfilled = [o for o in legs
+                    if o.filled_volume is None or o.filled_volume <= _EPS]
+        if unfilled:
+            # 有真实成交的腿，expected 可按当前券商净持仓如实落盘；
+            # 若完全没有成交，保留发送前 pending 意图，不得洗成 confirmed。
+            if filled:
+                self._write_confirmed(decision.decision_id, n)
+            if self._journal_active == decision.decision_id:
+                self._journal_finish(
+                    decision.decision_id, "unknown", n=n,
+                    detail=("broker accepted/request returned without "
+                            "confirmed fill; pending legs="
+                            f"{[(o.kind, o.ticket, o.retcode) for o in unfilled]}"))
+            append_alert(
+                self._live_dir, ALERT_EXECUTION_UNKNOWN,
+                f"magic {self._magic} {decision.decision_id} 存在已返回但未确认"
+                f"成交的订单腿 {[(o.kind, o.ticket, o.retcode) for o in unfilled]}；"
+                "不写成交台账、不解除执行未知门禁，等待券商成交/撤单终态并对账",
+                n)
+            return replace(
+                report, action="execution_pending",
+                error="broker_order_pending: request accepted but fill not confirmed")
+
+        # 所有开/平腿均有真实成交量，意图按实际净持仓确认。
         self._write_confirmed(decision.decision_id, n)
-        # H2-01（1A）：本轮已 journal pending 的决策在此落 confirmed 终态
-        #（订单已回、意图已如实确认）；_close_only_leg 等未入 journal 的
-        # 轮次不写（_journal_finish 只认 active 决策）。
         if self._journal_active == decision.decision_id:
             self._journal_finish(decision.decision_id, "confirmed", n=n,
                                  detail=f"action={report.action}")
@@ -937,8 +960,8 @@ class LiveExecutor:
                 f" 腿（净 {report.net_before:+.2f} → 目标差异）——D22 持仓期间"
                 "不调仓，正常轮次不应加减仓（固定手数配置被人为改动？仓位被"
                 "外部改动？），须人工核对", n)
-        for o in report.orders:
-            if o.kind in ("open", "close") and o.partial:
+        for o in filled:
+            if o.partial:
                 append_alert(
                     self._live_dir, ALERT_PARTIAL_FILL,
                     f"magic {self._magic} {decision.decision_id} {o.kind} "
@@ -946,6 +969,7 @@ class LiveExecutor:
                     f"{o.filled_volume} 手——意图按成交量登记；差额不再自动"
                     "补足（D22 持仓期间不调仓），反手/全平时了结或人工处置",
                     n)
+        return report
 
     def _from_execution(self, report) -> RoundReport:
         return RoundReport(
@@ -1757,15 +1781,16 @@ class LiveExecutor:
                                                else o.requested_volume),
                 "decision_id": decision_id or "-",
             })
-            # R10/T58（C-2）：主动成交证据行（price=成交价 res.deal_price、
-            # volume=成交量、decision_bar=当轮决策 bar）——与请求日志并存
-            self._log_deal(
-                n, ticket=o.ticket,
-                event="fill_open" if o.kind == "open" else "fill_close",
-                reason=None, price=o.price,
-                volume=(o.filled_volume if o.filled_volume is not None
-                        else o.requested_volume),
-                side=o.side or "")
+            # R10/T58（C-2）：成交证据只记录真实 fill。PLACED/accepted
+            # 请求没有 filled_volume，必须只留在 orders 请求日志，不能伪造
+            # fill_open/fill_close（否则台账会把未成交挂单当成交）。
+            if (o.filled_volume is not None and o.filled_volume > _EPS
+                    and o.price is not None):
+                self._log_deal(
+                    n, ticket=o.ticket,
+                    event="fill_open" if o.kind == "open" else "fill_close",
+                    reason=None, price=o.price, volume=o.filled_volume,
+                    side=o.side or "")
 
     def _log_external_exit_deal(self, deal, n: datetime) -> None:
         """R10/T58（C-2）：外部/保护性出场解释的成交证据行——_explain_exit
