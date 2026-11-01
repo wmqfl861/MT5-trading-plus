@@ -1422,14 +1422,16 @@ def test_h201_5_unknown_no_fill_blocked_until_history_window_covers(tmp_path):
     assert "EXECUTION_UNKNOWN" in _alerts_text(tmp_path)
     assert not _finals(tmp_path, "rejected")             # R3：不误判
 
-    # 窗口覆盖发送时刻（无成交、无仓）→ rejected + 恢复；重投被拒
-    late = NOW + timedelta(seconds=JOURNAL_HISTORY_COVER_MARGIN_S * 2)
+    # 即使时间窗口已经很长，空成交历史也不是拒单的正面证据；
+    # 必须保持 unknown，直到券商给出可归属终态或人工仲裁。
+    late = NOW + timedelta(seconds=JOURNAL_HISTORY_COVER_MARGIN_S * 20)
     rr2 = ex2.poll(d, late)
-    assert rr2.action == "duplicate"
-    assert _finals(tmp_path, "rejected")
+    assert rr2.action == "blocked_execution_unknown"
+    assert not _finals(tmp_path, "rejected")
     d2 = mk_decision(signal=1, volume_lots=0.01,
                      decision_id="XAUUSD|M15|2026-10-20T18:15:00")
-    assert ex2.poll(d2, late.replace(minute=25)).action == "open"
+    assert ex2.poll(d2, late.replace(minute=25)).action == \
+        "blocked_execution_unknown"
 
 
 def test_h201_pending_broker_order_keeps_execution_unknown(tmp_path):
