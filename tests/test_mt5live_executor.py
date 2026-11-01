@@ -1457,6 +1457,44 @@ def test_h201_pending_broker_order_keeps_execution_unknown(tmp_path):
     assert _finals(tmp_path, "rejected")
 
 
+def test_placed_order_is_not_confirmed_or_logged_as_fill(tmp_path):
+    """MT5 PLACED = accepted, not filled: keep journal pending and do not
+    emit fill_open evidence until a real deal is observed."""
+    from mt5gw.models import OrderResult
+
+    b = FakeBroker()
+    d = mk_decision(signal=1, volume_lots=0.02)
+    calls = []
+
+    def placed(symbol, side, volume, **kwargs):
+        calls.append((symbol, side, volume))
+        order = b.seed_pending(magic=kwargs.get("magic") or MAGIC,
+                               volume=volume)
+        return OrderResult(
+            ok=True, filled=False, partial=False, retcode=10008,
+            comment="placed", order_ticket=order.ticket, deal_ticket=None,
+            deal_price=None, requested_volume=volume, volume=None)
+
+    b.market_order = placed
+    ex = _mk_executor(b, tmp_path)
+    rr = ex.poll(d, NOW)
+
+    assert rr.action == "execution_pending"
+    assert calls and len(b.pending_orders("XAUUSD")) == 1
+    assert read_intent(tmp_path)["status"] == "pending"
+    assert not _finals(tmp_path, "confirmed")
+    records = _journal_records(tmp_path)
+    assert [r["status"] for r in records][-3:] == ["pending", "sent", "unknown"]
+    assert not (tmp_path / f"deals-{MAGIC}.jsonl").exists()
+
+    # A later decision cannot open while the broker still holds the accepted order.
+    d2 = mk_decision(signal=1, volume_lots=0.02,
+                     decision_id="XAUUSD|M15|2026-10-20T18:15:00")
+    rr2 = ex.poll(d2, NOW + timedelta(seconds=90))
+    assert rr2.action == "blocked_execution_unknown"
+    assert len(calls) == 1
+
+
 def test_h201_6_r3_delayed_broker_query_not_misjudged_rejected(tmp_path):
     """注入 6（R3）：重启时券商核对查询超时/延迟 → 不得误判 rejected（重复
     开仓风险），保持 unknown；下轮重查确认 → confirmed。"""
