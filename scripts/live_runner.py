@@ -587,6 +587,8 @@ def main(argv=None) -> int:
         if executor is None:
             if lock is not None:
                 lock.release()     # H-05：装配失败的早退同样释锁
+            if legacy_lock is not None:
+                legacy_lock.release()
             if temp_lock is not None:
                 temp_lock.release()
             return 2
@@ -600,6 +602,8 @@ def main(argv=None) -> int:
         if executor is None:
             if lock is not None:
                 lock.release()     # H-05：装配失败的早退同样释锁
+            if legacy_lock is not None:
+                legacy_lock.release()
             if temp_lock is not None:
                 temp_lock.release()
             return 2
