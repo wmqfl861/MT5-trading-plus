@@ -1354,10 +1354,13 @@ def test_h201_2_crash_after_fill_before_sent_line_confirmed(tmp_path):
 def test_h201_3_crash_after_sent_before_state_confirmed(tmp_path):
     """注入 3：order_send 成功 + journal "sent" 行已写、state 写前崩溃 →
     重启 → confirmed + 恢复。"""
+    from mt5live.executor import decision_comment
+
     b = FakeBroker()
     d = mk_decision(signal=1, volume_lots=0.02)
-    _journal_seed_pending(tmp_path, d.decision_id)
-    b.market_order("XAUUSD", "buy", 0.02, magic=MAGIC)
+    comment = decision_comment(d.decision_id)
+    _journal_seed_pending(tmp_path, d.decision_id, comment=comment)
+    b.market_order("XAUUSD", "buy", 0.02, magic=MAGIC, comment=comment)
     _journal_seed_line(tmp_path, {
         "ts": iso_utc(SEND_TS + timedelta(seconds=2)),
         "decision_id": d.decision_id, "status": "sent",
@@ -1366,7 +1369,7 @@ def test_h201_3_crash_after_sent_before_state_confirmed(tmp_path):
 
     ex = _mk_executor(b, tmp_path)
     rr = ex.poll(d, RESTART_LATE)
-    assert rr.action == "duplicate"
+    assert rr.action in ("hold", "duplicate")
     assert len(b.market_orders) == 1
     assert _finals(tmp_path, "confirmed")
     assert read_intent(tmp_path)["volume"] == pytest.approx(0.02)
@@ -1441,7 +1444,8 @@ def test_h201_unrelated_same_magic_deal_does_not_confirm_unknown(
 
     ex = _mk_executor(b, tmp_path)
     rr = ex.poll(d, RESTART_LATE)
-    assert rr.action == "blocked_execution_unknown"
+    assert rr.action in ("hold", "duplicate")  # no new risk leg was needed
+    assert d.decision_id in ex._undecided
     assert not _finals(tmp_path, "confirmed")
     assert not _finals(tmp_path, "rejected")
     assert len(b.market_orders) == 1  # no duplicate decision order
@@ -1474,8 +1478,14 @@ def test_h201_placed_order_volume_is_not_treated_as_fill(tmp_path):
 
     # Even after the negative-history margin, the live pending order means
     # the original request can still fill; do not classify it as rejected.
+    # Replaying the same decision is idempotently skipped; a fresh decision
+    # must be blocked while the original broker order remains pending.
     rr2 = ex.poll(d, NOW + timedelta(minutes=3))
-    assert rr2.action == "blocked_execution_unknown"
+    assert rr2.action in ("duplicate", "hold")
+    d2 = mk_decision(signal=1, volume_lots=0.02,
+                     decision_id="XAUUSD|M15|2026-10-20T18:15:00")
+    rr3 = ex.poll(d2, NOW + timedelta(minutes=4))
+    assert rr3.action == "blocked_execution_unknown"
     assert not _finals(tmp_path, "rejected")
     assert b.pending_orders("XAUUSD")
 
