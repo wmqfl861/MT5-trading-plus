@@ -112,6 +112,31 @@ def test_calibration_ok_false_blocks_even_adopted(monkeypatch):
     assert any("calibration_ok=False" in x for x in r.reasons)
 
 
+def test_acceptance_snapshot_drift_blocks_adopted_method(monkeypatch):
+    """即使方法已获批且样本充分，验收阈值漂移也必须阻断。"""
+    mid = _adopted_registry(monkeypatch)
+    monkeypatch.setattr(
+        "mt5quant.research.gate.acceptance_snapshot",
+        lambda: {"constants": {"lb_z": 2.0}, "expected": {"lb_z": 1.0},
+                 "sources": {}, "drift": ["lb_z"]})
+    r = research_gate(method_id=mid, dp=0.05, days=10 ** 6)
+    assert r.status == "FAIL"
+    assert any("阈值" in reason and "漂移" in reason for reason in r.reasons)
+    assert r.acceptance["drift"] == ["lb_z"]
+
+
+def test_acceptance_snapshot_unavailable_fails_closed(monkeypatch):
+    """验收快照无法读取时，不得退回默认常量继续放行。"""
+    mid = _adopted_registry(monkeypatch)
+    def unavailable():
+        raise OSError("snapshot source unavailable")
+    monkeypatch.setattr("mt5quant.research.gate.acceptance_snapshot",
+                        unavailable)
+    r = research_gate(method_id=mid, dp=0.05, days=10 ** 6)
+    assert r.status == "FAIL"
+    assert "快照不可用" in r.reasons[0]
+
+
 def test_insufficient_data_when_adopted_but_inputs_missing(monkeypatch):
     """adopted=True 但 dp/days 给不出 → INSUFFICIENT_DATA（注明原因）。"""
     mid = _adopted_registry(monkeypatch)
