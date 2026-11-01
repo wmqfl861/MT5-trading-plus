@@ -1588,10 +1588,14 @@ def test_placed_order_is_not_confirmed_or_logged_as_fill(tmp_path):
 def test_h201_6_r3_delayed_broker_query_not_misjudged_rejected(tmp_path):
     """注入 6（R3）：重启时券商核对查询超时/延迟 → 不得误判 rejected（重复
     开仓风险），保持 unknown；下轮重查确认 → confirmed。"""
+    from mt5live.executor import decision_comment
+
     b = FakeBroker()
     d = mk_decision(signal=1, volume_lots=0.02)
-    _journal_seed_pending(tmp_path, d.decision_id)
-    b.market_order("XAUUSD", "buy", 0.02, magic=MAGIC)   # 券商有仓
+    comment = decision_comment(d.decision_id)
+    _journal_seed_pending(tmp_path, d.decision_id, comment=comment)
+    b.market_order("XAUUSD", "buy", 0.02, magic=MAGIC,
+                   comment=comment)                     # 券商有仓
     _seed_pending_intent(tmp_path, d.decision_id)
 
     calls = {"pos": 0}
