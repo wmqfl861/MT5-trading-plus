@@ -85,7 +85,16 @@ def test_same_arbitration_can_retry_after_intent_write_failure(
     assert state["finals"][decision_id]["status"] == "rejected"
     assert not (live_dir / mod.INTENT_FILE_FMT.format(magic=777)).exists()
 
-    # Same conclusion may repair the intent; it must not append a second final.
+    # Same status with a changed reason is not the same arbitration and must
+    # not silently reuse the existing terminal record.
+    conflict = mod.ack(
+        str(live_dir), gw, 777, decision_id, "rejected",
+        "different reason", symbol="XAUUSD", now=now,
+    )
+    assert conflict == 2
+    assert calls["n"] == 1
+
+    # Same conclusion and same reason may repair the intent; no second final.
     second = mod.ack(
         str(live_dir), gw, 777, decision_id, "rejected",
         "broker backend verified not sent", symbol="XAUUSD", now=now,
