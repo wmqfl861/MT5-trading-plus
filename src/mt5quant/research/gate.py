@@ -205,8 +205,25 @@ def research_gate(*, method_id: str, days: int | None = None,
             detail={"registry": _entry_brief(method_id, entry),
                     "inputs": inputs})
 
-    # ---- 2) FAIL（adopted=False 或显式校准失败——必须阻断）
+    # ---- 2) FAIL（adopted=False / 校准失败 / 验收口径漂移——必须阻断）
     reasons: list[str] = []
+    try:
+        snapshot = acceptance_snapshot()
+    except Exception as exc:
+        # 无法读取验收口径本身即不能证明研究使用了冻结阈值。
+        return GateResult(
+            status="FAIL",
+            reasons=(f"验收阈值快照不可用（{type(exc).__name__}: {exc}）"
+                     "——fail-closed，禁止研究放行",),
+            method_id=method_id,
+            detail={"registry": _entry_brief(method_id, entry),
+                    "inputs": inputs,
+                    "acceptance_snapshot_error":
+                        f"{type(exc).__name__}: {exc}"})
+    if snapshot.get("drift"):
+        reasons.append(
+            "验收阈值相对冻结登记值发生漂移："
+            f"{snapshot['drift']}——必须走独立版本化提案，当前研究不得放行")
     if not entry.get("adopted"):
         reasons.append(
             f"方法 {method_id} 未获批准（registry status={status}、"
@@ -230,7 +247,7 @@ def research_gate(*, method_id: str, days: int | None = None,
         return GateResult(
             status="FAIL", reasons=tuple(reasons), method_id=method_id,
             detail={"registry": _entry_brief(method_id, entry),
-                    "inputs": inputs})
+                    "inputs": inputs, "acceptance_snapshot": snapshot})
 
     # ---- 3)/4) adopted=True：样本量证据三分（sample_size_evidence 同一判定）
     if dp is None or days is None:
@@ -245,7 +262,8 @@ def research_gate(*, method_id: str, days: int | None = None,
                      "——按 INSUFFICIENT_DATA 处理（不猜、不默认达标）",),
             method_id=method_id,
             detail={"registry": _entry_brief(method_id, entry),
-                    "inputs": inputs, "evidence": None})
+                    "inputs": inputs, "evidence": None,
+                    "acceptance_snapshot": snapshot})
     decision, state, detail_txt = sample_size_evidence(
         float(dp), days, n_hyp=(1 if n_hyp is None else int(n_hyp)))
     evidence = {"decision": decision, "state": state, "detail": detail_txt,
