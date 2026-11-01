@@ -110,8 +110,7 @@ def ack(live_dir: str, gw: MT5Gateway, magic: int, decision_id: str,
         # 仲裁终态已落但意图写入失败时，允许同一结论幂等重试，
         # 只补修意图；普通执行终态或不同结论绝不允许改写。
         if (existing.get("status") != status
-                or not str(existing.get("detail") or "").startswith(
-                    "arbitrated:")):
+                or existing.get("detail") != f"arbitrated: {reason}"):
             print(f"× 决策 {decision_id} 已有终态 "
                   f"{existing.get('status')}——拒绝重复/反向仲裁")
             return 2
@@ -133,7 +132,7 @@ def ack(live_dir: str, gw: MT5Gateway, magic: int, decision_id: str,
     symbols = {p.symbol for p in mine}
     if len(symbols) > 1:
         print(f"× magic {magic} 在多个品种上有持仓（{sorted(symbols)}），"
-              "无法登记为单一意图——journal 已仲裁，意图请人工核对")
+              "无法登记为单一意图——未写入 journal 终态，意图请人工核对")
         return 2
     sym = (symbols.pop() if symbols else None) or symbol
     if sym is None and not mine:
