@@ -1451,12 +1451,16 @@ def test_h201_pending_broker_order_keeps_execution_unknown(tmp_path):
     assert not _finals(tmp_path, "rejected")
     assert order in b.pending_orders("XAUUSD")
 
-    # Once the broker order is no longer pending, a complete negative
-    # reconciliation may classify it as rejected.
+    # Cancellation removes the pending order, but an empty deal history is
+    # still not positive proof of rejection; only explicit arbitration resolves it.
     b.cancel_order(order.ticket)
     rr2 = ex.poll(d, late + timedelta(seconds=1))
     assert rr2.action == "duplicate"
-    assert _finals(tmp_path, "rejected")
+    assert not _finals(tmp_path, "rejected")
+    d2 = mk_decision(signal=1, volume_lots=0.01,
+                     decision_id="XAUUSD|M15|2026-10-20T18:15:00")
+    assert ex.poll(d2, late + timedelta(minutes=2)).action == \
+        "blocked_execution_unknown"
 
 
 def test_placed_order_is_not_confirmed_or_logged_as_fill(tmp_path):
