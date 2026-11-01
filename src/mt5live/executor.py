@@ -297,7 +297,8 @@ class ExecutionAdapter:
         outcome = OrderOutcome(
             kind="open", ticket=res.order_ticket, side=side,
             requested_volume=res.requested_volume or lots,
-            filled_volume=res.volume, price=res.deal_price,
+            filled_volume=(res.volume if res.filled else None),
+            price=res.deal_price,
             partial=res.partial, retcode=res.retcode, comment=res.comment)
         outcomes = [outcome]
         outcomes.extend(self._align_sltp(decision, side, before, res, ref))
@@ -376,7 +377,8 @@ class ExecutionAdapter:
             outcomes.append(OrderOutcome(
                 kind="close", ticket=pos.ticket,
                 side="sell" if pos.side == "buy" else "buy",
-                requested_volume=vol, filled_volume=res.volume,
+                requested_volume=vol,
+                filled_volume=(res.volume if res.filled else None),
                 price=res.deal_price, partial=res.partial,
                 retcode=res.retcode, comment=res.comment))
         return outcomes
