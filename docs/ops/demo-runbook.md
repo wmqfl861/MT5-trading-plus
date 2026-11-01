@@ -218,10 +218,17 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_scheduled_tasks.ps1
 - 每次下单**发送前**追加一行：decision_id / request_uuid / 腿 / 状态
   （pending → sent → known_result）；同一 decision_id 的重发会被 journal
   幂等拒绝——这是"崩溃重启后同一决策不重复开仓"的主防线。
-- 崩溃/强杀后重启：runner 先读 journal 尾部的 pending/sent 行，核对券商
-  持仓 + 挂单 + 成交历史，再判定 confirmed / rejected / unknown；
-  **历史窗口未覆盖发送时刻的一律保持 unknown，不判 rejected**（防误判
-  成"未成交"而重发开仓）。
+- 崩溃/强杀后重启：runner 先读 journal 的 pending/sent/unknown 行，
+  核对券商持仓 + 挂单 + 成交历史。**confirmed 必须有与本请求关联的成交**
+  （优先匹配 broker order_ticket，其次匹配本决策唯一 comment）；同
+  magic/symbol 的其他成交或单纯出现新持仓，不足以确认本请求已成交。
+- **空历史 + 空持仓 + 空挂单不是 rejected 的正面证据**：订单可能已成交
+  后又平仓，或历史归档延迟。只有明确 TradeRejectedError 或 §5.4 人工
+  仲裁可写 rejected；其他情况无限保持 unknown，暂停开新仓（平仓不受限）。
+- MT5 `PLACED` 只代表请求已受理，不代表成交；即使返回 volume 非零，
+  也不得记 fill/confirmed。任何本 magic 的未完成挂单（包括旧版本、
+  人工或其他路径创建、未关联 journal 的挂单）都会阻止新开仓；平仓/
+  全平仍可执行，直到挂单终态得到核实。
 - journal 尾部撕裂行（写到一半断电/强杀）按 unknown 处理，程序不 crash；
   不要手工编辑或截断 journal——撕裂行会在下次仲裁/对账中被消化。
 - **禁止**删除 journal 来"清掉"待决项：待决项只能通过 §5.4 仲裁工具或
