@@ -1586,8 +1586,7 @@ def test_h201_arbitration_tool_resolves_permanent_unknown(tmp_path,
                         "--decision-id", d.decision_id, "--status", "rejected",
                         "--reason", "人工核对：订单确未到达服务器",
                         "--symbol", "XAUUSD"])
-    assert rc == 0, f"tool rc={rc}
-{_out.getvalue()}"  # CI 诊断：带工具输出
+    assert rc == 0, f"tool rc={rc}; output: {_out.getvalue()}"  # CI 诊断：带工具输出
     rejected = _finals(tmp_path, "rejected")
     assert rejected and rejected[-1]["detail"].startswith("arbitrated")
 
