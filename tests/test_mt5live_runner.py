@@ -645,6 +645,46 @@ trigger_delay_s = 5.0
         holder.release()
 
 
+def test_h201_upgrade_refuses_while_legacy_data_dir_lock_held(
+        tmp_path, monkeypatch, capsys):
+    """升级保护：旧版 runner 仍持有 data/live/runner-<magic>.lock 时，
+    新版即使取得身份锁也必须拒绝启动，防止跨版本双实例。"""
+    from datetime import datetime
+    from mt5live.runner import MagicInstanceLock
+    from tests.fakes_live import (
+        FakeBroker, bars_from_df, boundary_open, grid_bars,
+    )
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "lockshome"))
+    mod = load_live_runner()
+    now = datetime(2026, 10, 30, 10, 0, 7)
+    broker = FakeBroker("XAUUSD")
+    broker.set_bars("XAUUSD", "M15",
+                    bars_from_df(grid_bars(boundary_open(now), last="up")))
+    broker.quote_time = now
+    _wire_fake_gateway(monkeypatch, mod, broker, now)
+
+    cfg = _runner_config(tmp_path)
+    # _runner_config 的 data_root/live 是旧版本锁的固定位置。
+    import tomllib
+    with open(cfg, "rb") as stream:
+        data_root = tomllib.load(stream)["data_root"]
+    legacy_path = Path(data_root) / "live" / "runner-777.lock"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    old_process_lock = MagicInstanceLock(str(legacy_path))
+    assert old_process_lock.acquire() is True
+    try:
+        rc = mod.main(["--config", cfg, "--gateway-config",
+                       _gw_dummy_config(tmp_path), "--once",
+                       "--no-spread-gate"])
+        assert rc == 3
+        out = capsys.readouterr().out
+        assert "旧版/并行 runner" in out
+        assert broker.market_orders == []
+    finally:
+        old_process_lock.release()
+
+
 def test_runner_startup_trade_mode_check_rejects_non_demo(tmp_path, monkeypatch):
     """3B/F1：runner 启动时二次确认 trade_mode=0——非 DEMO → rc=3。"""
     from tests.fakes_live import FakeBroker, bars_from_df, boundary_open, grid_bars
