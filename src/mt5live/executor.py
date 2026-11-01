@@ -486,6 +486,8 @@ ALERT_STATE_CORRUPT = "STATE_CORRUPT"           # H-05：状态文件损坏/不�
 ALERT_EXECUTION_UNKNOWN = "EXECUTION_UNKNOWN"   # H2-01（1A/1B）：execution
 #   journal 存在未决决策（发送后崩溃/回报未知/行撕裂）——暂停开新仓
 #   （平仓不受影响），直到重启核对裁决或 live_ack_execution 仲裁
+ALERT_BROKER_PENDING_ORDER = "BROKER_PENDING_ORDER"  # H2-01：未关联到
+#   当前 journal 的本 magic 挂单仍可能成交——暂停开新仓，平仓不受影响
 ALERT_EXECUTION_RECOVERED = "EXECUTION_RECOVERED"   # H2-01（1B）：重启核对
 #   裁决落定（confirmed/rejected）——expected 已恢复为实际净持仓
 ALERT_BROKER_UNAVAILABLE = "BROKER_UNAVAILABLE" # H2-02（2C）：券商持仓查询
@@ -838,6 +840,28 @@ class LiveExecutor:
                     f"决策 {sorted(self._undecided)}（发送后崩溃/回报未知，"
                     "重启核对尚未裁决）——暂停开新仓（平仓不受影响），直到"
                     "核对裁决或 scripts/live_ack_execution.py 仲裁")
+            else:
+                # H2-01 P0：旧版本/人工/其他执行路径遗留的挂单可能在未来
+                # 成交。即使 journal 没有未决项，也不能在未决挂单仍存在时
+                # 再开新仓；否则旧挂单 + 新市价单会叠加风险。
+                try:
+                    broker_pendings = self._adapter.pending_orders()
+                except Exception as exc:
+                    block_action = "blocked_broker_unavailable"
+                    block_alert = ALERT_BROKER_UNAVAILABLE
+                    block_reason = (
+                        "broker_pending_query_failed: 无法确认本 magic 未决挂单"
+                        f"（{type(exc).__name__}: {exc}）——fail-closed，暂停"
+                        "开新仓（平仓不受影响）")
+                else:
+                    if broker_pendings:
+                        block_action = "blocked_broker_pending"
+                        block_alert = ALERT_BROKER_PENDING_ORDER
+                        block_reason = (
+                            "broker_pending_order: 本 magic 仍有未完成挂单 "
+                            f"{[o.ticket for o in broker_pendings]}——该订单可能"
+                            "稍后成交，暂停开新仓（平仓不受影响）；先核对并"
+                            "撤销/确认挂单终态后再开仓")
             if block_action is not None:
                 append_alert(
                     self._live_dir, block_alert,
