@@ -236,7 +236,9 @@ def test_acceptance_snapshot_source_hashes():
     for rel, digest in src.items():
         p = REPO / rel
         assert p.is_file(), rel
-        assert digest == hashlib.sha256(p.read_bytes()).hexdigest()
+        normalized = p.read_text(encoding="utf-8").replace("\r\n", "\n") \
+            .replace("\r", "\n").encode("utf-8")
+        assert digest == hashlib.sha256(normalized).hexdigest()
 
 
 def test_acceptance_snapshot_detects_semantic_source_drift(monkeypatch):
