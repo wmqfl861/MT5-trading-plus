@@ -3373,9 +3373,14 @@ def cmd_prob_round_report(args) -> int:
             research_gate_status = "PASS"
         else:
             research_gate_status = "NOT_RUN"
+        gate_reason_parts = list(dict.fromkeys(
+            str(r.get("research_gate_reason") or "").strip()
+            for r in rows if str(r.get("research_gate_reason") or "").strip()))
+        gate_reason_summary = "；".join(gate_reason_parts)
         research_gate_line = (
             f"研究门禁：{research_gate_status}——逐候选使用预注册 "
-            "expected_delta_p、触发日数与冻结假设族判定；只有 PASS 可推进")
+            "expected_delta_p、触发日数与冻结假设族判定；只有 PASS 可推进"
+            + (f"；原因：{gate_reason_summary}" if gate_reason_summary else ""))
 
         out_dir = Path("docs/research")
         out_dir.mkdir(parents=True, exist_ok=True)
