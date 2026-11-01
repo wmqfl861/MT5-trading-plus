@@ -1556,38 +1556,55 @@ class _ToolGW:
 
 
 def test_h201_arbitration_tool_resolves_permanent_unknown(tmp_path,
-                                                          monkeypatch, capsys):
-    """1D：永久 unknown → scripts/live_ack_execution.py 仲裁 →
-    journal 终态落盘。直接构造 journal 行（不依赖 executor 写入，
-    排查 CI 环境差异）。"""
-    from mt5live.fileio import append_jsonl
-    import json as _json
-
-    # 手写 journal：pending → sent → unknown（三行完整生命周期）
-    journal = tmp_path / f"execution-journal-{MAGIC}.jsonl"
-    did = "XAUUSD|M15|2026-11-01T10:00:00"
-    append_jsonl(journal, {"ts": "2026-11-01T10:00:01", "decision_id": did,
-                           "status": "pending", "action": "open",
-                           "symbol": "XAUUSD", "side": "buy", "volume": 0.01})
-    append_jsonl(journal, {"ts": "2026-11-01T10:00:02", "decision_id": did,
-                           "status": "sent"})
-    append_jsonl(journal, {"ts": "2026-11-01T10:00:03", "decision_id": did,
-                           "status": "unknown", "detail": "exception: IPC"})
-
+                                                          monkeypatch):
+    """1D：永久 unknown（券商核对始终不可用）→ scripts/live_ack_execution.py
+    仲裁 → journal 终态落盘 + 解除开仓暂停；重投被拒而非被挡。"""
     b = FakeBroker()
+    d = mk_decision(signal=1, volume_lots=0.02)
+    # 运行时回报丢失 + 券商实际未成交 → journal unknown
+    b.error_on_market_order = OrderResultUnknownError("IPC 中断")
+    ex = _mk_executor(b, tmp_path)
+    with pytest.raises(OrderResultUnknownError):
+        ex.poll(d, NOW)
+    b.error_on_market_order = None
+
+    # 券商核对持续不可用（查询一直超时）→ 永久 unknown、开仓被挡
+    def boom_deals(since, to):
+        raise RuntimeError("history_deals 持续不可用")
+
+    b.deals = boom_deals
+    assert ex.poll(d, NOW + timedelta(seconds=10)).action == \
+        "blocked_execution_unknown"
+
     tool = _load_script("live_ack_execution")
     monkeypatch.setattr("mt5gw.MT5Gateway.from_config_file",
                         staticmethod(lambda p: _ToolGW(b)))
     rc = tool.main(["--live-dir", str(tmp_path), "--magic", str(MAGIC),
-                    "--decision-id", did, "--status", "rejected",
+                    "--decision-id", d.decision_id, "--status", "rejected",
                     "--reason", "人工核对：订单确未到达服务器",
                     "--symbol", "XAUUSD"])
-    out = capsys.readouterr().out
-    assert rc == 0, f"tool rc={rc}, output: {out}"
-    # journal 终态行已落
-    lines = [json.loads(l) for l in journal.read_text().splitlines() if l.strip()]
-    finals = [l for l in lines if l["decision_id"] == did and l["status"] in ("confirmed", "rejected")]
-    assert finals and finals[-1]["detail"].startswith("arbitrated")
+    assert rc == 0
+    rejected = _finals(tmp_path, "rejected")
+    assert rejected and rejected[-1]["detail"].startswith("arbitrated")
+
+    # 解除开仓暂停：重投被"拒"（journal 终态幂等），不再被未决挡
+    rr = ex.poll(d, NOW.replace(minute=5))
+    assert rr.action == "duplicate"
+    assert "拒绝后不可重投" in rr.error
+    d2 = mk_decision(signal=1, volume_lots=0.01,
+                     decision_id="XAUUSD|M15|2026-10-20T18:15:00")
+    assert ex.poll(d2, NOW.replace(minute=16)).action == "open"
+
+
+# ================================================================ H2-02（阶段 2）
+# docs/reviews/2026-10-30-global-code-audit-2.md H2-02 + 计划
+# 2026-11-01-hline-foundation.md 2A/2B/2C：consumed deal 水位 + 部分减量
+# （R4）+ 事件区间窗（R4）+ consumed fail-closed（R5）+ 券商查询 fail-closed。
+# 核心复现：旧部分 SL deal 从未被消费 → 迟到的人工平仓被旧 SL"解释"→
+# pending 清空、防线解除（审计探针 live 场景）。
+
+CONSUMED_FMT = "consumed-deals-{magic}.jsonl"
+
 
 def _consumed_path(tmp_path):
     return tmp_path / CONSUMED_FMT.format(magic=MAGIC)
