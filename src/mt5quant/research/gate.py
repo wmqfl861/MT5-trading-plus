@@ -43,10 +43,21 @@ EXPECTED_ACCEPTANCE_CONSTANTS: dict[str, float | int] = {
     "prior_strength": 100,
 }
 
-# 快照覆盖的源文件（阈值定义处 + 收缩估计器实现处）：现行内容 sha256。
+# 快照覆盖的全部决策语义源：阈值/策略决策、概率收缩与 EV 下界公式。
+# 这些 SHA-256 是冻结基线；源文件改变但数值常量未变，同样必须阻断，
+# 不能仅把动态哈希记录下来就声称口径未漂移。
+EXPECTED_ACCEPTANCE_SOURCE_SHA256: dict[str, str] = {
+    "src/mt5quant/strategies/library/prob/level_decision.py":
+        "b81b1b39e8a8d809f1e567c309db342606d944eca02bfff866806ceb4ddbabc8",
+    "src/mt5quant/prob/tables.py":
+        "52248e1e8b60f2638672605c7edf10551d3bb522d7744ebf336dbe026bc0ccc7",
+    "src/mt5quant/prob/decision.py":
+        "705a7e05942bbc9971705d20c5ed95e9041fe40c0d3ac104cb947684c5842214",
+}
 _SNAPSHOT_MODULES = (
     "mt5quant.strategies.library.prob.level_decision",
     "mt5quant.prob.tables",
+    "mt5quant.prob.decision",
 )
 
 
@@ -98,11 +109,17 @@ def acceptance_snapshot() -> dict:
         if f.is_file():
             sources[_rel_key(f)] = hashlib.sha256(
                 f.read_bytes()).hexdigest()
+    source_drift = sorted(
+        path for path, expected in EXPECTED_ACCEPTANCE_SOURCE_SHA256.items()
+        if sources.get(path) != expected)
+    constant_drift = acceptance_drift(constants)
     return {
         "constants": constants,
         "expected": dict(EXPECTED_ACCEPTANCE_CONSTANTS),
         "sources": sources,
-        "drift": acceptance_drift(constants),
+        "expected_sources": dict(EXPECTED_ACCEPTANCE_SOURCE_SHA256),
+        "source_drift": source_drift,
+        "drift": sorted(constant_drift + [f"source:{p}" for p in source_drift]),
     }
 
 
