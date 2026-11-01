@@ -3186,10 +3186,10 @@ def cmd_prob_round_report(args) -> int:
     运行 → 拒；成本只认开轮前入账的台账预筛行——**不再回退磁盘
     precheck.json**（开轮后可被重写，不作数）。
 
-    T104 批 2：P2-09 方法批准门（丁-6）——主检验方法未获批（月内置换
-    在 v2/v3 成簇负对照失败）时报告照常生成（诊断），但标注"方法未批准
-    ——本报告不构成推进依据"、结论列一律"不推进（方法阻塞）"（exit code
-    不变）；P2-11（丁-7）行补可用/剔除列（metrics.prob 的 n_usable /
+    T104 批 2：P2-09 方法批准门（丁-6）——主检验方法未获批时结论阻塞。
+    T107 P0：ResearchGate 按每个候选的预注册 expected_delta_p、触发日数
+    与冻结假设族计算；任何一项不是 PASS，结论列必须"不推进"，不能只打印
+    诊断行。P2-11（丁-7）行补可用/剔除列（metrics.prob 的 n_usable /
     n_eligible_dropped 诊断入账的读侧，旧运行无键 → "—"）。"""
     try:
         data_root, _store_kind = _resolve_store(args)
