@@ -1579,6 +1579,10 @@ def test_h201_arbitration_tool_resolves_permanent_unknown(tmp_path,
     tool = _load_script("live_ack_execution")
     monkeypatch.setattr("mt5gw.MT5Gateway.from_config_file",
                         staticmethod(lambda p: _ToolGW(b)))
+    # CI 根因修复：直接 patch 工具的 _open_gateway（绕过 from_config_file
+    # 的 except fallback——CI 上 fallback 创建真 MT5Gateway 连接失败）
+    monkeypatch.setattr(tool, "_open_gateway",
+                        lambda gw_config: _ToolGW(b))
     import io, contextlib
     _out = io.StringIO()
     with contextlib.redirect_stdout(_out):
