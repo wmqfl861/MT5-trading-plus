@@ -1117,7 +1117,9 @@ class LiveExecutor:
             "request_uuid": uuid.uuid4().hex, "action": action,
             "symbol": self._symbol,
             "side": "buy" if target >= 0 else "sell",
-            "volume": round(abs(target), 8), "status": "pending"})
+            "volume": round(abs(target), 8),
+            "comment": decision_comment(decision.decision_id),
+            "status": "pending"})
 
     def _journal_sent(self, decision_id: str, report, n: datetime) -> None:
         """发送已回（首个开/平腿的 retcode/ticket 如实入行）。"""
@@ -1200,11 +1202,16 @@ class LiveExecutor:
                 _synthetic(f"torn@{i}")     # R5：撕裂/损坏行按 unknown 处理
                 continue
             if status == "pending" and did not in finals:
-                undecided[did] = {"decision_id": did, "status": "pending",
-                                  "send_ts": self._journal_entry_ts(
-                                      rec.get("ts"))}
+                undecided[did] = {
+                    "decision_id": did, "status": "pending",
+                    "send_ts": self._journal_entry_ts(rec.get("ts")),
+                    "order_ticket": rec.get("order_ticket"),
+                    "comment": rec.get("comment"),
+                }
             elif status in ("sent", "unknown") and did in undecided:
                 undecided[did]["status"] = status
+                if rec.get("order_ticket") is not None:
+                    undecided[did]["order_ticket"] = rec.get("order_ticket")
             elif status in ("confirmed", "rejected"):
                 finals[did] = status
                 undecided.pop(did, None)
@@ -1267,13 +1274,23 @@ class LiveExecutor:
             return "", (f"仍有本 magic 未决挂单 "
                         f"{[o.ticket for o in pendings]}——保持 unknown，"
                         "等待挂单终态并重新对账")
-        if deals:
-            return "confirmed", (f"发送后本 magic 成交 {len(deals)} 笔"
-                                 f"（tickets {[d.ticket for d in deals]}）")
-        known = set(self._state.get("known_positions") or {})
-        fresh = [p.ticket for p in positions if p.ticket not in known]
-        if fresh:
-            return "confirmed", f"出现 state 未知的新持仓 {fresh}"
+        # A same-magic/symbol deal is not enough: it may be an unrelated
+        # manual order or another strategy action. Confirm only a deal linked
+        # to this journaled broker order (preferred) or its unique request
+        # comment. Otherwise keep unknown; false confirmation could release
+        # the gate while the original request is still unresolved.
+        order_ticket = entry.get("order_ticket")
+        request_comment = entry.get("comment")
+        matched = [
+            d for d in deals
+            if ((order_ticket is not None and d.order == order_ticket)
+                or (request_comment and d.comment == request_comment))
+        ]
+        if matched:
+            return "confirmed", (
+                f"找到与本决策请求关联的成交 {len(matched)} 笔"
+                f"（order tickets {[d.order for d in matched]}，"
+                f"deal tickets {[d.ticket for d in matched]}）")
         # Absence of a deal after an arbitrary time margin is not positive
         # evidence that the broker rejected the request: history publication
         # can be delayed, and an accepted order may have filled and closed.
