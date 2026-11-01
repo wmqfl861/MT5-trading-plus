@@ -1210,6 +1210,14 @@ class LiveExecutor:
                 if send_ts is not None else [])
         except Exception as exc:
             return "", f"券商核对查询失败 {type(exc).__name__}: {exc}"
+        # P0 audit fix: any still-open pending order for this magic/symbol
+        # keeps the execution outcome unresolved. Check this before accepting
+        # broad post-send deal/position evidence, which may otherwise belong to
+        # a different event while the original request can still fill.
+        if pendings:
+            return "", (f"仍有本 magic 未决挂单 "
+                        f"{[o.ticket for o in pendings]}——保持 unknown，"
+                        "等待挂单终态并重新对账")
         if deals:
             return "confirmed", (f"发送后本 magic 成交 {len(deals)} 笔"
                                  f"（tickets {[d.ticket for d in deals]}）")
@@ -1217,14 +1225,6 @@ class LiveExecutor:
         fresh = [p.ticket for p in positions if p.ticket not in known]
         if fresh:
             return "confirmed", f"出现 state 未知的新持仓 {fresh}"
-        # P0 audit fix: a live pending order is evidence that the request may
-        # still execute. Never classify the decision as rejected merely because
-        # the history-coverage margin elapsed; doing so would release the
-        # execution-unknown gate while the broker can still fill the order.
-        if pendings:
-            return "", (f"仍有本 magic 未决挂单 "
-                        f"{[o.ticket for o in pendings]}——保持 unknown，"
-                        "等待挂单终态并重新对账")
         if (send_ts is not None and (n - send_ts).total_seconds()
                 >= JOURNAL_HISTORY_COVER_MARGIN_S):
             return "rejected", (
