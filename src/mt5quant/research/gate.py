@@ -247,7 +247,8 @@ def research_gate(*, method_id: str, days: int | None = None,
         return GateResult(
             status="FAIL", reasons=tuple(reasons), method_id=method_id,
             detail={"registry": _entry_brief(method_id, entry),
-                    "inputs": inputs, "acceptance_snapshot": snapshot})
+                    "inputs": inputs, "acceptance_snapshot": snapshot},
+            acceptance=snapshot)
 
     # ---- 3)/4) adopted=True：样本量证据三分（sample_size_evidence 同一判定）
     if dp is None or days is None:
@@ -263,7 +264,8 @@ def research_gate(*, method_id: str, days: int | None = None,
             method_id=method_id,
             detail={"registry": _entry_brief(method_id, entry),
                     "inputs": inputs, "evidence": None,
-                    "acceptance_snapshot": snapshot})
+                    "acceptance_snapshot": snapshot},
+            acceptance=snapshot)
     decision, state, detail_txt = sample_size_evidence(
         float(dp), days, n_hyp=(1 if n_hyp is None else int(n_hyp)))
     evidence = {"decision": decision, "state": state, "detail": detail_txt,
@@ -275,12 +277,16 @@ def research_gate(*, method_id: str, days: int | None = None,
             reasons=(f"方法 {method_id} 已获批（{status}）且样本量证据"
                      f"calibrated_sufficient：{detail_txt}",),
             detail={"registry": _entry_brief(method_id, entry),
-                    "inputs": inputs, "evidence": evidence})
+                    "inputs": inputs, "evidence": evidence,
+                    "acceptance_snapshot": snapshot},
+            acceptance=snapshot)
     return GateResult(
         status="INSUFFICIENT_DATA", method_id=method_id,
         reasons=(f"样本量证据不足（{state}）：{detail_txt}",),
         detail={"registry": _entry_brief(method_id, entry),
-                "inputs": inputs, "evidence": evidence})
+                "inputs": inputs, "evidence": evidence,
+                "acceptance_snapshot": snapshot},
+        acceptance=snapshot)
 
 
 def _entry_brief(method_id: str, entry: dict) -> dict:
