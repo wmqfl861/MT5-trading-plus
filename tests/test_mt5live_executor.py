@@ -1271,12 +1271,16 @@ def _journal_records(tmp_path) -> list:
 
 
 def _journal_seed_pending(tmp_path, decision_id, *, ts=SEND_TS,
-                          action="open", volume=0.02, side="buy") -> None:
+                          action="open", volume=0.02, side="buy",
+                          comment=None) -> None:
     """手写一条 pending 行（=发送前 journal 已落盘、其后崩溃）。"""
-    append_jsonl(str(_journal_path(tmp_path)), {
+    rec = {
         "ts": iso_utc(ts), "decision_id": decision_id,
         "request_uuid": "test-uuid", "action": action, "symbol": "XAUUSD",
-        "side": side, "volume": volume, "status": "pending"})
+        "side": side, "volume": volume, "status": "pending"}
+    if comment is not None:
+        rec["comment"] = comment
+    append_jsonl(str(_journal_path(tmp_path)), rec)
 
 
 def _journal_seed_line(tmp_path, record: dict) -> None:
@@ -1414,6 +1418,29 @@ def test_h201_unjournaled_pending_order_blocks_new_open_but_not_close(
     assert rr_close.action == "close"
     assert b.positions() == []
     assert b.pending_orders("XAUUSD") == []
+
+
+def test_h201_unrelated_same_magic_deal_does_not_confirm_unknown(
+        tmp_path):
+    """A different order's deal with the same magic/symbol is not positive
+    evidence that this decision's order executed."""
+    from mt5live.executor import decision_comment
+
+    b = FakeBroker()
+    d = mk_decision(signal=1, volume_lots=0.02)
+    _journal_seed_pending(tmp_path, d.decision_id,
+                          comment=decision_comment(d.decision_id))
+    _seed_pending_intent(tmp_path, d.decision_id)
+    # Simulate an unrelated manual/other-path trade after the send timestamp.
+    b.market_order("XAUUSD", "buy", 0.01, magic=MAGIC,
+                   comment="manual-unrelated-order")
+
+    ex = _mk_executor(b, tmp_path)
+    rr = ex.poll(d, RESTART_LATE)
+    assert rr.action == "blocked_execution_unknown"
+    assert not _finals(tmp_path, "confirmed")
+    assert not _finals(tmp_path, "rejected")
+    assert len(b.market_orders) == 1  # no duplicate decision order
 
 
 def test_h201_placed_order_volume_is_not_treated_as_fill(tmp_path):
