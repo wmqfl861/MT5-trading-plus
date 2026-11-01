@@ -1432,6 +1432,31 @@ def test_h201_5_unknown_no_fill_blocked_until_history_window_covers(tmp_path):
     assert ex2.poll(d2, late.replace(minute=25)).action == "open"
 
 
+def test_h201_pending_broker_order_keeps_execution_unknown(tmp_path):
+    """P0 regression: an open broker pending order must prevent rejected
+    classification even after the history coverage margin has elapsed."""
+    from mt5live.executor import JOURNAL_HISTORY_COVER_MARGIN_S
+
+    b = FakeBroker()
+    d = mk_decision(signal=1, volume_lots=0.02)
+    _journal_seed_pending(tmp_path, d.decision_id)
+    order = b.seed_pending(magic=MAGIC, volume=0.02)
+
+    ex = _mk_executor(b, tmp_path)  # restart with unresolved broker order
+    late = NOW + timedelta(seconds=JOURNAL_HISTORY_COVER_MARGIN_S * 2)
+    rr = ex.poll(d, late)
+    assert rr.action == "blocked_execution_unknown"
+    assert not _finals(tmp_path, "rejected")
+    assert order in b.pending_orders("XAUUSD")
+
+    # Once the broker order is no longer pending, a complete negative
+    # reconciliation may classify it as rejected.
+    b.cancel_order(order.ticket)
+    rr2 = ex.poll(d, late + timedelta(seconds=1))
+    assert rr2.action == "duplicate"
+    assert _finals(tmp_path, "rejected")
+
+
 def test_h201_6_r3_delayed_broker_query_not_misjudged_rejected(tmp_path):
     """注入 6（R3）：重启时券商核对查询超时/延迟 → 不得误判 rejected（重复
     开仓风险），保持 unknown；下轮重查确认 → confirmed。"""
