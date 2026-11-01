@@ -1249,13 +1249,15 @@ class LiveExecutor:
         fresh = [p.ticket for p in positions if p.ticket not in known]
         if fresh:
             return "confirmed", f"出现 state 未知的新持仓 {fresh}"
-        if (send_ts is not None and (n - send_ts).total_seconds()
-                >= JOURNAL_HISTORY_COVER_MARGIN_S):
-            return "rejected", (
-                f"无成交、无新仓、无新挂单（持仓 {len(positions)}、挂单 "
-                f"{len(pendings)}），成交历史窗口已覆盖发送时刻（≥"
-                f"{JOURNAL_HISTORY_COVER_MARGIN_S:.0f}s）")
-        return "", "成交历史窗口尚未覆盖发送时刻（R3：防延迟可见误判）"
+        # Absence of a deal after an arbitrary time margin is not positive
+        # evidence that the broker rejected the request: history publication
+        # can be delayed, and an accepted order may have filled and closed.
+        # Only an explicit TradeRejectedError or operator arbitration may
+        # resolve this negative case. Keep the gate closed indefinitely.
+        return "", (
+            f"未发现可归属成交或新持仓（持仓 {len(positions)}、挂单 "
+            f"{len(pendings)}），但空历史不是拒单证明——保持 unknown，"
+            "须等待券商订单/成交证据或 live_ack_execution 人工仲裁")
 
     def _run_journal_recovery(self, n: datetime) -> None:
         """每轮开头：journal 刷新 + 未决项核对券商（H2-01/1B，重启或崩溃后）。
