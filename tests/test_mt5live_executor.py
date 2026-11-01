@@ -1426,7 +1426,7 @@ def test_h201_5_unknown_no_fill_blocked_until_history_window_covers(tmp_path):
     # 必须保持 unknown，直到券商给出可归属终态或人工仲裁。
     late = NOW + timedelta(seconds=JOURNAL_HISTORY_COVER_MARGIN_S * 20)
     rr2 = ex2.poll(d, late)
-    assert rr2.action == "blocked_execution_unknown"
+    assert rr2.action == "duplicate"  # 同一决策不可重放；unknown门禁仍保留
     assert not _finals(tmp_path, "rejected")
     d2 = mk_decision(signal=1, volume_lots=0.01,
                      decision_id="XAUUSD|M15|2026-10-20T18:15:00")
