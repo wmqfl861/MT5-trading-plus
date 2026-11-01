@@ -12,7 +12,7 @@
 ### 1A execution_unknown 持久化 + 订单幂等
 - 发送前写 `execution-journal-<magic>.jsonl`（decision_id / request_uuid / 腿 / 状态 pending→sent→known_result）
 - **R2**：executor.py:766 现有"未知异常也写 confirmed"改为 **pending + journal 记 unknown**
-- 重启时：读 journal 最后一行 pending/sent → 核对券商持仓+挂单+成交历史 → confirmed / rejected / unknown
+- 重启时：读 journal pending/sent → 仅用与请求关联的成交证据（order_ticket / unique comment）判 confirmed；其他情况保持 unknown
 - 同一 decision_id 的重发被 journal 幂等拒绝
 - **R5** journal 尾部撕裂行按 unknown 处理（不 crash）
 - 故障注入测试（**R3 补齐 6+ 个场景**）：
@@ -22,7 +22,7 @@
   4. 成交后 state 写前崩溃
   5. **R3** 重启时持仓/成交历史延迟可见（不得误判 rejected=重复开仓风险）
   6. **R3** 重启时仓位已被 SL/人工平+重放同 decision_id 不得再开
-  + 判 rejected 需历史窗口覆盖发送时刻，否则保持 unknown
+  + 空历史/空持仓/空挂单不是拒单正面证据；只有明确 TradeRejectedError 或人工仲裁可落 rejected
 
 ### 1B ACK 丢失恢复 + 重启对账
 - expected 文件损坏/缺失：从 journal + 券商实际持仓重建，写差异告警
