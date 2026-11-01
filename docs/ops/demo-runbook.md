@@ -269,8 +269,9 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_scheduled_tasks.ps1
 
 - 仲裁前先读取并校验券商持仓；查询失败时不写 journal 终态，可直接
   修复连接后重试。若 journal 仲裁终态已落但意图文件写入失败，只允许用
-  **相同 decision_id + 相同 status** 重试补写意图；不同结论或普通执行
-  终态均拒绝改写。工具会在意图成功恢复后才写 ACK_EXECUTION 告警。
+  **相同 decision_id + 相同 status + 相同 reason** 重试补写意图；不同
+  结论/原因或普通执行终态均拒绝改写。工具会在意图成功恢复后才写
+  ACK_EXECUTION 告警。
 
 ### 5.5 重启对账三步（每次崩溃恢复自动执行，人工复核同序）
 
