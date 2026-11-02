@@ -18,8 +18,8 @@
 ## 1. 启动（第 0 天）
 
 ```powershell
-# 一次性：安装每日/每周计划任务（演练期会自动检测 paper 状态切日报口径）
-powershell -ExecutionPolicy Bypass -File scripts\setup_scheduled_tasks.ps1
+# 一次性：在维护窗口显式指定模式安装每日/每周计划任务
+powershell -ExecutionPolicy Bypass -File scripts\setup_scheduled_tasks.ps1 -Mode Demo
 
 # 影子盘延长观察（PaperSoak；示例配置 demo-configs\MA-XAUUSD-M15.toml）
 powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1 -Mode PaperSoak
@@ -60,9 +60,13 @@ powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1 -Stop
   每进程一个 `runner|risk|reconcile-<name>-<stamp>.log`（+ `.err`）。
 - 顺序已内建：先运行器（写意图/心跳/paper 状态）→ 8 秒后风控 → 对账。
   **不要**先起风控（心跳未落盘会被写成 halt.json 一键停机）。
-- PaperSoak 演练期 `data\live\paper` 存在，`MT5Quant\live_daily_report`
-  计划任务自动改读 `--paper-state`（不连真实账户）；演练结束归档 paper
-  目录后重跑安装脚本恢复真账户口径。
+- 安装器默认只创建日报和周报任务，不覆盖快照、K 线、tick 或 swap 任务。
+  历史数据任务需另行核对终端身份与配置后显式加 `-IncludeDataTasks`，
+  当前阶段 F 安装命令不加该参数。
+- 日报模式由安装时的 `-Mode Demo` / `-Mode PaperSoak` 显式固定。Demo
+  使用 `--demo --gw-config`，拒绝实盘解锁配置，核验 `trade_mode=0` 后才读
+  成交流水；PaperSoak 只读 `--paper-state`。影子目录归档或缺失不会自动
+  切换到终端。当前阶段禁止真实账户连接与下单；模式变更只在维护窗口执行。
 - 重启机器后：直接重跑同模式命令即可——脚本按 `data\live\instances.json`
   （三要素核验）检测并跳过仍存活的进程，只补已退出的角色（绝不满组
   重跑，见 §3）。**每次启动都生成新日志文件**——这是 demo_check 识别
@@ -131,11 +135,14 @@ powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1 -Stop
    `data\live\paper\state-*.json` 存在且非空；
 2. 点差比对报 `model_sha256` 不一致 → 重跑 `scripts/build_cost_model.py`
    重建 `data\costs/spread_model.json`（日报拒绝用被动过的模型）；
-3. 手动补跑（与计划任务同参）：
+3. 手动补跑（保持已生成 `scripts/task_live_daily_report.cmd` 中的模式和配置路径；首次生成前使用与安装器相同的配置选择顺序）：
 ```powershell
+$gwConfig = @("config.json", "gateway.json") | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $gwConfig) { throw "缺少 Demo 网关配置" }
 .venv/Scripts/python.exe scripts/live_daily_report.py --date 2026-11-10 `
-    --paper-state data\live\paper `
+    --demo --gw-config $gwConfig `
     --spread-model data\costs\spread_model.json --log-dir data\demo
+# PaperSoak 仅将 --demo --gw-config ... 换成 --paper-state data\live\paper。
 ```
 
 ## 4. 结束与最终验收（第 10 个交易日后；Demo 模式）
@@ -168,10 +175,11 @@ Start-Sleep 15                                     # 等风控写 halt.json
 powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1 -Stop
 Remove-Item data\live/killSwitch, data\live/halt.json -ErrorAction SilentlyContinue
 
-# 4) 收尾：删演练周任务；归档 paper 状态后重跑安装脚本（日报恢复真账户）
+# 4) 收尾：卸载演练周报与日报任务；只归档确实存在的影子状态
 schtasks /Delete /TN "MT5Quant\demo_weekly_check" /F
-Move-Item data\live/paper data\demo\paper-final     # 归档（重跑安装脚本前）
-powershell -ExecutionPolicy Bypass -File scripts\setup_scheduled_tasks.ps1
+schtasks /Delete /TN "MT5Quant\live_daily_report" /F
+if (Test-Path data\live\paper) { Move-Item data\live\paper data\demo\paper-final }
+# 不自动切换账户或重装任务。需要继续 Demo 时另按维护窗口执行本手册 §1。
 ```
 
 最终交付物：`data\demo\final-check.md`（--accept 验收结论 + 全期判据 +

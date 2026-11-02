@@ -1,8 +1,10 @@
 ﻿# MT5 量化系统每日计划任务安装脚本。
-# 本脚本只负责"创建"，由主会话/运维手动执行；不随任何测试自动运行。
+# 本脚本只负责"创建"，由主会话/运维手动执行；测试只在临时目录替代 schtasks。
+# 默认仅日报与周报；-IncludeDataTasks 才另外覆盖既有数据采集任务。
+# 数据任务没有日报的 Demo 身份检查，须另行核对终端与配置后才可选择。
 #
 # 安装（PowerShell）：
-#   powershell -ExecutionPolicy Bypass -File scripts\setup_scheduled_tasks.ps1
+#   powershell -ExecutionPolicy Bypass -File scripts\setup_scheduled_tasks.ps1 -Mode Demo
 #
 # 删除（卸载全部任务；逐条执行）：
 #   schtasks /Delete /TN "MT5Quant\snapshot_specs"     /F
@@ -19,9 +21,9 @@
 #                                     仅当 data\ticks 已有品种目录时安装，否则跳过并提示）
 #   MT5Quant\live_daily_report 00:20  实盘日报（scripts\task_live_daily_report.cmd；
 #                                     T24：render_daily_report → data\reports\live\。
-#                                     G2/T46：演练期（data\live\paper 存在）自动改读
-#                                     --paper-state 影子状态 + 决策日志点差比对，
-#                                     不连真实账户；演练结束后重跑本脚本恢复真账户）
+#                                     显式 -Mode Demo 或 PaperSoak：分别读模拟账户
+#                                     或 --paper-state 影子状态，并做点差比对；
+#                                     影子目录缺失不改变模式，禁止真实账户）
 #
 # 周任务（G2/T46 阶段 F 演练验收）：
 #   MT5Quant\demo_weekly_check 周日 23:00 UTC（本机 UTC+8 = 周一 07:00）
@@ -41,7 +43,16 @@
 # 实现说明：schtasks /TR 上限 261 字符，直接塞完整命令行必然超限——改为生成
 # .cmd 包装器（cd 钉仓库根 + 输出落 data\logs\task_*.log），/TR 只填包装器路径。
 
+[CmdletBinding()]
+param(
+    [string]$Mode = "",
+    [switch]$IncludeDataTasks
+)
+
 $ErrorActionPreference = "Stop"
+if ($Mode -notin @("Demo", "PaperSoak")) {
+    throw "须显式指定 -Mode Demo 或 -Mode PaperSoak；不自动回退到终端。"
+}
 
 $scriptsDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot   = Split-Path -Parent $scriptsDir
@@ -76,6 +87,12 @@ foreach ($name in @("config.json", "gateway.json")) {
     if (Test-Path $cfgPath) { $cfgArg = " --config `"$cfgPath`""; break }
 }
 
+if ($Mode -eq "Demo" -and [string]::IsNullOrWhiteSpace($cfgArg)) {
+    throw "Demo 日报缺少网关配置；请配置 config.json 或 gateway.json。"
+}
+
+# 默认只安装演练日报/周报；数据任务需运维另行显式选择。
+if ($IncludeDataTasks) {
 New-DailyTask "snapshot_specs" "00:05" `
     (New-TaskWrapper "snapshot_specs" "snapshot_specs.py" $cfgArg)
 New-DailyTask "refresh_bars" "00:10" `
@@ -94,22 +111,20 @@ if (Test-Path $ticksDir) {
 } else {
     Write-Host "data\ticks 不存在，跳过 MT5Quant\refresh_ticks（建 tick 库后重跑本脚本安装）"
 }
+}
 
-# T24：实盘日报（昨天的 UTC 日；render_daily_report 落 data\reports\live\）。
-# G2/T46：演练（paper）期间读影子状态而非真实账户——检测 data\live\paper
-# 存在即追加 --paper-state（聚合 state-<magic>.json）+ --spread-model +
-# --log-dir（决策日志点差样本，蓝图 §7 按小时比对）。演练结束归档 paper
-# 目录后重跑本脚本即恢复真账户口径。
-$reportArgs = $cfgArg + " --date yesterday"
+# 日报模式显式固定；影子状态缺失时保留路径，由日报拒绝，不回退到终端。
+$reportArgs = " --date yesterday --data-dir `"$repoRoot\data`"" +
+    " --reports-dir `"$repoRoot\data\reports`"" +
+    " --spread-model `"$repoRoot\data\costs\spread_model.json`"" +
+    " --log-dir `"$repoRoot\data\demo`""
 $paperDir = Join-Path $repoRoot "data\live\paper"
-if (Test-Path $paperDir) {
-    $reportArgs = $reportArgs +
-        " --paper-state `"$paperDir`"" +
-        " --spread-model `"$repoRoot\data\costs\spread_model.json`"" +
-        " --log-dir `"$repoRoot\data\demo`""
-    Write-Host "检测到演练影子状态：live_daily_report 改读 --paper-state $paperDir（不连真实账户）"
+if ($Mode -eq "PaperSoak") {
+    $reportArgs += " --paper-state `"$paperDir`""
+    Write-Host "PaperSoak 日报只读影子状态（缺失时拒绝，不连终端）"
 } else {
-    Write-Host "未发现 data\live\paper：live_daily_report 读真实账户（演练启动后重跑本脚本切换 paper 口径）"
+    $reportArgs += " --demo --gw-config `"$cfgPath`""
+    Write-Host "Demo 日报只读模拟账户（trade_mode=0；禁止真实账户）"
 }
 New-DailyTask "live_daily_report" "00:20" `
     (New-TaskWrapper "live_daily_report" "live_daily_report.py" $reportArgs)
@@ -145,7 +160,7 @@ Write-Host ("已创建 MT5Quant\demo_weekly_check（每周本地 {0} {1:HH:mm} =
 # /RI 1 + /DU 03:00。10-31 之后本任务不再触发（/ED 已限制），但仍应手动删除。
 $watchUtcStart = [DateTime]::SpecifyKind([DateTime]::Parse("2026-10-26 20:30"), [DateTimeKind]::Utc)
 $watchUtcEnd   = [DateTime]::SpecifyKind([DateTime]::Parse("2026-10-30 23:30"), [DateTimeKind]::Utc)
-if ((Get-Date).ToUniversalTime() -le $watchUtcEnd) {
+if ($IncludeDataTasks -and (Get-Date).ToUniversalTime() -le $watchUtcEnd) {
     $localStart = $watchUtcStart.ToLocalTime()
     $localLast  = $watchUtcEnd.ToLocalTime()      # 最后一天的 23:30 UTC → 本机日期
     $watchST    = $localStart.ToString("HH:mm")

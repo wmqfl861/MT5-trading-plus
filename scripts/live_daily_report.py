@@ -1,10 +1,11 @@
 """实盘/演练日报 CLI（T24；G2/T46 演练运维完善）：调 mt5live.monitor.
 
 render_daily_report 落盘。账户/持仓/成交流水两个来源：
-- 缺省：MT5 网关（只读）；
+- ``--demo --gw-config <path>``：Demo 网关（只读，trade_mode=0）；
 - ``--paper-state <dir|file>``：影子券商状态文件（PaperStateGateway 聚合
   data/live/paper/state-<magic>.json，与 risk_process / live_reconcile 的
-  同名参数同口径）——阶段 F 模拟盘演练用它，绝不连真实终端。
+  同名参数同口径）——PaperSoak 只读文件，不连终端。
+未显式选择模式时拒绝运行；不因影子目录缺失而回退到终端。
 
 另从 data/live/ 读全部策略心跳与 alerts.log，渲染 Markdown 写
 {reports_dir}/live/daily-YYYY-MM-DD.md。
@@ -19,8 +20,8 @@ build_cost_model.py 的 v1/v2 缓存包装与旧裸模型（与 live_runner 同�
 不给 --spread-model 或当日无样本 → 如实标注"当日无点差样本"。
 
 用法（计划任务每日一次，见 scripts/setup_scheduled_tasks.ps1）：
-    .venv/Scripts/python.exe scripts/live_daily_report.py --date yesterday
-    .venv/Scripts/python.exe scripts/live_daily_report.py --date 2026-10-28
+    .venv/Scripts/python.exe scripts/live_daily_report.py --demo --gw-config gateway.json --date yesterday
+    .venv/Scripts/python.exe scripts/live_daily_report.py --demo --gw-config gateway.json --date 2026-10-28
     # 演练（paper）：日报读影子状态 + 决策日志点差比对
     .venv/Scripts/python.exe scripts/live_daily_report.py --date yesterday \
         --paper-state data/live/paper \
@@ -223,20 +224,35 @@ def spread_samples_from_logs(log_dirs: list[str],
     return tuple(samples)
 
 
-def build_gw(paper_state: str | None, gw_config: str | None, live_dir: str):
-    """装配账户网关：--paper-state → PaperStateGateway（只读影子状态，
-    不连终端）；缺省 → MT5Gateway。返回 (gw, owned)。
-    """
+def build_gw(paper_state: str | None, gw_config: str | None, live_dir: str,
+             *, demo: bool = False):
+    """显式选择影子状态或 Demo；缺模式/配置时不连接终端。"""
     if paper_state:
+        if demo:
+            raise DataUnavailableError("--demo 与 --paper-state 互斥")
         from mt5live.paper import PaperStateGateway
 
         return PaperStateGateway(paper_state, alert_dir=live_dir), True
-    from mt5gw import GatewayConfig, MT5Gateway
+    if not demo:
+        raise DataUnavailableError("日报须显式选择 --demo 或 --paper-state")
+    from mt5gw import MT5Gateway, load
 
-    cfg_path = gw_config if os.path.exists(gw_config or "") else None
-    gw = (MT5Gateway.from_config_file(cfg_path) if cfg_path
-          else MT5Gateway(GatewayConfig()))
-    gw.connect()
+    if not gw_config or not os.path.isfile(gw_config):
+        raise DataUnavailableError("Demo 日报须提供存在的 --gw-config")
+    try:
+        config = load(gw_config)
+    except (OSError, ValueError) as exc:
+        raise DataUnavailableError("Demo 网关配置无法装载") from exc
+    if config.allow_live_trading:
+        raise DataUnavailableError("Demo 日报拒绝 allow_live_trading=true")
+    gw = MT5Gateway(config)
+    try:
+        gw.connect()
+        if gw.account.state().trade_mode != 0:
+            raise DataUnavailableError("Demo 日报要求 trade_mode=0，停止读取")
+    except Exception:
+        gw.shutdown()
+        raise
     return gw, True
 
 
@@ -244,7 +260,9 @@ def main(argv=None, *, gw=None) -> int:
     ap = argparse.ArgumentParser(description="实盘日报（render_daily_report）")
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--reports-dir", default="data/reports")
-    ap.add_argument("--gw-config", default="config.json")
+    ap.add_argument("--gw-config", default=None)
+    ap.add_argument("--demo", action="store_true",
+                    help="仅允许 Demo 终端；须提供 --gw-config，拒绝实盘解锁配置")
     ap.add_argument("--date", default="yesterday",
                     help="YYYY-MM-DD / yesterday / today（默认 yesterday）")
     ap.add_argument("--live-subdir", default="live",
@@ -278,7 +296,8 @@ def main(argv=None, *, gw=None) -> int:
 
     if gw is None:
         try:
-            gw, owned = build_gw(args.paper_state, args.gw_config, live_dir)
+            gw, owned = build_gw(args.paper_state, args.gw_config, live_dir,
+                                 demo=args.demo)
         except DataUnavailableError as e:   # 影子状态不可用：fail-closed
             print(f"× {e}")
             return 2
