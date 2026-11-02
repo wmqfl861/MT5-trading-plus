@@ -929,9 +929,9 @@ def test_r1_old_precheck_missing_aux_baseline_cannot_borrow_trade_years(tmp_path
     from mt5quant.research.ledger import Ledger
     # Genuine previous implementation produces the incomplete ledger row; no
     # hand-inserted signal coverage, no mutation/rechain of an existing row.
-    mod, root, path, args = setup_candidate_check_chain(tmp_path, monkeypatch, precheck_revision="24ce4c7")
-    old = baseline_module("src/mt5quant/research/candidates.py", "t112_old_candidate", revision="24ce4c7")
-    old_bt = baseline_module("scripts/bt.py", "t112_old_candidate_cli", revision="24ce4c7")
+    mod, root, path, args = setup_candidate_check_chain(tmp_path, monkeypatch, precheck_revision="6f33ad585d810d17ff7cce1794ec8d15f65df0b3")
+    old = baseline_module("src/mt5quant/research/candidates.py", "t112_old_candidate", revision="6f33ad585d810d17ff7cce1794ec8d15f65df0b3")
+    old_bt = baseline_module("scripts/bt.py", "t112_old_candidate_cli", revision="6f33ad585d810d17ff7cce1794ec8d15f65df0b3")
     old_bt.cand = old
     cdir = Path(args[args.index("--cards-dir") + 1]).parent / "candidates"
     assert old_bt.main(["candidate", "check", "C003", "--candidates-dir", str(cdir), "--data-root", str(root), "--ledger", str(path)]) == 0
@@ -1022,8 +1022,8 @@ def test_r1_legacy_h_no_fields_preserves_precheck_and_single_input(tmp_path, mon
     mod, root, path, args = setup_candidate_check_chain(tmp_path, monkeypatch, signal_symbol=None, signal_timeframe=None)
     with Ledger(path) as led:
         initial = json.loads(led.candidate_checks("C003")[-1]["result_json"])
-    old = baseline_module("scripts/bt.py", "t112_legacy_h_cli", revision="24ce4c7")
-    old.cand = baseline_module("src/mt5quant/research/candidates.py", "t112_legacy_h_candidate", revision="24ce4c7")
+    old = baseline_module("scripts/bt.py", "t112_legacy_h_cli", revision="6f33ad585d810d17ff7cce1794ec8d15f65df0b3")
+    old.cand = baseline_module("src/mt5quant/research/candidates.py", "t112_legacy_h_candidate", revision="6f33ad585d810d17ff7cce1794ec8d15f65df0b3")
     cdir = Path(args[args.index("--cards-dir") + 1]).parent / "candidates"
     assert old.main(["candidate", "check", "C003", "--candidates-dir", str(cdir), "--data-root", str(root), "--ledger", str(path)]) == 0
     with Ledger(path) as led:
