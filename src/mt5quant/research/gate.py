@@ -53,8 +53,9 @@ EXPECTED_ACCEPTANCE_SOURCE_SHA256: dict[str, str] = {
         "52248e1e8b60f2638672605c7edf10551d3bb522d7744ebf336dbe026bc0ccc7",
     "src/mt5quant/prob/decision.py":
         "705a7e05942bbc9971705d20c5ed95e9041fe40c0d3ac104cb947684c5842214",
+    # T112 H-only update: docs/reviews/2026-11-02-t112-module-review.md.
     "src/mt5quant/research/candidates.py":
-        "7af9e89c8fa07ca763ffddcb9ae38fdf52416610fe50b3ee3e0a18238abc5794",
+        "fb788db83cdb8ed113bcdf5734d086a5eb308d45bee6074c3479077771e85062",
     "src/mt5quant/validation/prob_mode.py":
         "30da71bda3281fad0aa281a16c826cca0964e52dd69d4d301a6e28b1bd0e7719",
 }
