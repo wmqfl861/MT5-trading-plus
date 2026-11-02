@@ -1074,6 +1074,19 @@ def _ex_ante_cost_per_symbol(candidate, symbol, *, data_root, cost_model,
     }
 
 
+def required_input_pairs(symbols, timeframe: str, declared=None) -> tuple[tuple[str, str], ...]:
+    """Exact H trade and signal inputs, deduplicated without a cross product.
+
+    A signal timeframe alone still declares a separate input for each trade
+    symbol. Missing signal declarations preserve the legacy trade-only set.
+    """
+    trades = [(str(symbol), timeframe.upper()) for symbol in symbols]
+    signal_symbol = getattr(declared, "signal_symbol", None)
+    signal_tf = getattr(declared, "signal_timeframe", None) or timeframe.upper()
+    signals = [(signal_symbol or symbol, signal_tf) for symbol in symbols]
+    return tuple(dict.fromkeys(trades + signals))
+
+
 def precheck(candidate: Candidate, *, data_root, cost_model,
              research_years: dict[str, float],
              active_mechanisms: set[str] | frozenset[str] | None = None,
@@ -1162,9 +1175,9 @@ def precheck(candidate: Candidate, *, data_root, cost_model,
     # T84/K4：σ 按声明的 window_bars 事件窗取（与 T66 σ_w 同一函数），
     # 日内周期再按 entry_hour_ny 取同一时段起点——单根 bar 口径会少算
     # √h、时段平均会盖掉定盘前一小时这类时段异方差。
-    years_detail = {f"{s}/{candidate.holding}":
-                    float(research_years.get(f"{s}/{candidate.holding}", 0.0))
-                    for s in candidate.symbols}
+    years_detail = {f"{symbol}/{tf}": float(research_years.get(f"{symbol}/{tf}", 0.0))
+                    for symbol, tf in required_input_pairs(
+                        candidate.symbols, candidate.holding, declared)}
     years = min(years_detail.values())
     missing = [k for k, v in years_detail.items() if v <= 0.0]
     sigma_by_symbol: dict[str, float | None] = {}

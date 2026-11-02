@@ -214,8 +214,11 @@ def test_loader_uses_latest_ledger_both_merged_inputs_and_end(tmp_path):
     stamps = pd.bdate_range("2024-01-01", "2024-03-31")
     df = pd.DataFrame({"time": stamps, "open": 100., "close": 100.})
     years = 88 / 365.25
+    # Loader-contract unit fixture: each input carries its own source evidence.
+    # The separate R1 CLI tests generate these fields through candidate check.
     pre = {"checks": {"power": {"years": years, "years_detail": {"EURUSD/H1": years, "USTEC/D1": years},
-           "coverage_segments": {"EURUSD/H1": [{"source": "histdata", "counted": True}]}}}}
+           "coverage_segments": {"EURUSD/H1": [{"source": "histdata", "counted": True}],
+                                 "USTEC/D1": [{"source": "fred", "counted": True}]}}}}
     cdir = tmp_path / "calendars"
     cdir.mkdir()
     for s in ("EURUSD", "USTEC"):
@@ -483,7 +486,8 @@ def test_real_disk_merged_loader_four_results_used_badmonth_cutoff_end(tmp_path)
     with Ledger(tmp_path / "ledger.sqlite") as led:
         led.record_candidate_check("C001", decision="pass", result={"checks": {"power": {
             "years_detail": {"EURUSD/H1": .08, "USTEC/D1": .15},
-            "coverage_segments": {"EURUSD/H1": [{"source": "histdata", "counted": True}]}}}})
+            "coverage_segments": {"EURUSD/H1": [{"source": "histdata", "counted": True}],
+                                  "USTEC/D1": [{"source": "fred", "counted": True}]}}}})
         ctx = mod._load_h_research_inputs(led, SimpleNamespace(symbols=("EURUSD",), timeframe="H1"),
             candidate_id="C001", declared=SimpleNamespace(signal_symbol="USTEC", signal_timeframe="D1", side_rule=None),
             data_root=str(root), end="2024-03-15", allow_unbounded=False,
@@ -609,13 +613,13 @@ def test_real_cli_dynamic_random_chain_fails_closed_without_null_refill(tmp_path
         assert "primary" not in detail  # no spurious significant p value
 
 
-def baseline_module(relpath, name):
-    """Execute only the task's trusted committed baseline blob, not store code."""
+def baseline_module(relpath, name, *, revision="f6c7b8112a73f111b3553f5413521fc75940a81e"):
+    """Execute only a trusted committed task blob, not store code."""
     import subprocess
     import sys
     import types
     repo = Path(__file__).resolve().parents[1]
-    raw = subprocess.run(["git", "-C", str(repo), "show", "f6c7b8112a73f111b3553f5413521fc75940a81e:" + relpath],
+    raw = subprocess.run(["git", "-C", str(repo), "show", revision + ":" + relpath],
                          capture_output=True, check=True).stdout.decode("utf8")
     module = types.ModuleType(name)
     module.__file__ = str(repo / relpath)
@@ -830,3 +834,202 @@ def test_real_cli_changed_signal_new_reservation_and_no_old_auto_evidence(tmp_pa
         assert led.round_n_trials("R1") == 2 and led.round_n_dedup("R1") == 2
         reservations = led.conn.execute("SELECT stage FROM trial_reservations").fetchall()
         assert [r["stage"] for r in reservations] == ["completed", "completed"]
+
+
+def setup_candidate_check_chain(tmp_path, monkeypatch, *, precheck_revision=None,
+                                signal_symbol="USTEC", signal_timeframe="D1",
+                                signal_start="2022-01-03", expected_check=0):
+    """Real disk cost/cache and candidate-check CLI; never insert coverage rows."""
+    from tests.test_research_candidates import CANDIDATE_TOML
+    from tests.test_research_bt_script import _CARD_H703, _ROUND_R1_STANDARD, patch_card_git
+    from mt5data.store import save_bars
+    from mt5quant.costs import SpreadModel, SpreadStat
+    mod = load_bt()
+    import run_backtest as rb
+    root = tmp_path / "synthetic-store"
+    times = pd.date_range("2022-02-01", "2024-03-29 23:00", freq="h")
+    times = times[times.weekday < 5]
+    trade = disk_bars(times)
+    save_bars(str(root), "EURUSD", "H1", trade)
+    signal = disk_bars(pd.bdate_range(signal_start, "2024-03-29"), 200.)
+    if signal_symbol is not None or signal_timeframe is not None:
+        write_external(root, signal_symbol or "EURUSD", signal_timeframe or "H1", "fred", signal,
+                       used={str(y): {"used": True} for y in (2022, 2023, 2024)})
+    (root / "lockbox.json").write_text(json.dumps({"version": 2, "global_cutoff": "2024-04-01T00:00:00"}), encoding="utf8")
+    specs = root / "specs"
+    specs.mkdir()
+    (specs / "latest.json").write_text(json.dumps({"EURUSD": {
+        "contract_size": 1., "swap_mode": 0, "swap_long": 0., "swap_short": 0.,
+        "swap_rollover3days": 3, "point": .01}}), encoding="utf8")
+    stats = {h: SpreadStat(median=.0002, p90=.0002, p99=.0002, n=1000, n_days=20) for h in range(24)}
+    rb.save_spread_model_cache(rb.spread_model_cache_path(str(root)),
+        SpreadModel({"EURUSD": stats}, {"EURUSD": .0002}, mode="relative"),
+        {"EURUSD": {"rows": 0, "first_msc": 0, "last_msc": 0}})
+    cdir, rdir, cards_dir = (tmp_path / p for p in ("candidates", "rounds", "cards"))
+    for p in (cdir, rdir, cards_dir): p.mkdir()
+    # Ex-ante Sharpe is synthetic-only; >2 years gives enough information for
+    # the test round without bypassing power or forging a pass record.
+    body = CANDIDATE_TOML.replace("C001", "C003").replace("TESTUSD", "EURUSD").replace('holding = "D1"', 'holding = "H1"')
+    body = body.replace("window_bars = 4", "window_bars = 1").replace("overnight_nights = 1", "overnight_nights = 0").replace("expected_sharpe = 1.0", "expected_sharpe = 10.0")
+    if signal_symbol is not None:
+        body += f'\nsignal_symbol = "{signal_symbol}"\n'
+    if signal_timeframe is not None:
+        body += f'\nsignal_timeframe = "{signal_timeframe}"\n'
+    (cdir / "C003.toml").write_text(body, encoding="utf8")
+    path = tmp_path / "ledger.sqlite"
+    checking = mod
+    if precheck_revision is not None:
+        checking = baseline_module("scripts/bt.py", "t112_old_check", revision=precheck_revision)
+        checking.cand = baseline_module("src/mt5quant/research/candidates.py", "t112_old_precheck", revision=precheck_revision)
+    assert checking.main(["candidate", "check", "C003", "--candidates-dir", str(cdir),
+                          "--data-root", str(root), "--ledger", str(path)]) == expected_check
+    (rdir / "R1.toml").write_text(_ROUND_R1_STANDARD, encoding="utf8")
+    (cards_dir / "H703.toml").write_text(_CARD_H703.replace("XAUUSD", "EURUSD"), encoding="utf8")
+    patch_card_git(monkeypatch, mod)
+    monkeypatch.setattr(mod.cards, "ensure_strategy_clean", lambda *a, **k: None)
+    monkeypatch.setattr(mod.cards, "strategy_fingerprint", lambda *a, **k: "f" * 64)
+    if expected_check == 0:
+        assert mod.main(["round", "open", "R1", "--rounds-dir", str(rdir), "--ledger", str(path)]) == 0
+    args = ["--card", "H703", "--cards-dir", str(cards_dir), "--data-root", str(root), "--ledger", str(path),
+            "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold", "--costs", "zero", "--volume-lots", "1"]
+    return mod, root, path, args
+
+
+def test_r1_candidate_check_records_trade_and_signal_coverage(tmp_path, monkeypatch):
+    from mt5quant.research.ledger import Ledger
+    mod, root, path, args = setup_candidate_check_chain(tmp_path, monkeypatch)
+    with Ledger(path) as led:
+        payload = json.loads(led.candidate_checks("C003")[-1]["result_json"])
+    power = payload["checks"]["power"]
+    assert set(power["years_detail"]) == {"EURUSD/H1", "USTEC/D1"}
+    assert power["years_detail"]["USTEC/D1"] == pytest.approx(816 / 365.25)
+    assert [s["source"] for s in power["coverage_segments"]["USTEC/D1"] if s["counted"]] == ["fred"]
+    assert set(power["sigma_by_symbol"]) == {"EURUSD"}
+    assert set(payload["checks"]["ex_ante_cost"]["per_symbol"]) == {"EURUSD"}
+    assert set(json.loads((root / "specs/latest.json").read_text(encoding="utf8"))) == {"EURUSD"}
+
+
+@pytest.mark.parametrize("command", ["screen", "gate"])
+def test_r1_candidate_check_to_screen_gate_uses_signal_only_fred(tmp_path, monkeypatch, capsys, command):
+    from mt5quant.research.ledger import Ledger
+    mod, root, path, args = setup_candidate_check_chain(tmp_path, monkeypatch)
+    command_args = [command, *args]
+    if command == "gate": command_args += ["--gates", "G0", "--params", "{}"]
+    assert mod.main(command_args) == 0, capsys.readouterr().out
+    with Ledger(path) as led:
+        row = led.conn.execute("SELECT metrics_json FROM runs").fetchone()
+        coverage = json.loads(row["metrics_json"])["metrics"]["runtime_coverage"]
+        assert coverage["USTEC/D1"]["segments"][0]["source"] == "ext:fred:2022"
+        assert {s["source"] for s in coverage["EURUSD/H1"]["segments"]} == {"mt5"}
+
+
+@pytest.mark.parametrize("command", ["screen", "gate"])
+def test_r1_old_precheck_missing_aux_baseline_cannot_borrow_trade_years(tmp_path, monkeypatch, capsys, command):
+    from mt5data.store import save_bars
+    from mt5quant.research.ledger import Ledger
+    # Genuine previous implementation produces the incomplete ledger row; no
+    # hand-inserted signal coverage, no mutation/rechain of an existing row.
+    mod, root, path, args = setup_candidate_check_chain(tmp_path, monkeypatch, precheck_revision="24ce4c7")
+    old = baseline_module("src/mt5quant/research/candidates.py", "t112_old_candidate", revision="24ce4c7")
+    old_bt = baseline_module("scripts/bt.py", "t112_old_candidate_cli", revision="24ce4c7")
+    old_bt.cand = old
+    cdir = Path(args[args.index("--cards-dir") + 1]).parent / "candidates"
+    assert old_bt.main(["candidate", "check", "C003", "--candidates-dir", str(cdir), "--data-root", str(root), "--ledger", str(path)]) == 0
+    # Auxiliary MT5 bars would let the faulty loader silently succeed by taking
+    # overall trade years. No calendar is needed for this standard H fixture.
+    save_bars(str(root), "USTEC", "D1", disk_bars(pd.bdate_range("2022-01-03", "2024-03-29"), 200.))
+    with Ledger(path) as led:
+        power = json.loads(led.candidate_checks("C003")[-1]["result_json"])["checks"]["power"]
+        assert "USTEC/D1" not in power["years_detail"] and power["years"] > 0
+    command_args = [command, *args]
+    if command == "gate": command_args += ["--gates", "G0", "--params", "{}"]
+    assert mod.main(command_args) == 1, capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "USTEC/D1" in out and "candidate check" in out
+    with Ledger(path) as led:
+        assert led.conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+        assert led.round_n_trials("R1") == 0
+
+
+@pytest.mark.parametrize("signal_symbol", ["EURUSD", None])
+def test_r1_same_symbol_distinct_timeframe_collects_exact_pairs(tmp_path, monkeypatch, capsys, signal_symbol):
+    from mt5quant.research.ledger import Ledger
+    mod, root, path, args = setup_candidate_check_chain(tmp_path, monkeypatch,
+                                                       signal_symbol=signal_symbol, signal_timeframe="D1")
+    with Ledger(path) as led:
+        power = json.loads(led.candidate_checks("C003")[-1]["result_json"])["checks"]["power"]
+        assert set(power["years_detail"]) == {"EURUSD/H1", "EURUSD/D1"}
+        assert {s["source"] for s in power["coverage_segments"]["EURUSD/D1"] if s["counted"]} == {"fred"}
+    assert mod.main(["screen", *args]) == 0, capsys.readouterr().out
+    assert mod.main(["gate", *args, "--gates", "G0", "--params", "{}"]) == 0, capsys.readouterr().out
+    with Ledger(path) as led:
+        assert led.round_n_trials("R1") == 1
+        rows = led.conn.execute("SELECT metrics_json FROM runs").fetchall()
+        for r in rows:
+            coverage = json.loads(r["metrics_json"])["metrics"]["runtime_coverage"]
+            assert set(coverage) == {"EURUSD/H1", "EURUSD/D1"}
+            assert coverage["EURUSD/D1"]["segments"][0]["source"] == "ext:fred:2022"
+
+
+def test_r1_exact_pairs_dedup_no_cross_product():
+    declared = SimpleNamespace(signal_symbol="USTEC", signal_timeframe="D1")
+    assert candidates.required_input_pairs(("EURUSD", "USDJPY", "EURUSD"), "H1", declared) == (
+        ("EURUSD", "H1"), ("USDJPY", "H1"), ("USTEC", "D1"))
+    assert candidates.required_input_pairs(("EURUSD",), "H1", SimpleNamespace(signal_symbol="EURUSD", signal_timeframe="H1")) == (("EURUSD", "H1"),)
+
+
+def test_r1_short_signal_governs_precheck_and_runtime_uses_own_baseline(tmp_path, monkeypatch, capsys):
+    from mt5quant.research.ledger import Ledger
+    from mt5data.ext.merge import merged_research_series
+    mod, root, path, args = setup_candidate_check_chain(tmp_path, monkeypatch,
+        signal_start="2024-03-01", expected_check=2)
+    with Ledger(path) as led:
+        payload = json.loads(led.candidate_checks("C003")[-1]["result_json"])
+        power = payload["checks"]["power"]
+        assert power["years_detail"]["EURUSD/H1"] > 2
+        assert power["years_detail"]["USTEC/D1"] == pytest.approx(28 / 365.25)
+        assert power["years"] == pytest.approx(28 / 365.25)
+        assert payload["decision"] == "waiting_data"
+    cdir = Path(args[args.index("--cards-dir") + 1]).parent / "candidates"
+    # Restore an ample signal and genuinely rerun the CLI precheck; then shorten
+    # only the file, proving runtime compares to that signal's own ledger years.
+    write_external(root, "USTEC", "D1", "fred", disk_bars(pd.bdate_range("2022-01-03", "2024-03-29"), 200.),
+                   used={str(y): {"used": True} for y in (2022, 2023, 2024)})
+    assert mod.main(["candidate", "check", "C003", "--candidates-dir", str(cdir), "--data-root", str(root), "--ledger", str(path)]) == 0
+    write_external(root, "USTEC", "D1", "fred", disk_bars(pd.bdate_range("2024-03-01", "2024-03-29"), 200.))
+    card = mod.cards.load_card(Path(args[args.index("--cards-dir") + 1]) / "H703.toml")
+    with Ledger(path) as led:
+        with pytest.raises(ValueError, match="runtime coverage USTEC/D1"):
+            mod._load_h_research_inputs(led, card, candidate_id="C003", declared=candidates.load_candidate(cdir / "C003.toml").declared,
+                data_root=str(root), end=None, allow_unbounded=False, load_plain=mod.load_series, load_merged=merged_research_series)
+
+
+def test_r1_missing_signal_is_zero_coverage_not_trade_substitution(tmp_path, monkeypatch):
+    from mt5quant.research.ledger import Ledger
+    mod, root, path, args = setup_candidate_check_chain(tmp_path, monkeypatch)
+    for p in (root / "ext/fred/USTEC/D1").iterdir(): p.unlink()
+    cdir = Path(args[args.index("--cards-dir") + 1]).parent / "candidates"
+    assert mod.main(["candidate", "check", "C003", "--candidates-dir", str(cdir), "--data-root", str(root), "--ledger", str(path)]) == 2
+    with Ledger(path) as led:
+        power = json.loads(led.candidate_checks("C003")[-1]["result_json"])["checks"]["power"]
+    assert power["years_detail"]["EURUSD/H1"] > 2
+    assert power["years"] == power["years_detail"]["USTEC/D1"] == 0.
+    assert power["coverage_segments"]["USTEC/D1"] == []
+
+
+def test_r1_legacy_h_no_fields_preserves_precheck_and_single_input(tmp_path, monkeypatch, capsys):
+    from mt5quant.research.ledger import Ledger
+    mod, root, path, args = setup_candidate_check_chain(tmp_path, monkeypatch, signal_symbol=None, signal_timeframe=None)
+    with Ledger(path) as led:
+        initial = json.loads(led.candidate_checks("C003")[-1]["result_json"])
+    old = baseline_module("scripts/bt.py", "t112_legacy_h_cli", revision="24ce4c7")
+    old.cand = baseline_module("src/mt5quant/research/candidates.py", "t112_legacy_h_candidate", revision="24ce4c7")
+    cdir = Path(args[args.index("--cards-dir") + 1]).parent / "candidates"
+    assert old.main(["candidate", "check", "C003", "--candidates-dir", str(cdir), "--data-root", str(root), "--ledger", str(path)]) == 0
+    with Ledger(path) as led:
+        previous = json.loads(led.candidate_checks("C003")[-1]["result_json"])
+    assert initial["checks"] == previous["checks"] and initial["decision"] == previous["decision"]
+    assert mod.main(["screen", *args]) == 0, capsys.readouterr().out
+    assert mod.main(["gate", *args, "--gates", "G0", "--params", "{}"]) == 0, capsys.readouterr().out
+    with Ledger(path) as led:
+        assert led.round_n_trials("R1") == 1

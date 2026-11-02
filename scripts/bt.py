@@ -2147,11 +2147,15 @@ def cmd_candidate_check(args) -> int:
                                            costs, active)
             segs, years = None, {}
         else:
-            # T80/G3：主段 + 已批准外部序列（fred/cdd，D36 白名单）逐段列出、
-            # 合并年数按**区间并集**（重叠不双计，审核修正）；未批准来源
-            # （histdata）在场不计
-            segs = cand.coverage_segments(data_root, candidate.symbols,
-                                          [candidate.holding])
+            # Required signal pairs are coverage inputs, not traded symbols:
+            # do not expand costs/volatility or form a symbols×timeframes product.
+            segs = {}
+            for symbol, tf in cand.required_input_pairs(
+                    candidate.symbols, candidate.holding, candidate.declared):
+                key = f"{symbol}/{tf}"
+                segs.update(cand.coverage_segments(data_root, [symbol], [tf]))
+                if (symbol, tf) not in [(s, candidate.holding) for s in candidate.symbols]:
+                    segs.setdefault(key, [])  # missing auxiliary evidence is explicit
             years = {k: cand.merged_coverage_years(v) for k, v in segs.items()}
             # T83/R13-K6 预筛双口径：持仓过夜的候选同时算 charged 与
             # swap_free 两口径，决定按 account-profile 状态取
@@ -3651,10 +3655,25 @@ def _load_h_research_inputs(ledger, card, *, candidate_id, declared, data_root,
     power_check = (pre.get("checks") or {}).get("power") or {}
     expected = power_check.get("years_detail") or {}
     segments = power_check.get("coverage_segments") or {}
-    use_merged = any(s.get("counted") and s.get("source") != "mt5"
-                     for group in segments.values() for s in group)
+    pairs = cand.required_input_pairs(card.symbols, card.timeframe, declared)
+    trade_keys = {f"{s}/{card.timeframe}" for s in card.symbols}
+    legacy_single = (len(pairs) == 1
+                     and getattr(declared, "signal_symbol", None) is None
+                     and getattr(declared, "signal_timeframe", None) is None)
+    baselines, merged_keys = {}, set()
+    for symbol, tf in pairs:
+        key = f"{symbol}/{tf}"
+        baseline = expected.get(key)
+        if baseline is None and legacy_single:
+            baseline = power_check.get("years")
+        if baseline is None or (key not in trade_keys and key not in segments):
+            raise ValueError(f"runtime coverage {key}: missing input baseline in latest ledger; rerun bt candidate check {candidate_id}")
+        baselines[key] = baseline
+        if any(s.get("counted") and s.get("source") != "mt5"
+               for s in segments.get(key, [])):
+            merged_keys.add(key)
     ctx = {"bars": {}, "signals": {}, "coverage": {}, "calendars": {},
-           "declared": declared, "merged": use_merged, "gaps": {}}
+           "declared": declared, "merged": bool(merged_keys), "gaps": {}}
     cache = {}
 
     def load_calendar(symbol):
@@ -3672,7 +3691,7 @@ def _load_h_research_inputs(ledger, card, *, candidate_id, declared, data_root,
         key = f"{symbol}/{tf}"
         if key in cache:
             return cache[key]
-        if use_merged:
+        if key in merged_keys:
             bars, tags, gaps, bad_months = load_merged(
                 data_root, symbol, tf, end=end, allow_unbounded=allow_unbounded)
         else:
@@ -3681,9 +3700,7 @@ def _load_h_research_inputs(ledger, card, *, candidate_id, declared, data_root,
         if bars is None or not len(bars):
             raise ValueError(f"signal/trade input unavailable: {key}")
         actual = cand.runtime_coverage(bars, tags, gap_spans=gaps)
-        baseline = expected.get(key, power_check.get("years"))
-        if baseline is None:
-            raise ValueError(f"runtime coverage {key}: latest ledger precheck lacks years")
+        baseline = baselines[key]
         cand.require_runtime_coverage(actual, baseline, key)
         actual.update(precheck_years=float(baseline), bad_months=list(bad_months),
                       gaps=[[str(a), str(b)] for a, b in gaps])
