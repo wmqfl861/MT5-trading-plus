@@ -3186,10 +3186,10 @@ def cmd_prob_round_report(args) -> int:
     运行 → 拒；成本只认开轮前入账的台账预筛行——**不再回退磁盘
     precheck.json**（开轮后可被重写，不作数）。
 
-    T104 批 2：P2-09 方法批准门（丁-6）——主检验方法未获批（月内置换
-    在 v2/v3 成簇负对照失败）时报告照常生成（诊断），但标注"方法未批准
-    ——本报告不构成推进依据"、结论列一律"不推进（方法阻塞）"（exit code
-    不变）；P2-11（丁-7）行补可用/剔除列（metrics.prob 的 n_usable /
+    T104 批 2：P2-09 方法批准门（丁-6）——主检验方法未获批时结论阻塞。
+    T107 P0：ResearchGate 按每个候选的预注册 expected_delta_p、触发日数
+    与冻结假设族计算；任何一项不是 PASS，结论列必须"不推进"，不能只打印
+    诊断行。P2-11（丁-7）行补可用/剔除列（metrics.prob 的 n_usable /
     n_eligible_dropped 诊断入账的读侧，旧运行无键 → "—"）。"""
     try:
         data_root, _store_kind = _resolve_store(args)
@@ -3206,7 +3206,8 @@ def cmd_prob_round_report(args) -> int:
     # P2-09（丁-6）：方法批准门——主检验方法（月内置换）在 v2/v3 成簇
     # 负对照失败、未获批准：运行/报告照常（诊断），但推进结论一律阻塞
     # 并显式标注"本报告不构成推进依据"（exit code 不变）
-    from mt5quant.validation.prob_mode import holm, primary_method_approved
+    from mt5quant.validation.prob_mode import (holm, primary_method_approved,
+                                               PRIMARY_METHOD)
     method_approved, method_reason = primary_method_approved()
     with Ledger(ledger_path) as ledger:
         round_row = ledger.round(round_obj.id)
@@ -3326,6 +3327,61 @@ def cmd_prob_round_report(args) -> int:
                              "cost_r": cost_r, "edge_ev_r": edge,
                              "cost_ok": cost_ok})
         adjusted = holm(pvals)
+
+        # T107 P0: ResearchGate is an actual per-hypothesis advancement gate,
+        # not merely a diagnostic line. Bind dp to pre-registered expected_delta_p,
+        # days to observed trigger days, and n_hyp to the frozen round family.
+        # Missing or unverifiable inputs fail closed.
+        from mt5quant.research.gate import research_gate
+        candidates_dir = Path(args.rounds_dir).parent / "candidates"
+        n_hyp_gate = max(sum(len(hyps) for hyps in family.values()), 1)
+        for gate_row in rows:
+            cid = gate_row["candidate"]
+            try:
+                frozen_error = _candidate_frozen_check(
+                    ledger, cid, candidates_dir)
+                if frozen_error:
+                    gate_row["research_gate_status"] = "FAIL"
+                    gate_row["research_gate_reason"] = frozen_error
+                    continue
+                registered = cand.load_candidate(
+                    candidates_dir / f"{cid}.toml")
+                pdecl = getattr(registered, "prob_declared", None)
+                if pdecl is None or pdecl.expected_delta_p is None:
+                    raise ValueError("候选缺少预注册 prob.expected_delta_p")
+                gate_result = research_gate(
+                    method_id=PRIMARY_METHOD,
+                    dp=float(pdecl.expected_delta_p),
+                    days=gate_row.get("n_trigger_days"),
+                    n_hyp=n_hyp_gate)
+                gate_row["research_gate_status"] = gate_result.status
+                gate_row["research_gate_reason"] = "；".join(
+                    gate_result.reasons)
+            except (cand.CandidateError, AttributeError, TypeError,
+                    ValueError, OSError) as exc:
+                gate_row["research_gate_status"] = "NOT_RUN"
+                gate_row["research_gate_reason"] = (
+                    f"无法建立可验证的研究门禁输入：{type(exc).__name__}: {exc}")
+        gate_statuses = [r["research_gate_status"] for r in rows]
+        if not gate_statuses or "NOT_RUN" in gate_statuses:
+            research_gate_status = "NOT_RUN"
+        elif "FAIL" in gate_statuses:
+            research_gate_status = "FAIL"
+        elif "INSUFFICIENT_DATA" in gate_statuses:
+            research_gate_status = "INSUFFICIENT_DATA"
+        elif all(s == "PASS" for s in gate_statuses):
+            research_gate_status = "PASS"
+        else:
+            research_gate_status = "NOT_RUN"
+        gate_reason_parts = list(dict.fromkeys(
+            str(r.get("research_gate_reason") or "").strip()
+            for r in rows if str(r.get("research_gate_reason") or "").strip()))
+        gate_reason_summary = "；".join(gate_reason_parts)
+        research_gate_line = (
+            f"研究门禁：{research_gate_status}——逐候选使用预注册 "
+            "expected_delta_p、触发日数与冻结假设族判定；只有 PASS 可推进"
+            + (f"；原因：{gate_reason_summary}" if gate_reason_summary else ""))
+
         out_dir = Path("docs/research")
         out_dir.mkdir(parents=True, exist_ok=True)
         stamp = pd.Timestamp.now().strftime("%Y-%m-%d")
@@ -3340,10 +3396,17 @@ def cmd_prob_round_report(args) -> int:
             lines += ["⚠ 方法未批准（成簇负对照失败）——本报告不构成推进依据"
                       f"（P2-09：{method_reason}；运行/报告仅作诊断，推进结论"
                       "一律阻塞，待新方法完整标定并获批后解除）。", ""]
+        # T107：研究门禁四态一行（与方法门标注并列；脚本成功≠研究通过——
+        # CLI exit 0 不构成 PASS，以本行为准）
+        lines += [research_gate_line, ""]
+        if research_gate_status != "PASS":
+            lines += [f"⚠ 研究门禁 {research_gate_status}——所有未通过门禁的"
+                      "假设均禁止推进；报告仅供诊断。", ""]
         lines += ["| 候选 | 假设 | 触发日数 | 可用 | 剔除 | Δp | 原始 p |"
-                  " Holm p | Holm 显著 | ΔEV(R) | 3×成本(R) | 成本条件 | 结论 |",
+                  " Holm p | Holm 显著 | ΔEV(R) | 3×成本(R) | 成本条件 |"
+                  " ResearchGate | 结论 |",
                   "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
-                  " --- | --- | --- | --- |"]
+                  " --- | --- | --- | --- | --- |"]
 
         def _num(v):
             return "—" if v is None else str(int(v))
@@ -3353,13 +3416,16 @@ def cmd_prob_round_report(args) -> int:
             key = f"{r['candidate']}:{r['hypothesis']}"
             adj = adjusted[key]
             holm_ok = adj < 0.05
-            advance = holm_ok and r["cost_ok"]
-            # P2-09：方法未批准 → 结论一律"不推进（方法阻塞）"（统计与
-            # 成本列照常给出供诊断；exit code 不变）
-            if advance and not method_approved:
-                advance = False
-            concl = ("推进" if advance else
-                     "不推进（方法阻塞）" if not method_approved else "不推进")
+            gate_ok = r.get("research_gate_status") == "PASS"
+            advance = holm_ok and r["cost_ok"] and method_approved and gate_ok
+            # 方法批准与逐假设 ResearchGate 均为硬门禁；任何一项不是 PASS
+            # 都只能诊断，不得推进（不能仅在报告中打印红灯）。
+            if not method_approved:
+                concl = "不推进（方法阻塞）"
+            elif not gate_ok:
+                concl = f"不推进（研究门禁 {r.get('research_gate_status', 'NOT_RUN')}）"
+            else:
+                concl = "推进" if advance else "不推进"
             verdicts.append(advance)
             lines.append(
                 f"| {r['candidate']} | {r['hypothesis']} | "
@@ -3367,10 +3433,12 @@ def cmd_prob_round_report(args) -> int:
                 f"{_num(r['n_eligible_dropped'])} | {r['delta_p']:+.4f} | "
                 f"{r['p_value']:.4f} | {adj:.4f} | {'✓' if holm_ok else '✗'} | "
                 f"{r['edge_ev_r']:+.4f} | {3 * r['cost_r']:.4f} | "
-                f"{'✓' if r['cost_ok'] else '✗'} | {concl} |")
+                f"{'✓' if r['cost_ok'] else '✗'} | "
+                f"{r.get('research_gate_status', 'NOT_RUN')} | {concl} |")
         lines += ["", f"推进 {sum(verdicts)} / {len(verdicts)} 条假设。"
                   + ("（方法未批准——推进被阻塞，见上方标注）"
-                     if not method_approved else ""),
+                     if not method_approved else
+                     f"（ResearchGate={research_gate_status}；只有 PASS 可推进）"),
                   "", "（本报告由 bt prob round-report 生成；方法变更与对照"
                   "见 T75 标定报告。）"]
         md.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -3378,9 +3446,11 @@ def cmd_prob_round_report(args) -> int:
                                   "status": "待审核",
                                   "method_approved": method_approved,
                                   "method_status": method_reason,
+                                  "research_gate_status": research_gate_status,
                                   "rows": rows, "holm": adjusted},
                                  ensure_ascii=False, indent=2),
                       encoding="utf-8")
+        print(research_gate_line)
         print(f"✓ 报告：{md}（同 JSON）——交 P 线审核会话"
               + ("（⚠ 方法未批准——本报告不构成推进依据，P2-09）"
                  if not method_approved else ""))
