@@ -10,13 +10,17 @@ T32（D21）：全平指令编号协议的执行器消费侧——ack 引用指�
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 
 from mt5gw.errors import RETCode, OrderResultUnknownError, TradeRejectedError
 
 from mt5live.executor import ExecutionAdapter, LiveExecutor
+from mt5live.fileio import append_jsonl
+from mt5live.monitor import iso_utc
+from mt5live.reconcile import STATUS_PENDING, Intent, write_intent
 
 from tests.fakes_live import FakeBroker, mk_decision
 
@@ -1188,13 +1192,20 @@ def test_h05_exit_explanation_bound_to_current_event(tmp_path):
     state = json.loads((tmp_path / f"state-{MAGIC}.json")
                        .read_text(encoding="utf-8"))
     assert str(ticket) in state["pending_external_exits"]   # 本次事件未解释
-    # deals 证据流不得出现把人工出场记成保护性出场的行
+    # deals 证据流不得出现把人工出场记成保护性出场的行（H2-02/R4 起部分
+    # 减量的 SL 解释合法入行——此处唯一 external_exit SL 行是 18:05 的部分
+    # SL 0.08；人工 CLIENT 成交（18:20 全平）绝不出现）
     deals_path = tmp_path / f"deals-{MAGIC}.jsonl"
     assert deals_path.exists()
     lines = [json.loads(ln) for ln
              in deals_path.read_text(encoding="utf-8").splitlines() if ln]
-    assert not any(r["event"] == "external_exit" and r["reason"] == "SL"
-                   for r in lines)
+    sl_lines = [r for r in lines
+                if r["event"] == "external_exit" and r["reason"] == "SL"]
+    assert len(sl_lines) == 1
+    assert sl_lines[0]["volume"] == pytest.approx(0.08)  # 部分 SL（已消费）
+    manual_ticket = b._deals[-1].ticket
+    assert not any(r["event"] == "external_exit"
+                   and r["ticket"] == manual_ticket for r in lines)
 
     # 人工确认（绑定协议）后恢复；解释行不再产出
     _write_ack_external_intent(tmp_path, tickets=(ticket,), net=0.0,
@@ -1231,3 +1242,872 @@ def test_open_comment_safe_and_decision_id_recoverable_from_logs(tmp_path):
     assert read_intent(tmp_path)["cause"] == d.decision_id
     with open(tmp_path / f"orders-{MAGIC}.jsonl", encoding="utf-8") as f:
         assert json.loads(f.readline())["decision_id"] == d.decision_id
+
+
+# ================================================================ H2-01（阶段 1）
+# docs/reviews/2026-10-30-global-code-audit-2.md H2-01 + 计划
+# docs/superpowers/plans/2026-11-01-hline-foundation.md 1A/1B/1D：
+# execution journal（发送前 pending → sent → confirmed/rejected/unknown）+
+# 同 decision_id 幂等 + 重启恢复核对券商。故障注入手法：先把 journal/券商/
+# 意图三者停在"崩溃瞬间"的精确状态（手写 journal 行=崩溃前最后一笔落盘），
+# 再用新执行器模拟重启，断言恢复裁决与重投递行为；运行时路径（order_send
+# 回报丢失）用钩子注入。
+
+JOURNAL_FMT = "execution-journal-{magic}.jsonl"
+SEND_TS = datetime(2026, 10, 20, 17, 59, 58)        # journal pending 行 ts
+RESTART_LATE = datetime(2026, 10, 20, 18, 10, 8)    # 发送后 10 分钟（窗口已覆盖）
+
+
+def _journal_path(tmp_path):
+    return tmp_path / JOURNAL_FMT.format(magic=MAGIC)
+
+
+def _journal_records(tmp_path) -> list:
+    p = _journal_path(tmp_path)
+    if not p.exists():
+        return []
+    return [json.loads(ln) for ln
+            in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+
+def _journal_seed_pending(tmp_path, decision_id, *, ts=SEND_TS,
+                          action="open", volume=0.02, side="buy",
+                          comment=None) -> None:
+    """手写一条 pending 行（=发送前 journal 已落盘、其后崩溃）。"""
+    rec = {
+        "ts": iso_utc(ts), "decision_id": decision_id,
+        "request_uuid": "test-uuid", "action": action, "symbol": "XAUUSD",
+        "side": side, "volume": volume, "status": "pending"}
+    if comment is not None:
+        rec["comment"] = comment
+    append_jsonl(str(_journal_path(tmp_path)), rec)
+
+
+def _journal_seed_line(tmp_path, record: dict) -> None:
+    append_jsonl(str(_journal_path(tmp_path)), record)
+
+
+def _seed_pending_intent(tmp_path, decision_id, *, volume=0.02,
+                         ts=SEND_TS) -> None:
+    """崩溃瞬间的意图文件：下单前写的 pending(目标)。"""
+    write_intent(str(tmp_path / f"expected-{MAGIC}.json"),
+                 Intent("XAUUSD", MAGIC, "buy", volume, STATUS_PENDING,
+                        decision_id, ts))
+
+
+def _alerts_text(tmp_path) -> str:
+    p = tmp_path / "alerts.log"
+    return p.read_text(encoding="utf-8") if p.exists() else ""
+
+
+def _finals(tmp_path, status: str) -> list:
+    return [r for r in _journal_records(tmp_path) if r.get("status") == status]
+
+
+def test_h201_1_crash_before_send_remains_unknown_without_positive_evidence(tmp_path):
+    """注入 1：journal pending 后、order_send 前崩溃，与发送后 ACK 丢失
+    无法仅凭空历史区分；必须保持 unknown，等待明确券商证据/人工仲裁。"""
+    b = FakeBroker()
+    d = mk_decision(signal=1, volume_lots=0.02)
+    _journal_seed_pending(tmp_path, d.decision_id)
+    _seed_pending_intent(tmp_path, d.decision_id)
+
+    ex = _mk_executor(b, tmp_path)                       # 重启
+    rr = ex.poll(d, RESTART_LATE)
+    assert rr.action == "blocked_execution_unknown"
+    assert b.positions() == []                           # 零新增请求
+    assert not _finals(tmp_path, "rejected")
+    it = read_intent(tmp_path)
+    assert it["status"] == "pending"                     # 不洗成 confirmed
+
+    # 无正面证据时，新决策仍被阻断；需人工仲裁后才能解除。
+    d2 = mk_decision(signal=1, volume_lots=0.01,
+                     decision_id="XAUUSD|M15|2026-10-20T18:15:00")
+    assert ex.poll(d2, RESTART_LATE.replace(minute=25)).action == \
+        "blocked_execution_unknown"
+
+
+def test_h201_2_crash_after_fill_before_sent_line_confirmed(tmp_path):
+    """注入 2：order_send 已成交（券商有仓+成交）但 journal "sent" 行未写即
+    崩溃 → 重启核对券商有成交 → confirmed + expected 恢复为实际持仓。"""
+    from mt5live.executor import decision_comment
+
+    b = FakeBroker()
+    d = mk_decision(signal=1, volume_lots=0.02)
+    comment = decision_comment(d.decision_id)
+    _journal_seed_pending(tmp_path, d.decision_id, comment=comment)
+    b.market_order("XAUUSD", "buy", 0.02, magic=MAGIC,
+                   comment=comment)                     # 券商侧已成交
+    _seed_pending_intent(tmp_path, d.decision_id)
+
+    ex = _mk_executor(b, tmp_path)                       # 重启
+    rr = ex.poll(d, RESTART_LATE)
+    assert rr.action == "duplicate"                      # 不重开（旧实现会再开）
+    assert len(b.market_orders) == 1
+    confirmed = _finals(tmp_path, "confirmed")
+    assert confirmed and confirmed[-1]["decision_id"] == d.decision_id
+    it = read_intent(tmp_path)
+    assert it["status"] == "confirmed"
+    assert it["volume"] == pytest.approx(0.02)           # expected 恢复=实际
+
+
+def test_h201_3_crash_after_sent_before_state_confirmed(tmp_path):
+    """注入 3：order_send 成功 + journal "sent" 行已写、state 写前崩溃 →
+    重启 → confirmed + 恢复。"""
+    from mt5live.executor import decision_comment
+
+    b = FakeBroker()
+    d = mk_decision(signal=1, volume_lots=0.02)
+    comment = decision_comment(d.decision_id)
+    _journal_seed_pending(tmp_path, d.decision_id, comment=comment)
+    b.market_order("XAUUSD", "buy", 0.02, magic=MAGIC, comment=comment)
+    _journal_seed_line(tmp_path, {
+        "ts": iso_utc(SEND_TS + timedelta(seconds=2)),
+        "decision_id": d.decision_id, "status": "sent",
+        "retcode": 10009, "order_ticket": b.positions()[0].ticket})
+    _seed_pending_intent(tmp_path, d.decision_id)
+
+    ex = _mk_executor(b, tmp_path)
+    rr = ex.poll(d, RESTART_LATE)
+    assert rr.action in ("hold", "duplicate")
+    assert len(b.market_orders) == 1
+    assert _finals(tmp_path, "confirmed")
+    assert read_intent(tmp_path)["volume"] == pytest.approx(0.02)
+
+
+def test_h201_4_order_send_unknown_intent_pending_restart_confirmed(tmp_path):
+    """注入 4：order_send 回报丢失（Unknown）→ R2：意图保持 pending（旧实现
+    写 confirmed 洗白）+ journal 记 unknown；重启核对券商有仓 → confirmed。"""
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    d = mk_decision(signal=1, volume_lots=0.02)
+    orig = b.market_order
+
+    def send_then_lose_ack(*a, **kw):
+        orig(*a, **kw)                                   # 券商已成交
+        raise OrderResultUnknownError("IPC 中断")
+
+    b.market_order = send_then_lose_ack
+    with pytest.raises(OrderResultUnknownError):
+        ex.poll(d, NOW)
+    # R2：未知异常不写 confirmed——意图保持 pending
+    assert read_intent(tmp_path)["status"] == "pending"
+    recs = _journal_records(tmp_path)
+    assert recs[0]["status"] == "pending"                # 发送前登记
+    assert recs[-1]["status"] == "unknown"
+
+    ex2 = _mk_executor(b, tmp_path)                      # 重启：券商有仓
+    rr = ex2.poll(d, datetime(2026, 10, 20, 18, 0, 30))
+    assert rr.action == "duplicate"
+    assert _finals(tmp_path, "confirmed")
+    assert read_intent(tmp_path)["volume"] == pytest.approx(0.02)
+    assert len(b.market_orders) == 1                     # 不重开
+
+
+def test_h201_unjournaled_pending_order_blocks_new_open_but_not_close(
+        tmp_path):
+    """Legacy/manual broker pending orders without a journal entry still
+    block risk-increasing opens; risk-reducing closes remain available."""
+    b = FakeBroker()
+    b.seed_pending(magic=MAGIC, volume=0.02)
+    ex = _mk_executor(b, tmp_path)
+    d_open = mk_decision(signal=1, volume_lots=0.02)
+    rr = ex.poll(d_open, NOW)
+    assert rr.action == "blocked_broker_pending"
+    assert b.market_orders == []
+    assert "BROKER_PENDING_ORDER" in _alerts_text(tmp_path)
+
+    # The safety gate is specifically for new risk: flattening remains live.
+    b.seed_position(side="buy", volume=0.02, magic=MAGIC)
+    d_close = mk_decision(signal=0, volume_lots=None,
+                          decision_id="XAUUSD|M15|2026-10-20T18:15:00")
+    rr_close = ex.poll(d_close, NOW.replace(minute=15))
+    assert rr_close.action == "close"
+    assert b.positions() == []
+    assert b.pending_orders("XAUUSD") == []
+
+
+def test_h201_unrelated_same_magic_deal_does_not_confirm_unknown(
+        tmp_path):
+    """A different order's deal with the same magic/symbol is not positive
+    evidence that this decision's order executed."""
+    from mt5live.executor import decision_comment
+
+    b = FakeBroker()
+    d = mk_decision(signal=1, volume_lots=0.02)
+    _journal_seed_pending(tmp_path, d.decision_id,
+                          comment=decision_comment(d.decision_id))
+    _seed_pending_intent(tmp_path, d.decision_id)
+    # Simulate an unrelated manual/other-path trade after the send timestamp.
+    b.market_order("XAUUSD", "buy", 0.01, magic=MAGIC,
+                   comment="manual-unrelated-order")
+
+    ex = _mk_executor(b, tmp_path)
+    rr = ex.poll(d, RESTART_LATE)
+    assert rr.action in ("hold", "duplicate")  # no new risk leg was needed
+    assert d.decision_id in ex._undecided
+    assert not _finals(tmp_path, "confirmed")
+    assert not _finals(tmp_path, "rejected")
+    assert len(b.market_orders) == 1  # no duplicate decision order
+
+
+def test_h201_placed_order_volume_is_not_treated_as_fill(tmp_path):
+    """PLACED is accepted but not filled: even if result.volume is nonzero,
+    it must leave the journal unknown and keep the open-order safety gate."""
+    from mt5gw.models import OrderResult
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    d = mk_decision(signal=1, volume_lots=0.02)
+
+    def placed_without_fill(symbol, side, volume, **kwargs):
+        order = b.seed_pending(magic=MAGIC, volume=volume)
+        # Deliberately return a nonzero volume with filled=False to ensure the
+        # adapter trusts the explicit fill flag, not the raw volume field.
+        return OrderResult(
+            ok=True, filled=False, partial=False, retcode=10008,
+            comment="placed", order_ticket=order.ticket, deal_ticket=None,
+            deal_price=None, requested_volume=volume, volume=volume)
+
+    b.market_order = placed_without_fill
+    rr = ex.poll(d, NOW)
+    assert rr.action == "execution_pending"
+    assert read_intent(tmp_path)["status"] == "pending"
+    assert _journal_records(tmp_path)[-1]["status"] == "unknown"
+    assert not _finals(tmp_path, "confirmed")
+
+    # Even after the negative-history margin, the live pending order means
+    # the original request can still fill; do not classify it as rejected.
+    # Replaying the same decision is idempotently skipped; a fresh decision
+    # must be blocked while the original broker order remains pending.
+    rr2 = ex.poll(d, NOW + timedelta(minutes=3))
+    assert rr2.action in ("duplicate", "hold")
+    d2 = mk_decision(signal=1, volume_lots=0.02,
+                     decision_id="XAUUSD|M15|2026-10-20T18:15:00")
+    rr3 = ex.poll(d2, NOW + timedelta(minutes=4))
+    assert rr3.action == "blocked_execution_unknown"
+    assert not _finals(tmp_path, "rejected")
+    assert b.pending_orders("XAUUSD")
+
+
+def test_h201_5_unknown_no_fill_blocked_until_history_window_covers(tmp_path):
+    """注入 5：order_send 回报丢失且实际未成交 → 重启（历史窗口尚未覆盖发送
+    时刻）→ 保持 unknown + 暂停开仓（不误判 rejected）；窗口覆盖后 → rejected
+    + 恢复（R3）。"""
+    from mt5live.executor import JOURNAL_HISTORY_COVER_MARGIN_S
+
+    b = FakeBroker()
+    b.error_on_market_order = OrderResultUnknownError("IPC 中断")
+    ex = _mk_executor(b, tmp_path)
+    d = mk_decision(signal=1, volume_lots=0.02)
+    with pytest.raises(OrderResultUnknownError):
+        ex.poll(d, NOW)
+    assert read_intent(tmp_path)["status"] == "pending"
+
+    # 重启（窗口未覆盖）：未决 → 挡开仓，绝不判 rejected
+    b.error_on_market_order = None
+    ex2 = _mk_executor(b, tmp_path)
+    early = NOW + timedelta(seconds=max(5.0,
+                                        JOURNAL_HISTORY_COVER_MARGIN_S / 6))
+    rr = ex2.poll(d, early)
+    assert rr.action == "blocked_execution_unknown"
+    assert "execution_unknown" in rr.error
+    assert b.positions() == []                           # 没有开仓
+    assert "EXECUTION_UNKNOWN" in _alerts_text(tmp_path)
+    assert not _finals(tmp_path, "rejected")             # R3：不误判
+
+    # 即使时间窗口已经很长，空成交历史也不是拒单的正面证据；
+    # 必须保持 unknown，直到券商给出可归属终态或人工仲裁。
+    late = NOW + timedelta(seconds=JOURNAL_HISTORY_COVER_MARGIN_S * 20)
+    rr2 = ex2.poll(d, late)
+    assert rr2.action == "duplicate"  # 同一决策不可重放；unknown门禁仍保留
+    assert not _finals(tmp_path, "rejected")
+    d2 = mk_decision(signal=1, volume_lots=0.01,
+                     decision_id="XAUUSD|M15|2026-10-20T18:15:00")
+    assert ex2.poll(d2, late.replace(minute=25)).action == \
+        "blocked_execution_unknown"
+
+
+def test_h201_pending_broker_order_keeps_execution_unknown(tmp_path):
+    """P0 regression: an open broker pending order must prevent rejected
+    classification even after the history coverage margin has elapsed."""
+    from mt5live.executor import JOURNAL_HISTORY_COVER_MARGIN_S
+
+    b = FakeBroker()
+    d = mk_decision(signal=1, volume_lots=0.02)
+    _journal_seed_pending(tmp_path, d.decision_id)
+    order = b.seed_pending(magic=MAGIC, volume=0.02)
+
+    ex = _mk_executor(b, tmp_path)  # restart with unresolved broker order
+    late = NOW + timedelta(seconds=JOURNAL_HISTORY_COVER_MARGIN_S * 2)
+    rr = ex.poll(d, late)
+    assert rr.action == "blocked_execution_unknown"
+    assert not _finals(tmp_path, "rejected")
+    assert order in b.pending_orders("XAUUSD")
+
+    # Cancellation removes the pending order, but an empty deal history is
+    # still not positive proof of rejection; only explicit arbitration resolves it.
+    b.cancel_order(order.ticket)
+    rr2 = ex.poll(d, late + timedelta(seconds=1))
+    assert rr2.action == "duplicate"
+    assert not _finals(tmp_path, "rejected")
+    d2 = mk_decision(signal=1, volume_lots=0.01,
+                     decision_id="XAUUSD|M15|2026-10-20T18:15:00")
+    assert ex.poll(d2, late + timedelta(minutes=2)).action == \
+        "blocked_execution_unknown"
+
+
+def test_placed_order_is_not_confirmed_or_logged_as_fill(tmp_path):
+    """MT5 PLACED = accepted, not filled: keep journal pending and do not
+    emit fill_open evidence until a real deal is observed."""
+    from mt5gw.models import OrderResult
+
+    b = FakeBroker()
+    d = mk_decision(signal=1, volume_lots=0.02)
+    calls = []
+
+    def placed(symbol, side, volume, **kwargs):
+        calls.append((symbol, side, volume))
+        order = b.seed_pending(magic=kwargs.get("magic") or MAGIC,
+                               volume=volume)
+        return OrderResult(
+            ok=True, filled=False, partial=False, retcode=10008,
+            comment="placed", order_ticket=order.ticket, deal_ticket=None,
+            deal_price=None, requested_volume=volume, volume=None)
+
+    b.market_order = placed
+    ex = _mk_executor(b, tmp_path)
+    rr = ex.poll(d, NOW)
+
+    assert rr.action == "execution_pending"
+    assert calls and len(b.pending_orders("XAUUSD")) == 1
+    assert read_intent(tmp_path)["status"] == "pending"
+    assert not _finals(tmp_path, "confirmed")
+    records = _journal_records(tmp_path)
+    assert [r["status"] for r in records][-3:] == ["pending", "sent", "unknown"]
+    assert not (tmp_path / f"deals-{MAGIC}.jsonl").exists()
+
+    # A later decision cannot open while the broker still holds the accepted order.
+    d2 = mk_decision(signal=1, volume_lots=0.02,
+                     decision_id="XAUUSD|M15|2026-10-20T18:15:00")
+    rr2 = ex.poll(d2, NOW + timedelta(seconds=90))
+    assert rr2.action == "blocked_execution_unknown"
+    assert len(calls) == 1
+
+
+def test_h201_6_r3_delayed_broker_query_not_misjudged_rejected(tmp_path):
+    """注入 6（R3）：重启时券商核对查询超时/延迟 → 不得误判 rejected（重复
+    开仓风险），保持 unknown；下轮重查确认 → confirmed。"""
+    from mt5live.executor import decision_comment
+
+    b = FakeBroker()
+    d = mk_decision(signal=1, volume_lots=0.02)
+    comment = decision_comment(d.decision_id)
+    _journal_seed_pending(tmp_path, d.decision_id, comment=comment)
+    b.market_order("XAUUSD", "buy", 0.02, magic=MAGIC,
+                   comment=comment)                     # 券商有仓
+    _seed_pending_intent(tmp_path, d.decision_id)
+
+    calls = {"pos": 0}
+    orig_positions = b.positions
+
+    def flaky_positions(symbol=None):
+        calls["pos"] += 1
+        if calls["pos"] == 1:          # 重启核对的第一次持仓查询超时（延迟可见）
+            raise RuntimeError("positions 查询超时（延迟可见）")
+        return orig_positions(symbol)
+
+    b.positions = flaky_positions
+    ex = _mk_executor(b, tmp_path)
+    rr = ex.poll(d, RESTART_LATE)                        # 第 1 轮：查询失败
+    assert rr.action in ("hold", "duplicate")            # 净额恰达标，零新增请求
+    assert not _finals(tmp_path, "rejected")             # 核心断言：不误判
+    assert "EXECUTION_UNKNOWN" in _alerts_text(tmp_path)
+    assert b.positions()                                 # 仓位原封未动
+
+    rr2 = ex.poll(d, RESTART_LATE.replace(minute=12))    # 第 2 轮：重查确认
+    assert rr2.action == "duplicate"
+    assert _finals(tmp_path, "confirmed")
+    assert read_intent(tmp_path)["volume"] == pytest.approx(0.02)
+
+
+def test_h201_7_position_sl_closed_replay_not_reordered(tmp_path):
+    """注入 7（审计探针原场景）：成交后 state 写前崩溃 + 重启前仓位已被 SL
+    平掉 → 重放同 decision_id 不得再开 1 笔（journal 幂等跳过）。"""
+    from mt5gw.models import DEAL_REASON_SL
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    d = mk_decision(signal=1, volume_lots=0.02)
+    assert ex.poll(d, NOW).action == "open"
+    ticket = b.positions()[0].ticket
+    # 崩溃注入：state 写前进程死亡（状态文件丢失，last_decision_id 不在场）
+    (tmp_path / f"state-{MAGIC}.json").unlink()
+    # 重启前仓位已被 SL 平掉
+    b.close_external(ticket, profit=-30.0, comment="[sl]",
+                     reason=DEAL_REASON_SL)
+
+    ex2 = _mk_executor(b, tmp_path)                      # 重启 + 重放同决策
+    rr = ex2.poll(d, NOW.replace(minute=5))
+    assert rr.action == "duplicate"                      # 旧实现：open 再开 1 笔
+    assert "journal 幂等跳过" in rr.error
+    assert b.positions() == [] and len(b.market_orders) == 1
+
+
+def test_h201_8_journal_torn_tail_no_crash_blocks_opening(tmp_path):
+    """注入 8（R5）：journal 尾部撕裂行（写一半崩溃）→ 读取不 crash、按
+    unknown 处理（挡开仓）；平仓腿不受限。"""
+    b = FakeBroker()
+    d = mk_decision(signal=1, volume_lots=0.02)
+    _journal_seed_pending(tmp_path, d.decision_id)
+    with open(_journal_path(tmp_path), "a", encoding="utf-8") as f:
+        f.write('{"ts": "2026-10-20T18:00:00+00:0')     # 撕裂：无换行+非完整 JSON
+
+    ex = _mk_executor(b, tmp_path)                       # 不得抛
+    rr = ex.poll(d, NOW)
+    assert rr.action == "blocked_execution_unknown"      # 撕裂行=未知
+    assert b.market_orders == [] and b.positions() == []  # 没有开仓
+    assert "EXECUTION_UNKNOWN" in _alerts_text(tmp_path)
+    # 平仓照常（防线只挡开仓腿）：期间出现的持仓，信号归零照常平掉
+    b.seed_position(side="buy", volume=0.02, magic=MAGIC)
+    d_close = mk_decision(signal=0, volume_lots=None,
+                          decision_id="XAUUSD|M15|2026-10-20T18:15:00")
+    assert ex.poll(d_close, NOW.replace(minute=15)).action == "close"
+    assert b.positions() == []
+
+
+def test_h201_9_journal_rejected_decision_replay_refused(tmp_path):
+    """注入 9：同 decision_id journal 已有 rejected 终态 → 重投递被拒（语义
+    变更：被拒决策不再可重投，重发须先过对账/仲裁）。"""
+    b = FakeBroker()
+    d = mk_decision(signal=1, volume_lots=0.02)
+    _journal_seed_pending(tmp_path, d.decision_id)
+    _journal_seed_line(tmp_path, {
+        "ts": iso_utc(SEND_TS + timedelta(seconds=5)),
+        "decision_id": d.decision_id, "status": "rejected",
+        "detail": "arbitrated: 人工核对订单确未成交"})
+
+    ex = _mk_executor(b, tmp_path)
+    rr = ex.poll(d, NOW)
+    assert rr.action == "duplicate"
+    assert "拒绝后不可重投" in rr.error
+    assert b.market_orders == []
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_script(name: str):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        name.replace("-", "_"), REPO_ROOT / "scripts" / f"{name}.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _ToolGW:
+    """仲裁工具的网关替身（只读持仓）。"""
+
+    def __init__(self, broker):
+        self.account = broker
+        self.market = broker
+        self.trading = broker
+
+    def connect(self):
+        pass
+
+    def shutdown(self):
+        pass
+
+
+def test_h201_arbitration_tool_resolves_permanent_unknown(tmp_path,
+                                                          monkeypatch):
+    """1D：永久 unknown（券商核对始终不可用）→ scripts/live_ack_execution.py
+    仲裁 → journal 终态落盘 + 解除开仓暂停；重投被拒而非被挡。"""
+    b = FakeBroker()
+    d = mk_decision(signal=1, volume_lots=0.02)
+    # 运行时回报丢失 + 券商实际未成交 → journal unknown
+    b.error_on_market_order = OrderResultUnknownError("IPC 中断")
+    ex = _mk_executor(b, tmp_path)
+    with pytest.raises(OrderResultUnknownError):
+        ex.poll(d, NOW)
+    b.error_on_market_order = None
+
+    # 券商核对持续不可用（查询一直超时）→ 永久 unknown、开仓被挡
+    def boom_deals(since, to):
+        raise RuntimeError("history_deals 持续不可用")
+
+    b.deals = boom_deals
+    assert ex.poll(d, NOW + timedelta(seconds=10)).action == \
+        "blocked_execution_unknown"
+
+    tool = _load_script("live_ack_execution")
+    monkeypatch.setattr("mt5gw.MT5Gateway.from_config_file",
+                        staticmethod(lambda p: _ToolGW(b)))
+    # CI 根因修复：直接 patch 工具的 _open_gateway（绕过 from_config_file
+    # 的 except fallback——CI 上 fallback 创建真 MT5Gateway 连接失败）
+    monkeypatch.setattr(tool, "_open_gateway",
+                        lambda gw_config: _ToolGW(b))
+    import io, contextlib
+    _out = io.StringIO()
+    with contextlib.redirect_stdout(_out):
+        rc = tool.main(["--live-dir", str(tmp_path), "--magic", str(MAGIC),
+                        "--decision-id", d.decision_id, "--status", "rejected",
+                        "--reason", "人工核对：订单确未到达服务器",
+                        "--symbol", "XAUUSD"])
+    assert rc == 0, f"tool rc={rc}; output: {_out.getvalue()}"  # CI 诊断：带工具输出
+    rejected = _finals(tmp_path, "rejected")
+    assert rejected and rejected[-1]["detail"].startswith("arbitrated")
+
+    # 解除开仓暂停：重投被"拒"（journal 终态幂等），不再被未决挡
+    rr = ex.poll(d, NOW.replace(minute=5))
+    assert rr.action == "duplicate"
+    assert "拒绝后不可重投" in rr.error
+    d2 = mk_decision(signal=1, volume_lots=0.01,
+                     decision_id="XAUUSD|M15|2026-10-20T18:15:00")
+    assert ex.poll(d2, NOW.replace(minute=16)).action == "open"
+
+
+# ================================================================ H2-02（阶段 2）
+# docs/reviews/2026-10-30-global-code-audit-2.md H2-02 + 计划
+# 2026-11-01-hline-foundation.md 2A/2B/2C：consumed deal 水位 + 部分减量
+# （R4）+ 事件区间窗（R4）+ consumed fail-closed（R5）+ 券商查询 fail-closed。
+# 核心复现：旧部分 SL deal 从未被消费 → 迟到的人工平仓被旧 SL"解释"→
+# pending 清空、防线解除（审计探针 live 场景）。
+
+CONSUMED_FMT = "consumed-deals-{magic}.jsonl"
+
+
+def _consumed_path(tmp_path):
+    return tmp_path / CONSUMED_FMT.format(magic=MAGIC)
+
+
+def _consumed_records(tmp_path) -> list:
+    p = _consumed_path(tmp_path)
+    if not p.exists():
+        return []
+    return [json.loads(ln) for ln
+            in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+
+def _state_json(tmp_path) -> dict:
+    return json.loads((tmp_path / f"state-{MAGIC}.json")
+                      .read_text(encoding="utf-8"))
+
+
+def test_h202_1_old_partial_sl_plus_delayed_manual_close_pending_holds(tmp_path):
+    """注入 1（审计探针原场景）：0.02 仓先部分 SL 0.01（已观察、已消费
+    水位），剩余 0.01 被人工平掉且成交延迟可见 → 旧部分 SL 不得解释新
+    消失（旧实现按"累计量够了"清空 pending 并重开）。"""
+    from mt5gw.models import DEAL_REASON_CLIENT, DEAL_REASON_SL
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d1"), NOW).action \
+        == "open"
+    ticket = b.positions()[0].ticket
+    # 部分 SL 0.01（18:05）→ 下一轮观察到量变：解释 + 消费（R4）
+    b.reduce_external(ticket, 0.01, profit=-5.0, comment="[sl]",
+                      reason=DEAL_REASON_SL, time=datetime(2026, 10, 20, 18, 5))
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d2"),
+                   NOW.replace(minute=15)).action == "hold"
+    consumed = _consumed_records(tmp_path)
+    assert len(consumed) == 1
+    assert consumed[0]["volume"] == pytest.approx(0.01)
+    assert consumed[0]["reason"] == DEAL_REASON_SL
+
+    # 人工平剩余 0.01（18:20，CLIENT）——成交历史延迟可见（6 次查询后）
+    b.close_external(ticket, profit=1.0, comment="manual",
+                     reason=DEAL_REASON_CLIENT,
+                     time=datetime(2026, 10, 20, 18, 20))
+    manual = b._deals[-1]
+    b._deal_visible_at[b._deals.index(manual)] = b._deal_polls + 6
+
+    rr = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                             decision_id="XAUUSD|M15|d3"),
+                 NOW.replace(minute=30))
+    assert rr.action == "blocked_external_exit"    # 旧实现：open（重开 0.02）
+    assert len(b.market_orders) == 1               # 没有重开
+    assert str(ticket) in _state_json(tmp_path)["pending_external_exits"]
+    assert read_intent(tmp_path)["volume"] == pytest.approx(0.01)  # 不洗白
+
+    # 延迟成交可见后（reason=CLIENT）→ 仍未解释：pending 不解除、防线不放
+    for i in range(7):
+        ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                            decision_id=f"XAUUSD|M15|loop{i}"),
+                NOW.replace(minute=31 + i))
+    assert str(ticket) in _state_json(tmp_path)["pending_external_exits"]
+    assert len(b.market_orders) == 1
+    # 旧 SL deal 没有被重复消费（水位单调）
+    assert len(_consumed_records(tmp_path)) == 1
+
+
+def test_h202_2_multiple_partial_sl_each_explained_and_consumed(tmp_path):
+    """注入 2：多个部分 SL 依次发生 → 各自解释+消费（水位逐笔累进，
+    后一笔不冒充前一笔）。"""
+    from mt5gw.models import DEAL_REASON_SL
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.03,
+                               decision_id="XAUUSD|M15|d1"), NOW).action \
+        == "open"
+    ticket = b.positions()[0].ticket
+    for i, (minute, event_minute) in enumerate(((5, 15), (20, 30)), start=2):
+        b.reduce_external(ticket, 0.01, profit=-5.0, comment="[sl]",
+                          reason=DEAL_REASON_SL,
+                          time=datetime(2026, 10, 20, 18, event_minute - 10))
+        assert ex.poll(mk_decision(signal=1, volume_lots=0.03,
+                                   decision_id=f"XAUUSD|M15|d{i}"),
+                       NOW.replace(minute=event_minute)).action == "hold"
+        assert len(_consumed_records(tmp_path)) == i - 1    # 逐笔累进
+    assert _state_json(tmp_path)["pending_external_exits"] == {}
+
+    # 最后一笔 SL 全平 → 整仓消失同样解释 + 消费（immediate 重入场是
+    # 解释成功后的正常行为——不挡）
+    b.close_external(ticket, profit=-5.0, comment="[sl]",
+                     reason=DEAL_REASON_SL,
+                     time=datetime(2026, 10, 20, 18, 35))
+    rr = ex.poll(mk_decision(signal=1, volume_lots=0.03,
+                             decision_id="XAUUSD|M15|d4"),
+                 NOW.replace(minute=45))
+    assert rr.action in ("open", "blocked_reentry")         # 解释成功不挡
+    assert _state_json(tmp_path)["pending_external_exits"] == {}
+    consumed = _consumed_records(tmp_path)
+    assert len(consumed) == 3
+    assert len({c["ticket"] for c in consumed}) == 3        # 三笔各消费一次
+    assert all(c["volume"] == pytest.approx(0.01) for c in consumed)
+    deals_log = [json.loads(ln) for ln in
+                 (tmp_path / f"deals-{MAGIC}.jsonl").read_text(
+                     encoding="utf-8").splitlines() if ln]
+    assert len([r for r in deals_log if r["event"] == "external_exit"]) == 3
+
+
+def test_h202_3_repeat_old_deal_not_reconsumed(tmp_path):
+    """注入 3：已消费的旧 SL deal 反复返回在成交历史 → 不得再次用于解释/
+    消费；人工平仓（CLIENT，立即可见）→ 未解释 pending。"""
+    from mt5gw.models import DEAL_REASON_CLIENT, DEAL_REASON_SL
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d1"), NOW).action \
+        == "open"
+    ticket = b.positions()[0].ticket
+    b.reduce_external(ticket, 0.01, profit=-5.0, comment="[sl]",
+                      reason=DEAL_REASON_SL, time=datetime(2026, 10, 20, 18, 5))
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d2"),
+                   NOW.replace(minute=15)).action == "hold"
+    assert len(_consumed_records(tmp_path)) == 1
+
+    # 人工平剩余 0.01（CLIENT 立即可见）：旧 SL 已消费 → 只剩 CLIENT 候选
+    b.close_external(ticket, profit=1.0, comment="manual",
+                     reason=DEAL_REASON_CLIENT,
+                     time=datetime(2026, 10, 20, 18, 20))
+    rr = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                             decision_id="XAUUSD|M15|d3"),
+                 NOW.replace(minute=30))
+    assert rr.action == "blocked_external_exit"
+    assert str(ticket) in _state_json(tmp_path)["pending_external_exits"]
+    assert len(_consumed_records(tmp_path)) == 1            # 不重复消费
+    deals_log = [json.loads(ln) for ln in
+                 (tmp_path / f"deals-{MAGIC}.jsonl").read_text(
+                     encoding="utf-8").splitlines() if ln]
+    assert not any(r["event"] == "external_exit"
+                   and r["ticket"] == b._deals[-1].ticket for r in deals_log)
+
+
+def test_h202_4_out_of_order_history_and_ancient_deal_filtered(tmp_path):
+    """注入 4：成交历史乱序返回（新 deal 排在旧 deal 之前）+ 更古老的
+    历史 SL deal 落在事件区间外 → 区间筛选与时间排序仍正确圈定本次事件
+    （古老 deal 不得冒充解释）。"""
+    from mt5gw.models import DEAL_REASON_CLIENT, DEAL_REASON_SL
+
+    class ReversedHistoryBroker(FakeBroker):
+        def deals_for_position(self, position_id):
+            return list(reversed(
+                super().deals_for_position(position_id)))
+
+    b = ReversedHistoryBroker()
+    ex = _mk_executor(b, tmp_path)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d1"), NOW).action \
+        == "open"
+    ticket = b.positions()[0].ticket
+    # 更古老的历史 SL deal（开仓之前——永远在事件区间外）
+    b._record_deal(entry="out", side="sell", volume=0.01, price=99.0,
+                   profit=-1.0, comment="[sl]", magic=MAGIC,
+                   position_id=ticket, reason=DEAL_REASON_SL,
+                   time=datetime(2026, 10, 20, 17, 50))
+    b.reduce_external(ticket, 0.01, profit=-5.0, comment="[sl]",
+                      reason=DEAL_REASON_SL, time=datetime(2026, 10, 20, 18, 5))
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d2"),
+                   NOW.replace(minute=15)).action == "hold"
+    consumed = _consumed_records(tmp_path)
+    assert len(consumed) == 1 and consumed[0]["volume"] == pytest.approx(0.01)
+
+    # 人工平剩余（CLIENT 延迟可见）：古老 deal 区间外 + 部分 SL 已消费
+    # → 无候选 → 未解释（旧实现：部分 SL"累计量够"解释掉新消失并重开）
+    b.close_external(ticket, profit=1.0, comment="manual",
+                     reason=DEAL_REASON_CLIENT,
+                     time=datetime(2026, 10, 20, 18, 20))
+    manual = b._deals[-1]
+    b._deal_visible_at[b._deals.index(manual)] = b._deal_polls + 6
+    rr = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                             decision_id="XAUUSD|M15|d3"),
+                 NOW.replace(minute=30))
+    assert rr.action == "blocked_external_exit"
+    assert len(b.market_orders) == 1
+    assert str(ticket) in _state_json(tmp_path)["pending_external_exits"]
+    assert len(_consumed_records(tmp_path)) == 1
+
+
+def test_h202_5_restart_keeps_consumed_watermark(tmp_path):
+    """注入 5：重启后 consumed 水位保留（磁盘持久）→ 旧 SL 不因重启被
+    重复消费/冒充解释。"""
+    from mt5gw.models import DEAL_REASON_CLIENT, DEAL_REASON_SL
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d1"), NOW).action \
+        == "open"
+    ticket = b.positions()[0].ticket
+    b.reduce_external(ticket, 0.01, profit=-5.0, comment="[sl]",
+                      reason=DEAL_REASON_SL, time=datetime(2026, 10, 20, 18, 5))
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d2"),
+                   NOW.replace(minute=15)).action == "hold"
+
+    # 重启（新执行器，水位从 consumed-deals-<magic>.jsonl 恢复）
+    b.close_external(ticket, profit=1.0, comment="manual",
+                     reason=DEAL_REASON_CLIENT,
+                     time=datetime(2026, 10, 20, 18, 20))
+    ex2 = _mk_executor(b, tmp_path)
+    rr = ex2.poll(mk_decision(signal=1, volume_lots=0.02,
+                              decision_id="XAUUSD|M15|d3"),
+                  NOW.replace(minute=30))
+    assert rr.action == "blocked_external_exit"    # 旧实现：SL 解释 → open
+    assert str(ticket) in _state_json(tmp_path)["pending_external_exits"]
+    assert len(_consumed_records(tmp_path)) == 1   # 水位没有回退
+
+
+def test_h202_6_consumed_file_corrupt_fail_closed(tmp_path):
+    """注入 6（R5）：consumed 水位文件损坏 → fail-closed——一切解释停摆
+    （新消失全部 pending、旧 pending 视为仍在）+ STATE_CORRUPT 告警。"""
+    from mt5gw.models import DEAL_REASON_SL
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d1"), NOW).action \
+        == "open"
+    ticket = b.positions()[0].ticket
+    b.reduce_external(ticket, 0.01, profit=-5.0, comment="[sl]",
+                      reason=DEAL_REASON_SL, time=datetime(2026, 10, 20, 18, 5))
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d2"),
+                   NOW.replace(minute=15)).action == "hold"
+    assert len(_consumed_records(tmp_path)) == 1
+
+    # 损坏水位文件（写一半崩溃）→ 重启 → 解释停摆
+    _consumed_path(tmp_path).write_text(
+        '{"ticket": 900001, "vol', encoding="utf-8")
+    b.close_external(ticket, profit=-5.0, comment="[sl]",
+                     reason=DEAL_REASON_SL,
+                     time=datetime(2026, 10, 20, 18, 20))
+    ex2 = _mk_executor(b, tmp_path)
+    rr = ex2.poll(mk_decision(signal=1, volume_lots=0.02,
+                              decision_id="XAUUSD|M15|d3"),
+                  NOW.replace(minute=30))
+    assert rr.action == "blocked_external_exit"    # 保护性出场也不自动解释
+    assert str(ticket) in _state_json(tmp_path)["pending_external_exits"]
+    assert "STATE_CORRUPT" in _alerts_text(tmp_path)
+
+
+def test_h202_7_broker_query_timeout_fail_closed(tmp_path):
+    """注入 7（2C）：券商持仓查询失败/超时 → 本轮不开新仓、不清空
+    pending、写告警（blocked_broker_unavailable），不 crash。"""
+    from mt5gw.models import DEAL_REASON_CLIENT
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d1"), NOW).action \
+        == "open"
+    ticket = b.positions()[0].ticket
+    b.close_external(ticket, profit=1.0, comment="manual",
+                     reason=DEAL_REASON_CLIENT)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d2"),
+                   NOW.replace(minute=15)).action == "blocked_external_exit"
+
+    # 券商持仓查询超时 → fail-closed（旧实现：异常上抛崩掉运行器）
+    orig_positions = b.positions
+
+    def boom_positions(symbol=None):
+        raise RuntimeError("positions 查询超时")
+
+    b.positions = boom_positions
+    rr = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                             decision_id="XAUUSD|M15|d3"),
+                 NOW.replace(minute=30))
+    assert rr.action == "blocked_broker_unavailable"
+    assert "BROKER_UNAVAILABLE" in _alerts_text(tmp_path)
+    assert len(b.market_orders) == 1               # 没有开新仓
+    assert str(ticket) in _state_json(tmp_path)["pending_external_exits"]
+
+    # 查询恢复 → pending 仍在（未被本轮清空）、防线照常
+    b.positions = orig_positions
+    rr2 = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                              decision_id="XAUUSD|M15|d4"),
+                  NOW.replace(minute=45))
+    assert rr2.action == "blocked_external_exit"
+    assert len(b.market_orders) == 1
+
+
+def test_h202_8_partial_reduction_explained_and_consumed(tmp_path):
+    """注入 8（R4 核心行为）：同 ticket volume 0.02→0.01（部分 SL）→
+    检测量变 → 解释新 deal + 记入 consumed 水位 + 不产生 pending；
+    deals 证据流记 external_exit 行（部分出场也是保护性出场证据）。"""
+    from mt5gw.models import DEAL_REASON_SL
+
+    b = FakeBroker()
+    ex = _mk_executor(b, tmp_path)
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d1"), NOW).action \
+        == "open"
+    ticket = b.positions()[0].ticket
+    b.reduce_external(ticket, 0.01, profit=-5.0, comment="[sl]",
+                      reason=DEAL_REASON_SL, time=datetime(2026, 10, 20, 18, 5))
+
+    rr = ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                             decision_id="XAUUSD|M15|d2"),
+                 NOW.replace(minute=15))
+    assert rr.action == "hold"                     # 仓位仍在（量变非出场）
+    assert b.positions()[0].volume == pytest.approx(0.01)
+    assert _state_json(tmp_path)["pending_external_exits"] == {}
+    consumed = _consumed_records(tmp_path)
+    assert len(consumed) == 1
+    assert consumed[0]["volume"] == pytest.approx(0.01)
+    assert consumed[0]["reason"] == DEAL_REASON_SL
+    assert consumed[0]["time"].startswith("2026-10-20T18:05")
+    deals_log = [json.loads(ln) for ln in
+                 (tmp_path / f"deals-{MAGIC}.jsonl").read_text(
+                     encoding="utf-8").splitlines() if ln]
+    ext = [r for r in deals_log if r["event"] == "external_exit"]
+    assert len(ext) == 1 and ext[0]["reason"] == "SL"
+    assert ext[0]["volume"] == pytest.approx(0.01)
+    assert read_intent(tmp_path)["volume"] == pytest.approx(0.01)  # 意图=实际
+
+    # 下一轮同信号：hold（不因量变重开/加仓）
+    assert ex.poll(mk_decision(signal=1, volume_lots=0.02,
+                               decision_id="XAUUSD|M15|d3"),
+                   NOW.replace(minute=30)).action == "hold"
+    assert len(b.market_orders) == 1

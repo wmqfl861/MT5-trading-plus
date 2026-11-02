@@ -553,19 +553,25 @@ def test_h05_magic_instance_lock_second_holder_refused(tmp_path):
 def test_h05_second_runner_same_magic_refused_by_lock(tmp_path, monkeypatch,
                                                       capsys):
     """接线（live_runner 主链路）：同 magic 第二份运行器启动即被进程锁
-    拒绝——rc=3，且拒绝发生在连接网关之前（from_config_file 被触达即失败）。"""
-    from mt5live.runner import MagicInstanceLock
+    拒绝——rc=3，且拒绝发生在连接网关之前（from_config_file 被触达即失败）。
+
+    H2-01/1C（2026-11-01 计划）：实跑的互斥锁改为 OS 状态目录
+    （%LOCALAPPDATA%\\mt5-trading-plus\\locks）的身份锁（server|login|magic）
+    + 连接前的 magic-only 临时锁——此处用临时锁驱动同一断言（拒绝仍在
+    连接网关之前）。"""
+    from mt5live.runner import (MagicInstanceLock, magic_lock_key,
+                                runner_lock_path)
 
     mod = load_live_runner()
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "lockshome"))
 
     def _boom(p):
         raise AssertionError("拒绝启动必须发生在连接网关之前")
 
     monkeypatch.setattr("mt5gw.MT5Gateway.from_config_file",
                         staticmethod(_boom))
-    lock = MagicInstanceLock(str(tmp_path / "data" / "live" /
-                                 "runner-777.lock"))
-    assert lock.acquire() is True              # 第一份运行器已持有
+    lock = MagicInstanceLock(runner_lock_path(magic_lock_key(777)))
+    assert lock.acquire() is True              # 第一份运行器已持临时锁
     try:
         rc = mod.main(["--config", _runner_config(tmp_path), "--once",
                        "--no-spread-gate",
@@ -575,3 +581,207 @@ def test_h05_second_runner_same_magic_refused_by_lock(tmp_path, monkeypatch,
     assert rc == 3                             # 第二份：拒绝启动
     out = capsys.readouterr().out
     assert "拒绝" in out and "777" in out
+
+
+# ================================================================ H2-01（1C）
+# docs/reviews/2026-10-30-global-code-audit-2.md H2-01：锁随 live_dir 定位
+# 不足以证明不同数据目录下的同账户同 magic 互斥——锁键改
+# sha256(server|login|magic)[:16]、锁文件落 OS 状态目录（R6）。
+
+def test_h201_instance_lock_key_is_identity_based():
+    """锁键 = server|login|magic 身份哈希（16 hex）：login 跨券商可撞号、
+    server 不同即不同键；magic-only 临时键与身份键不撞。"""
+    from mt5live.runner import instance_lock_key, magic_lock_key
+
+    key = instance_lock_key("DemoSrv-Test", 123456, 777)
+    assert len(key) == 16
+    assert key == instance_lock_key("DemoSrv-Test", 123456, 777)
+    assert key != instance_lock_key("DemoSrv-Test", 123457, 777)  # login
+    assert key != instance_lock_key("Other-Server", 123456, 777)      # server
+    assert key != instance_lock_key("DemoSrv-Test", 123456, 778)  # magic
+    assert magic_lock_key(777) != key
+    assert len(magic_lock_key(777)) == 16
+
+
+def test_h201_cross_data_dir_same_identity_second_refused(tmp_path,
+                                                          monkeypatch,
+                                                          capsys):
+    """注入 10：两个数据目录、同 server/login/magic → 第二份运行器被身份锁
+    拒绝（rc=3）——互斥不再随 live_dir 定位（审计 H2-01 锁缺陷）。"""
+    from mt5live.runner import (MagicInstanceLock, instance_lock_key,
+                                runner_lock_path)
+    from tests.fakes_live import FakeBroker
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "lockshome"))
+    mod = load_live_runner()
+    # 数据目录 A 的第一份运行器已持身份锁（FakeBroker.state(): 同 server/login）
+    holder = MagicInstanceLock(runner_lock_path(
+        instance_lock_key("Fake-Server", 123456, 777)))
+    assert holder.acquire() is True
+    try:
+        # 数据目录 B（不同目录、同 server/login/magic 的第二份运行器）
+        dir_b = tmp_path / "dirB"
+        dir_b.mkdir()
+        cfg_b = dir_b / "live.toml"
+        cfg_b.write_text(f"""
+symbol = "XAUUSD"
+timeframe = "M15"
+strategy = "mt5quant.strategies.library.buy_hold:BuyHold"
+magic = 777
+lookback_bars = 30
+volume_lots = 0.1
+data_root = "{(dir_b / 'data').as_posix()}"
+trigger_delay_s = 5.0
+""", encoding="utf-8")
+        monkeypatch.setattr(
+            "mt5gw.MT5Gateway.from_config_file",
+            staticmethod(lambda p: _FakeGW(FakeBroker("XAUUSD"))))
+        rc = mod.main(["--config", str(cfg_b), "--once", "--no-spread-gate",
+                       "--gateway-config", _gw_dummy_config(tmp_path)])
+        assert rc == 3
+        out = capsys.readouterr().out
+        assert "拒绝" in out and "777" in out
+    finally:
+        holder.release()
+
+
+def test_h201_upgrade_refuses_while_legacy_data_dir_lock_held(
+        tmp_path, monkeypatch, capsys):
+    """升级保护：旧版 runner 仍持有 data/live/runner-<magic>.lock 时，
+    新版即使取得身份锁也必须拒绝启动，防止跨版本双实例。"""
+    from datetime import datetime
+    from mt5live.runner import (
+        MagicInstanceLock, magic_lock_key, runner_lock_path,
+    )
+    from tests.fakes_live import (
+        FakeBroker, bars_from_df, boundary_open, grid_bars,
+    )
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "lockshome"))
+    mod = load_live_runner()
+    now = datetime(2026, 10, 30, 10, 0, 7)
+    broker = FakeBroker("XAUUSD")
+    broker.set_bars("XAUUSD", "M15",
+                    bars_from_df(grid_bars(boundary_open(now), last="up")))
+    broker.quote_time = now
+    _wire_fake_gateway(monkeypatch, mod, broker, now)
+
+    cfg = _runner_config(tmp_path)
+    # _runner_config 的 data_root/live 是旧版本锁的固定位置。
+    import tomllib
+    with open(cfg, "rb") as stream:
+        data_root = tomllib.load(stream)["data_root"]
+    legacy_path = Path(data_root) / "live" / "runner-777.lock"
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    old_process_lock = MagicInstanceLock(str(legacy_path))
+    assert old_process_lock.acquire() is True
+    try:
+        rc = mod.main(["--config", cfg, "--gateway-config",
+                       _gw_dummy_config(tmp_path), "--once",
+                       "--no-spread-gate"])
+        assert rc == 3
+        out = capsys.readouterr().out
+        assert "旧版/并行 runner" in out
+        assert broker.market_orders == []
+        # 拒绝启动也必须释放连接前临时锁，避免后续合法重启被永久挡住。
+        retry_lock = MagicInstanceLock(runner_lock_path(magic_lock_key(777)))
+        assert retry_lock.acquire() is True
+        retry_lock.release()
+    finally:
+        old_process_lock.release()
+
+
+def test_runner_startup_trade_mode_check_rejects_non_demo(tmp_path, monkeypatch):
+    """3B/F1：runner 启动时二次确认 trade_mode=0——非 DEMO → rc=3。"""
+    from tests.fakes_live import FakeBroker, bars_from_df, boundary_open, grid_bars
+    from datetime import datetime
+    mod = load_live_runner()
+    now = datetime(2026, 10, 30, 10, 0, 7)
+    broker = FakeBroker("XAUUSD")
+    broker.trade_mode = 2  # real
+    broker.set_bars("XAUUSD", "M15",
+                    bars_from_df(grid_bars(boundary_open(now), last="up")))
+    broker.quote_time = now
+    _wire_fake_gateway(monkeypatch, mod, broker, now)
+    cfg = _runner_config(tmp_path)
+    gw_cfg = _gw_dummy_config(tmp_path)
+    rc = mod.main(["--config", cfg, "--gateway-config", str(gw_cfg),
+                   "--once", "--no-spread-gate"])
+    assert rc == 3
+
+
+def test_runner_startup_trade_mode_unreadable_rejects(tmp_path, monkeypatch):
+    """3B/F1：trade_mode=None → 同样拒绝（fail-closed）。"""
+    from tests.fakes_live import FakeBroker, bars_from_df, boundary_open, grid_bars
+    from datetime import datetime
+    mod = load_live_runner()
+    now = datetime(2026, 10, 30, 10, 0, 7)
+    broker = FakeBroker("XAUUSD")
+    broker.trade_mode = None  # 读不到
+    broker.set_bars("XAUUSD", "M15",
+                    bars_from_df(grid_bars(boundary_open(now), last="up")))
+    broker.quote_time = now
+    _wire_fake_gateway(monkeypatch, mod, broker, now)
+    cfg = _runner_config(tmp_path)
+    gw_cfg = _gw_dummy_config(tmp_path)
+    rc = mod.main(["--config", cfg, "--gateway-config", str(gw_cfg),
+                   "--once", "--no-spread-gate"])
+    assert rc == 3
+
+
+def test_runner_startup_trade_mode_unreadable_rejects(tmp_path, monkeypatch):
+    """3B/F1：trade_mode 读不到（None）→ 同样拒绝（fail-closed）。"""
+    from tests.fakes_live import FakeBroker, bars_from_df, boundary_open,         grid_bars
+    from datetime import datetime
+
+    mod = load_live_runner()
+    now = datetime(2026, 10, 30, 10, 0, 7)
+    broker = FakeBroker("XAUUSD")
+    broker.trade_mode = None
+    broker.set_bars("XAUUSD", "M15",
+                    bars_from_df(grid_bars(boundary_open(now), last="up")))
+    broker.quote_time = now
+    _wire_fake_gateway(monkeypatch, mod, broker, now)
+    cfg = _runner_config(tmp_path)
+    gw_cfg = _gw_dummy_config(tmp_path)
+    rc = mod.main(["--config", cfg, "--gateway-config", str(gw_cfg),
+                   "--once", "--no-spread-gate"])
+    assert rc == 3
+def test_runner_startup_trade_mode_check_rejects_non_demo(tmp_path, monkeypatch):
+    """3B/F1：runner 启动时二次确认 trade_mode=0——非 DEMO → 零下单+rc=3。"""
+    from tests.fakes_live import FakeBroker, bars_from_df, boundary_open,         grid_bars
+    from datetime import datetime
+
+    mod = load_live_runner()
+    now = datetime(2026, 10, 30, 10, 0, 7)
+    broker = FakeBroker("XAUUSD")
+    broker.trade_mode = 2  # real
+    broker.set_bars("XAUUSD", "M15",
+                    bars_from_df(grid_bars(boundary_open(now), last="up")))
+    broker.quote_time = now
+    _wire_fake_gateway(monkeypatch, mod, broker, now)
+    cfg = _runner_config(tmp_path)
+    gw_cfg = _gw_dummy_config(tmp_path)
+    rc = mod.main(["--config", cfg, "--gateway-config", str(gw_cfg),
+                   "--once", "--no-spread-gate"])
+    assert rc == 3
+
+
+def test_runner_startup_trade_mode_unreadable_rejects(tmp_path, monkeypatch):
+    """3B/F1：trade_mode 读不到（None）→ 同样拒绝（fail-closed）。"""
+    from tests.fakes_live import FakeBroker, bars_from_df, boundary_open,         grid_bars
+    from datetime import datetime
+
+    mod = load_live_runner()
+    now = datetime(2026, 10, 30, 10, 0, 7)
+    broker = FakeBroker("XAUUSD")
+    broker.trade_mode = None
+    broker.set_bars("XAUUSD", "M15",
+                    bars_from_df(grid_bars(boundary_open(now), last="up")))
+    broker.quote_time = now
+    _wire_fake_gateway(monkeypatch, mod, broker, now)
+    cfg = _runner_config(tmp_path)
+    gw_cfg = _gw_dummy_config(tmp_path)
+    rc = mod.main(["--config", cfg, "--gateway-config", str(gw_cfg),
+                   "--once", "--no-spread-gate"])
+    assert rc == 3

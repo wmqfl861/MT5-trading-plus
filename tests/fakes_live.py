@@ -110,7 +110,7 @@ class FakeBroker:
         return AccountState(
             login=123456, server="Fake-Server", company="Fake Broker Ltd.",
             currency="USD", leverage=100, balance=self.balance, equity=equity,
-            margin=0.0, margin_free=equity, margin_mode=2, trade_mode=0)
+            margin=0.0, margin_free=equity, margin_mode=2, trade_mode=getattr(self, "trade_mode", 0))
 
     def _next_deal_ticket(self) -> int:
         ticket = 10_000_000 + len(self._deals)

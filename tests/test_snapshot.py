@@ -22,7 +22,7 @@ FullRow = namedtuple(
     "trade_contract_size volume_min volume_max volume_step filling_mode visible "
     "trade_stops_level swap_long swap_short trade_freeze_level "
     "trade_tick_size trade_tick_value trade_calc_mode margin_initial margin_maintenance "
-    "swap_mode swap_rollover3days",
+    "swap_mode swap_rollover3days currency_base",
 )
 # 旧式 row：无新字段（与 fakes.py 时代的 SymRow 同构，证明 getattr 兜底）
 OldRow = namedtuple(
@@ -41,7 +41,7 @@ def full(sym="XAUUSD"):
         trade_stops_level=30, swap_long=-18.4, swap_short=9.2,
         trade_freeze_level=15, trade_tick_size=0.01, trade_tick_value=1.0,
         trade_calc_mode=1, margin_initial=0.005, margin_maintenance=0.0025,
-        swap_mode=1, swap_rollover3days=3,
+        swap_mode=1, swap_rollover3days=3, currency_base="XAU",
     )
 
 
@@ -73,6 +73,7 @@ ALL_PARAM_FIELDS = [
     "tick_size", "tick_value", "trade_calc_mode",
     "margin_initial", "margin_maintenance",
     "swap_mode", "swap_rollover3days",
+    "currency_base",
 ]
 
 
@@ -95,6 +96,17 @@ def test_snapshot_contains_all_contract_param_fields():
     assert "raw" not in entry  # 原始对象不进 JSON
 
 
+def test_snapshot_exports_currency_base_field(tmp_path):
+    """3A（H2-03）：快照导出落盘后 latest.json 的 EURUSD 条目必须含
+    currency_base——mode=2 隔夜费按品种基础货币计，缺字段会被
+    swap.per_lot_per_night 拒绝（旧快照无法启用该校验的根因）。"""
+    eurusd = full("EURUSD")._replace(currency_base="EUR")
+    root = str(tmp_path)
+    latest = save_snapshot(root, take_snapshot(FakeCatalog([eurusd]), ["EURUSD"]))
+    on_disk = load_snapshot(latest)   # 走真实落盘再读回（不是内存 dict）
+    assert on_disk["EURUSD"]["currency_base"] == "EUR"
+
+
 def test_snapshot_old_row_missing_new_fields_falls_back_to_defaults():
     row = OldRow(
         name="EURUSD", description="", digits=5, point=0.00001, spread=12,
@@ -111,6 +123,9 @@ def test_snapshot_old_row_missing_new_fields_falls_back_to_defaults():
     assert e["margin_initial"] == 0.0 and e["margin_maintenance"] == 0.0
     # T5：旧式 row 缺 swap 字段 → getattr 兜底（0=禁用 / 3=MT5 周三）
     assert e["swap_mode"] == 0 and e["swap_rollover3days"] == 3
+    # 3A：旧式 row 缺 currency_base → None 兜底（如实导出"未知"，
+    # swap mode=2 路径据此拒绝——绝不退回 currency_profit 代理）
+    assert e["currency_base"] is None
     assert e["contract_size"] == 100000.0  # 旧字段照常映射
 
 
@@ -163,7 +178,7 @@ def test_spec_to_json_excludes_raw_only_whitelist_scalars():
         "trade_stops_level", "swap_long", "swap_short", "trade_freeze_level",
         "tick_size", "tick_value", "trade_calc_mode",
         "margin_initial", "margin_maintenance", "captured_at_utc",
-        "swap_mode", "swap_rollover3days",
+        "swap_mode", "swap_rollover3days", "currency_base",
     }
     json.dumps(entry)  # 全部可 JSON 化（raw 对象进 JSON 会当场炸）
 
@@ -181,6 +196,17 @@ def test_diff_reports_swap_mode_change():
         FakeCatalog([full()._replace(swap_rollover3days=5)]), ["XAUUSD"])
     assert diff_snapshots(old_snap, new_snap) == [
         SpecChange("swap_rollover3days", "XAUUSD", 3, 5)
+    ]
+
+
+def test_diff_reports_currency_base_change():
+    # 3A（H2-03）：基础币种进白名单即进比对——券商改基础币种（换牌/重构
+    # 品种）必须被 diff 第一时间抓到，不能静默滑过
+    old_snap = take_snapshot(FakeCatalog([full()]), ["XAUUSD"])
+    new_snap = take_snapshot(
+        FakeCatalog([full()._replace(currency_base="USD")]), ["XAUUSD"])
+    assert diff_snapshots(old_snap, new_snap) == [
+        SpecChange("currency_base", "XAUUSD", "XAU", "USD")
     ]
 
 

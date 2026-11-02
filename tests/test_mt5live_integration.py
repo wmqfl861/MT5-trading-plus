@@ -629,7 +629,8 @@ def test_scenario_9_after_signal_change(tmp_path):
     ticket = stack.broker.positions(SYMBOL)[0].ticket
 
     # 止损触发（外部平仓，不经执行器）
-    stack.broker.close_external(ticket, profit=-30.0, comment="[sl]")
+    stack.broker.close_external(ticket, profit=-30.0, comment="[sl]",
+                                time=T1)
 
     # 信号仍为 +1：不重入（blocked_dir 持久化；下单数停在首开那 1 笔）
     _, rr2 = stack.round(T2, "up")
@@ -660,7 +661,8 @@ def test_immediate_reentry_reopens_after_stop(tmp_path):
     stack = LiveStack(tmp_path)                         # 默认 immediate
     _, rr1 = stack.round(T1, "up")
     ticket = stack.broker.positions(SYMBOL)[0].ticket
-    stack.broker.close_external(ticket, profit=-30.0, comment="[sl]")
+    stack.broker.close_external(ticket, profit=-30.0, comment="[sl]",
+                                time=T1)
     _, rr2 = stack.round(T2, "up")
     assert rr2.action == "open"
     assert len(stack.broker.market_orders) == 2
@@ -684,7 +686,7 @@ def _run_protective_exit_case(tmp_path, *, reason: int, comment: str,
         assert rr1.action == "open"
         ticket = stack.broker.positions(SYMBOL)[0].ticket
         stack.broker.close_external(ticket, profit=profit, comment=comment,
-                                    reason=reason)
+                                    reason=reason, time=T1)
 
         # 执行器下一轮开头识别外部出场：reason 已解释 → 意图改为实际净持仓
         _, rr2 = stack.round(T2, "up")
@@ -725,7 +727,7 @@ def test_t30_sl_exit_transient_pause_auto_releases(tmp_path):
     stack.round(T1, "up")
     ticket = stack.broker.positions(SYMBOL)[0].ticket
     stack.broker.close_external(ticket, profit=-30.0, comment="[sl]",
-                                reason=DEAL_REASON_SL)
+                                reason=DEAL_REASON_SL, time=T1)
     # 识别发生前对账：意图（0.16 手）≠ 实际（空仓）→ 只暂停本 magic
     rc, _ = reconcile_all(stack, other, now=T1 + timedelta(seconds=30))
     assert rc == 1
@@ -757,7 +759,7 @@ def test_t30_manual_close_pauses_only_this_magic_until_acked(tmp_path, monkeypat
     assert rr1.action == "open"
     ticket = stack.broker.positions(SYMBOL)[0].ticket
     stack.broker.close_external(ticket, profit=5.0, comment="manual",
-                                reason=DEAL_REASON_CLIENT)
+                                reason=DEAL_REASON_CLIENT, time=T1)
 
     # 对账（30 秒一轮 << bar 间隔）：意图 0.16 vs 实际 0 → 只暂停本 magic
     rc, _ = stack.reconcile_once(now=T2)
@@ -955,7 +957,8 @@ def test_t31_reentry_after_stop_resizes_fresh(tmp_path):
     assert rr1.action == "open"
     ticket = stack.broker.positions(SYMBOL)[0].ticket
     stack.broker.close_external(ticket, profit=-300.0, comment="[sl]",
-                                reason=DEAL_REASON_SL)      # 权益 → 9700
+                                reason=DEAL_REASON_SL,      # 权益 → 9700
+                                time=T1)
     d2, rr2 = stack.round(T2, "up", tr=3.0)                 # 重入（ATR 3.0）
     assert rr2.action == "open"
     fresh = lots_for_risk(9_700.0, 0.005, d2.sl_atr * d2.atr,
@@ -1389,8 +1392,12 @@ def test_live_runner_refuses_start_without_spread_model(tmp_path, monkeypatch,
 def test_live_runner_no_spread_gate_flag_warns_red_and_proceeds(tmp_path,
                                                                 monkeypatch,
                                                                 capsys):
-    """--no-spread-gate：启动检查放行（走到网关装配）、启动日志标红警示。"""
+    """--no-spread-gate：启动检查放行（走到网关装配）、启动日志标红警示。
+
+    H2-01/1C：实跑的临时/身份锁落 OS 状态目录——测试沙箱化 LOCALAPPDATA，
+    不与本机其他 pytest 会话/真实运行器互撞。"""
     mod = load_script("live_runner")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "lockshome"))
 
     class _Sentinel(Exception):
         pass
@@ -1784,7 +1791,7 @@ def test_r6_manual_close_executor_before_reconcile_no_reopen(tmp_path,
     assert rr1.action == "open"
     ticket = stack.broker.positions(SYMBOL)[0].ticket
     stack.broker.close_external(ticket, profit=5.0, comment="manual",
-                                reason=DEAL_REASON_CLIENT)
+                                reason=DEAL_REASON_CLIENT, time=T1)
 
     # 执行器先跑（对账还没写 pause）：未解释出场 → 不重开
     _, rr2 = stack.round(T2, "up")
@@ -1824,7 +1831,7 @@ def test_r6_deal_history_delayed_two_rounds_then_explained_recovers(tmp_path):
     assert rr1.action == "open"
     ticket = stack.broker.positions(SYMBOL)[0].ticket
     stack.broker.close_external(ticket, profit=-30.0, comment="[sl]",
-                                reason=DEAL_REASON_SL)
+                                reason=DEAL_REASON_SL, time=T1)
 
     # 第 1 轮：查无成交 → 未决持久化 + 告警；immediate 也不重开
     _, rr2 = stack.round(T2, "up")
@@ -1898,20 +1905,21 @@ def test_r7_nc1_stale_ack_cannot_release_new_exit_full_chain(tmp_path,
     assert rr1.action == "open"
     ticket = stack.broker.positions(SYMBOL)[0].ticket
 
-    # 人工减仓至 0.08（ticket 仍在 → 不是出场事件）→ 无订单轮（hold）
+    # 人工减仓至 0.08（R4 起量变也是待解释事件；hold 轮不挡，先观察到）
     stack.broker.reduce_external(ticket, 0.08, profit=2.0, comment="manual",
-                                 reason=DEAL_REASON_CLIENT)
+                                 reason=DEAL_REASON_CLIENT, time=T1)
     _, rr_hold = stack.round(T2, "up")
     assert rr_hold.action == "hold"
     assert len(stack.broker.market_orders) == 1
 
-    # 人工确认（真脚本）：绑定此刻的未决出场（空集）+ 净仓快照 0.08
+    # 人工确认（真脚本）：绑定此刻的未决出场（R4 起人工减量也是事件）
+    # + 净仓快照 0.08
     ack = load_script("live_ack_external")
     rc = _ack_via_script(ack, monkeypatch, stack, now=T2 + timedelta(minutes=2),
                          reason="人工减仓已核对")
     assert rc == 0
     ev = intent_of(stack.live_dir)["confirmed_events"]
-    assert ev["tickets"] == []                          # 无未决事件可绑定
+    assert ev["tickets"] == [ticket]   # R4：人工减量（量变）已入未决
     assert ev["net_volume"] == pytest.approx(0.08)      # 确认时净仓快照
     assert ev["positions"][0]["ticket"] == ticket
 
@@ -1922,7 +1930,7 @@ def test_r7_nc1_stale_ack_cannot_release_new_exit_full_chain(tmp_path,
 
     # 再次人工平掉余仓 → 执行器先于对账运行：新出场事件不被旧确认放行
     stack.broker.close_external(ticket, profit=1.0, comment="manual",
-                                reason=DEAL_REASON_CLIENT)
+                                reason=DEAL_REASON_CLIENT, time=T3)
     _, rr = stack.round(T4, "up")
     assert rr.action == "blocked_external_exit"         # 旧实现：open（基线）
     assert len(stack.broker.market_orders) == 1         # 没有重开 0.16

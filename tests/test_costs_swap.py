@@ -650,3 +650,131 @@ def test_h23_symbol_mode_missing_base_currency_rejected():
     with pytest.raises(NotImplementedError, match="currency_base"):
         per_lot_per_night(_snap_entry(
             swap_mode=SWAP_MODE_CURRENCY_SYMBOL, currency_profit="USD"))
+
+
+# ---- 3A（H2-03，基石阶段 3）：快照 → build_costs 集成 ----
+#
+# 审计 H2-03 的残留：swap.py 的 mode=2 基础币种校验此前"够不到"正式
+# 快照——mt5gw 的 SymbolSpec / snapshot 白名单 / symbols row 映射根本
+# 不导出 currency_base，正常抓取的 data/specs/latest.json 永远缺字段，
+# 上面的校验只对手工构造的条目生效。本节走**全链路**：
+#   MT5 symbol row → _to_spec → take_snapshot → save_snapshot
+#   （{root}/specs/latest.json 落盘）→ scripts/run_backtest.py
+#   build_costs → SwapModel.from_snapshot → per_lot_per_night
+
+import importlib.util  # noqa: E402
+from collections import namedtuple  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from mt5gw.snapshot import load_snapshot, save_snapshot, take_snapshot  # noqa: E402
+from mt5gw.symbols import _to_spec  # noqa: E402
+
+GwRow = namedtuple(
+    "GwRow",
+    "name description digits point spread trade_mode currency_profit currency_margin "
+    "trade_contract_size volume_min volume_max volume_step filling_mode visible "
+    "trade_stops_level swap_long swap_short trade_freeze_level "
+    "trade_tick_size trade_tick_value trade_calc_mode margin_initial margin_maintenance "
+    "swap_mode swap_rollover3days currency_base",
+)
+
+
+def _mode2_row(name="EURUSD", *, currency_base="EUR", currency_profit="USD",
+               currency_margin="USD", swap_long=-2.5, swap_short=1.0):
+    """mode=2（品种货币=基础货币计）的全字段 MT5 symbol row。"""
+    return GwRow(
+        name=name, description="", digits=5, point=0.00001, spread=12,
+        trade_mode=4, currency_profit=currency_profit,
+        currency_margin=currency_margin, trade_contract_size=100000.0,
+        volume_min=0.01, volume_max=100.0, volume_step=0.01, filling_mode=1,
+        visible=True, trade_stops_level=0, swap_long=swap_long,
+        swap_short=swap_short, trade_freeze_level=0, trade_tick_size=0.00001,
+        trade_tick_value=1.0, trade_calc_mode=1, margin_initial=0.0,
+        margin_maintenance=0.0, swap_mode=SWAP_MODE_CURRENCY_SYMBOL,
+        swap_rollover3days=3, currency_base=currency_base,
+    )
+
+
+class _SingleCatalog:
+    """最小 SymbolCatalog 替身：get 走真实 _to_spec（row→Spec 映射一并覆盖）。"""
+
+    def __init__(self, row):
+        self._row = row
+
+    def get(self, name):
+        assert name == self._row.name
+        return _to_spec(self._row)
+
+
+def _write_ticks(root, symbol):
+    """单小时 tick（2026-10-19 12:00 UTC = 纽约 8 点，EDT）——build_costs
+    需有 tick 才会走到快照推算隔夜费的分支（无 tick 会先退零成本）。"""
+    import numpy as np
+    import pandas as pd
+    from mt5data.ticks import save_ticks
+
+    save_ticks(str(root), symbol, pd.DataFrame({
+        "time_msc": np.asarray(
+            [pd.Timestamp(f"2026-10-19 12:{m:02d}:00").value // 10**6
+             for m in (0, 10, 20, 30, 40, 50)], dtype="int64"),
+        "bid": [1.1] * 6,
+        "ask": [1.1002] * 6,
+        "last": [1.1001] * 6,
+        "volume": [0.0] * 6,
+        "flags": [2] * 6,
+    }))
+
+
+def _load_backtest_script():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "run_backtest.py"
+    spec = importlib.util.spec_from_file_location(
+        "run_backtest_script_swap_integration", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_snapshot_to_build_costs_mode2_base_eur_rejected(tmp_path):
+    """正式快照含 currency_base：EURUSD（base=EUR，账户 USD）mode=2 →
+    build_costs 在快照推算路径上正确拒绝（EUR ≠ USD 不猜汇率）。"""
+    root = tmp_path / "data"
+    _write_ticks(root, "EURUSD")
+    latest = save_snapshot(
+        str(root), take_snapshot(_SingleCatalog(_mode2_row()), ["EURUSD"]))
+    assert load_snapshot(latest)["EURUSD"]["currency_base"] == "EUR"  # 落盘核对
+    mod = _load_backtest_script()
+    with pytest.raises(ValueError, match="基础货币 EUR"):
+        mod.build_costs(str(root), "EURUSD", 0.1)
+
+
+def test_snapshot_to_build_costs_mode2_old_snapshot_without_base_rejected(tmp_path):
+    """旧快照（latest.json 无 currency_base 键）mode=2 → 同样拒绝：
+    基础币种未知即 fail-fast，绝不用 currency_profit 代算。"""
+    root = tmp_path / "data"
+    _write_ticks(root, "EURUSD")
+    snap = take_snapshot(_SingleCatalog(_mode2_row()), ["EURUSD"])
+    del snap["EURUSD"]["currency_base"]   # 模拟 3A 之前抓的旧快照（键不存在）
+    save_snapshot(str(root), snap)
+    mod = _load_backtest_script()
+    with pytest.raises(ValueError, match="currency_base"):
+        mod.build_costs(str(root), "EURUSD", 0.1)
+
+
+def test_snapshot_to_build_costs_mode2_base_usd_accepted(tmp_path):
+    """currency_base=USD（= 账户货币）mode=2 → 接受：金额确为 USD，
+    快照推算 SwapRule 生效，端到端隔夜费可手算复核。"""
+    root = tmp_path / "data"
+    _write_ticks(root, "USDJPY")
+    row = _mode2_row(name="USDJPY", currency_base="USD", currency_profit="JPY")
+    save_snapshot(str(root), take_snapshot(_SingleCatalog(row), ["USDJPY"]))
+    mod = _load_backtest_script()
+    costs, ver = mod.build_costs(str(root), "USDJPY", 0.1)
+    assert "swap-snapshot" in ver          # 走的是快照推算路径（非零回退）
+    r = costs.swap.rule("USDJPY")
+    assert r.long_per_day == pytest.approx(-2.5)   # mode=2：swap 即每手金额
+    assert r.short_per_day == pytest.approx(1.0)
+    # 端到端：周三夜（rollover=3 → py 周三×3）多头 = -|3 × -2.5| = -7.5
+    assert costs.swap.overnight_fee(
+        "USDJPY", "long",
+        D(2026, 10, 21, 20, 0), D(2026, 10, 22, 20, 59),
+    ) == pytest.approx(-7.5)
