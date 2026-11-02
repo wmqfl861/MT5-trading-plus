@@ -1,6 +1,8 @@
 # C002 月末对冲调仓（USTEC 当月涨跌 → EURUSD，月末定盘前）——蓝图 v4 §6.6
 # 首批候选之二（T68，2026-10-28 登记）。只写材料、不跑数据（附录 C）。
 # 信号品种 USTEC（只出信号不下单），交易品种 EURUSD（symbols 为成交品种）。
+# D58/T113 更正：R1 检验无效，待 R2 新版本重检；原 screened_pass 仅记录历史预筛，
+# 不是研究结论。run 449/450 保留并照常计入 N，R1 保持关闭；新轮次仍须独立批准。
 id = "C002"
 title = "月末对冲调仓（USTEC 当月涨跌 → EURUSD，伦敦定盘前）"
 mechanism_class = "cross_asset"
