@@ -162,14 +162,20 @@ powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1 -Stop
    `data\live\paper\state-*.json` 存在且非空；
 2. 点差比对报 `model_sha256` 不一致 → 重跑 `scripts/build_cost_model.py`
    重建 `data\costs/spread_model.json`（日报拒绝用被动过的模型）；
-3. 手动补跑（保持已生成 `scripts/task_live_daily_report.cmd` 中的模式和配置路径；首次生成前使用与安装器相同的配置选择顺序）：
+3. 手动补跑（保持已生成 `scripts/task_live_daily_report.cmd` 中的模式和配置路径；首次生成前使用与安装器相同的配置选择顺序）。Demo：
 ```powershell
 $gwConfig = @("config.json", "gateway.json") | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $gwConfig) { throw "缺少 Demo 网关配置" }
 .venv/Scripts/python.exe scripts/live_daily_report.py --date 2026-11-10 `
     --demo --gw-config $gwConfig `
     --spread-model data\costs\spread_model.json --log-dir data\demo
-# PaperSoak 仅将 --demo --gw-config ... 换成 --paper-state data\live\paper。
+```
+
+PaperSoak 离线补跑不需要网关配置，直接使用影子状态：
+```powershell
+.venv/Scripts/python.exe scripts/live_daily_report.py --date 2026-11-10 `
+    --paper-state data\live\paper `
+    --spread-model data\costs\spread_model.json --log-dir data\demo
 ```
 
 ## 4. 结束与最终验收（第 10 个交易日后；Demo 模式）
