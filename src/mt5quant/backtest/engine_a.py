@@ -469,6 +469,12 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
     ruined = False
     ruined_at: pd.Timestamp | None = None
 
+    from mt5quant.costs import source_costs
+    source_tags = bars.get("_research_source")
+
+    def _bar_costs(j):
+        return source_costs(costs, source_tags.iloc[j] if source_tags is not None else None)
+
     def _close(j: int, base_price: float, reason: str) -> None:
         """平仓。base_price 为 bid 口径基准价（空头出场另加 spr 变成 Ask）。
 
@@ -478,7 +484,7 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
         """
         nonlocal state, realized, blocked_dir
         assert state is not None
-        spr = costs.spread_p90(symbol, int(ny_hours[j]), price=base_price)
+        spr = _bar_costs(j).spread_p90(symbol, int(ny_hours[j]), price=base_price)
         slip = costs.slippage(symbol, int(ny_hours[j]), price=base_price)
         if state["dir"] == 1:
             exit_price = base_price - slip
@@ -552,7 +558,7 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
                 return
         else:
             lots = volume_lots
-        spr = costs.spread_p90(symbol, int(ny_hours[j]), price=opens[j])
+        spr = _bar_costs(j).spread_p90(symbol, int(ny_hours[j]), price=opens[j])
         slip = costs.slippage(symbol, int(ny_hours[j]), price=opens[j])
         base = opens[j]
         if desired == 1:
@@ -605,17 +611,17 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
                 _close(j, tp, "take_profit")
             return
         if gap_check and (sl is not None or tp is not None):
-            spr_open = costs.spread_p90(symbol, int(ny_hours[j]), price=opens[j])
+            spr_open = _bar_costs(j).spread_p90(symbol, int(ny_hours[j]), price=opens[j])
             if sl is not None and opens[j] + spr_open >= sl:
                 _close(j, opens[j], "stop_gap")          # exit = open + spr + slip
             elif tp is not None and opens[j] + spr_open <= tp:
                 _close(j, tp - spr_open, "take_profit_gap")  # exit = tp + slip
         if state is not None and sl is not None:
-            spr_high = costs.spread_p90(symbol, int(ny_hours[j]), price=highs[j])
+            spr_high = _bar_costs(j).spread_p90(symbol, int(ny_hours[j]), price=highs[j])
             if highs[j] + spr_high >= sl:
                 _close(j, sl - spr_high, "stop")         # exit = sl + slip
         if state is not None and tp is not None:
-            spr_low = costs.spread_p90(symbol, int(ny_hours[j]), price=lows[j])
+            spr_low = _bar_costs(j).spread_p90(symbol, int(ny_hours[j]), price=lows[j])
             if lows[j] + spr_low <= tp:
                 _close(j, tp - spr_low, "take_profit")   # exit = tp + slip
 
@@ -648,7 +654,7 @@ def run_backtest(strategy, bars: pd.DataFrame, costs, *, symbol: str, params: di
         if state is not None:
             mark = closes[j]
             if state["dir"] == -1:
-                mark = closes[j] + costs.spread_p90(symbol, int(ny_hours[j]),
+                mark = closes[j] + _bar_costs(j).spread_p90(symbol, int(ny_hours[j]),
                                                     price=closes[j])
             unreal = (mark - state["entry_price"]) * state["dir"] * state["lots"] * cs
         equity_vals[j] = initial_capital + realized + unreal

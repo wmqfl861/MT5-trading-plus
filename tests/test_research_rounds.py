@@ -88,7 +88,17 @@ CARD_IN_ROUND = CARD_BODY.replace(
     'id = "H100"\nround = "R1"\ncandidate = "C001"\n')
 
 
-def write_round(tmp_path, body=ROUND_TOML, name="R1.toml"):
+def write_round(tmp_path, body=ROUND_TOML, name="R1.toml", *, historical=False):
+    if not historical:
+        body = body.replace('mode = "event", primary', 'mode = "event", side_rule = "static_long", primary')
+        from tests.test_research_candidates import CANDIDATE_TOML
+        import tomllib
+        candidates_dir = tmp_path / "candidates"
+        candidates_dir.mkdir(exist_ok=True)
+        for cid in tomllib.loads(body)["candidates"]:
+            path = candidates_dir / f"{cid}.toml"
+            if not path.exists():
+                path.write_text(CANDIDATE_TOML.replace("C001", cid).replace("TESTUSD", "XAUUSD").replace('holding = "D1"', 'holding = "H1"') + '\nside_rule = "static_long"\n', encoding="utf8")
     d = tmp_path / "rounds"
     d.mkdir(exist_ok=True)
     p = d / name
@@ -128,7 +138,7 @@ def patch_strategy_fp(monkeypatch, mod, sha="f" * 64):
 
 
 def h1_bars(n=6):
-    times = pd.date_range("2026-01-05 10:00", periods=n, freq="h")
+    times = pd.date_range("2026-01-30 12:00", periods=n, freq="h")
     closes = [100.0, 100.0, 101.0, 102.0, 103.0, 104.0][:n]
     # H-13：high/low 随 close 抬高（旧固定 100.5 在 close>100.5 后非法）
     opens = [100.0] * n
@@ -144,6 +154,12 @@ def make_data_root(root, *, n=6):
     sdir = root / "bars" / "XAUUSD" / "H1"
     sdir.mkdir(parents=True, exist_ok=True)
     h1_bars(n).to_parquet(sdir / "data.parquet")
+    caldir = root / "calendars"
+    caldir.mkdir(exist_ok=True)
+    days = pd.bdate_range("2026-01-01", "2026-01-31")
+    (caldir / "XAUUSD.json").write_text(json.dumps({
+        "version": 1, "complete_through": "2026-01-31", "source": "synthetic schedule",
+        "sessions": [{"day": str(d.date()), "close_time": str(d + pd.Timedelta(hours=22))} for d in days]}), encoding="utf8")
     specs = root / "specs"
     specs.mkdir(parents=True, exist_ok=True)
     specs.joinpath("latest.json").write_text(
@@ -158,7 +174,9 @@ def record_check(ledger, cid, decision, *, at=None):
     return ledger.record_candidate_check(
         cid, decision=decision,
         result={"candidate_id": cid, "decision": decision, "at":
-                (at or NOW).isoformat()})
+                (at or NOW).isoformat(), "checks": {"power": {
+                    "years": 5 / (24 * 365.25),
+                    "years_detail": {"XAUUSD/H1": 5 / (24 * 365.25)}}}})
 
 
 def open_round(mod, tmp_path, ledger_path, monkeypatch, *, body=ROUND_TOML,
@@ -176,7 +194,7 @@ def open_round(mod, tmp_path, ledger_path, monkeypatch, *, body=ROUND_TOML,
 # ------------------------------------------------------- 装载器（附录 D）
 
 def test_load_round_valid(tmp_path):
-    d = write_round(tmp_path)
+    d = write_round(tmp_path, historical=True)
     r = load_round(d / "R1.toml")
     assert r.id == "R1"
     assert r.candidates == ("C001",)
@@ -364,7 +382,7 @@ def run_screen(mod, cards_dir, root, ledger_path, *, card="H100"):
          "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
-         "--costs", "zero", "--volume-lots", "0.01"])
+         "--costs", "zero", "--volume-lots", "0.01", "--event-kind", "london_fix"])
 
 
 def test_screen_rejects_card_in_unopened_round(tmp_path, monkeypatch, capsys):
@@ -867,7 +885,8 @@ def test_h08_candidate_modified_after_pass_requires_recheck(tmp_path,
     cdir = tmp_path / "candidates"
     cdir.mkdir()
     cpath = cdir / "C001.toml"
-    body = 'id = "C001"\ntitle = "月末效应"\n'
+    from tests.test_research_candidates import CANDIDATE_TOML
+    body = CANDIDATE_TOML.replace("TESTUSD", "XAUUSD").replace('holding = "D1"', 'holding = "H1"') + '\nside_rule = "static_long"\n'
     cpath.write_text(body, encoding="utf-8")
     ledger_path = tmp_path / "ledger.sqlite"
     rdir = write_round(tmp_path)
@@ -875,7 +894,9 @@ def test_h08_candidate_modified_after_pass_requires_recheck(tmp_path,
         led.record_candidate_check("C001", decision="pass", result={
             "candidate_id": "C001", "decision": "pass",
             "candidate_sha256": hashlib.sha256(
-                cpath.read_bytes()).hexdigest()})
+                cpath.read_bytes()).hexdigest(),
+            "checks": {"power": {"years": 5 / (24 * 365.25),
+                       "years_detail": {"XAUUSD/H1": 5 / (24 * 365.25)}}}})
     patch_git(monkeypatch, mod)
     assert mod.main(["round", "open", "R1", "--rounds-dir", str(rdir),
                      "--ledger", str(ledger_path)]) == 0
@@ -894,7 +915,9 @@ def test_h08_candidate_modified_after_pass_requires_recheck(tmp_path,
         led.record_candidate_check("C001", decision="pass", result={
             "candidate_id": "C001", "decision": "pass",
             "candidate_sha256": hashlib.sha256(
-                cpath.read_bytes()).hexdigest()})
+                cpath.read_bytes()).hexdigest(),
+            "checks": {"power": {"years": 5 / (24 * 365.25),
+                       "years_detail": {"XAUUSD/H1": 5 / (24 * 365.25)}}}})
     rc = run_screen(mod, cards_dir, root, ledger_path)
     assert rc == 0, capsys.readouterr().out
 

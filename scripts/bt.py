@@ -923,6 +923,20 @@ def cmd_round_open(args) -> int:
                   "全部候选必须最新预筛 decision=pass（bt candidate check）"
                   "才可开启（T62/D31 + T63/D32）")
             return 1
+        # T112: historical parsing stays permissive; opening new H event rounds
+        # requires matching declarations before any round row is written.
+        for cid, evaluation in r.evaluation.items():
+            if evaluation.get("mode") != "event":
+                continue
+            try:
+                registered = cand.load_candidate(
+                    Path(args.rounds_dir).parent / "candidates" / f"{cid}.toml")
+                rule = getattr(registered.declared, "side_rule", None)
+                if rule is None or evaluation.get("side_rule") != rule:
+                    raise ValueError(f"{cid}: candidate/evaluation side_rule must be declared and match")
+            except (ValueError, OSError) as exc:
+                print(f"✗ {exc}")
+                return 1
         # P 线小改（审核三）：[hypotheses] 与候选登记的假设交叉校验——
         # 轮次列出的每条假设都必须在候选登记的假设里（预筛/候选侧的
         # 预先声明是假设族的上界；先卡后测，轮次不得引入候选没登记的
@@ -1516,18 +1530,21 @@ def _v3_gate_evaluate(ledger, card, *, cfg, ctx, cards_dir, strategy, spec,
     if ctx.get("mode") == "event":
         from mt5quant.validation import events as vevents
         kind = ctx["kind"]
-        side = ctx["side"]
         draws = int(ctx["sims"])
         draws_min = int(ctx["draws_min"])
-        days = pd.DatetimeIndex(sorted(set(
-            pd.to_datetime(bars["time"]).dt.normalize())))
-        if kind == "month_end":
-            events = vevents.month_end_events(days)
-        else:                      # london_fix：月末定盘锚（与 T66 同构）
-            anchors = vevents.month_end_events(days, last_n=1, first_n=1)
-            events = vevents.london_fix_events(
-                pd.DatetimeIndex([e.entry_time for e in anchors]))
-        side_fn = (lambda event: side)          # noqa: E731
+        if ctx.get("event_setup") is not None:
+            events, days, side_fn = ctx["event_setup"]
+        else:
+            # Nonresearch/calibration compatibility only; H research always
+            # supplies an explicit calendar and the declared callback above.
+            days = pd.DatetimeIndex(sorted(set(pd.to_datetime(bars["time"]).dt.normalize())))
+            if kind == "month_end":
+                events = vevents.month_end_events(days)
+            else:
+                anchors = vevents.month_end_events(days, last_n=1, first_n=1)
+                events = vevents.london_fix_events(pd.DatetimeIndex([e.entry_time for e in anchors]))
+            side_fn = lambda event: ctx.get("side") or "long"
+        rule_name = ctx.get("side_rule", f"static_{ctx.get('side') or 'long'}")
         threshold = float(cfg.alpha) / max(1, n_raw)
         rat = vevents.randomization_test(
             bars, events, side_fn=side_fn, costs=costs, symbol=symbol,
@@ -1541,7 +1558,7 @@ def _v3_gate_evaluate(ledger, card, *, cfg, ctx, cards_dir, strategy, spec,
             "n_events": int(rat["n_events"]),
             "observed_mean": float(rat["observed_mean"]),
             "null_mean": float(rat["null_mean"]),
-            "event_kind": kind, "event_side": side,
+            "event_kind": kind, "event_side": rule_name, "side_rule": rule_name,
             "note": "随机化参照（D35 修改 1）；N 口径同 [v3] 主检验"
                     "（rounds_lineage），不吃 n_min",
         }
@@ -3605,6 +3622,195 @@ def cmd_fit(args) -> int:
     return 0
 
 
+def _h_declared(ledger, card, *, actor, event_side=None):
+    """H research declaration, checked before baseline/fitting/permutation."""
+    if actor == "calibration" or getattr(card, "prob", None) or not card.candidate:
+        return None
+    candidate = cand.load_candidate(Path(card.path).parent.parent / "candidates" / f"{card.candidate}.toml")
+    declared = candidate.declared
+    evaluation = json.loads(ledger.round(card.round)["evaluation_json"]).get(card.candidate, {})
+    if evaluation.get("mode") == "event":
+        rule = getattr(declared, "side_rule", None)
+        if rule is None or evaluation.get("side_rule") != rule:
+            raise ValueError("candidate/evaluation side_rule missing or mismatched; historical rounds remain readable")
+    if event_side is not None:
+        if declared is None or declared.side_rule != f"static_{event_side}":
+            raise ValueError("--event-side conflicts with declared side_rule; static override requires matching static declaration")
+    return declared
+
+
+def _load_h_research_inputs(ledger, card, *, candidate_id, declared, data_root,
+                            end, allow_unbounded, load_plain, load_merged):
+    """T112 H input assembly; X03 merged four-result contract stays intact."""
+    from mt5quant.costs import SOURCE_COST_POLICY
+    from mt5quant.validation import events as vevents
+    rows = ledger.candidate_checks(candidate_id)
+    if not rows:
+        raise ValueError("runtime coverage requires latest ledger precheck")
+    pre = json.loads(rows[-1]["result_json"])
+    power_check = (pre.get("checks") or {}).get("power") or {}
+    expected = power_check.get("years_detail") or {}
+    segments = power_check.get("coverage_segments") or {}
+    use_merged = any(s.get("counted") and s.get("source") != "mt5"
+                     for group in segments.values() for s in group)
+    ctx = {"bars": {}, "signals": {}, "coverage": {}, "calendars": {},
+           "declared": declared, "merged": use_merged, "gaps": {}}
+    cache = {}
+
+    def load_calendar(symbol):
+        if symbol not in ctx["calendars"]:
+            path = Path(data_root) / "calendars" / f"{symbol}.json"
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                vevents.trading_calendar(raw)
+            except (ValueError, OSError) as exc:
+                raise ValueError(f"explicit trading calendar required for {symbol}: {exc}") from exc
+            ctx["calendars"][symbol] = raw
+        return ctx["calendars"][symbol]
+
+    def load(symbol, tf):
+        key = f"{symbol}/{tf}"
+        if key in cache:
+            return cache[key]
+        if use_merged:
+            bars, tags, gaps, bad_months = load_merged(
+                data_root, symbol, tf, end=end, allow_unbounded=allow_unbounded)
+        else:
+            bars = load_plain(data_root, symbol, tf, end, allow_unbounded=allow_unbounded)
+            tags, gaps, bad_months = ["mt5"] * len(bars), [], []
+        if bars is None or not len(bars):
+            raise ValueError(f"signal/trade input unavailable: {key}")
+        actual = cand.runtime_coverage(bars, tags, gap_spans=gaps)
+        baseline = expected.get(key, power_check.get("years"))
+        if baseline is None:
+            raise ValueError(f"runtime coverage {key}: latest ledger precheck lacks years")
+        cand.require_runtime_coverage(actual, baseline, key)
+        actual.update(precheck_years=float(baseline), bad_months=list(bad_months),
+                      gaps=[[str(a), str(b)] for a, b in gaps])
+        ctx["coverage"][key] = actual
+        ctx["gaps"][key] = list(gaps)
+        bars = bars.copy()
+        bars["_research_source"] = list(tags)
+        cache[key] = bars
+        return bars
+
+    for symbol in card.symbols:
+        bars = load(symbol, card.timeframe).copy()
+        signal_symbol = declared.signal_symbol or symbol
+        signal_tf = declared.signal_timeframe or card.timeframe
+        signal = load(signal_symbol, signal_tf).copy()
+        calendars = {}
+        if declared.side_rule == "mtd_sign":
+            calendars = {s: load_calendar(s) for s in (symbol, signal_symbol)}
+            # Close-only external D1 inputs require a known session close, not
+            # a fabricated 24h bar interval or an H1 proxy.
+            signal["close_time"] = vevents.signal_close_times(
+                signal, signal_tf, calendars[signal_symbol])
+        identity = {"version": "h-input-v1", "signal_symbol": signal_symbol,
+                    "signal_timeframe": signal_tf, "signal_sha256": data_sha256(signal),
+                    "side_rule": declared.side_rule, "window_version": vevents.WINDOW_VERSION,
+                    "source_cost_policy": SOURCE_COST_POLICY, "calendars": calendars}
+        if declared.side_rule in ("static_long", "static_short"):
+            # Explicit event calendars are also required for static H research.
+            path = Path(data_root) / "calendars" / f"{symbol}.json"
+            if path.exists():
+                identity["calendars"] = {symbol: load_calendar(symbol)}
+        ctx["timeframe"] = card.timeframe
+        bars.attrs["research_input"] = identity
+        ctx["bars"][symbol], ctx["signals"][symbol] = bars, signal
+    return ctx
+
+
+def _bind_h_strategy(strategy, ctx, symbol):
+    if ctx is not None and getattr(strategy, "auxiliary_signal_required", False):
+        declared = ctx["declared"]
+        signal_symbol = declared.signal_symbol or symbol
+        required_rule = getattr(strategy, "side_rule", None)
+        required_signal = getattr(strategy, "signal_symbol", None)
+        if required_rule and declared.side_rule != required_rule:
+            raise ValueError("declared side_rule conflicts with strategy rule")
+        if signal_symbol == symbol or (required_signal and signal_symbol != required_signal):
+            raise ValueError("cross-symbol strategy requires its declared signal_symbol; no implicit trade proxy")
+        strategy.signal_bars = ctx["signals"][symbol]
+        strategy.signal_timeframe = declared.signal_timeframe or strategy.required_data.timeframe
+        strategy.signal_calendar = ctx["calendars"].get(signal_symbol)
+        strategy.event_calendar = ctx["calendars"].get(symbol)
+    if getattr(strategy, "auxiliary_signal_required", False) and getattr(strategy, "signal_bars", None) is None:
+        raise ValueError("cross-symbol signal input required before research baseline")
+    return strategy
+
+
+def _h_event_setup(ctx, symbol, bars, kind, params):
+    from mt5quant.validation import events as vevents
+    declared = ctx["declared"]
+    signal_symbol = declared.signal_symbol or symbol
+    raw = ctx["calendars"].get(symbol)
+    if raw is None:
+        raise ValueError("event research requires explicit trading calendar")
+    cal = vevents.trading_calendar(raw)
+    days = pd.DatetimeIndex(cal.day)
+    if kind == "month_end":
+        events = vevents.month_end_events(days)
+    else:
+        last = [g.day.iloc[-1] for _, g in cal.groupby(cal.day.dt.to_period("M"))
+                if g.day.iloc[0].to_period("M").end_time.normalize() <= cal.attrs["complete_through"]]
+        events = vevents.london_fix_events(pd.DatetimeIndex(last))
+    times = pd.DatetimeIndex(bars.time)
+    events = [e for e in events if times[0] <= e.entry_time and e.exit_time <= times[-1]]
+    side_fn = vevents.declared_event_side(
+        declared.side_rule, signal_bars=ctx["signals"][symbol],
+        signal_timeframe=declared.signal_timeframe or ctx["timeframe"],
+        calendar=ctx["calendars"].get(signal_symbol), threshold=params.get("threshold_pct", 0.0))
+    usable = 0
+    for event in events:
+        if event.entry_time not in times or event.exit_time not in times:
+            raise ValueError(f"event coverage unavailable: exact trade window {event.label}")
+        if declared.side_rule == "mtd_sign":
+            side_fn.anchor_indices(event.entry_time)  # timestamp-only, before calculations
+        usable += 1
+    if not usable:
+        raise ValueError("event coverage unavailable: no usable events")
+    ctx.setdefault("usable_events", {})[symbol] = usable
+    signal_key = f"{signal_symbol}/{declared.signal_timeframe or ctx['timeframe']}"
+    if signal_key in ctx.get("coverage", {}):
+        ctx["coverage"][signal_key]["signal_events_available"] = usable
+    # Scheduled future sessions remain in the anchor calendar, but the frozen
+    # randomizer receives only calendar days with observed trade timestamps.
+    days = days.intersection(times.normalize().unique())
+    return events, days, side_fn
+
+
+def _h_preflight(ctx, strategy, card, *, event_kind=None):
+    """Check all event windows and auxiliary anchors before any calculation."""
+    if ctx is None:
+        return
+    native_kind = getattr(strategy, "event_kind", None)
+    if event_kind is not None and native_kind is not None and event_kind != native_kind:
+        raise ValueError("--event-kind conflicts with the strategy event window")
+    kind = event_kind or native_kind
+    is_event = _round_eval_mode(card) == "event"
+    if is_event and kind is None:
+        raise ValueError("event research requires --event-kind before screen/gate baseline")
+    if not is_event and native_kind is None:
+        return
+    for symbol, bars in ctx["bars"].items():
+        _bind_h_strategy(strategy, ctx, symbol)
+        _h_event_setup(ctx, symbol, bars, kind, {})  # availability uses timestamps only
+
+
+def _h_coverage_report(ctx):
+    lines = ["\n## 运行时覆盖（过滤后）\n",
+             "| 输入 | 实际年数 | 台账预筛年数 | 来源 | 剔除月 |",
+             "| --- | ---: | ---: | --- | --- |"]
+    for key, actual in ctx["coverage"].items():
+        sources = sorted({s["source"] for s in actual["segments"]})
+        lines.append(f"| {key} | {actual['years']:.6f} | {actual['precheck_years']:.6f} | {', '.join(sources)} | {', '.join(actual['bad_months']) or '—'} |")
+        for a, b in actual["gaps"]:
+            lines.append(f"\n- {key} merged gap：{a} → {b}")
+    lines.append(f"\n- 可用事件：{ctx.get('usable_events', {})}（逐事件时间窗与信号锚点已核对）\n")
+    return "\n".join(lines)
+
+
 def cmd_screen(args) -> int:
     if _reject_ops_ack(args):                 # R6/C6：研究命令拒绝运维豁免
         return 1
@@ -3688,11 +3894,23 @@ def cmd_screen(args) -> int:
                                for sym in card.symbols}
             else:
                 vols_by_sym = None
-            bars_by_sym = {sym: load_series(data_root, sym,
-                                            card.timeframe, args.end,
-                                            allow_unbounded=(
-                                                _allow_unbounded(args)))
-                           for sym in card.symbols}
+            h_declared = _h_declared(ledger, card, actor=actor,
+                                      event_side=getattr(args, "event_side", None))
+            h_ctx = None
+            if h_declared is not None:
+                from mt5data.ext.merge import merged_research_series
+                h_ctx = _load_h_research_inputs(
+                    ledger, card, candidate_id=card.candidate, declared=h_declared,
+                    data_root=data_root, end=args.end, allow_unbounded=_allow_unbounded(args),
+                    load_plain=load_series, load_merged=merged_research_series)
+                bars_by_sym = h_ctx["bars"]
+                _h_preflight(h_ctx, strategy_cls(), card,
+                             event_kind=getattr(args, "event_kind", None))
+            else:
+                bars_by_sym = {sym: load_series(data_root, sym,
+                                                card.timeframe, args.end,
+                                                allow_unbounded=_allow_unbounded(args))
+                               for sym in card.symbols}
             # T20：禁入窗唯一来源 config/sessions.toml（sha 进 cost_model_version）
             from mt5data.sessions import load_session_policy
             sess_policy = load_session_policy(str(SESSIONS_PATH))
@@ -3824,6 +4042,11 @@ def cmd_screen(args) -> int:
             times = bars["time"]
             data_first = pd_iso(times.iloc[0])
             data_last = pd_iso(times.iloc[-1])
+            try:
+                _bind_h_strategy(strategy_cls(), h_ctx, sym)
+            except ValueError as exc:
+                print(f"✗ {exc}")
+                return 1
             for params in combos:
                 label = f"{sym} {card.timeframe} {params}"
                 # X-01：reservation 口径——组合回测**之前**占位（预算拒绝
@@ -3869,7 +4092,7 @@ def cmd_screen(args) -> int:
                 try:
                     if sizing is not None:
                         result = run_backtest(
-                            strategy_cls(), bars, costs_by_sym[sym], symbol=sym,
+                            _bind_h_strategy(strategy_cls(), h_ctx, sym), bars, costs_by_sym[sym], symbol=sym,
                             params=dict(params), contract_size=sizes[sym],
                             volume_lots=None, sizing=sizing,
                             vol_min=vols_by_sym[sym][0],
@@ -3880,7 +4103,7 @@ def cmd_screen(args) -> int:
                             session_policy=policy_by_sym[sym])
                     else:
                         result = run_backtest(
-                            strategy_cls(), bars, costs_by_sym[sym], symbol=sym,
+                            _bind_h_strategy(strategy_cls(), h_ctx, sym), bars, costs_by_sym[sym], symbol=sym,
                             params=dict(params), contract_size=sizes[sym],
                             volume_lots=lots,
                             initial_capital=args.initial_capital,
@@ -3902,6 +4125,9 @@ def cmd_screen(args) -> int:
                                     "资金基准 = 分界当根权益（= 初始资金）"}
                     else:
                         summary = summarize(result, cost_version=cost_version)
+                    if h_ctx is not None:
+                        summary["runtime_coverage"] = h_ctx["coverage"]
+                        summary["usable_events"] = h_ctx.get("usable_events")
                     summary["sizing"] = dict(   # T23：定手数方式随 metrics 落台账
                         sizing_info,
                         vol_min=vols_by_sym[sym][0] if vols_by_sym else None,
@@ -4160,6 +4386,12 @@ def cmd_gate(args) -> int:
         # 次的 N 定下限，宁可多跑不少跑；评估与报告的 N 在 V3 块内按
         # 入账后的台账重算，与 G4 同一取数时点）。
         v3_ctx = None
+        try:
+            h_declared = _h_declared(ledger, card, actor=actor,
+                                      event_side=getattr(args, "event_side", None))
+        except (ValueError, OSError) as exc:
+            print(f"✗ {exc}")
+            return 1
         if "V3" in wanted:
             try:
                 if _round_eval_mode(card) == "event":
@@ -4210,11 +4442,23 @@ def cmd_gate(args) -> int:
                                for sym in card.symbols}
             else:
                 vols_by_sym = None
-            bars_by_sym = {sym: load_series(data_root, sym,
-                                            card.timeframe, args.end,
-                                            allow_unbounded=(
-                                                _allow_unbounded(args)))
-                           for sym in card.symbols}
+            h_declared = _h_declared(ledger, card, actor=actor,
+                                      event_side=getattr(args, "event_side", None))
+            h_ctx = None
+            if h_declared is not None:
+                from mt5data.ext.merge import merged_research_series
+                h_ctx = _load_h_research_inputs(
+                    ledger, card, candidate_id=card.candidate, declared=h_declared,
+                    data_root=data_root, end=args.end, allow_unbounded=_allow_unbounded(args),
+                    load_plain=load_series, load_merged=merged_research_series)
+                bars_by_sym = h_ctx["bars"]
+                _h_preflight(h_ctx, strategy, card,
+                             event_kind=getattr(args, "event_kind", None))
+            else:
+                bars_by_sym = {sym: load_series(data_root, sym,
+                                                card.timeframe, args.end,
+                                                allow_unbounded=_allow_unbounded(args))
+                               for sym in card.symbols}
             # T20：禁入窗唯一来源 config/sessions.toml（sha 进 cost_model_version）
             from mt5data.sessions import load_session_policy
             sess_policy = load_session_policy(str(SESSIONS_PATH))
@@ -4364,6 +4608,14 @@ def cmd_gate(args) -> int:
                 print(f"✗ {e}")
                 return 1
 
+        try:
+            strategy = _bind_h_strategy(strategy, h_ctx, symbol)
+            if h_ctx is not None and (v3_ctx or {}).get("mode") == "event":
+                v3_ctx["event_setup"] = _h_event_setup(h_ctx, symbol, bars, v3_ctx["kind"], params)
+                v3_ctx["side_rule"] = h_declared.side_rule
+        except ValueError as exc:
+            print(f"✗ {exc}")
+            return 1
         # 基准运行（引擎 A）：先入台账（失败的也记），关卡结果挂在它名下
         data_first, data_last = pd_iso(bars["time"].iloc[0]), pd_iso(bars["time"].iloc[-1])
         rec_params, _unused = _prob_run_fields(fit_ctx, params, None)
@@ -4428,6 +4680,9 @@ def cmd_gate(args) -> int:
             else:
                 summary = summarize(base, cost_version=cost_version)
             _, summary = _prob_run_fields(fit_ctx, params, summary)
+            if h_ctx is not None:
+                summary["runtime_coverage"] = h_ctx["coverage"]
+                summary["usable_events"] = h_ctx.get("usable_events")
             summary["sizing"] = dict(
                 sizing_info,
                 vol_min=(vols_by_sym[symbol][0] if vols_by_sym else None),
@@ -4501,6 +4756,10 @@ def cmd_gate(args) -> int:
         # T79：序列 meta.json 登记的已知缺口——G2 按年分段 / G3 walk-forward
         # 读到时在关卡 details 里注明相关窗口样本不完整（只注记，不改判定）
         known_gaps = read_known_gaps(data_root, symbol, card.timeframe)
+        if h_ctx is not None:
+            known_gaps = list(known_gaps) + [
+                {"start": str(a), "end": str(b), "kind": "merged_gap", "input": key}
+                for key, spans in h_ctx["gaps"].items() for a, b in spans]
         results: dict[str, dict] = {}
         # T73B：fittable G3 的逐窗冻结模型（内存缓存——V3 同批重放消费；
         # 不入台账，重放凭段 model_sha256/model_path 从 artifact 装载）
@@ -4522,6 +4781,11 @@ def cmd_gate(args) -> int:
             details = dict(results[name])
             # M5：参数选择过程（候选数、选中 run_id）随每个关卡落台账
             details["params_selection"] = selection
+            if h_ctx is not None:
+                details["runtime_coverage"] = h_ctx["coverage"]
+                details["usable_events"] = h_ctx.get("usable_events")
+                results[name]["runtime_coverage"] = h_ctx["coverage"]
+                results[name]["usable_events"] = h_ctx.get("usable_events")
             ledger.record_gate(run_id, name, bool(results[name]["passed"]),
                                details)
 
@@ -4657,6 +4921,8 @@ def cmd_gate(args) -> int:
                 approved_by=args.approved_by or args.actor, cfg=cfg))
 
         report = vgate.render_gate_report(card.id, params, results)
+        if h_ctx is not None:
+            report += _h_coverage_report(h_ctx)
         if selection["selection"] == "auto":
             report += (
                 f"\n## 参数选择（auto）\n\n"
@@ -4984,6 +5250,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_screen.add_argument("--risk-per-trade", type=float, default=None,
                           help="按风险定手数的单笔风险比例（缺省 0.005；0=固定手数；"
                                "与 --volume-lots 同时显式给且>0 会拒绝）")
+    p_screen.add_argument("--event-kind", choices=("month_end", "london_fix"),
+                          default=None, help="Explicit event window when strategy has no event_kind declaration")
     p_screen.add_argument("--initial-capital", type=float, default=10_000.0)
     p_screen.add_argument("--spread-fraction", type=float, default=0.1)
     p_screen.add_argument("--commission", type=float, default=0.0)
@@ -5060,9 +5328,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "[evaluation] mode=\"event\" 的卡必填——事件窗"
                              "按预注册机制锚定，不静默取缺省）")
     p_gate.add_argument("--event-side", choices=("long", "short"),
-                        default="long",
-                        help="T86：事件分支的方向（静态方向；信号驱动的"
-                             "动态方向由候选机制另行声明）")
+                        default=None,
+                        help="Explicit static direction override; must match declared side_rule")
     p_gate.add_argument("--event-sims", type=int, default=None,
                         help="T86：事件分支随机化次数（缺省 = 下限 "
                              "max(1999, ⌈20N/α⌉)；低于下限拒绝运行）")

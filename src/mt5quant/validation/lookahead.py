@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from mt5quant.backtest.truncation import check_no_lookahead
+from mt5quant.backtest.truncation import check_no_lookahead, signal_window
 
 # 窗口内合法的滚动/递推算子：同一行出现即视为 mean/std 有界
 _WINDOWED = ("rolling(", "ewm(", "expanding(")
@@ -81,13 +81,15 @@ def check_window_invariance(strategy, bars: pd.DataFrame, params: dict, *,
     lo = lookback - 1
     if n <= lo or probes < 1:
         return []
-    full = pd.Series(strategy.generate_signals(bars, params))
+    full = pd.Series(signal_window(strategy, bars).generate_signals(bars, params))
     full_vals = full.astype("float64").to_numpy()
     cuts = draw_probe_positions(lo, n - 1, probes, seed)
+    event_probes = getattr(strategy, "signal_probe_positions", lambda _: [])(bars)
+    cuts = sorted(set(cuts) | {int(t) for t in event_probes if lo <= t < n})
     violations: list[int] = []
     for t in cuts:
         window = bars.iloc[t - lookback + 1: t + 1]
-        tail = pd.Series(strategy.generate_signals(window, params))
+        tail = pd.Series(signal_window(strategy, window).generate_signals(window, params))
         if len(tail) == 0:
             violations.append(t)
             continue
@@ -118,12 +120,12 @@ def check_window_invariance_sweep(strategy, bars: pd.DataFrame, params: dict, *,
     lo = lookback - 1
     if n <= lo or span < 1:
         return []
-    full = pd.Series(strategy.generate_signals(bars, params))
+    full = pd.Series(signal_window(strategy, bars).generate_signals(bars, params))
     full_vals = full.astype("float64").to_numpy()
     violations: list[int] = []
     for t in range(max(lo, n - span), n):
         window = bars.iloc[t - lookback + 1: t + 1]
-        tail = pd.Series(strategy.generate_signals(window, params))
+        tail = pd.Series(signal_window(strategy, window).generate_signals(window, params))
         if len(tail) == 0:
             violations.append(t)
             continue

@@ -144,7 +144,7 @@ def _validate_evaluation(raw: object, candidates: tuple[str, ...],
                 f"{source}：[evaluation].{cid} 必须是表"
                 f'（形如 {cid} = {{ mode = "event", primary = "…" }}），'
                 f"收到 {ev!r}")
-        bad = sorted(set(ev) - set(_EVAL_KEYS))
+        bad = sorted(set(ev) - set(_EVAL_KEYS) - {"side_rule"})
         if bad:
             raise RoundError(
                 f"{source}：[evaluation].{cid} 有未知键 {bad}，"
@@ -157,6 +157,10 @@ def _validate_evaluation(raw: object, candidates: tuple[str, ...],
                     f"{source}：[evaluation].{cid}.{k} 必须是非空字符串，"
                     f"收到 {v!r}")
             item[k] = v
+        if "side_rule" in ev:
+            if ev["side_rule"] not in ("static_long", "static_short", "mtd_sign"):
+                raise RoundError(f"{source}: evaluation.{cid}.side_rule invalid")
+            item["side_rule"] = ev["side_rule"]
         out[cid] = item
     return out
 

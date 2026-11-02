@@ -40,7 +40,7 @@ def make_bars(start, end, daily_growth, base=1.10):
 
 
 def signals(bars, params=P0):
-    return MonthEndHedgeRebalance().generate_signals(bars, params)
+    return MonthEndHedgeRebalance(diagnostic_same_series=True).generate_signals(bars, params)
 
 
 def sig_at(sig, bars, ts):
@@ -119,7 +119,7 @@ def test_truncation_window_invariance_and_static_scan():
               for m in (1, 2, 3, 4)}
     bars = make_bars("2024-01-01", "2024-04-30 23:00", growth)
     assert len(bars) > LOOKBACK_BARS
-    s = MonthEndHedgeRebalance()
+    s = MonthEndHedgeRebalance(diagnostic_same_series=True)
     for params in (P0, P2):
         assert check_no_lookahead(s, bars, params=params,
                                   probe_points=5) == []
@@ -142,7 +142,7 @@ def test_required_data_and_exit_rules_declared():
 
 
 def test_params_grid_and_validation():
-    s = MonthEndHedgeRebalance()
+    s = MonthEndHedgeRebalance(diagnostic_same_series=True)
     for thr in (0.0, 0.02):
         s.validate_params({"threshold_pct": thr})
     with pytest.raises(ValueError):

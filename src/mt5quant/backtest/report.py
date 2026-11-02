@@ -411,8 +411,15 @@ def data_sha256(bars: pd.DataFrame) -> str:
     parts = [header]
     for i, row in enumerate(zip(*tokens)):
         parts.append(f"[{i},{','.join(row)}]")
-    return _DATA_SHA_V2_PREFIX + hashlib.sha256(
+    digest = _DATA_SHA_V2_PREFIX + hashlib.sha256(
         "\n".join(parts).encode("utf-8")).hexdigest()
+    context = bars.attrs.get("research_input")
+    if context is None:
+        return digest
+    identity = json.dumps({"trade": digest, "research_input": context},
+                          sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+                          allow_nan=False)
+    return "h-input-v1:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 def _jsonable(obj):

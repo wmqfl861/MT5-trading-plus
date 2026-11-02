@@ -44,6 +44,31 @@ __all__ = [
 ]
 
 
+SOURCE_COST_POLICY = "external-spread-x1.5-v1"
+
+
+class _SourceSpreadCosts:
+    """Source uncertainty applies to spread alone, never the other charges."""
+
+    def __init__(self, base):
+        self.base = base
+
+    def spread_p90(self, symbol, hour_ny, *, price=None):
+        return 1.5 * self.base.spread_p90(symbol, hour_ny, price=price)
+
+    def __getattr__(self, name):
+        return getattr(self.base, name)
+
+
+def source_costs(costs, source=None):
+    """Additive metadata context; legacy and MT5 calls return the original object."""
+    if source is None or source == "mt5":
+        return costs
+    if isinstance(source, str) and source.startswith("ext:"):
+        return _SourceSpreadCosts(costs)
+    raise ValueError(f"Unknown research source cost context: {source!r}")
+
+
 @dataclass(frozen=True)
 class Costs:
     """把各类成本模型聚成一个对象，方法名与引擎的 Costs Protocol 一致。"""

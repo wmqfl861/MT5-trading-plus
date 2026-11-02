@@ -179,6 +179,133 @@ def london_fix_events(trading_days, *, tz: str = "Europe/London",
     return events
 
 
+SIDE_RULES = ("static_long", "static_short", "mtd_sign")
+WINDOW_VERSION = "penultimate-close-v1"
+
+
+class SignalUnavailable(ValueError):
+    """A declared observation cannot be evaluated; never a flat position."""
+
+
+def trading_calendar(raw) -> pd.DataFrame:
+    """Explicit UTC session closes plus a declared calendar completeness bound."""
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        raise SignalUnavailable("signal unavailable: explicit trading calendar v1 required")
+    try:
+        frame = pd.DataFrame(raw["sessions"])[["day", "close_time"]].copy()
+        frame["day"] = pd.to_datetime(frame["day"], utc=True).dt.tz_localize(None)
+        frame["close_time"] = pd.to_datetime(frame["close_time"], utc=True).dt.tz_localize(None)
+        complete = pd.Timestamp(raw["complete_through"])
+    except (KeyError, ValueError, TypeError) as exc:
+        raise SignalUnavailable(f"signal unavailable: invalid calendar: {exc}") from exc
+    if (frame.empty or frame.isna().any().any() or frame.day.duplicated().any()
+            or not frame.day.is_monotonic_increasing
+            or not frame.day.equals(frame.day.dt.normalize())
+            or (frame.close_time <= frame.day).any()
+            or (frame.close_time > frame.day + pd.Timedelta(days=2)).any()
+            or complete.tzinfo is not None):
+        raise SignalUnavailable("signal unavailable: invalid calendar session/close_time")
+    frame.attrs["complete_through"] = complete.normalize()
+    return frame
+
+
+def signal_close_times(bars, timeframe, calendar) -> pd.DatetimeIndex:
+    """Known closes, never treating FRED date labels as bar opens."""
+    from mt5data.store import TIMEFRAME_SECONDS
+    tf = str(timeframe).upper()
+    if tf not in TIMEFRAME_SECONDS:
+        raise SignalUnavailable("signal unavailable: explicit signal_timeframe required")
+    times = pd.DatetimeIndex(pd.to_datetime(bars["time"]))
+    if "close_time" in bars:
+        closes = pd.DatetimeIndex(pd.to_datetime(bars["close_time"]))
+    else:
+        closes = times + pd.Timedelta(seconds=TIMEFRAME_SECONDS[tf])
+    sources = bars.get("_research_source", pd.Series("mt5", index=bars.index))
+    ext = sources.astype(str).str.startswith("ext:").to_numpy()
+    if tf == "D1":
+        trading_calendar(calendar)  # validate the calendar, including completeness
+        sessions = (calendar or {}).get("sessions", [])
+        by_day = {pd.Timestamp(s["day"]): s for s in sessions}
+        by_open = {(pd.Timestamp(s["bar_time"]), s.get("price_source")): s
+                   for s in sessions if s.get("bar_time")}
+        out = list(closes)
+        for i, source in enumerate(sources):
+            if ext[i]:
+                if not str(source).startswith("ext:fred:"):
+                    raise SignalUnavailable("signal unavailable: only approved FRED D1 close semantics supported")
+                session = by_day.get(times[i]) if times[i] == times[i].normalize() else None
+                if session is None or session.get("price_source", "fred") != "fred":
+                    raise SignalUnavailable("signal unavailable: FRED D1 date/source absent from explicit calendar")
+            else:
+                # Broker D1 may close at a different session time than FRED.
+                # Do not infer it from a date label or from 24 hours elapsed.
+                session = by_open.get((times[i], "mt5"))
+                if session is None:
+                    raise SignalUnavailable("signal unavailable: D1 requires source-bound bar_time/close_time mapping")
+            out[i] = pd.Timestamp(session["close_time"])
+        closes = pd.DatetimeIndex(out)
+    if closes.hasnans or times.hasnans or (closes <= times).any():
+        raise SignalUnavailable("signal unavailable: invalid close visibility")
+    return closes
+
+
+class DeclaredEventSide:
+    """One direction contract for observed and randomized event timestamps."""
+    strict_windows = True
+
+    def __init__(self, rule, *, signal_bars=None, signal_timeframe=None,
+                 calendar=None, threshold=0.0):
+        if rule not in SIDE_RULES:
+            raise ValueError(f"side_rule must be one of {SIDE_RULES}: {rule!r}")
+        if not math.isfinite(float(threshold)) or float(threshold) < 0:
+            raise ValueError("threshold must be finite and nonnegative")
+        self.rule, self.threshold = rule, float(threshold)
+        self.bars = signal_bars
+        self.calendar = trading_calendar(calendar) if rule == "mtd_sign" else None
+        self.close_times = (signal_close_times(signal_bars, signal_timeframe, calendar)
+                            if rule == "mtd_sign" and signal_bars is not None else None)
+        if rule == "mtd_sign" and (signal_bars is None or not len(signal_bars)):
+            raise SignalUnavailable("signal unavailable: missing signal bars")
+
+    def anchor_indices(self, entry_time):
+        """Timestamp-only availability; no prices or derived returns read here."""
+        entry = pd.Timestamp(entry_time)
+        if entry.tzinfo is not None:
+            entry = entry.tz_convert("UTC").tz_localize(None)
+        month = entry.to_period("M")
+        indices = []
+        for m in (month - 1, month):
+            if self.calendar.attrs["complete_through"] < m.end_time.normalize():
+                raise SignalUnavailable(f"signal unavailable: incomplete calendar for {m}")
+            days = self.calendar[self.calendar.day.dt.to_period("M") == m]
+            if len(days) < 2:
+                raise SignalUnavailable(f"signal unavailable: calendar anchors for {m}")
+            close_at = days.close_time.iloc[-2]
+            if close_at >= entry:
+                raise SignalUnavailable(f"signal unavailable: anchor {close_at} not closed before {entry}")
+            hits = np.flatnonzero(self.close_times == close_at)
+            if len(hits) != 1:
+                raise SignalUnavailable(f"signal unavailable: missing/duplicate anchor close {close_at}")
+            indices.append(int(hits[0]))
+        return tuple(indices)
+
+    def __call__(self, event):
+        if self.rule == "static_long":
+            return 1
+        if self.rule == "static_short":
+            return -1
+        a, b = self.anchor_indices(event.entry_time)
+        first, last = float(self.bars.close.iloc[a]), float(self.bars.close.iloc[b])
+        if not all(math.isfinite(v) and v > 0 for v in (first, last)):
+            raise SignalUnavailable("signal unavailable: invalid anchor price")
+        change = last / first - 1.0
+        return 1 if change > self.threshold else -1 if change < -self.threshold else 0
+
+
+def declared_event_side(rule, **kwargs):
+    return DeclaredEventSide(rule, **kwargs)
+
+
 # ---------------------------------------------------------------- 净收益
 
 def _side_sign(side) -> int:
@@ -192,7 +319,9 @@ def _side_sign(side) -> int:
         return 1
     if side in (-1, -1.0):
         return -1
-    raise ValueError(f"side_fn 须返回 'long'/'short'（或 ±1），收到 {side!r}")
+    if not isinstance(side, bool) and side == 0:
+        return 0
+    raise ValueError(f"side_fn 须返回 'long'/'short'（或 ±1/0），收到 {side!r}")
 
 
 def event_returns(bars, events, *, side_fn: Callable[[EventWindow], object],
@@ -236,11 +365,22 @@ def event_returns(bars, events, *, side_fn: Callable[[EventWindow], object],
     rows: list[dict] = []
     dropped = 0
     for e in events:
+        if getattr(side_fn, "strict_windows", False):
+            # Validate direction even when the trade window is absent. Missing
+            # observations must not disappear from a randomized null sample.
+            side_fn(e)
         i_e = int(np.searchsorted(arr, e.entry_time.to_datetime64(), "left"))
         i_x = int(np.searchsorted(arr, e.exit_time.to_datetime64(), "left"))
         if i_e >= len(arr) or i_x >= len(arr) or i_x <= i_e:
+            if getattr(side_fn, "strict_windows", False):
+                raise SignalUnavailable(f"event unavailable: window missing for {e.label}")
             dropped += 1
             continue
+        if getattr(side_fn, "strict_windows", False) and (
+                i_e >= len(arr) or i_x >= len(arr)
+                or arr[i_e] != e.entry_time.to_datetime64()
+                or arr[i_x] != e.exit_time.to_datetime64()):
+            raise SignalUnavailable(f"event unavailable: exact window missing for {e.label}")
         sign = _side_sign(side_fn(e))
         entry_ts = pd.Timestamp(arr[i_e])   # 直接从 numpy 取（iloc 逐条太慢）
         exit_ts = pd.Timestamp(arr[i_x])
@@ -248,11 +388,25 @@ def event_returns(bars, events, *, side_fn: Callable[[EventWindow], object],
         if not (entry > 0.0 and exit_ > 0.0):
             dropped += 1
             continue
+        if sign == 0:
+            rows.append({
+                "label": e.label, "kind": e.kind, "side": "flat",
+                "entry_time": e.entry_time, "exit_time": e.exit_time,
+                "entry_bar_time": entry_ts, "exit_bar_time": exit_ts,
+                "entry_price": entry, "exit_price": exit_,
+                "gross": 0.0, "spread": 0.0, "slippage": 0.0,
+                "commission": 0.0, "overnight": 0.0, "nights": 0,
+                "cost": 0.0, "net": 0.0})
+            continue
         gross = sign * (exit_ / entry - 1.0)
         h_e, h_x = int(hours_ny[i_e]), int(hours_ny[i_x])
-        # 点差：来回全幅一次，入/出场小时较不利侧（T62 同口径）
-        spr_e = costs.spread_p90(symbol, h_e, price=entry)
-        spr_x = costs.spread_p90(symbol, h_x, price=entry)
+        # Metadata context changes spread only; fill references remain untouched.
+        from mt5quant.costs import source_costs
+        tags = bars.get("_research_source")
+        ce = source_costs(costs, tags.iloc[i_e] if tags is not None else None)
+        cx = source_costs(costs, tags.iloc[i_x] if tags is not None else None)
+        spr_e = ce.spread_p90(symbol, h_e, price=entry)
+        spr_x = cx.spread_p90(symbol, h_x, price=entry)
         spread = max(spr_e, spr_x) / entry
         slip = (costs.slippage(symbol, h_e, price=entry)
                 + costs.slippage(symbol, h_x, price=entry)) / entry

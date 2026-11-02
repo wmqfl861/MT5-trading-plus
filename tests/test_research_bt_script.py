@@ -1477,9 +1477,14 @@ def test_gate_g4_round_n_when_card_in_round(tmp_path, monkeypatch, capsys):
                 '\n[evaluation]\n'
                 'C001 = { mode = "standard", primary = "dsr_v0" }\n')
     (rnd_dir / "R1.toml").write_text(rnd_body, encoding="utf-8")
+    from tests.test_research_candidates import CANDIDATE_TOML
+    cdir = tmp_path / "candidates"
+    cdir.mkdir(exist_ok=True)
+    (cdir / "C001.toml").write_text(CANDIDATE_TOML.replace("TESTUSD", "XAUUSD").replace('holding = "D1"', 'holding = "H1"'), encoding="utf8")
     with Ledger(ledger_path) as led:          # 直接铺轮次上下文（绕过 CLI
         led.record_candidate_check(           # 前置：候选最新 decision=pass）
-            "C001", decision="pass", result={"candidate_id": "C001"})
+            "C001", decision="pass", result={"candidate_id": "C001", "checks": {"power": {
+                "years": 5 / (24 * 365.25), "years_detail": {"XAUUSD/H1": 5 / (24 * 365.25)}}}})
         led.record_round_open(
             round_id="R1", candidates=("C001",), trial_budget=10,
             lockbox_uses_max=1, dsr_trial_scope="family",
@@ -1591,20 +1596,30 @@ def _setup_t86_round(tmp_path, monkeypatch, mod, *, mode="event",
     (cards_dir / "H703.toml").write_text(_CARD_H703, encoding="utf-8")
     cdir = tmp_path / "candidates"
     cdir.mkdir(exist_ok=True)
-    body = 'id = "C003"\n'
+    from tests.test_research_candidates import CANDIDATE_TOML
+    body = CANDIDATE_TOML.replace('C001', 'C003').replace('TESTUSD', 'XAUUSD').replace('holding = "D1"', 'holding = "H1"')
     if continues_family:
-        body += f'continues_family = "{continues_family}"\n'
+        body = f'continues_family = "{continues_family}"\n' + body
+    body += '\nside_rule = "static_long"\n'
     (cdir / "C003.toml").write_text(body, encoding="utf-8")
     rdir = tmp_path / "rounds"
     rdir.mkdir(exist_ok=True)
     (rdir / "R1.toml").write_text(
-        _ROUND_R1_EVENT if mode == "event" else _ROUND_R1_STANDARD,
+        (_ROUND_R1_EVENT.replace('mode = "event",', 'mode = "event", side_rule = "static_long",')
+         if mode == "event" else _ROUND_R1_STANDARD),
         encoding="utf-8")
     ledger_path = tmp_path / "ledger.sqlite"
     with Ledger(ledger_path) as led:
         led.record_candidate_check("C003", decision="pass",
-                                   result={"candidate_id": "C003",
-                                           "decision": "pass"})
+                                   result={"candidate_id": "C003", "decision": "pass",
+                                           "checks": {"power": {"years": 799 / 365.25,
+                                               "years_detail": {"XAUUSD/H1": 799 / 365.25}}}})
+    caldir = root / "calendars"
+    caldir.mkdir(exist_ok=True)
+    days = pd.date_range("2024-01-01", periods=830, freq="D")
+    (caldir / "XAUUSD.json").write_text(json.dumps({
+        "version": 1, "complete_through": str(days[-1].date()),
+        "sessions": [{"day": str(d.date()), "close_time": str(d + pd.Timedelta(hours=22))} for d in days]}), encoding="utf8")
     patch_card_git(monkeypatch, mod)
     monkeypatch.setattr(mod.cards, "ensure_strategy_clean",
                         lambda ref, root_dir, **kw: None)

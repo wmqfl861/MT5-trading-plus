@@ -90,9 +90,10 @@ _TOP_KEYS = ("id", "title", "mechanism_class", "status", "symbols",
 _FAMILY_PATTERN = re.compile(r"^[A-Z]+\d{2,}$")
 _LIT_KEYS = ("original", "replications", "rebuttals", "search_log",
              "published_effect", "expected_effect")
-_DECLARED_KEYS = ("events_per_year", "gross_return_per_event",
-                  "window_bars", "entry_hour_ny", "exit_hour_ny",
-                  "overnight_nights", "expected_sharpe")
+_DECLARED_REQUIRED = ("events_per_year", "gross_return_per_event",
+                      "window_bars", "entry_hour_ny", "exit_hour_ny",
+                      "overnight_nights", "expected_sharpe")
+_DECLARED_KEYS = _DECLARED_REQUIRED + ("signal_symbol", "signal_timeframe", "side_rule")
 
 _DAYS_PER_YEAR = 365.25
 
@@ -128,6 +129,9 @@ class Declared:
     exit_hour_ny: int               # 出场成交的纽约本地小时
     overnight_nights: float         # 每笔/每事件预期计费夜数（0=不过夜；保守申报）
     expected_sharpe: float          # 折算后预期年化夏普（检验力用）
+    signal_symbol: str | None = None
+    signal_timeframe: str | None = None
+    side_rule: str | None = None
 
 
 # ------------------------------------------------------------------ P 线（T76）
@@ -437,9 +441,17 @@ def _validate_declared(raw: object, source: str) -> Declared:
         raise CandidateError(
             f"{source}：[declared] 有未知键 {unknown}，合法键 "
             f"{list(_DECLARED_KEYS)}")
-    for k in _DECLARED_KEYS:
+    for k in _DECLARED_REQUIRED:
         if k not in raw:
             raise CandidateError(f"{source}：[declared] 缺键 {k!r}")
+    for k in ("signal_symbol", "signal_timeframe", "side_rule"):
+        if k in raw and (not isinstance(raw[k], str) or not raw[k].strip()):
+            raise CandidateError(f"{source}：[declared].{k} must be nonempty text")
+    if "side_rule" in raw and raw["side_rule"] not in (
+            "static_long", "static_short", "mtd_sign"):
+        raise CandidateError(f"{source}：[declared].side_rule invalid")
+    if "signal_timeframe" in raw and raw["signal_timeframe"] not in TIMEFRAME_SECONDS:
+        raise CandidateError(f"{source}：[declared].signal_timeframe invalid")
 
     def _num(k: str, *, positive: bool) -> float:
         v = raw[k]
@@ -482,6 +494,9 @@ def _validate_declared(raw: object, source: str) -> Declared:
         exit_hour_ny=_hour("exit_hour_ny"),
         overnight_nights=_num("overnight_nights", positive=False),
         expected_sharpe=_num("expected_sharpe", positive=False),
+        signal_symbol=raw.get("signal_symbol"),
+        signal_timeframe=raw.get("signal_timeframe"),
+        side_rule=raw.get("side_rule"),
     )
 
 
@@ -868,6 +883,44 @@ def merged_coverage_years(segments: list[dict]) -> float:
             merged.append([a, b])
     return float(sum((b - a).total_seconds() for a, b in merged)
                  / (_DAYS_PER_YEAR * 86400.0))
+
+
+def runtime_coverage(bars, source_tags, *, gap_spans=()) -> dict:
+    """Timestamp-only coverage after filters; explicit removed spans also split."""
+    times = pd.DatetimeIndex(pd.to_datetime(bars["time"]))
+    tags = list(source_tags)
+    if len(times) != len(tags) or times.hasnans or not times.is_monotonic_increasing or times.has_duplicates:
+        raise ValueError("runtime coverage: invalid timestamps/source alignment")
+    removed = {(pd.Timestamp(a), pd.Timestamp(b)) for a, b in gap_spans}
+    segments = []
+    spans = []
+    if len(times):
+        first = seg_first = 0
+        for i in range(1, len(times)):
+            gap = (times[i] - times[i - 1] > _GAP_SPLIT
+                   or (times[i - 1], times[i]) in removed)
+            if gap:
+                spans.append({"first": times[first].isoformat(), "last": times[i - 1].isoformat(), "counted": True})
+                first = i
+            if gap or tags[i] != tags[i - 1]:
+                segments.append({"source": tags[seg_first], "first": times[seg_first].isoformat(),
+                                 "last": times[i - 1].isoformat(), "counted": True})
+                seg_first = i
+        spans.append({"first": times[first].isoformat(), "last": times[-1].isoformat(), "counted": True})
+        segments.append({"source": tags[seg_first], "first": times[seg_first].isoformat(),
+                         "last": times[-1].isoformat(), "counted": True})
+    return {"years": merged_coverage_years(spans), "segments": segments, "spans": spans,
+            "bars": len(times), "gap_split_days": 30}
+
+
+def require_runtime_coverage(actual, precheck_years, key):
+    expected = float(precheck_years)
+    years = float(actual["years"])
+    if not math.isfinite(expected) or expected <= 0:
+        raise ValueError(f"runtime coverage {key}: missing/invalid latest ledger precheck years")
+    boundary = .9 * expected
+    if years < boundary and not math.isclose(years, boundary, rel_tol=1e-12, abs_tol=1e-12):
+        raise ValueError(f"runtime coverage {key}: {years:.8g} years < 90% of precheck {expected:.8g}")
 
 
 def coverage_years(data_root, symbols, timeframes) -> dict[str, float]:

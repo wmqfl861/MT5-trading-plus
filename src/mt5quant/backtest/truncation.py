@@ -10,6 +10,12 @@ import numpy as np
 import pandas as pd
 
 
+def signal_window(strategy, bars):
+    """Give every auxiliary input the same visible interval as the trade probe."""
+    crop = getattr(strategy, "for_signal_window", None)
+    return crop(bars) if crop is not None else strategy
+
+
 def check_no_lookahead(strategy, bars: pd.DataFrame, *, params: dict,
                        probe_points: int = 5) -> list[int]:
     """返回前视违规的位置索引列表（空列表 = 通过）。
@@ -23,17 +29,19 @@ def check_no_lookahead(strategy, bars: pd.DataFrame, *, params: dict,
     n = len(bars)
     if n < 2 or probe_points < 1:
         return []
-    full = pd.Series(strategy.generate_signals(bars, params))
+    full = pd.Series(signal_window(strategy, bars).generate_signals(bars, params))
     full_vals = full.astype("float64").to_numpy()
     cuts = sorted({
         int(round(c))
         for c in np.linspace(1, n - 1, probe_points)
     })
+    event_probes = getattr(strategy, "signal_probe_positions", lambda _: [])(bars)
+    cuts = sorted(set(cuts) | {int(t) + 1 for t in event_probes if 0 <= t < n - 1})
     violations: list[int] = []
     for c in cuts:
         c = max(1, min(c, n - 1))
         prefix_vals = pd.Series(
-            strategy.generate_signals(bars.iloc[:c], params)
+            signal_window(strategy, bars.iloc[:c]).generate_signals(bars.iloc[:c], params)
         ).astype("float64").to_numpy()
         if len(prefix_vals) != c:  # 长度都对不上：整个前缀按违规处理
             violations.extend(range(c))
