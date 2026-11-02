@@ -206,7 +206,7 @@ CI 红时停止推送新功能，先修红。
    - 候选登记 `[declared]` 新增 `signal_symbol`（可选，缺省等于成交品种）与 `side_rule`，取值 `static_long`、`static_short`、`mtd_sign`；以后需要新的规则，按版本新增；
    - 轮次 `[evaluation]` 必须重复声明 `side_rule`，两处不一致时拒绝开轮。
 2. **事件分支**：
-   - `_v3_gate_evaluate` 的 `side_fn` 按 `side_rule` 逐事件计算方向：`mtd_sign` 取信号品种在事件入场时刻之前最后一根已收盘 bar 的月内涨跌符号，以上月最后一根收盘为基准；
+   - `_v3_gate_evaluate` 的 `side_fn` 按 `side_rule` 逐事件计算方向。`mtd_sign` 的信号窗口按候选登记的定义取，只用事件入场之前已收盘的数据。C002 登记的窗口是"上月倒数第二个交易日收盘 → 本月倒数第二个交易日收盘"（Melvin 与 Prins 的口径）；现行 B7 用的是"上月最后一根收盘 → 事件日前一日收盘"，与登记不一致，一并改正；
    - 随机化零分布里的随机事件，用同一规则在随机时刻计算方向；
    - `--event-side` 只在 `side_rule` 为静态时允许，且必须一致，否则在任何计算之前拒绝。
 3. **H 线读合并数据**：`cmd_screen`、`cmd_gate` 对候选预筛计入外部段的品种（含信号品种）用 `merged_research_series` 读取（X-03 契约），外部段点差按 ×1.5 绑定，source tags 写进运行记录。
@@ -244,7 +244,7 @@ CI 红时停止推送新功能，先修红。
 
 1. **候选与卡**：
    - C002 写明延续谱系 H101（`continues_family`）；
-   - 新卡 H101-v2 绑定修正后的策略：信号 `signal_symbol=USTEC`、`side_rule=mtd_sign`；
+   - 新卡 H101-v2 绑定修正后的策略：信号 `signal_symbol=USTEC`、`side_rule=mtd_sign`，信号窗口按 C002 登记（上月倒数第二个交易日 → 本月倒数第二个交易日）；
    - USTEC 信号来源：MT5 覆盖期用 MT5，之前用 FRED 纳指 100 日线；做一次重叠期一致性核对（月涨跌符号一致率），写进候选材料。
 2. **分段**：
    - 主检验：EURUSD 的 HistData 段，从 2007-01 到 MT5 覆盖开始（2021-05-17）之前，扣除已知空洞。这一段没有被任何收益计算看过；T87 用定盘时刻的波动对齐时间标签，只用了绝对波动，不涉及方向，要在草案里写明；

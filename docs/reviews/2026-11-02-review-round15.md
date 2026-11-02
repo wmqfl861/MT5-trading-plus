@@ -71,7 +71,7 @@ main 上自 `de91881` 起共 64 个提交（其中自 `067b6f0` 起 48 个），
 
 - `scripts/bt.py:1519` 取 `side = ctx["side"]`，`:1530` 写 `side_fn = (lambda event: side)`，`ctx["side"]` 来自 `:4116` 的 `args.event_side`，`:4992` 定义 `--event-side` 只能取 long/short，缺省 long。
 - C002 与 H101 登记的规则是"USTEC 当月上涨 → 做多 EURUSD，下跌 → 做空"。事件分支拿不到信号品种的数据，也没有按事件取方向的接口。
-- bar 级 B7（`b7_monthend_hedge_rebalance.py:30`）明文写着信号与成交"同为传入序列"，即用 EURUSD 自己的当月涨跌。
+- bar 级 B7（`b7_monthend_hedge_rebalance.py:30`）明文写着信号与成交"同为传入序列"，即用 EURUSD 自己的当月涨跌。它的信号窗口（上月最后一根收盘 → 事件日前一日收盘）也与 C002 登记的"上月倒数第二个交易日 → 本月倒数第二个交易日"不一致。
 - 结果：run 449（screen）与 run 450（gate）检验的都不是 C002。R1 报告的"不通过（p = 0.979，成本否决未过）"描述的是固定方向这条规则（缺省做多，以 run 450 记录的 `event_side` 为准），`falsified` 登记不成立。
 - 复现：探针 H15-1。合成数据上，按登记方向的均值是 +9.85bp，bt 的事件分支只能算出固定做多的 +0.61bp。
 - 处置（D58）：
