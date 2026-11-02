@@ -97,4 +97,6 @@
 
 实现者在独立depth=1克隆中运行同八个节点，得到8 failed、退出码1；完整历史克隆中得到8 passed、退出码0。替换前后 `scripts/bt.py` 与 `candidates.py` 的Git blob分别同为 `8ba93ade67b35cb206b896f893a6e0fd80a5b906`、`9efdfe41c5523927cbe2b6c5da03f2f77a2ab586`，原始字节相同；f6c7b81与6f33ad5均为main祖先。主会话已读取验证日志、基线证明与受测补丁一致性记录。
 
-原T112独立审核者随后只读复核上述两文件完整diff及有限RED/GREEN、基线和提交证据，结论为：**绑定3c2a2df的spec compliance PASS、quality PASS，批准限定CI修复，无blocking finding**。本轮未重审T112或重跑测试；没有产品代码、冻结哈希、阈值或研究批准变更。修复后的同步全量及对应新main CI仍须通过，T113正式写库在此之前继续阻断。
+原T112独立审核者随后只读复核上述两文件完整diff及有限RED/GREEN、基线和提交证据，结论为：**绑定3c2a2df的spec compliance PASS、quality PASS，批准限定CI修复，无blocking finding**。本轮未重审T112或重跑测试；没有产品代码、冻结哈希、阈值或研究批准变更。
+
+主会话在同步后的固定提交 `3c2a2df` 上运行完整套件，结果 **2990 passed、3 skipped、3条既有转义警告，退出码0**（1923.07秒）。推送后GitHub tests **#296**（run `41441553282`）为completed/success，与该main SHA对应。CI #295的历史读取失败由限定修复闭环，T112代码与该次限定源码基线更新达到交付条件；这不扩大任何研究批准，也不解除Demo运行时保护。
