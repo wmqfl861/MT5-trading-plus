@@ -560,9 +560,8 @@ def test_t55_cross_logdir_mode_conflict_refused(tmp_path):
         assert "mode conflict" in out and str(MAGIC) in out
 
 
-def test_t55_cross_logdir_same_mode_runner_detected(tmp_path):
-    """同模式跨 LogDir：登记存活运行器（PaperSoak）→ 换 LogDir 预检仍
-    检出并列出跳过清单（runner/<magic>——绝不并行第二份）。"""
+def test_t55_cross_logdir_legacy_identity_refused(tmp_path):
+    """换 LogDir 不允许以旧 PID/basename 登记绕过严格树核验。"""
     cfg_dir = tmp_path / "configs"
     cfg_dir.mkdir()
     (cfg_dir / "strategy.toml").write_text(CONFIG_VOLUME_001, encoding="utf-8")
@@ -574,13 +573,13 @@ def test_t55_cross_logdir_same_mode_runner_detected(tmp_path):
         proc = run_ps1("-Mode", "PaperSoak", "-ConfigDir", str(cfg_dir),
                        "-LogDir", str(tmp_path / "logs-b"), *args,
                        "-PrecheckOnly")
-        assert proc.returncode == 0, _diag(proc)
-        assert f"runner/{MAGIC}" in out_text(proc)
+        assert proc.returncode == 1, _diag(proc)
+        assert "verified-tree-required" in out_text(proc)
+        assert _pid_exists(pid)
 
 
-def test_t55_fake_pid_and_feature_mismatch_not_alive(tmp_path):
-    """三要素存活判定：伪造 PID（已退出）与特征不匹配的活进程（命令行
-    无 live_runner.py）都不视为存活——不进跳过清单、不挡启动。"""
+def test_t55_fake_pid_and_feature_mismatch_refused(tmp_path):
+    """PID 缺失或命令行不符都不能作为补起依据，保留登记拒绝。"""
     cfg_dir = tmp_path / "configs"
     cfg_dir.mkdir()
     (cfg_dir / "strategy.toml").write_text(CONFIG_VOLUME_001, encoding="utf-8")
@@ -601,12 +600,13 @@ def test_t55_fake_pid_and_feature_mismatch_not_alive(tmp_path):
             # risk 特征也不匹配：live_pid 的命令行是 live_runner.py 而非
             # risk_process.py → 同样不视为存活
             write_instances(_data_dir(tmp_path), entries)
+            before = (_data_dir(tmp_path) / "live" / "instances.json").read_bytes()
             proc = run_ps1("-Mode", "PaperSoak", "-ConfigDir", str(cfg_dir),
                            *args, "-PrecheckOnly")
-            assert proc.returncode == 0, _diag(proc)
-            out = out_text(proc)
-            assert f"runner/{MAGIC}" not in out
-            assert "reconcile" not in out   # risk 项特征不匹配 → 未检出
+            assert proc.returncode == 1, _diag(proc)
+            assert "verified-tree-required" in out_text(proc)
+            assert (_data_dir(tmp_path) / "live" / "instances.json").read_bytes() == before
+            assert _pid_exists(wrong.pid) and _pid_exists(live_pid)
         finally:
             with contextlib.suppress(OSError):
                 wrong.kill()
@@ -658,25 +658,18 @@ def _pid_exists(pid: int) -> bool:
         return False
 
 
-def test_t55_stop_stops_only_verified_current_entries(tmp_path):
-    """-Stop：只处理 instances.json 当前项——核验存活的停止（核验失败/
-    已退出的不动），随后清空登记；不遍历 pids.txt 历史 PID。"""
-    args = precheck_artifact_args(tmp_path)
+def test_t55_stop_refuses_legacy_identity_and_preserves_registry(tmp_path):
+    """Legacy entries cannot prove a whole tree: do not kill or erase them."""
+    precheck_artifact_args(tmp_path)
     data = _data_dir(tmp_path)
     with fake_live_instance("runner") as (pid, started):
-        write_instances(data, [
-            registry_entry(pid, "runner", "PaperSoak", MAGIC, started),
-            registry_entry(_dead_pid(), "risk", "PaperSoak", None),
-        ])
-        proc = run_ps1("-Stop", "-DataDir", str(data))
-        assert proc.returncode == 0, _diag(proc)
-        out = out_text(proc)
-        assert str(pid) in out
-        deadline = time.time() + 30           # fake 进程应已被 ps1 停止
-        while time.time() < deadline and _pid_exists(pid):
-            time.sleep(0.2)
-        assert not _pid_exists(pid), "登记项进程应被 -Stop 停止"
-        assert read_instances(data)["instances"] == []
+        write_instances(data, [registry_entry(pid, "runner", "PaperSoak", MAGIC, started)])
+        before = (data / "live" / "instances.json").read_bytes()
+        proc = run_ps1("-Stop", "-DataDir", str(data), "-PythonExe", sys.executable)
+        assert proc.returncode == 1, _diag(proc)
+        assert "verified-tree-required" in out_text(proc)
+        assert _pid_exists(pid)
+        assert (data / "live" / "instances.json").read_bytes() == before
 
 
 # ------------------------------------------------ C-1 run-manifest
@@ -696,11 +689,8 @@ def test_c1_corrupt_run_manifest_refuses(tmp_path):
     assert "run-manifest.json" in out_text(proc)
 
 
-def test_c1_run_manifest_append_start_and_restart(tmp_path):
-    """C-1 契约：启动追加 runs（kind=start；字段 schema_version/mode/
-    magics/runs/account_hint）；恢复重启再追加（kind=restart、runs 只增
-    不覆盖）。用 where.exe 顶替 -PythonExe 走真实启动分支——where.exe
-    对任意参数立即退出，不连终端、无任何交易路径副作用。"""
+def test_c1_initial_manifest_retained_when_legacy_restart_refused(tmp_path):
+    """首次启动追加运行窗与完整参数；未核验的旧身份重启保留全部历史。"""
     where = shutil.which("where.exe")
     if not where:
         pytest.skip("无 where.exe")
@@ -728,6 +718,14 @@ def test_c1_run_manifest_append_start_and_restart(tmp_path):
 
     kinds = {e["kind"] for e in read_instances(data)["instances"]}
     assert {"runner", "risk", "reconcile"} <= kinds
+    for entry in read_instances(data)["instances"]:
+        argv = entry["argv"]
+        assert argv[1] == "-u"
+        assert argv[argv.index("--data-dir") + 1] == str(data)
+        gateway_flag = "--gateway-config" if entry["kind"] == "runner" else "--gw-config"
+        assert argv[argv.index(gateway_flag) + 1] == entry["gateway_config"]
+        assert entry["data_dir"] == str(data)
+        assert entry["deployment_dir"] == str(REPO_ROOT)
 
     # 恢复重启：登记一个存活的同模式运行器 → 跳过该运行器、追加 restart
     with fake_live_instance("runner") as (pid, started):
@@ -737,20 +735,16 @@ def test_c1_run_manifest_append_start_and_restart(tmp_path):
         proc2 = run_ps1("-Mode", "PaperSoak", "-ConfigDir", str(cfg_dir),
                         "-LogDir", str(log2), "-PythonExe", where, *args,
                         timeout=180)
-        assert proc2.returncode == 0, _diag(proc2)
-        mf2 = read_run_manifest(data)
-        assert len(mf2["runs"]) == 2            # 追加，绝不覆盖
-        assert mf2["runs"][0] == mf["runs"][0]  # 历史条目原样保留
-        assert mf2["runs"][1]["kind"] == "restart"
-        assert mf2["runs"][1]["log_dir"] == str(log2)
-        assert str(pid) in out_text(proc2)      # 存活运行器被跳过
+        assert proc2.returncode == 1, _diag(proc2)
+        assert "verified-tree-required" in out_text(proc2)
+        assert read_run_manifest(data) == mf
+        assert _pid_exists(pid)
 
 
 # ------------------------------------------------ 生命周期（R8-I6 → T55）
 
-def test_precheck_only_lists_alive_runner_skip(tmp_path):
-    """instances.json 里目标 magic 有存活运行器（三要素通过）→
-    -PrecheckOnly 显示跳过清单 runner/<magic>；且不改写登记文件。"""
+def test_precheck_preserves_unverifiable_legacy_registry(tmp_path):
+    """预检拒绝旧身份且不改登记，不凭 basename 宣称可安全补起。"""
     cfg_dir = tmp_path / "configs"
     cfg_dir.mkdir()
     (cfg_dir / "strategy.toml").write_text(CONFIG_VOLUME_001, encoding="utf-8")
@@ -762,8 +756,8 @@ def test_precheck_only_lists_alive_runner_skip(tmp_path):
         before = (data / "live" / "instances.json").read_bytes()
         proc = run_ps1("-Mode", "PaperSoak", "-ConfigDir", str(cfg_dir),
                        *args, "-PrecheckOnly")
-        assert proc.returncode == 0, _diag(proc)
-        assert f"runner/{MAGIC}" in out_text(proc)   # 将被跳过（绝不并行第二份）
+        assert proc.returncode == 1, _diag(proc)
+        assert "verified-tree-required" in out_text(proc)
         assert (data / "live" / "instances.json").read_bytes() == before
 
 
@@ -785,14 +779,16 @@ def test_legacy_pids_txt_not_used_for_detection(tmp_path):
     assert f"runner/{MAGIC}" not in out_text(proc)
 
 
-def test_dead_registry_entry_not_treated_as_alive(tmp_path):
-    """登记表里的死 PID 不视为存活：不进跳过清单（允许补启动）。"""
+def test_dead_legacy_registry_requires_verified_tree_before_replacement(tmp_path):
+    """A dead launcher alone cannot prove its workers are dead."""
     cfg_dir = tmp_path / "configs"
     cfg_dir.mkdir()
     (cfg_dir / "strategy.toml").write_text(CONFIG_VOLUME_001, encoding="utf-8")
     write_instances(_data_dir(tmp_path),
                     [registry_entry(_dead_pid(), "runner", "PaperSoak", MAGIC)])
+    before = (_data_dir(tmp_path) / "live" / "instances.json").read_bytes()
     proc = run_ps1("-Mode", "PaperSoak", "-ConfigDir", str(cfg_dir),
                    *precheck_artifact_args(tmp_path), "-PrecheckOnly")
-    assert proc.returncode == 0, _diag(proc)
-    assert f"runner/{MAGIC}" not in out_text(proc)  # 不挡启动
+    assert proc.returncode == 1, _diag(proc)
+    assert "verified-tree-required" in out_text(proc)
+    assert (_data_dir(tmp_path) / "live" / "instances.json").read_bytes() == before

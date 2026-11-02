@@ -30,8 +30,8 @@ powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1 -Mode Demo
 # 只做预检与生命周期检测（不启动任何进程；Demo 模式含网关 dry 预检）
 powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1 -Mode Demo -PrecheckOnly
 
-# 停止当前登记的演练进程（只处理 instances.json 当前项，逐项核验存活）
-powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1 -Stop
+# 固定部署的启动/补缺和停止使用 §6.2/§6.3 的完整路径与 SHA。
+# 旧无固定身份的 -Stop/已登记实例补缺已禁用，不能仅凭 PID/basename 操作。
 ```
 
 - 通用预检（两种模式同）：点差模型/研究缓存/合约快照/会话配置/风控配置/
@@ -40,16 +40,14 @@ powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1 -Stop
   固定 `volume_lots=0.01` 且无 `risk_fraction`——注释/多行字符串/表
   作用域骗不过）与 DEMO 保险丝/网关预检（账户非模拟盘或读不到账户
   状态 → fail-closed 拒启动）。
-- **生命周期（单实例，R9-I5/T55）**：实例登记在 `data\live\instances.json`
-  （字段 pid/kind/magic/mode/started_utc/log/account_hint），**跨 LogDir**
-  生效——换日志目录不会漏检。存活判定三要素：PID 存在 + 进程创建时间
-  与登记时间容差 5 秒（防 PID 复用）+ 命令行特征（live_runner.py /
-  risk_process.py / live_reconcile.py）。同 magic 或同角色且**同模式**的
-  存活实例 → 跳过并告警，**绝不并行第二份**（同 magic 双写 state/意图/
-  下单日志会互相覆盖）；**Mode 不符的存活实例 → mode conflict 拒绝启动**
-  （先 `-Stop` 旧实例）。检测→启动→登记→运行窗追加在
-  `data\live\instances.lock` 临界区内完成，并发启动的第二个调用立即
-  失败。`data\demo\pids.txt` 是**追加式**启动历史日志（不参与检测）。
+- **生命周期（T110）**：实例登记在 `data\live\instances.json`，除角色/PID/
+  创建时间外，还记录完整 argv、deployment_sha、部署目录与数据目录。固定
+  Demo 部署的检测/停止与 supervisor 共用同一 `verified_tree`：核验完整
+  身份与全部父子进程，存活的角色跳过，只有整树被证明缺失才补起。命令行
+  不可读、PID 复用或存活孤儿 worker 都拒绝。旧登记不能自动迁移，旧无固定
+  身份的补缺/停止入口已禁用。检测→启动→登记→运行窗追加仍在
+  `instances.lock`（FileShare.None）临界区内，停止保留登记。完整操作见
+  §6.2/§6.3；`pids.txt` 只是追加式历史，不参与身份判定。
 - **运行窗登记（C-1）**：每次启动（含恢复重启）向
   `data\live\run-manifest.json` **追加**一条 runs（kind=start|restart）；
   该文件读失败或 JSON 损坏时脚本 fail-closed 拒绝启动。`--accept` 的
@@ -67,11 +65,9 @@ powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1 -Stop
   使用 `--demo --gw-config`，拒绝实盘解锁配置，核验 `trade_mode=0` 后才读
   成交流水；PaperSoak 只读 `--paper-state`。影子目录归档或缺失不会自动
   切换到终端。当前阶段禁止真实账户连接与下单；模式变更只在维护窗口执行。
-- 重启机器后：直接重跑同模式命令即可——脚本按 `data\live\instances.json`
-  （三要素核验）检测并跳过仍存活的进程，只补已退出的角色（绝不满组
-  重跑，见 §3）。**每次启动都生成新日志文件**——这是 demo_check 识别
-  "重启"的依据，属正常现象；恢复重启会向 run-manifest.json 追加
-  kind=restart 条目（运行窗不清）。
+- 重启机器后：按 §6.2 重用固定 SHA 和完整路径，只补已核验退出的整树。
+  旧登记缺身份字段时先人工核验迁移，不能删登记后重跑。每次新进程生成
+  新日志；恢复向 run-manifest.json 追加记录，运行窗不清。
 
 ### 1a. runner 启动二次确认 trade_mode=0（3B 规格，H 线基石阶段 3）
 
@@ -129,32 +125,18 @@ Remove-Item data\live\killSwitch, data\live\halt.json -ErrorAction SilentlyConti
 # 恢复 = 只移除停机信号；进程若还活着就什么都不用再启动（killSwitch 不杀进程）
 ```
 
-**进程重启（R8-I6/R9-I5：绝不满组重跑）**：
-```powershell
-# ① 核对哪些进程真的退了：instances.json 逐项核验 + 对应日志尾部
-Get-Content data\live\instances.json                # 当前登记（pid/kind/magic/mode）
-Get-Process -Id <pid>            # 在 = 还活着，什么都不做
-Get-Content data\demo\runner-<magic>-<stamp>.log -Tail 20   # 尾部有
-#   "收到中断，退出"/Traceback = 真退出；强杀不留退出说明
+**进程重启/停止（T110：完整树核验）**：
 
-# ② 只重启已确认退出的进程：重跑同模式命令即可——脚本按 instances.json
-#    （三要素存活判定）检测存活实例并自动跳过，只补缺的运行器/风控/对账；
-#    跨模式（登记 Mode 与本次 -Mode 不符）会因 mode conflict 被拒绝
-powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1 -Mode Demo   # 例
+先按 §6.3 禁用 supervisor 并设置 killSwitch；用 §6.2 的同一组固定 SHA 与
+显式路径调用 `live_supervisor.py --inspect` 检查，`--stop` 停止。`demo_run.ps1
+-Stop` 仅是该停止入口的转发，也要求相同完整部署参数。全部角色身份核验
+完成后才开始子先父后的停止，登记保留。某个父 PID 不存在、日志已有退出
+行、或任务管理器不见 launcher，均不能证明 worker 已退出。
 
-# ③ 停止单个/全部当前登记进程（推荐 -Stop：逐项核验存活后才停止，
-#    不遍历 pids.txt 历史 PID——历史 PID 可能已被系统复用）
-powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1 -Stop
-#   紧急停单个进程（核验后确属演练实例）：taskkill /PID <pid> /F
-#   注意：强杀不留退出日志，demo_check 的"重启有说明"检查会不通过。
-#   计划内停止优先 Ctrl-C（日志留"收到中断，退出"）或先放 killSwitch；
-#   紧急强杀后，在 alerts.log 有当日 HEARTBEAT_TIMEOUT/RISK_HALT 佐证
-#   也可接受。
-
-# ④ 禁止：清掉 instances.json 登记后全组重跑——同 magic 并行第二份运行器
-#    会双写 state-<magic>.json、意图与下单日志（R8-I6）。instances.json
-#    由脚本维护（死项自动剔除），pids.txt 是追加式历史，永远不要删。
-```
+补缺启动仍用 §6.2 完整命令，共用同一树核验。不可读 PID、身份不符、存活
+孤儿 worker 均保守拒绝。禁止单杀 launcher、清掉 instances.json 后重跑或
+用历史 pids.txt 杀进程。旧版/PaperSoak 无固定身份登记须在维护窗口人工
+确认整树及数据状态后迁移，不能自动补起。
 
 **日报缺失/内容异常排查**（`data\reports\live\daily-*.md` 没生成）：
 1. `type data\logs\task_live_daily_report.log`——最常见：影子状态不可用
@@ -201,12 +183,8 @@ PaperSoak 离线补跑不需要网关配置，直接使用影子状态：
 # 2) 日常全周汇总留档（宽松口径，供运维浏览）
 .venv/Scripts/python.exe scripts/demo_check.py --summary > data\demo\weekly-final.md
 
-# 3) 停止全部演练进程（-Stop：只处理 instances.json 当前项，逐项核验
-#    存活后停止；不再遍历 pids.txt 历史 PID）
-New-Item -ItemType File data\live\killSwitch       # 先停开仓（留演练证据）
-Start-Sleep 15                                     # 等风控写 halt.json
-powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1 -Stop
-Remove-Item data\live/killSwitch, data\live/halt.json -ErrorAction SilentlyContinue
+# 3) 按 §6.3 禁用 supervisor、设置 killSwitch，再严格核验并停止整树。
+#    保留 instances.json、halt 与 journal；不在验收脚本中自动清除停机原因。
 
 # 4) 收尾：卸载演练周报与日报任务；只归档确实存在的影子状态
 schtasks /Delete /TN "MT5Quant\demo_weekly_check" /F
@@ -266,9 +244,8 @@ if (Test-Path data\live\paper) { Move-Item data\live\paper data\demo\paper-final
   data root）绕不开**。锁获取时机在网关连接之后（需读 login）。
 - 锁冲突 = 同 server+login+magic 已有存活实例：跳过并告警，绝不并行
   第二份（同 magic 双写 state/journal/consumed 会互相覆盖）。
-- 强杀进程后锁残留：核验锁文件内登记的 PID 确已不存在（`Get-Process
-  -Id`），且 `data\live\instances.json` 三要素判定该实例已死，方可删除
-  对应锁文件；删除前把锁文件内容抄进当日处置记录（`data\demo\` 下）。
+- 进程退出后内核自动释放锁；磁盘上的锁文件可以保留。不得仅凭父 PID
+  已退出删除锁来绕过互斥；按 §6.3 核验整棵树，清理前保留维护记录。
 
 ### 5.4 人工仲裁工具（`scripts\live_ack_execution.py`）
 
@@ -304,25 +281,131 @@ if (Test-Path data\live\paper) { Move-Item data\live\paper data\demo\paper-final
 并用 `snapshot_specs.py` 的 diff 输出确认只新增了 `currency_base` 一类
 字段、其余合约参数无漂移；刷新前后各留一份 history 版本供审计。
 
-## 6. 已知限制与监控建议
+## 6. T110 超时防护与外部 supervisor（维护窗口部署）
 
-### 6.1 风控进程"活着但冻结"的漏检风险（2026-10-30 审计发现）
+### 6.1 完成心跳、异常证据与边界
 
-`demo_check --accept` 的存活判据是**风控心跳日志覆盖当日逐小时**。
-这**不是**连续存活的绝对证明：进程在写出某小时的心跳行之后立刻卡死
-（日志冻结、循环不再推进、但 PID 仍在），到下一次小时检查前都不会
-暴露——runbook §4 已把该残余边界写进验收注记。进程内的 risk
-watchdog 线程与被冻结的进程同生共死，不能自证存活。
+网关所有 MT5 调用（包括 initialize、terminal_info、account_info、last_error、
+shutdown 和下单）由同一个专用 worker 执行，锁等待也有 deadline。网关配置
+可设置有限正数 `query_timeout_s`（默认 30 秒）、`order_timeout_s`（默认
+60 秒）。交易的账户核验、保险丝、发送与 last_error 仍在同一串行原子区内。
+超时输出 CRITICAL，写 `gateway-stall.json` 与 `exit-<component>.json`，
+以 **rc75** 硬退出；在途交易证据按进程登记，任一线程/连接先超时都尝试把
+全部已登记交易 journal 记为 unknown，expected 保持 pending。首次超时负责
+落证据，其他超时线程不抢先退出；正常结束的证据登记立即移除。恢复仍按
+§5 核对，超时不证明订单未成交。
 
-建议监控（演练期部署，成本极低）：
+三个角色均启用 faulthandler，逐轮重置堆栈 watchdog，stderr 落对应 `.err`；
+其他不可恢复异常输出 CRITICAL + traceback 并写 exit marker（rc、原因、时间）。
+完成心跳分别为 `heartbeat-<magic>.json`、`heartbeat-risk.json`、
+`heartbeat-reconcile.json`，含 PID 与 deployment_sha。数据读取失败不刷新
+完成心跳；risk 的 DataUnavailableError 记录失败后有界轮询重试，其他异常
+停机退出。heartbeat open PermissionError 最多重试 3 次（间隔 50ms），
+持续失败保留 traceback 和退出证据。
 
-1. **外部新鲜度探测**：新增一个独立计划任务（每 5–10 分钟），检查
-   `data\live\heartbeat-<magic>.json` 的内容时间戳与各风控日志的文件
-   mtime，超过阈值（建议 2× 心跳周期，如 240s）即向
-   `data\live\alerts.log` 写 STALE 告警——外部探测与被监控进程无
-   同生共死关系，是唯一能抓"活着但冻结"的手段。
-2. 日常档 `demo_check --day` 重点关注心跳连续性与 HEARTBEAT_TIMEOUT
-   类告警；收到即按 §3 检查进程实际状态（任务管理器看 CPU/线程，
-   不只看 PID 存在）。
-3. **兜底**：无法解释持仓差异 ≠ 0 与对账告警是最终防线——冻结的
-   风控最终会表现为对账差异；每日检查不可因为"有外部探测"而跳过。
+RiskGate 在组装账户快照前检查 halt/killSwitch 与独立 risk 心跳；缺失、未来、
+损坏或超过 `max(120s, 3×interval)` 即拒开仓并告警，纯平仓不经开仓闸门。
+健康检查在读取心跳（supervisor 同时读取日志 mtime）后取观测时钟，与账户
+快照/决策截止时间分离；读取期间新写入的心跳不误判未来，真正未来仍拒绝。
+当前部署固定 risk interval=10s，reconcile=30s，runner=2s。risk/reconcile
+角色文件不计入策略登记。周末报价陈旧但循环完整执行时照常更新心跳和周期
+健康日志，不能用“无决策/无 tick/空 .err”判定冻结。
+
+Python Future timeout、Timer 和 faulthandler **不能保证在原生扩展持续持有
+GIL 时继续推进**；外部 supervisor 才是硬卡死兜底。超时证据写入另有 5 秒
+退出兜底，磁盘不可写时可能只留下 stderr 或发送前 pending journal；不得
+把“无 marker”解释为健康。网络、磁盘或 OS 本身整体失去响应也超出本机
+supervisor 的保证。历史故障原因以历史取证记录为准，不能据本次修复统一
+归因为 heartbeat PermissionError。
+
+### 6.2 固定部署和统一路径
+
+在维护窗口准备**固定完整 SHA 的 detached、干净、隔离部署目录**，并明确
+同一个 DataDir、ConfigDir、PythonExe、GatewayConfig、RiskConfig、
+SessionsConfig、SpreadModel、LogDir。部署代码目录可与数据目录不同；
+`demo_run.ps1 -DataDir` 会显式传给三个角色，runner 同时覆盖配置中的
+`data_root` 与自定义 heartbeat_path。网关预检和三角色使用同一个
+`-GatewayConfig`，所有 Python 子进程均为 `-u`。
+
+示例仅为维护窗口操作模板（先替换占位值，**开发/测试不执行**）
+
+```powershell
+$deploy = (Resolve-Path '.\deployments\<fixed-sha>').Path
+$data = (Resolve-Path '.\data').Path
+$configs = (Resolve-Path '.\data\demo-configs').Path
+$python = (Resolve-Path '.\.venv\Scripts\python.exe').Path
+$gateway = (Resolve-Path '.\gateway.json').Path
+$risk = (Resolve-Path '.\config\risk-demo.toml').Path
+$sessions = (Resolve-Path '.\config\sessions.toml').Path
+$spread = (Resolve-Path '.\data\costs\spread_model.json').Path
+$research = (Resolve-Path '.\data_research\costs\spread_model.json').Path
+$logs = (Resolve-Path '.\data\demo').Path
+$sha = '<40-character-fixed-sha>'
+
+# 维护窗口，旧进程整棵树已核验退出后首次启动。
+# 不删除 journal/consumed/expected；旧登记缺 T110 身份字段时须人工迁移核验。
+& (Join-Path $deploy 'scripts\demo_run.ps1') -Mode Demo `
+  -DeploymentSha $sha -DataDir $data -ConfigDir $configs -PythonExe $python `
+  -GatewayConfig $gateway -RiskConfig $risk -SessionsConfig $sessions `
+  -SpreadModel $spread -ResearchCache $research -LogDir $logs
+```
+
+supervisor 拒绝非 Demo/实盘解锁配置、缺失或损坏登记、不符 SHA/路径/参数、
+PID 创建时间不符、未知子进程或缺 launcher 但 worker 仍活着的情况：写 halt
+与 SUPERVISOR_REFUSED，留给人工核验，不猜测身份。PID、创建时间、脚本及
+全部参数匹配后才核验 venv 父子树；停止按子进程到 launcher 顺序执行，
+使用绑定创建时间的 Windows 进程句柄防 PID 复用竞态。启动器与 supervisor
+共用 `instances.lock`（Windows FileShare.None），核验/停止/启动/登记互斥。
+
+### 6.3 每分钟计划任务安装、卸载和人工停机
+
+沿用 §6.2 的变量，仅在维护窗口明确批准后安装。任务只运行一次 supervisor，
+由 Windows 每分钟触发；不要在本次开发验证中安装或执行真实业务动作。
+
+```powershell
+$supervisor = Join-Path $deploy 'scripts\live_supervisor.py'
+$argv = @('-u', $supervisor, '--directory', $deploy, '--sha', $sha,
+  '--data-dir', $data, '--config-dir', $configs, '--python', $python,
+  '--gateway-config', $gateway, '--risk-config', $risk,
+  '--sessions-config', $sessions, '--spread-model', $spread, '--log-dir', $logs)
+$quoted = ($argv | ForEach-Object { '"' + $_ + '"' }) -join ' '
+$action = New-ScheduledTaskAction -Execute $python -Argument $quoted -WorkingDirectory $deploy
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+  -RepetitionInterval (New-TimeSpan -Minutes 1)
+$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor' `
+  -Action $action -Trigger $trigger -Settings $settings
+
+# 计划内停止业务前先停用 supervisor，防它按职责补回缺失进程。
+Disable-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor'
+# 然后设置 killSwitch，核验并停止整个父子树；仅杀 venv launcher 不够。
+New-Item -ItemType File -Force (Join-Path $data 'live\killSwitch')
+# $argv 已含解释器之后的脚本及全部固定部署参数。
+& $python @argv --inspect
+if ($LASTEXITCODE -ne 0) { throw 'identity verification refused; keep halted' }
+& $python @argv --stop
+if ($LASTEXITCODE -ne 0) { throw 'tree stop incomplete; preserve registry and investigate' }
+# Stop 保留登记；不要自动删除 halt/killSwitch/journal。
+# 卸载（不改变业务进程、halt、killSwitch 或历史证据）
+Unregister-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor' -Confirm:$false
+```
+
+supervisor 发现 risk 丢失时先写自己所有的 halt 与告警；发现缺失/停止推进的
+角色时仅重启该角色，追加 `ops-restarts.jsonl`（utc、component、reason_code、
+old_pid、new_pid、deployment_sha），不清运行窗。失败重启会在下次任务继续
+核验，身份不确定时拒绝。人工停机后应保持任务禁用，直至维护完成。
+
+自动解除只处理 `owner=supervisor` 且 token 未变化的 halt；要求三角色完成
+心跳/周期日志连续新鲜至少 5 分钟、每次检查间隔不超过 90 秒、reconcile
+确认无差异且无在途 pending。任何重启或中断重置计时。killSwitch、人工
+halt、风险 halt 从不自动删除。若 supervisor halt 已存在时又触发独立风险
+停机，保留首次原因/owner，同时写 `halt-risk-veto.json`；该 veto 只能经人工
+核对原因、确认风险消除后移除，不可为恢复自动开仓直接删它。
+
+### 6.4 验收与部署边界
+
+`demo_check` 可用 `ops-restarts.jsonl` 解释相应运行器重启，但不会用它补齐
+日志/心跳空洞，也不会据重启记录证明连续存活。逐小时日志验收仍是有限证据，
+不能替代实际故障演练。离线 blocked-fake、未知订单、PID 复用/父子树、健康
+窗口与 PowerShell 接线测试通过，仅说明代码契约可验证；**CI、真实 Demo
+断线/硬卡死/重启演练和计划任务安装均待主控在维护窗口单独执行**。

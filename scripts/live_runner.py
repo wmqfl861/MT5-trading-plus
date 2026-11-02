@@ -65,12 +65,14 @@ import json
 import os
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mt5data.store import load_bars  # noqa: E402
+from mt5live.monitor import guarded_main, reset_watchdog  # noqa: E402
 from mt5live.config import LiveConfig, load as load_config  # noqa: E402
 from mt5live.executor import ExecutionAdapter, LiveExecutor, \
     validate_live_strategy  # noqa: E402
@@ -327,7 +329,7 @@ def build_executor_stack(trading, account, market, *, cfg: LiveConfig,
                                       else account), market=market,
                     specs_path=specs_path, live_dir=live_dir,
                     spread_model=spread_model,
-                    session_policy=session_policy)
+                    session_policy=session_policy, clock=now_utc)
     sizer = (None if cfg.volume_lots is not None else
              LiveSizer(RiskSizing(cfg.risk_fraction, basis="equity"),
                        account=account, specs_path=specs_path))
@@ -342,6 +344,7 @@ def build_executor_stack(trading, account, market, *, cfg: LiveConfig,
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="mt5live 信号运行器")
     p.add_argument("--config", required=True, help="live.toml 路径")
+    p.add_argument("--data-dir", default=None, help="覆盖 data_root 与心跳目录，固定部署共用数据根")
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--once", action="store_true", help="跑一轮即退出")
     mode.add_argument("--loop", action="store_true", help="常驻轮询")
@@ -389,10 +392,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    try:
+        cfg = load_config(args.config)
+        if args.data_dir is not None:
+            cfg = replace(cfg, data_root=os.path.abspath(args.data_dir), heartbeat_path=None)
+    except Exception:
+        def invalid():
+            return load_config(args.config)
+        return guarded_main("runner", os.path.join(args.data_dir or "data", "live"),
+                            args.poll_interval, invalid)
+    return guarded_main(f"runner-{cfg.magic}", os.path.join(cfg.data_root, "live"),
+                        args.poll_interval, lambda: _run(args, cfg))
+
+
+def _run(args, cfg: LiveConfig) -> int:
     if args.offline and not args.dry_run:
         print("× --offline 只能配合 --dry-run 使用（实盘必须有终端行情源）")
         return 2
-    cfg: LiveConfig = load_config(args.config)
     strategy = load_strategy(cfg.strategy)()
     validate_live_strategy(strategy)          # M1：未实现的出场规则拒启动
 
@@ -631,9 +647,11 @@ def main(argv=None) -> int:
     try:
         skips_logged = runner.market_closed_skips
         while True:
+            reset_watchdog(args.poll_interval)
             now = now_utc()
             decision = None
             error = None
+            cycle_complete = True
             if paper is not None:
                 # T34：每轮先按实时 bid/ask 检查 SL/TP（触发即平、成交带
                 # reason），再进执行器轮——保护性出场同轮就被识别为
@@ -650,6 +668,7 @@ def main(argv=None) -> int:
             except MarketClosedError:
                 pass   # 理论上 runner 已捕获；双保险不刷错误
             except Exception as exc:   # 决策侧异常：记录并继续（数据滞后等可自愈）
+                cycle_complete = False
                 error = f"{type(exc).__name__}: {exc}"
                 print(f"[{now.isoformat()}] 决策异常：{error}", flush=True)
             if runner.market_closed_skips != skips_logged:
@@ -668,13 +687,9 @@ def main(argv=None) -> int:
             if executor is not None:
                 try:
                     rr = executor.poll(decision, now)
-                except Exception as exc:
-                    # 执行侧异常：原样上抛前先把状态写进心跳（风控要能看到）；
-                    # 心跳本身写失败也不再掩盖原始异常（T33/M1）
-                    hb_writer.write(decision=decision,
-                                    error=f"执行异常 {type(exc).__name__}: "
-                                          f"{exc}",
-                                    dry_run=args.dry_run)
+                except Exception:
+                    # No completed-loop heartbeat on an interrupted execution.
+                    # guarded_main records traceback and exit evidence.
                     raise
                 print(f"    执行 {rr.action}：net {rr.net_before} → "
                       f"{rr.net_after}，{len(rr.orders)} 笔请求"
@@ -686,10 +701,15 @@ def main(argv=None) -> int:
                           f"{' [部分成交]' if o.partial else ''}", flush=True)
                 if rr.error:
                     error = rr.error
+                    if (rr.action == "blocked_broker_unavailable"
+                            or "risk_gate_error:" in rr.error):
+                        cycle_complete = False
             elif decision is not None:
                 print("    [dry-run] 不下单", flush=True)
-            hb_writer.write(decision=decision, error=error,
-                            dry_run=args.dry_run)
+            if cycle_complete:
+                hb_writer.write(decision=decision, error=error,
+                                dry_run=args.dry_run)
+                print(f"[{now_utc().isoformat()}] loop_completed magic={cfg.magic}", flush=True)
             if args.once:
                 return 0
             time.sleep(max(args.poll_interval, 0.1))

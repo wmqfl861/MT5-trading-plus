@@ -42,6 +42,7 @@ from mt5live.monitor import (
     append_alert,
     naive_utc,
     parse_iso,
+    risk_health,
 )
 from mt5live.riskproc import OrderRequest, RiskDecision, RiskProcess, RiskState, daily_pnl
 from mt5quant.costs.spread import BUCKET_TZ, SpreadModel
@@ -293,6 +294,16 @@ class RiskGate:
             return RiskDecision(
                 False, f"reconcile_paused: 全局人工暂停（pause.json，"
                 f"{manual.reason or '原因见文件'}），暂停开仓")
+
+        # Halt and independent risk health precede any potentially blocking IPC.
+        stopped = self._process.check_stopped(n)
+        if stopped is not None:
+            return stopped
+        health = risk_health(self._live_dir, clock=self._clock)
+        if not health.ok:
+            reason = f"risk_health: {health.reason}; independent monitor unavailable"
+            append_alert(self._live_dir, "RISK_HEALTH", reason, n)
+            return RiskDecision(False, reason)
 
         # 1) 组装 RiskState（各来源缺数据 → 检查器 missing_data 拒单）。
         #    R7/N-C2 一致快照：账户提供 snapshot()（paper 目录聚合视图

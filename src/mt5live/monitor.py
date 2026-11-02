@@ -12,12 +12,17 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
+import faulthandler
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 
 from mt5data.store import atomic_replace, fsync_file
-from mt5live.fileio import append_line, write_json_atomic
+from mt5live.fileio import append_line, file_lock, write_json_atomic
 from mt5quant.costs.spread import SpreadModel
 
 HEARTBEAT_FILE = "heartbeat.json"
@@ -80,13 +85,9 @@ def read_heartbeat_path(path: str) -> Heartbeat | None:
 
     文件不存在 → None，内容不合法 → ValueError（如实抛错）。
     """
-    if not os.path.exists(path):
+    data = read_json_retry(path)
+    if data is None:
         return None
-    with open(path, encoding="utf-8") as f:
-        try:
-            data = json.load(f)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"{path} 不是合法 JSON：{e}") from e
     if (not isinstance(data, dict) or "runner_alive" not in data
             or "ts" not in data):
         raise ValueError(f"{path} 缺 runner_alive/ts 字段：{data!r}")
@@ -106,7 +107,8 @@ def heartbeat_files(live_dir: str) -> list[str]:
     per_magic = sorted(
         os.path.join(live_dir, name)
         for name in os.listdir(live_dir)
-        if name.startswith("heartbeat-") and name.endswith(".json"))
+        if name.startswith("heartbeat-") and name.endswith(".json")
+        and name[len("heartbeat-"):-len(".json")].isdigit())
     legacy = os.path.join(live_dir, HEARTBEAT_FILE)
     if os.path.exists(legacy):
         per_magic.append(legacy)
@@ -146,6 +148,8 @@ def heartbeat_status(hb: Heartbeat | None, now: datetime,
     if hb is None:
         return HeartbeatStatus(False, "missing", None)
     age = (naive_utc(now) - hb.ts).total_seconds()
+    if age < 0:
+        return HeartbeatStatus(False, "future", age)
     if not hb.runner_alive:
         return HeartbeatStatus(False, "runner_stopped", age)
     if age > timeout_s:
@@ -157,6 +161,114 @@ def check_heartbeat(live_dir: str, now: datetime,
                     *, timeout_s: float = DEFAULT_HEARTBEAT_TIMEOUT_S,
                     ) -> HeartbeatStatus:
     return heartbeat_status(read_heartbeat(live_dir), now, timeout_s=timeout_s)
+
+
+# ---- T110 completed-loop health and process evidence ----
+
+def read_json_retry(path: str):
+    """Bounded Windows sharing retry; persistent access failure stays visible."""
+    for attempt in range(3):
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return None
+        except PermissionError:
+            if attempt == 2:
+                raise
+            time.sleep(0.05)
+
+
+def health_timeout(interval: float) -> float:
+    if (isinstance(interval, bool) or not isinstance(interval, (int, float))
+            or not math.isfinite(interval) or interval <= 0):
+        raise ValueError("interval must be finite and positive")
+    return max(120.0, 3.0 * interval)
+
+
+def write_role_heartbeat(live_dir: str, component: str, *, interval: float,
+                         now: datetime | None = None, **details) -> None:
+    health_timeout(interval)
+    write_json_atomic(os.path.join(live_dir, f"heartbeat-{component}.json"), {
+        **details, "component": component, "runner_alive": True,
+        "ts": iso_utc(now or datetime.now(timezone.utc)),
+        "interval_s": interval, "pid": os.getpid(),
+        "deployment_sha": os.environ.get("MT5_DEPLOYMENT_SHA", "")})
+
+
+def risk_health(live_dir: str, *, clock=None, interval: float = 10.0) -> HeartbeatStatus:
+    # Observe time AFTER the read: a writer may complete during sharing retries.
+    # Configured interval, never an untrusted heartbeat's self-declared TTL.
+    observe = clock or (lambda: datetime.now(timezone.utc))
+    try:
+        hb = read_heartbeat_path(os.path.join(live_dir, "heartbeat-risk.json"))
+        return heartbeat_status(hb, observe(), timeout_s=health_timeout(interval))
+    except (OSError, ValueError):
+        return HeartbeatStatus(False, "unreadable", None)
+
+
+def write_halt_once(live_dir: str, reason: str, now: datetime, *,
+                    owner: str = "risk", token: str | None = None) -> bool:
+    """Shared lock + exclusive create preserves even a concurrent manual halt."""
+    os.makedirs(live_dir, exist_ok=True)
+    with file_lock(os.path.join(live_dir, "halt.lock")):
+        try:
+            with open(os.path.join(live_dir, "halt.json"), "x", encoding="utf-8") as f:
+                json.dump({"reason": reason, "ts": iso_utc(now), "owner": owner,
+                           "token": token or uuid.uuid4().hex}, f)
+                f.flush()
+                os.fsync(f.fileno())
+        except FileExistsError:
+            existing = read_json_retry(os.path.join(live_dir, "halt.json"))
+            if owner != "supervisor" and isinstance(existing, dict) and existing.get("owner") == "supervisor":
+                # Preserve the first owner/reason, but do not let its later
+                # auto-clear erase a concurrent independent risk/manual stop.
+                write_json_atomic(os.path.join(live_dir, "halt-risk-veto.json"), {
+                    "reason": reason, "owner": owner, "ts": iso_utc(now)})
+            return False
+    append_alert(live_dir, ALERT_RISK_HALT, f"{owner} halt: {reason}", now)
+    return True
+
+
+def reset_watchdog(interval: float) -> None:
+    # Stack evidence only: the independent supervisor handles hard process stalls.
+    faulthandler.dump_traceback_later(health_timeout(interval), repeat=True, file=2)
+
+
+def guarded_main(component: str, live_dir: str, interval: float, function) -> int:
+    """All three CLI roles use this boundary, including startup and shutdown."""
+    old = {k: os.environ.get(k) for k in ("MT5_LIVE_DIR", "MT5_COMPONENT")}
+    os.environ["MT5_LIVE_DIR"] = os.path.abspath(live_dir)
+    os.environ["MT5_COMPONENT"] = component
+    rc, reason = 2, "startup_failed"
+    try:
+        faulthandler.enable(file=2)
+        reset_watchdog(interval)
+        rc = function()
+        reason = "completed" if rc == 0 else f"exit_code_{rc}"
+        if rc:
+            logging.critical("%s failed rc=%s", component, rc)
+        return rc
+    except KeyboardInterrupt:
+        rc, reason = 0, "interrupted"
+        return rc
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        logging.critical("%s fatal: %s", component, reason, exc_info=True)
+        write_halt_once(live_dir, f"{component}_fatal: {reason}", datetime.now(timezone.utc))
+        return rc
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+        try:
+            write_json_atomic(os.path.join(live_dir, f"exit-{component}.json"), {
+                "component": component, "rc": rc, "reason": reason,
+                "ts": iso_utc(datetime.now(timezone.utc)), "pid": os.getpid()})
+        finally:
+            for key, value in old.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 # ---- 即时告警 ----

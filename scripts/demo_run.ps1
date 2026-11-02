@@ -26,20 +26,13 @@
     无 -Mode 拒绝裸跑（-Stop 例外）——两种模式的成交路径、手数口径与
     验收边界完全不同，不允许缺省猜测。
 
-    生命周期（R8-I6 + R9-I5/T55，单实例）：实例登记在
-    <DataDir>/live/instances.json（字段 pid/kind/magic/mode/started_utc/
-    log/account_hint），**跨 LogDir**（同一 DataDir 换日志目录不再漏检）。
-    存活判定三要素：PID 存在 + 进程创建时间与登记 started_utc 容差
-    5 秒（防 PID 复用误认）+ 命令行特征（runner→live_runner.py、
-    risk→risk_process.py、reconcile→live_reconcile.py）。同 magic/角色
-    且 Mode 匹配的存活实例 → 跳过并告警，**绝不并行第二份**（每 magic
-    单写者：state-<magic>.json、意图与下单日志不允许两进程同时写）；
-    Mode 不符的存活实例 → mode conflict 拒绝启动。检测→启动→登记→
-    run-manifest 追加的临界区经 <DataDir>/live/instances.lock 独占
-    （[IO.File]::Open FileShare::None；锁被占用 → 本次**立即失败**）；
-    边界：该锁只互斥本 ps1 的并发启动/停止，与 src/mt5live/fileio 的
-    字节锁不互通（该锁文件只有本 ps1 读写）。pids.txt 降级为纯追加的
-    启动历史日志，不再参与存活检测。
+    生命周期（T110，单实例）：实例登记在 <DataDir>/live/instances.json。
+    固定部署的检测、停止复用 live_supervisor.py 的 verified_tree：完整
+    SHA/目录/参数、PID 创建时间及全部父子关系核验。不可读 PID、存活孤儿
+    worker、身份不符均拒绝，不当作缺失后补起。旧无固定身份登记的补缺和
+    -Stop 已禁用，保留登记供维护窗口迁移。检测→启动→登记→run-manifest
+    追加在 instances.lock 独占段内完成（FileShare.None，与 supervisor
+    共用）。pids.txt 只是追加式启动历史，不参与存活检测。
 
     运行窗登记（R10/C-1）：<DataDir>/live/run-manifest.json——
     schema_version/mode/magics/account_hint 描述当前运行；runs **追加式**
@@ -66,28 +59,21 @@
         # 风控进程下一轮写 data/live/halt.json（一键停机，不自动平仓），
         # 各执行器开仓腿随即被拒；确认后按方式二结束进程。
 
-    停止方式二（-Stop，T55：只处理 instances.json 当前登记项）：
-        powershell -ExecutionPolicy Bypass -File scripts/demo_run.ps1 -Stop
-        # 逐项按三要素核验存活后 Stop-Process；核验不通过/已退出的不动。
-        # 不再遍历 pids.txt 历史 PID（历史 PID 可能已被系统复用，盲杀
-        # 会误伤无关进程）。强杀不留退出日志——计划内停止优先
-        # killSwitch/Ctrl-C。
+    停止方式二（T110）：先禁用 supervisor 计划任务并设置 killSwitch，
+    再带启动时完全相同的 -DeploymentSha / DataDir / ConfigDir / PythonExe /
+    GatewayConfig / RiskConfig / SessionsConfig / SpreadModel / LogDir 调 -Stop。
+    它调用 live_supervisor.py --stop，先核验全部角色，再子先父后停止，
+    不清空登记；身份不确定则拒绝。完整命令见 runbook §6.2/§6.3。
 
-    恢复（只移除停机信号，仅重启已确认退出的进程）：
-        Remove-Item data/live/killSwitch, data/live/halt.json -ErrorAction SilentlyContinue
-        # ① 确认哪些进程真的退了：instances.json 逐项核验（或
-        #    Get-Process -Id <pid>）+ 对应日志尾部（"收到中断，退出"/
-        #    Traceback = 真退出）；
-        # ② 只重启已确认退出的角色——重跑本脚本（同 -Mode）即可：它按
-        #    instances.json 检测存活实例并跳过，只补缺的运行器/风控/对账；
-        # ③ 绝不"清掉登记后全组重跑"——同 magic 并行第二份运行器会双写
-        #    state-<magic>.json/意图/下单日志（R8-I6）。
+    恢复：人工完成对账与停机原因核验后，只补严格证明整树已退出的角色。
+    固定部署重用同一组路径与 SHA；旧 PID/basename 登记不能自动迁移。
+    禁止清登记后满组重跑，禁止仅杀 venv launcher。
 
 .PARAMETER Mode
     PaperSoak | Demo（必填；-Stop 时不需要）。
 .PARAMETER Stop
-    停止当前登记的演练进程：只读 <DataDir>/live/instances.json 当前项，
-    逐项按三要素核验存活后停止，随后清空登记。不需要 -Mode。
+    仅固定 Demo 部署：共用 supervisor 的完整树核验与停止；需要 killSwitch
+    和完整固定部署路径参数，保留登记。不需要 -Mode。
 .PARAMETER PrecheckOnly
     只做启动前检查 + 生命周期检测（含 Demo 模式的 DEMO 保险丝与网关
     预检 dry 检查），不启动任何进程、不写 pids.txt、不改登记文件。
@@ -129,6 +115,9 @@ param(
     [string]$SpreadModel = "data/costs/spread_model.json",
     [string]$ResearchCache = "data_research/costs/spread_model.json",
     [string]$PythonExe = ".venv/Scripts/python.exe",
+    [string]$GatewayConfig = "",
+    [string]$SessionsConfig = "config/sessions.toml",
+    [string]$DeploymentSha = "",
     [double]$MinFreeGB = 5
 )
 
@@ -152,7 +141,7 @@ if ($Stop) {
         Write-Host "                     固定 volume_lots=0.01（禁 risk_fraction）；启动前跑 DEMO 保险丝与网关预检。"
         Write-Host ""
         Write-Host "示例：powershell -ExecutionPolicy Bypass -File scripts/demo_run.ps1 -Mode Demo"
-        Write-Host "停止：powershell -ExecutionPolicy Bypass -File scripts/demo_run.ps1 -Stop"
+        Write-Host "停止：固定部署参数与 -Stop（先禁用 supervisor 并设置 killSwitch，见 runbook §6.3）"
         exit 1
     }
     if ($Mode -ne "PaperSoak" -and $Mode -ne "Demo") {
@@ -192,34 +181,40 @@ function Assert-Ok([bool]$cond, [string]$message) {
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:PyFileExit = 0
 
-function Test-InstanceAlive($entry) {
-    # T55/R9-I5 三要素存活判定：PID 存在 + 进程创建时间与登记
-    # started_utc 容差 5 秒（防 PID 复用误认）+ 命令行特征（防把无关
-    # 进程当成演练实例）。任一不满足 → 不视为存活（不挡启动、不停止）。
-    $procId = 0
-    if (-not [int]::TryParse([string]$entry.pid, [ref]$procId)) { return $false }
-    if ($procId -le 0) { return $false }
-    $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
-    if ($null -eq $proc) { return $false }
-    try {
-        $startedUtc = [DateTimeOffset]::Parse([string]$entry.started_utc,
-            [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
-        $createdUtc = $proc.StartTime.ToUniversalTime()
-        if ([math]::Abs(($createdUtc - $startedUtc).TotalSeconds) -gt 5) { return $false }
-    } catch { return $false }
-    $feature = $null
-    switch ([string]$entry.kind) {
-        "runner"    { $feature = "live_runner.py" }
-        "risk"      { $feature = "risk_process.py" }
-        "reconcile" { $feature = "live_reconcile.py" }
+function Invoke-VerifiedLifecycle([string]$action) {
+    if ($DeploymentSha -notmatch '^[0-9a-f]{40}$') {
+        throw "verified-tree-required: fixed DeploymentSha and explicit paths are required; legacy PID-only stop/replacement is disabled"
     }
-    if ($null -eq $feature) { return $false }
-    $cmd = $null
-    try {
-        $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -ErrorAction SilentlyContinue).CommandLine
-    } catch { }
-    if ([string]::IsNullOrWhiteSpace([string]$cmd)) { return $false }
-    return (([string]$cmd).Contains($feature))
+    $lifecyclePython = Resolve-RepoPath $PythonExe
+    if (-not (Test-Path -LiteralPath $lifecyclePython -PathType Leaf)) {
+        throw "verified-tree-required: explicit PythonExe is missing"
+    }
+    $gatewayPath = $GatewayConfig
+    if ([string]::IsNullOrWhiteSpace($gatewayPath)) {
+        $gatewayPath = "config.json"
+        if (-not (Test-Path (Resolve-RepoPath $gatewayPath)) -and (Test-Path (Resolve-RepoPath "gateway.json"))) {
+            $gatewayPath = "gateway.json"
+        }
+    }
+    $lifecycleArgs = @(
+        "-u", (Join-Path $RepoRoot "scripts/live_supervisor.py"),
+        "--directory", $RepoRoot, "--sha", $DeploymentSha,
+        "--data-dir", (Resolve-RepoPath $DataDir),
+        "--config-dir", (Resolve-RepoPath $ConfigDir),
+        "--python", $lifecyclePython,
+        "--gateway-config", (Resolve-RepoPath $gatewayPath),
+        "--risk-config", (Resolve-RepoPath $RiskConfig),
+        "--sessions-config", (Resolve-RepoPath $SessionsConfig),
+        "--spread-model", (Resolve-RepoPath $SpreadModel),
+        "--log-dir", (Resolve-RepoPath $LogDir), ("--" + $action)
+    )
+    $raw = & $lifecyclePython @lifecycleArgs
+    $code = $LASTEXITCODE
+    try { $result = ($raw -join "`n") | ConvertFrom-Json } catch { $result = $null }
+    if ($code -ne 0 -or $null -eq $result -or $result.refused) {
+        throw ("verified-tree-required: " + ($raw -join "`n"))
+    }
+    return $result
 }
 
 function Write-InstancesFile([string]$path, [array]$entries) {
@@ -251,56 +246,17 @@ function Get-UtcStamp {
         [Globalization.CultureInfo]::InvariantCulture)
 }
 
-# ---- -Stop：停止当前登记的演练进程（T55：只处理当前项，不遍历历史） ----
+# ---- Stop shares the supervisor's full-tree identity and termination path. ----
 if ($Stop) {
-    $stopDataDir = Resolve-RepoPath $DataDir
-    $stopLiveDir = Join-Path $stopDataDir "live"
-    New-Item -ItemType Directory -Force -Path $stopLiveDir | Out-Null
-    $stopLockPath = Join-Path $stopLiveDir "instances.lock"
     try {
-        $script:InstancesLockHandle = [IO.File]::Open($stopLockPath,
-            [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        $result = Invoke-VerifiedLifecycle "stop"
+        Write-Host ("Verified stopped roles: " + ($result.stopped -join ","))
+        Write-Host "instances.json retained for audit and verified restart."
+        exit 0
     } catch {
-        Write-Host "× instances.lock 已被独占——另一个启动/停止流程正在进行。本次立即失败。" -ForegroundColor Red
+        Write-Host ([string]$_) -ForegroundColor Red
         exit 1
     }
-    try {
-        $stopRegFile = Join-Path $stopLiveDir "instances.json"
-        $stopEntries = @()
-        if (Test-Path $stopRegFile) {
-            try {
-                $parsed = Get-Content -Raw -Encoding UTF8 $stopRegFile | ConvertFrom-Json
-                if ($null -ne $parsed -and $null -ne $parsed.instances) {
-                    $stopEntries = @($parsed.instances | Where-Object { $null -ne $_ })
-                }
-            } catch {
-                Write-Host "× instances.json JSON 损坏——无法核验当前登记项，拒绝盲停（人工核验该文件后再操作）。" -ForegroundColor Red
-                exit 1
-            }
-        }
-        if ($stopEntries.Count -eq 0) {
-            Write-Host "instances.json 无当前登记项——无可停止的演练进程。"
-        } else {
-            Write-Host ("== -Stop：核验并停止 {0} 个登记项（只处理当前项，不遍历 pids.txt 历史 PID）==" -f $stopEntries.Count)
-            foreach ($e in $stopEntries) {
-                if (Test-InstanceAlive $e) {
-                    Write-Host ("  停止 {0} PID {1}（mode={2}）……" -f $e.kind, $e.pid, $e.mode)
-                    Stop-Process -Id ([int]$e.pid) -Force -ErrorAction SilentlyContinue
-                } else {
-                    Write-Host ("  跳过 {0} PID {1}（三要素核验不通过：已退出/创建时间不符/特征不符——不视为存活，不动）" -f $e.kind, $e.pid)
-                }
-            }
-            # 当前登记项处理完毕 → 清空（启动历史仍在 pids.txt 与日志里）
-            Write-InstancesFile $stopRegFile @()
-            Write-Host "登记表已清空（instances.json instances=[]；启动历史见各 LogDir pids.txt）。"
-        }
-    } finally {
-        if ($null -ne $script:InstancesLockHandle) {
-            $script:InstancesLockHandle.Close()
-            $script:InstancesLockHandle = $null
-        }
-    }
-    exit 0
 }
 
 Write-Host ("== 演练启动前检查（阶段 F，蓝图 §7；模式 = {0}） ==" -f $Mode)
@@ -312,6 +268,34 @@ if (-not (Test-Path $PythonExeAbs)) {
     $PythonExeAbs = "python"
 }
 Assert-Ok ($PythonExeAbs -eq "python" -or (Test-Path $PythonExeAbs)) "Python 解释器可用：$PythonExeAbs"
+
+# One effective gateway configuration for precheck AND every child.
+if ([string]::IsNullOrWhiteSpace($GatewayConfig)) {
+    $GatewayConfig = "config.json"
+    if (-not (Test-Path (Resolve-RepoPath $GatewayConfig)) -and (Test-Path (Resolve-RepoPath "gateway.json"))) {
+        $GatewayConfig = "gateway.json"
+    }
+}
+$GatewayConfigAbs = Resolve-RepoPath $GatewayConfig
+$env:PYTHONUNBUFFERED = "1"
+if (-not [string]::IsNullOrWhiteSpace($DeploymentSha)) {
+    if ($Mode -ne "Demo" -or $DeploymentSha -notmatch '^[0-9a-f]{40}$') {
+        throw "DeploymentSha requires Demo and a full fixed SHA"
+    }
+    $actualSha = (& git -C $RepoRoot rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $actualSha -ne $DeploymentSha) { throw "deployment SHA mismatch" }
+    & git -C $RepoRoot symbolic-ref -q HEAD | Out-Null
+    if ($LASTEXITCODE -ne 1) { throw "deployment must be detached at fixed SHA" }
+    $dirty = & git -C $RepoRoot status --porcelain --untracked-files=all
+    if ($LASTEXITCODE -ne 0 -or $dirty) { throw "deployment must be clean and isolated" }
+    if ($PythonExeAbs -eq "python") { throw "deployment requires explicit PythonExe" }
+    $env:MT5_DEPLOYMENT_SHA = $DeploymentSha
+} else {
+    $env:MT5_DEPLOYMENT_SHA = ""
+}
+if ($Mode -eq "Demo" -and -not $SkipGatewayCheck) {
+    Assert-Ok (Test-Path $GatewayConfigAbs) "Explicit gateway configuration: $GatewayConfigAbs"
+}
 
 # 2) 点差模型缓存（点差闸门 + 成本口径；缺文件在 PaperSoak 只告警、在
 #    Demo 实盘路径拒绝启动——全链路演练要求重建后的模型在场）
@@ -327,7 +311,7 @@ $SpecsAbs = Resolve-RepoPath (Join-Path $DataDir "specs/latest.json")
 Assert-Ok (Test-Path $SpecsAbs) "合约快照存在：$SpecsAbs"
 
 # 5) 会话配置（换日禁入窗唯一来源）
-$SessionsAbs = Resolve-RepoPath "config/sessions.toml"
+$SessionsAbs = Resolve-RepoPath $SessionsConfig
 Assert-Ok (Test-Path $SessionsAbs) "会话配置存在：$SessionsAbs"
 
 # 6) 风控配置
@@ -440,35 +424,50 @@ try {
         }
     }
 
-    # 生命周期检测（T55/R9-I5）：唯一来源 <DataDir>/live/instances.json
-    # （跨 LogDir）；pids.txt 只是历史日志。死项剔除；Mode 不符 → 冲突拒绝。
-    $aliveRunners = @{}   # magic -> pid（该 magic 已有存活运行器 → 跳过）
-    $aliveRoles = @{}     # risk/reconcile -> pid（已有存活进程 → 跳过）
+    # Fixed deployments share the supervisor's complete process-tree verifier.
+    # Legacy entries cannot prove missing workers; never drop them and fill gaps.
+    $aliveRunners = @{}
+    $aliveRoles = @{}
     $script:RegistryKept = @()
+    $entries = @()
     if (Test-Path $InstanceRegistryFile) {
-        $entries = @()
         try {
             $parsed = Get-Content -Raw -Encoding UTF8 $InstanceRegistryFile | ConvertFrom-Json
-            if ($null -ne $parsed -and $null -ne $parsed.instances) {
-                $entries = @($parsed.instances | Where-Object { $null -ne $_ })
+            if ($null -eq $parsed -or $parsed.schema_version -ne 1 -or $null -eq $parsed.instances) {
+                throw "invalid schema"
             }
+            $entries = @($parsed.instances | Where-Object { $null -ne $_ })
         } catch {
-            Write-Host "× instances.json JSON 损坏——无法检测存活实例（fail-closed）。人工核验该文件后再启动。" -ForegroundColor Red
+            Write-Host "instances.json invalid: refuse startup" -ForegroundColor Red
+            exit 1
+        }
+    }
+    foreach ($e in $entries) {
+        if ([string]$e.mode -ne $Mode) {
+            Write-Host ("mode conflict: kind={0} magic={1} PID={2}" -f $e.kind, $e.magic, $e.pid) -ForegroundColor Red
+            exit 1
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($DeploymentSha)) {
+        if ($entries.Count -gt 0) {
+            Write-Host "verified-tree-required: legacy entries cannot authorize stop/replacement; retain registry and migrate verified identity" -ForegroundColor Red
+            exit 1
+        }
+    } else {
+        try { $inspection = Invoke-VerifiedLifecycle "inspect" } catch {
+            Write-Host ([string]$_) -ForegroundColor Red
             exit 1
         }
         foreach ($e in $entries) {
-            if (-not (Test-InstanceAlive $e)) { continue }   # 死项：不挡启动
-            if ([string]$e.mode -ne $Mode) {
-                $magicDisp = "-"
-                if ($null -ne $e.magic) { $magicDisp = $e.magic }
-                Write-Host ("× mode conflict：instances.json 登记的存活实例 kind={0} magic={1} PID={2} 运行于 Mode={3}，与本次 Mode={4} 不符——同 magic/角色跨模式并行会双写状态与日志，拒绝启动（先 -Stop 旧实例或换配置）。" -f $e.kind, $magicDisp, $e.pid, $e.mode, $Mode) -ForegroundColor Red
-                exit 1
-            }
+            $key = [string]$e.kind
+            if ($key -eq "runner") { $key = [string]$e.magic }
+            $alive = $inspection.alive.PSObject.Properties[$key]
+            if ($null -eq $alive) { continue }  # verifier proved the WHOLE tree absent
             $script:RegistryKept += $e
             if ([string]$e.kind -eq "runner") {
-                $aliveRunners[[int]$e.magic] = [int]$e.pid
+                $aliveRunners[[int]$e.magic] = [int]$alive.Value
             } else {
-                $aliveRoles[[string]$e.kind] = [int]$e.pid
+                $aliveRoles[[string]$e.kind] = [int]$alive.Value
             }
         }
     }
@@ -491,9 +490,10 @@ try:
     from mt5gw.models import ACCOUNT_TRADE_MODE_DEMO
 except ImportError:                                    # 常量兜底：0=DEMO
     ACCOUNT_TRADE_MODE_DEMO = 0
-cfg_path = next((p for p in ("config.json", "gateway.json") if Path(p).exists()), None)
-cfg = load(cfg_path) if cfg_path else GatewayConfig()
-symbols = [s for s in sys.argv[1:] if s]
+cfg = load(sys.argv[1])
+if cfg.allow_live_trading is not False:
+    raise SystemExit("FAIL Demo configuration must keep allow_live_trading=false")
+symbols = [s for s in sys.argv[2:] if s]
 try:
     with MT5Gateway(cfg) as gw:
         st = gw.account.state()          # 读不到 → 异常 → fail-closed 拒启动
@@ -546,7 +546,7 @@ print('sha256=' + hashlib.sha256(data).hexdigest())
             }
         } else {
             Write-Host "== Demo 专项预检：DEMO 保险丝 + 网关连通（只读，不下单） =="
-            Invoke-PythonFile $demoFusePy $symbols
+            Invoke-PythonFile $demoFusePy (@($GatewayConfigAbs) + $symbols)
             if ($script:PyFileExit -ne 0) {
                 Write-Host "  [X]  DEMO 保险丝/网关预检未通过——不启动任何进程。" -ForegroundColor Red
                 exit 1
@@ -579,12 +579,19 @@ print('sha256=' + hashlib.sha256(data).hexdigest())
     }
 
     function Start-DemoProcess([string]$kind, [string]$name, $magicVal, [string[]]$argList) {
+        $argList = @("-u") + $argList
         $log = Join-Path $LogDirAbs ("{0}-{1}-{2}.log" -f $kind, $name, $stamp)
         $errLog = "$log.err"
         Write-Host ("启动 {0} {1} -> {2}" -f $kind, $name, (Split-Path $log -Leaf))
-        $p = Start-Process -FilePath $PythonExeAbs -ArgumentList $argList `
+        $quotedArgs = @($argList | ForEach-Object {
+            if ($_.Contains('"')) { throw "Unsupported quote in process argument" }
+            '"' + $_.TrimEnd('\') + '"'
+        })
+        $p = Start-Process -FilePath $PythonExeAbs -ArgumentList $quotedArgs `
             -WorkingDirectory $RepoRoot -WindowStyle Hidden -PassThru `
             -RedirectStandardOutput $log -RedirectStandardError $errLog
+        $registeredStart = (Get-Date).ToUniversalTime().ToString("o")
+        try { $registeredStart = $p.StartTime.ToUniversalTime().ToString("o") } catch { }
         $script:manifest += [ordered]@{
             kind = $kind; name = $name; pid = $p.Id
             log = $log; err_log = $errLog
@@ -595,8 +602,11 @@ print('sha256=' + hashlib.sha256(data).hexdigest())
         # T55 实例登记（instances.json，锁内）：存活三要素据此核验
         $script:RegistryKept += [ordered]@{
             pid = $p.Id; kind = $kind; magic = $magicVal; mode = $Mode
-            started_utc = Get-UtcStamp
+            started_utc = $registeredStart
             log = $log; account_hint = $accountHint
+            argv = @($PythonExeAbs) + $argList
+            data_dir = $DataDirAbs; deployment_dir = $RepoRoot
+            deployment_sha = $DeploymentSha; gateway_config = $GatewayConfigAbs
         }
         Write-InstancesFile $InstanceRegistryFile $script:RegistryKept
         return $p.Id
@@ -620,10 +630,13 @@ print('sha256=' + hashlib.sha256(data).hexdigest())
             continue
         }
         $runnerArgs = @(
-            "scripts/live_runner.py",
-            "--config", $c.FullName,
+            (Join-Path $RepoRoot "scripts/live_runner.py"),
+            "--data-dir", $DataDirAbs,
             "--loop",
+            "--config", $c.FullName,
+            "--gateway-config", $GatewayConfigAbs,
             "--risk-config", $RiskConfigAbs,
+            "--sessions-config", $SessionsAbs,
             "--spread-model", $SpreadModelAbs
         )
         if ($Mode -eq "PaperSoak") {
@@ -644,10 +657,13 @@ print('sha256=' + hashlib.sha256(data).hexdigest())
         Write-Host ("跳过风控进程（已有存活 PID {0}——绝不并行第二份）" -f $aliveRoles["risk"]) -ForegroundColor Yellow
     } else {
         $riskArgs = @(
-            "scripts/risk_process.py",
-            "--config", $RiskConfigAbs,
+            (Join-Path $RepoRoot "scripts/risk_process.py"),
             "--data-dir", $DataDirAbs,
-            "--loop", "--interval", "10"
+            "--loop",
+            "--gw-config", $GatewayConfigAbs,
+            "--interval", "10.0",
+            "--config", $RiskConfigAbs,
+            "--sessions-config", $SessionsAbs
         )
         if ($Mode -eq "PaperSoak") { $riskArgs += @("--paper-state", $PaperStateAbs) }
         Start-DemoProcess "risk" "account" $null $riskArgs | Out-Null
@@ -660,9 +676,11 @@ print('sha256=' + hashlib.sha256(data).hexdigest())
         Write-Host ("跳过对账进程（已有存活 PID {0}——绝不并行第二份）" -f $aliveRoles["reconcile"]) -ForegroundColor Yellow
     } else {
         $reconArgs = @(
-            "scripts/live_reconcile.py",
+            (Join-Path $RepoRoot "scripts/live_reconcile.py"),
             "--data-dir", $DataDirAbs,
-            "--loop", "--interval", "30"
+            "--loop",
+            "--gw-config", $GatewayConfigAbs,
+            "--interval", "30.0"
         )
         if ($Mode -eq "PaperSoak") { $reconArgs += @("--paper-state", $PaperStateAbs) }
         Start-DemoProcess "reconcile" "all" $null $reconArgs | Out-Null
@@ -702,7 +720,7 @@ print('sha256=' + hashlib.sha256(data).hexdigest())
     Write-Host ""
     Write-Host ("模式 {0}：本次新启动 {1} 个进程（登记表：{2}；PID 历史日志（追加式）：{3}；运行清单：{4}；运行窗：{5}）" -f $Mode, $manifest.Count, $InstanceRegistryFile, $pidsFile, $manifestFile, $RunManifestFile)
     Write-Host "停止（killSwitch）：New-Item -ItemType File data/live/killSwitch   （先停开仓；恢复=只移除停机信号，重启仅针对已确认退出的进程）"
-    Write-Host "停止（-Stop）      ：powershell -ExecutionPolicy Bypass -File scripts/demo_run.ps1 -Stop   （只停 instances.json 当前核验存活的登记项）"
+    Write-Host "停止（-Stop）      ：复用同一完整固定部署参数；先禁用 supervisor 并设置 killSwitch，见 runbook §6.3（整树核验，保留登记）"
     Write-Host "日常检查        ：$PythonExeAbs scripts/demo_check.py --day YYYY-MM-DD   或 --summary"
     Write-Host "阶段 F 验收     ：$PythonExeAbs scripts/demo_check.py --accept   （严格：无样本/未覆盖=未验收）"
 } finally {

@@ -7,6 +7,7 @@
 """
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass
 
@@ -50,8 +51,15 @@ class GatewayConfig:
     # Exness 为 GMT+0 故默认 0.0；换 GMT+2/+3 券商必须显式声明并经
     # mt5data.clock.check_server_offset 用实测时钟校验
     server_utc_offset_hours: float = 0.0
+    query_timeout_s: float = 30.0
+    order_timeout_s: float = 60.0
 
     def __post_init__(self):
+        for key in ("query_timeout_s", "order_timeout_s"):
+            value = getattr(self, key)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value <= 0):
+                raise ValueError(f"{key} must be finite and positive: {value!r}")
         # 代码构造（GatewayConfig(...)、dataclasses.replace）与 JSON 装载同一条
         # 类型底线：字符串 "false" 是真值，混进来等于静默武装实盘。
         for key, expected in _EXPECTED_TYPES.items():

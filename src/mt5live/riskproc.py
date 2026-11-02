@@ -69,6 +69,7 @@ from mt5live.monitor import (
     mark_heartbeat_stale,
     naive_utc,
     read_heartbeat_path,
+    write_halt_once,
 )
 
 FREQUENCY_WINDOW_S = 60.0        # 下单频率滑窗宽度
@@ -421,15 +422,18 @@ class RiskProcess:
                     now: datetime | None = None) -> RiskDecision:
         n = naive_utc(now if now is not None
                       else datetime.now(timezone.utc))
-        if os.path.exists(self.kill_switch_path):
-            self._write_halt("kill_switch", n)
-            return RiskDecision(
-                False, f"kill_switch: {self.kill_switch_path} 存在，一键停机",
-                halt=True)
-        if os.path.exists(self.halt_path):
-            reason = self._read_halt_reason()
-            return RiskDecision(False, f"halted: {reason}", halt=True)
+        stopped = self.check_stopped(n)
+        if stopped is not None:
+            return stopped
         return check(order_request, state, self.config, n, self.session_policy)
+
+    def check_stopped(self, now: datetime) -> RiskDecision | None:
+        if os.path.exists(self.kill_switch_path):
+            self._write_halt("kill_switch", now)
+            return RiskDecision(False, "kill_switch: manual stop", halt=True)
+        if os.path.exists(self.halt_path):
+            return RiskDecision(False, f"halted: {self._read_halt_reason()}", halt=True)
+        return None
 
     def trigger_flatten_and_halt(self, reason: str,
                                  now: datetime | None = None) -> None:
@@ -444,8 +448,9 @@ class RiskProcess:
     # -- 主循环单轮 --
 
     def run_cycle(self, snapshot: AccountSnapshot | None,
-                  now: datetime | None = None) -> CycleResult:
-        """一轮：心跳（全部登记策略）→ killSwitch → 账户日亏 → flatten 归档。"""
+                  now: datetime | None = None, *, health_clock=None) -> CycleResult:
+        """一轮；业务快照截止时间与读取后健康观测时钟分离。"""
+        observe = health_clock or (lambda: datetime.now(timezone.utc))
         n = naive_utc(now if now is not None
                       else datetime.now(timezone.utc))
         if snapshot is not None and snapshot.currency != "USD":
@@ -462,7 +467,7 @@ class RiskProcess:
         worst = None          # (path, status)；优先级 timeout/missing > runner_stopped
         for path in heartbeat_files(self.live_dir):
             hb = read_heartbeat_path(path)
-            st = heartbeat_status(hb, n, timeout_s=self.heartbeat_timeout_s)
+            st = heartbeat_status(hb, observe(), timeout_s=self.heartbeat_timeout_s)
             if st.ok:
                 continue
             if worst is None or worst[1].reason == "runner_stopped":
@@ -472,7 +477,7 @@ class RiskProcess:
                                             timeout_s=self.heartbeat_timeout_s))
         if worst is not None:
             path, st = worst
-            if st.reason in ("timeout", "missing"):
+            if st.reason in ("timeout", "missing", "future"):
                 if path is not None:
                     hb = read_heartbeat_path(path)
                     if hb is not None:
@@ -537,12 +542,7 @@ class RiskProcess:
 
     def _write_halt(self, reason: str, now: datetime) -> bool:
         """写 halt.json；已存在则保留首次原因不覆盖。返回是否本次写入。"""
-        if os.path.exists(self.halt_path):
-            return False
-        os.makedirs(self.live_dir, exist_ok=True)
-        write_json_atomic(self.halt_path, {"reason": reason, "ts": iso_utc(now)})
-        append_alert(self.live_dir, ALERT_RISK_HALT, f"风控停机：{reason}", now)
-        return True
+        return write_halt_once(self.live_dir, reason, now, owner="risk")
 
     def _write_flatten(self, reason: str, now: datetime) -> bool:
         """写全平指令（T32/D21 编号协议，mt5live.commands.write_flatten）；

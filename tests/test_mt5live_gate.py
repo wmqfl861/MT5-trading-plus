@@ -59,6 +59,8 @@ def make_gate(tmp_path):
 
     live = tmp_path / "live"
     live.mkdir(parents=True, exist_ok=True)
+    from mt5live.monitor import write_role_heartbeat
+    write_role_heartbeat(str(live), "risk", interval=10.0, now=NOW)
     specs = _write(tmp_path / "specs" / "latest.json",
                    json.dumps({"XAUUSD": {"contract_size": 100.0}}))
     policy = load_session_policy(_write(tmp_path / "s.toml", SESSIONS_TOML))
@@ -66,7 +68,7 @@ def make_gate(tmp_path):
                           live_dir=str(live), session_policy=policy)
     broker = FakeBroker()
     gate = RiskGate(process, account=broker, market=broker, specs_path=specs,
-                    live_dir=str(live), session_policy=policy)
+                    live_dir=str(live), session_policy=policy, clock=lambda: NOW)
     return gate, live
 
 
@@ -81,6 +83,8 @@ def _gate_with_spread(tmp_path, stats_by_hour, *, min_days=20):
 
     live = tmp_path / "live"
     live.mkdir(parents=True, exist_ok=True)
+    from mt5live.monitor import write_role_heartbeat
+    write_role_heartbeat(str(live), "risk", interval=10.0, now=NOW)
     specs = _write(tmp_path / "specs" / "latest.json",
                    json.dumps({"XAUUSD": {"contract_size": 100.0}}))
     toml = SESSIONS_TOML + f"min_days_per_hour = {min_days}\n"
@@ -94,7 +98,7 @@ def _gate_with_spread(tmp_path, stats_by_hour, *, min_days=20):
         {"XAUUSD": 0.02}, mode="absolute")
     gate = RiskGate(process, account=broker, market=broker, specs_path=specs,
                     live_dir=str(live), spread_model=model,
-                    session_policy=policy)
+                    session_policy=policy, clock=lambda: NOW)
     return gate, live
 
 
@@ -125,6 +129,9 @@ def test_spread_gate_missing_hour_still_forbids(tmp_path):
                                  n_days=25)}
     gate, _live = _gate_with_spread(tmp_path, model_hours)
     # NOW 之后 2 小时 = 12:00 UTC = 纽约 8 点（不在模型里）
+    from mt5live.monitor import write_role_heartbeat
+    gate._clock = lambda: NOW + timedelta(hours=2)
+    write_role_heartbeat(str(_live), "risk", interval=10.0, now=NOW + timedelta(hours=2))
     d = gate.check_open("XAUUSD", "buy", 0.01, MAGIC,
                         now=NOW + timedelta(hours=2))
     assert not d.allowed

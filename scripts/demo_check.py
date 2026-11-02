@@ -829,6 +829,25 @@ def check_protective_exit(ctx, day: date) -> Check:
                  f"保护性出场 {len(magics)} 个 magic（{magics}），暂停均已自动解除")
 
 
+def load_ops_restarts(live_dir: str) -> list[dict]:
+    """Restart explanations only, never synthetic liveness/coverage evidence."""
+    path = os.path.join(live_dir, "ops-restarts.jsonl")
+    try:
+        with open(path, encoding="utf-8") as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+        for row in rows:
+            parse_iso(row["utc"])
+            if (not row.get("reason_code") or not isinstance(row.get("component"), str)
+                    or not re.fullmatch(r"[0-9a-f]{40}", row.get("deployment_sha", ""))
+                    or type(row.get("new_pid")) is not int or row["new_pid"] <= 0):
+                raise ValueError("invalid ops restart")
+        return rows
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError, TypeError, KeyError):
+        return []  # unreadable explanations cannot excuse a restart
+
+
 def check_heartbeat_continuity(ctx, day: date) -> Check:
     """§7-1：进程不间断、重启有日志说明（心跳超时后有恢复记录）。"""
     name = "心跳连续性（中断有日志说明）"
@@ -851,6 +870,12 @@ def check_heartbeat_continuity(ctx, day: date) -> Check:
                 continue
             tail = ctx["log_tail_text"].get((mg, prev["log"]), "")
             explained = any(mark in tail for mark in EXIT_MARKS)
+            if not explained:
+                explained = any(
+                    r.get("component") == str(mg) and r.get("reason_code")
+                    and prev["ts"] <= parse_iso(r["utc"]) <= cur["ts"]
+                    and (cur["ts"] - parse_iso(r["utc"])).total_seconds() <= 120
+                    for r in ctx.get("ops_restarts", []))
             if not explained:
                 covered = [a for a in ctx["alerts"]
                            if a.kind in ("HEARTBEAT_TIMEOUT", "RISK_HALT")
@@ -1520,6 +1545,7 @@ def build_ctx(args) -> dict:
         "intent_symbols": intent_symbols,
         "logs": logs, "start_events": start_events,
         "log_tail_text": log_tail_text,
+        "ops_restarts": load_ops_restarts(live_dir),
         "session_policy": session_policy,
         "now": now,
         "all_days": all_days, "latest_day": max(all_days) if all_days else None,

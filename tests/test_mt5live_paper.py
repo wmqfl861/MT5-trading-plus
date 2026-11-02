@@ -494,7 +494,7 @@ def test_paper_state_view_feeds_risk_cycle_daily_loss(tmp_path):
     process = RiskProcess(
         load_risk_config(str(_write(live.parent / "risk.toml", RISK_TOML))),
         live_dir=str(live))
-    res = process.run_cycle(snap, T0)
+    res = process.run_cycle(snap, T0, health_clock=lambda: T0)
     assert res.daily_loss_breached and res.flatten_written
     assert (live / "commands" / "flatten.json").exists()
 
@@ -743,14 +743,14 @@ def test_r6_daily_loss_aggregates_across_magics(tmp_path):
     # 单策略（文件视图）：-25.5 未触 -50 上限 → 不触发
     single = mod.build_snapshot(
         PaperStateGateway(paper_state_path(str(live), MAGIC)), now)
-    res_single = process.run_cycle(single, now)
+    res_single = process.run_cycle(single, now, health_clock=lambda: now)
     assert not res_single.daily_loss_breached
     assert not (live / "commands" / "flatten.json").exists()
 
     # 聚合（目录视图）：-51 ≤ -50 → 触发全平（当日成交跨 magic 合并）
     snap = mod.build_snapshot(PaperStateGateway(paper_dir(tmp_path)), now)
     assert len(snap.deals) == 4 and snap.positions == ()
-    res = process.run_cycle(snap, now)
+    res = process.run_cycle(snap, now, health_clock=lambda: now)
     assert res.daily_loss_breached and res.flatten_written
     assert (live / "commands" / "flatten.json").exists()
 
@@ -877,6 +877,8 @@ def make_aggregate_gate(tmp_path, *, risk_toml: str = RISK_TOML,
 
     live = tmp_path / "live"
     live.mkdir(parents=True, exist_ok=True)
+    from mt5live.monitor import write_role_heartbeat
+    write_role_heartbeat(str(live), "risk", interval=10.0, now=T0)
     process = RiskProcess(
         load_risk_config(_write(tmp_path / "risk.toml", risk_toml)),
         live_dir=str(live))
@@ -885,7 +887,7 @@ def make_aggregate_gate(tmp_path, *, risk_toml: str = RISK_TOML,
         process,
         account=(account if account is not None
                  else PaperAccountView(paper_dir(tmp_path))),
-        market=market, specs_path=gate_specs(tmp_path), live_dir=str(live))
+        market=market, specs_path=gate_specs(tmp_path), live_dir=str(live), clock=lambda: T0)
     return gate
 
 

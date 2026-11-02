@@ -35,7 +35,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mt5gw import GatewayConfig, MT5Gateway  # noqa: E402
 from mt5gw.errors import DataUnavailableError  # noqa: E402
-from mt5live.monitor import ALERT_ACCOUNT_POLL_ERROR, append_alert  # noqa: E402
+from mt5live.monitor import (ALERT_ACCOUNT_POLL_ERROR, append_alert,
+                             guarded_main, reset_watchdog, write_role_heartbeat)  # noqa: E402
 from mt5live.paper import PaperStateGateway  # noqa: E402（T34 --paper-state）
 from mt5live.riskproc import (  # noqa: E402
     AccountSnapshot,
@@ -90,12 +91,13 @@ def run_one_cycle(risk: RiskProcess, gw) -> CycleResult:
     """单轮（账户轮询失败如实抛 DataUnavailableError，由调用方决定重试）。"""
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     snap = build_snapshot(gw, now)
-    res = risk.run_cycle(snap, now)
+    res = risk.run_cycle(snap, now, health_clock=lambda: datetime.now(timezone.utc))
     mode = ("paper" if isinstance(gw, PaperStateGateway) else "live")
     print(f"· {now:%Y-%m-%d %H:%M:%S} UTC [{mode}] 心跳={res.heartbeat_reason} "
           f"halt={'是' if res.halt_active else '否'} "
           f"flatten={'写入' if res.flatten_written else '—'} "
-          f"日亏触发={'是' if res.daily_loss_breached else '否'}")
+          f"日亏触发={'是' if res.daily_loss_breached else '否'}", flush=True)
+    write_role_heartbeat(risk.live_dir, "risk", interval=getattr(risk, "interval_s", 10.0))
     return res
 
 
@@ -104,6 +106,7 @@ def main(argv=None) -> int:
     ap.add_argument("--config", default="config/risk.toml", help="风控配置 TOML")
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--gw-config", default="config.json", help="网关配置 JSON")
+    ap.add_argument("--sessions-config", default=None)
     ap.add_argument("--paper-state", default=None,
                     help="影子券商状态（T34/R6）：paper 目录（每轮聚合读全部"
                          " state-<magic>.json——多运行器并行）或单个状态文件"
@@ -115,15 +118,22 @@ def main(argv=None) -> int:
     ap.add_argument("--heartbeat-timeout", type=float, default=120.0,
                     help="心跳超时判定（秒）")
     args = ap.parse_args(argv)
+    return guarded_main("risk", os.path.join(args.data_dir, "live"), args.interval,
+                        lambda: _run(args))
 
+
+def _run(args) -> int:
     try:
         config = load_risk_config(args.config)
     except RiskConfigError as e:
         print(f"× {e}")
         return 2
+    from mt5live.riskproc import load_default_session_policy
     risk = RiskProcess(
         config, live_dir=os.path.join(args.data_dir, "live"),
-        heartbeat_timeout_s=args.heartbeat_timeout)
+        heartbeat_timeout_s=args.heartbeat_timeout,
+        session_policy=load_default_session_policy(args.sessions_config))
+    risk.interval_s = args.interval
 
     try:
         if args.paper_state:
@@ -137,9 +147,8 @@ def main(argv=None) -> int:
                 return 2
         else:
             gw = _open_gateway(args.gw_config)
-    except Exception as e:
-        print(f"× 网关连接失败：{e}")
-        return 2
+    except Exception:
+        raise  # guarded_main records CRITICAL traceback and durable exit evidence
 
     def _poll_failed(e: DataUnavailableError) -> None:
         now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -149,6 +158,7 @@ def main(argv=None) -> int:
     try:
         if args.loop:
             while True:
+                reset_watchdog(args.interval)
                 try:
                     run_one_cycle(risk, gw)
                 except DataUnavailableError as e:
@@ -163,9 +173,6 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         print("· 手动停止")
         return 0
-    except ValueError as e:  # 账户货币等配置性错误：停止并如实报告
-        print(f"× {e}")
-        return 2
     finally:
         gw.shutdown()
 

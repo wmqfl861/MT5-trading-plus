@@ -36,6 +36,9 @@ from mt5live.monitor import (  # noqa: E402
     ALERT_RECONCILE_MISMATCH,
     append_alert,
     naive_utc,
+    guarded_main,
+    reset_watchdog,
+    write_role_heartbeat,
 )
 from mt5live.paper import PaperStateGateway  # noqa: E402（T34 --paper-state）
 from mt5live.reconcile import (  # noqa: E402
@@ -97,8 +100,10 @@ def run_once(live_dir: str, gw, *,
         else:
             write_pause(live_dir, magic, paused=False, reason=None, now=n)
 
+    write_role_heartbeat(live_dir, "reconcile", interval=30.0,
+                         reconcile_clean=res.ok and all(i.status == "confirmed" for i in intents))
     if res.ok:
-        print(f"· {n:%Y-%m-%d %H:%M:%S} UTC 对账一致（{len(actual)} 个持仓）")
+        print(f"· {n:%Y-%m-%d %H:%M:%S} UTC 对账一致（{len(actual)} 个持仓）", flush=True)
         return 0, res
     for d in res.diffs:
         print(f"× {d.detail}")
@@ -127,7 +132,11 @@ def main(argv=None) -> int:
     ap.add_argument("--grace-s", type=float, default=DEFAULT_GRACE_S,
                     help="pending 意图的宽限秒数（下单在途不判）")
     args = ap.parse_args(argv)
+    return guarded_main("reconcile", os.path.join(args.data_dir, "live"), args.interval,
+                        lambda: _run(args))
 
+
+def _run(args) -> int:
     live_dir = os.path.join(args.data_dir, "live")
     try:
         if args.paper_state:
@@ -135,14 +144,14 @@ def main(argv=None) -> int:
             gw = PaperStateGateway(args.paper_state, alert_dir=live_dir)
         else:
             gw = _open_gateway(args.gw_config)
-    except Exception as e:
-        print(f"× {'影子状态文件不可用' if args.paper_state else '网关连接失败'}：{e}")
-        return 2
+    except Exception:
+        raise  # guarded_main records the original traceback
 
     try:
         if args.loop:
             was_ok: bool | None = None  # 首轮与跳变时告警；持续不一致不重复告警
             while True:
+                reset_watchdog(args.interval)
                 _, res = run_once(live_dir, gw,
                                   volume_tolerance=args.volume_tolerance,
                                   grace_s=args.grace_s,

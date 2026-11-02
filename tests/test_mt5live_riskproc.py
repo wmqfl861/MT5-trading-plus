@@ -469,7 +469,7 @@ def test_run_cycle_heartbeat_timeout_halts(tmp_path):
     rp = make_process(tmp_path)
     live = tmp_path / "live"
     write_heartbeat_file(live, True, NOW - timedelta(seconds=300))
-    res = rp.run_cycle(None, NOW)
+    res = rp.run_cycle(None, NOW, health_clock=lambda: NOW)
     assert not res.heartbeat_ok
     assert res.heartbeat_reason == "timeout"
     assert res.halt_written and res.halt_active
@@ -484,7 +484,7 @@ def test_run_cycle_heartbeat_missing_halts(tmp_path):
     rp = make_process(tmp_path)
     live = tmp_path / "live"
     live.mkdir(parents=True)  # 无 heartbeat.json → fail-closed
-    res = rp.run_cycle(None, NOW)
+    res = rp.run_cycle(None, NOW, health_clock=lambda: NOW)
     assert not res.heartbeat_ok
     assert res.heartbeat_reason == "missing"
     assert read_json(live / "halt.json")["reason"] == "heartbeat_missing"
@@ -494,7 +494,7 @@ def test_run_cycle_fresh_heartbeat_no_halt(tmp_path):
     rp = make_process(tmp_path)
     live = tmp_path / "live"
     write_heartbeat_file(live, True, NOW - timedelta(seconds=10))
-    res = rp.run_cycle(None, NOW)
+    res = rp.run_cycle(None, NOW, health_clock=lambda: NOW)
     assert res.heartbeat_ok and res.heartbeat_reason == "ok"
     assert not res.halt_written and not res.halt_active
     assert not (live / "halt.json").exists()
@@ -505,7 +505,7 @@ def test_run_cycle_runner_stopped_cleanly_no_halt(tmp_path):
     rp = make_process(tmp_path)
     live = tmp_path / "live"
     write_heartbeat_file(live, False, NOW - timedelta(seconds=5))
-    res = rp.run_cycle(None, NOW)
+    res = rp.run_cycle(None, NOW, health_clock=lambda: NOW)
     assert not res.heartbeat_ok and res.heartbeat_reason == "runner_stopped"
     assert not (live / "halt.json").exists()
 
@@ -526,7 +526,7 @@ def test_run_cycle_daily_loss_writes_flatten_command(tmp_path):
         positions=(pos("XAUUSD", 0.1, profit=-450.0),),
         deals=(deal(entry="out", profit=-200.0),),
     )  # 已实现 -200 + 浮动 -450 = -650 ≤ -500
-    res = rp.run_cycle(snap, NOW)
+    res = rp.run_cycle(snap, NOW, health_clock=lambda: NOW)
     assert res.daily_loss_breached and res.flatten_written
     cmd = read_json(live / "commands" / "flatten.json")
     assert cmd["command"] == "flatten_all"
@@ -547,7 +547,7 @@ def test_run_cycle_daily_loss_flatten_idempotent(tmp_path):
            "ts": "2026-10-26T08:00:00+00:00"}
     (cmd_dir / "flatten.json").write_text(json.dumps(old), encoding="utf-8")
     snap = snapshot(deals=(deal(entry="out", profit=-600.0),))
-    res = rp.run_cycle(snap, NOW)
+    res = rp.run_cycle(snap, NOW, health_clock=lambda: NOW)
     assert res.daily_loss_breached
     assert not res.flatten_written  # 已有指令不重写（执行器改名/删除以示完成）
     assert read_json(cmd_dir / "flatten.json")["ts"] == old["ts"]
@@ -558,7 +558,7 @@ def test_run_cycle_healthy_account_no_action(tmp_path):
     live = tmp_path / "live"
     write_heartbeat_file(live, True, NOW - timedelta(seconds=10))
     snap = snapshot(positions=(pos("XAUUSD", 0.1, profit=25.0),))
-    res = rp.run_cycle(snap, NOW)
+    res = rp.run_cycle(snap, NOW, health_clock=lambda: NOW)
     assert res.heartbeat_ok and not res.halt_written
     assert not res.daily_loss_breached and not res.flatten_written
     assert not (live / "halt.json").exists()
@@ -570,7 +570,7 @@ def test_run_cycle_kill_switch_writes_halt(tmp_path):
     live = tmp_path / "live"
     write_heartbeat_file(live, True, NOW - timedelta(seconds=10))
     (live / "killSwitch").write_text("", encoding="utf-8")
-    res = rp.run_cycle(None, NOW)
+    res = rp.run_cycle(None, NOW, health_clock=lambda: NOW)
     assert res.halt_written
     assert read_json(live / "halt.json")["reason"] == "kill_switch"
 
@@ -691,7 +691,7 @@ def test_riskproc_unreadable_flatten_not_archived_with_alert(tmp_path):
     cmds.mkdir(parents=True)
     (cmds / "flatten.json").write_text("oops", encoding="utf-8")
     write_heartbeat_file(live, True, NOW - timedelta(seconds=10))
-    res = rp.run_cycle(None, NOW)
+    res = rp.run_cycle(None, NOW, health_clock=lambda: NOW)
     assert not res.flatten_archived
     assert (cmds / "flatten.json").exists()
     assert "COMMAND_UNREADABLE" in (live / "alerts.log").read_text(

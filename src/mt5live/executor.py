@@ -912,8 +912,16 @@ class LiveExecutor:
         # 纯平仓的 _close_only_leg 不入 journal（重放安全：目标 0，已平则
         # hold——journal 防的是重复开仓，不拦风险降低操作）。
         self._journal_begin(decision, target, net, n)
+        from mt5gw.connection import timeout_evidence
+
+        def deadline_unknown(record):
+            self._journal_finish(
+                decision.decision_id, "unknown", n=n,
+                detail=f"gateway deadline: {record['call']} ({record['duration_s']:.3f}s)")
+
         try:
-            report = self._adapter.execute(decision)
+            with timeout_evidence(deadline_unknown):
+                report = self._adapter.execute(decision)
         except TradeRejectedError as exc:
             # 确定态拒绝（服务器明确拒单，订单确定未成交）：journal 记
             # rejected；意图如实 confirmed(实际净持仓)——确定没有成交，

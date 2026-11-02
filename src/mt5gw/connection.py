@@ -1,21 +1,56 @@
-"""与 MT5 终端的连接：串行化、懒连接、有界自动重连。
+"""Serialized MT5 access with terminal deadlines (T110).
 
-MetaTrader5 包为同步调用且非线程安全——本类是它唯一的入口，
-所有调用在同一把锁下执行，对上层呈现线程安全。
-
-实测（见 README）：该 C 扩展对"单个位置参数经 *args 解包传入"的形态报
-(-2, 'Unnamed arguments not allowed')，单参数调用一律用直接位置调用。
+A deadline includes lock contention and every raw API entry. The dedicated
+worker cannot be joined after a timeout: native IPC may never return. Evidence
+is flushed before os._exit(75); an external supervisor covers native GIL hangs.
 """
 from __future__ import annotations
 
+import logging
+import os
+import sys
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from contextlib import contextmanager
+from datetime import datetime, timezone
 
 from mt5gw.config import GatewayConfig
 from mt5gw.errors import DataUnavailableError, NotConnectedError
+from mt5gw.snapshot import write_json_atomic
+
+_TIMEOUT_EVIDENCE = {}
+_EVIDENCE_LOCK = threading.Lock()
+_FATAL_LOCK = threading.Lock()
+_TERMINATING = threading.Event()
+
+
+def _await_terminal_exit():
+    if _TERMINATING.is_set():
+        # Another thread is persisting unknown/markers. Never overtake it with
+        # an order, a final journal status or an early os._exit.
+        threading.Event().wait()
+
+
+@contextmanager
+def timeout_evidence(callback):
+    """Register in-flight evidence process-wide, across connections and threads."""
+    token = object()
+    with _EVIDENCE_LOCK:
+        _await_terminal_exit()
+        _TIMEOUT_EVIDENCE[token] = callback
+    try:
+        yield
+    finally:
+        with _EVIDENCE_LOCK:
+            terminating = _TERMINATING.is_set()
+            if not terminating:
+                _TIMEOUT_EVIDENCE.pop(token, None)
+        if terminating:
+            _await_terminal_exit()
 
 
 def _is_success(error_tuple) -> bool:
-    """last_error 的成功形态是 (1, 'Success')；兼容旧 fake 的 (0, 'success')。"""
     if not error_tuple:
         return False
     code = error_tuple[0]
@@ -27,19 +62,89 @@ class MT5Connection:
     def __init__(self, config: GatewayConfig | None = None, mt5_module=None):
         self.config = config or GatewayConfig()
         if mt5_module is None:
-            import MetaTrader5 as mt5_module  # 延迟导入：纯逻辑测试不触终端
+            import MetaTrader5 as mt5_module
         self._mt5 = mt5_module
         self._lock = threading.RLock()
         self._initialized = False
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mt5-deadline")
+
+    def _fatal_timeout(self, name: str, started: float, timeout: float):
+        if not _FATAL_LOCK.acquire(blocking=False):
+            threading.Event().wait()  # the first failure owns evidence and exit
+        # Evidence I/O must not leave a stuck process indefinitely either. This
+        # timer also needs the GIL; native GIL stalls require the supervisor.
+        killer = threading.Timer(5.0, lambda: os._exit(75))
+        killer.daemon = True
+        killer.start()
+        record = {"rc": 75, "reason": "gateway_deadline", "call": name,
+                  "duration_s": time.monotonic() - started, "timeout_s": timeout,
+                  "ts": datetime.now(timezone.utc).isoformat(), "pid": os.getpid()}
+        logging.critical("MT5 deadline call=%s duration=%.3fs limit=%.3fs rc=75",
+                         name, record["duration_s"], timeout)
+        with _EVIDENCE_LOCK:
+            _TERMINATING.set()
+            callbacks = tuple(_TIMEOUT_EVIDENCE.values())
+        for callback in callbacks:
+            try:
+                callback(record)
+            except BaseException:
+                logging.critical("Cannot persist execution unknown", exc_info=True)
+        try:
+            live = os.environ.get("MT5_LIVE_DIR", os.path.join("data", "live"))
+            write_json_atomic(os.path.join(live, "gateway-stall.json"), record)
+            component = os.environ.get("MT5_COMPONENT", "gateway")
+            write_json_atomic(os.path.join(live, f"exit-{component}.json"), record)
+        except BaseException:
+            logging.critical("Cannot persist deadline marker", exc_info=True)
+        finally:
+            for stream in (sys.stderr, sys.stdout):
+                try:
+                    stream.flush()
+                except Exception:
+                    pass
+            os._exit(75)  # never wait for ThreadPoolExecutor's atexit join
+
+    @contextmanager
+    def _serialized(self, name, timeout=None):
+        _await_terminal_exit()
+        timeout = self.config.query_timeout_s if timeout is None else timeout
+        started = time.monotonic()
+        if not self._lock.acquire(timeout=timeout):
+            self._fatal_timeout(f"lock:{name}", started, timeout)
+        try:
+            yield
+        finally:
+            self._lock.release()
+
+    def _invoke(self, name, fn, *args, timeout=None, **kwargs):
+        _await_terminal_exit()
+        timeout = self.config.query_timeout_s if timeout is None else timeout
+        started = time.monotonic()
+        # Direct one-position invocation preserves the C extension's ABI quirk.
+        def invoke():
+            if len(args) == 1 and not kwargs:
+                return fn(args[0])
+            return fn(*args, **kwargs)
+        future = self._executor.submit(invoke)
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeout:
+            # A function may itself raise TimeoutError. That is not a stuck IPC.
+            if future.done():
+                return future.result()
+            self._fatal_timeout(name, started, timeout)
+
+    def _raw(self, name, *args, **kwargs):
+        return self._invoke(name, getattr(self._mt5, name), *args, **kwargs)
 
     def connect(self) -> None:
-        with self._lock:
+        with self._serialized("initialize"):
             self._ensure_initialized()
 
     def shutdown(self) -> None:
-        with self._lock:
+        with self._serialized("shutdown"):
             if self._initialized:
-                self._mt5.shutdown()
+                self._raw("shutdown")
                 self._initialized = False
 
     @property
@@ -47,70 +152,55 @@ class MT5Connection:
         return self._initialized
 
     def call(self, fn, *args, **kwargs):
-        with self._lock:
+        name = getattr(fn, "__name__", "call")
+        with self._serialized(name):
             self._ready_or_raise()
-            if len(args) == 1 and not kwargs:
-                return fn(args[0])
-            return fn(*args, **kwargs)
+            return self._invoke(name, fn, *args, **kwargs)
 
     def call_status(self, fn, *args, **kwargs):
-        """原子地执行调用并取回 last_error（None 歧义由调用方按成功码裁决）。"""
-        with self._lock:
+        name = getattr(fn, "__name__", "call_status")
+        with self._serialized(name):
             self._ready_or_raise()
-            if kwargs or len(args) != 1:
-                result = fn(*args, **kwargs)
-            else:
-                result = fn(args[0])
-            error = self._mt5.last_error()
-            return result, error
+            result = self._invoke(name, fn, *args, **kwargs)
+            return result, self._raw("last_error")
 
     def trade_send(self, request: dict, fuse_check, login_check=None):
-        """交易唯一出口：同一次持锁内完成 重连检查→保险丝→order_send。
-
-        fuse_check(trade_mode) 在 order_send 之前执行；账户状态取不到时
-        fail-closed（拒单），杜绝"账户切换竞态"与"漏调保险丝"两类绕过。
-        login_check(login) 非空时同时校验账号（解锁实盘时强制钉死）。
-        返回 (result, last_error)：order_send 无返回时的诊断与发送同锁原子。
-        """
-        with self._lock:
+        # This entire transaction retains one lock: no interleaved reconnect,
+        # account check, fuse or order is allowed between these operations.
+        with self._serialized("order_send", self.config.order_timeout_s):
             self._ready_or_raise()
-            account = self._mt5.account_info()
+            account = self._raw("account_info")
             if account is None:
                 raise DataUnavailableError(
-                    f"下单前无法确认账户状态，拒绝发送：{self._mt5.last_error()}"
-                )
+                    f"下单前无法确认账户状态，拒绝发送：{self._raw('last_error')}")
             fuse_check(account.trade_mode)
             if login_check is not None:
                 login_check(account.login)
-            result = self._mt5.order_send(request)  # 直接位置调用（C 扩展解包限制）
-            return result, self._mt5.last_error()
+            result = self._raw("order_send", request, timeout=self.config.order_timeout_s)
+            return result, self._raw("last_error")
 
     def last_error(self) -> str:
-        # 同样要过锁：C 扩展非线程安全，错误路径也不能与在途调用并发
-        with self._lock:
-            return str(self._mt5.last_error())
+        with self._serialized("last_error"):
+            return str(self._raw("last_error"))
 
     def _ensure_initialized(self) -> None:
-        ok = self._mt5.initialize(self.config.terminal_path)
+        ok = self._raw("initialize", self.config.terminal_path)
         if not ok:
             self._initialized = False
             raise NotConnectedError(f"MT5 终端初始化失败：{self.last_error()}")
         self._initialized = True
 
     def _terminal_ok(self) -> bool:
-        # Python 包没有 terminal_connected()（MQL5 专有）；等价物是 terminal_info().connected
-        info = self._mt5.terminal_info()
+        info = self._raw("terminal_info")
         return bool(info is not None and info.connected)
 
     def _ready_or_raise(self) -> None:
         if not self._initialized or not self._terminal_ok():
             self._ensure_initialized()
-            # 重连成功 ≠ 交易服务器在线；仍掉线必须如实暴露（陈旧数据比无数据更危险）
             if not self._terminal_ok():
                 self._initialized = False
                 raise NotConnectedError(
-                    f"终端已初始化但交易服务器未连接：{self.last_error()}"
-                )
+                    f"终端已初始化但交易服务器未连接：{self.last_error()}")
 
     def __enter__(self) -> "MT5Connection":
         self.connect()

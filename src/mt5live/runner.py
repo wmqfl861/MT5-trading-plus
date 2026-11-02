@@ -523,6 +523,7 @@ def write_heartbeat(path: str, *, config, decision: Decision | None = None,
         "runner_alive": True,        # T14b monitor.read_heartbeat_path 的必需字段
         "ts": ts,                    # 同上；风控进程超时会整文件改写
         "pid": pid if pid is not None else os.getpid(),
+        "deployment_sha": os.environ.get("MT5_DEPLOYMENT_SHA", ""),
         "updated_at_utc": ts,
         "symbol": config.symbol,
         "timeframe": config.timeframe,

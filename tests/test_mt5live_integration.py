@@ -35,6 +35,7 @@ from mt5gw.models import (
     DEAL_REASON_SL,
     DEAL_REASON_TP,
 )
+from mt5live.monitor import write_role_heartbeat
 from mt5live.config import LiveConfig
 from mt5live.commands import write_ack, write_flatten
 from mt5live.executor import (
@@ -170,6 +171,7 @@ class LiveStack:
         self.live_dir = str(tmp_path / "live")
         self.data_root = str(tmp_path / "data")
         os.makedirs(self.live_dir, exist_ok=True)
+        write_role_heartbeat(self.live_dir, "risk", interval=10.0, now=T1)
         os.makedirs(self.data_root, exist_ok=True)
         self.specs_path = write_text(
             tmp_path / "data" / "specs" / "latest.json", json.dumps({
@@ -184,10 +186,12 @@ class LiveStack:
                                    session_policy=self.policy)
         self.broker = FakeBroker(symbol, balance=balance,
                                  contract_size=CONTRACT)
+        self._health_now = T1
         self.gate = RiskGate(
             self.process, account=self.broker, market=self.broker,
             specs_path=self.specs_path, live_dir=self.live_dir,
-            spread_model=spread_model, session_policy=self.policy)
+            spread_model=spread_model, session_policy=self.policy,
+            clock=lambda: self._health_now)
         self.cfg = LiveConfig(
             symbol=symbol, timeframe="M15",
             strategy="tests.fakes_live:ClosingSignal", params={}, magic=magic,
@@ -235,6 +239,8 @@ class LiveStack:
 
         tr：K 线振幅（TR≈tr → 该轮决策 ATR≈tr；T31 逐 bar ATR 变化用）。
         """
+        self._health_now = now
+        write_role_heartbeat(self.live_dir, "risk", interval=10.0, now=now)
         self._bars_df = grid_bars(boundary_open(now), last=last, tr=tr)
         decision = self.runner.decide(now)
         rr = (executor or self.executor).poll(decision, now)
@@ -247,7 +253,7 @@ class LiveStack:
         snap = AccountSnapshot(
             currency="USD", positions=tuple(self.broker.positions()),
             deals=tuple(self.broker.deals(day_start, now)))
-        return self.process.run_cycle(snap, now)
+        return self.process.run_cycle(snap, now, health_clock=lambda: now)
 
     def reconcile_once(self, now: datetime | None = None):
         mod = load_script("live_reconcile")
@@ -1201,6 +1207,8 @@ def test_gate_frequency_reads_local_order_log(tmp_path):
 def test_gate_missing_hour_forbids_open(tmp_path):
     """点差模型缺该小时统计（missing_hour_policy=forbid）→ 禁入。"""
     stack = LiveStack(tmp_path, spread_model=_spread_model(6))
+    stack._health_now = datetime(2026, 10, 28, 12, 0, 7)
+    write_role_heartbeat(stack.live_dir, "risk", interval=10.0, now=stack._health_now)
     d = stack.gate.check_open(SYMBOL, "buy", 0.1, MAGIC,
                               now=datetime(2026, 10, 28, 12, 0, 7))  # NY 08
     assert not d.allowed
@@ -1221,7 +1229,7 @@ def test_risk_process_checks_all_registered_heartbeats(tmp_path):
             "runner_alive": True,
             "ts": (now - timedelta(seconds=age)).isoformat() + "+00:00"}),
             encoding="utf-8")
-    res = process.run_cycle(None, now)
+    res = process.run_cycle(None, now, health_clock=lambda: now)
     assert not res.heartbeat_ok
     assert (live / "halt.json").exists()
     assert read_json(live / f"heartbeat-{MAGIC_B}.json")["runner_alive"] is False
@@ -1247,12 +1255,12 @@ def test_risk_process_archives_flatten_after_all_acks(tmp_path):
     (live / f"expected-{MAGIC_B}.json").write_text(json.dumps(
         {"ts": now.isoformat() + "+00:00", "positions": []}), encoding="utf-8")
     write_ack(str(live), MAGIC, cmd.id, closed=0, now=now)
-    res = process.run_cycle(None, now)
+    res = process.run_cycle(None, now, health_clock=lambda: now)
     assert not res.flatten_archived
     assert (cmds / "flatten.json").exists()
     # B 也确认（同编号）→ 归档并删除 ack
     write_ack(str(live), MAGIC_B, cmd.id, closed=0, now=now)
-    res2 = process.run_cycle(None, now)
+    res2 = process.run_cycle(None, now, health_clock=lambda: now)
     assert res2.flatten_archived
     assert not (cmds / "flatten.json").exists()
     assert not (cmds / f"flatten.ack-{MAGIC}").exists()
@@ -1349,8 +1357,9 @@ data_root = "{(tmp_path / 'data').as_posix()}"
 
     mod.load_strategy = patched
     try:
-        with pytest.raises(ValueError, match="time_stop"):
-            mod.main(["--config", cfg_path, "--once", "--dry-run", "--offline"])
+        assert mod.main(["--config", cfg_path, "--once", "--dry-run", "--offline"]) == 2
+        marker = read_json(tmp_path / "data" / "live" / f"exit-runner-{MAGIC}.json")
+        assert "time_stop" in marker["reason"]
     finally:
         mod.load_strategy = orig_load
 
@@ -1410,10 +1419,11 @@ def test_live_runner_no_spread_gate_flag_warns_red_and_proceeds(tmp_path,
                         staticmethod(lambda p: _FakeGW()))
     gw_dummy = tmp_path / "gw.json"
     gw_dummy.write_text("{}", encoding="utf-8")
-    with pytest.raises(_Sentinel):
-        mod.main(["--config", _runner_cfg(tmp_path), "--once", "--no-spread-gate",
-                  "--spread-model", str(tmp_path / "missing.json"),
-                  "--gateway-config", str(gw_dummy)])
+    assert mod.main(["--config", _runner_cfg(tmp_path), "--once", "--no-spread-gate",
+                     "--spread-model", str(tmp_path / "missing.json"),
+                     "--gateway-config", str(gw_dummy)]) == 2
+    marker = read_json(tmp_path / "data" / "live" / f"exit-runner-{MAGIC}.json")
+    assert "_Sentinel" in marker["reason"]
     out = capsys.readouterr().out
     assert "\033[31m" in out                    # 标红
     assert "点差闸门" in out
@@ -1478,6 +1488,7 @@ class PaperStack:
         self.live_dir = str(base / "live")
         self.data_root = str(base / "data")
         os.makedirs(self.live_dir, exist_ok=True)
+        write_role_heartbeat(self.live_dir, "risk", interval=10.0, now=T1)
         os.makedirs(self.data_root, exist_ok=True)
         self.specs_path = write_text(
             base / "data" / "specs" / "latest.json", json.dumps({
@@ -1500,10 +1511,11 @@ class PaperStack:
             self.market, state_path=self.paper_state,
             contract_sizes={SYMBOL: CONTRACT}, balance=balance,
             clock=lambda: T1)
+        self._health_now = T1
         self.gate = RiskGate(
             self.process, account=self.paper, market=self.market,
             specs_path=self.specs_path, live_dir=self.live_dir,
-            session_policy=self.policy)
+            session_policy=self.policy, clock=lambda: self._health_now)
         self.cfg = LiveConfig(
             symbol=SYMBOL, timeframe="M15",
             strategy="tests.fakes_live:ClosingSignal", params={}, magic=magic,
@@ -1528,6 +1540,8 @@ class PaperStack:
     def round(self, now: datetime, last: str = "up"):
         """一轮 = paper 保护性出场轮询 + 运行器决策 + 执行器轮 + 心跳
         （live_runner --paper 的主循环顺序）。"""
+        self._health_now = now
+        write_role_heartbeat(self.live_dir, "risk", interval=10.0, now=now)
         self.market.quote_time = now           # 行情新鲜（fake 的 quote 时刻）
         protective = self.paper.poll_protective(now)
         self._bars_df = grid_bars(boundary_open(now), last=last)
@@ -1542,7 +1556,7 @@ class PaperStack:
         R6/C3 起传 paper 目录——聚合全部 state-<magic>.json）。"""
         mod = load_script("risk_process")
         snap = mod.build_snapshot(PaperStateGateway(self.paper_dir), now)
-        return self.process.run_cycle(snap, now)
+        return self.process.run_cycle(snap, now, health_clock=lambda: now)
 
     def reconcile_from_paper(self, now: datetime):
         mod = load_script("live_reconcile")
@@ -1685,6 +1699,8 @@ def test_t34_paper_dry_run_offline_end_to_end(tmp_path, capsys):
     save_bars(str(tmp_path / "data"), SYMBOL, "M15",
               grid_bars(pd.Timestamp(last_open, unit="s"), last="up"))
     env = _paper_cli_env(tmp_path)
+    write_role_heartbeat(str(tmp_path / "data" / "live"), "risk", interval=10.0,
+                         now=mod.now_utc())
 
     rc = mod.main(["--config", env["config"], "--once", "--dry-run", "--offline",
                    "--paper", "--risk-config", env["risk"],
@@ -1755,6 +1771,8 @@ def test_t34_live_runner_paper_mode_wires_full_stack(tmp_path, monkeypatch,
                         staticmethod(lambda p: _FakeGW()))
     monkeypatch.setattr(mod, "now_utc", lambda: now)
     env = _paper_cli_env(tmp_path)
+    write_role_heartbeat(str(tmp_path / "data" / "live"), "risk", interval=10.0,
+                         now=mod.now_utc())
 
     rc = mod.main(["--config", env["config"], "--once", "--paper",
                    "--risk-config", env["risk"],
