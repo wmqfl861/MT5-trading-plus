@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from mt5quant.backtest.engine_a import atr_series
+from mt5quant.costs.volatility import atr_series
 from mt5quant.prob.gaps import FEATURE_WARMUP_BARS, eligibility_mask
 from mt5quant.strategies.library.prob.actions import (
     ActionParams, action_triggers,
@@ -34,7 +34,8 @@ __all__ = ["count_triggers", "level_rows_for_situation", "triggers_before"]
 def level_rows_for_situation(bars: pd.DataFrame, situation: str, *,
                              grid_step: float | None = None,
                              approach: Approach | None = None,
-                             atr: pd.Series | None = None) -> pd.Series:
+                             atr: pd.Series | None = None,
+                             bars_per_day: int = 24) -> pd.Series:
     """局面 → 每 bar 候选价位列表（S1 需 grid_step/approach/atr）。"""
     if situation == "S1":
         if grid_step is None or approach is None or atr is None:
@@ -45,7 +46,7 @@ def level_rows_for_situation(bars: pd.DataFrame, situation: str, *,
         return levels_from_frame(s2_level_rows(bars),
                                  columns=["prev_high", "prev_low"])
     if situation == "S3":
-        return levels_from_frame(s3_level_rows(bars),
+        return levels_from_frame(s3_level_rows(bars, bars_per_day=bars_per_day),
                                  columns=["chan_high", "chan_low"])
     raise ValueError(f"未知局面编号：{situation!r}")
 
@@ -56,7 +57,10 @@ def count_triggers(bars: pd.DataFrame, *, symbol: str, situation: str,
                    atr: pd.Series | None = None, gap_spans=None,
                    feature_warmup: int | None = FEATURE_WARMUP_BARS,
                    hold_bars: int = 0,
-                   max_gap_days: int = 30) -> pd.DataFrame:
+                   max_gap_days: int = 30,
+                   levels_by_bar: pd.Series | None = None,
+                   situation_starts=None, bars_per_day: int = 24,
+                   s3_bars: int = 480) -> pd.DataFrame:
     """数一个品种一个局面上的全部动作触发（不看结果）。
 
     返回列：time、situation、action、side、level、kind、anchor、bar、
@@ -74,11 +78,19 @@ def count_triggers(bars: pd.DataFrame, *, symbol: str, situation: str,
       传卡 bracket 的 horizon_bars（与 P1 的 hold=K 同口径；bt 接线）；
     - max_gap_days：未来窗的洞宽阈值（缺省 30，与 merge 的 gap_spans
       口径一致；回看窗按先决 4 用 gap_spans 原样）。
+
+    T121 additive parameters: levels_by_bar bypasses level construction;
+    situation_starts supplies actual UTC lookback timestamps indexed by bar
+    (A2/A4 use the anchor's start). S3 callers pass both bars_per_day and
+    s3_bars together; H1 defaults remain 24/480, H4 uses 6/120.
     """
     if atr is None:
         atr = atr_series(bars)
-    levels = level_rows_for_situation(bars, situation, grid_step=grid_step,
-                                      approach=approach, atr=atr)
+    levels = levels_by_bar
+    if levels is None:
+        levels = level_rows_for_situation(
+            bars, situation, grid_step=grid_step, approach=approach,
+            atr=atr, bars_per_day=bars_per_day)
     events = find_level_events(bars, levels, situation=situation,
                                approach=approach, atr=atr)
     trig = action_triggers(bars, events, params=action_params, atr=atr)
@@ -86,7 +98,8 @@ def count_triggers(bars: pd.DataFrame, *, symbol: str, situation: str,
     if len(trig) and (gap_spans or warm or hold_bars):
         keep = eligibility_mask(
             trig, bars, gap_spans or [], situation, approach.lookback_bars,
-            feature_warmup=warm,
+            feature_warmup=warm, s3_bars=s3_bars,
+            situation_starts=situation_starts,
             hold_bars=int(hold_bars), max_gap_days=max_gap_days)
         trig = trig.iloc[[k for k, ok in enumerate(keep) if ok]]
     if len(trig) == 0:

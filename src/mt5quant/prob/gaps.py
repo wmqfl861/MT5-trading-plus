@@ -185,7 +185,8 @@ def _s2_prev_session_starts(bars) -> list[int]:
 
 def _eligibility_of(i, *, bars, n, gap_spans, wide, feature_warmup,
                     hold_bars, origin, window_start,
-                    anchor_action_end=None) -> tuple[bool, str]:
+                    anchor_action_end=None,
+                    situation_start=None) -> tuple[bool, str]:
     """单触发的统一资格 → (合格, 剔除原因；合格为 "")。
 
     P2-03 全部窗（与 EligibilityContext.eligible_bars 同一核心）：
@@ -205,7 +206,16 @@ def _eligibility_of(i, *, bars, n, gap_spans, wide, feature_warmup,
         return False, REASON_FEATURE_WARMUP
     if warm and suppress_across_gaps(i, bars, gap_spans, max(0, i - warm)):
         return False, REASON_FEATURE_GAP
-    if suppress_across_gaps(origin, bars, gap_spans, int(window_start)):
+    if situation_start is None:
+        crossed = suppress_across_gaps(origin, bars, gap_spans, int(window_start))
+    else:
+        start = pd.Timestamp(situation_start)
+        stop = pd.Timestamp(bars["time"].iloc[origin])
+        if pd.isna(start) or start > stop:
+            return False, "situation_unavailable"
+        crossed = any(start <= pd.Timestamp(s) and pd.Timestamp(e) <= stop
+                      for s, e in (gap_spans or []))
+    if crossed:
         return False, REASON_SITUATION_GAP
     if anchor_action_end is not None and suppress_across_gaps(
             int(anchor_action_end), bars, gap_spans, origin):
@@ -223,7 +233,8 @@ def eligibility_reasons(triggers, bars, gap_spans, situation,
                         approach_lookback, s3_bars: int = S3_WINDOW_BARS,
                         feature_warmup: int = FEATURE_WARMUP_BARS,
                         hold_bars: int = 0,
-                        max_gap_days: int = 30) -> list[str]:
+                        max_gap_days: int = 30, *,
+                        situation_starts=None) -> list[str]:
     """eligibility_mask 的逐原因版（P2-03"逐原因记录剔除"）：每个触发行
     的剔除原因（""=合格；原因码见模块 REASON_* 常量），口径/参数与
     eligibility_mask 逐位一致。p1/P1 报告与计数侧消费（乙的
@@ -235,7 +246,11 @@ def eligibility_reasons(triggers, bars, gap_spans, situation,
     if len(triggers) == 0:
         return []
     wide = _wide_gaps(gap_spans, max_gap_days) if hold_bars else []
-    s2_starts = _s2_prev_session_starts(bars) if situation == "S2" else None
+    starts = None if situation_starts is None else list(situation_starts)
+    if starts is not None and len(starts) != n:
+        raise ValueError("situation_starts must have one timestamp per bar")
+    s2_starts = (_s2_prev_session_starts(bars)
+                 if situation == "S2" and starts is None else None)
     columns = set(triggers.columns) if hasattr(triggers, "columns") else set()
     t_bars = [int(b) for b in triggers["bar"]]
     t_anchor = (list(triggers["anchor"]) if "anchor" in columns
@@ -258,14 +273,15 @@ def eligibility_reasons(triggers, bars, gap_spans, situation,
             if not 0 <= origin < n:
                 raise ValueError(
                     f"anchor/bar 越界：origin={origin}（序列长 {n}）")
-            w = s2_starts[origin]
+            w = s2_starts[origin] if starts is None else 0
         else:
             w = situation_window_start(origin, situation, bars,
                                        approach_lookback, s3_bars)
         ok, reason = _eligibility_of(
             i, bars=bars, n=n, gap_spans=gap_spans, wide=wide,
             feature_warmup=feature_warmup, hold_bars=hold_bars,
-            origin=origin, window_start=w, anchor_action_end=anchor_action_end)
+            origin=origin, window_start=w, anchor_action_end=anchor_action_end,
+            situation_start=None if starts is None else starts[origin])
         out.append(reason)
     return out
 
@@ -274,7 +290,8 @@ def eligibility_mask(triggers, bars, gap_spans, situation, approach_lookback,
                      s3_bars: int = S3_WINDOW_BARS,
                      feature_warmup: int = FEATURE_WARMUP_BARS,
                      hold_bars: int = 0,
-                     max_gap_days: int = 30) -> list[bool]:
+                     max_gap_days: int = 30, *,
+                     situation_starts=None) -> list[bool]:
     """P-09 + P2-03 共同可用集合：每个触发行是否合格（counting 与 p1 共用）。
 
     合格 ⇔ `_eligibility_of` 的全部窗成立：
@@ -300,7 +317,7 @@ def eligibility_mask(triggers, bars, gap_spans, situation, approach_lookback,
     return [r == "" for r in eligibility_reasons(
         triggers, bars, gap_spans, situation, approach_lookback,
         s3_bars=s3_bars, feature_warmup=feature_warmup, hold_bars=hold_bars,
-        max_gap_days=max_gap_days)]
+        max_gap_days=max_gap_days, situation_starts=situation_starts)]
 
 
 # ------------------------------------------------- 统一资格（T104 P2-03）
