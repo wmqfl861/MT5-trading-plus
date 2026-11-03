@@ -1,0 +1,16 @@
+# R2 研究轮次预注册草案（T114 / A1 待审）。
+# approved_by 为空表示尚未批准；本文件不得用于 bt round open。
+# opened 是既有 loader 要求的预注册日期字段，下面的日期只表示草案编制日，
+# 不表示轮次已经打开或已写入台账。正式开启日期/状态须由批准方处理。
+id = "R2"
+opened = "2026-11-03"
+candidates = ["C002"]
+trial_budget = 2
+lockbox_uses_max = 1
+dsr_trial_scope = "rounds_lineage"
+approved_by = ""
+advance_rule = "C002 仅在主检验段上运行。主检验为随机化参照检验，单侧 p ≤ α/N，α=0.05，N 按 rounds_lineage 的 D33 谱系口径（包含 R1 的历史试验计数，但 R1 的错误检验对象不转化为本版本结论）；随机事件在实际随机入口按同一 mtd_sign 规则重算方向。唯一适用否决为成本 ×1.5 后每事件净均值 > 0；事件模式不运行延迟一根与多头相对买入持有两项否决。单次预筛检验力必须 ≥50% 才可进入本轮；α/N 检验力单独报告，不把旧的约58%或约46%估计当作当前结果。通过后不在本轮挑选新参数。"
+close_rule = "先到即止：主规格运行一次，预算保留一次代码修复后的重跑，最多 2 次去重研究试验；若 C002 得到结论则按预写规则关闭，若预算用尽也关闭。lockbox_uses_max=1，锁箱使用需另经批准；关闭后不得继续运行。"
+
+[evaluation]
+C002 = { mode = "event", primary = "randomization", side_rule = "mtd_sign" }

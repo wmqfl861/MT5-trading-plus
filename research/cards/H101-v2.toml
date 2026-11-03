@@ -1,0 +1,34 @@
+# H101-v2（T114 / A1 待审）：C002 新版本的事件模式卡。
+# 该卡放在正式 cards 同类目录；load_card 只做 TOML/模式校验，不写台账。
+# 只有 R2 获批准并开启、且候选正式提升后才允许研究运行。
+id = "H101-v2"
+family = "H101"
+version = 2
+parent = "H101"
+strategy = "mt5quant.strategies.library.b7_monthend_hedge_rebalance:MonthEndHedgeRebalance"
+symbols = ["EURUSD"]
+timeframe = "H1"
+round = "R2"
+candidate = "C002"
+session = "Europe/London 15:00-16:00"
+selection_rule = "single_spec"
+evaluation_mode = "standard"
+primary_statistic = "randomization"
+phenomenon = "月末定盘前一小时的可预测货币移动：当月 USTEC 从上月倒数第二个交易日收盘到本月倒数第二个交易日收盘上涨时，按登记方向做多 EURUSD；下跌时做空 EURUSD。交易事件为月末最后交易日伦敦 15:00 入场、16:00 定盘出场。"
+mechanism = "外国股票组合管理人按月末市值调汇率对冲敞口：当月美股上涨 → 对冲市值上升 → 月末最后一个定盘前须卖出 USD 买回本币（或反向）。信号为 USTEC D1，交易为 EURUSD H1；方向由冻结的 mtd_sign 规则在实际事件入口和随机事件入口分别按同一窗口计算。"
+should_fail_when = "USTEC 当月平盘（|mtd_sign| ≤ threshold_pct）没有方向仓；信号日历或收盘映射不能提供上月/本月倒数第二个交易日收盘；任一锚点不在实际事件入口之前；或定盘前一小时的可预测成分在成本压力下消失。缺锚必须 fail-closed，不能解释为零方向或补抽样。"
+falsified_if = "R2 预写的随机化参照主检验不满足单侧 p ≤ α/N，或唯一适用的成本 ×1.5 否决未通过；动态随机事件若缺少合法月内锚，运行失败关闭，不生成伪造的主检验结论。"
+graveyard_checked = []
+
+[rules]
+entry = "月末最后交易日（必须来自显式交易日历）伦敦 15:00 事件窗起点。USTEC D1 信号取上月倒数第二个交易日收盘至本月倒数第二个交易日收盘，两个收盘必须严格早于事件入口；上涨 → 多 EURUSD，下跌 → 空 EURUSD，平盘 → 不交易。"
+exit = "伦敦 16:00 定盘时刻平仓；事件窗为一根 H1，日内不过夜。"
+stop = "1.0×ATR 保护性止损（沿用 MonthEndHedgeRebalance 的 ExitRules）；事件模式的主检验与成本压力按 R2 预注册规则执行。"
+
+[params]
+threshold_pct = [0.0]
+
+[expected]
+trades_per_year = "12 个计划事件/年（每月最后一个交易日一个定盘前一小时事件窗）；约 3.1bp/事件为既有文献折算的事前毛收益声明，不是样本内结果。"
+win_rate = "未登记；事件方向盈亏概率不作点预测。"
+payoff_ratio = "不适用；固定一小时事件窗、对称方向仓、无参数化止盈结构。"

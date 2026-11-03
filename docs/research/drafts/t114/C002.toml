@@ -1,0 +1,40 @@
+# C002 新版本离线草案（T114 / A1 待审）
+#
+# 该文件位于 docs/research/drafts/t114，不属于正式候选扫描目录。
+# 保留 id=C002 与 H101 谱系；通过 A1 后，才可由审核方显式提升到
+# research/candidates/C002.toml。没有写 [precheck]，也没有在本文件中填入
+# 任何运行产物或台账结论。
+id = "C002"
+title = "月末对冲调仓（USTEC 当月涨跌 → EURUSD，伦敦定盘前）"
+mechanism_class = "cross_asset"
+status = "registered"
+symbols = ["EURUSD"]
+holding = "H1"
+mechanism = "外国股票组合管理人按月末市值调汇率对冲敞口：当月美股上涨 → 对冲市值上升 → 月末最后一个定盘前须卖出 USD 买回本币（或反向），集中在伦敦定盘前一小时成交（Melvin & Prins 2015 的对冲通道）。信号品种为 USTEC，交易品种为 EURUSD；信号窗口为上月倒数第二个交易日收盘至本月倒数第二个交易日收盘，涨跌方向按 mtd_sign 逐事件决定。"
+continues_family = "H101"
+notes = "T114 离线草案：该 C002 版本只声明待审核的输入契约，不表示已完成预筛。R1 的 run 449/450 保留并计入 D33 谱系计数，但其固定做多/同序列近似方向不是本版本的检验结果。正式提升前必须用主检验段实际输入重跑预筛；不得把旧 C002、旧 precheck JSON 或 R1 报告中的覆盖/检验力数字复制为本版本证据。"
+
+[literature]
+original = ["Melvin & Prins (2015), Equity hedging and exchange rates at the London 4 p.m. fix, Journal of Financial Markets 22: 50-72"]
+replications = [
+  "Ito & Yamada (2017/2018), Did the Reform Fix the London Fix Problem?, NBER WP 23327；Journal of International Money and Finance 80: 75-95——2015-02-15 定盘改革（WMR 4pm 计算窗口 1 分钟→5 分钟，约 15:57:30-16:02:30）后，成交量尖峰消失但此前报告的价格动态异象仍存在。",
+  "Krohn, Mueller & Whelan (2024), Foreign Exchange Fixings and Returns Around the Clock, Journal of Finance 79(1): 541-578——1999-01 至 2019-12 的样本跨越定盘改革，报告定盘前持续升值、定盘后反转的时间模式。"
+]
+rebuttals = [
+  "Krohn, Mueller & Whelan (2024) 同文：扣足全额买卖价差后，定盘周边波动大多消失（hard to exploit after costs）；该可交易性反驳仍是本版本的预先风险。"
+]
+search_log = "继承旧 C002 已登记材料的文献检索记录（2026-10-28）：核对 Melvin-Prins、Ito-Yamada、Krohn-Mueller-Whelan、WMR 2015 五分钟窗口与 ECB 会议稿 14bp/10% 锚；未在本 T114 草案阶段新增检索或数据调用。该记录只说明来源链，不证明当前日历、收盘映射、重叠一致率、覆盖或预筛已经取得。"
+published_effect = "2004-2013 八大流动货币：上月倒数第二日至本月倒数第二日的股市收益可预测本月最后一个交易日伦敦定盘前的货币收益；股市上涨对应该国货币在定盘前可预测贬值。ECB 第三届 FX Workshop 会议稿第 14 页的量化锚为：月内股市每上涨 10%，该国货币在月末最后定盘前一小时贬值约 14bp。"
+expected_effect = "全部为文献折算或事前品种性质声明，不取本项目样本内结果：14bp/10% 月涨幅折为 1.4bp/1%；采用既有材料的 E|r_月|≈5.25% 与发表后衰减 ×0.42，得约 3.1bp/事件（0.00031）。该数字是预筛输入声明，不是当前预筛结果；成本来源层与事件压力层须分开记录：MT5 输入使用 MT5 成本来源，HistData/FRED 外部输入的点差按冻结契约 ×1.5；V3 事件成本否决再独立使用成本 ×1.5。"
+
+[declared]
+events_per_year = 12
+gross_return_per_event = 0.00031
+window_bars = 1
+entry_hour_ny = 10
+exit_hour_ny = 11
+overnight_nights = 0.0
+expected_sharpe = 0.83
+signal_symbol = "USTEC"
+signal_timeframe = "D1"
+side_rule = "mtd_sign"
