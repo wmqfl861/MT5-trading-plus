@@ -27,6 +27,7 @@ CODE_FILES = (
     "src/mt5quant/costs/volatility.py", "src/mt5quant/costs/spread.py",
     "src/mt5quant/costs/slippage.py", "src/mt5quant/costs/commission.py",
     "src/mt5quant/costs/overshoot.py", "src/mt5quant/costs/swap.py",
+    "src/mt5quant/prob/__init__.py",
 )
 
 

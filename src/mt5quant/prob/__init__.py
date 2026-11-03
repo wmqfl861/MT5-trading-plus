@@ -1,16 +1,39 @@
-"""概率决策线（P 线）评估代码（T72，蓝图 `docs/blueprint-p-line.md`）。
+"""Probability-line public API with lazy legacy exports.
 
-本包是标签、概率表、决策规则与模型产物——**研究角色只读**（D45）；局面与
-动作在策略库 `mt5quant.strategies.library.prob`。使用约束：T75 标定报告与
-T77 轮次草案获批之前，不得在真实局面触发上计算任何标签（蓝图 v4 §2）。
+The counting/feasibility entry can cold-import this package without importing
+labels, probability tables, or the backtest engine. Legacy names retain their
+module/object identity once explicitly requested.
 """
-from mt5quant.prob.artifact import ModelIntegrityError, load_model, save_model
-from mt5quant.prob.decision import ACTION_ORDER, choose, ev_lower
-from mt5quant.prob.labels import LOOKBACK_BARS, Bracket, label_triggers
-from mt5quant.prob.tables import CellEstimate, ProbTable
+from __future__ import annotations
 
-__all__ = [
-    "ACTION_ORDER", "Bracket", "CellEstimate", "LOOKBACK_BARS",
-    "ModelIntegrityError", "ProbTable", "choose", "ev_lower", "label_triggers",
-    "load_model", "save_model",
-]
+import importlib
+
+_LAZY_EXPORTS = {
+    "ACTION_ORDER": ("decision", "ACTION_ORDER"),
+    "Bracket": ("labels", "Bracket"),
+    "CellEstimate": ("tables", "CellEstimate"),
+    "LOOKBACK_BARS": ("labels", "LOOKBACK_BARS"),
+    "ModelIntegrityError": ("artifact", "ModelIntegrityError"),
+    "ProbTable": ("tables", "ProbTable"),
+    "choose": ("decision", "choose"),
+    "ev_lower": ("decision", "ev_lower"),
+    "label_triggers": ("labels", "label_triggers"),
+    "load_model": ("artifact", "load_model"),
+    "save_model": ("artifact", "save_model"),
+}
+
+__all__ = list(_LAZY_EXPORTS)
+
+
+def __getattr__(name):
+    try:
+        module_name, attribute = _LAZY_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    value = getattr(importlib.import_module(f"{__name__}.{module_name}"), attribute)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_LAZY_EXPORTS))

@@ -487,3 +487,240 @@ def test_cli_help_identity_receipts_and_overwrite_refusal(tmp_path):
     first = (out / "report.json").read_bytes()
     again = subprocess.run(args, cwd=root, env=env, capture_output=True, text=True)
     assert again.returncode != 0 and (out / "report.json").read_bytes() == first
+
+
+# Independent review fix round 1: reproduce all findings before changing code.
+def charged_evidence():
+    e = cost_evidence()
+    e["payload"]["spread"]["hours"] = {"6": {"p90": .02, "n_days": 20}}
+    e["payload"]["slippage"]["event_hours"] = []
+    e["payload"]["overshoot"]["hours"] = {"6": {"p90": .0001, "n_days": 20}}
+    e["payload"]["commission"]["round_trip_per_lot"] = .2
+    e["payload"]["swap"] = {"basis": "charged", "scope": "Demo",
+        "long_per_day": -20., "short_per_day": -20.,
+        "charge_weekdays": [0, 1, 2, 3, 4], "triple_weekdays": [2]}
+    return seal(e)
+
+
+def test_fix1_valid_weekdays_charge_actual_endpoint_nights(feasibility):
+    # (.02 spread + .004 slip + .01 overshoot + .002 commission + .2 night)/10.
+    one_night = trigger_cost(feasibility, charged_evidence())
+    assert one_night["cost_r"] == pytest.approx(.0236)
+    assert one_night["cost_gate"] == "fail"
+    triple = trigger_cost(feasibility, charged_evidence(),
+        signal_time=pd.Timestamp("2015-01-07 10:00"),
+        entry_time=pd.Timestamp("2015-01-07 11:00"),
+        exit_time=pd.Timestamp("2015-01-08 11:00"))
+    assert triple["cost_r"] == pytest.approx(.0636)
+
+
+@pytest.mark.parametrize("field", ["charge_weekdays", "triple_weekdays"])
+@pytest.mark.parametrize("bad", [[.5, 1.5, 2.5, 3.5, 4.5], [True], ["1"], [7]])
+@pytest.mark.parametrize("missing_overshoot", [False, True])
+def test_fix1_invalid_weekdays_cannot_hide_charges_or_failures(
+        feasibility, field, bad, missing_overshoot):
+    e = charged_evidence()
+    e["payload"]["swap"][field] = bad
+    if missing_overshoot:
+        del e["payload"]["overshoot"]
+    out = trigger_cost(feasibility, seal(e))
+    assert out["cost_r"] is None
+    assert out["cost_gate"] == "fail"
+    assert "invalid_swap_" + field in out["fail_reasons"]
+    if missing_overshoot:
+        assert "missing_overshoot" in out["waiting_reasons"]
+
+
+@pytest.mark.parametrize("component", ["spread", "overshoot"])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -.01])
+def test_fix1_invalid_p90_and_missing_coverage_preserve_both_gates(feasibility, component, bad):
+    e = cost_evidence()
+    e["payload"][component]["hours"]["6"] = {"p90": bad}
+    out = trigger_cost(feasibility, seal(e))
+    assert out["cost_r"] is None and out["cost_gate"] == "fail"
+    assert "invalid_" + component + "_p90" in out["fail_reasons"]
+    assert "invalid_" + component + "_coverage" in out["waiting_reasons"]
+    row = feasibility.summarize_hypothesis([pd.Timestamp("2015-01-05")], [out])
+    assert row["status"] == "waiting_data" and row["cost_gate"] == "fail"
+    assert out["fail_reasons"] == row["fail_reasons"]
+    assert set(out["waiting_reasons"]) <= set(row["waiting_reasons"])
+
+
+@pytest.mark.parametrize("bad", [[24], [6.5], [True], ["6"]])
+def test_fix1_invalid_event_hours_are_not_masked_by_missing_component(feasibility, bad):
+    e = cost_evidence()
+    e["payload"]["slippage"]["event_hours"] = bad
+    del e["payload"]["overshoot"]
+    out = trigger_cost(feasibility, seal(e))
+    assert out["cost_r"] is None and out["cost_gate"] == "fail"
+    assert "invalid_slippage_event_hours" in out["fail_reasons"]
+    assert "missing_overshoot" in out["waiting_reasons"]
+
+
+def test_fix1_rejected_production_evidence_is_not_numerically_validated(feasibility):
+    e = charged_evidence()
+    e["kind"] = "production"
+    e["payload"]["swap"]["charge_weekdays"] = [.5]
+    e["payload"]["spread"]["hours"]["6"] = {"p90": float("nan")}
+    out = trigger_cost(feasibility, seal(e))
+    assert out["cost_r"] is None and out["cost_gate"] == "waiting_data"
+    assert out["waiting_reasons"] == ["production_cost_not_released"]
+    assert out["fail_reasons"] == []
+
+
+def test_fix1_gap_timezones_have_identical_qualification_and_identity(feasibility):
+    b = bars(2200)
+    b.loc[26:, "time"] += pd.Timedelta(days=31)
+    # The first trigger's warmup spans the gap, the second's does not.
+    b.loc[[2001, 2050], ["open", "high", "low", "close"]] = [100., 105., 99., 104.]
+    tags = ["mt5"] * len(b)
+    gap = [(b.time.iloc[25], b.time.iloc[26])]
+    identity = input_identity(b, tags, gap)
+    representations = [gap,
+        [(s.isoformat() + "Z", e.isoformat() + "Z") for s, e in gap],
+        [(s.tz_localize("UTC").tz_convert("Etc/GMT-2").isoformat(),
+          e.tz_localize("UTC").tz_convert("Etc/GMT+5").isoformat()) for s, e in gap]]
+    reports = []
+    for spans in representations:
+        report = feasibility.run_feasibility({"XAUUSD": b}, source_tags={"XAUUSD": tags},
+            gap_spans={"XAUUSD": spans}, sessions=frozen_sessions(),
+            input_evidence={"XAUUSD": identity}, cost_evidence={"XAUUSD": cost_evidence()})
+        row = next(r for r in report["rows"] if (r["family"], r["symbol"], r["situation"], r["action"])
+                   == ("F1", "XAUUSD", "S1", "A3"))
+        assert row["n_triggers"] == 1 and row["n_days"] == 1
+        assert row["exclusions"]["feature_gap"] == 1
+        assert report["inputs"]["XAUUSD"]["payload_sha256"] == identity["payload_sha256"]
+        reports.append(report)
+    assert reports[0] == reports[1] == reports[2]
+
+
+@pytest.mark.parametrize("spans", [
+    [("2015-01-05T02:00:00Z", "2015-01-05T01:00:00Z")],
+    [("NaT", "2015-01-05T01:00:00Z")],
+    [("not-a-time", "2015-01-05T01:00:00Z")],
+    [("2015-01-05T01:00:00Z",)],
+])
+def test_fix1_malformed_gap_still_rejects_input(feasibility, spans):
+    b = bars(30)
+    tags = ["mt5"] * len(b)
+    report = feasibility.run_feasibility({"XAUUSD": b}, source_tags={"XAUUSD": tags},
+        gap_spans={"XAUUSD": spans}, sessions=frozen_sessions(),
+        input_evidence={"XAUUSD": input_identity(b, tags, [])}, cost_evidence={})
+    rows = [r for r in report["rows"] if r["symbol"] == "XAUUSD"]
+    assert all(r["n_triggers"] is None and r["cost_r"] is None and
+               r["status"] == "waiting_data" for r in rows)
+    assert all("input_identity_incomplete" in r["waiting_reasons"] or
+               "input_gap_range" in r["waiting_reasons"] for r in rows)
+
+
+def cold_python(code, *args):
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    root = Path(__file__).resolve().parents[1]
+    return subprocess.run([sys.executable, "-I", "-c", code, str(root), *map(str, args)],
+        cwd=root, env={**os.environ, "PYTHONUTF8": "1"}, capture_output=True, text=True,
+        timeout=60)
+
+
+@pytest.mark.parametrize("mode", ["help", "compute"])
+def test_fix1_cold_cli_blocks_dependencies_before_first_package_import(tmp_path, mode):
+    b = bars(2200)
+    b.loc[2050, ["open", "high", "low", "close"]] = [100., 105., 99., 104.]
+    tags = ["mt5"] * len(b)
+    rows = b.copy()
+    rows["time"] = rows.time.map(lambda t: t.isoformat())
+    inputs = {"symbols": {"XAUUSD": {"bars": rows.to_dict("records"), "source_tags": tags,
+        "gap_spans": [], "evidence": input_identity(b, tags, [])}}}
+    input_path, cost_path, out = tmp_path / "input.json", tmp_path / "costs.json", tmp_path / "out"
+    input_path.write_text(json.dumps(inputs), encoding="utf-8")
+    e = cost_evidence()
+    e["payload"]["spread"]["hours"] = {str(h): {"p90": .1, "n_days": 20} for h in range(24)}
+    cost_path.write_text(json.dumps({"XAUUSD": seal(e)}), encoding="utf-8")
+    result = cold_python('''
+import sys
+import importlib.abc
+import runpy
+from pathlib import Path
+forbidden = ("mt5quant.prob.labels", "mt5quant.prob.tables", "mt5quant.prob.p1",
+             "mt5quant.backtest.engine_a", "mt5quant.backtest.engine_b",
+             "mt5quant.research.candidates")
+assert not any(n.startswith(("mt5quant", "mt5data")) for n in sys.modules)
+class Guard(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if any(fullname == p or fullname.startswith(p + ".") for p in forbidden):
+            raise AssertionError("forbidden cold import: " + fullname)
+sys.meta_path.insert(0, Guard())
+root, mode, input_path, cost_path, output = sys.argv[1:]
+script = str(Path(root) / "scripts/pline_feasibility.py")
+sys.argv = [script, "--help"] if mode == "help" else [script, "--input", input_path,
+    "--cost-evidence", cost_path, "--sessions", str(Path(root) / "config/sessions.toml"),
+    "--output", output]
+try:
+    runpy.run_path(script, run_name="__main__")
+except SystemExit as exc:
+    assert exc.code == 0, exc.code
+else:
+    raise AssertionError("CLI did not finish")
+assert not any(n == p or n.startswith(p + ".") for n in sys.modules for p in forbidden)
+print("COLD_IMPORT_GUARD_PASS")
+''', mode, input_path, cost_path, out)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "COLD_IMPORT_GUARD_PASS" in result.stdout
+    if mode == "help":
+        assert "--input" in result.stdout
+        assert not out.exists()
+    else:
+        report = json.loads((out / "report.json").read_text(encoding="utf-8"))
+        row = next(r for r in report["rows"] if (r["family"], r["symbol"], r["situation"], r["action"])
+                   == ("F1", "XAUUSD", "S1", "A3"))
+        assert row["n_triggers"] == 1 and row["cost_r"] > 0
+        receipt = json.loads((out / "receipt.json").read_text(encoding="utf-8"))
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        assert receipt["code_files_sha256"]["src/mt5quant/prob/__init__.py"] == hashlib.sha256(
+            (root / "src/mt5quant/prob/__init__.py").read_bytes()).hexdigest()
+
+
+def test_fix1_lazy_exports_preserve_names_identity_and_legacy_imports():
+    result = cold_python('''
+import sys
+import importlib
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / "src"))
+import mt5quant.prob as prob
+assert "mt5quant.prob.labels" not in sys.modules
+assert "mt5quant.prob.tables" not in sys.modules
+assert "mt5quant.backtest.engine_a" not in sys.modules
+expected = {
+    "ACTION_ORDER": "decision", "Bracket": "labels", "CellEstimate": "tables",
+    "LOOKBACK_BARS": "labels", "ModelIntegrityError": "artifact", "ProbTable": "tables",
+    "choose": "decision", "ev_lower": "decision", "label_triggers": "labels",
+    "load_model": "artifact", "save_model": "artifact",
+}
+assert prob.__all__ == list(expected)
+assert set(expected) <= set(dir(prob))
+try:
+    prob.unknown_export
+except AttributeError:
+    pass
+else:
+    raise AssertionError("unknown name was accepted")
+for name, module in expected.items():
+    public = getattr(prob, name)
+    assert public is getattr(importlib.import_module("mt5quant.prob." + module), name)
+    imported = {}
+    exec("from mt5quant.prob import " + name, imported)
+    assert imported[name] is public
+    assert getattr(prob, name) is public
+wildcard = {}
+exec("from mt5quant.prob import *", wildcard)
+assert all(wildcard[name] is getattr(prob, name) for name in expected)
+from mt5quant.prob import counting, gaps
+assert counting is importlib.import_module("mt5quant.prob.counting")
+assert gaps is importlib.import_module("mt5quant.prob.gaps")
+print("LEGACY_EXPORTS_PASS")
+''')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "LEGACY_EXPORTS_PASS" in result.stdout

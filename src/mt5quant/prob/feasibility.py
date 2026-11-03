@@ -118,6 +118,7 @@ def qualify_triggers(triggers, bars, *, symbol, situation, hold_bars,
     """Registered qualification only; future bars supply timestamps alone."""
     if sessions.forbidden_hours_ny:
         raise ValueError("data-driven forbidden hours are not T121 calendar policy")
+    gap_spans = _normalize_gap_spans(gap_spans)
     times = _times(bars["time"]).reset_index(drop=True)
     temporal = pd.DataFrame({"time": times})
     reasons = eligibility_reasons(
@@ -150,6 +151,37 @@ def _number(value, *, positive=False):
 def _utc(value):
     t = pd.Timestamp(value)
     return t.tz_convert("UTC").tz_localize(None) if t.tzinfo is not None else t
+
+
+def _normalize_gap_spans(gap_spans):
+    """Normalize admitted gap endpoints to the bars' naive UTC basis."""
+    if gap_spans is None:
+        return []
+    normalized = []
+    for span in gap_spans:
+        if not isinstance(span, (tuple, list)) or len(span) != 2:
+            raise ValueError("gap span must contain exactly two timestamps")
+        start, end = (_utc(value) for value in span)
+        if pd.isna(start) or pd.isna(end) or not start < end:
+            raise ValueError("gap span must be an increasing finite interval")
+        normalized.append((start, end))
+    return normalized
+
+
+def _valid_weekday_field(value):
+    """Require an explicit iterable of plain weekday integers 0..6."""
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return False
+    return all(isinstance(day, int) and not isinstance(day, bool) and 0 <= day <= 6
+               for day in value)
+
+
+def _valid_event_hours(value):
+    """Require explicit local-hour integers 0..23; booleans are not integers here."""
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return False
+    return all(isinstance(hour, int) and not isinstance(hour, bool) and 0 <= hour <= 23
+               for hour in value)
 
 
 def trigger_cost(*, symbol, signal_time, entry_time, exit_time, side, source,
@@ -235,6 +267,8 @@ def trigger_cost(*, symbol, signal_time, entry_time, exit_time, side, source,
             field("slippage", key, positive=key == "event_multiplier")
         if "event_hours" not in parts["slippage"]:
             waiting.append("missing_slippage_event_hours")
+        elif not _valid_event_hours(parts["slippage"]["event_hours"]):
+            failures.append("invalid_slippage_event_hours")
 
     qualified = {}
     for name in ("spread", "overshoot"):
@@ -252,15 +286,29 @@ def trigger_cost(*, symbol, signal_time, entry_time, exit_time, side, source,
             waiting.append("overshoot_version_basis")
         for hour, stat in table.items():
             try:
-                h = int(hour)
-                days = stat["n_days"]
-                if not 0 <= h <= 23 or not isinstance(days, int) or isinstance(days, bool) or days < 0:
+                if not isinstance(hour, (str, int)) or isinstance(hour, bool):
                     raise ValueError
-                if not _number(stat["p90"]):
+                h = int(hour)
+                if not 0 <= h <= 23:
+                    raise ValueError
+                if not isinstance(stat, dict):
+                    raise TypeError
+                p90_present = "p90" in stat
+                p90_valid = p90_present and _number(stat["p90"])
+                if p90_present and not p90_valid:
                     failures.append("invalid_" + name + "_p90")
-                elif days >= 20:
+                if "n_days" not in stat:
+                    waiting.append("invalid_" + name + "_coverage")
+                    continue
+                days = stat["n_days"]
+                if not isinstance(days, int) or isinstance(days, bool) or days < 0:
+                    waiting.append("invalid_" + name + "_coverage")
+                    continue
+                if not p90_present:
+                    waiting.append("invalid_" + name + "_coverage")
+                elif p90_valid and days >= 20:
                     qualified[name][h] = stat["p90"]
-            except (ValueError, TypeError, KeyError):
+            except (ValueError, TypeError):
                 waiting.append("invalid_" + name + "_coverage")
         if not qualified[name]:
             waiting.append("no_qualified_" + name + "_hours")
@@ -278,6 +326,10 @@ def trigger_cost(*, symbol, signal_time, entry_time, exit_time, side, source,
             for key in ("long_per_day", "short_per_day", "triple_weekdays", "charge_weekdays"):
                 if key not in swap:
                     waiting.append("missing_swap_" + key)
+            if "triple_weekdays" in swap and not _valid_weekday_field(swap["triple_weekdays"]):
+                failures.append("invalid_swap_triple_weekdays")
+            if "charge_weekdays" in swap and not _valid_weekday_field(swap["charge_weekdays"]):
+                failures.append("invalid_swap_charge_weekdays")
             for key in ("long_per_day", "short_per_day"):
                 if key in swap and not _number(-swap[key] if isinstance(swap[key], (int, float)) else None):
                     failures.append("invalid_swap_" + key)
@@ -473,7 +525,8 @@ def run_feasibility(h1_by_symbol, *, source_tags, gap_spans, sessions,
         if not unavailable:
             try:
                 clean, _, _ = prepare_bars(h1, tags, "H1")
-                receipts[symbol] = _input_receipt(h1, tags, gaps, evidence)
+                normalized_gaps = _normalize_gap_spans(gaps)
+                receipts[symbol] = _input_receipt(h1, tags, normalized_gaps, evidence)
                 # Unknown source anywhere may affect signals through a lookback.
                 # Preserve all trigger counts and mark the entire symbol as waiting.
                 source_wait = ["source_unknown"] if any(_source(t) is None for t in tags) else []
@@ -492,7 +545,7 @@ def run_feasibility(h1_by_symbol, *, source_tags, gap_spans, sessions,
                             selected = raw[raw.action == action]
                             qualified, dropped = qualify_triggers(
                                 selected, b[["time"]], symbol=symbol, situation=sit, hold_bars=k,
-                                gap_spans=gaps, sessions=sessions, s3_bars=20 * per_day,
+                                gap_spans=normalized_gaps, sessions=sessions, s3_bars=20 * per_day,
                                 situation_starts=starts if sit == "S2" else None)
                             prepared[tf, sit, action] = (b, src, qualified,
                                 {**pre_excluded, **dropped}, source_wait)
