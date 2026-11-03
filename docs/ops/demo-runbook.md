@@ -281,6 +281,11 @@ if (Test-Path data\live\paper) { Move-Item data\live\paper data\demo\paper-final
 并用 `snapshot_specs.py` 的 diff 输出确认只新增了 `currency_base` 一类
 字段、其余合约参数无漂移；刷新前后各留一份 history 版本供审计。
 
+两份已授权快照也可交给 §6.2 的 `t111b_prepare.py` 离线核对：只接受当前
+公开的品种名→字段对象结构，原字段及类型须保持一致，新增 `currency_base`
+须为非空字符串。唯一不参与参数比较的元数据是 `captured_at_utc`（沿用
+`mt5gw.snapshot.diff_snapshots` 契约）；重复键、未知字段、空快照均拒绝。
+
 ## 6. T110 超时防护与外部 supervisor（维护窗口部署）
 
 ### 6.1 完成心跳、异常证据与边界
@@ -326,6 +331,26 @@ SessionsConfig、SpreadModel、LogDir。部署代码目录可与数据目录不�
 `demo_run.ps1 -DataDir` 会显式传给三个角色，runner 同时覆盖配置中的
 `data_root` 与自定义 heartbeat_path。网关预检和三角色使用同一个
 `-GatewayConfig`，所有 Python 子进程均为 `-u`。
+
+已有 release 目录和两份独立授权快照可先运行纯离线前置检查（占位值须替换，
+工具不创建部署目录、不读取部署配置内容、不执行输入脚本或运行时步骤）：
+
+```powershell
+python scripts/t111b_prepare.py --release-dir '<existing-release-tree>' `
+  --expected-sha '<40-character-lowercase-fixed-sha>' `
+  --before-snapshot '<authorized-before.json>' --after-snapshot '<authorized-after.json>'
+```
+
+JSON/stdout 确定性输出固定 SHA、detached/clean、三角色必需脚本的相对名与
+SHA-256、快照文件 SHA-256 和允许差异计数；失败退出非零。脚本内容须逐字节
+匹配 HEAD blob；经换行转换或过滤器改变的文件也拒绝。可重复提供
+`--path 'NAME=<existing-absolute-path>'`，NAME 限于 `data_dir`、`config_dir`、
+`python`、`gateway_config`、`risk_config`、`sessions_config`、`spread_model`、
+`log_dir`，只核对存在性和文件/目录类型，输出不包含路径值。未提供的项目列入
+`static_prerequisites_pending`；`static_checks_passed=true` 仅指已执行的检查，
+缺路径时 `deployment_prerequisites_complete=false`，不表示完整发布前置通过。
+即使全部路径存在，也未验证配置内容或 DEMO 保险丝；`runtime_checks_pending`
+始终保留维护窗口批准、真实健康/进程、授权及部署/正式窗事项，不能据此批准 U3。
 
 示例仅为维护窗口操作模板（先替换占位值，**开发/测试不执行**）
 
