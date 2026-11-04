@@ -342,9 +342,19 @@ python scripts/t111b_prepare.py --release-dir '<existing-release-tree>' `
 ```
 
 JSON/stdout 确定性输出固定 SHA、detached/clean、三角色必需脚本的相对名与
-SHA-256、快照文件 SHA-256 和允许差异计数；失败退出非零。脚本内容须逐字节
-匹配 HEAD blob；经换行转换或过滤器改变的文件也拒绝。可重复提供
-`--path 'NAME=<existing-absolute-path>'`，NAME 限于 `data_dir`、`config_dir`、
+SHA-256、快照文件 SHA-256 和允许差异计数；检查失败退出 1。整树索引存在
+`assume-unchanged` 或 `skip-worktree` 标志即拒绝（含非入口模块及未改动文件），
+输出 `release_hidden_index_flags` 且 `clean=false`，不自动清除标志。
+三个明确入口 `live_reconcile.py`、`live_runner.py`、`risk_process.py` 须匹配
+HEAD blob；仅允许这些 UTF-8 文本脚本的统一 CRLF 工作树对应 LF blob，输出
+SHA-256 始终取实际文件字节。不放宽混合换行、裸 CR、编码/BOM、空白或实质
+内容变化，不调用 clean/smudge/process 过滤器。其他文件不适用该身份等价例外。
+CLI 缺参数、未知选项/值及参数格式解析错误退出 2，stdout 固定输出
+`{"errors":["cli_arguments_invalid"],"schema_version":1,"static_checks_passed":false}`，
+stderr 为空，不回显参数、路径或原始错误；正常 `--help` 仍显示帮助并退出 0。
+过深 JSON 在解析阶段按 `snapshot_before_invalid_json` 或
+`snapshot_after_invalid_json` 稳定失败，不输出回溯。
+可重复提供 `--path 'NAME=<existing-absolute-path>'`，NAME 限于 `data_dir`、`config_dir`、
 `python`、`gateway_config`、`risk_config`、`sessions_config`、`spread_model`、
 `log_dir`，只核对存在性和文件/目录类型，输出不包含路径值。未提供的项目列入
 `static_prerequisites_pending`；`static_checks_passed=true` 仅指已执行的检查，

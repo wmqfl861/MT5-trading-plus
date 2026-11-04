@@ -160,6 +160,10 @@ def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _git_blob_id(value: bytes) -> str:
+    return hashlib.sha1(b"blob " + str(len(value)).encode("ascii") + b"\0" + value).hexdigest()
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -236,6 +240,18 @@ def _check_release(release: Path, expected_sha: str) -> tuple[dict[str, Any], li
     else:
         errors.append("release_attached")
 
+    # Inspect the whole index: status can hide changes outside the entry scripts.
+    # -v lowercases assume-unchanged entries; S/s denotes skip-worktree.
+    index_flags = _git(release, "ls-files", "-v", "-z")
+    hidden_flags = any(
+        entry[:1].islower() or entry[:1] == "S"
+        for entry in index_flags.stdout.split("\0") if entry
+    )
+    if index_flags.returncode != 0:
+        errors.append("release_index_flags_unavailable")
+    elif hidden_flags:
+        errors.append("release_hidden_index_flags")
+
     # Git status may run an attribute clean/process filter. Disable configured
     # filter commands for this query as well as fsmonitor in _git.
     filters = _git(release, "config", "--name-only", "--get-regexp", r"^filter\..*\.(clean|process)$")
@@ -245,7 +261,7 @@ def _check_release(release: Path, expected_sha: str) -> tuple[dict[str, Any], li
     status = _git(release, *filter_options, "status", "--porcelain", "--untracked-files=all",
                   "--ignore-submodules=none")
     if status.returncode == 0 and not status.stdout.strip():
-        info["clean"] = True
+        info["clean"] = index_flags.returncode == 0 and not hidden_flags
     else:
         errors.append("release_not_clean")
 
@@ -260,15 +276,25 @@ def _check_release(release: Path, expected_sha: str) -> tuple[dict[str, Any], li
         except OSError:
             errors.append(f"required_artifact_unreadable:{relative}")
             continue
-        # Compare the unfiltered Git blob ID directly. Git status can hide a
-        # changed file via assume-unchanged/skip-worktree or ignored files.
-        blob_id = hashlib.sha1(b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw).hexdigest()
+        # Only these three UTF-8 text scripts may match an LF HEAD blob after
+        # uniform CRLF checkout conversion. Keep the digest of the actual bytes;
+        # reject mixed/bare CR, binary encodings and all other content changes.
+        blob_ids = {_git_blob_id(raw)}
+        lf = raw.replace(b"\r\n", b"\n")
+        if (b"\r\n" in raw and b"\r" not in lf and b"\0" not in raw
+                and raw == lf.replace(b"\n", b"\r\n")):
+            try:
+                raw.decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+            else:
+                blob_ids.add(_git_blob_id(lf))
         tree = _git(release, "ls-tree", actual_sha, "--", relative)
         entry = tree.stdout.strip().split("\t", 1)
         metadata = entry[0].split()
         if (tree.returncode or len(entry) != 2 or entry[1] != relative
                 or len(metadata) != 3 or metadata[0] not in ("100644", "100755")
-                or metadata[1:] != ["blob", blob_id]):
+                or metadata[1] != "blob" or metadata[2] not in blob_ids):
             errors.append(f"required_artifact_not_at_head:{relative}")
         info["artifacts"].append({"path": relative, "sha256": digest})
 
@@ -340,7 +366,7 @@ def _read_json_snapshot(path: Path, label: str) -> tuple[Any, str | None]:
         return None, f"snapshot_{label}_duplicate_json_key"
     except _NonFinite:
         return None, f"snapshot_{label}_nonfinite_number"
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
         return None, f"snapshot_{label}_invalid_json"
     return (value, digest), None
 
@@ -539,8 +565,20 @@ def build_manifest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     return manifest, 0 if not manifest["errors"] else 1
 
 
+class _ArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        # argparse's message can contain raw private arguments; never emit it.
+        failure = {
+            "schema_version": SCHEMA_VERSION,
+            "static_checks_passed": False,
+            "errors": ["cli_arguments_invalid"],
+        }
+        print(json.dumps(failure, sort_keys=True, separators=(",", ":")))
+        self.exit(2)
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _ArgumentParser(
         description="Read-only T111b fixed-SHA and authorized snapshot pre-check"
     )
     parser.add_argument("--release-dir", required=True, help="existing detached release tree")

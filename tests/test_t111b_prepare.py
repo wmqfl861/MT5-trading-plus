@@ -45,18 +45,25 @@ SNAPSHOT_FIELDS = {
 
 
 def _run_git(path: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+               GIT_NO_LAZY_FETCH="1", GIT_NO_REPLACE_OBJECTS="1", GIT_TERMINAL_PROMPT="0")
     return subprocess.run(
-        ["git", "-C", str(path), *args],
+        ["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false",
+         "-c", "commit.gpgsign=false", "-C", str(path), *args],
+        env=env,
         check=check,
         capture_output=True,
         text=True,
     )
 
 
-def make_release(tmp_path: Path, *, missing: str | None = None) -> tuple[Path, str]:
+def make_release(
+    tmp_path: Path, *, missing: str | None = None, crlf: bool = False,
+) -> tuple[Path, str]:
     release = tmp_path / "release"
     release.mkdir(parents=True)
-    _run_git(release, "init", "-b", "main")
+    _run_git(release, "init", "--template=", "-b", "main")
     _run_git(release, "config", "user.email", "test@example.invalid")
     _run_git(release, "config", "user.name", "Test User")
     _run_git(release, "config", "core.autocrlf", "false")
@@ -69,11 +76,20 @@ def make_release(tmp_path: Path, *, missing: str | None = None) -> tuple[Path, s
         if name != missing:
             path = release / name
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(f"# synthetic {name}\n", encoding="utf-8")
+            path.write_bytes(f"# synthetic {name}\n# offline fixture only\n".encode("utf-8"))
+    module = release / "src" / "mt5live" / "gate.py"
+    module.parent.mkdir(parents=True)
+    module.write_bytes(b"# synthetic non-entry module\n")
     _run_git(release, "add", ".")
     _run_git(release, "commit", "-m", "synthetic release")
     sha = _run_git(release, "rev-parse", "HEAD").stdout.strip()
     _run_git(release, "checkout", "--detach", sha)
+    if crlf:
+        _run_git(release, "config", "core.autocrlf", "true")
+        for name in required:
+            if name != missing:
+                (release / name).unlink()
+        _run_git(release, "checkout-index", "--force", "--all", "--index")
     return release, sha
 
 
@@ -126,8 +142,8 @@ def parse_output(result: subprocess.CompletedProcess[str]) -> dict:
     return json.loads(result.stdout)
 
 
-def prepare_inputs(tmp_path: Path) -> tuple[Path, str, Path, Path]:
-    release, sha = make_release(tmp_path)
+def prepare_inputs(tmp_path: Path, *, crlf: bool = False) -> tuple[Path, str, Path, Path]:
+    release, sha = make_release(tmp_path, crlf=crlf)
     before_data, after_data = snapshots()
     before = tmp_path / "before.json"
     after = tmp_path / "after.json"
@@ -376,3 +392,135 @@ def test_empty_snapshots_are_not_valid_authorized_snapshots(tmp_path):
     result = invoke(release, sha, before, after)
     assert result.returncode != 0
     assert parse_output(result)["static_checks_passed"] is False
+
+
+@pytest.mark.parametrize("flags", [
+    ("--assume-unchanged",), ("--skip-worktree",),
+    ("--assume-unchanged", "--skip-worktree"),
+], ids=["assume-unchanged", "skip-worktree", "both"])
+@pytest.mark.parametrize("modified", [False, True], ids=["unchanged", "modified"])
+def test_rejects_hidden_index_flags_on_non_entry_module(tmp_path, flags, modified):
+    release, sha, before, after = prepare_inputs(tmp_path)
+    module = "src/mt5live/gate.py"
+    for flag in flags:
+        _run_git(release, "update-index", flag, module)
+    if modified:
+        (release / module).write_bytes(b"raise RuntimeError('must not run')\n")
+    assert not _run_git(release, "status", "--porcelain").stdout.strip()
+    index = release / ".git" / "index"
+    index_before = index.read_bytes()
+    module_before = (release / module).read_bytes()
+
+    result = invoke(release, sha, before, after)
+    manifest = parse_output(result)
+    assert result.returncode == 1
+    assert manifest["static_checks_passed"] is False
+    assert manifest["release"]["clean"] is False
+    assert "release_hidden_index_flags" in manifest["errors"]
+    assert index.read_bytes() == index_before
+    assert (release / module).read_bytes() == module_before
+
+
+def test_accepts_lf_blobs_with_crlf_text_artifacts_and_hashes_actual_bytes(tmp_path):
+    release, sha, before, after = prepare_inputs(tmp_path, crlf=True)
+    eol = _run_git(release, "ls-files", "--eol", "--", "scripts").stdout.splitlines()
+    assert len(eol) == 3
+    assert all(line.split()[:2] == ["i/lf", "w/crlf"] for line in eol)
+    assert not _run_git(release, "status", "--porcelain").stdout.strip()
+    result = invoke(release, sha, before, after)
+    manifest = parse_output(result)
+    assert result.returncode == 0, manifest["errors"]
+    assert manifest["static_checks_passed"] is True
+    assert manifest["release"]["clean"] is True
+    for item in manifest["release"]["artifacts"]:
+        actual = (release / item["path"]).read_bytes()
+        assert item["sha256"] == hashlib.sha256(actual).hexdigest()
+        assert item["sha256"] != hashlib.sha256(actual.replace(b"\r\n", b"\n")).hexdigest()
+
+
+@pytest.mark.parametrize("artifact", [
+    "scripts/live_reconcile.py", "scripts/live_runner.py", "scripts/risk_process.py",
+])
+def test_crlf_equivalence_rejects_substantive_artifact_edit(tmp_path, artifact):
+    release, sha, before, after = prepare_inputs(tmp_path, crlf=True)
+    path = release / artifact
+    path.write_bytes(path.read_bytes() + b"raise RuntimeError('must not run')\r\n")
+    result = invoke(release, sha, before, after)
+    manifest = parse_output(result)
+    assert result.returncode == 1
+    assert manifest["static_checks_passed"] is False
+    assert f"required_artifact_not_at_head:{artifact}" in manifest["errors"]
+
+
+@pytest.mark.parametrize("change", ["bare-cr", "mixed-eol", "bom", "utf16", "trailing-space"])
+def test_crlf_equivalence_does_not_allow_other_text_changes(tmp_path, change):
+    release, sha, before, after = prepare_inputs(tmp_path, crlf=True)
+    artifact = "scripts/live_runner.py"
+    path = release / artifact
+    raw = path.read_bytes()
+    changed = {
+        "bare-cr": raw.replace(b"\r\n", b"\r"),
+        "mixed-eol": raw.replace(b"\r\n", b"\n", 1),
+        "bom": b"\xef\xbb\xbf" + raw,
+        "utf16": raw.decode("utf-8").encode("utf-16"),
+        "trailing-space": raw.replace(b"\r\n", b" \r\n", 1),
+    }[change]
+    path.write_bytes(changed)
+    result = invoke(release, sha, before, after)
+    manifest = parse_output(result)
+    assert result.returncode == 1
+    assert f"required_artifact_not_at_head:{artifact}" in manifest["errors"]
+
+
+@pytest.mark.parametrize("case", [
+    "missing-required", "unknown-option", "unknown-value", "missing-value",
+    "malformed-help", "end-of-options-value",
+])
+def test_cli_parse_failures_are_fixed_redacted_json(tmp_path, case):
+    # Parsing failures must finish without touching even the synthetic paths.
+    private = str(tmp_path / "SYNTHETIC-PRIVATE-ACCOUNT" / "gateway.json")
+    valid = [
+        "--release-dir", private, "--expected-sha", "0" * 40,
+        "--before-snapshot", private + ".before", "--after-snapshot", private + ".after",
+    ]
+    argv = {
+        "missing-required": ["--release-dir", private],
+        "unknown-option": valid + ["--gateway-config", private],
+        "unknown-value": valid + [private],
+        "missing-value": valid + ["--path"],
+        "malformed-help": valid + ["--help=" + private],
+        "end-of-options-value": valid + ["--", private],
+    }[case]
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), *argv], cwd=ROOT,
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    assert result.returncode == 2
+    assert result.stderr == ""
+    assert parse_output(result) == {
+        "schema_version": 1, "static_checks_passed": False,
+        "errors": ["cli_arguments_invalid"],
+    }
+    for text in (result.stdout, result.stderr):
+        assert "SYNTHETIC-PRIVATE-ACCOUNT" not in text
+        assert private not in text
+        assert str(SCRIPT) not in text
+
+
+@pytest.mark.parametrize("label", ["before", "after"])
+def test_deep_json_returns_stable_snapshot_error_without_traceback(tmp_path, label):
+    release, sha, before, after = prepare_inputs(tmp_path)
+    path = before if label == "before" else after
+    raw = b"[" * 10000 + b"0" + b"]" * 10000
+    path.write_bytes(raw)
+    first = invoke(release, sha, before, after)
+    second = invoke(release, sha, before, after)
+    assert first.returncode == second.returncode == 1
+    assert first.stderr == second.stderr == ""
+    assert first.stdout == second.stdout
+    manifest = parse_output(first)
+    assert manifest["static_checks_passed"] is False
+    assert manifest["errors"] == [f"snapshot_{label}_invalid_json"]
+    assert path.read_bytes() == raw
+    assert str(path) not in first.stdout
+    assert str(SCRIPT) not in first.stdout
