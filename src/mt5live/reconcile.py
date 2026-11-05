@@ -26,6 +26,8 @@
 （mt5live.gate.RiskGate）同时读两者，任一 paused 即拒绝开仓。
 T78：一致恢复不清 line_cap；真实 mismatch 可接管其兼容输出，但独立线
 锁存仍有效。人工、未知或损坏 pause 不自动覆盖/解除；所有读改写共用文件锁。
+fix1：真实 mismatch 先写独立 ``reconcile-block-<magic>.json``，避免人工
+paused=false 遮蔽对账阻断；Gate 始终消费它，一致时只清自身可验证的记录。
 
 时间约定：内存中 naive UTC，文件中 ISO 时间带 +00:00（同 mt5live.monitor）。
 """
@@ -48,6 +50,7 @@ INTENT_FILE_FMT = "expected-{magic}.json"   # T30：意图文件名（沿用 T24
 #   风控进程 registered_magics 的登记扫描不变）
 PAUSE_FILE = "pause.json"               # 全局暂停（只留给人工）
 PAUSE_MAGIC_FMT = "pause-{magic}.json"  # T30/D20：对账进程按策略写
+RECONCILE_BLOCK_FMT = "reconcile-block-{magic}.json"  # 独立于人工 pause 的对账阻断
 DEFAULT_VOLUME_TOLERANCE = 1e-6   # 手（volume_step 通常 0.01，纯浮点噪声容差）
 DEFAULT_GRACE_S = 60.0            # pending 宽限（秒）：下单在途不判
 
@@ -324,6 +327,24 @@ def reconcile_pause_owned(data, magic: int) -> bool:
     return True
 
 
+def read_reconcile_block(live_dir: str, magic: int) -> dict | None:
+    """Read our independent mismatch block; malformed/foreign files must block.
+
+    Presence means blocked. Only this exact owned shape can be auto-cleared;
+    legacy pause output remains separate and can belong to an operator.
+    """
+    path = os.path.join(live_dir, RECONCILE_BLOCK_FMT.format(magic=magic))
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    if (not reconcile_pause_owned(data, magic)
+            or data.get("owner") != "reconcile" or data.get("paused") is not True):
+        raise ValueError(f"reconcile block ownership/shape invalid: {os.path.basename(path)}")
+    return data
+
+
 def write_pause(live_dir: str, magic: int | None, *, paused: bool,
                 reason: str | None, diffs=(),
                 now: datetime | None = None) -> str:
@@ -331,7 +352,8 @@ def write_pause(live_dir: str, magic: int | None, *, paused: bool,
 
     magic 非 None → ``pause-<magic>.json``（对账进程的写路径：不一致 →
     paused=true，恢复 → paused=false）；magic=None → 全局 ``pause.json``
-    （只留给人工）。返回写出的路径。
+    （只留给人工）。返回兼容输出路径；若其由人工持有则保留原字节，真实
+    mismatch 仍写独立 reconcile-block 文件供 Gate 消费。写失败如实抛错。
     """
     n = naive_utc(now if now is not None else datetime.now(timezone.utc))
     data = {
@@ -353,6 +375,20 @@ def write_pause(live_dir: str, magic: int | None, *, paused: bool,
     # inside the lock; a check-then-replace outside it could erase a mismatch.
     with file_lock(path + ".lock"):
         if magic is not None:
+            if reason in (None, "reconcile_mismatch"):
+                data["owner"] = "reconcile"
+                block_path = os.path.join(live_dir, RECONCILE_BLOCK_FMT.format(magic=magic))
+                try:
+                    block = read_reconcile_block(live_dir, magic)
+                except (OSError, ValueError):
+                    # Preserve unreadable/foreign protection; the gate treats
+                    # its presence as blocked. Do not silently replace it.
+                    pass
+                else:
+                    if paused:
+                        write_json_atomic(block_path, data)
+                    elif block is not None:
+                        os.remove(block_path)
             try:
                 with open(path, encoding="utf-8") as f:
                     previous = json.load(f)
@@ -370,7 +406,5 @@ def write_pause(live_dir: str, magic: int | None, *, paused: bool,
                         return path
                 elif not reconcile_pause_owned(previous, magic):
                     return path
-            if reason in (None, "reconcile_mismatch"):
-                data["owner"] = "reconcile"
         write_json_atomic(path, data)
     return path

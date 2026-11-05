@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from mt5data.sessions import SessionPolicy
+from mt5gw.errors import DataUnavailableError
 from mt5live import riskproc
 from mt5live.executor import ExecutionAdapter, LiveExecutor
 from mt5live.fileio import write_json_atomic
@@ -504,6 +505,151 @@ def test_pure_check_and_monitor_nan_and_non_usd_are_fail_closed(tmp_path):
     with pytest.raises(ValueError):
         c.risk.run_cycle(AccountSnapshot("USD", (), (deal(profit=float("nan"), magic=H),)), NOW,
                          health_clock=lambda: NOW)
+
+
+@pytest.mark.parametrize("entrypoint", ["monitor", "gate"])
+def test_fix1_first_line_breach_survives_real_pause_lock_timeout(tmp_path, monkeypatch, entrypoint):
+    from mt5live.fileio import file_lock
+    c = Chain(tmp_path)
+    c.trade(H, 1, "h-open")
+    c.trade(P, -1, "p-open")
+    c.mark(1750)  # H=-250, P=+250; no account cap.
+    locked, release = Event(), Event()
+    path = str(c.live / f"pause-{H}.json.lock")
+
+    def cooperating_writer():
+        with file_lock(path):
+            locked.set()
+            assert release.wait(5)
+
+    # Real kernel lock and timeout; only this fixture's retry budget is short.
+    @contextmanager
+    def short_budget(dest, **kwargs):
+        with file_lock(dest, attempts=2, retry_s=0.01, **kwargs):
+            yield
+
+    monkeypatch.setattr(riskproc, "file_lock", short_budget)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        writer = pool.submit(cooperating_writer)
+        try:
+            assert locked.wait(5)
+            if entrypoint == "monitor":
+                result = c.cycle()
+                assert not result.flatten_written and not result.halt_active
+            else:
+                assert not c.open_check(H).allowed
+        finally:
+            release.set()
+        writer.result(timeout=5)
+    if entrypoint == "monitor":
+        assert "LINE_CAP_STATE" in (c.live / "alerts.log").read_text(encoding="utf-8")
+    c.mark(2000)
+    c.restart()
+    c.add(H + 1)
+    denied = c.trade(H + 1, 1, "post-timeout-new-h")
+    assert denied.action == "risk_rejected" and not c.brokers[H + 1].positions()
+    saved = json.loads((c.live / "line-cap-H.json").read_text(encoding="utf-8"))
+    assert saved["day"] == "2026-11-05" and saved["latched"] is True
+    c.add(P + 1)
+    c.trade(P + 1, 1, "post-timeout-new-p")
+    assert len(c.brokers[P + 1].positions()) == 1
+    assert not (c.live / "halt.json").exists()
+    assert not (c.live / "commands" / "flatten.json").exists()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_fix1_manual_false_cannot_hide_persistent_reconcile_mismatch(tmp_path, enabled):
+    from mt5live.fileio import file_lock
+    c = Chain(tmp_path, enabled=enabled)
+    path = c.live / f"pause-{H}.json"
+    raw = '{"paused":false,"reason":"manual","owner":"operator"}'
+    with file_lock(str(path) + ".lock"):
+        path.write_text(raw, encoding="utf-8")
+    write_intent(str(c.live / f"expected-{H}.json"),
+                 Intent("XAUUSD", H, "buy", 0.01, "confirmed", "mismatch", NOW))
+    assert c.reconcile() == 1
+    assert path.read_text(encoding="utf-8") == raw
+    c.restart()
+    blocked = c.trade(H, 1, "mismatch-must-block")
+    assert blocked.action == "risk_rejected" and not c.brokers[H].positions()
+    assert "reconcile" in blocked.error
+    assert c.open_check(P).allowed
+    # Restore the real intent, then only the reconcile-owned block may clear.
+    write_intent(str(c.live / f"expected-{H}.json"),
+                 Intent("XAUUSD", H, "buy", 0, "confirmed", "corrected", NOW))
+    assert c.reconcile() == 0
+    assert path.read_text(encoding="utf-8") == raw
+    c.trade(H, 1, "clean-may-open")
+    assert len(c.brokers[H].positions()) == 1
+    c.trade(H, 0, "close")
+    manual_true = raw.replace("false", "true")
+    with file_lock(str(path) + ".lock"):
+        path.write_text(manual_true, encoding="utf-8")
+    assert c.reconcile() == 0
+    assert path.read_text(encoding="utf-8") == manual_true
+    denied = c.trade(H, 1, "manual-true-still-blocks")
+    assert denied.action == "risk_rejected" and not c.brokers[H].positions()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("raw", ["{broken", "null", '{"paused":false}',
+                                    '{"owner":"operator","paused":false}'])
+def test_fix1_corrupt_or_foreign_reconcile_block_is_not_cleared(tmp_path, enabled, raw):
+    c = Chain(tmp_path, enabled=enabled)
+    path = c.live / f"reconcile-block-{H}.json"
+    path.write_text(raw, encoding="utf-8")
+    assert c.reconcile() == 0
+    c.restart()
+    denied = c.trade(H, 1, "bad-reconcile-block")
+    assert denied.action == "risk_rejected" and not c.brokers[H].positions()
+    assert path.read_text(encoding="utf-8") == raw
+    assert c.open_check(P).allowed
+
+
+@pytest.mark.parametrize("collection", ["positions", "deals"])
+@pytest.mark.parametrize("bad", [True, "902000", 902000.5, 902000.0, "missing", -1, 2**63])
+def test_fix1_raw_paper_magic_rejected_before_coercion_by_real_consumers(tmp_path, collection, bad):
+    c = Chain(tmp_path)
+    c.trade(H, 1, "h-open")
+    c.trade(P, -1, "p-open")
+    c.mark(1750)
+    if collection == "deals":
+        c.trade(H, 0, "realize-h-loss")
+    path = Path(paper_state_path(str(c.live), H))
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for row in data[collection]:
+        if bad == "missing":
+            row.pop("magic")
+        else:
+            row["magic"] = bad
+    write_json_atomic(str(path), data)
+    c.add(H + 1)
+    rejected = c.trade(H + 1, 1, "invalid-paper-magic")
+    assert rejected.action == "risk_rejected" and "magic" in rejected.error
+    assert not c.brokers[H + 1].positions()
+    with pytest.raises(DataUnavailableError, match="magic"):
+        c.view.snapshot()
+    # Actual monitor ingestion must refuse the same disk snapshot too.
+    with pytest.raises(DataUnavailableError, match="magic"):
+        c.cycle()
+
+
+def test_fix1_raw_paper_manual_zero_and_line_magics_remain_compatible(tmp_path):
+    c = Chain(tmp_path)
+    c.add(0)
+    for magic in (0, H, P):
+        c.trade(magic, 1, f"open-{magic}")
+    snap = c.view.snapshot()
+    assert {p.magic for p in snap.positions} == {0, H, P}
+    assert {d.magic for d in snap.deals} == {0, H, P}
+    assert all(type(p.magic) is int for p in snap.positions)
+    c.mark(1900)  # -100 per book: manual loss counts in the account, not H/P.
+    assert not c.cycle().daily_loss_breached
+    assert c.open_check(H + 1).allowed and c.open_check(P + 1).allowed
+    for magic in (0, H, P):
+        c.trade(magic, 0, f"close-{magic}")
+    assert not c.view.positions()
+    assert {d.magic for d in c.view.snapshot().deals} == {0, H, P}
 
 
 BASE_TOML = '''version = 1

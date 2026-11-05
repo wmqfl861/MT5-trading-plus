@@ -599,6 +599,14 @@ class RiskProcess:
                         or parse_iso(saved["ts"]).date() != day):
                     raise ValueError("invalid/future line latch date")
             active = saved is not None and saved["day"] == today.isoformat()
+            # The independent latch is the safety consequence. Persist a newly
+            # observed breach before any compatibility pause can block/fail.
+            if not active and value <= -cap.daily_loss_cap_usd:
+                saved = dict(identity, day=today.isoformat(), ts=iso_utc(now), latched=True)
+                write_json_atomic(path, saved)
+                active = True
+                append_alert(self.live_dir, ALERT_LINE_CAP,
+                             f"{cap.name}: daily PnL {value:.2f} USD; opens paused until next UTC day", now)
             touched = sorted(m for m in magics if _valid_magic(m)
                              and cap.magic_min <= m <= cap.magic_max)
             # Recover the latch from an owned same-day compatibility output if

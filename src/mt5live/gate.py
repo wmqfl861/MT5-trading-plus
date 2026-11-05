@@ -46,6 +46,7 @@ from mt5live.monitor import (
     parse_iso,
     risk_health,
 )
+from mt5live.reconcile import read_reconcile_block
 from mt5live.riskproc import (
     OrderRequest, RiskDecision, RiskProcess, RiskState, daily_pnl, line_daily_pnl,
 )
@@ -381,6 +382,14 @@ class RiskGate:
     # ---- 内部 ----
 
     def _pause_decision(self, magic: int, now: datetime) -> RiskDecision | None:
+        try:
+            mismatch = read_reconcile_block(self._live_dir, magic)
+        except (OSError, ValueError) as e:
+            reason = f"reconcile_block_unreadable: magic {magic}: {e}"
+            append_alert(self._live_dir, ALERT_PAUSE_UNREADABLE, reason, now)
+            return RiskDecision(False, reason)
+        if mismatch is not None:
+            return RiskDecision(False, f"reconcile_paused: magic {magic}: reconcile_mismatch")
         strict = bool(self._process.config.line_caps)
         paused = read_pause(self._live_dir, magic, strict=strict)
         if paused.paused:

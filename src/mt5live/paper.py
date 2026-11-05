@@ -463,13 +463,16 @@ def _position_to_dict(p: Position) -> dict:
 
 
 def _position_from_dict(d: dict) -> Position:
+    magic = d.get("magic")
+    if type(magic) is not int or not 0 <= magic <= 2**63 - 1:
+        raise DataUnavailableError("paper position magic must be a nonnegative 64-bit integer")
     return Position(
         ticket=int(d["ticket"]), symbol=d["symbol"], side=d["side"],
         volume=float(d["volume"]), price_open=float(d["price_open"]),
         price_current=float(d["price_current"]), sl=float(d["sl"]),
         tp=float(d["tp"]), swap=float(d.get("swap", 0.0)),
         profit=float(d.get("profit", 0.0)), time=parse_iso(d["time"]),
-        comment=d.get("comment", ""), magic=int(d.get("magic", 0)))
+        comment=d.get("comment", ""), magic=magic)
 
 
 def _deal_to_dict(d: Deal) -> dict:
@@ -484,6 +487,9 @@ def _deal_to_dict(d: Deal) -> dict:
 
 
 def _deal_from_dict(d: dict) -> Deal:
+    magic = d.get("magic")
+    if type(magic) is not int or not 0 <= magic <= 2**63 - 1:
+        raise DataUnavailableError("paper deal magic must be a nonnegative 64-bit integer")
     return Deal(
         ticket=int(d["ticket"]), order=int(d.get("order", 0)),
         position_id=int(d.get("position_id", 0)), symbol=d["symbol"],
@@ -492,7 +498,7 @@ def _deal_from_dict(d: dict) -> Deal:
         commission=float(d.get("commission", 0.0)),
         swap=float(d.get("swap", 0.0)), fee=float(d.get("fee", 0.0)),
         time=parse_iso(d["time"]), comment=d.get("comment", ""),
-        magic=int(d.get("magic", 0)),
+        magic=magic,
         reason=(int(d["reason"]) if d.get("reason") is not None else None))
 
 
