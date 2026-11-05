@@ -9,7 +9,7 @@ H/P交易接线批次已交付到 `c0df5a1d133eadbe8a8c089fba0758ed840d830b`：�
 | H单文件时间诊断 | `e7a0f95`，120 passed、exit0；[独立审核](../reviews/2026-11-05-h-time-audit-review.md) Spec PASS / Quality PASS，已合入开发集成树 | 精确真实快照及整列time/footer/tail允许范围仍需绑定；工具不证明来源、非锁箱资格或完整日历 |
 | P V2-A计算核 | `0626dd7`，121 passed、exit0；[独立审核](../reviews/2026-11-05-d61-v2a-kernel-review.md) Spec PASS / Quality PASS，已合入开发集成树 | 完整D61统计研究、V2-B、真实适用性与产品替换尚未完成 |
 | D57正式窗口检查 | 最终 `2cc35ca`，168 passed、exit0；[独立复核](../reviews/2026-11-05-demo-formal-window-review.md) Spec PASS / Quality PASS，五项Important全部闭合，已合入开发集成树 | 机械满足仅返回3，历史真实性及A5仍未审定；真实历史原件和运行条件须另行核实 |
-| 本批交付 | 三个模块均按最终受审版本合入 | 待完成独立整合审核、最终全仓回归与对应main CI |
+| 本批交付 | `849cc73` 经[独立整合审核](../reviews/2026-11-06-readiness-followup-integration-review.md) Spec PASS / Quality PASS；唯一用法提示 Minor 在 `dffd1c5` 修复并由同一审核者确认闭合 | 最终待推送提交仍须取得自身的全仓回归与对应main CI证据 |
 
 ## 已交付交易接线证据
 
