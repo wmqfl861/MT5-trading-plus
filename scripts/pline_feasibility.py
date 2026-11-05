@@ -41,11 +41,34 @@ def git(*args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, required=True, help="explicit JSON H1 inputs and identities")
-    parser.add_argument("--cost-evidence", type=Path, required=True, help="explicit JSON symbol cost evidence")
-    parser.add_argument("--sessions", type=Path, required=True, help="frozen sessions TOML")
+    parser.add_argument("--mode", choices=("synthetic", "production"), default="synthetic")
+    parser.add_argument("--release-id", help="code-registered one-execution release")
+    parser.add_argument("--release-manifest", type=Path, help="exact reviewed release manifest")
+    parser.add_argument("--input", type=Path, help="explicit JSON H1 inputs and identities")
+    parser.add_argument("--cost-evidence", type=Path, help="explicit JSON symbol cost evidence")
+    parser.add_argument("--sessions", type=Path, help="frozen sessions TOML")
     parser.add_argument("--output", type=Path, required=True, help="new exclusive output directory")
     args = parser.parse_args(argv)
+    if args.mode == "production":
+        if not args.release_id or args.release_manifest is None or any(
+                value is not None for value in (args.input, args.cost_evidence, args.sessions)):
+            parser.error("production requires release-id/manifest and excludes synthetic inputs")
+        from mt5quant.prob.production_adapter import AdmissionRefused, run_production
+        try:
+            report = run_production(args.release_id, args.release_manifest, args.output)
+            print(f"T121 {report['context']}: 96 rows, 8 summaries; {report['production_execution']}")
+            return 0
+        except AdmissionRefused as exc:
+            print(f"T121 refused: {exc}", file=sys.stderr)
+            return 2
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError, subprocess.CalledProcessError):
+            # No account material, caller paths, or raw exception payload in output.
+            print("T121 refused: admission or consumed execution failure", file=sys.stderr)
+            return 2
+    if args.release_id is not None or args.release_manifest is not None:
+        parser.error("synthetic mode excludes release parameters")
+    if any(value is None for value in (args.input, args.cost_evidence, args.sessions)):
+        parser.error("synthetic mode requires input, cost-evidence and sessions")
     try:
         if args.output.exists():
             raise ValueError("output directory already exists; refusing overwrite")

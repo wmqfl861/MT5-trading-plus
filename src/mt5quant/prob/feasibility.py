@@ -186,10 +186,19 @@ def _valid_event_hours(value):
 
 def trigger_cost(*, symbol, signal_time, entry_time, exit_time, side, source,
                  signal_price, atr, sl_atr, evidence):
+    """Synthetic-only public API; production claims never release arithmetic."""
+    return _trigger_cost_kernel(symbol=symbol, signal_time=signal_time,
+        entry_time=entry_time, exit_time=exit_time, side=side, source=source,
+        signal_price=signal_price, atr=atr, sl_atr=sl_atr, evidence=evidence,
+        kind="synthetic")
+
+
+def _trigger_cost_kernel(*, symbol, signal_time, entry_time, exit_time, side, source,
+                         signal_price, atr, sl_atr, evidence, kind):
     """One frozen cost scenario using signal prices and endpoint TIMES only.
 
-    Evidence schema is intentionally narrow and synthetic-only. Hashes establish
-    identity, not permission; production evidence never reaches cost arithmetic.
+    The public wrapper enforces synthetic-only evidence; the byte adapter owns
+    admission for production evidence. Hashes alone never grant permission.
     Missing and invalid components are accumulated independently.
     """
     waiting, failures = [], []
@@ -215,7 +224,7 @@ def trigger_cost(*, symbol, signal_time, entry_time, exit_time, side, source,
         waiting.append("missing_cost_evidence")
         return result()
     # No caller-supplied approval string can release real cost evidence.
-    if evidence.get("kind") != "synthetic":
+    if evidence.get("kind") != kind:
         waiting.append("production_cost_not_released")
         return result()
     expected = {"purpose": "T121-count-cost", "symbol": symbol, "account_kind": "Demo",
@@ -447,10 +456,10 @@ def input_payload(h1, tags, gaps):
             "gap_spans": [[_utc(s).isoformat(), _utc(e).isoformat()] for s, e in gaps]}
 
 
-def _input_reasons(h1, tags, gaps, evidence):
+def _input_reasons(h1, tags, gaps, evidence, *, kind="synthetic"):
     if not isinstance(evidence, dict):
         return ["missing_input_evidence"]
-    if evidence.get("kind") != "synthetic":
+    if evidence.get("kind") != kind:
         return ["production_input_not_released"]
     reasons = []
     if evidence.get("purpose") != "T121-count-cost":
@@ -512,6 +521,14 @@ def run_feasibility(h1_by_symbol, *, source_tags, gap_spans, sessions,
     inputs return uncounted waiting_data regardless of caller approval claims.
     This is an engineering artifact, never a T121 execution authorization.
     """
+    return _run_feasibility_kernel(h1_by_symbol, source_tags=source_tags,
+        gap_spans=gap_spans, sessions=sessions, input_evidence=input_evidence,
+        cost_evidence=cost_evidence, kind="synthetic")
+
+
+def _run_feasibility_kernel(h1_by_symbol, *, source_tags, gap_spans, sessions,
+                            input_evidence, cost_evidence, kind):
+    """Shared arithmetic; callers own admission, never infer it from a label."""
     if sessions != SessionPolicy(exempt_symbols=frozenset({"BTCUSD"})):
         raise ValueError("T121 requires the frozen sessions calendar")
     rows, receipts = [], {}
@@ -520,7 +537,7 @@ def run_feasibility(h1_by_symbol, *, source_tags, gap_spans, sessions,
         tags, gaps = source_tags.get(symbol), gap_spans.get(symbol)
         evidence = input_evidence.get(symbol)
         unavailable = (["missing_input"] if h1 is None else
-                       _input_reasons(h1, tags, gaps, evidence))
+                       _input_reasons(h1, tags, gaps, evidence, kind=kind))
         prepared = {}
         if not unavailable:
             try:
@@ -562,11 +579,11 @@ def run_feasibility(h1_by_symbol, *, source_tags, gap_spans, sessions,
                         costs = []
                         for t in qualified.itertuples(index=False):
                             i = int(t.bar)
-                            costs.append(trigger_cost(
+                            costs.append(_trigger_cost_kernel(
                                 symbol=symbol, signal_time=t.time, entry_time=b.time.iloc[i + 1],
                                 exit_time=b.time.iloc[i + k + 1], side=int(t.side), source=src[i],
                                 signal_price=float(t.close), atr=float(t.atr), sl_atr=sl,
-                                evidence=cost_evidence.get(symbol)))
+                                evidence=cost_evidence.get(symbol), kind=kind))
                         summary = summarize_hypothesis(qualified.time, costs, waiting_reasons=source_wait)
                     rows.append(dict(family=family, symbol=symbol, timeframe=tf,
                         sl_atr=sl, tp_r=2, hold_bars=k, situation=sit, action=action,
