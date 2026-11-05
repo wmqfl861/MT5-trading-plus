@@ -52,9 +52,28 @@ import json
 import sys
 from datetime import date, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SESSIONS = REPO_ROOT / "config" / "sessions.toml"
+
+
+def synthetic_sessions(root):
+    # D57: never read a real runtime/config artifact during offline validation.
+    path = root / "sessions.toml"
+    path.write_text('''version = 1
+[rollover]
+local_time = "17:00"
+tz = "America/New_York"
+[forbidden]
+pre_minutes = 5
+post_minutes = 60
+exempt_symbols = []
+[costs]
+spread_gate_multiplier = 3.0
+missing_hour_policy = "forbid"
+min_days_per_hour = 20
+''', encoding="utf-8")
+    return path
 
 MAGIC = 902601
 MAGIC_B = 902602
@@ -99,15 +118,39 @@ def load_demo_check():
 
 
 def run_cli(mod, root: Path, *flags: str):
-    """跑 demo_check CLI（cwd 无关：全部路径显式）。返回 (exit_code, stdout)。"""
+    """日常走 CLI；旧 accept 夹具直接回归全部原判据，不伪造历史原件。
+
+    D57 正式 CLI 契约由 test_demo_formal_window 的真实子进程覆盖。这里
+    仍执行 run_accept 的全部判据/逐日 sweep，保留原有实质负例。
+    """
+    sessions = synthetic_sessions(root)
+    if flags == ("--accept",):
+        return run_legacy_predicates(mod, root, sessions)
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         code = mod.main([
             "--data-dir", str(root / "data"),
             "--log-dir", str(root / "logs"),
             "--reports-dir", str(root / "reports"),
-            "--sessions-config", str(SESSIONS),
+            "--sessions-config", str(sessions),
             *flags])
+    return code, out.getvalue()
+
+
+def run_legacy_predicates(mod, root, sessions):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        ctx = mod.build_ctx(SimpleNamespace(data_dir=str(root / "data"),
+            log_dir=str(root / "logs"), reports_dir=str(root / "reports"),
+            sessions_config=str(sessions)))
+        checks, problems = mod.run_accept(ctx)
+        for check in checks:
+            print(f"[{'满足' if check.ok is True else '不通过'}] {check.name}：{check.detail}")
+        for day, failed, nas in problems:
+            print(f"{day} 不通过={failed} 无样本={nas}")
+        print("机械判据回归（非正式 CLI；未审定历史真实性或 A5）")
+        code = 3 if all(c.ok is True for c in checks) and not problems else 1
+        print("mechanical_checks_passed=" + str(code == 3).lower())
     return code, out.getvalue()
 
 
@@ -392,8 +435,9 @@ def test_accept_passes_with_full_evidence(tmp_path):
     mod = load_demo_check()
     build_full_evidence(tmp_path)
     code, out = run_cli(mod, tmp_path, "--accept")
-    assert code == 0, out
-    assert "验收通过" in out
+    assert code == 3, out
+    assert "mechanical_checks_passed=true" in out
+    assert "验收通过" not in out
     for name in ("证据来源", "known_positions", "连续交易日覆盖", "逐小时",
                  "SL 与 TP 样本", "六项演练", "双全平演练", "点差样本", "滑点"):
         assert name in out, name + " 判据缺失：\n" + out
@@ -902,7 +946,7 @@ def test_accept_rejects_p16_counterexample(tmp_path):
     code, out = run_cli(mod, tmp_path, "--accept")
     assert code != 0
     assert code == 1, out                       # 未验收 = 1（区别于 2=数据错）
-    assert "未通过" in out or "未验收" in out
+    assert "不通过" in out
     assert "连续交易日覆盖" in out               # 覆盖判据必须出现且不通过
     assert "验收通过" not in out
 
@@ -923,16 +967,9 @@ def test_accept_daily_sweep_treats_na_as_fail(tmp_path):
     不通过——会话配置不可读 → 禁入窗判 None → 未验收。"""
     mod = load_demo_check()
     build_full_evidence(tmp_path)
-    out = io.StringIO()
-    with contextlib.redirect_stdout(out):
-        code = mod.main([
-            "--data-dir", str(tmp_path / "data"),
-            "--log-dir", str(tmp_path / "logs"),
-            "--reports-dir", str(tmp_path / "reports"),
-            "--sessions-config", str(tmp_path / "nope-sessions.toml"),
-            "--accept"])
+    code, out = run_legacy_predicates(mod, tmp_path, tmp_path / "nope-sessions.toml")
     assert code == 1
-    assert "无样本" in out.getvalue() or "无法判定" in out.getvalue()
+    assert "无样本" in out or "无法判定" in out
 
 
 # ---------------------------------------------------------------- 日常档（宽松）
@@ -1005,8 +1042,9 @@ def test_drill_archive_contract_real_producer(tmp_path):
         assert {a["magic"] for a in rounds[cid]["acks"]} == magics
         assert all(a["id"] == cid for a in rounds[cid]["acks"])
     code, out = run_cli(mod, tmp_path, "--accept")
-    assert code == 0, out
-    assert "验收通过" in out
+    assert code == 3, out
+    assert "mechanical_checks_passed=true" in out
+    assert "验收通过" not in out
 
 
 def test_deals_decision_bar_contract_real_format(tmp_path):
@@ -1029,8 +1067,9 @@ def test_deals_decision_bar_contract_real_format(tmp_path):
     assert did == DEC_SL                                 # naive 无时区后缀
     assert first_fill["decision_bar"] != did             # 正是断链差异
     code, out = run_cli(mod, tmp_path, "--accept")
-    assert code == 0, out
-    assert "验收通过" in out
+    assert code == 3, out
+    assert "mechanical_checks_passed=true" in out
+    assert "验收通过" not in out
     assert "无滑点样本" not in out
     assert "无对应决策" not in out
     assert "4 样本：min" in out                          # 4 笔 fill_open 全命中
@@ -1074,6 +1113,7 @@ def test_accept_ignores_out_of_window_stale_evidence(tmp_path):
     with open(paths["runner_b"], "a", encoding="utf-8") as f:
         f.write(decision_line(stale, 10, 45))
     code, out = run_cli(mod, tmp_path, "--accept")
-    assert code == 0, out
-    assert "验收通过" in out
+    assert code == 3, out
+    assert "mechanical_checks_passed=true" in out
+    assert "验收通过" not in out
     assert "2026-10-08" not in out       # 数据范围/逐日复核都不得再含窗外旧日

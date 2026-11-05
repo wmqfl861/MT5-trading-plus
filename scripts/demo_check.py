@@ -1,118 +1,32 @@
-"""scripts/demo_check.py（T45/T49）：阶段 F 演练检查（蓝图 §7 逐条转化）。
+"""D57 / T45/T49: read-only Demo checks, without MT5 or process operations.
 
-两档口径（R8-I5：日常"没有发现异常"≠阶段"取得验收证据"，绝不共用布尔）：
+``--day`` / ``--summary`` retain their lenient operational behavior: 0 means
+no observed anomaly, 1 means an observed failure, 2 means unusable arguments/data.
+They do not claim final acceptance.
 
-- 日常档 ``--day`` / ``--summary``（宽松显示）：逐日 7 项检查，返回 0
-  只要无异常**证据**（ok=False 项）；"无样本"（ok=None）如实标注、不判
-  不通过，但汇总不再宣称"全部通过"——只说"未发现异常证据（日常口径）"。
-- 验收档 ``--accept``（阶段 F 最终验收，严格）：证据源钉死为 **Demo 运行
-  契约**（R10/T53+T54，R9-I3/I4：C-1 run-manifest.json / C-2
-  deals-<magic>.jsonl / C-3 drill-archive）——在逐日严格复核（任何
-  ok=None 无样本/无法判定项 = 不通过）之上，另强制九条全期证据判据，
-  任一"无样本/未覆盖"= 未验收，退出码非 0：
-  0. C-1 manifest 证据源：``<data>/live/run-manifest.json`` 存在且
-     mode=="Demo"、magics 与证据一致；运行窗=当前 mode 最早 started_utc
-     ..now（重启不清窗）；manifest 缺失/mode 不符/schema_version 缺失或
-     ≠1/存在 paper 状态文件/日志含 ``[paper`` 行 = "证据来源可疑"拒绝；
-  1. 持仓状态可核（T53 持仓判据源的选择）：state-<magic>.json 的
-     **known_positions**（executor 每轮 ``_finish`` 已持久化——不连 MT5、
-     不读 paper）逐 magic 存在，且与 confirmed 意图净手数一致；
-  2. 连续交易日覆盖 ≥10（工作日无缺日；假日历不可得，按周一至五近似，
-     跨假日段须人工在验收报告注明例外）；
-  3. 各进程存活证据（覆盖跨度内逐日：风控/对账进程有当日日志行；每个
-     magic 的运行器有当日日志行，或当日风控日志有"心跳=ok"行佐证——
-     风控每轮核对全部登记心跳，ok 即全部运行器心跳新鲜），且**风控心跳
-     日志覆盖当日每小时**（T53 加强：一条日志不再能证明整日存活）；
-  4. SL 与 TP 样本均存在（唯一采信源 = C-2 deals 的 external_exit
-     reason∈{SL,TP}；paper 影子盘证据不被 --accept 采信——R9-I3）；
-  5. §7 六项演练逐项判据（运行窗内）：killSwitch=kill_switch 停机告警+
-     恢复对（其后有 halt=否 风控行，恢复由风控日志推导）、心跳超时=
-     HEARTBEAT_TIMEOUT 告警、分策略暂停=RECONCILE 暂停告警+pause 解除、
-     重连=C-4 ``gateway_reconnected`` 行、幂等=推导（同 bar 同 magic 无
-     重复开仓请求）、换日禁入=forbidden_session 拒单记录；每项缺失=
-     未验收；
-  6. 双全平演练真实完成（T54/C-3）：两轮指令均在运行窗内；每轮须有
-     **全部参与 magic**（manifest 集合）的关联 ack（command_id 匹配+
-     magic+时间在指令后 1 小时内+closed>0 或附空仓证明——编号协议 ack
-     本身即执行器重查持仓/挂单清零后写出的空仓证明，closed=0 的**关联**
-     ack 计入并标注）；孤儿 ack 不计；一轮缺任一 magic 的 ack=该轮未完成；
-     窗外旧指令（D′）不计；
-  7. 实际点差样本（结构化解析）：覆盖工作日日报存在、含可解析的结构化
-     点差行（品种|小时|样本，逐小时比对由日报承担）、无"当日无点差
-     样本"、无"**超标**"行；
-  8. 滑点样本：C-2 fill_open 成交价 vs 决策行参考价（buy=ask / sell=bid）
-     的差值分布——有样本且 min/p50/p95/max 分位数入报告（PaperSoak 影子
-     盘不产生经纪商滑点，无样本=未验收）。
+``--accept --formal-window DESCRIPTOR`` requires explicit offline data, logs,
+reports and sessions paths. FormalWindowV1 binds retained manifest, per-launch
+inventory, instances, deployment-source excerpt and a complete sourced UTC
+calendar. It checks the preserved identity chain, uses one observation T, and
+starts S at the first trading-day boundary at or after claimed completion C.
+All finished trading days (at least ten) and all natural days in [S,T] are
+required; same-deployment restarts do not reset S. Every positive event and its
+supporting reference is filtered by its own timestamp and strategy magic.
+Current protections are checked separately, including pre-window state.
 
-只读检查（不连 MT5、不下单、不改任何状态文件）。数据源：
-- ``<data>/live/run-manifest.json``（C-1，T53）：运行清单——mode/magics/
-  追加式 runs（--accept 的证据源与运行窗定义）；
-- ``<data>/live/deals-<magic>.jsonl``（C-2，T53）：执行器成交流水
-  （fill_open/fill_close/external_exit；external_exit 的 decision_bar
-  语义=检测当轮 bar 或 null，按此解析、不作归因键）；
-- ``<data>/live/drill-archive/<command_id>/``（C-3，T54）：演练保全的全平
-  指令与 ack 副本（--accept 双全平判据的主源；commands 目录兜底）；
-- ``<data>/live/paper/state-<magic>.json``：影子券商账本（PaperSoak 日常
-  诊断用；positions/deals，含 reason——SL=4/TP=5/SO=6，见 mt5gw.models。
-  --accept 不采信 paper 证据——存在即"证据来源可疑"拒绝）；
-- ``<data>/live/expected-<magic>.json``（意图，T30/D19）、
-  ``pause-<magic>.json``（对账按策略暂停，T30/D20）、
-  ``state-<magic>.json``（执行器状态：known_positions 持仓判据源 +
-  pending_external_exits 未解释出场）、
-  ``orders-<magic>.jsonl``（下单台账，幂等推导数据源）、``alerts.log``、
-  ``heartbeat-<magic>.json``；
-- 运行器/风控/对账进程日志：``<log-dir>/*.log``（demo_run.ps1 逐次启动写
-  data/demo/）与 ``<data>/live/*.log``；
-- 日报：``<reports>/live/daily-YYYY-MM-DD.md``（live_daily_report.py 产物）。
-
-蓝图 §7 → 日常检查映射（一行一项）：
-- 无法解释的持仓差异 = 0 ………… check_unexplained_diffs：最新日的意图 vs
-  实际净持仓差分（mt5live.reconcile.diff_positions）+ 当日
-  RECONCILE_MISMATCH / EXTERNAL_EXIT 告警是否至今未解除（pause 仍 paused、
-  执行器 pending_external_exits 非空）；历史日只按当日告警追溯（现场状态
-  无法复原，告警是当时落下的证据）。
-- 每笔成交可在台账或日志中找到对应决策 ………… check_deal_attribution：
-  开仓成交的 comment（= decision_id）须出现在 orders-*.jsonl 的 open 记录
-  或运行器日志"决策 <id>："行；平仓成交按 reason∈{SL,TP,SO} 解释为保护性
-  出场，comment="close" 的须有 orders 台账 close 记录支撑（数量口径）。
-  成交记录两源并存：paper 影子账本（PaperSoak 日常诊断）与 C-2
-  deals-*.jsonl（fill_open→in/decision_bar、fill_close→out/"close"、
-  external_exit→out/reason 数值化——Demo 运行的成交证据源）。
-- 持仓期间零调仓（市价单数 = 入场数 + 出场数）………… check_zero_rebalance：
-  当日无 UNEXPECTED_RESIZE 告警；成交 entry 只为 in/out；同一 position_id
-  至多一笔开仓成交（无加仓腿）。
-- 服务器端 SL/TP 出场后不触发暂停 ………… check_protective_exit：当日有
-  保护性出场（reason∈{SL,TP,SO}）的 magic，现在 pause 不得仍 paused、
-  执行器 pending_external_exits 必须已清空（自动解除 = 同策略可按重入规则
-  继续）。
-- 进程不间断（重启有日志说明）………… check_heartbeat_continuity：当日
-  HEARTBEAT_TIMEOUT 告警之后须有运行器重启记录（新日志文件的启动行）；
-  每次重启（同 magic 第二个日志文件 / 同文件第二个"mt5live 启动"行）须在
-  上一份日志尾部留有说明（"收到中断，退出" / Traceback / 执行异常 /
-  "手动停止"）或当日有 HEARTBEAT_TIMEOUT / RISK_HALT 告警佐证。
-- 换日禁止时段（含冬令时 22:00）………… check_forbidden_session：当日
-  开仓成交时刻须全部在 config/sessions.toml 禁入窗之外（SessionPolicy.
-  entry_allowed，DST 感知——冬令时窗自动落在 22:00 GMT）；拒单记录数取
-  alerts.log 中含 forbidden_session 的 RISK_REJECT 条目（§7 演练项证据，
-  --summary 汇总展示；--accept 走上面的九条全期判据）。
-- 实际点差落在成本模型区间内 ………… check_daily_report：日报里
-  compare_spreads 的"**超标**"行数 = 0（按小时比对由日报承担）。
-- 每日日报自动生成 ………… check_daily_report：daily-<day>.md 存在且非空。
-
-用法：
-    .venv/Scripts/python.exe scripts/demo_check.py --day 2026-11-10   # 日常
-    .venv/Scripts/python.exe scripts/demo_check.py --summary          # 全周汇总
-    .venv/Scripts/python.exe scripts/demo_check.py --accept           # 阶段 F 验收
-    # 可选：--data-dir data --log-dir data/demo --reports-dir data/reports
-    #       --sessions-config config/sessions.toml
-
-退出码：0 = 通过（日常档=无异常证据；--accept=验收通过）；1 = 存在不通过
-项（--accept 下即"未验收"）；2 = 用法/数据错误。
+Formal exit codes: 2 invalid/incomplete evidence, 1 known unmet checks,
+3 mechanical checks satisfied. Never 0. Every formal result fixes
+historical_identity_verified=false and a5_status=not_evaluated: byte hashes and
+literal source matches do not prove historical authenticity or grant A5.
+See docs/ops/demo-runbook.md section 4 for the exact evidence schema and usage.
 """
 from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
+import math
+import ntpath
 import json
 import os
 import re
@@ -181,6 +95,875 @@ class DayReport:
     @property
     def failed(self) -> list[Check]:
         return [c for c in self.checks if c.ok is False]
+
+
+# ---------------------------------------------------------------- D57 offline formal evidence
+
+class FormalInvalid(ValueError):
+    """Only logical aliases/codes may cross the formal CLI boundary."""
+
+
+def _require(condition, code):
+    if not condition:
+        raise FormalInvalid(code)
+
+
+def _fields(doc, names, alias):
+    _require(isinstance(doc, dict) and set(doc) == set(names.split()), alias + ".schema")
+
+
+def _integer(value, minimum=0):
+    return type(value) is int and value >= minimum
+
+
+def _hex(value, length):
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{%d}" % length, value) is not None
+
+
+def _utc(value, alias, *, naive=False):
+    _require(isinstance(value, str) and re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?(?:Z|\+00:00)?", value), alias + ".time")
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        _require(naive or dt.tzinfo is not None, alias + ".timezone")
+        return dt.replace(tzinfo=None)
+    except ValueError:
+        raise FormalInvalid(alias + ".time") from None
+
+
+def _json_bytes(raw, alias):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            _require(key not in result, alias + ".duplicate_key")
+            result[key] = value
+        return result
+    def constant(_):
+        raise FormalInvalid(alias + ".number")
+    try:
+        return json.loads(raw.decode("utf-8-sig"), object_pairs_hook=pairs, parse_constant=constant)
+    except (UnicodeError, ValueError):
+        raise FormalInvalid(alias + ".json") from None
+
+
+def _ref_schema(doc, alias):
+    _fields(doc, "path sha256", alias)
+    _require(isinstance(doc["path"], str) and bool(doc["path"]) and "\x00" not in doc["path"], alias + ".path")
+    _require(_hex(doc["sha256"], 64), alias + ".sha256")
+
+
+def _line_range(value, alias):
+    _require(isinstance(value, list) and len(value) == 2
+             and all(_integer(v, 1) for v in value) and value[0] <= value[1], alias + ".lines")
+
+
+def _role(doc, magics, alias):
+    kind, magic = doc.get("kind"), doc.get("magic")
+    _require(kind in ("runner", "risk", "reconcile"), alias + ".role")
+    if kind == "runner":
+        _require(_integer(magic, 1) and magic in magics, alias + ".magic")
+        return str(magic)
+    _require(magic is None, alias + ".magic")  # both actual producers write null
+    return kind
+
+
+def validate_formal_descriptor(doc):
+    alias = "descriptor"
+    _fields(doc, "schema_version mode deployment_sha magics anchor run_bindings restart_bindings calendar", alias)
+    _require(type(doc["schema_version"]) is int and doc["schema_version"] == 1, alias + ".version")
+    _require(doc["mode"] == "Demo" and _hex(doc["deployment_sha"], 40), alias + ".identity")
+    magics = doc["magics"]
+    _require(isinstance(magics, list) and magics and all(_integer(m, 1) for m in magics)
+             and len(set(magics)) == len(magics), alias + ".magics")
+    _require(isinstance(doc["run_bindings"], list) and isinstance(doc["restart_bindings"], list), alias + ".bindings")
+    for n, binding in enumerate([doc["anchor"], *doc["run_bindings"]]):
+        _fields(binding, "run_index manifest_snapshot launcher_snapshot instances_snapshot" +
+                (" deployment_claim" if n == 0 else ""), alias)
+        _require(_integer(binding["run_index"]), alias + ".run_index")
+        for name in ("manifest_snapshot", "launcher_snapshot", "instances_snapshot"):
+            _ref_schema(binding[name], alias)
+    claim = doc["anchor"]["deployment_claim"]
+    _fields(claim, "source source_lines excerpt_sha256 completed_utc processes", alias)
+    _ref_schema(claim["source"], alias)
+    _line_range(claim["source_lines"], alias)
+    _require(_hex(claim["excerpt_sha256"], 64), alias + ".excerpt_sha256")
+    _utc(claim["completed_utc"], alias)
+    _require(isinstance(claim["processes"], list), alias + ".processes")
+    roles, pids = set(), set()
+    for proc in claim["processes"]:
+        _fields(proc, "kind magic pid", alias)
+        role = _role(proc, magics, alias)
+        _require(_integer(proc["pid"], 1) and proc["pid"] not in pids and role not in roles, alias + ".pid")
+        roles.add(role)
+        pids.add(proc["pid"])
+    _require(roles == {str(m) for m in magics} | {"risk", "reconcile"}, alias + ".roles")
+    for binding in doc["restart_bindings"]:
+        _fields(binding, "line_number before_instances after_instances", alias)
+        _require(_integer(binding["line_number"], 1), alias + ".line_number")
+        _ref_schema(binding["before_instances"], alias)
+        _ref_schema(binding["after_instances"], alias)
+    _ref_schema(doc["calendar"], alias)
+    return doc
+
+
+class FormalEvidence:
+    """One read per actual artifact; hashes and parsers consume the same bytes."""
+
+    def __init__(self, root):
+        self.root = Path(root).resolve()
+        self.cache = {}
+        self.hashes = {}
+
+    def read(self, path, alias):
+        try:
+            path = Path(path).resolve()
+            st = path.stat()
+            key = (st.st_dev, st.st_ino) if st.st_ino else str(path).casefold()
+            if key not in self.cache:
+                self.cache[key] = path.read_bytes()
+            return key, self.cache[key]
+        except (OSError, ValueError):
+            raise FormalInvalid(alias + ".unreadable") from None
+
+    def json(self, path, alias):
+        return _json_bytes(self.read(path, alias)[1], alias)
+
+    def text(self, path, alias):
+        try:
+            return self.read(path, alias)[1].decode("utf-8-sig")
+        except UnicodeError:
+            raise FormalInvalid(alias + ".encoding") from None
+
+    def bound(self, reference, alias):
+        _ref_schema(reference, alias)
+        try:
+            path = (self.root / reference["path"]).resolve()
+            _require(path.is_relative_to(self.root), alias + ".outside_root")
+        except (OSError, ValueError):
+            raise FormalInvalid(alias + ".path") from None
+        key, raw = self.read(path, alias)
+        wanted = reference["sha256"]
+        _require(key not in self.hashes or self.hashes[key] == wanted, alias + ".conflicting_hash")
+        self.hashes[key] = wanted
+        _require(hashlib.sha256(raw).hexdigest() == wanted, alias + ".hash")
+        return raw
+
+    def bound_json(self, reference, alias):
+        return _json_bytes(self.bound(reference, alias), alias)
+
+    def excerpt(self, reference, selected, alias):
+        raw = self.bound(reference, alias)
+        try:
+            raw.decode("utf-8")  # validate the entire original, not just selected lines
+        except UnicodeError:
+            raise FormalInvalid(alias + ".encoding") from None
+        _line_range(selected, alias)
+        rows = raw.splitlines(keepends=True)
+        _require(selected[1] <= len(rows), alias + ".lines")
+        return b"".join(rows[selected[0] - 1:selected[1]])
+
+
+def _identity_path(value):
+    # Lexical only: never stat/resolve any deployment/config path in a record.
+    _require(isinstance(value, str) and bool(value) and "\x00" not in value, "identity.path")
+    _require(ntpath.isabs(value) or value.startswith("/"), "identity.path")
+    return ntpath.normcase(ntpath.normpath(value))
+
+
+def _argv_identity(entry):
+    argv, kind = entry.get("argv"), entry["kind"]
+    _require(isinstance(argv, list) and len(argv) >= 6
+             and all(isinstance(x, str) and x for x in argv), "instances.argv")
+    _require(argv[1] == "-u", "instances.argv")
+    script = {"runner": "live_runner.py", "risk": "risk_process.py", "reconcile": "live_reconcile.py"}[kind]
+    dep = _identity_path(entry.get("deployment_dir"))
+    _require(_identity_path(argv[2]) == ntpath.join(dep, "scripts", script), "instances.script")
+    _identity_path(argv[0])
+    options = {}
+    i = 3
+    while i < len(argv):
+        key = argv[i]
+        _require(key.startswith("--") and key not in options, "instances.argv")
+        if key == "--loop":
+            options[key] = True
+            i += 1
+        else:
+            _require(i + 1 < len(argv) and not argv[i + 1].startswith("--"), "instances.argv")
+            options[key] = argv[i + 1]
+            i += 2
+    required = {"--data-dir", "--loop"}
+    if kind == "runner":
+        required |= {"--config", "--gateway-config", "--risk-config", "--sessions-config", "--spread-model"}
+    else:
+        required |= {"--gw-config", "--interval"}
+        if kind == "risk":
+            required |= {"--config", "--sessions-config"}
+    _require(set(options) == required, "instances.argv")
+    _require(_identity_path(options["--data-dir"]) == _identity_path(entry.get("data_dir")), "instances.data_dir")
+    if "gateway_config" in entry:
+        gateway = options["--gateway-config" if kind == "runner" else "--gw-config"]
+        _require(_identity_path(entry["gateway_config"]) == _identity_path(gateway), "instances.gateway_config")
+    normalized = []
+    for key, value in sorted(options.items()):
+        if key == "--interval":
+            _require(value == ("10.0" if kind == "risk" else "30.0"), "instances.interval")
+        elif key != "--loop":
+            value = _identity_path(value)
+        normalized.append((key, value))
+    return (_identity_path(argv[0]), _identity_path(argv[2]), tuple(normalized))
+
+
+def _instances(doc, descriptor, baseline=None):
+    _require(isinstance(doc, dict) and type(doc.get("schema_version")) is int
+             and doc["schema_version"] == 1 and isinstance(doc.get("instances"), list), "instances.schema")
+    roles, pids = {}, set()
+    for e in doc["instances"]:
+        _require(isinstance(e, dict), "instances.schema")
+        role = _role(e, descriptor["magics"], "instances")
+        _require(role not in roles and _integer(e.get("pid"), 1) and e["pid"] not in pids, "instances.pid")
+        _require(e.get("mode") == "Demo" and e.get("deployment_sha") == descriptor["deployment_sha"], "instances.deployment")
+        _utc(e.get("started_utc"), "instances")
+        signature = (_identity_path(e.get("deployment_dir")), _identity_path(e.get("data_dir")), _argv_identity(e))
+        _identity_path(e.get("log"))
+        if baseline is not None:
+            b = baseline[role]
+            _require(signature == (b["deployment_dir"], b["data_dir"], b["argv"]), "instances.identity_changed")
+        roles[role] = dict(pid=e["pid"], started_utc=_utc(e["started_utc"], "instances"),
+                           deployment_dir=signature[0], data_dir=signature[1], argv=signature[2],
+                           log=_identity_path(e["log"]))
+        pids.add(e["pid"])
+    _require(set(roles) == {str(m) for m in descriptor["magics"]} | {"risk", "reconcile"}, "instances.roles")
+    _require(len({e["deployment_dir"] for e in roles.values()}) == 1
+             and len({e["data_dir"] for e in roles.values()}) == 1, "instances.paths")
+    return roles
+
+
+def _manifest(doc, descriptor):
+    _require(isinstance(doc, dict) and type(doc.get("schema_version")) is int
+             and doc["schema_version"] == 1 and doc.get("mode") == "Demo", "manifest.schema")
+    _require(isinstance(doc.get("magics"), list) and all(_integer(m, 1) for m in doc["magics"])
+             and sorted(doc["magics"]) == sorted(descriptor["magics"]), "manifest.magics")
+    _require(isinstance(doc.get("runs"), list) and doc["runs"], "manifest.runs")
+    last = None
+    for run in doc["runs"]:
+        _require(isinstance(run, dict) and run.get("kind") in ("start", "restart"), "manifest.run")
+        ts = _utc(run.get("started_utc"), "manifest")
+        _require(last is None or ts >= last, "manifest.order")
+        last = ts
+        _identity_path(run.get("log_dir"))
+    return doc["runs"]
+
+
+def _launcher(doc, run, registry, descriptor, instances_doc):
+    _require(isinstance(doc, dict) and doc.get("mode") == "Demo"
+             and isinstance(doc.get("processes"), list), "launcher.schema")
+    t = _utc(doc.get("started_utc"), "launcher")
+    _require(t >= _utc(run["started_utc"], "manifest"), "launcher.time_order")
+    _require(_identity_path(doc.get("repo_root")) == registry["risk"]["deployment_dir"], "launcher.deployment_dir")
+    config_dir = _identity_path(doc.get("config_dir"))
+    _require(_identity_path(doc.get("paper_state_dir")) == ntpath.join(registry["risk"]["data_dir"], "live", "paper"), "launcher.data_dir")
+    skipped = doc.get("skipped_alive_runners")
+    _require(isinstance(skipped, list) and all(_integer(m, 1) and m in descriptor["magics"] for m in skipped)
+             and len(set(skipped)) == len(skipped), "launcher.skipped")
+    raw_by_pid = {e["pid"]: e for e in instances_doc["instances"]}
+    launched = set()
+    for p in doc["processes"]:
+        _require(isinstance(p, dict) and _integer(p.get("pid"), 1), "launcher.process")
+        kind = p.get("kind")
+        name = p.get("name")
+        role = name if kind == "runner" else kind
+        _require(role in registry and role not in launched, "launcher.role")
+        _require(kind == ("runner" if role.isdigit() else role), "launcher.role")
+        _require(kind == "runner" or name == ("account" if kind == "risk" else "all"), "launcher.name")
+        e = registry[role]
+        _require(p["pid"] == e["pid"] and _identity_path(p.get("log")) == e["log"], "launcher.pid_log")
+        _require(ntpath.dirname(e["log"]) == _identity_path(run["log_dir"]), "launcher.log_dir")
+        _require(_identity_path(p.get("err_log")) == e["log"] + ".err", "launcher.err_log")
+        _require(e["started_utc"] <= _utc(p.get("started_utc"), "launcher") <= t, "launcher.process_time")
+        # The actual PS producer joins argv without quoting. Compare that exact
+        # record; do not try to execute it or split it on whitespace.
+        raw = raw_by_pid[p["pid"]]
+        _require(p.get("command") == " ".join(raw["argv"]), "launcher.command")
+        if kind == "runner":
+            opts = dict(e["argv"][2])
+            _require(ntpath.dirname(opts["--config"]) == config_dir, "launcher.config_dir")
+        launched.add(role)
+    _require({str(m) for m in skipped} == {str(m) for m in descriptor["magics"]} - launched,
+             "launcher.skipped")
+    return t, launched
+
+
+@dataclass(frozen=True)
+class FormalWindow:
+    deployment_sha: str
+    anchor: dict
+    start_utc: datetime
+    end_utc: datetime
+    required_trading_days: tuple[date, ...]
+    required_calendar_days: tuple[date, ...]
+    registry: dict = field(repr=False)
+    restart_rows: tuple[dict, ...] = field(default=(), repr=False)
+    registry_starts: tuple[dict, ...] = field(default=(), repr=False)
+
+
+def resolve_formal_window(manifest, descriptor, bound_records, *, now):
+    """Bind retained identity first; no current identity can fill historic holes."""
+    d = validate_formal_descriptor(descriptor)
+    batch = bound_records
+    now = now.astimezone(timezone.utc).replace(tzinfo=None) if now.tzinfo else now
+    runs = _manifest(manifest, d)
+    anchor = d["anchor"]
+    idx = anchor["run_index"]
+    claim = anchor["deployment_claim"]
+    completed = _utc(claim["completed_utc"], "deployment_claim")
+    _require(completed <= now, "deployment_claim.future")
+    source = batch.excerpt(claim["source"], claim["source_lines"], "deployment_claim")
+    _require(hashlib.sha256(source).hexdigest() == claim["excerpt_sha256"], "deployment_claim.excerpt_hash")
+    text = source.decode("utf-8")
+    for literal in (d["deployment_sha"], claim["completed_utc"]):
+        _require(re.search(r"(?<![\w:.+-])" + re.escape(literal) + r"(?![\w:.+-])", text), "deployment_claim.literal")
+    for p in claim["processes"]:
+        _require(re.search(r"(?<!\d)" + str(p["pid"]) + r"(?!\d)", text), "deployment_claim.pid_literal")
+    bindings = [anchor, *d["run_bindings"]]
+    _require([b["run_index"] for b in bindings] == list(range(idx, len(runs))), "manifest.bindings")
+    events, baseline, registry_starts = [], None, []
+    for b in bindings:
+        i = b["run_index"]
+        snap = batch.bound_json(b["manifest_snapshot"], "manifest_snapshot")
+        prefix = _manifest(snap, d)
+        _require(len(prefix) == i + 1 and prefix == runs[:i + 1], "manifest.prefix")
+        run = prefix[-1]
+        _require(run.get("mode", snap["mode"]) == "Demo", "manifest.mode")
+        ts = _utc(run["started_utc"], "manifest")
+        _require(ts <= now, "manifest.future")
+        instances = batch.bound_json(b["instances_snapshot"], "instances_snapshot")
+        registry = _instances(instances, d, baseline)
+        launcher = batch.bound_json(b["launcher_snapshot"], "launcher_snapshot")
+        launch_ts, launched = _launcher(launcher, run, registry, d, instances)
+        _require(launch_ts <= now, "launcher.future")
+        if baseline is None:
+            baseline = registry
+            _require(launched == set(registry) and launch_ts <= completed, "anchor.initial_deployment")
+            claimed = {_role(p, d["magics"], "claim"): p["pid"] for p in claim["processes"]}
+            _require(claimed == {r: e["pid"] for r, e in registry.items()}, "anchor.pid")
+        else:
+            _require(ts >= completed, "launcher.before_anchor")
+            events.append((ts, "launcher", registry, launched))
+            registry_starts.extend(dict(magic=int(role), ts=registry[role]["started_utc"],
+                                        log="launcher-retained", retained=True)
+                                   for role in launched if role.isdigit())
+    # The CLI supplies the complete raw physical journal and current registry.
+    journal = getattr(batch, "journal", [])
+    relevant = [(n, row) for n, row in journal
+                if _utc(row["utc"], "journal") >= _utc(runs[idx]["started_utc"], "manifest")]
+    restarts = d["restart_bindings"]
+    _require([b["line_number"] for b in restarts] == [n for n, _ in relevant], "journal.bindings")
+    for b, (_, row) in zip(restarts, relevant):
+        _require(row["deployment_sha"] == d["deployment_sha"], "journal.deployment")
+        t = _utc(row["utc"], "journal")
+        _require(completed <= t <= now, "journal.time")
+        before = _instances(batch.bound_json(b["before_instances"], "restart.before"), d, baseline)
+        after = _instances(batch.bound_json(b["after_instances"], "restart.after"), d, baseline)
+        role = row["component"]
+        _require(role in before and row["old_pid"] == before[role]["pid"]
+                 and row["new_pid"] == after[role]["pid"] and row["new_pid"] != row["old_pid"], "journal.pid")
+        _require(t <= after[role]["started_utc"] <= now, "journal.launch_time")
+        _require(all(before[k] == after[k] for k in before if k != role), "journal.unrelated_change")
+        events.append((t, "supervisor", before, after))
+        if role.isdigit():
+            registry_starts.append(dict(magic=int(role), ts=after[role]["started_utc"],
+                                        log="supervisor-retained", retained=True))
+    current = baseline
+    for _, kind, left, right in sorted(events, key=lambda e: e[0]):
+        if kind == "supervisor":
+            _require(current == left, "journal.chain")
+            current = right
+        else:
+            changed = {k for k in current if current[k] != left[k]}
+            _require(changed == right and all(current[k]["pid"] != left[k]["pid"] for k in changed), "launcher.chain")
+            current = left
+    if hasattr(batch, "current_instances"):
+        _require(_instances(batch.current_instances, d, baseline) == current, "instances.current_chain")
+    calendar = batch.bound_json(d["calendar"], "calendar")
+    _fields(calendar, "schema_version timezone market source days", "calendar")
+    _require(type(calendar["schema_version"]) is int and calendar["schema_version"] == 1
+             and calendar["timezone"] == "UTC" and calendar["market"] == "XAUUSD", "calendar.schema")
+    _ref_schema(calendar["source"], "calendar")
+    _require(isinstance(calendar["days"], list), "calendar.days")
+    dates, trading = [], []
+    for row in calendar["days"]:
+        _fields(row, "date trading reason source_lines", "calendar")
+        _require(isinstance(row["date"], str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", row["date"]), "calendar.date")
+        try:
+            day = date.fromisoformat(row["date"])
+        except ValueError:
+            raise FormalInvalid("calendar.date") from None
+        _require(type(row["trading"]) is bool and row["reason"] in ("weekday", "weekend", "holiday"), "calendar.reason")
+        reason = row["reason"]
+        _require((reason == "weekday" and row["trading"] and day.weekday() < 5)
+                 or (reason == "weekend" and not row["trading"] and day.weekday() >= 5)
+                 or (reason == "holiday" and not row["trading"]), "calendar.reason")
+        excerpt = batch.excerpt(calendar["source"], row["source_lines"], "calendar").decode("utf-8")
+        matching = [ln for ln in excerpt.splitlines() if re.search(r"(?<!\d)" + str(day) + r"(?!\d)", ln)]
+        _require(any(re.search(r"\b" + reason + r"\b", ln) for ln in matching), "calendar.source")
+        if reason == "holiday":
+            _require(any(re.sub(r"[\W_]", "", ln.replace(str(day), "").replace("holiday", ""))
+                         for ln in matching), "calendar.holiday_reason")
+        dates.append(day)
+        if row["trading"]:
+            trading.append(day)
+    expected = [completed.date() + timedelta(days=i) for i in range((now.date() - completed.date()).days + 1)]
+    _require(dates == expected, "calendar.coverage")
+    starts = [datetime.combine(day, datetime.min.time()) for day in trading
+              if datetime.combine(day, datetime.min.time()) >= completed]
+    _require(starts and starts[0] <= now, "calendar.window_not_started")
+    start = starts[0]
+    return FormalWindow(d["deployment_sha"], anchor, start, now,
+        tuple(day for day in trading if start.date() <= day < now.date()),
+        tuple(day for day in dates if day >= start.date()), current,
+        tuple(row for _, row in relevant), tuple(registry_starts))
+
+
+def _formal_jsonl(batch, path, alias):
+    rows = []
+    for n, line in enumerate(batch.text(path, alias).splitlines(), 1):
+        if not line.strip():
+            continue
+        doc = _json_bytes(line.encode("utf-8"), alias)
+        _require(isinstance(doc, dict), alias + ".row")
+        rows.append((n, doc))
+    return rows
+
+
+def _formal_glob(directory, pattern, alias):
+    try:
+        return sorted(Path(directory).glob(pattern))
+    except OSError:
+        raise FormalInvalid(alias + ".unreadable") from None
+
+
+def _formal_exists(path, alias):
+    try:
+        path.stat()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise FormalInvalid(alias + ".unreadable") from None
+
+
+def _number(value, *, minimum=0):
+    return type(value) in (int, float) and math.isfinite(value) and value >= minimum
+
+
+def _alert_magics(message, magics):
+    found = set()
+    for group in re.findall(r"magic\s*\[([^]]+)\]", message):
+        _require(re.fullmatch(r"\s*\d+(?:\s*,\s*\d+)*\s*", group), "alerts.magic")
+        found.update(int(x.strip()) for x in group.split(","))
+    for a, b in re.findall(r"\bmagic[= ]+(\d+)\b|heartbeat-(\d+)\.json", message):
+        found.add(int(a or b))
+    _require(found <= set(magics), "alerts.magic")
+    return found
+
+
+def _formal_log_time(line):
+    match = re.match(r"\[(\d{4}-\d{2}-\d{2}T[^]]+)\]", line)
+    if match:
+        return _utc(match.group(1), "logs", naive=True)
+    match = re.match(r"[·\s]*(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}) UTC\b", line)
+    if match:
+        return _utc(match.group(1) + "T" + match.group(2) + "Z", "logs")
+    return None
+
+
+FORMAL_ANOMALY_ALERTS = frozenset({
+    "ACCOUNT_POLL_ERROR", "HEARTBEAT_WRITE_ERROR", "PARTIAL_FILL", "EXTERNAL_EXIT",
+    "UNEXPECTED_RESIZE", "FLATTEN_RESIDUAL", "DEALS_LOG_ERROR", "STATE_CORRUPT",
+    "EXECUTION_UNKNOWN", "BROKER_PENDING_ORDER", "BROKER_UNAVAILABLE", "EXECUTION_RECOVERED",
+    "PAUSE_UNREADABLE", "ORDER_LOG_BAD_LINE", "RISK_HEALTH", "SUPERVISOR_REFUSED",
+    "TRADE_MODE", "ORDER_ERROR", "LINE_CAP_STATE",
+})
+FORMAL_DRILL_ALERTS = frozenset({"RISK_HALT", "RISK_FLATTEN", "HEARTBEAT_TIMEOUT",
+                               "RECONCILE_MISMATCH", "RISK_REJECT", "SUPERVISOR"})
+
+
+def _normal_log_metadata(line):
+    """Only actual, non-evidence producer lines; never guess a missing time."""
+    number = r"-?\d+(?:\.\d+)?"
+    return any(re.fullmatch(pattern, line) for pattern in (
+        r"mt5live 启动：[^\r\n]+",
+        r"身份锁已取得：[^\r\n]+",
+        r"    执行 (?:hold|none|duplicate|open|close|reverse|reverse_pending|add|reduce|flatten|flatten_acked|blocked_reentry|skipped_zero_lots)：net "
+        + number + r" → " + number + r"，\d+ 笔请求",
+        r"      (?:open|close) ticket=\d+ vol=" + number + "/" + number + " price=" + number,
+    ))
+
+
+def load_formal_raw(args, descriptor, batch, *, now):
+    """Strict raw reader. No calls into the forgiving day/summary loaders."""
+    from mt5live.monitor import Alert
+    from mt5live.reconcile import Intent
+    from mt5data.sessions import _session_policy_from_dict
+    import tomllib
+
+    live = Path(args.data_dir) / "live"
+    for directory in (live, Path(args.log_dir), Path(args.reports_dir)):
+        _require(_formal_exists(directory, "inputs") and directory.is_dir(), "inputs.directory")
+    manifest = batch.json(live / RUN_MANIFEST_FILE, "manifest")
+    batch.current_instances = batch.json(live / "instances.json", "instances.current")
+    batch.journal = []
+    journal_path = live / "ops-restarts.jsonl"
+    if _formal_exists(journal_path, "journal"):
+        batch.journal = _formal_jsonl(batch, journal_path, "journal")
+        last = None
+        for _, row in batch.journal:
+            _require(set(row) == {"utc", "component", "reason_code", "old_pid", "new_pid", "deployment_sha"}, "journal.schema")
+            t = _utc(row["utc"], "journal")
+            _require(last is None or last <= t, "journal.order")
+            _require(isinstance(row["component"], str) and bool(row["component"])
+                     and isinstance(row["reason_code"], str) and bool(row["reason_code"])
+                     and (row["old_pid"] is None or _integer(row["old_pid"], 1))
+                     and _integer(row["new_pid"], 1) and _hex(row["deployment_sha"], 40), "journal.schema")
+            last = t
+    window = resolve_formal_window(manifest, descriptor, batch, now=now)
+    magics = set(descriptor["magics"])
+    try:
+        policy = _session_policy_from_dict(tomllib.loads(batch.text(args.sessions_config, "sessions")), "sessions")
+    except Exception:
+        raise FormalInvalid("sessions.invalid") from None
+    states, pauses, intents = {}, {}, []
+    for prefix in ("state", "pause", "expected"):
+        for path in _formal_glob(live, prefix + "-*.json", prefix):
+            m = re.fullmatch(prefix + r"-(\d+)\.json", path.name)
+            _require(m and int(m[1]) in magics, prefix + ".magic")
+            magic = int(m[1])
+            doc = batch.json(path, prefix)
+            _require(isinstance(doc, dict) and type(doc.get("magic")) is int
+                     and doc["magic"] == magic, prefix + ".schema")
+            if prefix == "state":
+                known, pending = doc.get("known_positions"), doc.get("pending_external_exits")
+                _require(isinstance(known, dict) and isinstance(pending, dict), "state.schema")
+                _utc(doc.get("updated_at_utc"), "state")
+                _require(type(doc.get("state_corrupt", False)) is bool, "state.state_corrupt")
+                for ticket, item in known.items():
+                    _require(ticket.isdigit() and isinstance(item, dict)
+                             and type(item.get("dir")) is int and item["dir"] in (-1, 1)
+                             and _number(item.get("volume")), "state.position")
+                for ticket, item in pending.items():
+                    _require(ticket.isdigit() and isinstance(item, dict), "state.pending")
+                    _utc(item.get("ts"), "state.pending")
+                states[magic] = doc
+            elif prefix == "pause":
+                _require(type(doc.get("paused")) is bool, "pause.schema")
+                _utc(doc.get("ts"), "pause")
+                pauses[magic] = doc
+            else:
+                _require(isinstance(doc.get("symbol"), str) and bool(doc["symbol"])
+                         and _number(doc.get("volume")), "expected.schema")
+                try:
+                    intents.append(Intent(symbol=doc["symbol"], magic=magic, side=doc["side"],
+                        volume=doc["volume"], status=doc["status"], cause=doc["cause"],
+                        ts=_utc(doc.get("ts"), "expected")))
+                except (KeyError, TypeError, ValueError):
+                    raise FormalInvalid("expected.schema") from None
+    _require(set(states) == magics and {it.magic for it in intents} == magics, "current.missing_state")
+    _require(not _formal_exists(live / "expected.json", "expected"), "expected.legacy_unbound")
+    controls = []
+    for path in [live / "pause.json", *_formal_glob(live, "reconcile-block-*.json", "current.pause")]:
+        if not _formal_exists(path, "current.pause"):
+            continue
+        doc = batch.json(path, "current.pause")
+        _require(isinstance(doc, dict) and type(doc.get("paused")) is bool, "current.pause.schema")
+        _utc(doc.get("ts"), "current.pause")
+        if path.name == "pause.json":
+            _require(doc.get("magic") is None, "current.pause.magic")
+        else:
+            m = re.fullmatch(r"reconcile-block-(\d+)\.json", path.name)
+            _require(m and int(m[1]) in magics and type(doc.get("magic")) is int
+                     and doc["magic"] == int(m[1]) and doc["paused"] is True
+                     and doc.get("owner") == "reconcile" and doc.get("reason") == "reconcile_mismatch",
+                     "current.pause.schema")
+        if doc["paused"]:
+            controls.append("global_pause" if path.name == "pause.json" else "reconcile_block")
+    for name in ("killSwitch", "halt.json", "halt-risk-veto.json"):
+        path = live / name
+        if _formal_exists(path, "current"):
+            if name == "killSwitch":
+                batch.read(path, "current.killSwitch")
+            else:
+                doc = batch.json(path, "current.halt")
+                _require(isinstance(doc, dict) and isinstance(doc.get("reason"), str), "current.halt.schema")
+                _utc(doc.get("ts"), "current.halt")
+            controls.append(name)
+    deals, orders = [], []
+    for prefix in ("deals", "orders"):
+        for path in _formal_glob(live, prefix + "-*.jsonl", prefix):
+            m = re.fullmatch(prefix + r"-(\d+)\.jsonl", path.name)
+            _require(m and int(m[1]) in magics, prefix + ".magic")
+            for _, row in _formal_jsonl(batch, path, prefix):
+                _require(type(row.get("magic")) is int and row["magic"] == int(m[1]), prefix + ".magic")
+                row["_t"] = _utc(row.get("ts"), prefix, naive=True)
+                if prefix == "orders":
+                    _require(row.get("kind") in ("open", "close") and isinstance(row.get("decision_id"), str), "orders.schema")
+                    orders.append(row)
+                else:
+                    event = row.get("event")
+                    _require(event in DEAL_EVENT_ENTRY and _integer(row.get("ticket"), 1)
+                             and _number(row.get("price")) and _number(row.get("volume"))
+                             and row.get("side") in ("buy", "sell")
+                             and (row.get("reason") is None or row["reason"] in ("SL", "TP", "SO")), "deals.schema")
+                    if event == "fill_open":
+                        _require(_bar_close_key(row.get("decision_bar")) is not None, "deals.decision_bar")
+                    row.update(entry=DEAL_EVENT_ENTRY[event], position_id=row["ticket"],
+                               comment=row.get("decision_bar") if event == "fill_open" else "close" if event == "fill_close" else "",
+                               reason=REASON_CODE_BY_NAME.get(row.get("reason")))
+                    deals.append(row)
+    alerts = []
+    for line in batch.text(live / "alerts.log", "alerts").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t", 2)
+        _require(len(parts) == 3 and bool(re.fullmatch(r"[A-Z][A-Z_0-9]*", parts[1])) and bool(parts[2]), "alerts.row")
+        _utc(parts[0], "alerts", naive=True)
+        _require(parts[1] in FORMAL_ANOMALY_ALERTS | FORMAL_DRILL_ALERTS, "alerts.unknown_kind")
+        if parts[1] in ("RECONCILE_MISMATCH", "EXTERNAL_EXIT", "HEARTBEAT_TIMEOUT", "RISK_REJECT"):
+            _require(_alert_magics(parts[2], magics), "alerts.unattributed")
+        alerts.append(Alert(_utc(parts[0], "alerts", naive=True), parts[1], parts[2]))
+    logs = []
+    seen = set()
+    for directory in (Path(args.log_dir), live):
+        for path in _formal_glob(directory, "*.log", "logs") + _formal_glob(directory, "*.log.err", "logs"):
+            if path == live / "alerts.log":
+                continue
+            key, raw = batch.read(path, "logs")
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                text = raw.decode("utf-8-sig")
+            except UnicodeError:
+                raise FormalInvalid("logs.encoding") from None
+            if not text.strip():
+                continue
+            _require(PAPER_LOG_MARK not in text, "logs.paper_mode_conflict")
+            magic_matches = {int(x) for x in re.findall(r"mt5live 启动：.*?magic=(\d+)", text)}
+            _require(len(magic_matches) <= 1 and magic_matches <= magics, "logs.magic")
+            magic = next(iter(magic_matches), None)
+            kind = "runner" if magic is not None else ("risk" if "心跳=" in text else
+                   "reconcile" if "对账一致" in text or "持仓不一致" in text else "other")
+            events = []
+            for line in text.splitlines():
+                if not line.strip():
+                    continue
+                ts = _formal_log_time(line)
+                if ts is None:
+                    _require(_normal_log_metadata(line), "logs.missing_event_time")
+                    continue
+                if "决策 " in line:
+                    decision = re.search(r"决策 (\S+?)：", line)
+                    _require(kind == "runner" and decision is not None
+                             and _bar_close_key(decision[1]) is not None, "logs.decision")
+                    quote = DECISION_QUOTE_RE.search(line)
+                    if "bid=" in line or "ask=" in line:
+                        _require(quote is not None and all(_number(float(v)) for v in quote.groups()[1:]), "logs.quote")
+                events.append((ts, line))
+            logs.append((path.name, magic, kind, events))
+    rounds = {}
+    paths = set(_formal_glob(live / DRILL_ARCHIVE_SUBDIR, "*/*.json", "drills")
+                + _formal_glob(live / DRILL_ARCHIVE_SUBDIR, "*/flatten.ack-*", "drills")
+                + _formal_glob(live / "commands", "flatten.json", "drills")
+                + _formal_glob(live / "commands", "flatten.ack-*", "drills")
+                + _formal_glob(live / "commands/archive", "flatten-*.json", "drills"))
+    for path in sorted(paths):
+        doc = batch.json(path, "drills")
+        _require(isinstance(doc, dict) and isinstance(doc.get("id"), str) and doc["id"], "drills.id")
+        t = _utc(doc.get("ts"), "drills", naive=True)
+        cid = doc["id"]
+        r = rounds.setdefault(cid, dict(command=None, command_ts=None, acks=[]))
+        if "command" in doc:
+            _require(doc["command"] == FLATTEN_COMMAND, "drills.command")
+            _require(r["command"] is None or r["command"] == doc, "drills.conflicting_command")
+            r.update(command=doc, command_ts=t)
+        else:
+            _require(_integer(doc.get("magic"), 1) and doc["magic"] in magics
+                     and _integer(doc.get("closed")), "drills.ack")
+            r["acks"].append(dict(magic=doc["magic"], id=cid, closed=doc["closed"], ts=t))
+    reports = {}
+    for path in _formal_glob(Path(args.reports_dir) / "live", "daily-*.md", "reports"):
+        m = re.fullmatch(r"daily-(\d{4}-\d{2}-\d{2})\.md", path.name)
+        _require(m is not None, "reports.name")
+        try:
+            day = date.fromisoformat(m[1])
+        except ValueError:
+            raise FormalInvalid("reports.date") from None
+        reports[day] = batch.text(path, "reports")
+    return dict(manifest=manifest, window=window, deals=deals, orders=orders, alerts=alerts,
+                log_events=logs, pauses=pauses, executor_states=states, intents=intents,
+                current_controls=controls, reports=reports, drill_rounds=rounds, session_policy=policy,
+                paper_state_files=_formal_glob(live / "paper", "state-*.json", "paper"))
+
+
+def build_accept_ctx(raw_ctx, formal_window):
+    """Derive every positive event view only after its own time was validated."""
+    raw, w = raw_ctx, formal_window
+    inside = lambda t: w.start_utc <= t <= w.end_utc
+    logs, starts = [], []
+    for name, magic, kind, events in raw["log_events"]:
+        selected = [(ts, ln) for ts, ln in events if inside(ts)]
+        if not selected:
+            continue
+        times, lines = zip(*selected)
+        logs.append(LogFile(name, list(lines), magic, kind, min(times), max(times), w.end_utc))
+        for ts, ln in selected:
+            if kind == "runner" and RUNNER_START_MARK in ln:
+                starts.append(dict(magic=magic, ts=ts, log=name))
+    starts.extend(s for s in w.registry_starts if inside(s["ts"]))
+    evidence = {"runner_days": {}, "risk_days": set(), "reconcile_days": set(),
+                "heartbeat_ok_days": set(), "risk_hb_hours": {}}
+    for _, magic, kind, events in raw["log_events"]:
+        for ts, ln in events:
+            if not inside(ts):
+                continue
+            day = ts.date()
+            if kind == "runner":
+                evidence["runner_days"].setdefault(magic, set()).add(day)
+            elif kind == "risk":
+                evidence["risk_days"].add(day)
+                if "心跳=" in ln:
+                    evidence["risk_hb_hours"].setdefault(day, set()).add(ts.hour)
+                if HEARTBEAT_OK_MARK in ln:
+                    evidence["heartbeat_ok_days"].add(day)
+            elif kind == "reconcile":
+                evidence["reconcile_days"].add(day)
+    deals = [r for r in raw["deals"] if inside(r["_t"])]
+    orders = [r for r in raw["orders"] if inside(r["_t"])]
+    alerts = [a for a in raw["alerts"] if inside(a.time)]
+    report_days = {day for day in raw["reports"] if w.start_utc.date() <= day <= w.end_utc.date()}
+    activity = report_days | {d["_t"].date() for d in deals} | {a.time.date() for a in alerts}
+    activity |= {d for ds in evidence["runner_days"].values() for d in ds}
+    rounds = {}
+    for cid, r in raw["drill_rounds"].items():
+        rounds[cid] = dict(command=r["command"] if r["command_ts"] and inside(r["command_ts"]) else None,
+                           command_ts=r["command_ts"], acks=[a for a in r["acks"] if inside(a["ts"])])
+    return {**raw, "formal_window": w, "now": w.end_utc, "run_window": (w.start_utc, w.end_utc),
+            "deals": deals, "deals_log": deals, "orders": orders, "alerts": alerts, "logs": logs,
+            "start_events": sorted(starts, key=lambda s: s["ts"]), "drill_rounds": rounds,
+            "states": {}, "intent_symbols": {i.magic: i.symbol for i in raw["intents"]},
+            "manifest_error": None, "manifest_magics": raw["manifest"]["magics"],
+            "runner_magics": set(raw["manifest"]["magics"]), "evidence_magics": set(raw["manifest"]["magics"]),
+            "all_days": activity, "activity_days": activity, "latest_day": None,
+            "runner_magic_days": evidence["runner_days"], **{k: v for k, v in evidence.items() if k != "runner_days"},
+            "paper_log_count": sum(PAPER_LOG_MARK in ln for lf in logs for ln in lf.lines),
+            "deals_log_bad": 0, "ops_restarts": list(w.restart_rows),
+            "log_tail_text": {(lf.magic, lf.path): "\n".join(lf.lines) for lf in logs}}
+
+
+def formal_current_state(ctx):
+    problems = list(ctx["current_controls"])
+    for magic, pause in ctx["pauses"].items():
+        if pause["paused"]:
+            problems.append(f"pause magic={magic}")
+    for magic, state in ctx["executor_states"].items():
+        if state.get("state_corrupt"):
+            problems.append(f"state_corrupt magic={magic}")
+        if state["pending_external_exits"]:
+            problems.append(f"pending magic={magic}")
+        if _utc(state["updated_at_utc"], "state") > ctx["now"]:
+            problems.append(f"future state magic={magic}")
+    for it in ctx["intents"]:
+        if it.ts > ctx["now"]:
+            problems.append(f"future intent magic={it.magic}")
+    result = diff_positions(ctx["intents"], actual_positions({}, ctx["executor_states"], ctx["intent_symbols"]),
+                            now=ctx["now"], grace_s=60.0, volume_tolerance=DEFAULT_VOLUME_TOLERANCE)
+    if result.diffs:
+        problems.append("known_positions 与当前意图不一致")
+    return Check("当前持续保护与持仓差分", not problems, "；".join(problems) if problems else "当前保护未置位且持仓一致")
+
+
+def formal_day_coverage(ctx):
+    w = ctx["formal_window"]
+    missing = [d for d in w.required_trading_days if d not in ctx["activity_days"]]
+    problems = []
+    if len(w.required_trading_days) < 10:
+        problems.append(f"已结束交易日 {len(w.required_trading_days)}（<10）")
+    if missing:
+        problems.append("缺失交易日 " + ",".join(map(str, missing)))
+    return Check("连续交易日覆盖（完整日历）", not problems,
+                 "；".join(problems) if problems else f"全部 {len(w.required_trading_days)} 已结束交易日有证据")
+
+
+def formal_process_liveness(ctx):
+    w = ctx["formal_window"]
+    problems = []
+    for day in w.required_calendar_days:
+        # Same hourly grace as the daily checker; at 00:00..00:09 no hour
+        # has fallen due yet, so do not invent a requirement for hour zero.
+        hi = 23 if day < w.end_utc.date() else w.end_utc.hour - (w.end_utc.minute < 10)
+        hours = set(range(hi + 1))
+        if not hours:
+            continue
+        for label, days in (("风控", ctx["risk_days"]), ("对账", ctx["reconcile_days"])):
+            if day not in days:
+                problems.append(f"{day} 无{label}进程日志")
+        if hours - ctx["risk_hb_hours"].get(day, set()):
+            problems.append(f"{day} 风控逐小时心跳缺失")
+        for magic in ctx["manifest_magics"]:
+            if day not in ctx["runner_magic_days"].get(magic, set()) and day not in ctx["heartbeat_ok_days"]:
+                problems.append(f"{day} magic={magic} 无运行器存活证据")
+    return Check("各进程存活（完整自然日及已到期小时）", not problems,
+                 "；".join(problems) if problems else "完整自然日存活证据齐全")
+
+
+def formal_report(ctx, day):
+    text = ctx["reports"].get(day)
+    ok = bool(text and text.strip())
+    detail = f"{day} 日报缺失/为空"
+    if ok:
+        ok = "**超标**" not in text and "当日无点差样本" not in text and any(
+            sym == "XAUUSD" and 0 <= int(hour) <= 23 and int(n) > 0
+            for sym, hour, n in SPREAD_ROW_RE.findall(text))
+        detail = f"{day} " + ("结构化点差样本正常" if ok else "点差超标或无结构化样本")
+    return Check("日报和点差样本", ok, detail)
+
+
+def run_formal_accept(ctx):
+    checks = [accept_evidence_source(ctx), formal_current_state(ctx), formal_day_coverage(ctx),
+              formal_process_liveness(ctx), accept_sl_tp_samples(ctx), accept_drills(ctx),
+              accept_double_flatten(ctx), accept_slippage(ctx)]
+    w = ctx["formal_window"]
+    for day in w.required_calendar_days:
+        for fn in (check_deal_attribution, check_zero_rebalance, check_protective_exit,
+                   check_heartbeat_continuity, check_forbidden_session):
+            c = fn(ctx, day)
+            if c.ok is not True:
+                checks.append(Check(c.name, False, f"{day}: {c.detail}"))
+        if day in w.required_trading_days:
+            checks.append(formal_report(ctx, day))
+        elif day == w.end_utc.date() and day in ctx["reports"] and "**超标**" in ctx["reports"][day]:
+            checks.append(Check("当日点差", False, f"{day} 点差超标"))
+    anomalies = [(a.time, a.kind) for a in ctx["alerts"] if a.kind in FORMAL_ANOMALY_ALERTS]
+    anomalies += [(ts, "日志异常") for _, _, _, events in ctx["log_events"]
+                  for ts, ln in events if _in_window(ctx, ts)
+                  and any(mark in ln for mark in ("Traceback", "执行异常", "决策异常", "CRITICAL", "ERROR"))]
+    if anomalies:
+        checks.append(Check("窗口内异常", False, "；".join(f"{t} {kind}" for t, kind in anomalies)))
+    return checks
+
+
+def _formal_result(code, *, checks=(), window=None, error=None):
+    print("historical_identity_verified=false")
+    print("a5_status=not_evaluated")
+    print("mechanical_checks_passed=" + ("true" if code == 3 else "false"))
+    if error:
+        print("invalid_evidence=" + error)
+    if window:
+        print(f"正式窗口机械预检 [S,T]=[{window.start_utc.isoformat()}Z,{window.end_utc.isoformat()}Z]")
+        print("deployment_sha=" + window.deployment_sha)
+    for c in checks:
+        print(f"[{'满足' if c.ok is True else '不满足'}] {c.name}：{c.detail}")
+    print("仅机械核对；历史真实性及独立 A5 尚未审定。")
+    return code
 
 
 # ---------------------------------------------------------------- 数据装载
@@ -731,15 +1514,16 @@ def check_deal_attribution(ctx, day: date) -> Check:
     后缀（naive）与 C-2 decision_bar（iso_utc 带 +00:00）字符串形态
     不同，禁止字符串相等比较（会断链）。"""
     name = "每笔成交可归因（台账/日志有对应决策）"
-    decision_ids = {r["decision_id"] for r in ctx["orders"]
+    formal = "formal_window" in ctx
+    decision_ids = {(r.get("magic") if formal else None, r["decision_id"]) for r in ctx["orders"]
                     if r.get("kind") == "open" and r.get("decision_id", "-") != "-"}
     for lf in ctx["logs"]:
         for ln in lf.lines:
             m = re.search(r"决策 (\S+?)：", ln)
             if m:
-                decision_ids.add(m.group(1))
-    decision_keys = {k for k in map(_bar_close_key, decision_ids)
-                     if k is not None}
+                decision_ids.add((lf.magic if formal else None, m.group(1)))
+    decision_keys = {(mg, k) for mg, did in decision_ids
+                     if (k := _bar_close_key(did)) is not None}
     closes_available: dict[int, int] = {}
     for r in ctx["orders"]:
         if r.get("kind") == "close":
@@ -751,7 +1535,7 @@ def check_deal_attribution(ctx, day: date) -> Check:
             continue
         if d["entry"] == "in":
             key = _bar_close_key(d.get("comment", ""))
-            if key is None or key not in decision_keys:
+            if key is None or (d["magic"] if formal else None, key) not in decision_keys:
                 bad_in.append(f"#{d.get('ticket')} comment={d.get('comment')!r}")
         else:
             if d.get("reason") in PROTECTIVE_REASONS:
@@ -857,8 +1641,11 @@ def check_heartbeat_continuity(ctx, day: date) -> Check:
     problems = []
     # 1) 心跳超时之后须有运行器重启（新启动事件 ts > 告警 ts）
     for a in timeouts:
-        if not any(s["ts"] > a.time for s in starts):
-            problems.append(f"{a.time:%H:%M} 心跳超时后无重启恢复记录")
+        timed_out = (_alert_magics(a.message, ctx["manifest_magics"])
+                     if "formal_window" in ctx else {None})
+        if not all(any(s["ts"] > a.time and (m is None or s["magic"] == m)
+                       for s in starts) for m in timed_out):
+            problems.append(f"{a.time:%H:%M} 心跳超时后无同策略重启恢复记录")
     # 2) 每次重启须在上一段日志留有说明（退出标记或当期停机类告警）；
     #    只判"重启发生在当日"的事件（历史日的重启归历史日）
     by_magic: dict[int | None, list[dict]] = {}
@@ -868,6 +1655,8 @@ def check_heartbeat_continuity(ctx, day: date) -> Check:
         for prev, cur in zip(evs, evs[1:]):
             if cur["ts"].date() != day:
                 continue
+            if cur.get("retained"):
+                continue  # checked launcher/journal identity explains this restart, not liveness
             tail = ctx["log_tail_text"].get((mg, prev["log"]), "")
             explained = any(mark in tail for mark in EXIT_MARKS)
             if not explained:
@@ -1151,9 +1940,11 @@ def accept_sl_tp_samples(ctx) -> Check:
     产生，Demo 真实成交路径不落此格式）。"""
     name = "SL 与 TP 样本均存在（C-2 deals external_exit）"
     sl = [d for d in ctx["deals_log"]
-          if d.get("event") == "external_exit" and d.get("reason") == REASON_SL]
+          if d.get("event") == "external_exit" and d.get("reason") == REASON_SL
+          and _in_window(ctx, d["_t"])]
     tp = [d for d in ctx["deals_log"]
-          if d.get("event") == "external_exit" and d.get("reason") == REASON_TP]
+          if d.get("event") == "external_exit" and d.get("reason") == REASON_TP
+          and _in_window(ctx, d["_t"])]
     if not sl or not tp:
         return Check(name, False,
                      f"C-2 成交流水 SL 样本 {len(sl)} 笔、TP 样本 {len(tp)} 笔"
@@ -1190,7 +1981,7 @@ def accept_drills(ctx) -> Check:
     recovered = any(
         lf.kind == "risk" and "halt=否" in ln
         and (ts := _dot_line_ts(ln)) is not None
-        and any(ts > a.time for a in halts)
+        and _in_window(ctx, ts) and any(ts > a.time for a in halts)
         for lf in ctx["logs"] for ln in lf.lines)
     if halts and recovered:
         notes.append(f"killSwitch×{len(halts)}（停机告警+恢复 halt=否）")
@@ -1209,9 +2000,10 @@ def accept_drills(ctx) -> Check:
             if a.kind == "RECONCILE_MISMATCH" and _in_window(ctx, a.time)]
     released = any(
         not doc.get("paused")
-        and (ts := _parse_any_ts(doc.get("ts"))) is not None
-        and any(ts > a.time for a in mism)
-        for doc in ctx["pauses"].values())
+        and (ts := _parse_any_ts(doc.get("ts"))) is not None and _in_window(ctx, ts)
+        and any(ts > a.time and ("formal_window" not in ctx or
+                mg in _alert_magics(a.message, ctx["manifest_magics"])) for a in mism)
+        for mg, doc in ctx["pauses"].items())
     if mism and released:
         notes.append(f"分策略暂停×{len(mism)}+解除")
     else:
@@ -1220,8 +2012,9 @@ def accept_drills(ctx) -> Check:
     # 4) 重连（C-4）
     reconnected = any(
         lf.kind == "runner" and GATEWAY_RECONNECTED_MARK in ln
-        and (m := TS_RE.search(ln)) is not None
-        and _in_window(ctx, parse_iso(m.group(1)))
+        and (ts := (_formal_log_time(ln) if "formal_window" in ctx else
+                    parse_iso(m.group(1)) if (m := TS_RE.search(ln)) else None)) is not None
+        and _in_window(ctx, ts)
         for lf in ctx["logs"] for ln in lf.lines)
     if reconnected:
         notes.append("重连 gateway_reconnected")
@@ -1276,7 +2069,7 @@ def accept_double_flatten(ctx) -> Check:
     if start is None:
         return Check(name, False, "运行窗不可定（C-1 manifest 缺失/无 runs）")
     magics = set(ctx["manifest_magics"]) or ctx["runner_magics"]
-    rounds = load_drill_rounds(ctx["live_dir"])
+    rounds = ctx["drill_rounds"] if "formal_window" in ctx else load_drill_rounds(ctx["live_dir"])
     complete: list[tuple[str, datetime, list[str]]] = []
     incomplete: list[tuple[str, list[int]]] = []
     n_stale = 0
@@ -1292,8 +2085,9 @@ def accept_double_flatten(ctx) -> Check:
         for m in sorted(magics):
             acks = [a for a in r["acks"]
                     if a["id"] == cid and a["magic"] == m
+                    and _integer(a["closed"])
                     and ts <= a["ts"]
-                    <= ts + timedelta(seconds=ACK_LINK_WINDOW_S)]
+                    <= min(end, ts + timedelta(seconds=ACK_LINK_WINDOW_S))]
             if not acks:
                 missing.append(m)
                 continue
@@ -1401,7 +2195,8 @@ def accept_slippage(ctx) -> Check:
     name = "滑点样本（deals 成交价 vs 决策参考价）"
     if ctx["run_window"][0] is None:
         return Check(name, False, "运行窗不可定（C-1 manifest 缺失/无 runs）")
-    refs: dict[datetime, tuple[float, float]] = {}
+    formal = "formal_window" in ctx
+    refs: dict[tuple, tuple[float, float]] = {}
     for lf in ctx["logs"]:
         if lf.kind != "runner":
             continue
@@ -1412,7 +2207,7 @@ def accept_slippage(ctx) -> Check:
                 if key is None:
                     continue
                 try:
-                    refs[key] = (float(m.group(2)), float(m.group(3)))
+                    refs[(lf.magic if formal else None, key)] = (float(m.group(2)), float(m.group(3)))
                 except ValueError:
                     continue
     samples: list[float] = []
@@ -1420,7 +2215,7 @@ def accept_slippage(ctx) -> Check:
         if d.get("event") != "fill_open" or not _in_window(ctx, d["_t"]):
             continue
         bar_key = _bar_close_key(d.get("decision_bar"))
-        ref = refs.get(bar_key) if bar_key is not None else None
+        ref = refs.get((d["magic"] if formal else None, bar_key)) if bar_key is not None else None
         if ref is None or not isinstance(d.get("price"), (int, float)):
             continue
         bid, ask = ref
@@ -1694,9 +2489,23 @@ def print_accept(ctx, checks: list[Check],
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(
-        description="阶段 F 演练检查（蓝图 §7，只读不连 MT5；日常档宽松 / "
-                    "--accept 验收档严格）")
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    # argparse accepts unambiguous long-option abbreviations. Recognize the
+    # same formal prefixes before parsing so they cannot fall into build_ctx.
+    formal_requested = any(
+        a.startswith("--") and len(a.split("=", 1)[0]) > 2
+        and any(option.startswith(a.split("=", 1)[0]) for option in ("--accept", "--formal-window"))
+        for a in raw_argv)
+    if formal_requested and any(a in ("-h", "--help") for a in raw_argv):
+        return _formal_result(2, error="arguments.help_requires_standalone_invocation")
+
+    class Parser(argparse.ArgumentParser):
+        def error(self, message):
+            if formal_requested:
+                raise FormalInvalid("arguments.invalid")
+            super().error(message)
+
+    ap = Parser(description="阶段 F 日常检查 / 离线正式窗口机械预检（不审定历史真实性或 A5）")
     ap.add_argument("--data-dir", default="data", help="数据根（live=data/live）")
     ap.add_argument("--log-dir", default="data/demo",
                     help="进程日志目录（另自动并入 <data-dir>/live/*.log）")
@@ -1709,24 +2518,35 @@ def main(argv=None) -> int:
                    help="单日日常检查（宽松：无异常证据即 0，无样本如实标注）")
     g.add_argument("--summary", action="store_true",
                    help="全期逐日汇总（日常口径，同 --day 宽松）")
-    g.add_argument("--accept", action="store_true",
-                   help="阶段 F 最终验收（严格）：证据源钉死 Demo 运行契约——"
-                        "C-1 run-manifest（mode=Demo）/持仓状态（"
-                        "known_positions）/连续覆盖/逐小时进程存活/SL 与 TP "
-                        "样本（C-2 deals）/§7 六项演练/双全平（C-3 两轮指令×"
-                        "全部 magic 关联 ack）/结构化点差/滑点样本——任何"
-                        "无样本/未覆盖/纯 paper 证据 = 未验收，退出码非 0")
-    args = ap.parse_args(argv)
+    ap.add_argument("--formal-window", help="FormalWindowV1 离线证据索引（必须搭配 --accept 和四个显式路径）")
+    g.add_argument("--accept", action="store_true", help="正式窗口机械预检：满足 exit3，不满足 exit1，无效 exit2")
+    try:
+        args = ap.parse_args(raw_argv)
+        if formal_requested:
+            _require(args.accept and args.formal_window, "arguments.formal-window_required")
+            explicit = {a.split("=", 1)[0] for a in raw_argv}
+            _require({"--data-dir", "--log-dir", "--reports-dir", "--sessions-config"} <= explicit,
+                     "arguments.explicit_offline_paths_required")
+            descriptor_path = Path(args.formal_window)
+            batch = FormalEvidence(descriptor_path.parent)
+            descriptor = validate_formal_descriptor(batch.json(descriptor_path, "descriptor"))
+            now = datetime.now(timezone.utc).replace(tzinfo=None)  # single production observation
+            raw = load_formal_raw(args, descriptor, batch, now=now)
+            ctx = build_accept_ctx(raw, raw["window"])
+            checks = run_formal_accept(ctx)
+            code = 3 if all(c.ok is True for c in checks) else 1
+            return _formal_result(code, checks=checks, window=raw["window"])
+    except FormalInvalid as exc:
+        return _formal_result(2, error=str(exc))
+    except (OSError, ValueError, TypeError, KeyError, OverflowError):
+        if formal_requested:
+            return _formal_result(2, error="evidence.invalid")
+        raise
 
     ctx = build_ctx(args)
     if not ctx["all_days"]:
         print("× 未发现任何演练数据（成交/告警/日报均无）——先启动 demo_run.ps1")
         return 2
-
-    if args.accept:
-        checks, problems = run_accept(ctx)
-        print_accept(ctx, checks, problems)
-        return 0 if (all(c.ok is True for c in checks) and not problems) else 1
 
     if args.day:
         try:

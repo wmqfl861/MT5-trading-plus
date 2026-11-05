@@ -10,7 +10,7 @@
 | 风控/对账 | `--paper-state` 聚合读 `data\live\paper\state-<magic>.json` | 直连 demo 终端（`--gw-config`），不用 paper 状态 |
 | 启动前专项预检 | 七项通用预检 | 七项通用预检 + 配置手数校验 + **DEMO 保险丝与网关预检**（只读 dry：连接、读账户核对 trade_mode=0、逐品种报价；绝不下单） |
 | 产生的证据 | 无经纪商成交滑点/拒单/重连证据 | 真实成交滑点、服务器端 SL/TP、拒单与重连均可观测 |
-| 验收口径 | 只做日常检查（`--day`/`--summary`）；**PaperSoak 的证据不被 `--accept` 采信**（验收按运行窗登记要求 mode=="Demo" 与真实成交证据）——单独跑它不能通过阶段 F 验收 | 日常检查 + 第 10 个交易日后跑 `demo_check.py --accept`（严格验收） |
+| 验收口径 | 只做日常检查（`--day`/`--summary`）；**PaperSoak 的证据不被正式机械预检采信** | 日常检查 + `--accept --formal-window` 离线机械预检（§4）；机械满足仍须独立核实历史真实性及 A5 |
 
 共同骨架：每策略一个运行器、一个风控 `--loop`、一个对账 `--loop`。验收
 标准见蓝图 §7；检查器是 `scripts/demo_check.py`（两档口径，见 §2）。
@@ -41,7 +41,7 @@ powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1 -Mode Demo -Preche
   作用域骗不过）与 DEMO 保险丝/网关预检（账户非模拟盘或读不到账户
   状态 → fail-closed 拒启动）。
 - **生命周期（T110）**：实例登记在 `data\live\instances.json`，除角色/PID/
-  创建时间外，还记录完整 argv、deployment_sha、部署目录与数据目录。固定
+  登记时刻（可能回退到启动后登记时间）外，还记录完整 argv、deployment_sha、部署目录与数据目录。固定
   Demo 部署的检测/停止与 supervisor 共用同一 `verified_tree`：核验完整
   身份与全部父子进程，存活的角色跳过，只有整树被证明缺失才补起。命令行
   不可读、PID 复用或存活孤儿 worker 都拒绝。旧登记不能自动迁移，旧无固定
@@ -50,8 +50,9 @@ powershell -ExecutionPolicy Bypass -File scripts\demo_run.ps1 -Mode Demo -Preche
   §6.2/§6.3；`pids.txt` 只是追加式历史，不参与身份判定。
 - **运行窗登记（C-1）**：每次启动（含恢复重启）向
   `data\live\run-manifest.json` **追加**一条 runs（kind=start|restart）；
-  该文件读失败或 JSON 损坏时脚本 fail-closed 拒绝启动。`--accept` 的
-  运行窗 = runs 中**当前 mode** 的最早 started_utc → now（重启不清窗）。
+  该文件读失败或 JSON 损坏时脚本 fail-closed 拒绝启动。正式机械预检不再
+  采用当前 mode 的最早 run 起算，必须按 §4 绑定留存部署原件与完整日历；
+  同 SHA 重启不清窗，异 SHA/mode/路径混入后再切回也拒绝。
 - 产物：`data\live\instances.json`（当前登记）、`data\live\run-manifest.json`
   （运行窗，追加式）、`data\demo\pids.txt`（追加式 PID 历史）、
   `data\demo\demo-run-<Mode>-*.json`（本次清单，含跳过的存活运行器）、
@@ -160,44 +161,122 @@ PaperSoak 离线补跑不需要网关配置，直接使用影子状态：
     --spread-model data\costs\spread_model.json --log-dir data\demo
 ```
 
-## 4. 结束与最终验收（第 10 个交易日后；Demo 模式）
+## 4. 正式窗口机械预检（离线材料；历史真实性及 A5 另审）
+
+本入口仅核对明确提供的离线副本。当前实施范围只使用人工临时合成材料；
+不授权真实 data/config/DB、账户/MT5、进程、任务、维护或部署操作。不要将
+运行中的目录作为本批输入，也不要因结果而清除保护。旧 `--day/--summary`
+用法和日常退出码保持不变。
 
 ```powershell
-# 1) 阶段 F 最终验收（--accept 严格口径：任何"无样本/未覆盖"= 未验收，
-#    退出码非 0）——运行窗（data\live\run-manifest.json 的 runs 中当前
-#    mode 最早 started_utc → now）之上的全期判据 + 逐日严格复核：
-#      · 连续交易日覆盖 ≥10（工作日无缺日）
-#      · 各进程存活证据（风控心跳日志覆盖当日**逐小时**——"每日有日志"
-#        ≠ "整日连续运行"，逐小时心跳仍非绝对证明，属 --accept 的残余
-#        边界：进程整日内反复"活着但卡死在小时之间"理论上仍可漏检，
-#        只能靠告警与对账差异兜底）
-#      · SL 与 TP 样本均存在（读 data\live\deals-<magic>.jsonl 真实成交）
-#      · 双全平真实完成（drill-archive 指令 + 全部参与 magic 的 ack）
-#      · 实际点差样本存在且无超标小时；滑点=成交价 vs 决策价分布
-.venv/Scripts/python.exe scripts/demo_check.py --accept > data\demo\final-check.md
-#   通过（退出码 0）才算阶段 F 验收证据齐全。PaperSoak 的证据**不被
-#   --accept 采信**：验收按运行窗登记要求 mode=="Demo" 与真实成交证据；
-#   PaperSoak 期间产生的 paper 状态/影子成交不在采信范围（那正是两种
-#   模式的边界，不是工具缺陷）。
-
-# 2) 日常全周汇总留档（宽松口径，供运维浏览）
-.venv/Scripts/python.exe scripts/demo_check.py --summary > data\demo\weekly-final.md
-
-# 3) 按 §6.3 禁用 supervisor、设置 killSwitch，再严格核验并停止整树。
-#    保留 instances.json、halt 与 journal；不在验收脚本中自动清除停机原因。
-
-# 4) 收尾：卸载演练周报与日报任务；只归档确实存在的影子状态
-schtasks /Delete /TN "MT5Quant\demo_weekly_check" /F
-schtasks /Delete /TN "MT5Quant\live_daily_report" /F
-if (Test-Path data\live\paper) { Move-Item data\live\paper data\demo\paper-final }
-# 不自动切换账户或重装任务。需要继续 Demo 时另按维护窗口执行本手册 §1。
+# evidence 是已保全的离线材料根，下面四条路径必须逐一显式指定。
+.venv/Scripts/python.exe scripts/demo_check.py --accept `
+    --formal-window C:\offline-evidence\formal.json `
+    --data-dir C:\offline-evidence\data `
+    --log-dir C:\offline-evidence\logs `
+    --reports-dir C:\offline-evidence\reports `
+    --sessions-config C:\offline-evidence\sessions.toml
+$LASTEXITCODE
 ```
 
-最终交付物：`data\demo\final-check.md`（--accept 验收结论 + 全期判据 +
-逐日严格复核）、`data\demo\weekly-final.md`（日常汇总）、
-`data\reports\live\daily-*.md`（每日日报）、`data\demo\*.log`（全程日志）、
-`data\demo\pids.txt`（追加式完整进程清单）、`data\live\run-manifest.json`
-（运行窗登记，追加式）、`data\live\instances.json`（进程登记）。
+裸 `--accept`、不合法描述、缺显式路径在读取默认 data/config 前拒绝。
+`--formal-window` 只能配合 `--accept`；没有 `--start/--end/--now`、批准开关
+或环境变量时间覆盖。帮助用单独的 `--help`。
+
+| 退出码 | 正式分支含义 |
+|---|---|
+| 2 | 参数、原件、身份绑定或日历无效/不完整，无法判定 |
+| 1 | 材料可解析，但天数、样本不足或有异常/当前保护 |
+| 3 | `mechanical_checks_passed=true`，全部机械检查满足 |
+| 0 | 正式分支禁止返回 |
+
+所有正式结果固定 `historical_identity_verified=false` 和
+`a5_status=not_evaluated`，机械满足不表示阶段 F 验收完成。脚本不写入
+`approved_by`。完整历史原件、其同期真实性、真实部署完成时刻和 A5 必须由
+独立责任人核实。SHA256 只证明本批输入字节一致，不能证明历史真实性；
+**没有留存原件时，禁止用当前 instances 或新写 JSON 补造历史身份。**
+
+### 4.1 固定索引与留存原件
+
+下列是字段结构说明（不是可直接替代原件的示例证据）：
+
+```text
+Ref = {path, sha256}
+RunBinding = {
+  run_index, manifest_snapshot: Ref,
+  launcher_snapshot: Ref, instances_snapshot: Ref
+}
+FormalWindowV1 = {
+  schema_version: 1, mode: "Demo", deployment_sha, magics,
+  anchor: RunBinding + {
+    deployment_claim: {
+      source: Ref, source_lines: [first, last], excerpt_sha256,
+      completed_utc, processes: [{kind, magic, pid}]
+    }
+  },
+  run_bindings: [RunBinding],
+  restart_bindings: [{line_number, before_instances: Ref, after_instances: Ref}],
+  calendar: Ref
+}
+Calendar = {
+  schema_version: 1, timezone: "UTC", market: "XAUUSD", source: Ref,
+  days: [{date, trading, reason: "weekday"|"weekend"|"holiday",
+          source_lines: [first, last]}]
+}
+```
+
+- 描述/日历/索引严格拒绝未知或重复键。整数不接受 bool；`magics` 为非空、
+  不重复正整数；`deployment_sha` 为完整小写 40hex；文件及选段摘要为小写
+  64hex SHA256；`run_index` 零基，文本与 journal 物理行号一基。
+- `Ref.path` 相对 formal.json 所在目录解析，引用不得逃出该证据根。身份
+  原件内部的部署/配置路径只做离线规范化比较，不访问其所指配置或代码。
+  对外仅输出逻辑别名/错误码，不转印绝对路径或底层异常。
+- 全文摘要来自原文件 bytes。选段摘要严格对源 UTF-8 原 bytes 执行
+  `splitlines(keepends=True)`，按 `[first,last]` 一基闭区间取行并连接，
+  **保留原 CRLF/LF 和行结束符**后计算 SHA256；不能先解码再规范化换行。
+  全文编码错误拒绝。每个实际工件只读一次，同批 bytes 用于哈希与解析，
+  同一工件通过别名重复引用时也不得声明冲突哈希。
+- anchor 指向留存 manifest 快照最后一项；绑定完整 runner magic 集合、
+  risk/reconcile 角色 PID 和同期逐次 launcher 清单/instances。risk 与
+  reconcile 的生产 magic 为 null，不冒充某个 runner。部署原文选段必须
+  出现完整 SHA、明确 UTC `completed_utc` 及完整 PID 数字词元，与机器原件
+  一致；短 SHA、近似时间不能补齐。登记时间不称为独立 OS 创建时间。
+- 当前 `data/live/run-manifest.json` 必须保留锚快照整个 runs 内容前缀，
+  后续每 run 都有 binding。每条锚后 `data/live/ops-restarts.jsonl` 记录
+  都有以物理行号关联的前/后 instances 副本；journal 时间在 launch 前，
+  不强求等于新实例启动时间。坏行、缺原件、删改前缀拒绝。每段核对 SHA、
+  Demo、部署/数据目录、角色/magic/PID、关键 argv；切到别的身份再切回
+  仍拒绝，同 SHA 的 kind=start 或 supervisor 重启不重起算。
+- 当前 `data/live/instances.json` 必须与整条链最后状态一致。后移 anchor
+  若与部署 PID 或初始材料矛盾则拒绝；全套原件一起被替换，机械比较本身
+  无法证明或发现，因此历史未核实/A5 未评估始终不变。
+
+### 4.2 日历、事件与当前保护
+
+日历必须从声明部署完成 C 的 UTC 日期逐自然日覆盖到程序一次观测 T 的
+日期，含今天、周末和休市日，唯一连续且不缺日。来源选行须有具体日期及
+对应 `weekday/weekend/holiday` 词元；holiday 行还必须有具体休市理由
+（例如 `2026-12-25 holiday Christmas closure`）。无活动不能推定假日。
+
+S 为首个交易日 00:00 且 S≥C；日中部署跳过当天余段，恰 00:00 可计该日。
+未来锚或窗口未开始拒绝。S 至 T **全部已结束交易日**至少十日并全部检查，
+不能只选十个有活动的日期；自然日存活要求覆盖首尾、周末与休市。当前日
+不强求未到期整日日报，但检查已发生异常及已到期小时心跳（当前小时最初
+十分钟保留既有宽限）。十日以后的异常仍会阻断。
+
+成交、orders、alerts、日志、SL/TP、重连/恢复、暂停解除、command/ack 及
+归因/滑点引用均先校验自身事件时刻，再按 `[S,T]` 筛选，再派生日/小时/
+magic。禁止用 mtime、decision bar、下一条日志时间替代事件时间；正常无
+时间的启动头/执行明细仅作元数据，不支持事件或存活证据，无时间异常拒绝。
+暂停解除须同 magic；未来恢复不计。两轮全平必须不同 id，各轮全部 magic
+关联 ack 满足 `S≤command_ts≤ack_ts≤min(T,command_ts+1小时)`，`closed`
+为非负整数且拒 bool；0 仅按既有协议作为该关联 ack 的空仓证明。
+
+当前 pause（含全局 pause/独立 reconcile-block）、pending 出场、意图与
+known_positions 差分、state_corrupt、killSwitch、halt、halt-risk-veto
+独立检查，窗前创建仍阻断，不依赖活动 latest_day；合法 pending 意图保留
+60 秒在途宽限。坏状态/不可读拒绝；检查只读，不执行恢复或清理。保留离线
+原件、描述、命令输出与退出码供独立 A5 审核，不能把 exit3 包装成正式批准。
 
 ## 5. 故障恢复（H 线基石阶段 1/2 落地后的新机制）
 
