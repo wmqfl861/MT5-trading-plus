@@ -24,6 +24,8 @@
 暂停指令（T30/D20：按策略隔离）：对账进程只写 ``pause-<magic>.json``；
 全局 ``pause.json`` 只留给人工（写入路径保留 ``magic=None``）。闸门
 （mt5live.gate.RiskGate）同时读两者，任一 paused 即拒绝开仓。
+T78：一致恢复不清 line_cap；真实 mismatch 可接管其兼容输出，但独立线
+锁存仍有效。人工、未知或损坏 pause 不自动覆盖/解除；所有读改写共用文件锁。
 
 时间约定：内存中 naive UTC，文件中 ISO 时间带 +00:00（同 mt5live.monitor）。
 """
@@ -31,11 +33,13 @@ from __future__ import annotations
 
 import glob
 import json
+import math
 import os
+import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
-from mt5live.fileio import write_json_atomic
+from mt5live.fileio import file_lock, write_json_atomic
 from mt5live.monitor import iso_utc, naive_utc, parse_iso
 
 EXPECTED_FILE = "expected.json"          # 旧版单文件（只兼容读）
@@ -277,6 +281,49 @@ def diff_positions(intents, actual, *, now: datetime,
     return ReconcileResult(ok=not diffs, diffs=tuple(diffs))
 
 
+def line_cap_pause_day(data, magic: int, now: datetime) -> date | None:
+    """Recognize only T78's owned, well-formed, non-future compatibility pause."""
+    if (not isinstance(data, dict) or set(data) != {
+            "owner", "line", "magic_min", "magic_max", "daily_loss_cap_usd",
+            "magic", "paused", "reason", "day", "ts", "diffs"}):
+        return None
+    try:
+        day = date.fromisoformat(data["day"])
+        lo, hi = data["magic_min"], data["magic_max"]
+        cap = data["daily_loss_cap_usd"]
+        if (data.get("owner") != "risk_line_cap" or data.get("reason") != "line_cap"
+                or data.get("paused") is not True or type(data.get("magic")) is not int
+                or data["magic"] != magic or type(lo) is not int or type(hi) is not int
+                or not 0 <= lo <= magic <= hi <= 2**63 - 1
+                or not isinstance(data["line"], str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]+", data["line"])
+                or type(cap) not in (int, float) or not math.isfinite(cap) or cap <= 0
+                or data.get("diffs") != [] or day.isoformat() != data["day"]
+                or parse_iso(data["ts"]).date() != day or day > naive_utc(now).date()):
+            return None
+        return day
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def reconcile_pause_owned(data, magic: int) -> bool:
+    """Recognize this writer's output, including its pre-owner legacy shape."""
+    if not isinstance(data, dict):
+        return False
+    if (set(data) - {"magic", "paused", "reason", "ts", "diffs", "owner"}
+            or data.get("owner") not in (None, "reconcile")
+            or type(data.get("magic")) is not int or data["magic"] != magic
+            or type(data.get("paused")) is not bool
+            or data.get("reason") != ("reconcile_mismatch" if data["paused"] else None)
+            or not isinstance(data.get("diffs"), list)):
+        return False
+    try:
+        parse_iso(data["ts"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
 def write_pause(live_dir: str, magic: int | None, *, paused: bool,
                 reason: str | None, diffs=(),
                 now: datetime | None = None) -> str:
@@ -302,5 +349,28 @@ def write_pause(live_dir: str, magic: int | None, *, paused: bool,
     name = (PAUSE_FILE if magic is None
             else PAUSE_MAGIC_FMT.format(magic=magic))
     path = os.path.join(live_dir, name)
-    write_json_atomic(path, data)
+    # T78: same lock as the line-cap writer/rollover. Ownership is checked
+    # inside the lock; a check-then-replace outside it could erase a mismatch.
+    with file_lock(path + ".lock"):
+        if magic is not None:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    previous = json.load(f)
+                if not isinstance(previous, dict):
+                    return path
+            except FileNotFoundError:
+                previous = None
+            except (OSError, ValueError):
+                return path  # unreadable protection belongs to no automatic writer
+            if previous is not None:
+                if line_cap_pause_day(previous, magic, n) is not None:
+                    # A new mismatch takes over the compatibility output. The
+                    # independent line latch still blocks this magic all day.
+                    if not paused or reason != "reconcile_mismatch":
+                        return path
+                elif not reconcile_pause_owned(previous, magic):
+                    return path
+            if reason in (None, "reconcile_mismatch"):
+                data["owner"] = "reconcile"
+        write_json_atomic(path, data)
     return path

@@ -36,15 +36,23 @@
 check 只裁决**开仓**请求；平仓任何时候都不经此门（禁止时段也允许平仓）。
 缺数据（品种无现价/合约大小）→ 拒单（reason 前缀 missing_data），
 绝不静默放行。
+
+T78 可选 ``line_caps``：同次 USD/UTC 快照按 magic 号段汇总含费损益；
+触限只禁该线开仓，不全平、不全局停机。独立 ``line-cap-<name>.json``
+锁存至下一 UTC 日，覆盖重启和新 magic；``pause-<magic>.json`` 仅兼容输出。
+所有权校验、原子写和与 reconcile 共用的文件锁保护其他暂停原因；坏状态拒开。
+未配置 line_caps 时保留旧账户风控入口语义。
 """
 from __future__ import annotations
 
+import glob
 import json
 import math
 import os
+import re
 import tomllib
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Mapping
 
 from mt5data.sessions import DEFAULT_SESSIONS_PATH, SessionPolicy, load_session_policy
@@ -56,7 +64,8 @@ from mt5live.commands import (
     archive_if_all_acked,
     write_flatten,
 )
-from mt5live.fileio import write_json_atomic
+from mt5live.fileio import file_lock, write_json_atomic
+from mt5live.reconcile import line_cap_pause_day, reconcile_pause_owned
 from mt5live.monitor import (
     ALERT_HEARTBEAT_TIMEOUT,
     ALERT_RISK_FLATTEN,
@@ -68,6 +77,7 @@ from mt5live.monitor import (
     iso_utc,
     mark_heartbeat_stale,
     naive_utc,
+    parse_iso,
     read_heartbeat_path,
     write_halt_once,
 )
@@ -106,6 +116,38 @@ def load_default_session_policy(path: str | None = None) -> SessionPolicy:
 # T20：禁止开仓时段已迁 config/sessions.toml（SessionPolicy，单一定义源），
 # risk.toml 不再有 crypto_symbols / [[forbidden]]——出现即按未知键拒绝。
 
+LINE_CAP_OWNER = "risk_line_cap"
+ALERT_LINE_CAP = "LINE_CAP"
+
+
+def _valid_magic(value) -> bool:
+    return type(value) is int and 0 <= value <= 2**63 - 1
+
+
+def _finite_number(value) -> bool:
+    return (type(value) in (int, float) and math.isfinite(value))
+
+
+@dataclass(frozen=True)
+class LineCap:
+    """Optional USD daily loss sublimit, inclusive magic range; never flattens."""
+
+    name: str
+    magic_min: int
+    magic_max: int
+    daily_loss_cap_usd: float
+
+    def __post_init__(self):
+        if not isinstance(self.name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", self.name):
+            raise ValueError("line_caps name must be a nonempty identifier")
+        if (not _valid_magic(self.magic_min) or not _valid_magic(self.magic_max)
+                or self.magic_min > self.magic_max):
+            raise ValueError("line_caps magic range must be ordered nonnegative integers")
+        if (not _finite_number(self.daily_loss_cap_usd)
+                or self.daily_loss_cap_usd <= 0):
+            raise ValueError("line_caps daily_loss_cap_usd must be finite and positive")
+
+
 @dataclass(frozen=True)
 class RiskConfig:
     """风控参数（字段与 risk.toml 一一对应；金额均为账户货币 USD）。"""
@@ -117,8 +159,18 @@ class RiskConfig:
     max_usd_exposure: float               # 组合美元暴露上限（USD 名义）
     max_orders_per_minute: int            # 每分钟最大下单数（60 秒滑窗）
     daily_loss_cap_usd: float             # 日亏损上限（正数；≤ -cap 触发全平）
+    line_caps: tuple[LineCap, ...] = ()    # T78：可选、只禁止触限号段开仓
 
     def __post_init__(self):
+        if not isinstance(self.line_caps, tuple) or not all(
+                isinstance(cap, LineCap) for cap in self.line_caps):
+            raise ValueError("line_caps must be a tuple of LineCap")
+        names = [cap.name.casefold() for cap in self.line_caps]
+        if len(set(names)) != len(names):
+            raise ValueError("line_caps names must be unique")
+        ordered = sorted(self.line_caps, key=lambda cap: cap.magic_min)
+        if any(a.magic_max >= b.magic_min for a, b in zip(ordered, ordered[1:])):
+            raise ValueError("line_caps magic ranges must not overlap")
         if not self.symbols:
             raise ValueError("symbols 白名单不能为空")
         if not math.isfinite(self.max_lots_per_order) or self.max_lots_per_order <= 0:
@@ -181,6 +233,13 @@ def load_risk_config(path: str) -> RiskConfig:
         "daily_loss_cap_usd": _as_float(
             require("daily_loss_cap_usd"), "daily_loss_cap_usd"),
     }
+    raw_caps = data.pop("line_caps", [])
+    if not isinstance(raw_caps, list):
+        raise RiskConfigError("line_caps must be an array of tables")
+    try:
+        kw["line_caps"] = tuple(LineCap(**entry) for entry in raw_caps)
+    except (TypeError, ValueError) as e:
+        raise RiskConfigError(f"{path} line_caps: {e}") from e
     if data:
         raise RiskConfigError(
             f"风控配置未知键：{sorted(data)}（{path}）。禁止开仓时段自 T20 起"
@@ -215,6 +274,8 @@ class RiskState:
     today_realized: float = 0.0           # 当日已实现盈亏（USD）
     today_floating: float = 0.0           # 当日浮动盈亏（USD）
     halted: bool = False                  # 已处于停机状态
+    line_pnl: Mapping[str, float] | None = None  # T78：同次账户快照的分线净损益
+    snapshot_magics: tuple[int, ...] = ()  # 持仓/成交中可见的 magic（含未登记）
 
 
 @dataclass(frozen=True)
@@ -291,6 +352,13 @@ def check(order_request: OrderRequest, state: RiskState, config: RiskConfig,
             False,
             "halted: 风控已停机（killSwitch/心跳超时/日亏触发），"
             "恢复须人工清理 halt.json", halt=True)
+    # T78 sublimits follow the account cap and stop; no account-wide effects.
+    if config.line_caps:
+        if not all(_finite_number(v) for v in (state.today_realized, state.today_floating, total)):
+            return RiskDecision(False, "line_cap_data: invalid account PnL")
+        line = _line_decision(order_request, state, config)
+        if line is not None:
+            return line
     # 3. 品种白名单
     if order_request.symbol not in config.symbols:
         return RiskDecision(
@@ -359,6 +427,43 @@ def daily_pnl(deals, positions) -> tuple[float, float]:
     return float(realized), float(floating)
 
 
+def line_daily_pnl(deals, positions, caps: tuple[LineCap, ...]) -> dict[str, float]:
+    """Same USD trade/fee/floating basis as daily_pnl, partitioned by magic.
+
+    Inputs are the caller's single UTC-day snapshot. A malformed trade magic
+    cannot silently disappear between ranges; invalid PnL cannot become zero.
+    """
+    totals = {cap.name: 0.0 for cap in caps}
+    rows = [(d, (d.profit, d.commission, d.swap, d.fee))
+            for d in deals if d.entry in TRADE_ENTRY_KINDS]
+    rows.extend((p, (p.profit, p.swap)) for p in positions)
+    for row, amounts in rows:
+        if not _valid_magic(row.magic) or not all(_finite_number(v) for v in amounts):
+            raise ValueError("line_cap_data: invalid magic or non-finite USD PnL")
+        for cap in caps:
+            if cap.magic_min <= row.magic <= cap.magic_max:
+                totals[cap.name] += sum(amounts)
+    if not all(_finite_number(v) for v in totals.values()):
+        raise ValueError("line_cap_data: non-finite aggregated PnL")
+    return totals
+
+
+def _line_decision(order: OrderRequest, state: RiskState,
+                   config: RiskConfig) -> RiskDecision | None:
+    if not config.line_caps:
+        return None
+    if not _valid_magic(order.magic):
+        return RiskDecision(False, "line_cap_data: invalid order magic")
+    for cap in config.line_caps:
+        if cap.magic_min <= order.magic <= cap.magic_max:
+            value = state.line_pnl.get(cap.name) if isinstance(state.line_pnl, Mapping) else None
+            if not _finite_number(value):
+                return RiskDecision(False, f"line_cap_data: missing/invalid PnL for {cap.name}")
+            if value <= -cap.daily_loss_cap_usd:
+                return RiskDecision(False, f"line_cap: {cap.name} daily PnL {value:.2f} USD")
+    return None
+
+
 # ---- 风控进程（文件级停机 + 主循环） ----
 
 @dataclass(frozen=True)
@@ -395,10 +500,6 @@ def registered_magics(live_dir: str) -> set[int]:
 class RiskProcess:
     """绑定配置与 live 目录的风控进程（检查器 + 周期逻辑，不做任何下单）。"""
 
-
-class RiskProcess:
-    """绑定配置与 live 目录的风控进程（检查器 + 周期逻辑，不做任何下单）。"""
-
     def __init__(self, config: RiskConfig, *,
                  live_dir: str = os.path.join("data", "live"),
                  heartbeat_timeout_s: float = DEFAULT_HEARTBEAT_TIMEOUT_S,
@@ -425,7 +526,126 @@ class RiskProcess:
         stopped = self.check_stopped(n)
         if stopped is not None:
             return stopped
+        if self.config.line_caps:
+            loss = self.check_loss_limits(order_request, state, n)
+            if loss is not None:
+                return loss
         return check(order_request, state, self.config, n, self.session_policy)
+
+    def check_loss_limits(self, order: OrderRequest, state: RiskState,
+                          now: datetime) -> RiskDecision | None:
+        """T78 pre-pause check; callers must check stop/health before account IPC."""
+        total = state.today_realized + state.today_floating
+        if total <= -self.config.daily_loss_cap_usd:
+            self.trigger_flatten_and_halt("daily_loss_cap", now)
+            return RiskDecision(False, "daily_loss_cap: account daily loss", True, True)
+        if not all(_finite_number(v) for v in (state.today_realized, state.today_floating, total)):
+            return RiskDecision(False, "line_cap_data: invalid account PnL")
+        if not _valid_magic(order.magic):
+            return RiskDecision(False, "line_cap_data: invalid order magic")
+        magics = set(state.snapshot_magics) | {p.magic for p in state.positions} | {order.magic}
+        if not all(_valid_magic(m) for m in magics):
+            return RiskDecision(False, "line_cap_data: invalid snapshot magic")
+        blocked = self._update_line_caps(state.line_pnl, magics, now)
+        for cap in self.config.line_caps:
+            if cap.magic_min <= order.magic <= cap.magic_max and cap.name in blocked:
+                return RiskDecision(False, blocked[cap.name])
+        return None
+
+    def _update_line_caps(self, totals, magics, now: datetime) -> dict[str, str]:
+        blocked = {}
+        known = registered_magics(self.live_dir) | set(magics)
+        for path in glob.glob(os.path.join(self.live_dir, "pause-*.json")):
+            try:
+                known.add(int(os.path.basename(path)[6:-5]))
+            except ValueError:
+                continue
+        for cap in self.config.line_caps:
+            value = totals.get(cap.name) if isinstance(totals, Mapping) else None
+            if not _finite_number(value):
+                blocked[cap.name] = f"line_cap_data: missing/invalid PnL for {cap.name}"
+                continue
+            try:
+                if self._sync_line_cap(cap, value, known, now):
+                    blocked[cap.name] = f"line_cap: {cap.name} latched for UTC day"
+            except (OSError, ValueError, TypeError, KeyError) as e:
+                # Bad/foreign/future state is preserved, never treated as reset.
+                blocked[cap.name] = f"line_cap_state: {cap.name}: {e}"
+        return blocked
+
+    def _sync_line_cap(self, cap: LineCap, value: float, magics: set[int],
+                       now: datetime) -> bool:
+        today = naive_utc(now).date()
+        path = os.path.join(self.live_dir, f"line-cap-{cap.name}.json")
+        identity = {"owner": LINE_CAP_OWNER, "line": cap.name,
+                    "magic_min": cap.magic_min, "magic_max": cap.magic_max,
+                    "daily_loss_cap_usd": cap.daily_loss_cap_usd}
+        # Serializes monitor + all synchronous gates, including first-trigger alert.
+        with file_lock(path + ".lock"):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    saved = json.load(f)
+            except FileNotFoundError:
+                saved = None
+            else:
+                if (not isinstance(saved, dict)
+                        or set(saved) != set(identity) | {"day", "ts", "latched"}
+                        or any(saved.get(k) != v or type(saved.get(k)) is not type(v)
+                               for k, v in identity.items())
+                        or saved.get("latched") is not True):
+                    raise ValueError("unrecognized line latch ownership/shape")
+                day = date.fromisoformat(saved["day"])
+                if (day.isoformat() != saved["day"] or day > today
+                        or parse_iso(saved["ts"]).date() != day):
+                    raise ValueError("invalid/future line latch date")
+            active = saved is not None and saved["day"] == today.isoformat()
+            touched = sorted(m for m in magics if _valid_magic(m)
+                             and cap.magic_min <= m <= cap.magic_max)
+            # Recover the latch from an owned same-day compatibility output if
+            # the independent state was absent. Never infer ownership from reason alone.
+            for magic in touched:
+                pause_path = os.path.join(self.live_dir, f"pause-{magic}.json")
+                with file_lock(pause_path + ".lock"):
+                    previous = self._read_line_pause(pause_path)
+                    day = line_cap_pause_day(previous, magic, now)
+                    owned = (day is not None and all(previous.get(k) == v
+                                                     for k, v in identity.items()))
+                    if owned and day == today:
+                        active = True
+                    if owned and day < today:
+                        os.remove(pause_path)
+            active = active or value <= -cap.daily_loss_cap_usd
+            if active:
+                if saved is None or saved["day"] != today.isoformat():
+                    saved = dict(identity, day=today.isoformat(), ts=iso_utc(now), latched=True)
+                    write_json_atomic(path, saved)
+                    append_alert(self.live_dir, ALERT_LINE_CAP,
+                                 f"{cap.name}: daily PnL {value:.2f} USD; opens paused until next UTC day", now)
+                for magic in touched:
+                    pause_path = os.path.join(self.live_dir, f"pause-{magic}.json")
+                    with file_lock(pause_path + ".lock"):
+                        previous = self._read_line_pause(pause_path)
+                        # Do not replace an active reconcile/manual/unknown/broken pause.
+                        if previous is not None and not (
+                                reconcile_pause_owned(previous, magic) and previous["paused"] is False):
+                            continue
+                        write_json_atomic(pause_path, dict(
+                            identity, magic=magic, paused=True, reason="line_cap",
+                            day=saved["day"], ts=saved["ts"], diffs=[]))
+            elif saved is not None:
+                os.remove(path)  # only validated past-day state reaches this branch
+            return active
+
+    @staticmethod
+    def _read_line_pause(path: str):
+        try:
+            with open(path, encoding="utf-8") as f:
+                value = json.load(f)
+            return value if isinstance(value, dict) else {"unreadable": True}
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            return {"unreadable": True}
 
     def check_stopped(self, now: datetime) -> RiskDecision | None:
         if os.path.exists(self.kill_switch_path):
@@ -510,6 +730,20 @@ class RiskProcess:
                 daily_breached = True
                 flatten_written |= self._write_flatten("daily_loss_cap", n)
                 halt_written |= self._write_halt("daily_loss_cap", n)
+
+        # T78: account consequence is already durable before parsing sublimits.
+        if self.config.line_caps and not daily_breached:
+            if snapshot is None:
+                raise ValueError("line_cap_data: missing account snapshot")
+            totals = line_daily_pnl(snapshot.deals, snapshot.positions, self.config.line_caps)
+            if not all(_finite_number(v) for v in (realized, floating, realized + floating)):
+                raise ValueError("line_cap_data: invalid account PnL")
+            magics = {p.magic for p in snapshot.positions} | {
+                d.magic for d in snapshot.deals if d.entry in TRADE_ENTRY_KINDS}
+            blocked = self._update_line_caps(totals, magics, n)
+            for reason in blocked.values():
+                if not reason.startswith("line_cap:"):
+                    append_alert(self.live_dir, "LINE_CAP_STATE", reason, n)
 
         # 4) flatten 指令归档（T32/D21 编号协议）：所有登记 magic 的
         #    ack.id == 当前指令 id 才归档并删除 ack（旧编号不算数——C3），

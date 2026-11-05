@@ -12,7 +12,8 @@ RiskGate.check_open 组装 RiskState（计划 T24 逐字）：
 - 当日盈亏（UTC 日内 deals 的已实现 + 持仓浮动，daily_pnl 同源）；
 - 停机标志（killSwitch / halt.json 由 RiskProcess.check_order 文件级
   裁决；对账暂停 pause-<magic>.json（按策略，T30/D20）与全局 pause.json
-  （人工）在本闸门最前检查，任一暂停即拒开仓）
+  （人工）在旧无 caps 分支最前检查；启用 line_caps 后先检查文件停机与
+  risk_health，再取一次账户快照，先落实账户 cap、线 cap，最后检查 pause）
 → RiskProcess.check_order（含 SessionPolicy 的禁入窗检查）。
 
 点差闸门（T24/M10）：开仓前当前点差 > config/sessions.toml 的
@@ -39,12 +40,15 @@ from zoneinfo import ZoneInfo
 from mt5data.sessions import SessionPolicy
 from mt5live.monitor import (
     ALERT_RISK_REJECT,
+    TRADE_ENTRY_KINDS,
     append_alert,
     naive_utc,
     parse_iso,
     risk_health,
 )
-from mt5live.riskproc import OrderRequest, RiskDecision, RiskProcess, RiskState, daily_pnl
+from mt5live.riskproc import (
+    OrderRequest, RiskDecision, RiskProcess, RiskState, daily_pnl, line_daily_pnl,
+)
 from mt5quant.costs.spread import BUCKET_TZ, SpreadModel
 from mt5quant.sizing import RiskSizing, lots_for_risk
 
@@ -152,7 +156,7 @@ class _Paused:
     unreadable: bool = False   # T33/M2：文件存在但读不出（fail-closed 按暂停）
 
 
-def read_pause(live_dir: str, magic: int | None = None) -> _Paused:
+def read_pause(live_dir: str, magic: int | None = None, *, strict: bool = False) -> _Paused:
     """读暂停指令（T30/D20：只读；写路径在对账进程/人工）。
 
     magic 给定 → ``pause-<magic>.json``（对账进程按策略写的暂停）；
@@ -160,7 +164,8 @@ def read_pause(live_dir: str, magic: int | None = None) -> _Paused:
     **存在但读不出（损坏/权限/缺 paused 字段）= 暂停**（T33/M2 反转旧
     语义——停机类信号读不出必须按停机处理，绝不默认未暂停）。此时
     paused=True、reason 以 ``pause_unreadable`` 开头、unreadable=True，
-    由调用方（RiskGate.check_open）写告警。
+    由调用方（RiskGate.check_open）写告警。T78 启用 caps 的调用另设 strict，
+    paused 必须为 bool；旧无 caps 调用保留历史读值语义。
     """
     name = (PAUSE_FILE if magic is None
             else PAUSE_MAGIC_FMT.format(magic=magic))
@@ -170,7 +175,8 @@ def read_pause(live_dir: str, magic: int | None = None) -> _Paused:
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-        if not isinstance(data, dict) or "paused" not in data:
+        if (not isinstance(data, dict) or "paused" not in data
+                or strict and type(data["paused"]) is not bool):
             raise ValueError(f"顶层须为带 paused 字段的对象，收到 {data!r}")
     except (OSError, ValueError) as e:
         return _Paused(
@@ -275,25 +281,13 @@ class RiskGate:
                    now: datetime | None = None) -> RiskDecision:
         n = naive_utc(now if now is not None else self._clock())
 
-        # 0) 对账暂停（T30/D20）：本策略 pause-<magic>.json（对账进程写）与
-        #    全局 pause.json（人工）任一暂停即拒开仓；读不出按暂停处理并
-        #    告警（T33/M2 fail-closed——停机类信号读不出必须按停机处理）
-        paused = read_pause(self._live_dir, magic)
-        if paused.paused:
-            if paused.unreadable:
-                append_alert(self._live_dir, ALERT_PAUSE_UNREADABLE,
-                             f"magic {magic}：{paused.reason}", n)
-            return RiskDecision(
-                False, f"reconcile_paused: 持仓对账不一致（magic {magic}，"
-                f"{paused.reason or f'详见 pause-{magic}.json'}），暂停开仓")
-        manual = read_pause(self._live_dir)
-        if manual.paused:
-            if manual.unreadable:
-                append_alert(self._live_dir, ALERT_PAUSE_UNREADABLE,
-                             f"全局人工暂停文件：{manual.reason}", n)
-            return RiskDecision(
-                False, f"reconcile_paused: 全局人工暂停（pause.json，"
-                f"{manual.reason or '原因见文件'}），暂停开仓")
+        # Legacy no-cap ordering is retained. With caps, account loss must be
+        # decided before a line compatibility pause can short-circuit this gate.
+        caps = self._process.config.line_caps
+        if not caps:
+            paused = self._pause_decision(magic, n)
+            if paused is not None:
+                return paused
 
         # Halt and independent risk health precede any potentially blocking IPC.
         stopped = self._process.check_stopped(n)
@@ -317,11 +311,37 @@ class RiskGate:
         snap_fn = getattr(self._account, "snapshot", None)
         if callable(snap_fn):
             snap = snap_fn()
-            positions = snap.positions
+            if caps and getattr(getattr(snap, "state", snap), "currency", None) != "USD":
+                raise ValueError("line_cap_data: account currency must be USD")
+            positions = tuple(snap.positions)
             deals = tuple(d for d in snap.deals if day_start <= d.time <= n)
         else:
+            if caps and self._account.state().currency != "USD":
+                raise ValueError("line_cap_data: account currency must be USD")
             positions = tuple(self._account.positions())
             deals = tuple(self._account.deals(day_start, n))
+        realized, floating = daily_pnl(deals, positions)
+        line_pnl = None
+        snapshot_magics = ()
+        if caps:
+            # The account cap remains first even if per-line data/state or
+            # specs/quotes are broken; all PnL comes from the same snapshot.
+            if realized + floating <= -self._process.config.daily_loss_cap_usd:
+                self._process.trigger_flatten_and_halt("daily_loss_cap", n)
+                return RiskDecision(False, "daily_loss_cap: account daily loss", True, True)
+            line_pnl = line_daily_pnl(deals, positions, caps)
+            snapshot_magics = tuple({p.magic for p in positions} | {
+                d.magic for d in deals if d.entry in TRADE_ENTRY_KINDS})
+            loss = self._process.check_loss_limits(
+                OrderRequest(symbol, side, lots, magic),
+                RiskState(positions=positions, contract_sizes={}, prices={},
+                          today_realized=realized, today_floating=floating,
+                          line_pnl=line_pnl, snapshot_magics=snapshot_magics), n)
+            if loss is not None:
+                return loss
+            paused = self._pause_decision(magic, n)
+            if paused is not None:
+                return paused
         contract_sizes = load_contract_sizes(self._specs_path)
         quotes: dict[str, tuple[float, float]] = {}
         for sym in {p.symbol for p in positions} | {symbol}:
@@ -329,11 +349,11 @@ class RiskGate:
             quotes[sym] = (float(q.bid), float(q.ask))
         prices = {s: (b + a) / 2.0 for s, (b, a) in quotes.items()}
         recent = read_recent_order_times(self._live_dir, n)
-        realized, floating = daily_pnl(deals, positions)
         state = RiskState(
             positions=positions, contract_sizes=contract_sizes, prices=prices,
             recent_order_times=recent, today_realized=realized,
-            today_floating=floating, halted=False)
+            today_floating=floating, halted=False,
+            line_pnl=line_pnl, snapshot_magics=snapshot_magics)
 
         # 2) 风控进程裁决（killSwitch/halt 文件优先，其后 8 条纯函数规则）
         decision = self._process.check_order(
@@ -359,6 +379,26 @@ class RiskGate:
         return decision
 
     # ---- 内部 ----
+
+    def _pause_decision(self, magic: int, now: datetime) -> RiskDecision | None:
+        strict = bool(self._process.config.line_caps)
+        paused = read_pause(self._live_dir, magic, strict=strict)
+        if paused.paused:
+            if paused.unreadable:
+                append_alert(self._live_dir, ALERT_PAUSE_UNREADABLE,
+                             f"magic {magic}：{paused.reason}", now)
+            return RiskDecision(
+                False, f"reconcile_paused: 持仓对账不一致（magic {magic}，"
+                f"{paused.reason or f'详见 pause-{magic}.json'}），暂停开仓")
+        manual = read_pause(self._live_dir, strict=strict)
+        if manual.paused:
+            if manual.unreadable:
+                append_alert(self._live_dir, ALERT_PAUSE_UNREADABLE,
+                             f"全局人工暂停文件：{manual.reason}", now)
+            return RiskDecision(
+                False, f"reconcile_paused: 全局人工暂停（pause.json，"
+                f"{manual.reason or '原因见文件'}），暂停开仓")
+        return None
 
     def _spread_check(self, symbol: str, quote: tuple[float, float],
                       now: datetime) -> RiskDecision | None:
