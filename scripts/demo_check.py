@@ -634,10 +634,14 @@ def load_formal_raw(args, descriptor, batch, *, now):
         raise FormalInvalid("sessions.invalid") from None
     states, pauses, intents = {}, {}, []
     for prefix in ("state", "pause", "expected"):
+        seen_magics = set()
         for path in _formal_glob(live, prefix + "-*.json", prefix):
-            m = re.fullmatch(prefix + r"-(\d+)\.json", path.name)
+            m = re.fullmatch(prefix + r"-([0-9]+)\.json", path.name)
             _require(m and int(m[1]) in magics, prefix + ".magic")
             magic = int(m[1])
+            _require(path.name == f"{prefix}-{magic}.json", prefix + ".filename")
+            _require(magic not in seen_magics, prefix + ".duplicate_magic")
+            seen_magics.add(magic)
             doc = batch.json(path, prefix)
             _require(isinstance(doc, dict) and type(doc.get("magic")) is int
                      and doc["magic"] == magic, prefix + ".schema")
@@ -669,23 +673,29 @@ def load_formal_raw(args, descriptor, batch, *, now):
                     raise FormalInvalid("expected.schema") from None
     _require(set(states) == magics and {it.magic for it in intents} == magics, "current.missing_state")
     _require(not _formal_exists(live / "expected.json", "expected"), "expected.legacy_unbound")
-    controls = []
+    controls, seen_blocks = [], set()
     for path in [live / "pause.json", *_formal_glob(live, "reconcile-block-*.json", "current.pause")]:
         if not _formal_exists(path, "current.pause"):
             continue
         doc = batch.json(path, "current.pause")
         _require(isinstance(doc, dict) and type(doc.get("paused")) is bool, "current.pause.schema")
-        _utc(doc.get("ts"), "current.pause")
+        pause_ts = _utc(doc.get("ts"), "current.pause")
         if path.name == "pause.json":
             _require(doc.get("magic") is None, "current.pause.magic")
         else:
-            m = re.fullmatch(r"reconcile-block-(\d+)\.json", path.name)
+            m = re.fullmatch(r"reconcile-block-([0-9]+)\.json", path.name)
             _require(m and int(m[1]) in magics and type(doc.get("magic")) is int
                      and doc["magic"] == int(m[1]) and doc["paused"] is True
                      and doc.get("owner") == "reconcile" and doc.get("reason") == "reconcile_mismatch",
                      "current.pause.schema")
+            _require(path.name == f"reconcile-block-{doc['magic']}.json", "current.pause.filename")
+            _require(doc["magic"] not in seen_blocks, "current.pause.duplicate_magic")
+            seen_blocks.add(doc["magic"])
+        control = "global_pause" if path.name == "pause.json" else "reconcile_block"
+        if pause_ts > window.end_utc:
+            controls.append("future " + control)
         if doc["paused"]:
-            controls.append("global_pause" if path.name == "pause.json" else "reconcile_block")
+            controls.append(control)
     for name in ("killSwitch", "halt.json", "halt-risk-veto.json"):
         path = live / name
         if _formal_exists(path, "current"):
@@ -864,6 +874,20 @@ def formal_current_state(ctx):
     for magic, pause in ctx["pauses"].items():
         if pause["paused"]:
             problems.append(f"pause magic={magic}")
+        if _utc(pause["ts"], "pause") > ctx["now"]:
+            problems.append(f"future pause magic={magic}")
+    # A completed drill is an existence check, not proof that every later
+    # mismatch was resolved. Check each magic's latest in-window alert here.
+    latest_mismatch = {}
+    for alert in ctx["alerts"]:
+        if alert.kind == "RECONCILE_MISMATCH":
+            for magic in _alert_magics(alert.message, ctx["manifest_magics"]):
+                latest_mismatch[magic] = max(alert.time, latest_mismatch.get(magic, alert.time))
+    for magic, alert_ts in sorted(latest_mismatch.items()):
+        pause = ctx["pauses"].get(magic)
+        if (pause is None or pause["paused"]
+                or not alert_ts < _utc(pause["ts"], "pause") <= ctx["now"]):
+            problems.append(f"RECONCILE_MISMATCH magic={magic} 未有同策略后续有效解除")
     for magic, state in ctx["executor_states"].items():
         if state.get("state_corrupt"):
             problems.append(f"state_corrupt magic={magic}")
@@ -895,7 +919,8 @@ def formal_day_coverage(ctx):
 
 def formal_process_liveness(ctx):
     w = ctx["formal_window"]
-    problems = []
+    problems = [f"magic={magic} 全窗口无有效自身运行器日志事件"
+                for magic in ctx["manifest_magics"] if not ctx["runner_magic_days"].get(magic)]
     for day in w.required_calendar_days:
         # Same hourly grace as the daily checker; at 00:00..00:09 no hour
         # has fallen due yet, so do not invent a requirement for hour zero.
@@ -2496,10 +2521,20 @@ def main(argv=None) -> int:
         a.startswith("--") and len(a.split("=", 1)[0]) > 2
         and any(option.startswith(a.split("=", 1)[0]) for option in ("--accept", "--formal-window"))
         for a in raw_argv)
-    if formal_requested and any(a in ("-h", "--help") for a in raw_argv):
-        return _formal_result(2, error="arguments.help_requires_standalone_invocation")
-
     class Parser(argparse.ArgumentParser):
+        def print_help(self, file=None):
+            # Help actions (including every argparse abbreviation) run before
+            # normal argument validation. Keep formal calls on the same exit2
+            # result path instead of printing help and raising SystemExit(0).
+            if formal_requested:
+                raise FormalInvalid("arguments.help_requires_standalone_invocation")
+            super().print_help(file)
+
+        def exit(self, status=0, message=None):
+            if formal_requested:
+                raise FormalInvalid("arguments.invalid")
+            super().exit(status, message)
+
         def error(self, message):
             if formal_requested:
                 raise FormalInvalid("arguments.invalid")

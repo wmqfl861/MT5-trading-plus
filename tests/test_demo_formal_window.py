@@ -748,3 +748,167 @@ def test_untimed_paper_header_is_invalid_identity_not_positive_metadata(tmp_path
     p = f.logs / f"runner-{MAGICS[0]}.log"
     p.write_text(p.read_text(encoding="utf-8").replace("[LIVE]", "[paper]"), encoding="utf-8")
     assert_result(formal(tmp_path), 2, "paper")
+
+
+# fix1: independent review's five counterexamples and their direct controls.
+@pytest.mark.parametrize("prefix", ["pause", "state", "expected", "reconcile-block"])
+@pytest.mark.parametrize("spelling", ["fullwidth", "leading_zero"])
+def test_fix1_noncanonical_alias_cannot_override_canonical_state(tmp_path, prefix, spelling):
+    f = build_evidence(tmp_path)
+    magic = MAGICS[1]
+    canonical = f.live / f"{prefix}-{magic}.json"
+    if prefix == "reconcile-block":
+        doc = dict(magic=magic, paused=True, reason="reconcile_mismatch", owner="reconcile",
+                   ts=iso(f.start - timedelta(days=1)), diffs=[])
+    else:
+        doc = get(canonical)
+        if prefix == "pause":
+            doc.update(paused=True, reason="manual", ts=iso(f.start - timedelta(days=1)))
+        elif prefix == "state":
+            doc["pending_external_exits"] = {"42": {"ts": iso(f.start - timedelta(days=1))}}
+        else:
+            doc["volume"] = .01
+    put(canonical, doc)
+    assert_result(formal(tmp_path), 1)
+    original = canonical.read_bytes()
+    alias_magic = "９０２６０２" if spelling == "fullwidth" else "0902602"
+    alias_doc = copy.deepcopy(doc)
+    if prefix == "pause":
+        alias_doc.update(paused=False, reason=None, ts=iso(f.start + timedelta(hours=6)))
+    elif prefix == "state":
+        alias_doc["pending_external_exits"] = {}
+    elif prefix == "expected":
+        alias_doc["volume"] = 0.0
+    put(f.live / f"{prefix}-{alias_magic}.json", alias_doc)
+    result = formal(tmp_path)
+    assert canonical.read_bytes() == original, "canonical protection was changed"
+    assert_result(result, 2)
+
+
+def test_fix1_canonical_state_without_conflicting_alias_is_accepted(tmp_path):
+    build_evidence(tmp_path)
+    assert_result(formal(tmp_path), 3, "mechanical_checks_passed=true")
+
+
+@pytest.mark.parametrize("scope", ["strategy", "global"])
+@pytest.mark.parametrize("prior_alert", [False, True])
+def test_fix1_future_pause_false_cannot_hide_behind_other_magic_drill(tmp_path, scope, prior_alert):
+    f = build_evidence(tmp_path)
+    magic = MAGICS[1]
+    if prior_alert:
+        with (f.live / "alerts.log").open("a", encoding="utf-8") as out:
+            out.write(f"{iso(f.start - timedelta(days=1))}\tRECONCILE_MISMATCH\t已暂停 magic [{magic}]\n")
+    path = f.live / (f"pause-{magic}.json" if scope == "strategy" else "pause.json")
+    doc = dict(magic=magic if scope == "strategy" else None, paused=False, reason=None,
+               ts=iso(f.now + timedelta(days=1)), diffs=[])
+    put(path, doc)
+    # Match existing state/intent future-time classification: known anomaly, exit1.
+    out = assert_result(formal(tmp_path), 1, "当前")
+    assert "future" in out
+
+
+@pytest.mark.parametrize("scope", ["strategy", "global"])
+@pytest.mark.parametrize("state", ["past_false", "past_true", "missing"])
+def test_fix1_current_pause_valid_time_controls(tmp_path, scope, state):
+    f = build_evidence(tmp_path)
+    magic = MAGICS[1]
+    path = f.live / (f"pause-{magic}.json" if scope == "strategy" else "pause.json")
+    if state == "missing":
+        path.unlink(missing_ok=True)
+    else:
+        put(path, dict(magic=magic if scope == "strategy" else None,
+                       paused=state == "past_true", reason="manual" if state == "past_true" else None,
+                       ts=iso(f.start - timedelta(days=1)), diffs=[]))
+    assert_result(formal(tmp_path), 1 if state == "past_true" else 3)
+
+
+@pytest.mark.parametrize("release", ["earlier", "equal", "future", "other_magic", "missing", "later"])
+def test_fix1_latest_mismatch_requires_own_valid_later_release(tmp_path, release):
+    f = build_evidence(tmp_path)
+    magic = MAGICS[1]
+    latest = f.now - timedelta(seconds=2)
+    with (f.live / "alerts.log").open("a", encoding="utf-8") as out:
+        # First B alert can have been resolved; the later one is after ten days.
+        out.write(f"{iso(f.start + timedelta(hours=4))}\tRECONCILE_MISMATCH\t已暂停 magic [{magic}]\n")
+        out.write(f"{iso(latest)}\tRECONCILE_MISMATCH\t已暂停 magic [{magic}]\n")
+    path = f.live / f"pause-{magic}.json"
+    if release == "missing":
+        path.unlink()
+    elif release != "earlier":
+        doc = get(path)
+        doc["ts"] = iso(latest if release == "equal" else
+                        f.now + timedelta(days=1) if release == "future" else
+                        latest + timedelta(seconds=1))
+        if release == "other_magic":
+            path = f.live / f"pause-{MAGICS[0]}.json"
+            doc["magic"] = MAGICS[0]
+        put(path, doc)
+    out = assert_result(formal(tmp_path), 3 if release == "later" else 1)
+    if release != "later":
+        assert "RECONCILE_MISMATCH" in out and str(magic) in out
+
+
+def test_fix1_multi_magic_mismatch_needs_release_for_each_magic(tmp_path):
+    f = build_evidence(tmp_path)
+    latest = f.now - timedelta(seconds=2)
+    with (f.live / "alerts.log").open("a", encoding="utf-8") as out:
+        out.write(f"{iso(latest)}\tRECONCILE_MISMATCH\t已暂停 magic {MAGICS}\n")
+    path = f.live / f"pause-{MAGICS[0]}.json"
+    doc = get(path)
+    doc["ts"] = iso(latest + timedelta(seconds=1))
+    put(path, doc)
+    assert_result(formal(tmp_path), 1, str(MAGICS[1]))
+    doc["magic"] = MAGICS[1]
+    put(f.live / f"pause-{MAGICS[1]}.json", doc)
+    assert_result(formal(tmp_path), 3)
+
+
+@pytest.mark.parametrize("remaining", ["none", "untimed_header", "outside_window", "retained_restart"])
+def test_fix1_risk_heartbeats_cannot_replace_all_runner_events(tmp_path, remaining):
+    f = build_evidence(tmp_path)
+    magic = MAGICS[1]
+    path = f.logs / f"runner-{magic}.log"
+    if remaining in ("none", "retained_restart"):
+        path.unlink()
+    else:
+        text = f"mt5live 启动：XAUUSD M15 magic={magic} strategy=synthetic [LIVE]\n"
+        if remaining == "outside_window":
+            text += f"[{f.start - timedelta(seconds=1):%Y-%m-%dT%H:%M:%S}] loop_completed magic={magic}\n"
+        path.write_text(text, encoding="utf-8")
+    if remaining == "retained_restart":
+        append_restart(f, component=str(magic))
+    assert_result(formal(tmp_path), 1, str(magic))
+
+
+def test_fix1_one_own_runner_event_preserves_daily_heartbeat_fallback(tmp_path):
+    f = build_evidence(tmp_path)
+    magic = MAGICS[1]
+    (f.logs / f"runner-{magic}.log").write_text(
+        f"mt5live 启动：XAUUSD M15 magic={magic} strategy=synthetic [LIVE]\n"
+        f"[{f.start + timedelta(hours=10):%Y-%m-%dT%H:%M:%S}] loop_completed magic={magic}\n", encoding="utf-8")
+    assert_result(formal(tmp_path), 3)
+
+
+@pytest.mark.parametrize("flags", [
+    ["--accept", "--he"], ["--accept", "--h"], ["--help", "--accept"],
+    ["--h", "--acc"], ["--acc", "--hel"], ["--formal-w", "unused.json", "--he"],
+    ["--he", "--formal-w", "unused.json"], ["-h", "--accept"],
+])
+def test_fix1_all_formal_help_exits_are_fail_closed(tmp_path, flags):
+    before = snapshots(tmp_path)
+    result = subprocess.run([sys.executable, str(SCRIPT), *flags], cwd=tmp_path,
+        env={**os.environ, "PYTHONUTF8": "1"}, capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert snapshots(tmp_path) == before
+    out = assert_result(result, 2, "mechanical_checks_passed=false")
+    assert "会话配置" not in result.stderr and "先启动" not in result.stdout
+    assert "usage:" not in out
+
+
+@pytest.mark.parametrize("flags", [["--help"], ["--h"], ["--he"], ["--hel"], ["-h"],
+                                    ["--day", "2026-11-05", "--he"], ["--summary", "--h"]])
+def test_fix1_standalone_and_daily_help_remain_normal(tmp_path, flags):
+    result = subprocess.run([sys.executable, str(SCRIPT), *flags], cwd=tmp_path,
+        env={**os.environ, "PYTHONUTF8": "1"}, capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "usage:" in result.stdout
+    assert "historical_identity_verified" not in result.stdout
