@@ -2432,7 +2432,8 @@ def print_summary(ctx, reps: list[DayReport]) -> None:
               f"无样本 {n_na}（{status}）不通过项：{failed_names}")
     n_fail = sum(len(r.failed) for r in reps)
     print()
-    print("演练证据（§7 演练项，全期累计展示——最终验收以 --accept 为准）：")
+    print("演练证据（§7 演练项，全期累计展示——正式窗口机械预检见 "
+          "docs/ops/demo-runbook.md §4；exit3 仅表示机械满足，不等于 A5 通过）：")
     kinds = {}
     for a in ctx["alerts"]:
         kinds[a.kind] = kinds.get(a.kind, 0) + 1
@@ -2451,7 +2452,9 @@ def print_summary(ctx, reps: list[DayReport]) -> None:
     if n_fail:
         print(f"合计 {n_fail} 项不通过。")
     else:
-        print("未发现异常证据（日常口径）——阶段 F 最终验收须另跑 --accept："
+        print("未发现异常证据（日常口径）——正式窗口机械预检按 "
+              "docs/ops/demo-runbook.md §4 使用 --accept --formal-window 和四个显式离线路径；"
+              "exit3 仅表示机械满足，历史真实性及 A5 另审，不等于阶段 F 最终验收通过："
               "Demo 运行清单（C-1）/持仓状态/连续覆盖/逐小时进程存活/SL 与 TP "
               "样本（C-2）/六项演练/双全平（两轮指令×全部 magic 关联 ack，"
               "C-3）/结构化点差/滑点样本任一无证据 = 未验收。")
