@@ -38,7 +38,7 @@ audit_time_file(path, *, source, symbol, timeframe,
 main(argv=None) -> int
 ```
 
-API严格接收字符串绑定和本地绝对path。CLI提供对应八个必需长选项，不提供默认数据根、output、allow/approved或发现目录选项。API拒绝抛带稳定code的局部异常（不含原始路径），CLI输出单个JSON错误并非零退出；参数错误同样清洗。成功JSON含scope裁定的固定状态、派生series及时间统计，不含输入路径。
+API严格接收字符串绑定和本地绝对path。CLI提供对应七个必需长选项（原稿“八个”为计数笔误），不提供默认数据根、output、allow/approved或发现目录选项。API拒绝抛带稳定code的局部异常（不含原始路径），CLI输出单个JSON错误并非零退出；参数错误同样清洗。成功JSON含scope裁定的固定状态、派生series及时间统计，不含输入路径。
 
 - [ ] 先写实际人工Parquet及行为测试，保存有效RED。schema与投影的负例必须走真实文件；路径/API声明负例用观测守卫证明输入未打开。
 - [ ] 固定三source/品种/周期/语义配对及边界，按裁定表。UTC边界只接受明确Z/+00:00的ISO时间，不自动猜时区，最多9位小数，规范为精确纳秒；FRED边界仅日期。start<end且位于允许域。输出UTC ISO时间完整保留纳秒；FRED输出YYYY-MM-DD。

@@ -1,10 +1,17 @@
 # H/P 模拟交易准备验收（2026-11-05）
 
-当前四模块均已完成合成工程验证及独立审核，最终修订版本的联合 paper 验收也已通过。P 准入适配器的消费时效缺口经同一审核者复核闭合；完整整合版本 `56fb183` 已获[独立整合审核](../reviews/2026-11-05-demo-readiness-integration-review.md) Spec PASS / Quality PASS。本记录提交后，最终待推送版本仍须完成全仓回归与对应 main CI。H/P 使用真实行情在 MT5 Demo 做策略前向验证的条件仍待下列实际材料与研究、部署证据。
+H/P交易接线批次已交付到 `c0df5a1d133eadbe8a8c089fba0758ed840d830b`：四模块与整合独立审核通过，最终全仓3713 passed、3 skipped、3条既有警告，退出0；同一提交的 [tests #304](https://github.com/wmqfl861/MT5-trading-plus/actions/runs/42005274111) 成功。H/P使用真实行情在MT5 Demo做策略前向验证的条件仍待下列输入、研究和部署证据。
 
-已交付基线为 `def8744d90f75519ed9486e8d1ee7efa79ba2e6a`，本地3255 passed、3 skipped、退出0；[tests #303](https://github.com/wmqfl861/MT5-trading-plus/actions/runs/41945677004)成功。下述新增代码的验证与基线分开记录。
+## 本批后续工程
 
-## 本批工程证据
+| 项目 | 当前实际证据 | 尚需完成 |
+| --- | --- | --- |
+| H单文件时间诊断 | `e7a0f95`，120 passed、exit0；[独立审核](../reviews/2026-11-05-h-time-audit-review.md) Spec PASS / Quality PASS，已合入开发集成树 | 精确真实快照及整列time/footer/tail允许范围仍需绑定；工具不证明来源、非锁箱资格或完整日历 |
+| P V2-A计算核 | `0626dd7`，121 passed、exit0；[独立审核](../reviews/2026-11-05-d61-v2a-kernel-review.md) Spec PASS / Quality PASS，已合入开发集成树 | 完整D61统计研究、V2-B、真实适用性与产品替换尚未完成 |
+| D57正式窗口检查 | 最终 `2cc35ca`，168 passed、exit0；[独立复核](../reviews/2026-11-05-demo-formal-window-review.md) Spec PASS / Quality PASS，五项Important全部闭合，已合入开发集成树 | 机械满足仅返回3，历史真实性及A5仍未审定；真实历史原件和运行条件须另行核实 |
+| 本批交付 | 三个模块均按最终受审版本合入 | 待完成独立整合审核、最终全仓回归与对应main CI |
+
+## 已交付交易接线证据
 
 | 项目 | 实际验收与独立结论 | 边界 |
 | --- | --- | --- |
@@ -13,7 +20,7 @@
 | 冻结模型装载 | 最终源提交 `5b5c5b5`；315 passed、退出0；[独立复核](../reviews/2026-11-05-t78-model-loading-review.md) Spec PASS / Quality PASS | 模型进入真实策略和运行器；不 fit、不 mock 信号；所有新 fittable 在线启动仍在读模型/卡前拒绝 |
 | H/P 分线风控 | 最终源提交 `41236ef`；242 passed、退出0；[独立复核](../reviews/2026-11-05-t78-line-caps-review.md) Spec PASS / Quality PASS | H/P 各250USD只禁相应线开仓；账户500USD全平/halt；人工、对账与线锁存分别保留，合作读写遵守共同锁 |
 | 最终联合 paper | 集成提交 `006151f0df830084a22fe4198edf37d47d3dfc3f`，tree `28688e915dfe2ac3ce2ab3435aeec647b8f0d8d8`；8 passed / 23.55s / 退出0，前后 HEAD 一致，无已跟踪文件改动 | 模型与风控文件逐项匹配上述受审最终版本；H 使用 BuyHold 基线，P 使用合成冻结模型，费用也为合成输入 |
-| 整合交付 | `56fb183c4c79d771980b9ae93b499efad73d20d7` / tree `8c264180e1fae6c93adce5c1b0344b01cc35bc97`；[独立整合审核](../reviews/2026-11-05-demo-readiness-integration-review.md) Spec PASS / Quality PASS，无新增问题 | 本记录提交时，最终待推送版本的全量、推送及对应 main CI 尚待完成，不借用 #303 的结果 |
+| 整合交付 | `56fb183c4c79d771980b9ae93b499efad73d20d7` / tree `8c264180e1fae6c93adce5c1b0344b01cc35bc97`；[独立整合审核](../reviews/2026-11-05-demo-readiness-integration-review.md) Spec PASS / Quality PASS，无新增问题 | 随后仅补审核记录的最终 `c0df5a1` 已完成全仓3713 passed、3 skipped、退出0及同提交main CI #304；该批已交付 |
 
 联合命令在隔离开发 worktree 执行，使用项目既有解释器：
 
