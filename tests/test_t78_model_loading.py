@@ -674,3 +674,30 @@ volume_lots = 0.01
     assert runner.main(offline_args(path)) == 2
     marker = read_json(tmp_path / "data/live/exit-runner.json")
     assert marker["rc"] == 2 and "lookback_bars" in marker["reason"]
+
+
+def test_fix2_fittable_volume_overflow_without_model_rejects_before_guard(
+        tmp_path, monkeypatch, runner, capsys):
+    path = tmp_path / "config" / "live.toml"
+    cfg = dict(symbol="XAUUSD", timeframe="H1", strategy=STRATEGY,
+               magic=MAGIC, lookback_bars=2100, volume_lots=10 ** 400)
+    write_config(path, cfg)
+    # Both data_root and --data-dir are absent; a mistaken guard would write
+    # cwd/data/live. All sentinel state and filesystem comparisons stay in tmp.
+    monkeypatch.chdir(tmp_path)
+    assert_rejected_without_effects(
+        runner, path, {**cfg, "data_root": str(tmp_path / "data")}, monkeypatch)
+    assert "配置预检失败" in capsys.readouterr().out
+
+
+def test_fix2_nonfittable_volume_overflow_keeps_guarded_evidence(
+        tmp_path, monkeypatch, runner, caplog):
+    path = tmp_path / "legacy.toml"
+    write_config(path, dict(symbol="XAUUSD", timeframe="H1", strategy=H_STRATEGY,
+                           magic=MAGIC, lookback_bars=2100, volume_lots=10 ** 400))
+    monkeypatch.chdir(tmp_path)
+    assert runner.main(offline_args(path)) == 2
+    marker = read_json(tmp_path / "data/live/exit-runner.json")
+    assert marker["rc"] == 2
+    assert "int too large to convert to float" in marker["reason"]
+    assert "OverflowError" in caplog.text

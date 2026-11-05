@@ -233,6 +233,6 @@ def load(path: str) -> LiveConfig:
             from dataclasses import replace
             cfg = replace(cfg, **resolved)
         return cfg
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         message = f"配置结构不符：{exc}" if isinstance(exc, TypeError) else str(exc)
         raise error(message) from exc
