@@ -935,3 +935,138 @@ def test_fix1_registered_source_and_exact_implementation_required(tmp_path, muta
     assert not list(bundle.state.glob("*.claim"))
     if mutation != "ancestor-code":
         assert not bundle.state.exists()
+
+
+# fix2: move only the isolated clock at real closure reads / claim fsync calls.
+TIME_LAUNCHER = COLD_GUARD[:COLD_GUARD.index("root, bundle_path,")] + '''
+import os
+root, bundle_path, output, state, phase, advance_to, expected = sys.argv[1:]
+sys.path.insert(0, str(Path(root) / "src"))
+import mt5quant.prob.production_adapter as adapter
+now = datetime(2026, 11, 5, tzinfo=timezone.utc)
+advanced = datetime.fromisoformat(advance_to.replace("Z", "+00:00"))
+trace = {"clock_reads": [], "jumped": False, "claim_opens": [],
+         "claim_fsync_completed": False, "data_cost_reads": [], "kernel_calls": []}
+def clock():
+    trace["clock_reads"].append(now.isoformat())
+    return now
+adapter._clock = clock
+adapter._state_root = lambda: Path(state)
+materials, state_path = Path(bundle_path).resolve(), Path(state).resolve()
+closure_path = (Path(root) / "src/mt5quant/prob/feasibility.py").resolve()
+def advance():
+    global now
+    now = advanced
+    trace["jumped"] = True
+
+def observe_io(event, args):
+    if event != "open" or not isinstance(args[0], str):
+        return
+    path = Path(args[0]).resolve()
+    if phase == "closure" and path == closure_path and not trace["jumped"]:
+        frame = sys._getframe(1)
+        while frame is not None:
+            if frame.f_code.co_name == "_claim":
+                advance()
+                break
+            frame = frame.f_back
+    if path.parent == state_path and path.suffix == ".claim":
+        trace["claim_opens"].append(now.isoformat())
+    if path.parent == materials and path.name not in ("release.json", "review.json", "closure.json"):
+        trace["data_cost_reads"].append(path.name)
+        if expected == "refuse":
+            raise AssertionError("expired execution read data/cost: " + path.name)
+
+def observe_calls(frame, event, arg):
+    if event in ("c_call", "c_return") and arg is os.fsync and frame.f_code.co_name == "_write_exclusive":
+        path = frame.f_locals["path"]
+        if path.parent == state_path and path.suffix == ".claim":
+            if event == "c_call" and phase == "persist":
+                advance()
+            elif event == "c_return":
+                trace["claim_fsync_completed"] = True
+    if event == "call" and frame.f_code.co_name in ("_run_feasibility_kernel", "_trigger_cost_kernel"):
+        trace["kernel_calls"].append(frame.f_code.co_name)
+        if expected == "refuse":
+            raise AssertionError("expired execution reached count/cost kernel")
+sys.addaudithook(observe_io)
+sys.setprofile(observe_calls)
+cli = runpy.run_path(str(Path(root) / "scripts/pline_feasibility.py"))
+try:
+    result = cli["main"](["--mode", "production", "--release-id", "fixture-release",
+        "--release-manifest", str(materials / "release.json"), "--output", output])
+finally:
+    sys.setprofile(None)
+    print("TIME_EVIDENCE", json.dumps(trace))
+raise SystemExit(result)
+'''
+
+
+def run_time_boundary(bundle, phase, advance_to, *, succeeds=False, output=None):
+    command = [sys.executable, "-I", "-B", "-c", TIME_LAUNCHER, str(bundle.code_root),
+        str(bundle.directory), str(output or bundle.out), str(bundle.state), phase, advance_to,
+        "allow" if succeeds else "refuse"]
+    result = subprocess.run(command, cwd=bundle.code_root, capture_output=True, text=True, timeout=90)
+    print("TIME_PROCESS", result.returncode, result.stdout.strip(), result.stderr.strip())
+    evidence = json.loads(next(line.removeprefix("TIME_EVIDENCE ")
+        for line in result.stdout.splitlines() if line.startswith("TIME_EVIDENCE ")))
+    return result, evidence
+
+
+@pytest.mark.parametrize("phase,authority,advance_to,succeeds", [
+    ("closure", "manifest", "2026-11-05T00:00:02Z", False),
+    ("closure", "snapshot", "2026-11-05T00:00:01Z", False),
+    ("persist", "manifest", "2026-11-05T00:00:01Z", False),
+    ("persist", "snapshot", "2026-11-05T00:00:02Z", False),
+    ("persist", "condition", "2026-11-04T23:59:59.999999Z", False),
+    ("closure", "valid", "2026-11-05T00:00:00.999999Z", True),
+])
+def test_fix2_claim_uses_fresh_time_after_closure_and_persistence(
+        tmp_path, phase, authority, advance_to, succeeds):
+    root = make_code_repo(tmp_path / "implementation")
+    bundle = make_bundle(tmp_path / "artifacts", load_adapter(), code_root=root)
+    bundle.code_root = root
+    bundle.manifest["snapshot_version"] = 2
+    if authority in ("manifest", "valid"):
+        bundle.manifest["expires_at"] = "2026-11-05T00:00:01Z"
+    closure = ref_file(bundle.directory, "closure.json", {
+        "condition_id": "time-boundary", "status": "closed", "closed_at": NOW.isoformat()})
+    bundle.manifest["conditions"] = [{"condition_id": "time-boundary", "status": "closed", "evidence_ref": closure}]
+    reseal(bundle)
+    snapshot = snapshot_doc(bundle, version=2)
+    if authority in ("snapshot", "valid"):
+        snapshot["expires_at"] = "2026-11-05T00:00:01Z"
+    implementation = fixture_git(root, "rev-parse", "HEAD")
+    registration = register_snapshot(root, snapshot)
+    print("TIME_REGISTRATION", json.dumps({"I": implementation, "H": registration,
+        "phase": phase, "authority": authority, "advance_to": advance_to,
+        "manifest_raw_sha256": sha(bundle.raw), "snapshot_sha256": sha(encoded(snapshot))}))
+    result, trace = run_time_boundary(bundle, phase, advance_to, succeeds=succeeds)
+    assert trace["jumped"], "clock did not advance at the actual closure/persistence IO"
+    assert result.returncode == (0 if succeeds else 2), result.stdout + result.stderr
+    claims = {p.name: p.read_bytes() for p in bundle.state.glob("*.claim")}
+    assert len(claims) == (1 if phase == "persist" or succeeds else 0)
+    assert trace["claim_fsync_completed"] == bool(claims)
+    watermark = (bundle.state / "snapshot.json").read_bytes()
+    assert json.loads(watermark) == {"version": 2, "sha256": sha(encoded(snapshot))}
+    assert not (bundle.state / "claim.lock").exists()
+    if succeeds:
+        report = json.loads((bundle.out / "report.json").read_bytes())
+        assert len(report["rows"]) == 96 and len(report["summaries"]) == 8
+        row = next(r for r in report["rows"] if (r["family"], r["symbol"], r["situation"], r["action"]) == ("F1", "XAUUSD", "S1", "A3"))
+        assert row["n_triggers"] == 1 and row["cost_r"] == pytest.approx(.10675)
+        assert report["production_execution"] == "not_released"
+        assert trace["data_cost_reads"] and trace["kernel_calls"]
+    else:
+        assert not trace["data_cost_reads"] and not trace["kernel_calls"]
+        assert not bundle.out.exists()
+        if claims:
+            # A fresh interpreter with the original valid clock cannot recover
+            # an execution consumed before the post-persistence check refused it.
+            retry_out = tmp_path / "retry-output"
+            again, retrace = run_time_boundary(bundle, "retry", NOW.isoformat(), output=retry_out)
+            assert again.returncode == 2 and "consumed" in again.stderr
+            assert not retrace["data_cost_reads"] and not retrace["kernel_calls"]
+            assert {p.name: p.read_bytes() for p in bundle.state.glob("*.claim")} == claims
+            assert (bundle.state / "snapshot.json").read_bytes() == watermark
+            assert not retry_out.exists()

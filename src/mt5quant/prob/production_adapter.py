@@ -390,11 +390,15 @@ def _review(m, base, cache, now):
              _time(m["expires_at"]) <= b, "review time mismatch")
     _require(review["binding_domain"] == "canonical-json-v1" and
              review["binding_sha256"] == _sha(_canonical({k: v for k, v in m.items() if k != "review_ref"})), "review binding mismatch")
+    valid_from = a
     for condition in m["conditions"]:
         closure = _read_verified(base, condition["evidence_ref"], cache)
         _keys(closure, "condition_id status closed_at")
+        closed_at = _time(closure["closed_at"])
         _require(closure["condition_id"] == condition["condition_id"] and closure["status"] == "closed" and
-                 _time(closure["closed_at"]) <= now, "condition closure mismatch")
+                 closed_at <= now, "condition closure mismatch")
+        valid_from = max(valid_from, closed_at)
+    return valid_from, b
 
 
 def _sync_directory(path):
@@ -479,17 +483,34 @@ def _claim(snapshot, m, manifest_hash, base, cache):
         _trusted(latest, m["release_id"], now)
         _require(latest.registry[m["release_id"]] == manifest_hash, "manifest binding changed")
         _require(_time(m["valid_from"]) <= now < _time(m["expires_at"]), "release not current")
-        _review(m, base, cache, now)  # cached original bytes; clock/conditions rechecked
+        review_start, review_end = _review(m, base, cache, now)
         runtime = _implementation(m)
         _require(runtime["head"] == latest.source["head"], "code changed during claim")
         claim = root / (_sha(m["execution_id"].encode()) + ".claim")
+        claim_bytes = _canonical({"release_id": m["release_id"], "execution_id": m["execution_id"],
+            "manifest_raw_sha256": manifest_hash, "snapshot_version": latest.version,
+            "snapshot_sha256": _sha(_snapshot_bytes(latest))})
+        # These bounds come from the verified snapshot and cached metadata;
+        # condition closure times are included in review_start. Finish all
+        # hashing/Git/IO before taking the final clock sample.
+        valid_from = max(_time(latest.valid_from), _time(m["valid_from"]), review_start)
+        expires_at = min(_time(latest.expires_at), _time(m["expires_at"]), review_end)
+
+        def require_current_time():
+            current_time = _clock()
+            _require(isinstance(current_time, datetime) and current_time.tzinfo is not None,
+                     "trusted time unavailable")
+            _require(valid_from <= current_time < expires_at, "execution authorization not current")
+
+        require_current_time()
         try:
-            _write_exclusive(claim, _canonical({"release_id": m["release_id"], "execution_id": m["execution_id"],
-                "manifest_raw_sha256": manifest_hash, "snapshot_version": latest.version,
-                "snapshot_sha256": _sha(_snapshot_bytes(latest))}))
+            _write_exclusive(claim, claim_bytes)
         except FileExistsError:
             raise AdmissionRefused("execution already consumed") from None
         _sync_directory(root)
+        # Persistence may itself cross expiry. Refuse data/cost, but never
+        # remove the durable claim or roll back the observed snapshot.
+        require_current_time()
         return latest, runtime
 
 

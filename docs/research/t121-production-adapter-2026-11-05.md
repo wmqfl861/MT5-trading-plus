@@ -25,7 +25,7 @@
 
 在固定状态根的同一互斥协议内，先核对信任来源/完整结构/合法时间区间并持久观察版本与 canonical 摘要，再判 requested release 与当前有效性。可信更高版本即使 revoked、合法 unknown、过期或未生效也推进水位；invalid/未初始化不推进。同版本同摘要可重复观察，同版本异摘要或低版本拒绝且不覆盖，摘要不包含路径/HEAD/观察时刻。active 后清单/审核失败也不回退水位。水位损坏或持久化异常 fail closed，不清空、不降级。
 
-读取 data/cost 前，claim 在同一共享锁内重新加载受信快照和系统 UTC clock、比较当前版本/摘要与持久水位、重查 active/manifest rawSHA、清单/审核时效及条件、实现闭包；最后独占创建并 fsync execution claim。新版水位先持久完成则旧 claim 拒绝；claim 先持久完成属于已消费执行，不提供运行中撤回。生产根取 OS 用户 profile 固定目录，不受 HOME、APPDATA、XDG、数据根、输出或 worktree 影响。同一 execution ID 不能换 release 重用；进程中断留下 claim/锁，读取、解析、计算和输出失败不回收，无自动清理/重试许可接口。
+读取 data/cost 前，claim 在同一共享锁内重新加载受信快照、比较当前版本/摘要与持久水位、重查 active/manifest rawSHA、审核和条件以及实现闭包。耗时 Git/磁盘/摘要核验与 claim 序列化全部完成后，紧邻独占创建重新读取系统 UTC clock，检查快照、清单、审核有效区间及条件闭合时间的交集，终点等号拒绝。claim 文件 fsync 和所需目录持久化完成后再次取时复核；若持久化期间越过有效期，保留已写 claim 与水位，拒绝 data/cost、计算及输出，不回收执行。新版水位先持久完成则旧 claim 拒绝；claim 持久完成并通过最终时效检查后属于已消费执行，不提供运行中撤回。生产根取 OS 用户 profile 固定目录，不受 HOME、APPDATA、XDG、数据根、输出或 worktree 影响。同一 execution ID 不能换 release 重用；进程中断留下 claim/锁，读取、解析、计算和输出失败不回收，无自动清理/重试许可接口。
 
 占用后各工件每路径读一次，核验和解析复用内存 bytes。只窄提取已有 `_run_feasibility_kernel` / `_trigger_cost_kernel`，保持计数、资格、成本公式、96 行与 8 汇总。原公开 `run_feasibility` / `trigger_cost` 仍只接受 synthetic，production 工件没有改标 synthetic。新输出独占目录，receipt 包含 release/context/执行身份、manifest raw hash、各工件/代码/规则摘要和 report hash。
 
