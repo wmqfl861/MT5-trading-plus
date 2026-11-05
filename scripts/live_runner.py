@@ -75,7 +75,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mt5data.store import load_bars  # noqa: E402
 from mt5live.monitor import guarded_main, reset_watchdog  # noqa: E402
-from mt5live.config import LiveConfig, ModelConfigError, load as load_config  # noqa: E402
+from mt5live.config import (  # noqa: E402
+    LiveConfig, ModelConfigError, ParsedConfigError, load as load_config,
+)
 from mt5live.executor import ExecutionAdapter, LiveExecutor, \
     validate_live_strategy  # noqa: E402
 from mt5live.gate import LiveSizer, RiskGate, load_contract_sizes  # noqa: E402
@@ -130,6 +132,84 @@ def _model_equal(actual, expected) -> bool:
 def _require_model_equal(name, actual, expected) -> None:
     if not _model_equal(actual, expected):
         raise ValueError(f"{name} 缺失/错配：{actual!r}，预期 {expected!r}")
+
+
+def _validate_live_probability_table(table: dict, strategy, effective: set) -> None:
+    """Validate frozen table semantics before its permissive deserializer runs."""
+    keys = {"schema_version", "group_by", "prior_strength", "min_cell",
+            "base_rates", "parents", "cells"}
+    if set(table) != keys:
+        raise ValueError("model.prob_table 须完整声明概率表字段，不能含未知字段")
+    for key, expected in (("schema_version", 1),
+                          ("prior_strength", strategy.PRIOR_STRENGTH),
+                          ("min_cell", strategy.MIN_CELL)):
+        if type(table[key]) is not int or table[key] != expected:
+            raise ValueError(f"model.prob_table.{key} 必须是匹配策略的整数")
+    estimate_keys = {"n", "p_win", "p_loss", "p_time", "r_win", "r_loss",
+                     "r_time", "se_win", "se_loss"}
+
+    def validate_estimate(row, extra_keys, name):
+        if not isinstance(row, dict) or set(row) != estimate_keys | extra_keys:
+            raise ValueError(f"{name} 估计字段缺失/未知或行类型不合法")
+        if type(row["n"]) is not int or row["n"] <= 0:
+            raise ValueError(f"{name}.n 必须是正整数样本数")
+        for key in estimate_keys - {"n"}:
+            value = row[key]
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError(f"{name}.{key} 必须是有限数值（不接受 bool/字符串）")
+            if key.startswith("p_") and not 0 <= value <= 1:
+                raise ValueError(f"{name}.{key} 必须在 [0, 1] 内")
+            if key.startswith("se_") and value < 0:
+                raise ValueError(f"{name}.{key} 标准误不得为负")
+        total = row["p_win"] + row["p_loss"] + row["p_time"]
+        if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(f"{name} 三项概率之和必须为 1")
+
+    base = table["base_rates"]
+    if not isinstance(base, dict) or not base:
+        raise ValueError("model.prob_table.base_rates 必须是非空动作估计表")
+    actions = {action for _, action in effective}
+    for action, row in base.items():
+        if action not in actions:
+            raise ValueError("model.prob_table.base_rates 动作超出声明范围")
+        validate_estimate(row, set(), f"model.prob_table.base_rates[{action}]")
+
+    parent_keys = set()
+    # Frozen feature v1 categories, including the explicit warm-up 'na' bucket.
+    feature_values = {"trend_sma200": {"above", "below", "na"},
+                      "atr_pct_2000": {"high", "low", "na"}}
+    for tier in ("parents", "cells"):
+        rows = table[tier]
+        if not isinstance(rows, list):
+            raise ValueError(f"model.prob_table.{tier} 必须是行数组")
+        seen = set()
+        extra = {"situation", "action"} | ({"features"} if tier == "cells" else set())
+        for index, row in enumerate(rows):
+            name = f"model.prob_table.{tier}[{index}]"
+            validate_estimate(row, extra, name)
+            situation, action = row["situation"], row["action"]
+            if (not isinstance(situation, str) or not isinstance(action, str)
+                    or (situation, action) not in effective):
+                raise ValueError(f"{name} 局面/动作超出有效声明范围")
+            pair = (situation, action)
+            if action not in base:
+                raise ValueError(f"{name} 缺少对应 base_rates 动作")
+            key = pair
+            if tier == "cells":
+                features = row["features"]
+                if not isinstance(features, dict) or set(features) != set(table["group_by"]):
+                    raise ValueError(f"{name}.features 必须精确匹配 group_by")
+                for feature, value in features.items():
+                    if not isinstance(value, str) or value not in feature_values[feature]:
+                        raise ValueError(f"{name}.features[{feature}] 不是冻结特征合法值")
+                if pair not in parent_keys:
+                    raise ValueError(f"{name} 缺少对应 parents 局面/动作")
+                key = (*pair, *(features[g] for g in table["group_by"]))
+            if key in seen:
+                raise ValueError(f"{name} 重复格键会静默覆盖，拒绝装载")
+            seen.add(key)
+        if tier == "parents":
+            parent_keys = seen
 
 
 def load_live_strategy(cfg: LiveConfig, *, strategy_cls=None):
@@ -242,6 +322,7 @@ def load_live_strategy(cfg: LiveConfig, *, strategy_cls=None):
                        "prior_strength": strategy.PRIOR_STRENGTH,
                        "min_cell": strategy.MIN_CELL}.items():
         _require_model_equal(f"model.prob_table.{key}", table.get(key), value)
+    _validate_live_probability_table(table, strategy, effective)
     costs = model.get("cost_r_by_situation_action")
     if not isinstance(costs, dict):
         raise ValueError("model 缺 cost_r_by_situation_action")
@@ -556,7 +637,17 @@ def main(argv=None) -> int:
     except ModelConfigError as exc:
         print(f"模型配置预检失败：{exc}")
         return 2
-    except Exception:
+    except Exception as exc:
+        # A parseable fittable config can fail a legacy field before the missing
+        # model group is checked. Classify it without retrying or entering guard.
+        if isinstance(exc, ParsedConfigError) and isinstance(exc.strategy_ref, str):
+            try:
+                fittable = getattr(load_strategy(exc.strategy_ref), "fittable", False)
+            except Exception:
+                fittable = False       # Unidentified legacy errors keep monitor evidence.
+            if fittable:
+                print(f"模型配置预检失败：{ModelConfigError(str(exc))}")
+                return 2
         def invalid():
             return load_config(args.config)
         return guarded_main("runner", os.path.join(args.data_dir or "data", "live"),

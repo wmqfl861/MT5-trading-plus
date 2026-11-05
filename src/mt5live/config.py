@@ -36,6 +36,14 @@ class ModelConfigError(ValueError):
     """T78 新模型配置不完整；runner 在监控/运行状态写入前拒绝。"""
 
 
+class ParsedConfigError(ValueError):
+    """Keep a parsed strategy reference when another configuration field fails."""
+
+    def __init__(self, message: str, *, strategy_ref):
+        super().__init__(message)
+        self.strategy_ref = strategy_ref
+
+
 def _is_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
@@ -199,7 +207,11 @@ def load(path: str) -> LiveConfig:
             raw.decode("utf-8", errors="replace"))
         error = ModelConfigError if model_declared else ValueError
         raise error(f"配置文件 {path} 不是合法 TOML：{exc}") from exc
-    error = ModelConfigError if MODEL_CONFIG_KEYS & data.keys() else ValueError
+    def error(message):
+        if MODEL_CONFIG_KEYS & data.keys():
+            return ModelConfigError(message)
+        return ParsedConfigError(message, strategy_ref=data.get("strategy"))
+
     known = {f.name for f in fields(LiveConfig)}
     unknown = set(data) - known
     if unknown:
@@ -222,8 +234,5 @@ def load(path: str) -> LiveConfig:
             cfg = replace(cfg, **resolved)
         return cfg
     except (TypeError, ValueError) as exc:
-        if MODEL_CONFIG_KEYS & data.keys():
-            raise ModelConfigError(f"模型配置不合法：{exc}") from exc
-        if isinstance(exc, TypeError):
-            raise ValueError(f"配置结构不符：{exc}") from exc
-        raise
+        message = f"配置结构不符：{exc}" if isinstance(exc, TypeError) else str(exc)
+        raise error(message) from exc

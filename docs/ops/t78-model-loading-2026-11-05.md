@@ -36,9 +36,11 @@ experiment_fingerprint(
 
 当前仅支持 `LevelDecisionV1` 家族。关键模型字段必须完整：schema/prob_version、单品种/周期、fit_window 起止、purge、bracket、situations、features、policy、allowed_hypotheses。关键值与策略常量逐项核对；训练窗须起点早于终点且结束不晚于当前时间，purge 按现有拟合接线为 `horizon_bars + 2`。概率表的特征、prior_strength、min_cell 与策略/卡一致，成本键限定有效局面×动作且值为有限非负数。
 
+概率表的 `base_rates` / `parents` / `cells` 在 `with_model` 之前逐行校验：字段完整且无未知字段，样本数为正整数，估计值为有限数值（拒绝 bool/字符串），三项概率均在 `[0,1]` 且和为 1（绝对容差 `1e-12`），标准误非负。动作及局面×动作须在有效声明集合内，cell 特征键/值须符合冻结特征 v1；拒绝重复 parent/cell 键、缺少对应 base/parent 的孤立行。合法 base 回退、parent 回退及 cell 查询保持原语义。模型字节 SHA 和装配指纹即使重新计算，也不能绕过这些检查；不改冻结表反序列化器。
+
 卡须显式绑定相同策略、单品种和周期，采用 standard+validation；参数在卡网格内，bracket、网格、approach、breakout/retest、五个决策字段及有效假设集合须与策略一致。不接受冻结旧模型中省略关键身份字段的宽松路径，也不更改冻结策略本身的兼容行为。
 
-- fittable 缺模型、模型/卡/实验错配、模型配置错误：直接返回 2，不进入监控包装、不更改原有运行状态。
+- fittable 缺模型、模型/卡/实验错配、模型配置错误：直接返回 2，不进入监控包装、不更改原有运行状态。可解析 TOML 即使整组模型字段缺失且另有旧字段类型/缺项/拼写错误，也保留策略引用；main 识别其为 fittable 后在 guard 前拒绝，避免落到 cwd 默认 `data/live` 写错误状态。非 fittable 的同类旧字段错误继续保留监控证据。
 - 非 fittable 携带模型配置：拒绝，不静默忽略。
 - 旧非 fittable 策略装载/不支持的出场规则错误仍走 `guarded_main`，保留原 `exit-runner-*` / fatal 监控证据；`time_stop_bars` / `week_close_exit` 仍拒绝。
 - TOML 语法/编码损坏且含新模型字段声明时，直接返回 2；不生成运行状态。不带这些声明的旧损坏配置继续由 `guarded_main` 记录错误，旧合法配置路径保持原行为。

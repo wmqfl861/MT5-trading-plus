@@ -196,7 +196,8 @@ def offline_args(path):
     return ["--config", str(path), "--once", "--dry-run", "--offline", "--paper"]
 
 
-def test_main_consumes_two_frozen_models_in_real_paper_runner(tmp_path, monkeypatch, runner):
+@pytest.mark.parametrize("tier", ["parents", "base_rates", "cells"])
+def test_main_consumes_two_frozen_models_in_real_paper_runner(tmp_path, monkeypatch, runner, tier):
     # Ignoring with_model's NEW instance, replacing it in _run, or ignoring the
     # artifact all break the signal and real persisted execution assertions.
     attached = []
@@ -223,7 +224,21 @@ def test_main_consumes_two_frozen_models_in_real_paper_runner(tmp_path, monkeypa
     monkeypatch.chdir(unrelated)
     for strong in (True, False):
         root = tmp_path / str(strong)
-        path, cfg, _ = make_config(root, strong=strong)
+        path, cfg, model = make_config(root, strong=strong)
+        if tier == "base_rates":
+            model["prob_table"]["parents"] = []
+            update_model(path, cfg, model, rebind=True)
+        elif tier == "cells":
+            estimate = model["prob_table"]["base_rates"]["A3"]
+            model["prob_table"]["cells"] = [{
+                "situation": "S1", "action": "A3", **estimate,
+                "features": {"trend_sma200": "above", "atr_pct_2000": "high"}}]
+            # Make the fallback estimate imply the opposite decision so a
+            # mistakenly skipped valid cell cannot pass by using its parent.
+            fallback = frozen_model(strong=not strong)["prob_table"]
+            model["prob_table"]["base_rates"] = fallback["base_rates"]
+            model["prob_table"]["parents"] = fallback["parents"]
+            update_model(path, cfg, model, rebind=True)
         data = root / "override-data"
         args = paper_inputs(root, data)
         assert runner.main(offline_args(path) + ["--data-dir", str(data)] + args) == 0
@@ -518,3 +533,144 @@ def test_legacy_bad_toml_keeps_guarded_startup_evidence(tmp_path, runner):
     marker = read_json(data / "live/exit-runner.json")
     assert "TOML" in marker["reason"]
     assert marker["rc"] == 2
+
+
+def table_estimate(model, tier):
+    table = model["prob_table"]
+    if tier == "base_rates":
+        return table["base_rates"]["A3"]
+    if tier == "cells":
+        table["cells"] = [{**table["parents"][0],
+                           "features": {"trend_sma200": "above", "atr_pct_2000": "high"}}]
+    return table[tier][0]
+
+
+def write_rehashed_table_model(path, cfg, model):
+    # Nonfinite JSON numbers are deliberately malformed input: the frozen
+    # loader accepts json.loads' constants, although save_model disallows them.
+    # Recompute BOTH identities so no stale hash can mask semantic rejection.
+    payload = json.dumps(model, sort_keys=True, separators=(",", ":"), allow_nan=True).encode()
+    model_path = path.parent / "models" / "fix1-malformed.json"
+    model_path.write_bytes(payload)
+    cfg["model_path"] = "models/" + model_path.name
+    cfg["model_sha256"] = hashlib.sha256(payload).hexdigest()
+    cfg["experiment_sha256"] = fingerprint(model, (path.parent / cfg["card_path"]).read_bytes(), cfg)
+    write_config(path, cfg)
+
+
+@pytest.mark.parametrize("tier", ["base_rates", "parents", "cells"])
+@pytest.mark.parametrize("field,value", [
+    ("n", 0), ("n", True), ("n", 1.5), ("n", "1000"),
+    ("p_win", 2), ("p_loss", -0.1), ("p_time", 0.2),
+    ("p_win", False), ("r_win", "1.9"), ("r_loss", float("nan")),
+    ("r_time", float("inf")), ("se_win", -10), ("se_loss", -1),
+    ("se_win", float("inf")),
+])
+def test_fix1_rehashed_probability_estimates_reject_before_runtime(
+        tmp_path, monkeypatch, runner, capsys, tier, field, value):
+    path, cfg, model = make_config(tmp_path, strong=False)
+    table_estimate(model, tier)[field] = value
+    write_rehashed_table_model(path, cfg, model)
+    assert_rejected_without_effects(runner, path, cfg, monkeypatch)
+    out = capsys.readouterr().out
+    assert f"prob_table.{tier}" in out
+    assert "experiment_sha256" not in out and "哈希与预期不符" not in out
+
+
+@pytest.mark.parametrize("case", [
+    "base_type", "parents_type", "cells_type", "base_row_type", "parent_row_type", "cell_row_type",
+    "base_missing_estimate", "parent_missing_estimate", "cell_missing_estimate",
+    "parent_missing_key", "cell_missing_key", "parent_extra_key", "cell_extra_key",
+    "base_action", "parent_action", "cell_action", "parent_situation", "cell_situation",
+    "missing_base", "missing_parent", "duplicate_parent", "duplicate_cell",
+    "cell_features_type", "cell_feature_missing", "cell_feature_extra", "cell_feature_value",
+    "schema_bool", "prior_float", "min_cell_float",
+])
+def test_fix1_rehashed_table_structure_and_scope_reject_before_runtime(
+        tmp_path, monkeypatch, runner, capsys, case):
+    path, cfg, model = make_config(tmp_path, strong=False)
+    table = model["prob_table"]
+    cell = table_estimate(model, "cells")
+    base, parent = table["base_rates"]["A3"], table["parents"][0]
+    if case == "base_type":
+        table["base_rates"] = []
+    elif case == "parents_type":
+        table["parents"] = {}
+    elif case == "cells_type":
+        table["cells"] = {}
+    elif case == "base_row_type":
+        table["base_rates"]["A3"] = []
+    elif case == "parent_row_type":
+        table["parents"] = [[]]
+    elif case == "cell_row_type":
+        table["cells"] = [[]]
+    elif case.endswith("missing_estimate"):
+        {"base": base, "parent": parent, "cell": cell}[case.split("_")[0]].pop("se_loss")
+    elif case.endswith("missing_key"):
+        (parent if case.startswith("parent") else cell).pop("action")
+    elif case.endswith("extra_key"):
+        (parent if case.startswith("parent") else cell)["extra"] = 1
+    elif case == "base_action":
+        table["base_rates"]["A9"] = table["base_rates"].pop("A3")
+    elif case.endswith("action"):
+        (parent if case.startswith("parent") else cell)["action"] = "A9"
+    elif case.endswith("situation"):
+        (parent if case.startswith("parent") else cell)["situation"] = "S2"
+    elif case == "missing_base":
+        table["base_rates"] = {}
+    elif case == "missing_parent":
+        table["parents"] = []
+    elif case == "duplicate_parent":
+        table["parents"].append(dict(parent))
+    elif case == "duplicate_cell":
+        table["cells"].append(dict(cell))
+    elif case == "cell_features_type":
+        cell["features"] = []
+    elif case == "cell_feature_missing":
+        cell["features"].pop("trend_sma200")
+    elif case == "cell_feature_extra":
+        cell["features"]["unexpected"] = "above"
+    elif case == "cell_feature_value":
+        cell["features"]["trend_sma200"] = "unknown"
+    elif case == "schema_bool":
+        table["schema_version"] = True
+    elif case == "prior_float":
+        table["prior_strength"] = 100.0
+    elif case == "min_cell_float":
+        table["min_cell"] = 100.0
+    write_rehashed_table_model(path, cfg, model)
+    assert_rejected_without_effects(runner, path, cfg, monkeypatch)
+    assert "prob_table" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("case", ["lookback_type", "unknown_key", "missing_required"])
+def test_fix1_missing_model_with_invalid_legacy_field_never_enters_guard(
+        tmp_path, monkeypatch, runner, capsys, case):
+    path, cfg, _ = make_config(tmp_path)
+    for key in ("model_path", "model_sha256", "card_path", "experiment_sha256", "experiment"):
+        cfg.pop(key)
+    if case == "lookback_type":
+        cfg["lookback_bars"] = "2100"
+    elif case == "unknown_key":
+        cfg["lookbak_bars"] = 2100
+    else:
+        cfg.pop("symbol")
+    write_config(path, cfg)
+    # Deliberately omit --data-dir: an erroneous guard would target cwd/data/live.
+    monkeypatch.chdir(tmp_path)
+    assert_rejected_without_effects(runner, path, cfg, monkeypatch)
+    assert "配置预检失败" in capsys.readouterr().out
+
+
+def test_fix1_legacy_field_error_keeps_guarded_evidence(tmp_path, monkeypatch, runner):
+    path = write(tmp_path / "legacy.toml", f'''symbol = "XAUUSD"
+timeframe = "H1"
+strategy = "{H_STRATEGY}"
+magic = 780001
+lookback_bars = "2100"
+volume_lots = 0.01
+''')
+    monkeypatch.chdir(tmp_path)
+    assert runner.main(offline_args(path)) == 2
+    marker = read_json(tmp_path / "data/live/exit-runner.json")
+    assert marker["rc"] == 2 and "lookback_bars" in marker["reason"]
