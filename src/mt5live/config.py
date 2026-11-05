@@ -17,7 +17,9 @@ LiveConfig 只描述"跑什么"：品种、周期、策略（"module:Class"）�
 from __future__ import annotations
 
 import math
+import re
 import tomllib
+from pathlib import Path
 from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 
@@ -26,6 +28,12 @@ from mt5data.store import TIMEFRAME_SECONDS
 _DAY_SECONDS = 86400
 _SCALARS = (int, float, bool, str)
 MAX_RISK_FRACTION = 0.05       # 单笔风险占权益比例的保守上限（5%）
+MODEL_CONFIG_KEYS = frozenset({"model_path", "model_sha256", "card_path",
+                               "experiment_sha256", "experiment"})
+
+
+class ModelConfigError(ValueError):
+    """T78 新模型配置不完整；runner 在监控/运行状态写入前拒绝。"""
 
 
 def _is_int(v) -> bool:
@@ -34,6 +42,15 @@ def _is_int(v) -> bool:
 
 def _is_num(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _is_json_value(value) -> bool:
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _is_json_value(v) for k, v in value.items())
+    if isinstance(value, list):
+        return all(_is_json_value(v) for v in value)
+    return (value is None or isinstance(value, (str, bool, int))
+            or isinstance(value, float) and math.isfinite(value))
 
 
 @dataclass(frozen=True)
@@ -54,8 +71,40 @@ class LiveConfig:
     trigger_delay_s: float = 5.0        # bar 收盘后等待秒数（容差：等刷新进程落盘）
     heartbeat_path: str | None = None   # 心跳文件；None → {data_root}/live/heartbeat-<magic>.json
     created_utc: str | None = None      # 装载时间戳（仅审计用）
+    model_path: str | None = None       # T78：冻结 artifact；与 model_sha256 成对
+    model_sha256: str | None = None     # artifact 原始文件字节的 SHA256
+    card_path: str | None = None        # 显式卡；相对路径按配置文件目录解析
+    experiment_sha256: str | None = None  # 复算的装配指纹，绝非研究/发布批准
+    experiment: dict | None = None     # fingerprint 所需 data/cost/session 元信息
 
     def __post_init__(self):
+        supplied = {k for k in MODEL_CONFIG_KEYS if getattr(self, k) is not None}
+        if supplied:
+            missing = MODEL_CONFIG_KEYS - supplied
+            if missing:
+                raise ModelConfigError(f"模型配置须完整成组提供，缺 {sorted(missing)}")
+            for name in ("model_path", "card_path"):
+                value = getattr(self, name)
+                if not isinstance(value, str) or not value.strip():
+                    raise ModelConfigError(f"{name} 必须是非空路径字符串")
+            for name in ("model_sha256", "experiment_sha256"):
+                value = getattr(self, name)
+                if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+                    raise ModelConfigError(f"{name} 必须是 64 位十六进制 SHA256")
+                object.__setattr__(self, name, value.lower())
+            exp = self.experiment
+            required = {"bars_meta", "cost_version", "sessions_sha"}
+            if (not isinstance(exp, dict) or required - exp.keys()
+                    or exp.keys() - required - {"evaluator_sha"}):
+                raise ModelConfigError(
+                    "experiment 须含 bars_meta/cost_version/sessions_sha，"
+                    "只另允许 evaluator_sha（不读取行情/成本文件）")
+            if (not isinstance(exp["bars_meta"], dict) or not exp["bars_meta"]
+                    or not _is_json_value(exp["bars_meta"])):
+                raise ModelConfigError("experiment.bars_meta 必须是非空 JSON 表且数值有限")
+            for name in ("cost_version", "sessions_sha", "evaluator_sha"):
+                if name in exp and (not isinstance(exp[name], str) or not exp[name].strip()):
+                    raise ModelConfigError(f"experiment.{name} 必须是非空字符串")
         if not (isinstance(self.symbol, str) and self.symbol.strip()):
             raise ValueError(f"symbol 必须是非空字符串，收到 {self.symbol!r}")
         tf = self.timeframe.upper() if isinstance(self.timeframe, str) else ""
@@ -136,22 +185,45 @@ def load(path: str) -> LiveConfig:
     """
     try:
         with open(path, "rb") as f:
-            data = tomllib.load(f)
+            raw = f.read()
     except FileNotFoundError:
         raise FileNotFoundError(f"配置文件不存在：{path}") from None
-    except tomllib.TOMLDecodeError as exc:
-        raise ValueError(f"配置文件 {path} 不是合法 TOML：{exc}") from exc
+    try:
+        data = tomllib.loads(raw.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        # Malformed model declarations still fail before runtime state. Keep
+        # the legacy monitor path for malformed configurations without them.
+        keys = "|".join(sorted(MODEL_CONFIG_KEYS))
+        model_declared = re.search(
+            rf"(?m)^\s*(?:[\"']?(?:{keys})[\"']?\s*=|\[\s*[\"']?experiment(?:[\"']?\s*\]|\.))",
+            raw.decode("utf-8", errors="replace"))
+        error = ModelConfigError if model_declared else ValueError
+        raise error(f"配置文件 {path} 不是合法 TOML：{exc}") from exc
+    error = ModelConfigError if MODEL_CONFIG_KEYS & data.keys() else ValueError
     known = {f.name for f in fields(LiveConfig)}
     unknown = set(data) - known
     if unknown:
-        raise ValueError(f"未知配置项（可能是拼写错误）：{sorted(unknown)}")
+        raise error(f"未知配置项（可能是拼写错误）：{sorted(unknown)}")
     required = {"symbol", "timeframe", "strategy", "magic", "lookback_bars"}
     missing = required - set(data)
     if missing:
-        raise ValueError(f"缺少必填配置项：{sorted(missing)}")
+        raise error(f"缺少必填配置项：{sorted(missing)}")
     data.setdefault("created_utc",
                     datetime.now(timezone.utc).isoformat(timespec="seconds"))
     try:
-        return LiveConfig(**data)
-    except TypeError as exc:  # TOML 表嵌套给到标量字段等
-        raise ValueError(f"配置结构不符：{exc}") from exc
+        cfg = LiveConfig(**data)
+        resolved = {}
+        for name in ("model_path", "card_path"):
+            value = getattr(cfg, name)
+            if value is not None:
+                resolved[name] = str((Path(path).resolve().parent / value).resolve())
+        if resolved:
+            from dataclasses import replace
+            cfg = replace(cfg, **resolved)
+        return cfg
+    except (TypeError, ValueError) as exc:
+        if MODEL_CONFIG_KEYS & data.keys():
+            raise ModelConfigError(f"模型配置不合法：{exc}") from exc
+        if isinstance(exc, TypeError):
+            raise ValueError(f"配置结构不符：{exc}") from exc
+        raise

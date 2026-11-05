@@ -62,10 +62,12 @@ import argparse
 import hashlib
 import importlib
 import json
+import math
 import os
 import sys
 import time
-from dataclasses import replace
+import tomllib
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -73,7 +75,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mt5data.store import load_bars  # noqa: E402
 from mt5live.monitor import guarded_main, reset_watchdog  # noqa: E402
-from mt5live.config import LiveConfig, load as load_config  # noqa: E402
+from mt5live.config import LiveConfig, ModelConfigError, load as load_config  # noqa: E402
 from mt5live.executor import ExecutionAdapter, LiveExecutor, \
     validate_live_strategy  # noqa: E402
 from mt5live.gate import LiveSizer, RiskGate, load_contract_sizes  # noqa: E402
@@ -109,6 +111,161 @@ def load_strategy(path: str):
         return getattr(mod, class_name)
     except (ValueError, ImportError, AttributeError) as e:
         raise ValueError(f"无法装载策略 {path!r}：{e}") from e
+
+
+def _model_equal(actual, expected) -> bool:
+    """Strict JSON shape; bool is not a numeric identity value."""
+    if isinstance(expected, dict):
+        return (isinstance(actual, dict) and actual.keys() == expected.keys()
+                and all(_model_equal(actual[k], v) for k, v in expected.items()))
+    if isinstance(expected, (list, tuple)):
+        return (isinstance(actual, (list, tuple)) and len(actual) == len(expected)
+                and all(_model_equal(a, b) for a, b in zip(actual, expected)))
+    if isinstance(expected, (int, float)) and not isinstance(expected, bool):
+        return (isinstance(actual, (int, float)) and not isinstance(actual, bool)
+                and math.isfinite(actual) and actual == expected)
+    return type(actual) is type(expected) and actual == expected
+
+
+def _require_model_equal(name, actual, expected) -> None:
+    if not _model_equal(actual, expected):
+        raise ValueError(f"{name} 缺失/错配：{actual!r}，预期 {expected!r}")
+
+
+def load_live_strategy(cfg: LiveConfig, *, strategy_cls=None):
+    """T78: read-only preflight; consume a frozen artifact, never fit.
+
+    This checks assembly identity, not research approval. main separately refuses
+    every online fittable launch; no production model has an independent release.
+    """
+    cls = strategy_cls if strategy_cls is not None else load_strategy(cfg.strategy)
+    strategy = cls()
+    if not getattr(strategy, "fittable", False):
+        if cfg.model_path is not None:
+            raise ValueError("非 fittable 策略不接受冻结模型配置")
+        validate_live_strategy(strategy)
+        return strategy
+    if cfg.model_path is None:
+        raise ValueError("fittable 策略必须显式配置 model_path/model_sha256 及卡/实验绑定")
+
+    from mt5quant.prob.artifact import load_model
+    from mt5quant.research.cards import validate_card
+    from mt5quant.research.gate import experiment_fingerprint
+    from mt5quant.strategies.library.prob.level_decision import (
+        ALL_HYPOTHESES, PROB_VERSION, LevelDecisionV1, parse_hypothesis_pairs,
+    )
+
+    if not isinstance(strategy, LevelDecisionV1):
+        raise ValueError("T78 冻结模型装载仅支持 LevelDecisionV1 策略族")
+    model = load_model(cfg.model_path, expected_sha256=cfg.model_sha256)
+    if not isinstance(model, dict):
+        raise ValueError("冻结模型须为 JSON 对象")
+    params = strategy.validate_params(dict(cfg.params))
+    if cfg.lookback_bars < strategy.required_data.lookback_bars:
+        raise ValueError("lookback_bars 小于策略声明的预热下限")
+    _require_model_equal("strategy.SYMBOLS", strategy.SYMBOLS, [cfg.symbol])
+    _require_model_equal("strategy.TIMEFRAME", strategy.TIMEFRAME, cfg.timeframe.upper())
+    _require_model_equal("required_data.timeframe", strategy.required_data.timeframe,
+                         cfg.timeframe.upper())
+    bracket = dict(sl_atr=strategy.SL_ATR, tp_atr=strategy.TP_ATR,
+                   horizon_bars=strategy.HORIZON_BARS)
+    expected = {
+        "schema_version": 1, "prob_version": PROB_VERSION,
+        "symbols": [cfg.symbol], "timeframe": cfg.timeframe.upper(),
+        "bracket": bracket, "situations": list(strategy.SITUATIONS),
+        "features": list(strategy.FEATURES),
+        "policy": dict(z=strategy.POLICY.z, threshold_mult=strategy.POLICY.threshold_mult),
+        "allowed_hypotheses": strategy._allowed_model_entries(),
+        "purge_bars": strategy.HORIZON_BARS + 2,
+    }
+    if not expected["allowed_hypotheses"]:
+        raise ValueError("ALLOWED_HYPOTHESES 必须显式非空")
+    for key, value in expected.items():
+        _require_model_equal(f"model.{key}", model.get(key), value)
+    if type(model["schema_version"]) is not int or type(model["purge_bars"]) is not int:
+        raise ValueError("model.schema_version/purge_bars 必须是整数")
+    window = model.get("fit_window")
+    if not isinstance(window, dict) or set(window) != {"start", "end"}:
+        raise ValueError("model.fit_window 须完整声明 start/end")
+    dates = []
+    for key in ("start", "end"):
+        raw = window[key]
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError(f"model.fit_window.{key} 必须是 ISO 时间字符串")
+        date = datetime.fromisoformat(raw)
+        dates.append(date.replace(tzinfo=timezone.utc) if date.tzinfo is None
+                     else date.astimezone(timezone.utc))
+    start, end = dates
+    if not start < end <= now_utc().replace(tzinfo=timezone.utc):
+        raise ValueError("model.fit_window 须 start < end 且训练结束不晚于当前时刻")
+
+    # Parse and fingerprint the same card bytes; no ledger, rounds or data read.
+    card_path = Path(cfg.card_path)
+    card_bytes = card_path.read_bytes()
+    card = validate_card(tomllib.loads(card_bytes.decode("utf-8")), source=str(card_path))
+    if card.id != card_path.stem or not card.strategy:
+        raise ValueError("card 文件名须与 id 一致，并显式绑定 strategy")
+    for name, actual, want in (
+            ("strategy", card.strategy, cfg.strategy),
+            ("symbols", card.symbols, [cfg.symbol]),
+            ("timeframe", card.timeframe, cfg.timeframe.upper()),
+            ("evaluation_mode", card.evaluation_mode, "standard"),
+            ("segment", card.segment, "validation")):
+        _require_model_equal(f"card.{name}", actual, want)
+    if set(card.params) != set(params) or any(
+            not any(_model_equal(value, candidate) for candidate in card.params[name])
+            for name, value in params.items()):
+        raise ValueError("params 与显式卡参数网格不符")
+    prob = card.prob
+    if not isinstance(prob, dict):
+        raise ValueError("card 缺 [prob] 决策配置")
+    card_expected = {
+        "bracket": bracket, "situations": strategy.SITUATIONS,
+        "features": strategy.FEATURES, "level_grid": strategy.LEVEL_GRID or {},
+        "approach": asdict(strategy.APPROACH), "breakout_atr": strategy.BREAKOUT_ATR,
+        "retest_window_bars": strategy.RETEST_WINDOW_BARS,
+        "prior_strength": strategy.PRIOR_STRENGTH, "min_cell": strategy.MIN_CELL,
+        "lb_z": strategy.POLICY.z, "entry_threshold_cost_mult": strategy.POLICY.threshold_mult,
+    }
+    for key, value in card_expected.items():
+        _require_model_equal(f"card.prob.{key}", prob.get(key), value)
+    allowed = strategy._allowed_hypotheses()
+    effective = {(s, a) for s in strategy.SITUATIONS for a in ALL_HYPOTHESES
+                 if (s, a) in allowed or ("*", a) in allowed}
+    if parse_hypothesis_pairs(prob["hypotheses"]) != effective:
+        raise ValueError("card hypotheses 与模型/策略的有效 allowed 集合不一致")
+
+    table = model.get("prob_table")
+    if not isinstance(table, dict):
+        raise ValueError("model.prob_table 必须是对象")
+    for key, value in {"group_by": list(strategy.FEATURES),
+                       "prior_strength": strategy.PRIOR_STRENGTH,
+                       "min_cell": strategy.MIN_CELL}.items():
+        _require_model_equal(f"model.prob_table.{key}", table.get(key), value)
+    costs = model.get("cost_r_by_situation_action")
+    if not isinstance(costs, dict):
+        raise ValueError("model 缺 cost_r_by_situation_action")
+    for key, value in costs.items():
+        if (not isinstance(key, str) or tuple(key.split("|")) not in effective
+                or not isinstance(value, (int, float)) or isinstance(value, bool)
+                or not math.isfinite(value) or value < 0):
+            raise ValueError("model.cost_r_by_situation_action 格式/范围不符")
+
+    fingerprint = experiment_fingerprint(
+        strategy_ref=cfg.strategy, card=card.id, model_dict=model,
+        params={"strategy_params": params,
+                "card_sha256": hashlib.sha256(card_bytes).hexdigest()},
+        features=model["features"], **cfg.experiment)
+    if not fingerprint["components"]["code"]["files"]:
+        raise ValueError("experiment 策略闭包身份不可复算")
+    if fingerprint["sha256"] != cfg.experiment_sha256:
+        raise ValueError("experiment_sha256 与卡/策略/参数/冻结模型的装配指纹不符")
+    loaded = strategy.with_model(model)       # immutable protocol: retain NEW instance
+    if loaded is strategy or type(loaded) is not type(strategy):
+        raise ValueError("with_model 必须返回同策略类型的新实例")
+    validate_live_strategy(loaded)
+    loaded._check_exit_rules_consistency()
+    return loaded
 
 
 def now_utc() -> datetime:
@@ -396,21 +553,47 @@ def main(argv=None) -> int:
         cfg = load_config(args.config)
         if args.data_dir is not None:
             cfg = replace(cfg, data_root=os.path.abspath(args.data_dir), heartbeat_path=None)
+    except ModelConfigError as exc:
+        print(f"模型配置预检失败：{exc}")
+        return 2
     except Exception:
         def invalid():
             return load_config(args.config)
         return guarded_main("runner", os.path.join(args.data_dir or "data", "live"),
                             args.poll_interval, invalid)
+    try:
+        cls = load_strategy(cfg.strategy)
+    except Exception as exc:
+        if cfg.model_path is not None:
+            print(f"模型策略预检失败：{exc}")
+            return 2
+        # Legacy H startup exceptions still have guarded_main fatal evidence.
+        def invalid_strategy(error=exc):
+            raise error
+        return guarded_main(f"runner-{cfg.magic}", os.path.join(cfg.data_root, "live"),
+                            args.poll_interval, invalid_strategy)
+    strategy = None
+    if getattr(cls, "fittable", False) or cfg.model_path is not None:
+        try:
+            if getattr(cls, "fittable", False) and not (
+                    args.paper and args.dry_run and args.offline):
+                raise ValueError(
+                    "fittable 在线模型尚无独立 release；仅允许 --paper --dry-run --offline "
+                    "合成装配验证。哈希/自填批准不构成研究或部署许可")
+            strategy = load_live_strategy(cfg, strategy_cls=cls)
+        except Exception as exc:
+            print(f"模型策略预检失败：{exc}")
+            return 2
     return guarded_main(f"runner-{cfg.magic}", os.path.join(cfg.data_root, "live"),
-                        args.poll_interval, lambda: _run(args, cfg))
+                        args.poll_interval,
+                        lambda: _run(args, cfg, strategy if strategy is not None else cls()))
 
 
-def _run(args, cfg: LiveConfig) -> int:
+def _run(args, cfg: LiveConfig, strategy) -> int:
     if args.offline and not args.dry_run:
         print("× --offline 只能配合 --dry-run 使用（实盘必须有终端行情源）")
         return 2
-    strategy = load_strategy(cfg.strategy)()
-    validate_live_strategy(strategy)          # M1：未实现的出场规则拒启动
+    validate_live_strategy(strategy)          # M1：旧非 fittable 拒绝仍经监控记录
 
     # T33/L3：实盘（会下真实单的模式）缺点差模型文件 → 拒绝启动——点差
     # 闸门不能静默关闭；确要关闭必须显式 --no-spread-gate（启动日志标红）。
