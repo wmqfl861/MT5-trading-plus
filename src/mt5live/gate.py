@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from mt5data.sessions import SessionPolicy
+from mt5live.fileio import file_lock
 from mt5live.monitor import (
     ALERT_RISK_REJECT,
     TRADE_ENTRY_KINDS,
@@ -382,16 +383,22 @@ class RiskGate:
     # ---- 内部 ----
 
     def _pause_decision(self, magic: int, now: datetime) -> RiskDecision | None:
+        strict = bool(self._process.config.line_caps)
+        pause_path = os.path.join(self._live_dir, PAUSE_MAGIC_FMT.format(magic=magic))
         try:
-            mismatch = read_reconcile_block(self._live_dir, magic)
+            # Same lock as reconcile and cooperating manual writers: a reason
+            # handoff must not splice "no block" and a later "manual false".
+            # Only file reads are protected; account/market IPC and orders stay
+            # outside this short critical section.
+            with file_lock(pause_path + ".lock"):
+                mismatch = read_reconcile_block(self._live_dir, magic)
+                paused = read_pause(self._live_dir, magic, strict=strict)
         except (OSError, ValueError) as e:
-            reason = f"reconcile_block_unreadable: magic {magic}: {e}"
+            reason = f"pause_snapshot_unreadable: magic {magic}: {e}"
             append_alert(self._live_dir, ALERT_PAUSE_UNREADABLE, reason, now)
             return RiskDecision(False, reason)
         if mismatch is not None:
             return RiskDecision(False, f"reconcile_paused: magic {magic}: reconcile_mismatch")
-        strict = bool(self._process.config.line_caps)
-        paused = read_pause(self._live_dir, magic, strict=strict)
         if paused.paused:
             if paused.unreadable:
                 append_alert(self._live_dir, ALERT_PAUSE_UNREADABLE,

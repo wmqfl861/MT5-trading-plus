@@ -4,7 +4,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from threading import Event
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -650,6 +650,197 @@ def test_fix1_raw_paper_manual_zero_and_line_magics_remain_compatible(tmp_path):
         c.trade(magic, 0, f"close-{magic}")
     assert not c.view.positions()
     assert {d.magic for d in c.view.snapshot().deals} == {0, H, P}
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_fix2_pause_reason_handoff_is_one_gate_snapshot(tmp_path, monkeypatch, enabled):
+    from mt5live import gate as gate_module, reconcile
+    from mt5live.fileio import file_lock
+
+    c = Chain(tmp_path, enabled=enabled)
+    pause_path = c.live / f"pause-{H}.json"
+    lock_path = str(pause_path) + ".lock"
+    manual_true = {"paused": True, "reason": "manual", "owner": "operator"}
+    with file_lock(lock_path):
+        write_json_atomic(str(pause_path), manual_true)
+    write_intent(str(c.live / f"expected-{H}.json"),
+                 Intent("XAUUSD", H, "buy", 0.01, "confirmed", "handoff-mismatch", NOW))
+    block_read, resume_reader, writer_waited = Event(), Event(), Event()
+    real_read = gate_module.read_reconcile_block
+    real_writer_lock = reconcile.file_lock
+
+    def paused_after_real_read(live_dir, magic):
+        result = real_read(live_dir, magic)
+        if magic == H and not block_read.is_set():
+            assert result is None  # Original disk value, never a fake response.
+            block_read.set()
+            assert resume_reader.wait(5)
+        return result
+
+    @contextmanager
+    def observe_real_writer_contention(path, **kwargs):
+        if path != lock_path:
+            with real_writer_lock(path, **kwargs):
+                yield
+            return
+        # Test the same actual kernel lock. Old Gate: writer acquires it and
+        # completes the handoff before releasing the reader. Fixed Gate: this
+        # attempt times out, proving the reader holds it; release that reader
+        # and let the real reconcile call retry its unmodified write sequence.
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(real_writer_lock(path, attempts=1, retry_s=0.01, **kwargs))
+            except TimeoutError:
+                writer_waited.set()
+                resume_reader.set()
+            else:
+                yield
+                return
+        with real_writer_lock(path, **kwargs):
+            yield
+
+    def handoff_writer():
+        assert block_read.wait(5)
+        try:
+            assert c.reconcile() == 1
+            assert (c.live / f"reconcile-block-{H}.json").exists()
+            with file_lock(lock_path):
+                write_json_atomic(str(pause_path), dict(manual_true, paused=False))
+        finally:
+            resume_reader.set()
+
+    monkeypatch.setattr(gate_module, "read_reconcile_block", paused_after_real_read)
+    monkeypatch.setattr(reconcile, "file_lock", observe_real_writer_contention)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        writer = pool.submit(handoff_writer)
+        try:
+            report = c.trade(H, 1, "pause-reason-handoff")
+        finally:
+            resume_reader.set()
+        writer.result(timeout=5)
+    assert report.action == "risk_rejected", report
+    assert report.orders == () and not c.brokers[H].positions()
+    assert not c.brokers[H].deals(NOW - timedelta(seconds=1), NOW)
+    assert writer_waited.is_set(), "the writer must wait for the Gate's pause snapshot"
+    assert read_pause(str(c.live), H).paused is False
+    assert (c.live / f"reconcile-block-{H}.json").exists()
+    assert not c.open_check(H).allowed
+    assert c.open_check(P).allowed
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_fix2_pause_lock_timeout_rejects_open_but_allows_close(tmp_path, monkeypatch, enabled):
+    from mt5live import gate as gate_module
+    from mt5live.fileio import file_lock
+
+    c = Chain(tmp_path, enabled=enabled)
+    # Unconfigured magics isolate Gate's pause lock from the risk process's
+    # separate compatibility-output locks, which are already tested by fix1.
+    opening_magic, closing_magic = H - 1, H - 2
+    c.add(opening_magic)
+    c.add(closing_magic)
+    c.trade(closing_magic, 1, "position-to-close")
+    h_lock = str(c.live / f"pause-{opening_magic}.json.lock")
+    p_lock = str(c.live / f"pause-{closing_magic}.json.lock")
+    held, release = Event(), Event()
+
+    def cooperating_writer():
+        with file_lock(h_lock), file_lock(p_lock):
+            held.set()
+            assert release.wait(5)
+
+    @contextmanager
+    def short_reader_budget(path, **kwargs):
+        with file_lock(path, attempts=2, retry_s=0.01, **kwargs):
+            yield
+
+    monkeypatch.setattr(gate_module, "file_lock", short_reader_budget, raising=False)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        writer = pool.submit(cooperating_writer)
+        try:
+            assert held.wait(5)
+            rejected = c.trade(opening_magic, 1, "lock-timeout-open")
+            closed = c.trade(closing_magic, 0, "lock-timeout-close")
+        finally:
+            release.set()
+        writer.result(timeout=5)
+    assert rejected.action == "risk_rejected" and "pause" in rejected.error
+    assert not c.brokers[opening_magic].positions()
+    assert [order.kind for order in closed.orders] == ["close"]
+    assert not c.brokers[closing_magic].positions()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_fix2_pause_lock_is_released_before_account_market_and_order_calls(tmp_path, monkeypatch, enabled):
+    from mt5live.fileio import file_lock
+
+    c = Chain(tmp_path, enabled=enabled)
+    path = str(c.live / f"pause-{H}.json.lock")
+    seen = []
+    real_snapshot = c.view.snapshot
+    real_quote = c.market.quote
+    real_order = c.brokers[H].market_order
+
+    def snapshot():
+        with file_lock(path, attempts=1, retry_s=0.01):
+            seen.append("snapshot")
+        return real_snapshot()
+
+    def quote(symbol):
+        with file_lock(path, attempts=1, retry_s=0.01):
+            seen.append("quote")
+        return real_quote(symbol)
+
+    def order(*args, **kwargs):
+        with file_lock(path, attempts=1, retry_s=0.01):
+            seen.append("order")
+        return real_order(*args, **kwargs)
+
+    monkeypatch.setattr(c.view, "snapshot", snapshot)
+    monkeypatch.setattr(c.market, "quote", quote)
+    monkeypatch.setattr(c.brokers[H], "market_order", order)
+    report = c.trade(H, 1, "short-critical-section")
+    assert report.action == "open" and len(c.brokers[H].positions()) == 1
+    assert {"snapshot", "quote", "order"} <= set(seen)
+
+
+def test_fix2_account_cap_precedes_contended_pause_read_and_still_flattens(tmp_path, monkeypatch):
+    from mt5live import gate as gate_module
+    from mt5live.fileio import file_lock
+
+    c = Chain(tmp_path)
+    c.trade(H, 1, "h-open")
+    c.trade(P, 1, "p-open")
+    c.mark(1750)
+    lock_path = str(c.live / f"pause-{H}.json.lock")
+    held, release, attempted = Event(), Event(), Event()
+
+    def cooperating_writer():
+        with file_lock(lock_path):
+            held.set()
+            assert release.wait(5)
+
+    @contextmanager
+    def observed_reader(path, **kwargs):
+        attempted.set()
+        with file_lock(path, attempts=1, retry_s=0.01, **kwargs):
+            yield
+
+    monkeypatch.setattr(gate_module, "file_lock", observed_reader, raising=False)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        writer = pool.submit(cooperating_writer)
+        try:
+            assert held.wait(5)
+            verdict = c.open_check(H)
+        finally:
+            release.set()
+        writer.result(timeout=5)
+    assert verdict.flatten_all and verdict.halt
+    assert not attempted.is_set(), "account consequence must precede pause lock acquisition"
+    for magic in (H, P):
+        c.executors[magic].poll(None, NOW)
+    assert not c.view.positions()
+    assert (c.live / "halt.json").exists()
 
 
 BASE_TOML = '''version = 1
