@@ -4,7 +4,7 @@
 
 ## 入口与信任边界
 
-`scripts/pline_feasibility.py` 保留无 `--mode` 的原 synthetic 命令；显式 `--mode production --release-id ID --release-manifest FILE --output NEW_DIR` 走字节准入。这两类参数互斥。生产注册表固定于受审代码、初始为空，仅映射 release ID 到清单 **raw bytes SHA256**；当前撤回快照也由代码提供，没有 JSON、CLI 或环境变量覆盖。未知 release 在打开清单及 data/cost 前拒绝，不创建输出或消费记录。未来新增真实条目、当前快照与原审核来源仍需独立 review，不能由实现者自填。
+`scripts/pline_feasibility.py` 保留无 `--mode` 的原 synthetic 命令；显式 `--mode production --release-id ID --release-manifest FILE --output NEW_DIR` 走字节准入。这两类参数互斥。固定静态 `production_releases.py` 仅承载 `SNAPSHOT_JSON` 字面量；正式版本为空、未初始化、无有效期，不宣称 fresh。适配器核对其实际 HEAD 与原登记来源 Git blob、工作树原 bytes，再解析数据，不执行信任文件。完整快照包含 schema、initialized、正整数版本、有效区间、registry、states 和 context；所有登记条目须明确 active/revoked，缺状态或未知状态值属 invalid，合法 registry 中无请求 ID 才是 unknown。无 JSON、CLI 或环境变量覆盖信任；未来真实登记仍需独立 review。未知/撤回/过期等拒绝不读材料、不建输出或 execution claim，但可信完整的新版本会保留观察水位。初始未初始化快照不创建状态。
 
 `check_t121_admission(input_meta, cost_meta, review_binding)` 只是无 IO/clock 的声明摘要，恒为 `unverified` / `not_released`，不是完整元数据认证器，也不创建许可。`verify_artifact_bytes(raw, expected_ref)` 先核验文件原字节摘要，再解析传入的同批 bytes；不接受 canonical 摘要冒充文件身份。
 
@@ -17,19 +17,23 @@
 - input 为 `t121-input-v1`，两品种各含 bars、source_tags、显式 gap_spans；source manifest 为 `t121-sources-v1`，逐品种含 used_years、sources、excluded_months、覆盖申请范围的连续来源 segments。实际 bars 还需符合这些身份与范围；未知 source tag 保留旧规则的 waiting_data。
 - 每个品种的 spread/slippage/commission/contract/overshoot/swap 六项均独立绑定工件、source ref、用途、品种、原账户范围、观测/适用半开区间、basis/units/conversion_basis、精确 dependencies。v1 只接直接原工件（source ref 等于 artifact ref），未定义转换的来源保持拒绝。slippage→spread，commission/swap→contract 依赖身份逐项核对。
 - 原审核记录为 `t121-review-v1`，绑定 record/authority/reviewer/independence、结论、审核时刻及有效期，其 canonical-json-v1 摘要覆盖清单除 review_ref 以外的全部字段；review_ref 又以 raw bytes 绑定原记录。可信性来自固定注册表，单独填写 approved/hash 无效。非空 conditions 必须有逐项原始闭合证据。
-- `code` 绑定完整 Git HEAD 和入口、适配器、计数成本依赖的原文件字节摘要；`rules` 绑定原 RULES 的 canonical-json-v1 和预注册的 git-blob-bytes，后者沿用旧固定 SHA，不把 Windows 检出换行与 Git blob 摘要混用。
+- `code.repo_commit` 是稳定实现提交 I，固定 `CODE_FILES` 每项绑定 `raw_sha256` 与 `git_blob_sha256`；只排除静态 trust 数据文件，不允许调用者改闭包。I 必须是实际 HEAD H 的祖先，同时 I/H 的每个闭包 Git blob、工作树 bytes、本进程装载时的源码 bytes 须相符。只接受 exact bytes 或 Windows 明确完整 LF→CRLF 映射；不执行 Git filters/hooks。`rules` 绑定原 RULES 的 canonical-json-v1 和预注册 git-blob-bytes。清单绑定预定版本 v，不绑定最终 trust 摘要/登记 H；因此可以先固定 I、封印 manifest/review，再仅提交 trust 的 manifest rawSHA 登记。回执另记实际 H、I、完整快照 canonical 摘要及 trust raw/Git 身份和来源提交。
 
 2026 经验摘要不能参与本用途；charged 生产格式仍拒绝。free 仍限已绑定的 Demo/USD 原账户单项，并不能补齐其他成本；未获独立 release 不会因字段完整而执行。获准路径的缺值、无覆盖和不足日数保持原等待/失败规则，不能推导 feasible。
 
 ## 一次消费与内核
 
-入口读取系统 UTC clock，检查当前信任/撤回版本、清单、原审核、范围、条件和代码规则；data/cost 读取前以独占创建、文件 fsync 和持久快照版本记录原子占用 execution_id。生产根取 OS 用户 profile 下固定状态目录，不受 HOME、APPDATA、XDG、数据根、输出或 worktree 影响；同一 execution ID 不能换 release 重用。进程中断留下 claim/锁，读取、解析、计算和输出失败不回收。旧快照不能降低已持久记录的版本，也不提供自动清理/重试许可接口。
+在固定状态根的同一互斥协议内，先核对信任来源/完整结构/合法时间区间并持久观察版本与 canonical 摘要，再判 requested release 与当前有效性。可信更高版本即使 revoked、合法 unknown、过期或未生效也推进水位；invalid/未初始化不推进。同版本同摘要可重复观察，同版本异摘要或低版本拒绝且不覆盖，摘要不包含路径/HEAD/观察时刻。active 后清单/审核失败也不回退水位。水位损坏或持久化异常 fail closed，不清空、不降级。
+
+读取 data/cost 前，claim 在同一共享锁内重新加载受信快照和系统 UTC clock、比较当前版本/摘要与持久水位、重查 active/manifest rawSHA、清单/审核时效及条件、实现闭包；最后独占创建并 fsync execution claim。新版水位先持久完成则旧 claim 拒绝；claim 先持久完成属于已消费执行，不提供运行中撤回。生产根取 OS 用户 profile 固定目录，不受 HOME、APPDATA、XDG、数据根、输出或 worktree 影响。同一 execution ID 不能换 release 重用；进程中断留下 claim/锁，读取、解析、计算和输出失败不回收，无自动清理/重试许可接口。
 
 占用后各工件每路径读一次，核验和解析复用内存 bytes。只窄提取已有 `_run_feasibility_kernel` / `_trigger_cost_kernel`，保持计数、资格、成本公式、96 行与 8 汇总。原公开 `run_feasibility` / `trigger_cost` 仍只接受 synthetic，production 工件没有改标 synthetic。新输出独占目录，receipt 包含 release/context/执行身份、manifest raw hash、各工件/代码/规则摘要和 report hash。
 
 ## 合成验证范围与限制
 
-私有 fixture 仅在测试中 patch 内部 trust/clock/state，生产 CLI 无测试开关。验证真实 main 经字节准入到非零触发和手算成本、同批 bytes、独占输出、未知 release 读前拒绝、双摘要域、篡改、范围/账户/时效/撤回/条件、失败后不回收、两进程竞争和新解释器重启。跨路径测试从临时源代码副本加载入口并复用同一隔离状态，未创建第二个注册 Git worktree。
+原私有边界 fixture 仅在测试中隔离 trust/clock/state，生产 CLI 无测试开关。fix1 的登记验收在临时真实 Git 历史执行 I→封印合成 manifest/review→仅提交 trust→新解释器正常 loader/main，启动器仅隔离 clock/state，不 patch trust、Git、准入或 claim 判断，验证 96/8、非零触发及已知非零成本。真实新进程验证 v2 revoked/合法 unknown/过期/未生效水位阻止旧 v1 副本、同版本冲突、未登记 trust/来源错/祖先闭包变化拒绝；以文件 IO 同步控制旧初检完成后新撤回先持久，旧进程再尝试 claim，禁止 data/cost 读取。已知 active 的重复 execution 可先读绑定 manifest/review 获取执行 ID，但须在 data/cost 与内核前拒绝，原 claim 不变。未知/撤回路径仍禁止所有材料读取。
+
+原合成验证继续覆盖真实计数/成本、同批 bytes、独占输出、摘要域、篡改、范围/账户/时效/条件、失败不回收、两进程竞争及新解释器重启。跨路径使用临时完整 Git 源码副本和共享隔离状态，不创建第二个正式注册工作树；这些临时登记仅为生成的测试数据。
 
 冷 import guard 在首次工程包导入前阻止 labels/tables/P1、backtest、research、SQLite、MT5/live 导入。旧冻结 gaps/volatility 允许导入 `mt5data.store` 的常量/函数定义；测试不调用 store IO，未改冻结依赖。聚焦回归包含完整旧 T121 测试（含读取受版本控制的公开冻结 `config/sessions.toml` 的原 CLI 用例），另以临时合成 sessions 验证旧 CLI 冷启动兼容。
 

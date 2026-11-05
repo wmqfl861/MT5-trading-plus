@@ -62,7 +62,7 @@ def ref_file(directory, name, value, *, format="json"):
             "path": name, "format": format, "digest_domain": "raw-bytes", "sha256": sha(raw)}
 
 
-def make_bundle(directory, adapter, *, count=2200):
+def make_bundle(directory, adapter, *, count=2200, code_root=ROOT):
     directory.mkdir(exist_ok=True)
     symbols, sources, costs = {}, {}, {}
     for symbol in ("XAUUSD", "EURUSD"):
@@ -108,8 +108,11 @@ def make_bundle(directory, adapter, *, count=2200):
         "scope": scope, "input_ref": ref_file(directory, "input.json", {"schema": "t121-input-v1", "symbols": symbols}),
         "source_manifest_ref": ref_file(directory, "sources.json", {"schema": "t121-sources-v1", "symbols": sources}),
         "sessions_ref": ref_file(directory, "sessions.toml", SESSIONS, format="toml"), "costs": costs,
-        "code": {"repo_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-                 "files": {p: sha((ROOT / p).read_bytes()) for p in adapter.CODE_FILES}},
+        "code": {"repo_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=code_root, text=True).strip(),
+                 "files": {p: {"raw_sha256": sha((code_root / p).read_bytes()),
+                               "git_blob_sha256": sha(subprocess.check_output(
+                                   ["git", "cat-file", "blob", "HEAD:" + p], cwd=code_root))}
+                           for p in adapter.CODE_FILES}},
         "rules": {"version": "t121-offline-v1", "digest_domain": "canonical-json-v1", "sha256": sha(encoded(RULES)),
                   "prereg_digest_domain": "git-blob-bytes",
                   "prereg_sha256": "c78a78d13ed81c611b5f9599c96235d7bbcefceac6fda54566b103f3e8cb3235"},
@@ -133,7 +136,9 @@ def reseal(bundle):
 
 
 def install_trust(monkeypatch, adapter, bundle, **overrides):
-    values = dict(version=1, valid_from="2026-11-04T00:00:00Z", expires_at="2026-11-06T00:00:00Z",
+    values = dict(schema="t121-trust-v1", initialized=True, version=1,
+                  source={"head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=adapter.ROOT, text=True).strip()},
+                  valid_from="2026-11-04T00:00:00Z", expires_at="2026-11-06T00:00:00Z",
                   registry={bundle.manifest["release_id"]: sha(bundle.raw)},
                   states={bundle.manifest["release_id"]: "active"}, context="isolated-synthetic-fixture")
     values.update(overrides)
@@ -147,10 +152,17 @@ def args_for(bundle):
             "--release-manifest", str(bundle.directory / "release.json"), "--output", str(bundle.out)]
 
 
+@pytest.fixture(scope="module")
+def implementation_repo(tmp_path_factory):
+    return make_code_repo(tmp_path_factory.mktemp("t121-implementation") / "code")
+
+
 @pytest.fixture
-def bundle(tmp_path, monkeypatch):
+def bundle(tmp_path, monkeypatch, implementation_repo):
     adapter = load_adapter()
-    value = make_bundle(tmp_path, adapter)
+    monkeypatch.setattr(adapter, "ROOT", implementation_repo)
+    value = make_bundle(tmp_path, adapter, code_root=implementation_repo)
+    value.code_root = implementation_repo
     install_trust(monkeypatch, adapter, value)
     return value
 
@@ -221,7 +233,7 @@ def test_manifest_rejection_precedes_artifact_read_and_claim(bundle, monkeypatch
     for filename in ("input.json", "sources.json", "sessions.toml"):
         (bundle.directory / filename).unlink()
     assert load_cli().main(args_for(bundle)) == 2
-    assert not bundle.state.exists() and not bundle.out.exists()
+    assert not list(bundle.state.glob("*.claim")) and not bundle.out.exists()
 
 
 @pytest.mark.parametrize("missing", ["scope", "input_ref", "source_manifest_ref", "sessions_ref", "review_ref", "code", "rules", "conditions", "execution_id"])
@@ -234,7 +246,7 @@ def test_missing_manifest_bindings_are_not_inferred(bundle, monkeypatch, missing
         (bundle.directory / "release.json").write_bytes(bundle.raw)
     install_trust(monkeypatch, load_adapter(), bundle)
     assert load_cli().main(args_for(bundle)) == 2
-    assert not bundle.state.exists() and not bundle.out.exists()
+    assert not list(bundle.state.glob("*.claim")) and not bundle.out.exists()
 
 
 @pytest.mark.parametrize("part", PARTS)
@@ -243,14 +255,14 @@ def test_six_component_binding_required_before_read(bundle, monkeypatch, part):
     reseal(bundle)
     install_trust(monkeypatch, load_adapter(), bundle)
     assert load_cli().main(args_for(bundle)) == 2
-    assert not bundle.state.exists()
+    assert not list(bundle.state.glob("*.claim"))
 
 
 @pytest.mark.parametrize("state", [None, "unknown", "revoked"])
 def test_unknown_or_revoked_snapshot_never_consumes(bundle, monkeypatch, state):
     install_trust(monkeypatch, load_adapter(), bundle, states={} if state is None else {"fixture-release": state})
     assert load_cli().main(args_for(bundle)) == 2
-    assert not bundle.state.exists() and not bundle.out.exists()
+    assert not list(bundle.state.glob("*.claim")) and not bundle.out.exists()
 
 
 @pytest.mark.parametrize("change", ["expired", "future", "old-version"])
@@ -259,7 +271,7 @@ def test_snapshot_freshness_is_trusted_not_caller_as_of(bundle, monkeypatch, cha
                  "future": {"valid_from": "2026-11-06T00:00:00Z"}, "old-version": {"version": 2}}[change]
     install_trust(monkeypatch, load_adapter(), bundle, **overrides)
     assert load_cli().main(args_for(bundle)) == 2
-    assert not bundle.state.exists()
+    assert not list(bundle.state.glob("*.claim"))
 
 
 @pytest.mark.parametrize("target", ["release.json", "review.json", "input.json", "XAUUSD-spread.json", "sessions.toml"])
@@ -332,15 +344,19 @@ if action == "state-root":
     print(adapter._state_root())
     raise SystemExit(0)
 if action != "unknown":
-    adapter._trust_snapshot = lambda: SimpleNamespace(version=1,
+    adapter._trust_snapshot = lambda: SimpleNamespace(schema="t121-trust-v1", initialized=True, version=1,
+        source={"head": adapter._git("rev-parse", "HEAD").decode().strip()},
         valid_from="2026-11-04T00:00:00Z", expires_at="2026-11-06T00:00:00Z",
         registry={"fixture-release": manifest_sha}, states={"fixture-release": "active"},
         context="isolated-synthetic-fixture")
     adapter._clock = lambda: datetime(2026, 11, 5, tzinfo=timezone.utc)
 adapter._state_root = lambda: Path(state)
 if action == "unknown":
-    def forbidden_read(*args, **kwargs):
-        raise AssertionError("unknown release read artifact")
+    original_read = Path.read_bytes
+    def forbidden_read(path):
+        if path.is_relative_to(Path(bundle_path)):
+            raise AssertionError("unknown release read artifact")
+        return original_read(path)
     Path.read_bytes = forbidden_read
 cli = runpy.run_path(str(Path(root) / "scripts/pline_feasibility.py"))
 result = cli["main"](["--mode", "production", "--release-id", "fixture-release",
@@ -352,7 +368,7 @@ raise SystemExit(result)
 
 
 def child_command(bundle, action="run", output=None):
-    return [sys.executable, "-I", "-c", COLD_GUARD, str(ROOT), str(bundle.directory),
+    return [sys.executable, "-I", "-B", "-c", COLD_GUARD, str(bundle.code_root), str(bundle.directory),
             str(output or bundle.out), str(bundle.state), sha(bundle.raw), action]
 
 
@@ -366,14 +382,9 @@ def test_cold_main_two_process_claim_restart_and_other_checkout(bundle, tmp_path
     # A copied checkout (including the same Git identity) runs a fresh interpreter.
     # Do not register a second worktree: this task owns exactly one Git worktree.
     other = tmp_path / "other-worktree"
-    other.mkdir()
-    adapter = load_adapter()
-    for name in (*adapter.CODE_FILES, adapter.PREREG, ".git"):
-        target = other / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(ROOT / name, target)
+    shutil.copytree(bundle.code_root, other)
     command = child_command(bundle, output=other / "output")
-    command[4] = str(other)
+    command[5] = str(other)
     restart = subprocess.run(command, cwd=other, capture_output=True, text=True, timeout=60)
     assert restart.returncode == 2 and "consumed" in restart.stderr
     assert not (other / "output").exists()
@@ -387,7 +398,7 @@ def test_empty_production_registry_cannot_be_overridden_by_json_or_env(bundle):
     result = subprocess.run(child_command(bundle, "unknown"), cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
     assert result.returncode == 2 and "unknown release" in result.stderr, result.stderr
     assert "COLD_IMPORT_GUARD_PASS" in result.stdout
-    assert not bundle.state.exists() and not bundle.out.exists()
+    assert not list(bundle.state.glob("*.claim")) and not bundle.out.exists()
 
 
 def test_fixed_user_state_root_ignores_environment_and_cwd(bundle, tmp_path):
@@ -436,7 +447,7 @@ def test_clock_expiring_during_preflight_prevents_read_and_claim(bundle, monkeyp
     monkeypatch.setattr(adapter, "_clock", lambda: next(ticks))
     block_data_reads(monkeypatch, bundle)
     assert load_cli().main(args_for(bundle)) == 2
-    assert not bundle.state.exists() and not bundle.out.exists()
+    assert not list(bundle.state.glob("*.claim")) and not bundle.out.exists()
 
 
 @pytest.mark.parametrize("change", ["empty", "short", "unknown", "boolean-version"])
@@ -482,7 +493,7 @@ def test_registered_manifest_still_requires_bound_review_before_data(bundle, mon
     install_trust(monkeypatch, load_adapter(), bundle)
     block_data_reads(monkeypatch, bundle)
     assert load_cli().main(args_for(bundle)) == 2
-    assert not bundle.state.exists()
+    assert not list(bundle.state.glob("*.claim"))
 
 
 @pytest.mark.parametrize("closed", [False, True])
@@ -518,7 +529,7 @@ def test_manifest_strict_shape_rejects_before_data(bundle, monkeypatch, change):
     (bundle.directory / "release.json").write_bytes(raw)
     install_trust(monkeypatch, load_adapter(), bundle)
     assert load_cli().main(args_for(bundle)) == 2
-    assert not bundle.state.exists()
+    assert not list(bundle.state.glob("*.claim"))
 
 
 @pytest.mark.parametrize("change", ["excluded-month", "wrong-year", "wrong-source-segment", "cutoff-bar", "duplicate-root"])
@@ -648,3 +659,279 @@ raise SystemExit(cli["main"](args))
     assert row["n_triggers"] == 1 and row["cost_r"] == pytest.approx(.244 / (32 / 14))
     before = (bundle.out / "report.json").read_bytes()
     assert load_cli().main(args) == 2 and (bundle.out / "report.json").read_bytes() == before
+
+
+# fix1: real, temporary Git registration. No trust/Git/admission/claim mocks.
+TRUST_FILE = "src/mt5quant/prob/production_releases.py"
+
+
+def snapshot_doc(bundle=None, **changes):
+    value = {"schema": "t121-trust-v1", "initialized": True, "version": 1,
+        "valid_from": "2026-11-04T00:00:00Z", "expires_at": "2026-11-06T00:00:00Z",
+        "registry": {} if bundle is None else {bundle.manifest["release_id"]: sha(bundle.raw)},
+        "states": {} if bundle is None else {bundle.manifest["release_id"]: "active"},
+        "context": "isolated-synthetic-fixture"}
+    value.update(changes)
+    return value
+
+
+def static_trust_bytes(value):
+    return ('"""Isolated generated trust data; never a production approval."""\n'
+            'SNAPSHOT_JSON = ' + repr(encoded(value).decode()) + '\n').encode()
+
+
+def fixture_git(root, *args):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    cmd = ["git", "--no-replace-objects", "-c", "core.hooksPath=" + str(root / "no-hooks"),
+           "-c", "core.fsmonitor=false", "-c", "core.autocrlf=false", "-c", "commit.gpgSign=false",
+           "-c", "user.name=T121 Fixture", "-c", "user.email=t121-fixture@invalid", *args]
+    result = subprocess.run(cmd, cwd=root, env=env, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    return result.stdout.decode().strip()
+
+
+def make_code_repo(root):
+    root.mkdir()
+    adapter = load_adapter()
+    for name in (*adapter.CODE_FILES, adapter.PREREG):
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        raw = (ROOT / name).read_bytes()
+        target.write_bytes(raw.replace(b"\r\n", b"\n") if name == adapter.PREREG else raw)
+    trust = ROOT / TRUST_FILE
+    (root / TRUST_FILE).write_bytes(trust.read_bytes() if trust.exists() else static_trust_bytes(
+        snapshot_doc(initialized=False, valid_from=None, expires_at=None, context="production")))
+    fixture_git(root, "init", "--initial-branch=fixture")
+    fixture_git(root, "add", "--", *adapter.CODE_FILES, adapter.PREREG, TRUST_FILE)
+    fixture_git(root, "commit", "-m", "[P] isolated implementation I")
+    return root
+
+
+def register_snapshot(root, value):
+    (root / TRUST_FILE).write_bytes(static_trust_bytes(value))
+    fixture_git(root, "add", "--", TRUST_FILE)
+    fixture_git(root, "commit", "-m", "[P] isolated trust registration")
+    assert fixture_git(root, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD") == TRUST_FILE
+    return fixture_git(root, "rev-parse", "HEAD")
+
+
+def make_registered(tmp_path):
+    root = make_code_repo(tmp_path / "implementation")
+    bundle = make_bundle(tmp_path / "artifacts", load_adapter(), code_root=root)
+    bundle.code_root = root
+    bundle.implementation = fixture_git(root, "rev-parse", "HEAD")
+    bundle.registration = register_snapshot(root, snapshot_doc(bundle))
+    return bundle
+
+
+NORMAL_LAUNCHER = COLD_GUARD[:COLD_GUARD.index("root, bundle_path,")] + '''
+import time
+root, bundle_path, output, state, action, sync = sys.argv[1:]
+sys.path.insert(0, str(Path(root) / "src"))
+import mt5quant.prob.production_adapter as adapter
+adapter._clock = lambda: datetime(2026, 11, 5, tzinfo=timezone.utc)
+adapter._state_root = lambda: Path(state)
+materials = Path(bundle_path).resolve()
+paused = False
+def observe_io(event, args):
+    global paused
+    if event != "open" or not isinstance(args[0], str):
+        return
+    path = Path(args[0]).resolve()
+    if path.parent != materials:
+        return
+    if action == "no-material":
+        raise AssertionError("rejected release read material: " + path.name)
+    if action == "no-data-cost" and path.name not in ("release.json", "review.json"):
+        raise AssertionError("consumed execution read data/cost: " + path.name)
+    if action == "pause-review" and path.name == "review.json" and not paused:
+        paused = True
+        Path(sync + ".ready").write_text("initial admission passed")
+        deadline = time.monotonic() + 45
+        while not Path(sync + ".go").exists():
+            if time.monotonic() > deadline:
+                raise AssertionError("synchronization timeout")
+            time.sleep(.01)
+    if action == "pause-review" and path.name not in ("release.json", "review.json"):
+        raise AssertionError("old preflight reached data/cost")
+sys.addaudithook(observe_io)
+if action == "no-data-cost":
+    def observe_compute(frame, event, arg):
+        if event == "call" and frame.f_code.co_name in ("_run_feasibility_kernel", "_trigger_cost_kernel"):
+            raise AssertionError("consumed execution reached count/cost kernel")
+    sys.setprofile(observe_compute)
+cli = runpy.run_path(str(Path(root) / "scripts/pline_feasibility.py"))
+result = cli["main"](["--mode", "production", "--release-id", "fixture-release",
+    "--release-manifest", str(materials / "release.json"), "--output", output])
+print("NORMAL_LOADER_MAIN", result)
+raise SystemExit(result)
+'''
+
+
+def normal_command(bundle, *, root=None, action="run", output=None, sync="unused"):
+    return [sys.executable, "-I", "-B", "-c", NORMAL_LAUNCHER, str(root or bundle.code_root),
+            str(bundle.directory), str(output or bundle.out), str(bundle.state), action, str(sync)]
+
+
+def run_normal(bundle, **kwargs):
+    result = subprocess.run(normal_command(bundle, **kwargs), cwd=bundle.code_root,
+                            capture_output=True, text=True, timeout=90)
+    print("NORMAL_PROCESS", result.returncode, result.stdout.strip(), result.stderr.strip())
+    return result
+
+
+def test_fix1_revoked_observation_prevents_legacy_replay_red(bundle, monkeypatch):
+    install_trust(monkeypatch, load_adapter(), bundle, version=2, states={"fixture-release": "revoked"})
+    block_data_reads(monkeypatch, bundle)
+    assert load_cli().main(args_for(bundle)) == 2
+    watermark = bundle.state / "snapshot.json"
+    assert watermark.exists(), "trusted revoked v2 was forgotten before advancing watermark"
+    assert json.loads(watermark.read_bytes())["version"] == 2
+    assert not list(bundle.state.glob("*.claim"))
+    result = subprocess.run(child_command(bundle), cwd=ROOT, capture_output=True, text=True, timeout=90)
+    assert result.returncode == 2 and "old or conflicting" in result.stderr
+
+
+def test_fix1_real_registration_is_acyclic_and_normal_main_counts(tmp_path):
+    bundle = make_registered(tmp_path)
+    result = run_normal(bundle)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert bundle.implementation != bundle.registration
+    assert fixture_git(bundle.code_root, "diff", bundle.implementation, bundle.registration, "--", *load_adapter().CODE_FILES) == ""
+    report = json.loads((bundle.out / "report.json").read_bytes())
+    receipt = json.loads((bundle.out / "receipt.json").read_bytes())
+    assert len(report["rows"]) == 96 and len(report["summaries"]) == 8
+    row = next(r for r in report["rows"] if (r["family"], r["symbol"], r["situation"], r["action"]) == ("F1", "XAUUSD", "S1", "A3"))
+    assert row["n_triggers"] == 1 and row["cost_r"] == pytest.approx(.244 / (32 / 14))
+    assert report["production_execution"] == "not_released"
+    assert receipt["runtime"]["head"] == bundle.registration
+    assert receipt["runtime"]["implementation_commit"] == bundle.implementation
+    assert receipt["trust_source"]["source_commit"] == bundle.registration
+    assert receipt["trust_source"]["raw_sha256"] == sha((bundle.code_root / TRUST_FILE).read_bytes())
+    assert receipt["snapshot_sha256"] == sha(encoded(snapshot_doc(bundle)))
+    print("REGISTRATION_EVIDENCE", json.dumps({"I": bundle.implementation, "H": bundle.registration,
+        "manifest_raw_sha256": sha(bundle.raw), "snapshot_sha256": receipt["snapshot_sha256"],
+        "rows": len(report["rows"]), "summaries": len(report["summaries"]), "nonzero_cost_r": row["cost_r"]}))
+    other = tmp_path / "second-checkout"
+    shutil.copytree(bundle.code_root, other)
+    claims_before = {p.name: p.read_bytes() for p in bundle.state.glob("*.claim")}
+    report_before = (bundle.out / "report.json").read_bytes()
+    again = run_normal(bundle, root=other, output=tmp_path / "other-output", action="no-data-cost")
+    assert again.returncode == 2 and "consumed" in again.stderr
+    assert {p.name: p.read_bytes() for p in bundle.state.glob("*.claim")} == claims_before
+    assert len(claims_before) == 1 and not (tmp_path / "other-output").exists()
+    assert (bundle.out / "report.json").read_bytes() == report_before
+
+
+@pytest.mark.parametrize("state", ["revoked", "unknown", "expired", "future"])
+def test_fix1_new_rejected_snapshot_persists_and_blocks_old_process(tmp_path, state):
+    bundle = make_registered(tmp_path)
+    old = tmp_path / "old-copy"
+    shutil.copytree(bundle.code_root, old)
+    new = snapshot_doc(bundle, version=2)
+    if state == "revoked":
+        new["states"] = {"fixture-release": "revoked"}
+    elif state == "unknown":
+        new.update(registry={}, states={})
+    elif state == "expired":
+        new["expires_at"] = NOW.isoformat()
+    else:
+        new.update(valid_from="2026-11-06T00:00:00Z", expires_at="2026-11-07T00:00:00Z")
+    register_snapshot(bundle.code_root, new)
+    result = run_normal(bundle, action="no-material")
+    assert result.returncode == 2
+    watermark = json.loads((bundle.state / "snapshot.json").read_bytes())
+    assert watermark == {"version": 2, "sha256": sha(encoded(new))}
+    assert not list(bundle.state.glob("*.claim")) and not bundle.out.exists()
+    replay = run_normal(bundle, root=old, action="no-material")
+    assert replay.returncode == 2 and "old or conflicting" in replay.stderr
+    assert json.loads((bundle.state / "snapshot.json").read_bytes()) == watermark
+
+
+@pytest.mark.parametrize("bad", ["missing-state", "unknown-state", "bool-version", "invalid-time", "inverted", "extra", "schema"])
+def test_fix1_invalid_snapshot_never_advances_watermark(tmp_path, bad):
+    bundle = make_registered(tmp_path)
+    value = snapshot_doc(bundle, version=2)
+    if bad == "missing-state":
+        value["states"] = {}
+    elif bad == "unknown-state":
+        value["states"]["fixture-release"] = "approved"
+    elif bad == "bool-version":
+        value["version"] = True
+    elif bad == "invalid-time":
+        value["valid_from"] = "yesterday"
+    elif bad == "inverted":
+        value["expires_at"] = value["valid_from"]
+    elif bad == "extra":
+        value["caller_override"] = True
+    else:
+        value["schema"] = "other"
+    register_snapshot(bundle.code_root, value)
+    result = run_normal(bundle, action="no-material")
+    assert result.returncode == 2
+    assert not bundle.state.exists() and not bundle.out.exists()
+
+
+def test_fix1_same_version_digest_conflict_and_same_snapshot_repeat(tmp_path):
+    bundle = make_registered(tmp_path)
+    value = snapshot_doc(bundle, version=2, states={"fixture-release": "revoked"})
+    register_snapshot(bundle.code_root, value)
+    assert run_normal(bundle, action="no-material").returncode == 2
+    before = (bundle.state / "snapshot.json").read_bytes()
+    assert run_normal(bundle, action="no-material").returncode == 2
+    assert (bundle.state / "snapshot.json").read_bytes() == before
+    value["expires_at"] = "2026-11-07T00:00:00Z"
+    register_snapshot(bundle.code_root, value)
+    result = run_normal(bundle, action="no-material")
+    assert result.returncode == 2 and "old or conflicting" in result.stderr
+    assert (bundle.state / "snapshot.json").read_bytes() == before
+
+
+def test_fix1_new_revocation_observed_between_preflight_and_claim(tmp_path):
+    import time
+    bundle = make_registered(tmp_path)
+    old = tmp_path / "old-copy"
+    shutil.copytree(bundle.code_root, old)
+    sync = tmp_path / "synchronization"
+    process = subprocess.Popen(normal_command(bundle, root=old, action="pause-review", sync=sync),
+        cwd=old, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.monotonic() + 45
+        while not Path(str(sync) + ".ready").exists():
+            assert process.poll() is None, process.communicate()
+            assert time.monotonic() < deadline, "old preflight did not reach review IO"
+            time.sleep(.01)
+        register_snapshot(bundle.code_root, snapshot_doc(bundle, version=2, states={"fixture-release": "revoked"}))
+        assert run_normal(bundle, action="no-material").returncode == 2
+        assert json.loads((bundle.state / "snapshot.json").read_bytes())["version"] == 2
+        Path(str(sync) + ".go").write_text("new watermark committed before old claim")
+        stdout, stderr = process.communicate(timeout=90)
+        assert process.returncode == 2 and "old or conflicting" in stderr, stdout + stderr
+        assert not list(bundle.state.glob("*.claim")) and not bundle.out.exists()
+        print("REVOCATION_BEFORE_CLAIM_PASS")
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+
+
+@pytest.mark.parametrize("mutation", ["ancestor-code", "dirty-trust", "wrong-source"])
+def test_fix1_registered_source_and_exact_implementation_required(tmp_path, mutation):
+    bundle = make_registered(tmp_path)
+    if mutation == "ancestor-code":
+        path = bundle.code_root / "src/mt5quant/prob/feasibility.py"
+        path.write_bytes(path.read_bytes() + b"\n# unrelated later code is still different code\n")
+        fixture_git(bundle.code_root, "add", "--", "src/mt5quant/prob/feasibility.py")
+        fixture_git(bundle.code_root, "commit", "-m", "[P] isolated changed closure")
+    elif mutation == "dirty-trust":
+        (bundle.code_root / TRUST_FILE).write_bytes(static_trust_bytes(snapshot_doc(bundle, version=2)))
+    else:
+        # Working trust matches a registered sibling commit, but not actual HEAD.
+        previous = fixture_git(bundle.code_root, "rev-parse", "HEAD")
+        register_snapshot(bundle.code_root, snapshot_doc(bundle, version=2))
+        fixture_git(bundle.code_root, "update-ref", "refs/heads/fixture", previous)
+    result = run_normal(bundle)
+    assert result.returncode == 2 and not bundle.out.exists()
+    assert not list(bundle.state.glob("*.claim"))
+    if mutation != "ancestor-code":
+        assert not bundle.state.exists()

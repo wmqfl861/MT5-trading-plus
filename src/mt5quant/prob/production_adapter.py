@@ -6,6 +6,8 @@ supply trust. Private seams are patched only by isolated synthetic tests.
 """
 from __future__ import annotations
 
+import ast
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -16,7 +18,6 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import tomllib
-from types import MappingProxyType
 
 from mt5data.sessions import SessionPolicy, _session_policy_from_dict
 from mt5quant.prob.feasibility import (
@@ -52,6 +53,12 @@ CODE_FILES = (
 )
 
 
+TRUST_FILE = "src/mt5quant/prob/production_releases.py"
+# Capture this process's implementation before any admission IO. Recheck disk,
+# Git I/H and these bytes before claim; a changed checkout cannot rebind a process.
+_LOADED_CODE = {name: (ROOT / name).read_bytes() for name in CODE_FILES}
+
+
 @dataclass(frozen=True)
 class _Snapshot:
     version: int
@@ -59,15 +66,49 @@ class _Snapshot:
     expires_at: str | None
     registry: object
     states: object
-    context: str = "production"
+    context: str
+    schema: str
+    initialized: bool
+    source: object
 
 
-# Intentionally empty, with no assertion that a revocation snapshot is fresh.
-_PRODUCTION = _Snapshot(1, None, None, MappingProxyType({}), MappingProxyType({}))
+def _git(*args):
+    """Read raw Git objects only; no filters, hooks, replace refs or env overrides."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+               GIT_NO_REPLACE_OBJECTS="1", GIT_OPTIONAL_LOCKS="0")
+    return subprocess.check_output(["git", "--no-replace-objects", "-c", "core.fsmonitor=false",
+        "-c", "core.hooksPath=" + os.devnull, *args], cwd=ROOT, env=env, stderr=subprocess.DEVNULL)
+
+
+def _same_source(raw, blob):
+    # Only exact bytes or complete LF -> CRLF checkout mapping on Windows.
+    return raw == blob or (os.name == "nt" and b"\r" not in blob and
+                           raw == blob.replace(b"\n", b"\r\n"))
 
 
 def _trust_snapshot():
-    return _PRODUCTION
+    """Load only committed fixed-path literal data; never import/execute trust code."""
+    head = _git("rev-parse", "HEAD").decode().strip()
+    blob = _git("cat-file", "blob", head + ":" + TRUST_FILE)
+    raw = (ROOT / TRUST_FILE).read_bytes()
+    _require(_same_source(raw, blob), "unregistered trust bytes")
+    source = _git("log", "-1", "--format=%H", head, "--", TRUST_FILE).decode().strip()
+    _hash(source, 40)
+    _require(_git("cat-file", "blob", source + ":" + TRUST_FILE) == blob, "trust source identity mismatch")
+    tree = ast.parse(raw.decode("utf-8"))
+    body = tree.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+        body = body[1:]
+    _require(len(body) == 1 and isinstance(body[0], ast.Assign) and len(body[0].targets) == 1 and
+             isinstance(body[0].targets[0], ast.Name) and body[0].targets[0].id == "SNAPSHOT_JSON" and
+             isinstance(body[0].value, ast.Constant) and type(body[0].value.value) is str, "invalid static trust envelope")
+    data = _json(body[0].value.value.encode())
+    _keys(data, "schema initialized version valid_from expires_at registry states context")
+    return _Snapshot(**data, source={"head": head, "source_commit": source,
+        "git_blob_id": _git("rev-parse", head + ":" + TRUST_FILE).decode().strip(),
+        "git_blob_sha256": _sha(blob), "raw_sha256": _sha(raw),
+        "git_digest_domain": "git-blob-bytes", "raw_digest_domain": "raw-bytes"})
 
 
 def _clock():
@@ -204,16 +245,32 @@ def check_t121_admission(input_meta, cost_meta, review_binding):
             "execution_status": "not_released"}
 
 
+def _complete_snapshot(snapshot):
+    _require(snapshot.schema == "t121-trust-v1" and type(snapshot.initialized) is bool,
+             "invalid trust schema")
+    _require(type(snapshot.version) is int and snapshot.version > 0, "invalid trust version")
+    _require(type(snapshot.registry) is dict and type(snapshot.states) is dict and
+             snapshot.registry.keys() == snapshot.states.keys(), "invalid registry/states")
+    _require(snapshot.context in ("production", "isolated-synthetic-fixture"), "unknown execution context")
+    for release_id, digest in snapshot.registry.items():
+        _id(release_id)
+        _hash(digest)
+        _require(snapshot.states[release_id] in ("active", "revoked"), "invalid release state")
+    if not snapshot.initialized:
+        _require(not snapshot.registry and snapshot.valid_from is None and snapshot.expires_at is None,
+                 "invalid uninitialized snapshot")
+        return False
+    _window(snapshot.valid_from, snapshot.expires_at)
+    return True
+
+
 def _trusted(snapshot, release_id, now):
     _id(release_id)
     _require(release_id in snapshot.registry, "unknown release")
-    _hash(snapshot.registry[release_id])
-    _require(type(snapshot.version) is int and snapshot.version > 0, "unknown trust version")
-    _require(snapshot.states.get(release_id) == "active", "unknown or revoked release")
+    _require(snapshot.states[release_id] == "active", "unknown or revoked release")
     _require(isinstance(now, datetime) and now.tzinfo is not None, "trusted time unavailable")
     a, b = _window(snapshot.valid_from, snapshot.expires_at)
     _require(a <= now < b, "trust snapshot not current")
-    _require(snapshot.context in ("production", "isolated-synthetic-fixture"), "unknown execution context")
 
 
 def _scope(scope):
@@ -278,6 +335,10 @@ def _validate_manifest(m, snapshot, release_id, now):
     _keys(m["code"], "repo_commit files")
     _hash(m["code"]["repo_commit"], 40)
     _keys(m["code"]["files"], " ".join(CODE_FILES))
+    for identity in m["code"]["files"].values():
+        _keys(identity, "raw_sha256 git_blob_sha256")
+        _hash(identity["raw_sha256"])
+        _hash(identity["git_blob_sha256"])
     _require(type(m["conditions"]) is list, "condition list required")
     ids = set()
     for condition in m["conditions"]:
@@ -287,12 +348,25 @@ def _validate_manifest(m, snapshot, release_id, now):
         ids.add(condition["condition_id"])
         _ref(condition["evidence_ref"])
         _require(condition["evidence_ref"]["format"] == "json", "condition format mismatch")
-    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    _require(head == m["code"]["repo_commit"], "code commit mismatch")
+    _implementation(m)
+
+
+def _implementation(m):
+    head = _git("rev-parse", "HEAD").decode().strip()
+    implementation = m["code"]["repo_commit"]
+    _git("merge-base", "--is-ancestor", implementation, head)
     for path in CODE_FILES:
-        _require(_sha((ROOT / path).read_bytes()) == _hash(m["code"]["files"][path]), "code bytes mismatch")
-    prereg_bytes = subprocess.check_output(["git", "show", "HEAD:" + PREREG], cwd=ROOT)
+        blob = _git("cat-file", "blob", implementation + ":" + path)
+        actual_blob = _git("cat-file", "blob", head + ":" + path)
+        raw = (ROOT / path).read_bytes()
+        identity = m["code"]["files"][path]
+        _require(actual_blob == blob and _sha(blob) == identity["git_blob_sha256"] and
+                 _same_source(raw, blob) and _sha(raw) == identity["raw_sha256"] and
+                 raw == _LOADED_CODE[path], "implementation closure differs")
+    prereg_bytes = _git("cat-file", "blob", implementation + ":" + PREREG)
     _require(_sha(prereg_bytes) == PREREG_SHA256, "preregistration bytes mismatch")
+    return {"head": head, "implementation_commit": implementation,
+            "raw_digest_domain": "raw-bytes", "git_digest_domain": "git-blob-bytes"}
 
 
 def _read_verified(base, ref, cache):
@@ -340,49 +414,83 @@ def _write_exclusive(path, raw):
 
 
 def _snapshot_bytes(snapshot):
-    return _canonical({"version": snapshot.version, "valid_from": snapshot.valid_from,
-        "expires_at": snapshot.expires_at, "registry": dict(snapshot.registry), "states": dict(snapshot.states),
-        "context": snapshot.context})
+    return _canonical({"schema": snapshot.schema, "initialized": snapshot.initialized,
+        "version": snapshot.version, "valid_from": snapshot.valid_from,
+        "expires_at": snapshot.expires_at, "registry": snapshot.registry,
+        "states": snapshot.states, "context": snapshot.context})
 
 
-def _claim(snapshot, m, manifest_hash):
-    """Conservative fail-closed OS exclusion; a crash leaves state consumed/locked.
-
-    A persistent snapshot high-water mark prevents rollback across worktrees.
-    No cleanup API, TTL, retry reclamation, or caller-selected production root.
-    """
+@contextmanager
+def _state_lock():
     root = _state_root()
     root.mkdir(parents=True, exist_ok=True)
     lock = root / "claim.lock"
     try:
         _write_exclusive(lock, b"locked\n")
     except FileExistsError:
-        raise ValueError("execution state busy or interrupted; no automatic reclaim") from None
+        raise AdmissionRefused("execution state busy or interrupted; no automatic reclaim") from None
     try:
-        current = {"version": snapshot.version, "sha256": _sha(_snapshot_bytes(snapshot))}
-        watermark = root / "snapshot.json"
-        if watermark.exists():
-            previous = _json(watermark.read_bytes())
-            _keys(previous, "version sha256")
-            _require(type(previous["version"]) is int and previous["version"] > 0, "invalid persistent snapshot")
-            _hash(previous["sha256"])
-            _require(previous["version"] <= current["version"] and
-                     (previous["version"] != current["version"] or previous == current), "old or conflicting trust snapshot")
-        claim = root / (_sha(m["execution_id"].encode()) + ".claim")
-        _require(not claim.exists(), "execution already consumed")
-        pending = root / "snapshot.pending"
-        _write_exclusive(pending, _canonical(current))
-        os.replace(pending, watermark)
-        _sync_directory(root)
-        try:
-            _write_exclusive(claim, _canonical({"release_id": m["release_id"], "execution_id": m["execution_id"],
-                "manifest_raw_sha256": manifest_hash, "snapshot_version": snapshot.version}))
-        except FileExistsError:
-            raise ValueError("execution already consumed") from None
-        _sync_directory(root)
+        yield root
     finally:
         lock.unlink()
         _sync_directory(root)
+
+
+def _observe_locked(root, snapshot):
+    """Record complete trusted snapshots even when no release may execute."""
+    current = {"version": snapshot.version, "sha256": _sha(_snapshot_bytes(snapshot))}
+    watermark = root / "snapshot.json"
+    if watermark.exists():
+        previous = _json(watermark.read_bytes())
+        _keys(previous, "version sha256")
+        _require(type(previous["version"]) is int and previous["version"] > 0, "invalid persistent snapshot")
+        _hash(previous["sha256"])
+        _require(previous["version"] <= current["version"] and
+                 (previous["version"] != current["version"] or previous == current), "old or conflicting trust snapshot")
+        if previous == current:
+            return
+    pending = root / "snapshot.pending"
+    _write_exclusive(pending, _canonical(current))
+    os.replace(pending, watermark)
+    _sync_directory(root)
+
+
+def _observe(release_id):
+    # Validate before creating state, then reload under the shared exclusion.
+    snapshot = _trust_snapshot()
+    _require(_complete_snapshot(snapshot), "unknown release: trust uninitialized")
+    with _state_lock() as root:
+        snapshot = _trust_snapshot()
+        _require(_complete_snapshot(snapshot), "unknown release: trust uninitialized")
+        _observe_locked(root, snapshot)
+        now = _clock()
+        _trusted(snapshot, release_id, now)
+        return snapshot, now
+
+
+def _claim(snapshot, m, manifest_hash, base, cache):
+    """The authorization point is the final validation + durable claim under lock."""
+    with _state_lock() as root:
+        latest = _trust_snapshot()
+        _require(_complete_snapshot(latest), "trust uninitialized")
+        _observe_locked(root, latest)  # newer revoked/unknown/expired also persists
+        _require(_snapshot_bytes(latest) == _snapshot_bytes(snapshot), "trust changed during admission")
+        now = _clock()
+        _trusted(latest, m["release_id"], now)
+        _require(latest.registry[m["release_id"]] == manifest_hash, "manifest binding changed")
+        _require(_time(m["valid_from"]) <= now < _time(m["expires_at"]), "release not current")
+        _review(m, base, cache, now)  # cached original bytes; clock/conditions rechecked
+        runtime = _implementation(m)
+        _require(runtime["head"] == latest.source["head"], "code changed during claim")
+        claim = root / (_sha(m["execution_id"].encode()) + ".claim")
+        try:
+            _write_exclusive(claim, _canonical({"release_id": m["release_id"], "execution_id": m["execution_id"],
+                "manifest_raw_sha256": manifest_hash, "snapshot_version": latest.version,
+                "snapshot_sha256": _sha(_snapshot_bytes(latest))}))
+        except FileExistsError:
+            raise AdmissionRefused("execution already consumed") from None
+        _sync_directory(root)
+        return latest, runtime
 
 
 def _inputs(doc, sources, scope):
@@ -442,8 +550,7 @@ def _inputs(doc, sources, scope):
 
 def run_production(release_id, manifest_path, output):
     """Only executable entry: fixed trust → review → durable claim → bytes → kernel."""
-    snapshot, now = _trust_snapshot(), _clock()
-    _trusted(snapshot, release_id, now)  # no caller artifact opened for an unknown release
+    snapshot, now = _observe(release_id)  # no material read until observation + eligibility
     manifest_path, output = Path(manifest_path), Path(output)
     raw = manifest_path.read_bytes()
     _require(_sha(raw) == snapshot.registry[release_id], "release manifest raw bytes differ")
@@ -452,11 +559,7 @@ def run_production(release_id, manifest_path, output):
     base, cache = manifest_path.resolve().parent, {}
     _review(m, base, cache, now)
     _require(not output.exists(), "output directory already exists; refusing overwrite")
-    latest, current_time = _trust_snapshot(), _clock()
-    _trusted(latest, release_id, current_time)
-    _require(_snapshot_bytes(latest) == _snapshot_bytes(snapshot), "trust changed during admission")
-    _require(_time(m["valid_from"]) <= current_time < _time(m["expires_at"]), "release not current")
-    _claim(snapshot, m, _sha(raw))
+    snapshot, runtime = _claim(snapshot, m, _sha(raw), base, cache)
     # Every failure from this point leaves the execution occupied permanently.
     doc = _read_verified(base, m["input_ref"], cache)
     sources = _read_verified(base, m["source_manifest_ref"], cache)
@@ -498,7 +601,9 @@ def run_production(release_id, manifest_path, output):
     refs = [m[k] for k in ("input_ref", "source_manifest_ref", "sessions_ref", "review_ref")]
     refs += [m["costs"][s][p]["artifact_ref"] for s in SYMBOLS for p in PARTS]
     refs += [c["evidence_ref"] for c in m["conditions"]]
-    receipt = {**identities, "production_execution": report["production_execution"], "code": m["code"], "rules": m["rules"],
+    receipt = {**identities, "runtime": runtime, "trust_source": snapshot.source,
+        "snapshot_sha256": _sha(_snapshot_bytes(snapshot)), "snapshot_digest_domain": "canonical-json-v1",
+        "production_execution": report["production_execution"], "code": m["code"], "rules": m["rules"],
         "artifacts": [{k: ref[k] for k in ("artifact_id", "artifact_version", "digest_domain", "sha256")} for ref in refs],
         "report_sha256": _sha(report_bytes)}
     output.mkdir(parents=True, exist_ok=False)
