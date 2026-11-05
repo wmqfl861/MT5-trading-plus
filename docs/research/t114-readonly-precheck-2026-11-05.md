@@ -25,6 +25,7 @@ EURUSD 只保留 UTC `[2007-01-01,2021-05-17)` 的 HistData bars，再按冻结 
 
 - 文献/持仓声明由现有候选校验器复核。费用倍数门 3、单次功效门 0.5、alpha 0.05 和 Lo 近似直接复用冻结常量/功效函数。`cumulative_n` 只接受调用者明确已核对的正整数，拒绝 bool；缺失输出 `n_tests=null,power=null,status=unknown`，不以候选数或预算补齐。
 - 参考价是最后保留的合法主段 bar 收盘值。费用沿用旧预筛的单次较不利全幅点差、双边滑点、来回佣金/合约价值、声明计费夜数乘较不利双向隔夜费。`source_costs` 仅把 external spread 乘 1.5；滑点、佣金、隔夜不随此倍率改变。合约及费用必须显式，缺分量不补零；明确全零总成本因倍数无定义而拒绝。
+- API 和 CLI 当前仅支持**绝对每手隔夜费率**；`SwapRule.ref_price/contract_size` 非空时表示相对基准，数值计算前拒绝，不能把原每日金额直接除以当前合约价值。旧 `precheck` 对拍仅限绝对费率域，不证明相对口径正确。未来相对模式须另立规则并独立审核。API 要求 `CommissionModel(per_symbol={"EURUSD": fee})` 的显式记录，`fee=0` 合法；缺 EURUSD 记录时不接受默认值回退，即使默认值非零。
 - `window_volatility` 所在包初始化会间接加载 gates/引擎，因此新入口没有运行时导入它。新模块仅适配其无条件 `close[i+h]/close[i]-1`、纽约入场小时和 `ddof=1` 公式，并增加主段收盘端点/缺口切段。H1 起点取锚 bar 开盘加一小时，不按候选信号选择窗口；起点和终点收盘时刻均在主段且窗口不跨缺口。无缺口合成数据逐位对拍原函数与旧 `precheck`，不复制整个预筛。
 - 无法定义波动或没有正覆盖时功效为未知，不伪造 0；恒价的已定义零波动保留冻结的声明 Sharpe 回退。已知波动时用 min(声明 Sharpe, 隐含 Sharpe)。累计 N 功效单独报告，不替换原单次功效门。
 - 新入口没有调用旧 `precheck` 的磁盘成本/价格路径。CLI 对已读取 bytes 解析后用现有 `SpreadStat/SpreadModel`、`SlippageModel`、`CommissionModel`、`SwapRule/SwapModel` 装配。Spread 保留原 `to_dict()` 结构和 `mode/sampling/bucket_tz` 语义；此入口比旧路径严格，要求这些键显式存在、拒绝未知字段。Swap 的日历选项沿用原类约定；预筛按声明 fee-nights 计算，不模拟日历收费。
@@ -40,7 +41,7 @@ python scripts/h_readonly_precheck.py --mode synthetic \
 
 所有输入均显式支持 JSON/TOML；不提供默认数据根。manifest 顶层为 `mode="synthetic"` 和 `inputs`；每项以相对 manifest 目录的 `bars_file` 代替 API 的 bars/source_tags，覆盖与缺失记录以对象表达。价格工件恰有 `bars=[{time,close},...]` 和 `source_tags`。资格在打开任何价格工件前整体校验，production/self-approved 模式拒绝。
 
-成本顶层恰含 `mode="synthetic"`、`spread`、`slippage`、`commission_per_lot`、`swap`。Spread 是标准导出结构；slippage 显式含 `spread_fraction/fixed_price/event_hours/event_multiplier`；佣金为 `{EURUSD: number}`；swap 为 `{EURUSD: {long_per_day,short_per_day,...原SwapRule可选项}}`。规格恰含 `mode="synthetic"` 与 `contract_sizes={EURUSD: positive_number}`。未知键、重复 JSON 键、非有限数、缺必需分量均拒绝；显式零费不是缺失。
+成本顶层恰含 `mode="synthetic"`、`spread`、`slippage`、`commission_per_lot`、`swap`。Spread 是标准导出结构；slippage 显式含 `spread_fraction/fixed_price/event_hours/event_multiplier`；佣金为 `{EURUSD: number}`；swap 为 `{EURUSD: {long_per_day,short_per_day,...日历可选项}}`，日历可选项为 `triple_weekdays/charge_weekdays/charge_local/charge_tz`，非空相对基准 `ref_price/contract_size` 拒绝。规格恰含 `mode="synthetic"` 与 `contract_sizes={EURUSD: positive_number}`。未知键、重复 JSON 键、非有限数、缺必需分量均拒绝；显式零费不是缺失。
 
 每个解析路径只读取一次，原 bytes 同时用于解析及 raw SHA256；输出区分工件 raw hash、规则 canonical JSON hash 和代码文件 hash。哈希证明内容身份，不授予资格。默认仅 stdout；`--output` 必须是新独占目录，只创建独占 `result.json`。不写 candidate precheck、SQLite 或任何输入。
 

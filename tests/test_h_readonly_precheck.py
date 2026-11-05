@@ -73,7 +73,7 @@ def costs():
     stats = {h: SpreadStat(.0002, .0002, .0002, 100, 20) for h in range(24)}
     spread = SpreadModel({"EURUSD": stats}, {"EURUSD": .0002}, mode="relative")
     return Costs(spread, SlippageModel(spread, spread_fraction=.1),
-                 CommissionModel(default_per_lot=6),
+                 CommissionModel(default_per_lot=6, per_symbol={"EURUSD": 6}),
                  SwapModel(per_symbol={"EURUSD": SwapRule(-5, -1)}))
 
 
@@ -374,6 +374,93 @@ def test_real_cli_end_to_end_hashes_readonly_and_diagnostic_invariance(tmp_path,
     assert perturbed.returncode == 0, perturbed.stderr
     assert json.loads(perturbed.stdout)["result"] == doc["result"]
     assert not list(tmp_path.rglob("*.sqlite*")) and not list(tmp_path.rglob("*.precheck.json"))
+
+
+def test_fix1_api_rejects_relative_swap_with_otherwise_valid_costs():
+    data = inputs(mixed=False)
+    data[TRADE]["bars"]["close"] = 2.
+    c = candidate()
+    c = replace(c, declared=replace(c.declared, gross_return_per_event=.0006))
+    stats = {h: SpreadStat(.00004, .00004, .00004, 100, 20) for h in range(24)}
+    spread = SpreadModel({"EURUSD": stats}, {"EURUSD": .00004}, mode="relative")
+    relative_rule = SwapRule(-20., -10., ref_price=1., contract_size=100000.)
+    model = Costs(spread, SlippageModel(spread, spread_fraction=0., fixed_price=0.),
+                  CommissionModel(per_symbol={"EURUSD": 0.}),
+                  SwapModel({"EURUSD": relative_rule}))
+    # Valid absolute control isolates the unsupported basis, not another field.
+    absolute = replace(model, swap=SwapModel({"EURUSD": SwapRule(-20., -10.)}))
+    valid = run(data, c=c, model=absolute)["checks"]["ex_ante_cost"]
+    assert valid["per_symbol"]["EURUSD"]["overnight"] == .0001
+    assert valid["multiple"] == pytest.approx(3.75)
+    fee = model.overnight_fee("EURUSD", "long", pd.Timestamp("2007-01-02T21:00"),
+                              pd.Timestamp("2007-01-02T23:00"), price=2.)
+    assert fee == -40.  # One ordinary NY fee-night; relative basis doubles it.
+    assert abs(fee) / 200000. == .0002
+    assert .0006 / (.00006 + abs(fee) / 200000.) == pytest.approx(2.3076923076923075)
+    with pytest.raises(ValueError, match="relative swap unsupported.*absolute per-lot"):
+        accepted = run(data, c=c, model=model)["checks"]["ex_ante_cost"]
+        print("unsupported relative swap accepted:", accepted)
+
+
+@pytest.mark.parametrize("default", [0., 6.])
+def test_fix1_api_rejects_missing_commission_record_even_with_default(default):
+    data = inputs(mixed=False)
+    data[TRADE]["bars"]["close"] = 2.
+    c = candidate()
+    c = replace(c, declared=replace(c.declared, gross_return_per_event=.0011))
+    zero = replace(costs(), commission=CommissionModel(per_symbol={"EURUSD": 0.}))
+    charged = replace(costs(), commission=CommissionModel(per_symbol={"EURUSD": 6.}))
+    free_result = run(data, c=c, model=zero)["checks"]["ex_ante_cost"]
+    charged_result = run(data, c=c, model=charged)["checks"]["ex_ante_cost"]
+    assert free_result["multiple"] == pytest.approx(3.0136986301369864)
+    assert charged_result["multiple"] == pytest.approx(2.7848101265822782)
+    assert free_result["passed"] is True and charged_result["passed"] is False
+    missing = CommissionModel() if default == 0. else CommissionModel(default_per_lot=default)
+    with pytest.raises(ValueError, match="EURUSD explicit commission record required"):
+        accepted = run(data, c=c, model=replace(costs(), commission=missing))["checks"]["ex_ante_cost"]
+        print("missing commission record accepted:", accepted)
+
+
+@pytest.mark.parametrize("commission,swap_charge", [(0., 0.), (6., 20.)])
+def test_fix1_api_and_cli_absolute_and_explicit_zero_fees(tmp_path, commission, swap_charge):
+    model = replace(costs(), commission=CommissionModel(default_per_lot=999., per_symbol={"EURUSD": commission}),
+                    swap=SwapModel({"EURUSD": SwapRule(-swap_charge, 0.)}))
+    expected = run(model=model)
+    detail = expected["checks"]["ex_ante_cost"]["per_symbol"]["EURUSD"]
+    ref = main_bars().close.iloc[-1]
+    assert detail["commission"] == commission / (100000. * ref)
+    assert detail["overnight"] == swap_charge / (100000. * ref)
+    assert detail["round_trip_cost"] == pytest.approx(.00034 + (commission + swap_charge) / (100000. * ref))
+    args = cli_files(tmp_path)
+    path = tmp_path / "costs.json"
+    doc = json.loads(path.read_bytes())
+    doc["commission_per_lot"]["EURUSD"] = commission
+    doc["swap"]["EURUSD"] = {"long_per_day": -swap_charge, "short_per_day": 0.}
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    proc = cli(args)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["result"] == expected
+
+
+def test_fix1_cli_rejects_relative_swap_with_otherwise_valid_costs(tmp_path):
+    args = cli_files(tmp_path)
+    path = tmp_path / "costs.json"
+    doc = json.loads(path.read_bytes())
+    doc["swap"]["EURUSD"] = {"long_per_day": -20., "short_per_day": -10.}
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    valid = cli(args)
+    assert valid.returncode == 0, valid.stderr
+    assert json.loads(valid.stdout)["result"]["checks"]["ex_ante_cost"]["per_symbol"]["EURUSD"]["overnight"] \
+        == 20. / (100000. * main_bars().close.iloc[-1])
+    doc["swap"]["EURUSD"].update(ref_price=1., contract_size=100000.)
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    output = tmp_path / "must-not-create"
+    proc = cli([*args, "--output", str(output)])
+    assert proc.returncode == 2, proc.stdout
+    assert "relative swap unsupported" in proc.stderr and "absolute per-lot" in proc.stderr
+    assert not proc.stdout and not output.exists()
+    assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before
 
 
 def test_cli_exclusive_output_and_fixed_n(tmp_path):

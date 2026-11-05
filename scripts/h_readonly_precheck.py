@@ -18,7 +18,8 @@ from mt5quant.costs import (
 from mt5quant.costs.spread import BUCKET_TZ
 from mt5quant.h_main_scope import CoverageSegment, TimeInterval
 from mt5quant.h_readonly_precheck import (
-    PAIRS, RULES, _fields, _number, _validate_metadata, run_h_readonly_precheck,
+    PAIRS, RULES, _fields, _number, _validate_cost_model, _validate_metadata,
+    run_h_readonly_precheck,
 )
 from mt5quant.research.candidates import validate_candidate
 
@@ -101,6 +102,8 @@ def _costs(doc):
     must be explicit and unknown keys/omitted charges are rejected. No fees are
     supplied by constructor defaults. Swap calendar defaults retain SwapRule's
     convention; the precheck uses declared fee-nights, not calendar simulation.
+    Relative swap bases are parsed as SwapRule fields but rejected by the shared
+    API cost validator; only absolute per-lot rates are supported here.
     """
     _synthetic(doc, {"spread", "slippage", "commission_per_lot", "swap"}, "costs")
     spread = doc["spread"]
@@ -150,8 +153,10 @@ def _costs(doc):
             if not isinstance(swap[f], list):
                 raise ValueError(f"swap {f} must be explicit list")
             swap[f] = frozenset(_integer(w, f, 0, 6) for w in swap[f])
-    return Costs(model, slippage, CommissionModel(default_per_lot=commission,
-                 per_symbol={"EURUSD": commission}), SwapModel({"EURUSD": SwapRule(**swap)}))
+    costs = Costs(model, slippage, CommissionModel(default_per_lot=commission,
+                  per_symbol={"EURUSD": commission}), SwapModel({"EURUSD": SwapRule(**swap)}))
+    _validate_cost_model(costs)  # Reject unsupported bases before reading bars.
+    return costs
 
 
 def _code_hashes():

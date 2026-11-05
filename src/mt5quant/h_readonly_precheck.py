@@ -9,8 +9,10 @@
 * source_eligibility: {canonical_source: 'synthetic_only'} for every declared
   source. These are fixture declarations, never production approvals.
 
-No data root, ledger, event returns, labels, fitting or sampler is used. The
-caller supplies a standard Costs model and explicit EURUSD contract size.
+No data root, ledger, event returns, labels, fitting or sampler is used.
+The caller supplies a standard Costs model, an explicit EURUSD per_symbol
+commission record (zero allowed), absolute per-lot swap rates (no ref_price or
+contract_size basis), and an explicit EURUSD contract size.
 Coverage uses actual retained bar OPEN spans (runtime_coverage convention).
 Volatility uses unconditional close-to-close windows; both close timestamps
 must be in the main interval and the path must not cross a declared/removed
@@ -26,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 from mt5data.ext.merge import _month_sunday_hours_ok, _sunday_open_hours
-from mt5quant.costs import Costs, SOURCE_COST_POLICY, source_costs
+from mt5quant.costs import CommissionModel, Costs, SOURCE_COST_POLICY, source_costs
 from mt5quant.h_main_scope import (
     CoverageSegment, TimeInterval, _utc, validate_h_main_scope,
 )
@@ -197,9 +199,19 @@ def _window_sigma(frame, gaps, declared):
     return float(np.std(returns, ddof=1)), count
 
 
-def _cost_breakdown(model, contract, ref, declared):
+def _validate_cost_model(model):
     if not isinstance(model, Costs):
         raise TypeError("cost_model must be an explicitly assembled standard Costs model")
+    # Frozen CommissionModel exposes no record-presence API. Inspect its explicit
+    # mapping: commission_per_lot alone cannot distinguish a record from fallback.
+    if not isinstance(model.commission, CommissionModel) or "EURUSD" not in model.commission._per_symbol:
+        raise ValueError("EURUSD explicit commission record required; default fallback unsupported")
+    rule = model.swap.rule("EURUSD")
+    if rule.ref_price is not None or rule.contract_size is not None:
+        raise ValueError("EURUSD relative swap unsupported; absolute per-lot rates required")
+
+
+def _cost_breakdown(model, contract, ref, declared):
     # An empty spread model has a legacy zero fallback; this entry must refuse it.
     spread = model.spread.to_dict()
     if not spread["per_symbol"].get("EURUSD"):
@@ -250,6 +262,7 @@ def run_h_readonly_precheck(candidate, *, inputs, cost_model, contract_sizes, cu
         raise ValueError("fixed H candidate requires EURUSD/H1 and USTEC/D1 declarations")
     _fields(contract_sizes, {"EURUSD"}, "contract_sizes")
     contract = _number(contract_sizes["EURUSD"], "contract_size", positive=True)
+    _validate_cost_model(cost_model)
     scope, frames, tags = _normalize_inputs(inputs)
     selected, selected_tags = {}, {}
     selected[TRADE], selected_tags[TRADE] = _selected(
