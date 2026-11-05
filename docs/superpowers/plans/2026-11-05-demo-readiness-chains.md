@@ -42,15 +42,15 @@
 
 ### Task 2: P 字节准入与计数成本内核接线
 
-**Files:** Create `src/mt5quant/prob/production_adapter.py`, `tests/test_t121_production_adapter.py`, concise `docs/research/t121-production-adapter-2026-11-05.md`; modify minimally `src/mt5quant/prob/feasibility.py` and `scripts/pline_feasibility.py`。不得改counting/gaps或冻结源。
+**Files:** Create `src/mt5quant/prob/production_adapter.py`, `src/mt5quant/prob/production_releases.py`, `tests/test_t121_production_adapter.py`, concise `docs/research/t121-production-adapter-2026-11-05.md`; modify minimally `src/mt5quant/prob/feasibility.py` and `scripts/pline_feasibility.py`。静态信任文件为首轮审核后的必要修订，完整六条件见[独立裁定补充](../../reviews/2026-11-05-demo-readiness-engineering-ruling.md#实施中独立复核的设计修订)。不得改counting/gaps或冻结源。
 
 **Interfaces:** `check_t121_admission(input_meta, cost_meta, review_binding)`保持纯声明/unverified/not_released；`verify_artifact_bytes(raw: bytes, expected_ref)`按明确摘要域验证后只解析原bytes；生产入口由 `release_id` 与审核manifest驱动。原run_feasibility和trigger_cost合成API保留拒绝production；可提取私有共用内核供受控路径消费，不改synthetic标签来绕门。
 
-- [ ] 先落实独立裁定：固定代码级生产registry初始空，仅release_id→manifest rawSHA；不可CLI/env/输入覆盖。生产入口收到未知release在读取manifest之外的data/cost前拒绝，未批准不建输出/消费记录。用途T121-count-cost、XAUUSD/EURUSD、H1→H1/H4、发现段截止2016-05-01半开，账号用途Demo/USD与scopeID明确；所有六组件均绑定。
-- [ ] 定义明确版本清单并严格校验容器/类型/重复键/非有限/日期/摘要域：审核原记录hash、input/manifest/sixcost/sessions/code/rules身份，scope/observed/applies/dependencies/条件闭合/有效期、当前信任快照版本、一次execution_id。rawbytes与canonical摘要不混用；可信时刻从入口系统clock读取、调用者时间不能替代。空registry无真实运行，未来真实entry须独立review绑定新增。
-- [ ] 信任及撤回状态未知/过期/撤回/旧版本均拒绝；测试通过私有fixture隔离registry/时钟/消费根，生产CLI不暴露测试开关。跨进程/重启/worktree共享的固定用户状态目录保存一次消费，禁止由data-root/output/env改变根；可用独占创建+fsync或小型SQLite主键事务，别创建通用权限框架。data/cost读取前原子占用execution_id，读取/解析/计算失败也保持已消费；重跑需要新独立release，不自动回收。
+- [ ] 按修订后的独立裁定，固定静态生产快照初始空、未初始化，不宣称当前有效；调用者不能覆盖。manifest 绑定稳定实现 I、固定闭包和预定快照版本，登记 trust 后得到 H；验证 I→H 祖先与实际逐文件身份，manifest 不绑定最终 H/trust 字节。用途T121-count-cost、XAUUSD/EURUSD、H1→H1/H4、发现段截止2016-05-01半开，账户用途Demo/USD与scopeID明确，所有六组件均绑定。
+- [ ] 定义明确版本清单并严格校验容器/类型/重复键/非有限/日期/摘要域：审核原记录hash、input/manifest/sixcost/sessions/code/rules身份，scope/observed/applies/dependencies/条件闭合/有效期、当前信任快照版本、一次execution_id。rawbytes与canonical摘要不混用。先核实可信完整快照并持久观察水位，再判release；新版revoked/unknown/expired/future仍保持水位，无效快照不推进，同版本冲突及旧版拒绝。
+- [ ] 共享锁内重新验证当前快照、水位、release、manifest、review和条件。耗时实现/Git核验完成后紧邻claim重新取得可信时刻；claim持久化完成后再次复核时效，已到期则保留claim、拒绝data/cost/内核。跨进程/重启/worktree共享固定用户状态根，禁止data/output/env改变；失败不回收。revoked/unknown不读任何材料、不建claim或输出，重复active允许读取绑定metadata以取得execution_id但不得读data/cost。真实生产CLI不暴露私有fixture开关。
 - [ ] 绑定与范围通过后只读一次artifact bytes并核验，parse同bytes而不重读路径；内核不fit/labels/returns，原计算规则/96rows8summaries保持。缺成本/无资格依原规则等待，获准也不保证feasible。输出标明release/context/执行身份与完整hash，不包含原账户或本机路径。
-- [ ] 新CLI模式与旧synthetic模式显式互斥；缺mode新参数时旧命令行为保持。测试使用真实main+内部隔离fixture完整经过读前准入、字节核验、共用内核、96/8输出和独占输出；production空registry subprocess无读取拒绝。覆盖篡改/双摘要域/错账户品种范围/缺字段/时间边界/撤回未知/条件未闭合/重复消费两进程+重启/失败后不回收/换worktree不重用、自填批准无效。冷import guard禁止标签/拟合/DB研究/MT5。
+- [ ] 新CLI模式与旧synthetic模式显式互斥；缺mode新参数时旧命令行为保持。有效合成正链必须真实临时Git完成I→封印manifest/review→仅提交trust→新解释器正常loader/main/原内核，96/8输出且已知非零成本；不patch信任/Git身份/准入/claim判定。覆盖旧负例及新版拒绝后回滚、版本冲突、同步撤回先于claim、闭包/未登记trust变化、核验和持久化期间跨过到期点、失败claim不回收。冷import guard禁止标签/拟合/DB研究/MT5。
 - [ ] 本轮不添加真实release、不读真实工件、不放行2026摘要或charged新口径。聚焦新增+旧T121测试，完整命令/exit和固定tree后[P]提交。
 
 ### Task 3: T78 冻结模型进入运行器
@@ -66,12 +66,12 @@
 
 ### Task 4: T78 H/P 号段日亏子上限
 
-**Files:** Modify `src/mt5live/riskproc.py`, `src/mt5live/gate.py`, minimally `src/mt5live/reconcile.py` only if pauseownership needed; create `tests/test_t78_line_caps.py`, `docs/ops/t78-line-caps-2026-11-05.md`。不得修改model任务config.py/live_runner或其他代理测试。真实config/risk*.toml与部署不改，新配置只在合成fixture与公开示例中给出。
+**Files:** Modify `src/mt5live/riskproc.py`, `src/mt5live/gate.py`, minimally `src/mt5live/reconcile.py`; create `tests/test_t78_line_caps.py`, `docs/ops/t78-line-caps-2026-11-05.md`。独立首轮审核发现paper反序列化将bool等非法magic转成整数，修复范围因此增加`src/mt5live/paper.py`的两个原始magic校验点，成交算法不变。不得修改model任务config.py/live_runner或其他代理测试。真实config/risk*.toml与部署不改，新配置只在合成fixture与公开示例中给出。
 
 **Interfaces:** RiskConfig可选`line_caps: tuple[LineCap,...]=()`，LineCap包含name/magic_min/magic_max/daily_loss_cap_usd；TOML可选[[line_caps]]。新T78示例H902000–902999/P903000–903999各250USD，账户500不变。旧无line_caps配置维持原语义；重叠/重复name/非法magic/非有限或非正cap/bool类型拒绝。
 
 - [ ] 先RED：H损益≤-250只阻H开仓、P继续；反之同理，恰边界包含。账户≤-500仍全平+halt且不能被线pause优先短路；平仓/反手平仓腿不受线cap阻挡。沿daily_pnl UTC日，deals交易profit+commission+swap+fee和positions浮动profit+swap按magic号段聚合，不计出入金、不重算其他币种。
 - [ ] RiskGate从同次账户snapshot构造全账户与分线损益；RiskProcess定时周期和同步check_order都实施linecap，分线快照缺失/NaN/异常magic不放行配置线；没有新cap的旧调用保持兼容。不能仅写pause而闸门不检查，也不能仅闸门算而monitor没有后果。新注册magic/重启也不能在当天绕过已触发cap。
-- [ ] T78要求pause-<magic>.json reason=line_cap和告警；暂停所有已注册或快照内属该线magic，线本身状态必须覆盖后来加入magic。不得覆盖/自动清除人工或对账pause/halt，不让live_reconcile的自动恢复清掉linecap。采用最小独立线状态+ownership或兼容多原因表示；若要改reconcile只限保护线cap原因，不改变既有对账/仲裁行为。新增读坏状态一律拒开，首次触发记录和告警去重。
+- [ ] T78要求pause-<magic>.json reason=line_cap和告警；独立线状态先持久锁存，再处理兼容pause，覆盖后来加入magic。人工/未知/损坏pause保持；新的对账mismatch使用独立reconcile-block，即使人工pause=false也拒开，对账一致仅清自身记录。Gate在共同pause路径锁内一致读取两份状态，锁超时或读失败拒开，判断/告警在锁外且不持锁跨账户/报价/下单调用。
 - [ ] 日界策略明确保守：UTC当日触发保持到下一UTC日，即使浮亏恢复仍不自动开；隔日只解除自身可证明归属的上一日linecap，其他pause保持，坏状态/未来日期不自动清。无全平/全局halt后果由子cap生成；账户全平路径始终保留。只在合成目录测试文件后果，真实state不碰。
 - [ ] 真实RiskProcess→RiskGate→LiveExecutor/PaperBroker+reconcile合成链验收：两线同时存在，触单线cap不平仓/不影响另线、人工/对账暂停同时存在不被覆盖、对账一致不解除线pause、重启/新magic、隔日恢复所有权、账户cap全平仍有效、两次flatten编号旧测试不变。只跑新测试及直接相关risk/gate/reconcile回归；记录RED/GREEN命令exit/tree，[OPS]提交。
