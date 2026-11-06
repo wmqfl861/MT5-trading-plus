@@ -1,0 +1,178 @@
+{
+  "candidate_id": "C005",
+  "decision": "pass",
+  "reasons": [
+    "机制空缺：event_calendar（央行日程）在 schema 内落位 event 类——组合里还没有的类别（蓝图 §6.2 条件 5）",
+    "main-only 预筛（A1 E8）：主段 [1986-01-02, 2021-05-17) FRED USTEC/D1 唯一一次有效真实运行（2026-11-06）；MT5 段与 FRED 2021-05-17 后延长段不进任何输入——bt candidate check 的全库装配无法表达该口径（规格说明已声明），按 A1 裁定经台账追加 API 登记",
+    "工程等待理由如实保留：cumulative_n_unknown（预筛时点 D33 组成未定）与 production_input_release_required（开轮前置程序义务）、n1_registration_package_review_pending（已由 A1 批准闭合）——均非预筛五条件项，不阻塞 decision",
+    "swap_dependent=true：swap_free 口径（倍数 21.39、检验力 59.5%）通过而 charged 口径（倍数 4.07、检验力 44.7%）不通过——该候选的结论依赖账户免隔夜费状态（config/account-profile.toml 用户确认条目；规格说明 §3 预注册 charged 另检、A1 B 节知情接受不翻门）"
+  ],
+  "events_per_year": 8.0,
+  "checks": {
+    "literature": {
+      "passed": true,
+      "original_n": 1,
+      "replications_n": 3,
+      "rebuttals_n": 2
+    },
+    "holding": {
+      "passed": true,
+      "holding": "D1",
+      "seconds": 86400,
+      "min": "H1"
+    },
+    "ex_ante_cost": {
+      "passed": true,
+      "min": 3.0,
+      "source_policy": "external-spread-x1.5-v1",
+      "per_symbol": {
+        "USTEC": {
+          "reference_price": 13393.12,
+          "reference_timeframe": "D1",
+          "contract_size": 1.0,
+          "spread_round_trip": 0.0001010814394512393,
+          "spread_entry_frac": 0.0001010814394512393,
+          "spread_exit_frac": 0.0001010814394512393,
+          "slippage_entry": 6.738762630082621e-06,
+          "slippage_exit": 6.738762630082621e-06,
+          "commission": 0.0,
+          "overnight": 0.0,
+          "round_trip_cost": 0.00011455896471140455,
+          "multiple": 21.386366454794768
+        }
+      },
+      "multiple": 21.386366454794768
+    },
+    "power": {
+      "passed": true,
+      "power": 0.5948863577998579,
+      "min": 0.5,
+      "alpha": 0.05,
+      "n_tests": 1,
+      "years": 24.386036960985628,
+      "years_detail": {
+        "USTEC/D1": 24.386036960985628
+      },
+      "years_basis": "event era 1994-09-27 onward (registration-package audit contract); full-main-segment years reported separately and not used by the gate",
+      "years_full_main_segment": 32.46269678302532,
+      "expected_sharpe": 0.52,
+      "implied_sharpe": 0.39646021117234875,
+      "sharpe_used": 0.39646021117234875,
+      "sigma_by_symbol": {
+        "USTEC": 0.016661507476178988
+      },
+      "sigma_windows": 8611,
+      "sigma_window_bars": 1,
+      "sigma_entry_hour_ny": 16,
+      "sigma_entry_hour_applied": null,
+      "sigma_note": "D1 date labels carry no NY entry hour; the frozen window_volatility spec keeps a single daily start, so every main-segment window counts",
+      "min_detectable_sharpe": 0.5388560265191747,
+      "cumulative": {
+        "n_tests": null,
+        "power": null,
+        "status": "unknown"
+      }
+    }
+  },
+  "calendar_coverage": {
+    "total_meetings": 310,
+    "default_event_set": 257,
+    "era_start": "1994-09-27",
+    "announcement_day_rule": "last calendar day of the meeting",
+    "event_window": [
+      "1994-09-27T00:00:00",
+      "2021-05-17T00:00:00"
+    ],
+    "window_events": 213,
+    "window_first": "1994-09-27",
+    "window_last": "2021-04-28",
+    "events_with_announcement_bar": 213,
+    "events_with_entry_anchor": 213,
+    "dropped_no_bar": [],
+    "dropped_no_anchor": [],
+    "month_end_overlap": {
+      "fred_last_trading_day": [
+        "1996-01-31",
+        "1997-09-30",
+        "1998-03-31",
+        "1999-06-30",
+        "2001-01-31",
+        "2004-06-30",
+        "2005-06-30",
+        "2006-01-31",
+        "2007-01-31",
+        "2007-10-31",
+        "2008-04-30",
+        "2013-07-31",
+        "2014-04-30",
+        "2018-01-31",
+        "2019-07-31"
+      ],
+      "calendar_last_weekday": [
+        "1996-01-31",
+        "1997-09-30",
+        "1998-03-31",
+        "1999-06-30",
+        "2001-01-31",
+        "2004-06-30",
+        "2005-06-30",
+        "2006-01-31",
+        "2007-01-31",
+        "2007-10-31",
+        "2008-04-30",
+        "2013-07-31",
+        "2014-04-30",
+        "2018-01-31",
+        "2019-07-31"
+      ],
+      "purpose": "K3 mechanical cross-check: FOMC days are not month-end-flow days by construction"
+    },
+    "note": "event counts and coverage cross-checks are provenance registration only; the precheck gates on unconditional window volatility, ex-ante costs and coverage-years power, never on event returns (no event return is computed)",
+    "open_review_items": {
+      "sep_2003_double_entry": "resolved by the 2026-11-06 registration-package audit revision bound here: 2003-09-15 excluded from the default event set (official September 2003 meeting is the 9/16 single-day meeting); the entry is retained in the calendar for diagnostics"
+    },
+    "event_effective_power": {
+      "basis": "conservative registration basis: window events / declared events_per_year; the gate itself uses measured coverage years",
+      "declared_events_per_year": 8.0,
+      "window_events": 213,
+      "event_effective_years": 26.625,
+      "sr_req_50pct": 0.32722479420208866,
+      "power_at_event_effective_years": 0.6273235096841551
+    }
+  },
+  "cost_model_version": "external-spread-x1.5-v1[n1-main-only-real-precheck#spread-abed3b8f]+slip0.1-comm0(declared_terms)-swap0(declared_terms_swap_free)",
+  "checked_at_utc": "2026-11-06T14:08:43.883975+00:00",
+  "candidate_sha256": "d00adad5f6303b557a97300e2c64c6737be8f2a3d07a72ca7206f57af5040bfa",
+  "swap_basis": {
+    "applicable": true,
+    "account_profile": {
+      "USTEC": "swap_free"
+    },
+    "decision_basis": "swap_free",
+    "charged": {
+      "multiple": 4.073989795394991,
+      "implied_sharpe": 0.31381902600128775,
+      "power": 0.4474553469118876,
+      "decision": "fail"
+    },
+    "swap_free": {
+      "multiple": 21.386366454794768,
+      "implied_sharpe": 0.39646021117234875,
+      "power": 0.5948863577998579,
+      "decision": "pass"
+    },
+    "swap_dependent": true,
+    "charged_note": "charged 口径 = swap_free 来回 + specs/latest.json 点数快照最不利侧 ×1 夜（provenance.costs.swap.charged_reference，spec_snapshot_not_deal_measured，非门控参考口径）"
+  },
+  "precheck_source": {
+    "stable_key": "N1:C005:main-only-real-precheck:2026-11-06",
+    "registered_via": "ledger.record_candidate_check（追加哈希链 API，沿 T113 追加先例；bt candidate check 读全库覆盖、无法表达 main-only，A1/规格说明已声明该限制）",
+    "approval": "docs/reviews/2026-11-06-n1-a1-ruling.md（E8：candidate_checks 台账登记 decision=pass main-only）",
+    "spec": "docs/research/h-n1-precheck-2026-11-06.md；.superpowers/h-new-candidates/n1-draft/N1-precheck-spec-2026-11-06.md",
+    "result_json_path": "<workspace>/demo-n1-precheck-20261106/.superpowers/sdd/2026-11-06-n1-precheck/real-run/result.json",
+    "result_payload_sha256": "1a450369bebed3ebf812f0a915e2e9e00289ce82b8dce274cfa5cce22115a47e",
+    "run_log_path": "<workspace>/demo-n1-precheck-20261106/.superpowers/sdd/2026-11-06-n1-precheck/RUN-LOG.txt（run4 final）",
+    "calendar_sha256": "a53577d96c699a1a6e7bab2bfb5f80d43408380ea3e2f48c7e88c1e76ec971c5",
+    "candidate_sha256_bound": "d00adad5f6303b557a97300e2c64c6737be8f2a3d07a72ca7206f57af5040bfa"
+  }
+}

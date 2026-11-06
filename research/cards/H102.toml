@@ -1,0 +1,33 @@
+# H102【草案 / N1】：Pre-FOMC 公告前漂移的事件模式卡（新族 v1）。
+# 位于 .superpowers/h-new-candidates/n1-draft/（非 research/cards/ 扫描路径）；
+# H102 为占位谱系号（H101=C002 已用；正式提升时由登记环节确认）。
+# load_card 只做 TOML/模式校验：strategy 字段留空 = legacy 口径（运行须
+# --strategy 显式给出）；策略类未实现，提升前应绑定 module:Class。
+# 只有 R3 获批准并开启、候选正式提升后才允许研究运行。
+id = "H102"
+family = "H102"
+version = 1
+parent = ""
+symbols = ["USTEC"]
+timeframe = "D1"
+round = "R3"
+candidate = "C005"
+session = "America/New_York 16:00-16:00（前一交易日收盘 → 公告日收盘，D1）"
+selection_rule = "single_spec"
+evaluation_mode = "standard"
+primary_statistic = "randomization"
+phenomenon = "FOMC 预排会议公告日前约 24 小时的系统性向上漂移（Lucca & Moench 2015：S&P 49bp/24h 窗，占 1994 以来股票超额收益 ~80%）。事件 = 日历工件默认事件集内的预排常规会议公告日（会议最后一日，8 次/年，1994-09-27 起 LM 时代）；交易 = USTEC 公告日前一交易日纽约 16:00 收盘做多 1 根 D1，公告日 16:00 收盘平仓。"
+mechanism = "央行会议日程的信息溢价/风险补偿（机制类别：event——短名单标签 event_calendar 央行日程）：公告前 24 小时内投资者为承担隔夜宏观风险获得补偿/为央行信息提前反映付出溢价。事件触发只用事前公布的官方日历（federalreserve.gov 工件，../n1-fomc-calendar/，SHA256 绑定）与已收盘 bar，不读公告内容/惊喜方向。**与 C002（H101）不同源声明**：C002 = 月末组合对冲调仓流（cross_asset，USTEC 当月涨跌符号 → EURUSD 定盘前 1 小时，日内不过夜）；本卡 = 央行日程信息溢价（event，纯 USTEC、固定方向、隔 1 夜），事件集与月末近似不重叠（FOMC 日极少为月末），信号不依赖 USTEC 当月涨跌符号，机制族/方向规则/交易品种/持仓属性全部不同。"
+should_fail_when = "公告日不在冻结日历工件的默认事件集内（unscheduled/cancelled/电话会/notation vote/1994-09-27 前/抓取日之后的会议一律不触发）；公告日前一交易日或公告日缺 FRED 主段 bar（交易日历/收盘映射不能提供入场锚点）→ fail-closed 丢弃该事件并登记，不得移窗/补邻近日；主段边界外（MT5 段与 FRED 2021-05-17 之后段）只作诊断、不进主检验；漂移在成本 ×1.5 压力下净均值 ≤ 0 时按预写规则判否。"
+falsified_if = "R3 预写的随机化参照主检验不满足单侧 p ≤ α/N（α=0.05，N 按 rounds_lineage 的 D33 口径 = R1 计 1 次去重研究试验（runs 449/450 七元组去重口径，台账 primary_test_n=1）+ 本候选主规格 = N=2，α/N=0.025；若 R2 先行运行则按台账实际取数重列，见 R3 advance_rule），或唯一适用否决（成本 ×1.5 后每事件净均值 > 0）未通过；或日历工件哈希与登记绑定不一致（fail-closed，不得静默换用重抓日历）。"
+graveyard_checked = []
+
+[rules]
+entry = "冻结日历工件（fomc_meetings.json 默认事件集）内的每个预排常规会议公告日 D：取主段 FRED USTEC D1 显式交易日历上 D 的前一交易日，纽约 16:00 收盘价做多 USTEC（static_long，无条件、无参数）。锚点 bar 必须严格早于公告日；缺锚 fail-closed。"
+exit = "公告日 D 的纽约 16:00 收盘平仓；事件窗恰为 1 根 D1 bar、隔 1 夜（overnight_nights=1.0，swap_free 口径申报）。"
+stop = "不设参数化止损/止盈：固定 1 夜事件窗、持有到期（single_spec，无参数网格）；保护性止损若随策略实现引入属代码细节，不改变事件窗与主检验定义。"
+
+[expected]
+trades_per_year = "8 个计划事件/年（FOMC 预排常规会议；2020=7、2003=8 等年份偏差按工件如实计——2003-09-15 已剔除默认事件集，见 PROVENANCE）。约 24.5bp/事件为文献折算的发表后折减口径登记值（原作 49bp 双口径见 C005 登记），非样本内结果。"
+win_rate = "未登记；事件方向盈亏概率不作点预测。"
+payoff_ratio = "不适用；固定 1 夜事件窗、固定方向、无参数化止盈结构。"

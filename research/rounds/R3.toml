@@ -1,0 +1,23 @@
+# R3 研究轮次预注册草案（H 线 / N1=Pre-FOMC，2026-11-06）。
+# 位于 .superpowers/h-new-candidates/n1-draft/（非 research/rounds/ 扫描路径）。
+# approved_by 为空 = 草案：装载器（rounds.load_round）拒绝空 approved_by，
+# "批准前不开轮"由机器保证；本文件不得用于 bt round open。
+# opened 是既有 loader 要求的日期字段，下面的日期只表示草案编制日，
+# 不表示轮次已打开或已写入台账；正式开启由批准方处理。
+# candidates 编号 C005 为占位（与候选草案一致），正式登记时由登记环节
+# 分配/改号后同步更新。
+id = "R3"
+opened = "2026-11-06"
+candidates = ["C005"]        # 占位：N1（Pre-FOMC 公告前漂移，USTEC D1）
+trial_budget = 2             # 1 次主规格 + 1 次代码修复后的重跑（R1/R2 先例：
+                             # 每候选只跑登记的一个主规格；窗口变体只作诊断，
+                             # 不单独作研究运行）
+lockbox_uses_max = 1         # D16 机器强制：每研究轮次最多 1 次 G5（总预算 3
+                             # 次，H/P 线共用）；锁箱使用需另经批准
+dsr_trial_scope = "rounds_lineage"   # T85/D34 冻结 + T96 对齐
+approved_by = "A1 批准点独立审核记录 docs/reviews/2026-11-06-n1-a1-ruling.md（2026-11-06）"
+advance_rule = "C005 仅在主检验段（FRED USTEC D1 外部主段，边界与输入契约见预筛规格说明）上运行；主段外（MT5 段与 FRED 2021-05-17 之后段）只作诊断、标非盲。入轮前置门：主段 main-only 预筛单次检验功效必须 ≥50%（台账 candidate_checks 最新 decision=pass 方可开轮；若 waiting_data 则不开）。主检验 = 随机化参照检验，单侧 p ≤ α/N，α=0.05；N 按 dsr_trial_scope=rounds_lineage 的 D33 谱系口径（2026-11-06 修订）：R1 计 1 次去重研究试验（runs 449/450 七元组去重口径，台账 primary_test_n=1；依据 = R1 关闭报告'试验预算 1/2 七元组去重口径'、T113 更正'轮次内研究 N 仍为 1'、T114 草案'R2 只有 C002 时 N=1'）+ 本候选主规格 = **N=2**（α/N=0.025）；若 R2 先行运行则按台账实际取数重列（N 以台账 ledger.primary_test_n 实际取数为准），不按本草案预写的 2 硬编码。随机化事件必须从与实际事件同一冻结日历工件（fomc_meetings.json 默认事件集，SHA256 绑定）与同一主段交易日历中抽取非事件对照入口，方向恒为 static_long（不重算、不依赖任何当期信号）；随机化次数 ≥ max(1999, ⌈20N/α⌉)，入口预检低于下限拒绝运行。G0 通过。否决仅一项适用 = 成本 ×1.5 后每事件净均值 > 0（swap_free 申报口径；事件窗按交易所时钟定义，'延迟一根'与'多头相对买入持有超额'两项不适用、不运行——[v3.event] 两 veto=false，R1/R2 先例）。诊断四项（年块自助对 0、事件窗前后各移一根 bar、分段均值、已知缺口注记）只报告不否决；FOMC 偶数周窗口变体只作诊断（Uppal 2025 反驳，不入主检验）。判定'过'后本轮不再挑选参数或开新变体；判定依据全部为本文件与冻结 gates.toml 的预写规则，不按结果临时调整。单次功效门与 α/N 功效分别报告，不得混称。"
+close_rule = "先到即止：(a) 试验预算 2 次去重研究试验用尽（1 主规格 + 1 修复重跑）；或 (b) C005 得到结论——通过者最多 1 次 G5（lockbox_uses_max=1，D16）后关闭，未通过者登记结论关闭。关闭后 bt round close R3 生成轮次报告（含全部运行与按 advance_rule 的判定），本轮不能再运行。"
+
+[evaluation]
+C005 = { mode = "event", primary = "randomization", side_rule = "static_long" }
