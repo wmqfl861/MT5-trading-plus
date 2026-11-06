@@ -1,6 +1,12 @@
-# H/P 模拟交易准备验收（2026-11-05）
+# H/P 模拟交易准备验收（2026-11-05/06）
 
-H/P交易接线批次已交付到 `c0df5a1d133eadbe8a8c089fba0758ed840d830b`：四模块与整合独立审核通过，最终全仓3713 passed、3 skipped、3条既有警告，退出0；同一提交的 [tests #304](https://github.com/wmqfl861/MT5-trading-plus/actions/runs/42005274111) 成功。H/P使用真实行情在MT5 Demo做策略前向验证的条件仍待下列输入、研究和部署证据。
+H/P交易接线批次已交付到 `c0df5a1d133eadbe8a8c089fba0758ed840d830b`：四模块与整合独立审核通过，最终全仓3713 passed、3 skipped、3条既有警告，退出0；同一提交的 [tests #304](https://github.com/wmqfl861/MT5-trading-plus/actions/runs/42005274111) 成功。后续就绪批次交付到 `d29fff7`（全仓4051 passed、[CI #306](https://github.com/wmqfl861/MT5-trading-plus/actions/runs/42084884876) 成功）。
+
+## 2026-11-06 真实数据核验与 H 线 A1 裁定
+
+用户指示使用本机 MT5 与研究库真实数据后：Demo 账户确认、9 个真实序列拉取、时间诊断工具在真实 HistData/FRED 上通过（主段 88,786 根 0 重复/乱序/离格）。真实主段预筛（装配器经聚焦评审 Spec/Quality PASS）实测：**成本门 3.448 ≥3 通过；单次功效 42.4% <50% 不过** → [A1 独立裁定](../reviews/2026-11-06-t114-a1-ruling.md) **不批准开 R2，C002 维持 waiting_data**。稳健性核对：最有利年数口径下也仅 ~45.1%。预注册内无合规出路；后续仅两条路径（新合法数据实质增长主段年数、或机制不同的新候选）。H 线经研究批准进入 Demo 的路径就此被功效门真实阻断，如实报告。
+
+P 线成本缺口实测确认：XAUUSD 佣金未实测、overshoot 证据缺、spread 为 2026 情景基准；发现段数据在库（XAUUSD 2014 起、EURUSD 2007 起）。P 真实 T121 需成本补证范围裁定 + release 登记。
 
 ## 本批后续工程
 
