@@ -26,6 +26,15 @@ from mt5quant.prob.feasibility import (
 
 ROOT = Path(__file__).resolve().parents[3]
 PARTS = ("spread", "slippage", "commission", "contract", "overshoot", "swap")
+# Scope review B/E (2026-11-06): non-measured evidence never claims an
+# observation interval inside the discovery segment (observed=null); its
+# authority is basis/evidence_refs, and scenario components additionally
+# carry a positive multiplier. Measured keeps the v1 discovery-bounded
+# observation window unchanged.
+OBSERVATION_KINDS = ("measured", "declared_terms", "spec_snapshot", "scenario")
+COMPONENT_FIELDS = ("artifact_ref source_ref component symbol purpose account_scope_id "
+                    "account_purpose currency observed_start observed_end_exclusive "
+                    "applies_start applies_end_exclusive basis units conversion_basis dependencies")
 SYMBOLS = ("XAUUSD", "EURUSD")
 PURPOSE = "T121-count-cost"
 CUTOFF = datetime(2016, 5, 1, tzinfo=timezone.utc)
@@ -304,7 +313,16 @@ def _validate_manifest(m, snapshot, release_id, now):
         _keys(group, " ".join(PARTS))
         for name in PARTS:
             part = group[name]
-            _keys(part, "artifact_ref source_ref component symbol purpose account_scope_id account_purpose currency observed_start observed_end_exclusive applies_start applies_end_exclusive basis units conversion_basis dependencies")
+            kind = part.get("observation_kind", "measured") if type(part) is dict else "measured"
+            _require(kind in OBSERVATION_KINDS, "unknown observation kind")
+            fields = set(COMPONENT_FIELDS.split())
+            if type(part) is dict and "observation_kind" in part:
+                fields.add("observation_kind")
+            if kind != "measured":
+                fields |= {"evidence_refs"}
+                if kind == "scenario":
+                    fields.add("multiplier")
+            _require(type(part) is dict and set(part) == fields, "invalid or missing fields")
             _ref(part["artifact_ref"])
             _ref(part["source_ref"])
             # v1 admits only the reviewed source bytes themselves, not transforms
@@ -314,10 +332,31 @@ def _validate_manifest(m, snapshot, release_id, now):
                      "component purpose/symbol mismatch")
             _require(part["account_scope_id"] == m["scope"]["account_scope_id"] and
                      part["account_purpose"] == "Demo" and part["currency"] == "USD", "component account mismatch")
-            observed_start, observed_end = _window(part["observed_start"], part["observed_end_exclusive"])
             applies_start, applies_end = _window(part["applies_start"], part["applies_end_exclusive"])
-            _require(observed_start < observed_end <= CUTOFF and applies_start <= start < end <= applies_end <= CUTOFF,
-                     "component observation/application outside discovery")
+            _require(applies_start <= start < end <= applies_end <= CUTOFF,
+                     "component application outside discovery")
+            if kind == "measured":
+                observed_start, observed_end = _window(part["observed_start"], part["observed_end_exclusive"])
+                _require(observed_start < observed_end <= CUTOFF,
+                         "component observation outside discovery")
+            else:
+                # B: the account did not exist in 2007-2016; declared terms,
+                # spec snapshots and scenarios must never be registered as
+                # observation intervals ("非观测型记不适用").
+                _require(part["observed_start"] is None and part["observed_end_exclusive"] is None,
+                         "non-measured components cannot declare observation intervals")
+                refs = part["evidence_refs"]
+                if type(refs) is str:
+                    _require(refs.strip(), "invalid evidence references")
+                elif type(refs) is list:
+                    _require(refs and all(type(item) is str and item.strip() for item in refs),
+                             "invalid evidence references")
+                else:
+                    _require(False, "invalid evidence references")
+                if kind == "scenario":
+                    multiplier = part["multiplier"]
+                    _require(type(multiplier) in (int, float) and math.isfinite(multiplier) and
+                             multiplier > 0, "invalid scenario multiplier")
             for key in ("basis", "units", "conversion_basis"):
                 _id(part[key])
             allowed_basis = {"spread": ("absolute", "relative"), "slippage": ("spread-fraction-v1",),
