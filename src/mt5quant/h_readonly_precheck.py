@@ -8,6 +8,9 @@
   records ([] is checked-empty; None/absent is unknown and rejected);
 * source_eligibility: {canonical_source: 'synthetic_only'} for every declared
   source. These are fixture declarations, never production approvals.
+  The real precheck eligibility mode accepts exactly 'real_precheck_only'
+  instead; both are declarations and neither is a production approval, and
+  the two modes reject each other's inputs.
 
 No data root, ledger, event returns, labels, fitting or sampler is used.
 The caller supplies a standard Costs model, an explicit EURUSD per_symbol
@@ -37,6 +40,12 @@ from mt5quant.research import candidates as cand, power
 TRADE = "EURUSD/H1"
 SIGNAL = "USTEC/D1"
 PAIRS = {TRADE: ("EURUSD", "H1"), SIGNAL: ("USTEC", "D1")}
+# Eligibility declaration values. The default remains the synthetic fixture
+# gate; the real value is only produced by the bound real-input assembler and
+# still asserts not_released in every result.
+SYNTHETIC_ELIGIBILITY = "synthetic_only"
+REAL_ELIGIBILITY = "real_precheck_only"
+_ELIGIBILITY_MODES = frozenset({SYNTHETIC_ELIGIBILITY, REAL_ELIGIBILITY})
 MAIN_START = pd.Timestamp("2007-01-01")
 MAIN_END = pd.Timestamp("2021-05-17")
 WARMUP_START = MAIN_START - pd.Timedelta(days=40)
@@ -85,8 +94,10 @@ def _time(value):
     return pd.Timestamp(_utc(value)).tz_localize(None)
 
 
-def _validate_metadata(inputs):
+def _validate_metadata(inputs, *, required_eligibility=SYNTHETIC_ELIGIBILITY):
     """Pure metadata gate, also run by CLI BEFORE opening any bars artifact."""
+    if required_eligibility not in _ELIGIBILITY_MODES:
+        raise ValueError(f"unknown required eligibility: {required_eligibility!r}")
     _fields(inputs, PAIRS, "inputs")
     coverage, missing = [], {}
     for key, pair in PAIRS.items():
@@ -103,8 +114,9 @@ def _validate_metadata(inputs):
         sources = {s.source for s in segments}
         eligibility = rec["source_eligibility"]
         if not isinstance(eligibility, Mapping) or set(eligibility) != sources or not sources \
-                or any(v != "synthetic_only" for v in eligibility.values()):
-            raise PermissionError(f"{key}: source qualification not_released; synthetic_only required")
+                or any(v != required_eligibility for v in eligibility.values()):
+            raise PermissionError(
+                f"{key}: source qualification not_released; {required_eligibility} required")
         coverage.extend(segments)
         missing[pair] = holes
     scope = validate_h_main_scope(coverage=coverage, missing_intervals=missing)
@@ -113,11 +125,12 @@ def _validate_metadata(inputs):
     return scope
 
 
-def _normalize_inputs(inputs):
+def _normalize_inputs(inputs, *, required_eligibility=SYNTHETIC_ELIGIBILITY):
     _fields(inputs, PAIRS, "inputs")
     for key in PAIRS:
         _fields(inputs[key], _METADATA_KEYS | {"bars", "source_tags"}, key)
-    scope = _validate_metadata({k: {f: inputs[k][f] for f in _METADATA_KEYS} for k in PAIRS})
+    scope = _validate_metadata({k: {f: inputs[k][f] for f in _METADATA_KEYS} for k in PAIRS},
+                               required_eligibility=required_eligibility)
     frames, tags = {}, {}
     for key in PAIRS:
         rec, pair = inputs[key], PAIRS[key]
@@ -239,7 +252,8 @@ def _cost_breakdown(model, contract, ref, declared):
             "multiple": declared.gross_return_per_event / cost}
 
 
-def run_h_readonly_precheck(candidate, *, inputs, cost_model, contract_sizes, cumulative_n=None) -> dict:
+def run_h_readonly_precheck(candidate, *, inputs, cost_model, contract_sizes, cumulative_n=None,
+                            required_eligibility=SYNTHETIC_ELIGIBILITY) -> dict:
     """Engineering diagnostics only; every result is production not_released."""
     if cumulative_n is not None and (type(cumulative_n) is not int or cumulative_n <= 0):
         raise ValueError("cumulative_n must be an explicitly checked positive integer, not bool")
@@ -263,7 +277,7 @@ def run_h_readonly_precheck(candidate, *, inputs, cost_model, contract_sizes, cu
     _fields(contract_sizes, {"EURUSD"}, "contract_sizes")
     contract = _number(contract_sizes["EURUSD"], "contract_size", positive=True)
     _validate_cost_model(cost_model)
-    scope, frames, tags = _normalize_inputs(inputs)
+    scope, frames, tags = _normalize_inputs(inputs, required_eligibility=required_eligibility)
     selected, selected_tags = {}, {}
     selected[TRADE], selected_tags[TRADE] = _selected(
         frames[TRADE], tags[TRADE], scope.trade_intervals, MAIN_START, MAIN_END)
