@@ -442,6 +442,15 @@ def _validate_manifest(m, snapshot, release_id, now):
                      math.isfinite(step) and step > 0, "invalid release grid step")
             if grid_symbol in RULES["grids"]:
                 _require(step == RULES["grids"][grid_symbol], "frozen grid step changed")
+        # Registration review R2 (2026-11-07, docs/reviews/
+        # 2026-11-07-t121-release-v2-registration-review.md): a per-release
+        # grids entry pins exactly the declared pool — no extra SYMBOLS member
+        # (superset) and no pool symbol without a step. Fail-closed, reason
+        # naming both key-set differences.
+        _require(set(grids) == set(pool),
+                 "release grids keys differ from declared pool "
+                 "(grids-only: %s; pool-only: %s)" % (sorted(set(grids) - set(pool)),
+                                                      sorted(set(pool) - set(grids))))
     effective = {**RULES, "version": version}
     if grids is not None:
         effective["grids"] = grids

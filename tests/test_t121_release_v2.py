@@ -274,6 +274,58 @@ def test_rules_grids_and_version_binding(validate):
     refuse(stale)
 
 
+# Registration review R2 (docs/reviews/2026-11-07-t121-release-v2-registration-
+# review.md): when a manifest carries per-release grids, its key set must equal
+# the declared pool exactly (previously a SYMBOLS-superset of the pool was
+# accepted, production_adapter.py:435/444). The tightening is a precondition
+# for any future per-release-grids manifest registration; v1 (no grids key)
+# is untouched.
+def test_registration_review_r2_grids_keys_must_equal_declared_pool(validate):
+    equal_one = build_manifest(("USDJPY",))
+    assert validate(equal_one)  # grids keys == pool (single symbol)
+    equal_three = build_manifest(("XAUUSD", "EURUSD", "USDJPY"))
+    assert validate(equal_three)  # grids keys == pool (frozen two + per-release USDJPY)
+
+    # Superset of the pool (two extra SYMBOLS members with frozen-valid steps
+    # and a correctly recomputed canonical sha) must be refused; the refusal
+    # reason names both key-set differences (grids-only symbols; empty
+    # pool-only side — USDJPY is in both sets and is not a difference).
+    superset = build_manifest(("USDJPY",))
+    superset["rules"] = rules_block(version="t121-offline-v1-usdjpy",
+                                    grids={**RULES["grids"], "USDJPY": USDJPY_GRID})
+    with pytest.raises(adapter.AdmissionRefused) as excinfo:
+        validate(superset)
+    message = str(excinfo.value)
+    assert "grids" in message
+    for side in ("grids-only", "pool-only"):
+        assert side in message
+    for symbol in ("XAUUSD", "EURUSD"):  # grids-only difference
+        assert symbol in message
+    assert "[]" in message  # the empty pool-only difference is shown explicitly
+
+    # A pool member without any grid step stays refused (pre-R2 behavior:
+    # "release pool lacks grid steps" fail-closed) — with the same
+    # difference-naming form: here the pool-only side is non-empty.
+    missing = build_manifest(("USDJPY",))
+    missing["rules"] = rules_block(version="t121-offline-v1-usdjpy",
+                                   grids={"XAUUSD": 5.})
+    with pytest.raises(adapter.AdmissionRefused) as excinfo:
+        validate(missing)
+    missing_message = str(excinfo.value)
+    assert "pool-only" in missing_message and "USDJPY" in missing_message
+    assert "grids-only" in missing_message and "XAUUSD" in missing_message
+
+
+# R2 (c): v1 path zero change — no grids key means no pool-key-set coupling to
+# the rules block at all; the frozen v1 pool stays accepted and a pool without
+# frozen grid steps stays refused exactly as before.
+def test_registration_review_r2_v1_manifests_without_grids_unchanged(validate):
+    assert validate(build_manifest(("XAUUSD", "EURUSD"), mode="v1"))
+    no_frozen_step = build_manifest(("USDJPY",), mode="v1")
+    with pytest.raises(adapter.AdmissionRefused):
+        validate(no_frozen_step)
+
+
 def test_v1_manifest_acceptance_set_unchanged(validate):
     # Legacy v1 manifest (implicit measured, 2014->2015 windows, v1 pool and
     # rules) is accepted with identical semantics; its historical rejections
