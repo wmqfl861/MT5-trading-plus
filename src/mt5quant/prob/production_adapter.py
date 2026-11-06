@@ -42,7 +42,10 @@ CUTOFF = datetime(2016, 5, 1, tzinfo=timezone.utc)
 PREREG = "docs/research/pline-feasibility-prereg-2026-11-02.md"
 PREREG_SHA256 = "c78a78d13ed81c611b5f9599c96235d7bbcefceac6fda54566b103f3e8cb3235"
 PREREG_V2 = "docs/research/pline-feasibility-prereg-v2-2026-11-06.md"
-PREREG_V2_SHA256 = "32aaa92ccebdef5fdc1211073f5d38595ed8a979542eeebca473baf5488018b8"
+PREREG_V2_SHA256 = "9084d7c951cd246f4cae3f2dec5c5ec2c13d79a3d84b3c0a4e036ab1ca191315"
+# rebind R (registration re-adjudication 2026-11-07): prereg v2 blob changed
+# solely by secret redaction (account/server -> placeholders, 2 lines); see
+# docs/reviews/2026-11-07-history-redaction.md and the readjudication record.
 # t121-release-v2 (ruling 2026-11-06, conditional approved, option II): SYMBOLS
 # is now the admissible FULL set; each release manifest declares its own pool
 # (scope.symbols), validated as a non-empty duplicate-free subset, and the
