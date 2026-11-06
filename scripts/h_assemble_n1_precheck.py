@@ -65,8 +65,14 @@ FOMC_ERA_START = "1994-09-27"      # LM era; cross-checked against the bound cal
 N1_WHITELIST = {
     "ext/fred/USTEC/D1/data.parquet":
         "c6645256e2cf2ceb10474318c2e5f926a5157cc0c9d50027e55f1482200a71c6",
+    # Rebound 2026-11-07 (fix2, S2-S4c FRED yearly verification program): the
+    # manifest now declares yearly_verification 1986..2026 all used=true while
+    # the parquet bytes stay bit-identical (c6645256... above).  The pre-rebind
+    # pin 08ff3dff0f48330e48832c06eb21bbf8b7564f81616d5783cd183ce31311c5fe is
+    # kept here only as provenance of the re-binding
+    # (.superpowers/sdd/2026-11-07-r3-main-test-fix1/s2-s4-real-verification/).
     "ext/fred/USTEC/D1/manifest.json":
-        "08ff3dff0f48330e48832c06eb21bbf8b7564f81616d5783cd183ce31311c5fe",
+        "6f068426077c2c935ba1bb1d43946144db966fa47708d64e1d3007f39b3469d6",
     "costs/spread_model.json":
         "c35550b90fbefef0d61b6c767e9e5365d6480cffaee232a68da696edb667ce85",
     "specs/latest.json":
@@ -289,6 +295,37 @@ def _used_gate(manifest: dict, key: str, years: list[str]) -> dict:
     return {"touched_years": years, "basis": "yearly_verification", "years": detail}
 
 
+# fix2 (2026-11-07): the bound manifest's yearly reality is registered as it
+# is, per run — no hardcoded claim about yearly_verification existence.  The
+# pre-registered GAP_RULES constant (and with it the rules-hash domain of
+# hashes.rules) stays byte-identical; only the per-run provenance copy is
+# qualified by the measured used gate.
+_YEAR_HANDLING_NO_YEARLY = {
+    "basis": "not_applicable_fred_has_no_yearly_gate",
+    "note": "FRED manifest 无逐年声明；2019 类回收年处理 N/A",
+}
+
+
+def _year_handling(gate: dict) -> dict:
+    if gate["basis"] != "yearly_verification":
+        return dict(_YEAR_HANDLING_NO_YEARLY)
+    touched = gate["touched_years"]
+    return {"basis": "yearly_verification_all_touched_years_used",
+            "note": ("FRED manifest 声明 yearly_verification（S1 逐年核验程序 "
+                     "2026-11-07 换绑绑定）：主段 touched years "
+                     f"{touched[0]}..{touched[-1]} 共 {len(gate['years'])} 条经 "
+                     "used 门全 used=true；无 used=false 年份，2019 类回收年处理 N/A")}
+
+
+def _explicit_registration(gate: dict) -> str:
+    if gate["basis"] != "yearly_verification":
+        return GAP_RULES["explicit_registration"]
+    return ("none: the bound FRED manifest yearly_verification (S1 yearly "
+            "verification program, rebound 2026-11-07) declares every touched "
+            "year used=true; no salvage-excluded months are declared (no "
+            "used=false year, so 2019-style salvage handling is N/A)")
+
+
 def _read_prices(raw: bytes, rel: str) -> pd.DataFrame:
     """Decode time+close only, from the already verified bytes."""
     try:
@@ -465,6 +502,23 @@ def ustec_trading_calendar(prices: pd.DataFrame, *,
             "complete_through": last.date().isoformat()}
 
 
+def _write_calendar_export(target: Path, doc: dict) -> str:
+    """Write the derived trading calendar as LF-only bytes; return the sha256.
+
+    fix1-F1 (focused review 2026-11-07, low severity): ``Path.write_text``
+    with the default newline translates ``\\n`` to the platform line ending,
+    so on Windows the on-disk artifact diverged from the PROVENANCE-recorded
+    text hash (recorded b0dea4b2... = LF text vs on-disk 67479203... = CRLF).
+    The write is pinned to ``newline="\\n"``: the on-disk bytes are always the
+    recorded text bytes and both hashes coincide.  The caller keeps the
+    exclusive-refusal check (an existing target is never overwritten).
+    """
+    text = json.dumps(doc, ensure_ascii=False, indent=1, allow_nan=False) + "\n"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8", newline="\n")
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def _assemble_costs(spread_doc: dict, specs_doc: dict, reference_price: float) -> tuple[Costs, dict]:
     try:
         model = spread_doc["model"]
@@ -626,6 +680,8 @@ def assemble_n1_inputs(data_root, calendar_path, *,
         _parse_json(bound["costs/spread_model.json"], "costs/spread_model.json"),
         _parse_json(bound["specs/latest.json"], "specs/latest.json"),
         float(bars.close.iloc[-1]))
+    gap_rules = dict(GAP_RULES)
+    gap_rules["explicit_registration"] = _explicit_registration(gate)
     provenance = {
         "status": "provisional",
         "note": ("聚焦独立评审通过前不交 A1；本产物仅为工程诊断，非研究结论、非执行许可"),
@@ -643,9 +699,8 @@ def assemble_n1_inputs(data_root, calendar_path, *,
         },
         "eligibility": {SERIES: {SOURCE: REAL_ELIGIBILITY}},
         "used_gate": {SERIES: gate},
-        "year_handling": {"basis": "not_applicable_fred_has_no_yearly_gate",
-                          "note": "FRED manifest 无逐年声明；2019 类回收年处理 N/A"},
-        "gap_rules": GAP_RULES,
+        "year_handling": _year_handling(gate),
+        "gap_rules": gap_rules,
         "missing_intervals": {SERIES: [[_naive(h.start).isoformat(), _naive(h.end).isoformat()]
                                        for h in _union(missing)]},
         "missing_interval_counts": {SERIES: {"derived_weekday_grid": len(derived)}},
@@ -1013,14 +1068,10 @@ def main(argv=None):
             if args.export_calendar.exists():
                 raise BindingError(f"calendar export target already exists "
                                    f"(refusing to overwrite): {args.export_calendar}")
-            calendar_text = json.dumps(assembled["trading_calendar"],
-                                       ensure_ascii=False, indent=1,
-                                       allow_nan=False) + "\n"
-            args.export_calendar.parent.mkdir(parents=True, exist_ok=True)
-            args.export_calendar.write_text(calendar_text, encoding="utf-8")
+            calendar_sha = _write_calendar_export(args.export_calendar,
+                                                  assembled["trading_calendar"])
             print(f"calendar export: {args.export_calendar} (sha256 "
-                  f"{hashlib.sha256(calendar_text.encode('utf-8')).hexdigest()})",
-                  file=sys.stderr)
+                  f"{calendar_sha})", file=sys.stderr)
         rules = dict(N1_RULES)
         rules["main_start"] = provenance["main_window"][0]
         rules["windows"] = {SERIES: list(provenance["main_window"])}

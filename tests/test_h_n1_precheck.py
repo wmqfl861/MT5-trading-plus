@@ -34,11 +34,19 @@ SERIES = "USTEC/D1"
 MAIN_END = pd.Timestamp("2021-05-17")
 ERA_START = "1994-09-27"
 
+# fix2 (2026-11-07): exactly one whitelist entry is rebound — the FRED
+# manifest rewritten by the S2-S4c yearly verification program (41 entries
+# 1986..2026 all used=true; parquet bytes bit-identical).  The pre-rebind
+# manifest pin 08ff3dff... stays below only as provenance of the re-binding.
+NEW_MANIFEST_SHA256 = ("6f068426077c2c935ba1bb1d43946144db966fa47708d64e1d"
+                       "3007f39b3469d6")
+OLD_MANIFEST_SHA256 = ("08ff3dff0f48330e48832c06eb21bbf8b7564f81616d5783cd"
+                       "183ce31311c5fe")
+
 N1_WHITELIST = {
     "ext/fred/USTEC/D1/data.parquet":
         "c6645256e2cf2ceb10474318c2e5f926a5157cc0c9d50027e55f1482200a71c6",
-    "ext/fred/USTEC/D1/manifest.json":
-        "08ff3dff0f48330e48832c06eb21bbf8b7564f81616d5783cd183ce31311c5fe",
+    "ext/fred/USTEC/D1/manifest.json": NEW_MANIFEST_SHA256,
     "costs/spread_model.json":
         "c35550b90fbefef0d61b6c767e9e5365d6480cffaee232a68da696edb667ce85",
     "specs/latest.json":
@@ -691,3 +699,78 @@ def test_cli_export_calendar_flag_and_fail_closed_no_write(tmp_path):
     assert not export.exists()
     assert not out.exists()
     assert "--export-calendar" in _cli_flags()
+
+
+# ------------------------------- fix2 (2026-11-07): FRED yearly-verification rebind
+#
+# The S2-S4c FRED yearly verification program rewrote the bound research
+# manifest to carry yearly_verification (41 entries 1986..2026, all used=true)
+# with the parquet bytes bit-identical, so the frozen whitelist rebinds exactly
+# one entry (.superpowers/sdd/2026-11-07-r3-main-test-fix1/
+# s2-s4-real-verification/).  fix1-F1 (focused review, low severity): the
+# calendar export wrote with the platform newline, so on Windows the on-disk
+# artifact hash diverged from the PROVENANCE-recorded text hash — the export
+# write is now pinned to LF-only bytes.
+
+
+def test_whitelist_rebind_is_exactly_the_manifest_sha():
+    module = assembler()
+    entry = module.N1_WHITELIST["ext/fred/USTEC/D1/manifest.json"]
+    assert entry == NEW_MANIFEST_SHA256
+    assert entry != OLD_MANIFEST_SHA256
+    others = {k: v for k, v in module.N1_WHITELIST.items()
+              if k != "ext/fred/USTEC/D1/manifest.json"}
+    assert others == {
+        "ext/fred/USTEC/D1/data.parquet":
+            "c6645256e2cf2ceb10474318c2e5f926a5157cc0c9d50027e55f1482200a71c6",
+        "costs/spread_model.json":
+            "c35550b90fbefef0d61b6c767e9e5365d6480cffaee232a68da696edb667ce85",
+        "specs/latest.json":
+            "144bb2245479e3557c571c9f5f83ca92db9d269211da7845c9d5aa2467d3150f",
+    }
+
+
+def test_used_gate_accepts_all_used_yearly_verification(tmp_path):
+    """S5.4: with yearly_verification all used=true the used gate passes every
+    touched year (no BindingError) and the year_handling / gap_rules
+    registrations state the manifest's yearly reality truthfully."""
+    module = assembler()
+    yearly = {str(y): {"used": True, "verification": "fred_d1_v1"}
+              for y in range(1994, 2022)}
+    out = assembled(tmp_path, fred=fred_manifest(yearly=yearly))
+    gate = out["provenance"]["used_gate"][SERIES]
+    assert gate["basis"] == "yearly_verification"
+    assert sorted(gate["years"]) == [str(y) for y in range(1994, 2022)]
+    assert all(v == {"used": True, "calendar": None}
+               for v in gate["years"].values())
+    handling = out["provenance"]["year_handling"]
+    assert handling["basis"] == "yearly_verification_all_touched_years_used"
+    assert "1994" in handling["note"] and "2021" in handling["note"]
+    explicit = out["provenance"]["gap_rules"]["explicit_registration"]
+    assert "yearly_verification" in explicit
+    assert "no yearly_verification at all" not in explicit
+    # The no-yearly fixture keeps the pre-rebind registration verbatim.
+    plain = assembled(tmp_path / "plain")
+    assert plain["provenance"]["year_handling"] == {
+        "basis": "not_applicable_fred_has_no_yearly_gate",
+        "note": "FRED manifest 无逐年声明；2019 类回收年处理 N/A"}
+    assert plain["provenance"]["gap_rules"]["explicit_registration"] == \
+        assembler().GAP_RULES["explicit_registration"]
+    # The pre-registered rule constant itself is untouched (rules-hash domain).
+    assert "no yearly_verification at all" in \
+        assembler().GAP_RULES["explicit_registration"]
+
+
+def test_calendar_export_writes_lf_only_bytes(tmp_path):
+    """fix1-F1: the export write is pinned to newline="\\n" so the on-disk
+    artifact is byte-identical to the PROVENANCE-recorded text (no CRLF
+    translation on Windows) and the returned hash is the on-disk hash."""
+    module = assembler()
+    doc = assembled(tmp_path)["trading_calendar"]
+    target = tmp_path / "calendars" / "USTEC.json"
+    sha = module._write_calendar_export(target, doc)
+    raw = target.read_bytes()
+    assert b"\r" not in raw
+    text = json.dumps(doc, ensure_ascii=False, indent=1, allow_nan=False) + "\n"
+    assert raw == text.encode("utf-8")
+    assert sha == hashlib.sha256(raw).hexdigest()
