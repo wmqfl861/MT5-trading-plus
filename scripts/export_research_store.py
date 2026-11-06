@@ -214,7 +214,9 @@ def verify_research_store(dest: str, cutoff) -> list[str]:
 
 
 def export_ext_series(ext_root: str, dest: str, cutoff, *,
-                      now_iso: str) -> tuple[int, int, int]:
+                      now_iso: str,
+                      only_sources: set[str] | None = None
+                      ) -> tuple[int, int, int]:
     """把 data/ext/** 导出进研究库（只取 time < cutoff 的行；T67/T81）。
 
     - manifest 在读取侧过 validate_manifest（缺字段 → ExtDataError，
@@ -240,6 +242,8 @@ def export_ext_series(ext_root: str, dest: str, cutoff, *,
         return 0, 0, 0
     exported = skipped = rejected = 0
     for m in inv:
+        if only_sources is not None and m["source"] not in only_sources:
+            continue   # 域外来源：不导出、不拒绝、零触碰（域限定模式）
         key = f"{m['source']}/{m['symbol']}/{m['timeframe']}"
         try:
             check_exportable(m)
@@ -374,6 +378,10 @@ def main(argv=None) -> int:
                          "研究库纳入须用户先确认数据源）")
     ap.add_argument("--ext-root", default="data/ext",
                     help="外部数据根目录（默认 data/ext）")
+    ap.add_argument("--only-ext-source", action="append", default=None,
+                    metavar="SOURCE",
+                    help="域限定：只重导指定批准来源的 ext 序列进研究库"
+                         "（不动 bars/costs/specs；不做整库发布；可重复）")
     args = ap.parse_args(argv)
 
     lockbox = load_config(args.data_root)
@@ -382,6 +390,16 @@ def main(argv=None) -> int:
               "边界就是 cutoff，先跑 scripts/lockbox_init.py")
         return 1
     global_cutoff = getattr(lockbox, "global_cutoff", None)
+
+    # 域限定分流（S4c）：须在 --verify-only 分支之前判定——否则 verify-only
+    # 先行返回，互斥拒绝（--only-ext-source 不与 --verify-only 同用）不可达
+    if args.only_ext_source:
+        if args.include_ext or args.verify_only:
+            print("✗ --only-ext-source 不与 --include-ext/--verify-only 同用"
+                  "（域限定模式只重导指定来源的 ext 段，无全量导出、无复检）")
+            return 1
+        return _export_ext_only(args, lockbox=lockbox,
+                                global_cutoff=global_cutoff)
 
     if args.verify_only:
         # v2 用全局 cutoff 核全部序列；v1 逐序列分别核，缺 cutoff 的序列
@@ -550,6 +568,52 @@ def _export_snapshot(args, dest: str, *, lockbox, global_cutoff) -> int:
             "（所有 last_time < cutoff）。tick 不导出：研究侧成本经 "
             "data_research/costs/spread_model.json 缓存提供；"
             "lockbox.json 不复制（研究库无锁箱段，边界 = meta.source_cutoff）。")
+    return 0
+
+
+def _export_ext_only(args, *, lockbox, global_cutoff) -> int:
+    """域限定导出（S4c，--only-ext-source）：只重导指定批准来源的 ext 序列。
+
+    与全量路径（_export_snapshot + 暂存发布）的关键差别：
+    - **不导 bars、不复制 costs/specs、不触发成本缓存新鲜度门**——
+      dest 既有 bars/costs/specs/calendars 零触碰（外部进程写入研究库的
+      USDJPY bars 与 calendars/ 因此不被整库替换清掉）；
+    - 不做整库暂存发布：直接写 dest/ext/<来源>/<品种>/<周期>/
+      （save_ext_series 每文件 unique-tmp + os.replace 原子发布，
+      parquet/manifest 分两次发布间崩溃由 load_ext_series 的 rows 核对
+      fail-fast 拒读——沿用 ext 库既有契约）；
+    - 自检只跑 verify_ext_research_store（范围 = 写入范围）；**不跑**
+      verify_research_store（bars 段）——bars 段的外部违例不属本模式
+      写入范围，不清运也不放行；
+    - 复用全量路径的全部硬校验：白名单（check_exportable）、
+      validate_manifest 两侧校验、slice_before_cutoff、manifest 原样
+      拷贝 + rows/first/last 覆写 + research_cutoff/exported_at_utc
+      追加——零新语义。
+    """
+    if global_cutoff is None:
+        print("✗ 无全局 cutoff——ext 域限定导出同样必须受锁箱约束")
+        return 1
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        exported, skipped, rejected = export_ext_series(
+            args.ext_root, args.dest, global_cutoff, now_iso=now_iso,
+            only_sources=set(args.only_ext_source))
+    except ExtDataError as e:
+        print(f"✗ 外部数据导出失败：{e}")
+        return 1
+    if exported == 0:
+        print("✗ 指定来源无可导出序列（开放段全空或来源不存在）")
+        return 1
+    violations = verify_ext_research_store(args.dest, global_cutoff)
+    if violations:
+        for v in violations:
+            print(f"✗ 越界：{v}")
+        print("研究库 ext 段自检失败——域限定导出作废（已写序列按"
+              "save_ext_series 原子语义保持完整新旧之一）")
+        return 2
+    print(f"摘要：域限定重导 {exported} 个 ext 序列（来源 "
+          f"{sorted(set(args.only_ext_source))}）→ {args.dest}/ext；"
+          "bars/costs/specs 零触碰；未做整库发布")
     return 0
 
 
