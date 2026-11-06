@@ -6,6 +6,7 @@
 
 - v1＝[pline-feasibility-prereg-2026-11-02.md](pline-feasibility-prereg-2026-11-02.md)（A2 批准版，git-blob sha256 `c78a78d13ed81c611b5f9599c96235d7bbcefceac6fda54566b103f3e8cb3235`）。v2 不改动 v1 文件本身。
 - v2 的变更范围**严格限于** 2026-11-06 独立范围裁定（[.superpowers/sdd/2026-11-06-p-t121-real/scope-review.md](../../.superpowers/sdd/2026-11-06-p-t121-real/scope-review.md)，本地证据路径）的 **B 条款（用户条款费用）与 E 条款（overshoot 情景）**，以及第 3 节的 D60 入池声明。该裁定决定性事实 3 明确：采用 spread 情景外推属用途规则变更（v1 C1 冻结拒绝该摘要参与 feasible/fail），须版本化预注册 v2，并以该裁定作为 v2 的独立批准；本稿即该版本化文件。对第 4 节"逐字不变"清单的任何偏离使裁定批准失效。
+- **2026-11-06 修订并入（t121-release-v2 范围裁定前置 1）**：按同日 t121-release-v2 范围裁定（conditional approved，方案 II；编码 2a/2b/2d 获批附条件）对其 2c 条款显式委托与事实校正的落实，本稿并入以下修订：§1 措辞统一（统一为"非期望成本上界情景，方向未知"，消除 §1 构造性表述与 §2.1 禁方向宣称的碰撞）；§1 段尾水位精确值注记（含 USDJPY 水位尾 2026-11-06T12:03:45.848Z）；新增 §1-bis（t121-release-v2 登记对象声明：品种池恰为 {USDJPY}、六成本组件登记表、48 行＋4 汇总行结构、S1 网格锚机械规则、发现段强制披露条款）；§3 修订注记（本节对 v1 池 96 行不变）；§5 adapter 关系事实校正（measured 双分支水位绑定已实现）。**第 4 节冻结清单零触碰**；本稿状态仍为"待独立审核"。
 - 裁定决定性事实复述（约束本稿全部解释）：**(1) 样本门结构性不可达**——要求 ≥4521 UTC 触发日，发现段日历日上限 EURUSD [2007-01-02, 2016-05-01) ≈ 3,407 天、XAUUSD ≈ 850 天，任何行不可能 feasible，点差情景口径选择不可能翻转判定，只影响行级是否额外记成本门 fail；**(2) spread 2026→2007-2016 跨期外推方向未知**（裁定更正了请求中"方向可控"的表述）；可批准依据＝判定不变性＋强制情景标注＋仅限本次用途。
 - 总体计算边界不变（v1 §1 原文语义）：只回答两个问题——登记的 Δp 是否足以覆盖三倍保守成本；发现段是否有足够独立触发日。不得计算任何触发后的收益、胜负、止盈/止损先后、到期价格、Δp 实测值、拟合、排名或策略绩效；不调用 `label_triggers`、`ProbTable.fit`、回测运行器、screen/gate/prob test；产物零结局字段。本稿仍未执行任何读取或计算。
 
@@ -20,13 +21,39 @@
 | commission | `declared_terms` | **不适用**（observed=null；该账户 2007-2016 不存在，**禁止视为观测依据**） | 账户条款声明 2026-11-06＋实测佐证：用户声明"mt5的当前账户类型是没有佣金"＋EURUSD 实测 round_trip 0.0（8 进/12 出、共 0.13 手）＋同账户同条款（XAUUSD 无独立佣金字段可查，按账户类型推定）。数值＝两品种 0.0；dependencies=contract | `.superpowers/account-fee-terms-2026-11-06.md`（本地证据路径；登记时按 B 条款转录为 JSON 证据工件并绑定 SHA）＋costs/calibrated.json（sha `e2cae60cf76e70f0845933863ac552c1ec379373e1b73302625c883bfa267c4c`）实测记录 | 用户权威输入＋经验证词（非服务商书面条款） |
 | swap | `declared_terms` | **不适用**（observed=null；禁止视为观测依据） | 账户条款声明 2026-11-06＋实测佐证：用户声明"mt5显示会有，但是服务商会返还"＋全部 20 笔实测成交 0 隔夜费（positions_with_swap=0）。实效＝两品种 0.0（沿用 v1 swap_basis=free 语义，依据从"第十五轮记录"升级为本声明＋实测）；dependencies=contract。swap 显示值两快照出入（−496.4/−490.0）**只披露、不进成本** | 同 commission（同一条款记录与实测工件） | 用户权威输入＋经验证词 |
 | contract | `spec_snapshot` | **不适用**（observed=null；规格快照非观测区间） | `size-per-lot`：XAUUSD=100 oz、EURUSD=100000 base-unit（specs/latest.json，2026-10-28 快照）。哈希不证明数值适用性；适用性由本裁定＋本登记表绑定 | specs/latest.json（文件 sha256 `144bb2245479e3557c571c9f5f83ca92db9d269211da7845c9d5aa2467d3150f`） | 2026 规格快照外推（品种/账户规格假设） |
-| overshoot | `scenario` | **null**（无实测证据：trade_stops_level=0） | `scenario_multiple_of_spread_p90`：overshoot_p90＝**1.0×同品种同 NY 小时 p90 相对点差**（**不叠加**外部来源 ×1.5）；multiplier=1.0；每触发全额计入、不按实际止损概率加权；逐行标注**"非期望成本上界"**（p90 以上仍有尾部，不能称为期望成本上界）＋另披露"不含越幅的已知分量小计" | 裁定 E 条款＋spread 组件同一工件引用 | 情景（E 方案 a；保守上界情景，非实测） |
+| overshoot | `scenario` | **null**（无实测证据：trade_stops_level=0） | `scenario_multiple_of_spread_p90`：overshoot_p90＝**1.0×同品种同 NY 小时 p90 相对点差**（**不叠加**外部来源 ×1.5）；multiplier=1.0；每触发全额计入、不按实际止损概率加权；逐行标注**"非期望成本上界情景，方向未知"**（p90 以上仍有尾部，不能称为期望成本上界；2026→发现段跨期外推方向亦未知）＋另披露"不含越幅的已知分量小计" | 裁定 E 条款＋spread 组件同一工件引用 | 情景（E 方案 a；非期望成本上界情景，方向未知；非实测） |
 
 补充约束（B 条款）：
 
 - **证据等级标注强制**：运行产物须逐组件/逐行标注 observation_kind 与证据等级；未运行=null 与实际 0=0 严格区分。
 - v1 §5.1 的 C1 拒绝（2026 点差摘要仅来源披露、对应成本未知、整行 waiting_data）**就本次一次性 release 被本节＋第 2 节版本化取代**；2026 摘要的其他用途拒绝维持不变。v1 §5.1 逐品种"commission/contract 未知、swap 仅 Demo 假定"表由本登记表取代。
 - v1 §5.2 中"若获准越幅模型，必须为 version2、basis=stop_level"一句由本节 overshoot 情景组件取代（本次无实测越幅模型，不得默认零，也不冒充 stop_level 模型）；其余 §5.2 细则逐字沿用（见第 4 节第 5 条）。
+
+水位注记（2026-11-06 修订，事实校正）：上表 spread/slippage 的 2026 水位区间为分钟精度披露；被绑工件水位精确值（毫秒）为 XAUUSD 2026-01-01T23:05:00.025Z→2026-10-28T16:17:46.005Z、EURUSD 2026-01-02T00:00:01.291Z→2026-10-28T16:15:30.156Z（研究库 costs/spread_model.json watermarks：msc 1767308700025/1793204266005、1767312001291/1793204130156）。**USDJPY 水位尾＝2026-11-06T12:03:45.848Z**（水位首 2026-01-02T00:00:00.099Z；usdjpy_spread_component.json watermarks：msc 1767312000099/1793966625848；登记表见 §1-bis）。release manifest 的 measured 观测窗与 adapter 逐品种水位常量一律绑定上述精确值，不使用分钟精度近似。
+
+## 1-bis. t121-release-v2 登记对象声明（USDJPY 单独 release；方案 II）
+
+本节为 2026-11-06 t121-release-v2 范围裁定（conditional approved，方案 II）2c 条款显式委托的登记对象声明，并入本送审稿一并送审。
+
+- **登记对象与行结构**：登记对象恰为一个 release（t121-release-v2），**品种池恰为 {USDJPY}**（单品种；H1 输入、H1/H4 目标时间框），账户范围与 §1 相同（Demo <demo-login> @ <demo-server>，USD）。行结构＝**4 设计族（F1–F4）×1 品种×3 局面×4 动作＝48 行＋4 汇总**（每族×品种一汇总）。v1 池（XAUUSD/EURUSD、96 行＋8 汇总）的规则、接受集与行为不受本节影响（见 §3 注记与第 4 节冻结）。
+- **发现段与 applies**：USDJPY 发现段＝合法覆盖 [1971-01-03T22:00Z 首根 H1, 2016-05-01T00:00Z 不含)；各组件 applies 逐品种收窄为该区间内实际合法覆盖（终点一律 ≤ CUTOFF 2016-05-01T00:00Z 不含）。第 2 节规则 1 的情景外推授权对本 release 适用，其中"发现段"按本节取 USDJPY 合法覆盖（1971 起，非 v1 池的 2007 起）；v1 裁定的"判定不变性"依据（任何行不可能 feasible）**对本 release 不成立**——USDJPY 样本门结构上可达（见下文强制披露第 3 条），feasible/fail 须按实际计算结果输出，而"外推方向未知＋强制情景标注＋仅限本次用途"条款完全适用。
+- **六成本组件登记表**（与 `.superpowers/p-release/account-fee-terms.json` 及 `.superpowers/mt5fetch/usdjpy_cost_bundle.json` 同构；本地证据路径，登记时转为正式工件＋SHA256 绑定后入 manifest）：
+
+| 组件 | observation_kind | observed | basis 与数值/规则 | evidence_refs | 证据等级 |
+| --- | --- | --- | --- | --- | --- |
+| spread | `measured` | 2026 水位观测区间（精确毫秒）：USDJPY tick 水位 2026-01-02T00:00:00.099Z→2026-11-06T12:03:45.848Z | `relative`（与 costs/spread_model.json version2 同构口径：relative/bar_open_m1、NY 小时桶 p50/p90/p99）；用途＝**p90 情景外推至发现段**（第 2 节规则 1），不是发现段实测 | usdjpy_spread_component.json（sha256 `1419a0b418d1260793a5be11efce3e3a664e44dafbfbf9e1a8621a9a1ff25576`） | 2026 实测水位＋跨期情景外推（方向未知，强制情景标注） |
+| slippage | `measured` | 同一 2026 水位观测区间（依赖同一 spread 工件） | `spread-fraction-v1`：0.1×p90 点差比例（项目标准规则，无候选结局拟合）；dependencies=spread | 同 spread 工件引用 | 2026 实测水位上的比例规则情景 |
+| commission | `declared_terms` | **不适用**（observed=null；该账户 1971–2016 不存在，**禁止视为观测依据**） | `round-trip-per-lot`＝0.0（账户类型零佣金用户声明 2026-11-06＋EURUSD 实测 round_trip 0.0 佐证，同账户同账户类型条款推定）；dependencies=contract | `.superpowers/p-release/account-fee-terms.json`（JSON 证据工件，含声明转录与 costs/calibrated.json 实测佐证） | 用户权威输入＋经验证词（非服务商书面条款） |
+| swap | `declared_terms` | **不适用**（observed=null；禁止视为观测依据） | `free`：实效＝0.0（"mt5显示会有，但是服务商会返还"用户声明＋全部实测成交 0 隔夜费）；显示值 long 0.0/short −13.7（快照 2026-11-06）**只披露、不进成本**；dependencies=contract | 同 commission（同一条款工件与实测佐证） | 用户权威输入＋经验证词 |
+| contract | `spec_snapshot` | **不适用**（observed=null；规格快照非观测区间） | `size-per-lot`＝100000 base-unit（JPY）；MT5 symbol_info 快照 2026-11-06（digits 3、tick_size 0.001、tick_value 0.6316879966646874，同账户）；哈希不证明数值适用性，适用性由裁定＋本登记表绑定 | usdjpy_cost_bundle.json#contract_spec（sha256 `7abeb4587b47dbe50164320413eea7144649d47756b743694b4153a48e9025f4`） | 2026 规格快照外推（品种/账户规格假设） |
+| overshoot | `scenario` | **null**（无实测证据） | `scenario_multiple_of_spread_p90`：overshoot_p90＝**1.0×同品种同 NY 小时 p90 相对点差**（**不叠加**外部来源 ×1.5）；multiplier=1.0；每触发全额计入、不按实际止损概率加权；逐行标注**"非期望成本上界情景，方向未知"**＋另披露"不含越幅的已知分量小计" | 裁定 E 条款＋spread 组件同一工件引用 | 情景（E 方案 a；非期望成本上界情景，方向未知；非实测） |
+
+- **S1 网格锚机械规则**：锚＝发现段中位收盘价最接近的 1/2/5×10^k 圆整值；步长＝锚×0.4%（与 v1 §3 S1 规则同构，从零点整数倍起算，不赋予更高 Δp）。USDJPY 推导记录：发现段中位收盘价最接近的圆整值为 **125** → 步长 **0.5**（125×0.004＝0.5）。锚与步长须于**任何计数之前**选定并写入 release manifest（per-release grids 条目），**事后禁改**；若高日元价时代（中位收盘价进入其他数量级）导致锚/步长变化，按**同一机械规则**重选并将推导记录于 manifest。
+- **发现段强制披露条款（裁定 2c 委托）**：
+  1. **成本门分量分解**：运行产物逐行披露 p90 派生三分量小计（spread 1.0×p90＋slippage 0.1×p90＋overshoot 1.0×p90＝2.1×p90 相对点差）及其对 0.02R 预算的占比，与 declared 分量小计（commission 0.0＋swap 实效 0.0，按 contract 规格换算）并列对照披露。
+  2. **外推时距声明**："2026 水位→1971–2016 发现段跨期外推时距**最长约 55 年、方向未知**"逐行标注于**任何 feasible 行**（含全部使用 p90 情景外推分量的行）。
+  3. **样本门可达性重算披露**：USDJPY 发现段日历覆盖（1971-01-03→2016-05-01 约 16,500 天）在结构上可满足 ≥4521 触发日，与 v1 池结构性不可达不同；运行产物必须按**实际合法覆盖**（剔除缺口/排除段/不完整根后的可用触发日上限）重算可达性并披露，不得以日历上限替代实际覆盖。
+  4. **可选敏感性重算的事前约束**：若做任何敏感性重算（如不同点差倍数或外推口径），须**先预注册披露口径**再计算，且敏感性结果**禁止用于任何决策**（不得翻转 feasible/fail 判定，不得反推设计参数）。
 
 ## 2. 情景规则（B/E 条款）
 
@@ -41,6 +68,7 @@
 - 本节为该同意下的**品种池扩展声明**：候选 USDJPY **H1/H4**（MT5 原生数据 1971-01-03T22:00Z 起；H1 180,090 行、H4 52,080 行、D1 15,813 行）。数据深度使 EURUSD 量级的长发现段成为可能，样本门可达性须在入池评估中重新计算。
 - USDJPY 六成本组件证据包：`.superpowers/mt5fetch/usdjpy_cost_bundle.json`（**本地证据路径，不入公开库**）：spread 组件工件 usdjpy_spread_component.json（sha256 `1419a0b418d1260793a5be11efce3e3a664e44dafbfbf9e1a8621a9a1ff25576`）；commission 0.0（账户类型零佣金声明 2026-11-06＋EURUSD 实测）；swap 实效 0.0（服务商返还声明＋全部成交 0 隔夜费；显示值 long 0.0/short −13.7 仅披露）；slippage 0.1×p90 点差（项目标准情景）；overshoot 1.0×p90 点差（本裁定 E 条款情景）；contract 100000（MT5 symbol_info 快照 2026-11-06，同账户）。
 - **声明性质**：本节不改变本次 release 的品种池（仍为 XAUUSD/EURUSD、96 行）与第 4 节任何规则；USDJPY 正式入池时须按 production adapter 六条件**重新绑定**上述本地证据路径（转为正式工件＋SHA256＋独立审核记录），不得以本声明替代。
+- **2026-11-06 修订注记（t121-release-v2 范围裁定前置 1）**：本节**保留且对 v1 池（t121-release-v1，XAUUSD/EURUSD、96 行＋8 汇总）不变**；USDJPY 的正式登记对象声明已由 §1-bis（t121-release-v2，品种池恰为 {USDJPY}、48 行＋4 汇总）按 2026-11-06 范围裁定的独立批准路径宣布，本节"评估阶段"性质对 USDJPY 就此闭合并由 §1-bis 取代；本节其余文字原样保留作历史记录。
 
 ## 4. 其余规则：逐字沿用 v1（引用＋复述，语义不变）
 
@@ -58,6 +86,6 @@
 ## 5. 与 adapter 实现的关系（仅披露，不构成规则变更）
 
 - 裁定前置条件 2 的 adapter 语义对齐小改（observation_kind 枚举 measured/declared_terms/spec_snapshot/scenario；非 measured 类 observed 可空但必填 basis/evidence_refs；scenario 必填正 multiplier；measured 保持发现段内观测区间要求）已按 RED/GREEN 实现；六条件设计、claim 锁、水位、时效与 synthetic 测试路径不变。
-- adapter 的 `measured` 类仍要求观测区间终点 ≤2016-05-01（发现段内）。本稿第 1 节 spread/slippage 的 2026 水位观测区间在正式 release manifest 中的编码方式（observation_kind/basis/observed 字段取值）须在登记审核时按六条件显式裁定与绑定，不得隐式放宽任何一类校验。
+- adapter 的 `measured` 类观测窗校验（2026-11-06 事实校正，随裁定前置 2 落实）现为**双分支**：终点 ≤2016-05-01 的发现段内窗口（v1 语义逐字保留，v1 合法 manifest 接受集零变化）**或**与逐品种 2026 模型水位窗（`MODEL_WATERMARK_WINDOWS`，水位精确毫秒值：XAUUSD/EURUSD 取 costs/spread_model.json watermarks、USDJPY 取 usdjpy_spread_component.json watermarks）**精确相等**的窗口；内核层另以三工件水位外包络 [min lo, max hi] 作第二层包含校验（双层防御）。借用他品种水位窗、或超出水位首/尾 1 毫秒均拒绝。本稿第 1 节与 §1-bis 的 spread/slippage 2026 水位观测区间即按后一分支编码（observation_kind=`measured`＋observed＝水位精确值）；该编码方式属实现披露，规则效力以本稿登记表与裁定为准。
 
 **当前批准点：待独立审核。本文档经独立审核批准前不生效，v1 语义继续约束一切执行；本稿不授权任何计数、成本计算或 release 登记。**

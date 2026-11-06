@@ -22,6 +22,9 @@ NOW = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
 START = "2015-01-05T00:00:00Z"
 END = "2016-05-01T00:00:00Z"
 PARTS = ("spread", "slippage", "commission", "contract", "overshoot", "swap")
+# t121-release-v2 (2026-11-06): adapter.SYMBOLS is now the admissible FULL set
+# {XAUUSD, EURUSD, USDJPY}; these v1-shaped fixtures pin the frozen v1 pool.
+V1_POOL = ("XAUUSD", "EURUSD")
 BASES = {"spread": "absolute", "slippage": "spread-fraction-v1",
          "commission": "round-trip-per-lot", "contract": "size-per-lot",
          "overshoot": "stop-level-v2", "swap": "free"}
@@ -53,13 +56,13 @@ def part(symbol, name, **overrides):
 
 
 def manifest():
-    costs = {symbol: {name: part(symbol, name) for name in PARTS} for symbol in adapter.SYMBOLS}
-    for symbol in adapter.SYMBOLS:
+    costs = {symbol: {name: part(symbol, name) for name in PARTS} for symbol in V1_POOL}
+    for symbol in V1_POOL:
         for name, deps in {"slippage": ("spread",), "commission": ("contract",), "swap": ("contract",)}.items():
             costs[symbol][name]["dependencies"] = {d: costs[symbol][d]["artifact_ref"] for d in deps}
     scope = {"scope_id": "fixture-count-scope", "purpose": adapter.PURPOSE,
              "account_scope_id": "fixture-account-scope", "account_purpose": "Demo",
-             "currency": "USD", "quote_currency": "USD", "symbols": list(adapter.SYMBOLS),
+             "currency": "USD", "quote_currency": "USD", "symbols": list(V1_POOL),
              "source_timeframe": "H1", "target_timeframes": ["H1", "H4"],
              "range_start": START, "range_end_exclusive": END,
              "discovery_start": START, "discovery_end_exclusive": END}
@@ -99,7 +102,7 @@ def test_v1_shaped_measured_components_still_validate(validate, document):
 
 
 def test_explicit_measured_kind_keeps_v1_shape_only(validate, document):
-    for symbol in adapter.SYMBOLS:
+    for symbol in V1_POOL:
         document["costs"][symbol]["spread"]["observation_kind"] = "measured"
     assert validate(document)
     # evidence_refs/multiplier are not v1 fields; measured stays strictly v1.

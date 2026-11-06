@@ -28,6 +28,24 @@ from mt5quant.strategies.library.prob.situations import Approach
 
 CUTOFF = pd.Timestamp("2016-05-01")
 NY_TZ = "America/New_York"
+# t121-release-v2 (ruling 2026-11-06): outer envelope [min lo, max hi] of the
+# three bound 2026 model watermark windows. This is the kernel-side second
+# layer of the adapter's exact per-symbol watermark binding (the adapter pins
+# measured windows to a symbol's own window; this looser bound only contains
+# the 2026 watermark era). A test locks it to min lo / max hi of the adapter
+# windows. Pre-cutoff discovery-bounded windows keep the frozen v1 semantics.
+WATERMARK_ENVELOPE = (pd.Timestamp("2026-01-01T23:05:00.025"),
+                      pd.Timestamp("2026-11-06T12:03:45.848"))
+
+
+def _observed_window_admissible(observed_start, observed_end):
+    """Frozen v1 window acceptance, extended only by the watermark envelope."""
+    if not observed_start <= observed_end:
+        return False
+    if observed_end < CUTOFF:
+        return True  # frozen v1 discovery-bounded semantics, unchanged
+    lo, hi = WATERMARK_ENVELOPE
+    return lo <= observed_start and observed_end <= hi
 
 
 def _times(values):
@@ -240,7 +258,7 @@ def _trigger_cost_kernel(*, symbol, signal_time, entry_time, exit_time, side, so
         signal, entry, exit_ = map(_utc, (signal_time, entry_time, exit_time))
         if (any(pd.isna(t) for t in (start, end, observed_start, observed_end, signal, entry, exit_))
                 or not start <= signal < entry <= exit_ < end
-                or exit_ >= CUTOFF or not observed_start <= observed_end < CUTOFF):
+                or exit_ >= CUTOFF or not _observed_window_admissible(observed_start, observed_end)):
             waiting.append("evidence_range")
     except (KeyError, ValueError, TypeError):
         waiting.append("evidence_range")
@@ -527,12 +545,19 @@ def run_feasibility(h1_by_symbol, *, source_tags, gap_spans, sessions,
 
 
 def _run_feasibility_kernel(h1_by_symbol, *, source_tags, gap_spans, sessions,
-                            input_evidence, cost_evidence, kind):
-    """Shared arithmetic; callers own admission, never infer it from a label."""
+                            input_evidence, cost_evidence, kind, rules=None):
+    """Shared arithmetic; callers own admission, never infer it from a label.
+
+    ``rules`` defaults to the frozen RULES (the synthetic path and every v1
+    release); the byte adapter passes the effective per-release rules it
+    validated and bound (t121-release-v2 usdjpy path: bound version string
+    plus per-release grids).
+    """
+    rules = RULES if rules is None else rules
     if sessions != SessionPolicy(exempt_symbols=frozenset({"BTCUSD"})):
         raise ValueError("T121 requires the frozen sessions calendar")
     rows, receipts = [], {}
-    for symbol, grid in RULES["grids"].items():
+    for symbol, grid in rules["grids"].items():
         h1 = h1_by_symbol.get(symbol)
         tags, gaps = source_tags.get(symbol), gap_spans.get(symbol)
         evidence = input_evidence.get(symbol)
@@ -568,7 +593,7 @@ def _run_feasibility_kernel(h1_by_symbol, *, source_tags, gap_spans, sessions,
                                 {**pre_excluded, **dropped}, source_wait)
             except (ValueError, KeyError, TypeError):
                 unavailable = ["invalid_input"]
-        for family, (tf, sl, k) in RULES["families"].items():
+        for family, (tf, sl, k) in rules["families"].items():
             for sit in ("S1", "S2", "S3"):
                 for action in ("A1", "A2", "A3", "A4"):
                     excluded = {}
@@ -590,8 +615,8 @@ def _run_feasibility_kernel(h1_by_symbol, *, source_tags, gap_spans, sessions,
                         hypothesis="follow>base" if action in ("A1", "A2") else "fade>base",
                         exclusions=excluded, **summary))
     summaries = []
-    for family in RULES["families"]:
-        for symbol in RULES["grids"]:
+    for family in rules["families"]:
+        for symbol in rules["grids"]:
             selected = [r for r in rows if r["family"] == family and r["symbol"] == symbol]
             states = {r["status"] for r in selected}
             summaries.append(dict(family=family, symbol=symbol,
@@ -600,5 +625,5 @@ def _run_feasibility_kernel(h1_by_symbol, *, source_tags, gap_spans, sessions,
                 waiting_reasons=sorted({v for r in selected for v in r["waiting_reasons"]}),
                 fail_reasons=sorted({v for r in selected for v in r["fail_reasons"]})))
     return {"artifact_kind": "synthetic-engineering-only", "production_execution": "not_released",
-            "rules": RULES, "qualification_sha256": payload_sha256(RULES),
+            "rules": rules, "qualification_sha256": payload_sha256(rules),
             "inputs": receipts, "rows": rows, "summaries": summaries}

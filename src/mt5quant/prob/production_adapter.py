@@ -30,16 +30,44 @@ PARTS = ("spread", "slippage", "commission", "contract", "overshoot", "swap")
 # observation interval inside the discovery segment (observed=null); its
 # authority is basis/evidence_refs, and scenario components additionally
 # carry a positive multiplier. Measured keeps the v1 discovery-bounded
-# observation window unchanged.
+# window acceptance and additionally admits exactly the per-symbol 2026
+# model watermark window (t121-release-v2 binding path, see below).
 OBSERVATION_KINDS = ("measured", "declared_terms", "spec_snapshot", "scenario")
 COMPONENT_FIELDS = ("artifact_ref source_ref component symbol purpose account_scope_id "
                     "account_purpose currency observed_start observed_end_exclusive "
                     "applies_start applies_end_exclusive basis units conversion_basis dependencies")
-SYMBOLS = ("XAUUSD", "EURUSD")
+SYMBOLS = ("XAUUSD", "EURUSD", "USDJPY")
 PURPOSE = "T121-count-cost"
 CUTOFF = datetime(2016, 5, 1, tzinfo=timezone.utc)
 PREREG = "docs/research/pline-feasibility-prereg-2026-11-02.md"
 PREREG_SHA256 = "c78a78d13ed81c611b5f9599c96235d7bbcefceac6fda54566b103f3e8cb3235"
+PREREG_V2 = "docs/research/pline-feasibility-prereg-v2-2026-11-06.md"
+PREREG_V2_SHA256 = "32aaa92ccebdef5fdc1211073f5d38595ed8a979542eeebca473baf5488018b8"
+# t121-release-v2 (ruling 2026-11-06, conditional approved, option II): SYMBOLS
+# is now the admissible FULL set; each release manifest declares its own pool
+# (scope.symbols), validated as a non-empty duplicate-free subset, and the
+# costs key set must equal that declared pool. The frozen v1 two-symbol
+# manifest shape stays accepted with identical behavior.
+# Per-symbol 2026 model watermark windows, exact bound-artifact values
+# (milliseconds; tighten by rounding start up / end down if ever re-bound).
+# XAUUSD/EURUSD: research library data_research/costs/spread_model.json
+# watermarks (msc 1767308700025/1793204266005, 1767312001291/1793204130156).
+# USDJPY: usdjpy_spread_component.json watermarks (msc 1767312000099/1793966625848).
+MODEL_WATERMARK_WINDOWS = {
+    "XAUUSD": (datetime(2026, 1, 1, 23, 5, 0, 25000, tzinfo=timezone.utc),
+               datetime(2026, 10, 28, 16, 17, 46, 5000, tzinfo=timezone.utc)),
+    "EURUSD": (datetime(2026, 1, 2, 0, 0, 1, 291000, tzinfo=timezone.utc),
+               datetime(2026, 10, 28, 16, 15, 30, 156000, tzinfo=timezone.utc)),
+    "USDJPY": (datetime(2026, 1, 2, 0, 0, 0, 99000, tzinfo=timezone.utc),
+               datetime(2026, 11, 6, 12, 3, 45, 848000, tzinfo=timezone.utc)),
+}
+# Closed key-set assertion: every admissible pool symbol has a watermark
+# window and no window exists for a non-pool symbol.
+assert set(MODEL_WATERMARK_WINDOWS) == set(SYMBOLS)
+# Binding paths for the rules version string: the frozen v1 identity and the
+# t121-release-v2 usdjpy path (whose canonical RULES sha and prereg blob are
+# recomputed over the effective per-release rules at assembly time).
+RULES_VERSIONS = (RULES["version"], "t121-offline-v1-usdjpy")
 CODE_FILES = (
     "scripts/pline_feasibility.py", "src/mt5quant/prob/production_adapter.py",
     "src/mt5quant/prob/feasibility.py", "src/mt5quant/prob/counting.py", "src/mt5quant/prob/gaps.py",
@@ -288,7 +316,11 @@ def _scope(scope):
         _id(scope[key])
     _require(scope["purpose"] == PURPOSE and scope["account_purpose"] == "Demo" and
              scope["currency"] == scope["quote_currency"] == "USD", "purpose/account scope mismatch")
-    _require(type(scope["symbols"]) is list and scope["symbols"] == list(SYMBOLS) and
+    symbols = scope["symbols"]
+    # t121-release-v2: per-manifest declared pool (SYMBOLS is the admissible
+    # full set); non-empty, duplicate-free and a subset of it.
+    _require(type(symbols) is list and symbols and len(set(symbols)) == len(symbols) and
+             set(symbols) <= set(SYMBOLS) and
              scope["source_timeframe"] == "H1" and scope["target_timeframes"] == ["H1", "H4"], "frozen pool/timeframes mismatch")
     start, end = _window(scope["range_start"], scope["range_end_exclusive"])
     discovery, cutoff = _window(scope["discovery_start"], scope["discovery_end_exclusive"])
@@ -304,11 +336,13 @@ def _validate_manifest(m, snapshot, release_id, now):
     a, b = _window(m["valid_from"], m["expires_at"])
     _require(a <= now < b, "release not current")
     start, end = _scope(m["scope"])
+    pool = m["scope"]["symbols"]
     for key, fmt in (("input_ref", "json"), ("source_manifest_ref", "json"), ("sessions_ref", "toml"), ("review_ref", "json")):
         _ref(m[key])
         _require(m[key]["format"] == fmt, "artifact format mismatch")
-    _keys(m["costs"], "XAUUSD EURUSD")
-    for symbol in SYMBOLS:
+    # t121-release-v2: the costs key set equals the per-manifest declared pool.
+    _keys(m["costs"], " ".join(pool))
+    for symbol in pool:
         group = m["costs"][symbol]
         _keys(group, " ".join(PARTS))
         for name in PARTS:
@@ -337,8 +371,15 @@ def _validate_manifest(m, snapshot, release_id, now):
                      "component application outside discovery")
             if kind == "measured":
                 observed_start, observed_end = _window(part["observed_start"], part["observed_end_exclusive"])
-                _require(observed_start < observed_end <= CUTOFF,
-                         "component observation outside discovery")
+                # t121-release-v2 (ruling 2026-11-06): a measured window is
+                # either the frozen v1 discovery-bounded shape (byte-identical
+                # acceptance) or exactly the per-symbol 2026 model watermark
+                # window (mutual containment): borrowing another symbol's
+                # window or exceeding a watermark end by even 1ms is refused.
+                lo, hi = MODEL_WATERMARK_WINDOWS[symbol]
+                _require(observed_start < observed_end <= CUTOFF or
+                         (observed_start, observed_end) == (lo, hi),
+                         "component observation outside discovery or watermark")
             else:
                 # B: the account did not exist in 2007-2016; declared terms,
                 # spec snapshots and scenarios must never be registered as
@@ -361,16 +402,53 @@ def _validate_manifest(m, snapshot, release_id, now):
                 _id(part[key])
             allowed_basis = {"spread": ("absolute", "relative"), "slippage": ("spread-fraction-v1",),
                              "commission": ("round-trip-per-lot",), "contract": ("size-per-lot",),
-                             "overshoot": ("stop-level-v2",), "swap": ("free",)}
+                             # t121-release-v2 E clause: scenario overshoot bound
+                             # to the same-symbol p90 spread model.
+                             "overshoot": ("stop-level-v2", "scenario_multiple_of_spread_p90"),
+                             "swap": ("free",)}
             _require(part["basis"] in allowed_basis[name], "unreviewed component basis")
             required = {"slippage": ("spread",), "commission": ("contract",), "swap": ("contract",)}.get(name, ())
             _keys(part["dependencies"], " ".join(required))
             for dep in required:
                 _require(part["dependencies"][dep] == group[dep]["artifact_ref"], "component dependency mismatch")
-    _keys(m["rules"], "version digest_domain sha256 prereg_sha256 prereg_digest_domain")
-    _require(m["rules"] == {"version": RULES["version"], "digest_domain": "canonical-json-v1",
-             "sha256": _sha(_canonical(RULES)), "prereg_sha256": PREREG_SHA256,
-             "prereg_digest_domain": "git-blob-bytes"}, "frozen rule identity mismatch")
+        # The kernel evidence needs one observation interval per symbol; mixed
+        # kinds carry observed=null, so at least one measured component is
+        # required for every declared pool symbol.
+        _require(any(p.get("observation_kind", "measured") == "measured" for p in group.values()),
+                 "no measured observation window")
+    # t121-release-v2: rules stay byte-frozen for v1 manifests (no grids key,
+    # frozen version/prereg/canonical sha). The usdjpy binding path may carry
+    # an optional per-release grids entry (existing XAUUSD/EURUSD steps stay
+    # byte-frozen; the USDJPY step is decided at assembly time and entered in
+    # the manifest) plus the version string "t121-offline-v1-usdjpy", whose
+    # canonical RULES sha is recomputed over the effective rules and whose
+    # prereg binding moves to the v2 preregistration blob. Both branches
+    # recompute the digest here; a manifest never supplies a trusted sha.
+    rules = m["rules"]
+    base_fields = "version digest_domain sha256 prereg_sha256 prereg_digest_domain".split()
+    _require(type(rules) is dict and set(base_fields) <= set(rules) and
+             set(rules) <= set(base_fields) | {"grids"}, "invalid or missing fields")
+    version = rules["version"]
+    _require(version in RULES_VERSIONS, "unbound rules version")
+    grids = rules.get("grids")
+    if grids is not None:
+        _require(type(grids) is dict and grids and set(grids) <= set(SYMBOLS), "invalid release grids")
+        for grid_symbol, step in grids.items():
+            _require(type(step) in (int, float) and not isinstance(step, bool) and
+                     math.isfinite(step) and step > 0, "invalid release grid step")
+            if grid_symbol in RULES["grids"]:
+                _require(step == RULES["grids"][grid_symbol], "frozen grid step changed")
+    effective = {**RULES, "version": version}
+    if grids is not None:
+        effective["grids"] = grids
+    _require(set(pool) <= set(effective["grids"]), "release pool lacks grid steps")
+    prereg_sha = PREREG_V2_SHA256 if version == "t121-offline-v1-usdjpy" else PREREG_SHA256
+    expected = {"version": version, "digest_domain": "canonical-json-v1",
+                "sha256": _sha(_canonical(effective)), "prereg_sha256": prereg_sha,
+                "prereg_digest_domain": "git-blob-bytes"}
+    if grids is not None:
+        expected["grids"] = grids
+    _require(rules == expected, "frozen rule identity mismatch")
     _keys(m["code"], "repo_commit files")
     _hash(m["code"]["repo_commit"], 40)
     _keys(m["code"]["files"], " ".join(CODE_FILES))
@@ -402,8 +480,12 @@ def _implementation(m):
         _require(actual_blob == blob and _sha(blob) == identity["git_blob_sha256"] and
                  _same_source(raw, blob) and _sha(raw) == identity["raw_sha256"] and
                  raw == _LOADED_CODE[path], "implementation closure differs")
-    prereg_bytes = _git("cat-file", "blob", implementation + ":" + PREREG)
-    _require(_sha(prereg_bytes) == PREREG_SHA256, "preregistration bytes mismatch")
+    # t121-release-v2: the usdjpy binding path pins the v2 preregistration
+    # blob at the implementation commit; the frozen v1 path is unchanged.
+    prereg_path = PREREG_V2 if m["rules"]["version"] == "t121-offline-v1-usdjpy" else PREREG
+    prereg_sha = PREREG_V2_SHA256 if prereg_path == PREREG_V2 else PREREG_SHA256
+    prereg_bytes = _git("cat-file", "blob", implementation + ":" + prereg_path)
+    _require(_sha(prereg_bytes) == prereg_sha, "preregistration bytes mismatch")
     return {"head": head, "implementation_commit": implementation,
             "raw_digest_domain": "raw-bytes", "git_digest_domain": "git-blob-bytes"}
 
@@ -558,11 +640,12 @@ def _inputs(doc, sources, scope):
     _keys(doc, "schema symbols")
     _keys(sources, "schema symbols")
     _require(doc["schema"] == "t121-input-v1" and sources["schema"] == "t121-sources-v1", "input/source schema mismatch")
-    _keys(doc["symbols"], "XAUUSD EURUSD")
-    _keys(sources["symbols"], "XAUUSD EURUSD")
     start, end = _scope(scope)
+    pool = scope["symbols"]
+    _keys(doc["symbols"], " ".join(pool))
+    _keys(sources["symbols"], " ".join(pool))
     bars, tags, gaps, evidence = {}, {}, {}, {}
-    for symbol in SYMBOLS:
+    for symbol in pool:
         item, source = doc["symbols"][symbol], sources["symbols"][symbol]
         _keys(item, "bars source_tags gap_spans")
         _keys(source, "used_years sources excluded_months segments")
@@ -632,14 +715,20 @@ def run_production(release_id, manifest_path, output):
     sessions = _session_policy_from_dict(session_doc, "verified sessions bytes")
     _require(sessions == SessionPolicy(exempt_symbols=frozenset({"BTCUSD"})), "unfrozen sessions")
     bars, tags, gaps, evidence = _inputs(doc, sources, m["scope"])
+    pool = m["scope"]["symbols"]
     costs = {}
-    for symbol in SYMBOLS:
+    for symbol in pool:
         group = m["costs"][symbol]
         payload = {name: _read_verified(base, group[name]["artifact_ref"], cache) for name in PARTS}
         _require(payload["swap"].get("basis") == "free", "charged production format not released")
         _require(payload["spread"].get("mode") == group["spread"]["basis"], "spread basis mismatch")
-        observed_start = min(_time(p["observed_start"]) for p in group.values())
-        observed_end = max(_time(p["observed_end_exclusive"]) for p in group.values())
+        # Observed aggregation runs over measured components only: non-measured
+        # kinds carry observed=null by scope-review B and previously broke this
+        # min/max with a null timestamp after the durable claim.
+        measured = [p for p in group.values() if p.get("observation_kind", "measured") == "measured"]
+        _require(measured, "no measured observation window")
+        observed_start = min(_time(p["observed_start"]) for p in measured)
+        observed_end = max(_time(p["observed_end_exclusive"]) for p in measured)
         # The old kernel checks an inclusive observed endpoint; retain the half-open
         # scope above and supply its last representable instant without expanding it.
         from datetime import timedelta
@@ -649,8 +738,13 @@ def run_production(release_id, manifest_path, output):
             "applies_end": m["scope"]["range_end_exclusive"], "observed_start": observed_start.isoformat(),
             "observed_end": (observed_end - timedelta(microseconds=1)).isoformat(),
             "payload": payload, "payload_sha256": payload_sha256(payload)}
+    # Effective per-release rules: frozen RULES with the bound version string
+    # and, when the manifest carries per-release grids, exactly those grids.
+    effective_rules = {**RULES, "version": m["rules"]["version"]}
+    if "grids" in m["rules"]:
+        effective_rules["grids"] = m["rules"]["grids"]
     report = _run_feasibility_kernel(bars, source_tags=tags, gap_spans=gaps, sessions=sessions,
-        input_evidence=evidence, cost_evidence=costs, kind="production")
+        input_evidence=evidence, cost_evidence=costs, kind="production", rules=effective_rules)
     identities = {"release_id": release_id, "execution_id": m["execution_id"], "context": snapshot.context,
                   "scope_id": m["scope"]["scope_id"], "snapshot_version": snapshot.version,
                   "manifest_raw_sha256": _sha(raw)}
@@ -659,7 +753,7 @@ def run_production(release_id, manifest_path, output):
     report["production_execution"] = "consumed" if snapshot.context == "production" else "not_released"
     report_bytes = json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False).encode() + b"\n"
     refs = [m[k] for k in ("input_ref", "source_manifest_ref", "sessions_ref", "review_ref")]
-    refs += [m["costs"][s][p]["artifact_ref"] for s in SYMBOLS for p in PARTS]
+    refs += [m["costs"][s][p]["artifact_ref"] for s in pool for p in PARTS]
     refs += [c["evidence_ref"] for c in m["conditions"]]
     receipt = {**identities, "runtime": runtime, "trust_source": snapshot.source,
         "snapshot_sha256": _sha(_snapshot_bytes(snapshot)), "snapshot_digest_domain": "canonical-json-v1",
