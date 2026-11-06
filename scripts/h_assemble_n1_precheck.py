@@ -80,6 +80,18 @@ CALENDAR_LABEL = ".superpowers/h-new-candidates/n1-fomc-calendar/fomc_meetings.j
 # this check, see .superpowers/sdd/2026-11-06-n1-precheck/real-run.stderr).
 CALENDAR_SHA256 = ("a53577d96c699a1a6e7bab2bfb5f80d43408380ea3e2f48c7e8"
                    "8c1e76ec971c5")
+# Byte-identical to the coverage_merge_method note written by
+# candidates.precheck (src/mt5quant/research/candidates.py), so the
+# assembler-registered payload is indistinguishable in shape from a native
+# bt candidate check power block.  Locked by
+# test_run_registers_native_power_coverage_segments (fix1, 2026-11-07).
+_COVERAGE_MERGE_METHOD_NOTE = (
+    "计入段日历区间并集：相接/重叠的段合成连续跨度（min(first).."
+    "max(last)），不相接的分段各自计入——重叠不双计（T80/G3 审核"
+    "修正：相加会把完全包含/部分重叠的覆盖虚增，如 fred/USTEC "
+    "39.8 年包住 mt5 4.3 年 → 合并 39.8 而非 44.1）；每段在产出侧"
+    "已在 >30 天内部空洞处切开（T94/R14-L3：实测间隔+known_gaps+"
+    "manifest 未启用年份，边界随段的 gaps 字段）")
 CANDIDATE_LABEL = ".superpowers/h-new-candidates/n1-draft/C005.toml"
 # Same revision: expected_sharpe re-derived to 0.52 (213 window events);
 # the pre-pin ca6e7a55... is kept here only as provenance of the re-binding.
@@ -415,6 +427,44 @@ def _last_weekday(year: int, month: int) -> int:
     return day
 
 
+CALENDAR_ARTIFACT_VERSION = 1
+
+
+def ustec_trading_calendar(prices: pd.DataFrame, *,
+                           manifest_last: pd.Timestamp) -> dict:
+    """Derive the ``{data-root}/calendars/USTEC.json`` v1 artifact (fix1).
+
+    Root cause 2 of the run1 refusal
+    (.superpowers/sdd/2026-11-07-r3-main-test/root-cause-refusal.md): the
+    event branch of bt requires an explicit trading calendar.  The source of
+    truth here is the bound FRED series itself — the delivered trading-day
+    list (**all** days, not only the main window) plus the bound manifest
+    ``last_time`` as the completeness bound.  The frozen consumer is
+    ``mt5quant.validation.events.trading_calendar``: ``version == 1``,
+    ``sessions`` of strictly increasing midnight ``day`` labels with
+    ``close_time`` in ``(day, day + 2 days]``, and a naive
+    ``complete_through``.  FRED date labels carry no session clock, so
+    ``close_time`` is declared as the next UTC midnight — the same convention
+    as the engine's D1 fallback close (bar time + 86400 s), not a
+    market-clock claim.
+    """
+    stamps = pd.DatetimeIndex(pd.to_datetime(prices.time))
+    days = stamps.normalize()
+    if (days.hasnans or len(days) == 0 or days.has_duplicates
+            or not days.is_monotonic_increasing
+            or not (stamps == days).all()):
+        raise BindingError("bound series is not unique ordered D1 date labels")
+    last = _naive(manifest_last).normalize()
+    if days[-1] != last:
+        raise BindingError("calendar completeness bound must equal the "
+                           "bound manifest last_time")
+    sessions = [{"day": day.date().isoformat(),
+                 "close_time": (day + pd.Timedelta(days=1)).date().isoformat()}
+                for day in days]
+    return {"version": CALENDAR_ARTIFACT_VERSION, "sessions": sessions,
+            "complete_through": last.date().isoformat()}
+
+
 def _assemble_costs(spread_doc: dict, specs_doc: dict, reference_price: float) -> tuple[Costs, dict]:
     try:
         model = spread_doc["model"]
@@ -571,6 +621,7 @@ def assemble_n1_inputs(data_root, calendar_path, *,
                        "source_eligibility": {SOURCE: REAL_ELIGIBILITY}}}
     calendar_doc = _parse_calendar(calendar_raw)
     calendar = _calendar_registration(calendar_doc, bars, main_start)
+    trading_calendar = ustec_trading_calendar(prices, manifest_last=main_last)
     cost_model, costs_provenance = _assemble_costs(
         _parse_json(bound["costs/spread_model.json"], "costs/spread_model.json"),
         _parse_json(bound["specs/latest.json"], "specs/latest.json"),
@@ -601,12 +652,27 @@ def assemble_n1_inputs(data_root, calendar_path, *,
         "coverage_declared": {SERIES: [{"source": s.source, "start": _naive(s.start).isoformat(),
                                         "end": _naive(s.end).isoformat()} for s in coverage]},
         "mt5_series": "never included",
+        "trading_calendar_export": {
+            "artifact": "calendars/USTEC.json (engine v1 schema; consumer "
+                        "mt5quant.validation.events.trading_calendar via "
+                        "bt._load_h_research_inputs/_h_event_setup)",
+            "fix1_root_cause": 2,
+            "derived_from": ("bound ext/fred/USTEC/D1 delivered trading days "
+                             "(all days, main window NOT truncated) + bound "
+                             "manifest last_time as the completeness bound"),
+            "day_basis": "FRED date labels = trading days (close-only series)",
+            "close_time_basis": ("next UTC midnight (day+1d) — the engine D1 "
+                                 "fallback close convention (time + 86400 s); "
+                                 "no market-clock claim, no fabricated session"),
+            "exported_via": "--export-calendar (exclusive; refuses overwrite)",
+        },
         "costs": costs_provenance,
         "calendar": calendar,
     }
     return {"inputs": inputs, "cost_model": cost_model,
             "contract_sizes": {"USTEC": costs_provenance["contract"]["contract_size"]},
-            "calendar": calendar, "provenance": provenance}
+            "calendar": calendar, "trading_calendar": trading_calendar,
+            "provenance": provenance}
 
 
 def _fields(value, required, label):
@@ -855,6 +921,21 @@ def run_n1_precheck(candidate_obj, *, inputs, cost_model, contract_sizes,
         "cumulative": {"n_tests": cumulative_n, "power": cumulative,
                        "status": "known" if cumulative is not None else "unknown"},
     }
+    # fix1 (root cause 1, 2026-11-07): the registered payload must carry the
+    # main-window coverage segments in exactly the native bt candidate check
+    # shape (candidates.coverage_segments -> _segments_for_span /
+    # merged_coverage_years), so the frozen consumer
+    # bt._load_h_research_inputs can activate the FRED merged load path
+    # (any counted non-mt5 segment; bt.py merged_keys predicate).  Segment
+    # data comes from the already assembled main-window bars — no new
+    # computation, and every pre-existing number stays byte-identical.
+    coverage_segments = {SERIES: cand._segments_for_span(
+        SOURCE, frame.time.iloc[0], frame.time.iloc[-1],
+        cand._observed_gaps(frame.time))}
+    checks["power"]["coverage_segments"] = coverage_segments
+    checks["power"]["coverage_merged_years"] = {
+        SERIES: cand.merged_coverage_years(coverage_segments[SERIES])}
+    checks["power"]["coverage_merge_method"] = _COVERAGE_MERGE_METHOD_NOTE
     if not cost_ok:
         result["diagnostic_status"] = "engineering_fail"
         result["reasons"].append("cost_multiple_below_minimum")
@@ -890,6 +971,10 @@ def main(argv=None):
                         help="SHA256-pinned N1 draft candidate TOML (loader-validated)")
     parser.add_argument("--output", required=True, type=Path,
                         help="new exclusive output directory for result.json")
+    parser.add_argument("--export-calendar", type=Path, default=None,
+                        help="optional: write the derived {data-root}/calendars/USTEC.json "
+                             "v1 trading calendar artifact from the same bound inputs "
+                             "(exclusive; refuses to overwrite an existing file)")
     args = parser.parse_args(argv)
     try:
         assembled = assemble_n1_inputs(args.data_root, args.calendar)
@@ -922,6 +1007,20 @@ def main(argv=None):
                                           n_tests=cand._POWER_N_TESTS)
                     if sharpe_used is not None else None),
             }
+        # Calendar export precedes the result write: a failed export must not
+        # leave a half-completed run behind (fail-closed, exclusive target).
+        if args.export_calendar is not None:
+            if args.export_calendar.exists():
+                raise BindingError(f"calendar export target already exists "
+                                   f"(refusing to overwrite): {args.export_calendar}")
+            calendar_text = json.dumps(assembled["trading_calendar"],
+                                       ensure_ascii=False, indent=1,
+                                       allow_nan=False) + "\n"
+            args.export_calendar.parent.mkdir(parents=True, exist_ok=True)
+            args.export_calendar.write_text(calendar_text, encoding="utf-8")
+            print(f"calendar export: {args.export_calendar} (sha256 "
+                  f"{hashlib.sha256(calendar_text.encode('utf-8')).hexdigest()})",
+                  file=sys.stderr)
         rules = dict(N1_RULES)
         rules["main_start"] = provenance["main_window"][0]
         rules["windows"] = {SERIES: list(provenance["main_window"])}

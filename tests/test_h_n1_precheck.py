@@ -24,7 +24,9 @@ import pytest
 
 from mt5quant.costs import Costs
 from mt5quant.h_readonly_precheck import REAL_ELIGIBILITY
-from mt5quant.research.candidates import validate_candidate
+from mt5quant.research.candidates import (
+    _observed_gaps, _segments_for_span, merged_coverage_years, validate_candidate)
+from mt5quant.validation import events as vevents
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/h_assemble_n1_precheck.py"
@@ -577,3 +579,115 @@ def _cli_flags():
     proc = run_cli(SCRIPT, ["--help"])
     assert proc.returncode == 0, proc.stderr
     return proc.stdout
+
+
+# ------------------------------------------- fix1 (2026-11-07): registered payload repair
+#
+# run1 of the R3 main test failed assembly because the registered N1 main-only
+# precheck payload carried no checks.power.coverage_segments, so
+# bt._load_h_research_inputs never activated the FRED merged load path
+# (.superpowers/sdd/2026-11-07-r3-main-test/root-cause-refusal.md).  The fix is
+# assembler-side only: the payload must first carry the segments in exactly the
+# shape bt candidate check natively produces (candidates.coverage_segments /
+# _segments_for_span / merged_coverage_years); the frozen consumer in
+# bt.py:3676 only needs any(s["counted"] and s["source"] != "mt5").
+
+def test_run_registers_native_power_coverage_segments(tmp_path):
+    module = assembler()
+    out = assembled(tmp_path)
+    result = module.run_n1_precheck(
+        candidate(), inputs=out["inputs"], cost_model=out["cost_model"],
+        contract_sizes=out["contract_sizes"])
+    power = result["checks"]["power"]
+    assert "coverage_segments" in power
+    bars = out["inputs"][SERIES]["bars"]
+    expected = _segments_for_span("fred", bars.time.iloc[0], bars.time.iloc[-1],
+                                  _observed_gaps(bars.time))
+    assert power["coverage_segments"] == {SERIES: expected}
+    assert power["coverage_merged_years"] == {
+        SERIES: merged_coverage_years(expected)}
+    assert power["coverage_merge_method"] == _COVERAGE_MERGE_METHOD_NOTE
+    # The bt merged_keys predicate (bt.py:3676) must activate on this payload.
+    assert any(s["counted"] and s["source"] != "mt5"
+               for s in power["coverage_segments"][SERIES])
+    seg = power["coverage_segments"][SERIES][0]
+    assert set(seg) == {"source", "first", "last", "years", "counted"}
+    assert seg["source"] == "fred" and seg["counted"] is True
+    assert seg["first"] == bars.time.iloc[0].isoformat()
+    assert seg["last"] == bars.time.iloc[-1].isoformat()
+    # Existing numbers stay untouched: same fields as before the fix.
+    assert power["years_detail"] == {SERIES: power["years"]}
+
+
+_COVERAGE_MERGE_METHOD_NOTE = (
+    "计入段日历区间并集：相接/重叠的段合成连续跨度（min(first).."
+    "max(last)），不相接的分段各自计入——重叠不双计（T80/G3 审核"
+    "修正：相加会把完全包含/部分重叠的覆盖虚增，如 fred/USTEC "
+    "39.8 年包住 mt5 4.3 年 → 合并 39.8 而非 44.1）；每段在产出侧"
+    "已在 >30 天内部空洞处切开（T94/R14-L3：实测间隔+known_gaps+"
+    "manifest 未启用年份，边界随段的 gaps 字段）")
+
+
+def test_assemble_derives_ustec_trading_calendar_v1(tmp_path):
+    """fix1 root cause 2: the assembly derives the {data-root}/calendars/USTEC.json
+    v1 content from the bound FRED series (all delivered trading days, not just
+    the main window) and the engine's trading_calendar() must accept it."""
+    module = assembler()
+    out = assembled(tmp_path)
+    doc = out["trading_calendar"]
+    assert doc["version"] == 1
+    frame = daily_prices()
+    cal = vevents.trading_calendar(doc)
+    assert list(cal.day) == list(pd.DatetimeIndex(frame.time))
+    assert (cal.close_time == cal.day + pd.Timedelta(days=1)).all()
+    assert (cal.close_time > cal.day).all()
+    assert (cal.close_time <= cal.day + pd.Timedelta(days=2)).all()
+    assert pd.Timestamp(doc["complete_through"]) == pd.Timestamp(frame.time.iloc[-1])
+
+
+def test_trading_calendar_counterexamples_rejected(tmp_path):
+    """Counterexample guard: every malformed variant the engine's v1 validator
+    refuses must differ from what the assembler exports."""
+    module = assembler()
+    out = assembled(tmp_path)
+    doc = out["trading_calendar"]
+    sessions = [dict(s) for s in doc["sessions"]]
+    head = sessions[0]
+    variants = {
+        "wrong version": {**doc, "version": 2},
+        "duplicated day": {**doc, "sessions": sessions + [dict(sessions[-1])]},
+        "close_time not after day": {
+            **doc, "sessions": [dict(head, close_time=head["day"])] + sessions[1:]},
+        "close_time beyond day+2": {
+            **doc, "sessions": [dict(
+                head, close_time=(pd.Timestamp(head["day"])
+                                  + pd.Timedelta(days=3)).date().isoformat())]
+            + sessions[1:]},
+        "tz-aware complete_through": {
+            **doc, "complete_through": doc["complete_through"] + "T00:00:00+00:00"},
+        "non-midnight day": {
+            **doc, "sessions": [dict(head, day=head["day"] + "T12:00:00")]
+            + sessions[1:]},
+        "missing sessions": {k: v for k, v in doc.items() if k != "sessions"},
+    }
+    for name, bad in variants.items():
+        with pytest.raises(ValueError):
+            vevents.trading_calendar(bad)
+
+
+def test_cli_export_calendar_flag_and_fail_closed_no_write(tmp_path):
+    module = assembler()
+    root, _ = write_root(tmp_path)          # valid structure, unbound hashes
+    calendar, _ = write_calendar(tmp_path)
+    cand = tmp_path / "C005.toml"
+    cand.write_text(CANDIDATE_TOML, encoding="utf-8")
+    out = tmp_path / "never"
+    export = tmp_path / "calendars" / "USTEC.json"
+    proc = run_cli(SCRIPT, ["--data-root", str(root), "--calendar", str(calendar),
+                            "--candidate", str(cand), "--output", str(out),
+                            "--export-calendar", str(export)])
+    assert proc.returncode == 2            # binding refusal precedes any export
+    assert "sha256" in proc.stderr
+    assert not export.exists()
+    assert not out.exists()
+    assert "--export-calendar" in _cli_flags()
