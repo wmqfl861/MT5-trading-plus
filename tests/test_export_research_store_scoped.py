@@ -254,7 +254,7 @@ class TestScopedExtExport:
             "open": 150.0, "high": 151.0, "low": 149.0, "close": 150.5,
             "tick_volume": 10, "spread": 5, "real_volume": 0})
         save_bars(str(dest), "USDJPY", "D1", usdjpy,
-                  server="Exness-MT5Trial5", login=278008680)
+                  server="SimServer-X1", login=12345678)
         cal = dest / "calendars"
         cal.mkdir()
         (cal / "USTEC.json").write_text('{"外部进程写入": true}',
