@@ -22,6 +22,13 @@
 
 N1：日期解析宽松（"Jan 1 2024" 通过；aware 串 TypeError 裸 traceback）——改严格 YYYY-MM-DD+捕 TypeError。N2：成本小时口径（FRED D1 零点→NY19/20 vs 声明 entry_hour_ny=16）与 month_end D1 同一共犯既有约定、两侧同口径二阶影响——首次运行报告并列声明。N3：真实运行须传 --event-days-start 早于 1994-09-26、--event-days-end 2021-05-17 方复现 213/0/0——并入 F1 机器化。
 
-## 证据归属
+## F1/N1 修复定点复核（2026-11-07，转录）
 
-评审者独立复算：日历计数/星期/首末/丢弃、锚跳洞、随机化池包含性+星期+窗长+不重叠、CLI 边界四探针、diff 删除行枚举、卫生失败既有性。采信 committed：RED 13→GREEN 13、163+202 套件、零 runs 断言。修复完成后仅复核 F1/N1 diff；主检验经新路径运行前本评审+F1 复核是最后技术闸。
+修复提交 `26b2f90a60fbbf5248bbdad52bc9e6b0db651733`（父 `af7801b`，仅 bt.py +100/−7 与测试 +139）。同一评审链复核：**F1 ADDRESSED / N1 ADDRESSED / 无新破坏 / Spec PASS / Quality PASS。**
+
+- F1 五要素机械验证成立：比对源确为台账 candidate_checks 最新 result_json（无重算/无硬编码 213）；六对字段名与真实登记工件逐一解析核对；比对位于台账写入前（CLI 反例断言零 runs）；SHA/计数不符 ValueError；details_json 审计链落账（calendar_sha256/pool/precheck_binding/window_events/dropped）；无载荷合成路径标注。
+- N1 严格解析（str 门+TypeError 捕获+NaT/aware 门+isoformat 回代）；评审者探针补测 10 个边角全部正确拒绝。
+- 引擎已 PASS 部分零触碰（diff 范围核对）；触及路径两测试文件 17/17+52/52 实测。
+- 残留观察（不阻塞）：载荷存在但缺 coverage 字段时按 no_registered_precheck 放行——低风险宽裁量，C005 重登记流程变更时宜收紧。
+
+主检验经此完整链运行。
