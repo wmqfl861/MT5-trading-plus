@@ -85,6 +85,10 @@ CODE_FILES = (
     "src/mt5quant/strategies/library/b4_mean_reversion.py",
     "src/mt5quant/strategies/library/b5_intraday_momentum.py",
     "src/mt5quant/strategies/library/b6_vol_target_long.py",
+    # FOMC engine commit (add7ee0) made strategies/library/__init__ import
+    # fomc_preannouncement; without it here every isolated implementation
+    # copy breaks at import (ModuleNotFoundError) — see 2026-11-07 adapter fix.
+    "src/mt5quant/strategies/library/fomc_preannouncement.py",
     "src/mt5quant/strategies/library/prob/__init__.py",
     "src/mt5quant/strategies/library/prob/features.py",
 )
