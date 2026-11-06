@@ -10,6 +10,9 @@ from mt5quant.strategies.library.b4_mean_reversion import (
 from mt5quant.strategies.library.b5_intraday_momentum import IntradayMomentumNy
 from mt5quant.strategies.library.b6_vol_target_long import VolTargetLong
 from mt5quant.strategies.library.buy_hold import BuyHold
+from mt5quant.strategies.library.fomc_preannouncement import (
+    PreFomcAnnouncementDrift,
+)
 
 __all__ = [
     "BuyHold",
@@ -17,6 +20,7 @@ __all__ = [
     "IntradayMomentumNy",
     "LondonAsianBreakout",
     "NyOpeningRangeBreakout",
+    "PreFomcAnnouncementDrift",
     "TrendFilteredMeanReversion",
     "VolTargetLong",
 ]

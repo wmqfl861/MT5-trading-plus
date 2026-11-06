@@ -41,10 +41,13 @@ matched 随机化零分布比，而不是与 0 比；两者都在标定报告里
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -56,6 +59,7 @@ from mt5quant.research.power import _norm_ppf, _phi, _z_alpha
 
 __all__ = [
     "EventWindow", "month_end_events", "london_fix_events",
+    "fomc_calendar_events", "FOMC_ERA_START",
     "event_returns", "event_test", "randomize_event_times",
     "randomization_test", "aggregate_daily", "window_volatility",
     "plant_event_effect", "event_power", "required_events",
@@ -177,6 +181,133 @@ def london_fix_events(trading_days, *, tz: str = "Europe/London",
             kind="london_fix", label=f"london_fix:{d.date().isoformat()}",
             entry_time=fix_utc - lead, exit_time=fix_utc))
     return events
+
+
+FOMC_ERA_START = "1994-09-27"     # LM 时代起点（决议自该会议起当日即时公布）
+
+
+def fomc_calendar_events(calendar_path, expected_sha256,
+                         trading_days) -> tuple[list[EventWindow], dict]:
+    """FOMC 预排日历事件窗（C005/H102/R3：R3 主检验的事件构造路径）。
+
+    输入 = 冻结日历工件路径 + 期望 SHA256 + 主段交易日历：
+    - **SHA256 绑定 fail-closed**：工件不可读/摘要不符 → ValueError，绝不
+      静默换用重抓日历（与预筛装配器 h_assemble_n1_precheck 同一绑定
+      语义；SHA 绑定保证字节未动，此处结构校验只及消费面——era_start
+      与默认条目 announcement_date == end_date、公告日无重复）；
+    - 每个默认事件（in_default_event_set=true 且公告日 D 落在主段日历
+      span 内）生成：announcement_day=D（工件 announcement_date），
+      entry_anchor=D 的**前一主段交易日**；entry/exit 时刻取交易日零点
+      （与 month_end 同一成交解析口径——FRED D1 close-only 序列
+      open==close，bar 开盘成交价=该日官方收盘价，恰为登记的
+      "前收进/公告日收出"D1 近似窗，H102 与 C005 declared 同一口径）；
+    - D 不在主段日历上（无公告 bar）→ 丢弃并登记 dropped_no_bar；D 是
+      主段首日（无前一交易日）→ 丢弃并登记 dropped_no_anchor——
+      **不移窗、不补锚**（H102 should_fail_when / 裁定 E6 同一规则）；
+    - 非默认条目（电话会/notation vote/预时代/未举行/被审核剔除的
+      2003-09-15）不触发。
+
+    返回 (events, report)：report 为覆盖登记（calendar_sha256/
+    default_event_set/window_events/events/dropped_no_bar/
+    dropped_no_anchor），供运行报告与 E6 出证。主段窗 [首日, 2021-05-17)
+    由调用方以主段日历传入（bt._h_event_setup 的 --event-days-* 显式
+    参数），本函数不做窗推断。
+    """
+    want = str(expected_sha256).strip().lower()
+    if len(want) != 64 or any(c not in "0123456789abcdef" for c in want):
+        raise ValueError("fomc_calendar：期望 sha256 须为 64 位十六进制摘要，"
+                         f"收到 {expected_sha256!r}")
+    path = Path(calendar_path)
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"fomc_calendar：冻结日历工件不可读 {path}：{exc}") from exc
+    got = hashlib.sha256(raw).hexdigest()
+    if got != want:
+        raise ValueError("fomc_calendar：冻结日历工件 sha256 不符"
+                         f"（期望 {want}，实测 {got}）——fail-closed，"
+                         "不得静默换用重抓日历")
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"fomc_calendar：冻结日历工件不是合法 JSON：{exc}") from exc
+    if not isinstance(doc, dict) or not {"artifact", "event_definition",
+                                         "meetings"} <= set(doc):
+        raise ValueError("fomc_calendar：日历工件缺顶层必需键"
+                         "（artifact/event_definition/meetings）")
+    definition = doc["event_definition"]
+    era = definition.get("era_start") if isinstance(definition, dict) else None
+    if era != FOMC_ERA_START:
+        raise ValueError(f"fomc_calendar：event_definition.era_start 须为 "
+                         f"{FOMC_ERA_START}（LM 时代），收到 {era!r}")
+    meetings = doc["meetings"]
+    if not isinstance(meetings, list):
+        raise ValueError("fomc_calendar：meetings 须为列表")
+
+    def _day(value, field) -> pd.Timestamp:
+        if not isinstance(value, str):
+            raise ValueError(f"fomc_calendar：meeting.{field} 须为 "
+                             f"'YYYY-MM-DD' 字符串，收到 {value!r}")
+        try:
+            stamp = pd.Timestamp(value)
+        except ValueError as exc:
+            raise ValueError(f"fomc_calendar：meeting.{field} 不可解析："
+                             f"{value!r}") from exc
+        if stamp.isoformat()[:10] != value:
+            raise ValueError(f"fomc_calendar：meeting.{field} 须为严格 "
+                             f"YYYY-MM-DD：{value!r}")
+        return stamp.normalize()
+
+    defaults: list[pd.Timestamp] = []
+    for m in meetings:
+        if not isinstance(m, dict):
+            raise ValueError("fomc_calendar：meeting 条目须为对象")
+        if m.get("in_default_event_set") is not True:
+            continue                     # 非默认集（诊断变体）不触发
+        end = _day(m.get("end_date"), "end_date")
+        announcement = _day(m.get("announcement_date"), "announcement_date")
+        if announcement != end:
+            raise ValueError("fomc_calendar：默认条目 announcement_date 必须"
+                             "等于 end_date（公告日=会议最后一日），收到 "
+                             f"{announcement.date().isoformat()} != "
+                             f"{end.date().isoformat()}")
+        defaults.append(announcement)
+    defaults.sort()
+    for a, b in zip(defaults, defaults[1:]):
+        if a == b:
+            raise ValueError("fomc_calendar：默认事件公告日重复 "
+                             f"{a.date().isoformat()}——事件标识歧义，fail-closed")
+    days = _normalize_days(trading_days)
+    day_values = days.to_numpy()
+    span_lo, span_hi = days[0], days[-1]
+    events: list[EventWindow] = []
+    no_bar: list[str] = []
+    no_anchor: list[str] = []
+    for d in defaults:
+        if not span_lo <= d <= span_hi:
+            continue                     # 主段窗外（如 2021-05-17 之后延长段）
+        pos = int(np.searchsorted(day_values, d.to_datetime64()))
+        if pos >= len(days) or days[pos] != d:
+            no_bar.append(d.date().isoformat())
+            continue                     # 公告日无主段 bar：丢弃登记
+        if pos == 0:
+            no_anchor.append(d.date().isoformat())
+            continue                     # 首日无前交易日：丢弃，不移窗不补锚
+        events.append(EventWindow(
+            kind="fomc_calendar", label=f"fomc_calendar:{d.date().isoformat()}",
+            entry_time=days[pos - 1], exit_time=d))
+    report = {
+        "calendar_sha256": want,
+        "era_start": FOMC_ERA_START,
+        "announcement_day_rule": (definition.get("announcement_day_rule")
+                                  if isinstance(definition, dict) else None),
+        "default_event_set": len(defaults),
+        "window_events": len(events) + len(no_bar) + len(no_anchor),
+        "events": len(events),
+        "dropped_no_bar": no_bar,
+        "dropped_no_anchor": no_anchor,
+    }
+    return events, report
 
 
 SIDE_RULES = ("static_long", "static_short", "mtd_sign")

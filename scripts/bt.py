@@ -89,7 +89,7 @@
   基准运行前拒绝、成本 ×1.5 否决、buyhold/延迟不适用、四项诊断）。
   N = ledger.primary_test_n(候选声明的 continues_family) 的门槛部分
   （rounds_lineage；报告列轮次内/延续谱系/其余历史三行）。事件窗类别
-  --event-kind month_end|london_fix 必须显式声明（按预注册机制锚定）。
+  --event-kind month_end|london_fix|fomc_calendar 必须显式声明（按预注册机制锚定）。
 - contract_size 只认 {data-root}/specs/latest.json（与 run_backtest 同规：
   缺则报错，绝不静默按 1 折算）。
 - 定手数（T23/M2）：--risk-per-trade 缺省 0.005（按风险定手数，与
@@ -1537,6 +1537,10 @@ def _v3_gate_evaluate(ledger, card, *, cfg, ctx, cards_dir, strategy, spec,
         else:
             # Nonresearch/calibration compatibility only; H research always
             # supplies an explicit calendar and the declared callback above.
+            if kind == "fomc_calendar":
+                raise ValueError("fomc_calendar 无隐式兼容回退：事件集必须由"
+                                 "冻结日历工件构造（H 研究装配路径），非研究/"
+                                 "标定运行不得用工作日近似替代（fail-closed）")
             days = pd.DatetimeIndex(sorted(set(pd.to_datetime(bars["time"]).dt.normalize())))
             if kind == "month_end":
                 events = vevents.month_end_events(days)
@@ -3757,7 +3761,7 @@ def _bind_h_strategy(strategy, ctx, symbol):
     return strategy
 
 
-def _h_event_setup(ctx, symbol, bars, kind, params):
+def _h_event_setup(ctx, symbol, bars, kind, params, *, fomc=None):
     from mt5quant.validation import events as vevents
     declared = ctx["declared"]
     signal_symbol = declared.signal_symbol or symbol
@@ -3768,6 +3772,21 @@ def _h_event_setup(ctx, symbol, bars, kind, params):
     days = pd.DatetimeIndex(cal.day)
     if kind == "month_end":
         events = vevents.month_end_events(days)
+    elif kind == "fomc_calendar":
+        # R3/C005（裁定 E6/E10）：冻结 FOMC 日历工件默认事件集 → 公告日
+        # 事件 + 前一主段交易日入场锚；主段窗 [start, end) 显式传入——
+        # 事件构造与随机化抽样池用**同一主段日历**（MT5/延长非盲段绝不
+        # 作对照入口）。month_end/london_fix 的 days 取值行为不变。
+        if fomc is None:
+            raise ValueError("--event-kind fomc_calendar 需要 "
+                             "--fomc-calendar/--fomc-calendar-sha256 与 "
+                             "--event-days-start/--event-days-end 成对显式"
+                             "给出（冻结工件+主段窗绑定，fail-closed）")
+        path, sha, pool_start, pool_end = fomc
+        main_days = days[(days >= pool_start) & (days < pool_end)]
+        events, report = vevents.fomc_calendar_events(path, sha, main_days)
+        ctx.setdefault("fomc_calendar", {})[symbol] = report
+        days = main_days         # 随机化抽样池 = 主段日历（下方再 ∩ 观察日）
     else:
         last = [g.day.iloc[-1] for _, g in cal.groupby(cal.day.dt.to_period("M"))
                 if g.day.iloc[0].to_period("M").end_time.normalize() <= cal.attrs["complete_through"]]
@@ -3797,7 +3816,42 @@ def _h_event_setup(ctx, symbol, bars, kind, params):
     return events, days, side_fn
 
 
-def _h_preflight(ctx, strategy, card, *, event_kind=None):
+def _fomc_event_binding(args):
+    """fomc_calendar 事件的 CLI 绑定四元组（工件路径/期望 SHA/主段窗）。
+
+    仅 --event-kind fomc_calendar 时必需，且四参**成对**给出（缺一即拒）；
+    其他事件 kind 携带任一参数即拒绝（既有 month_end/london_fix 行为
+    不受影响）。返回 (path, sha, start, end) 或 None；start >= end 拒绝
+    （主段窗 [start, end) 为空/逆序无意义）。"""
+    kind = getattr(args, "event_kind", None)
+    path = getattr(args, "fomc_calendar", None)
+    sha = getattr(args, "fomc_calendar_sha256", None)
+    start = getattr(args, "event_days_start", None)
+    end = getattr(args, "event_days_end", None)
+    if kind != "fomc_calendar":
+        if path or sha or start or end:
+            raise ValueError("--fomc-calendar/--fomc-calendar-sha256/"
+                             "--event-days-start/--event-days-end 只与 "
+                             "--event-kind fomc_calendar 搭配使用"
+                             "（其他事件类不受影响）")
+        return None
+    if not (path and sha and start and end):
+        raise ValueError("--event-kind fomc_calendar 需要 "
+                         "--fomc-calendar/--fomc-calendar-sha256 与 "
+                         "--event-days-start/--event-days-end 成对显式给出"
+                         "（冻结工件+主段窗绑定，fail-closed）")
+    try:
+        lo, hi = pd.Timestamp(start), pd.Timestamp(end)
+    except ValueError as exc:
+        raise ValueError(f"--event-days-start/--event-days-end 须为可解析日期："
+                         f"{exc}") from exc
+    if lo >= hi:
+        raise ValueError(f"--event-days-start {start} 须早于 --event-days-end "
+                         f"{end}（主段窗 [start, end)）")
+    return path, sha, lo, hi
+
+
+def _h_preflight(ctx, strategy, card, *, event_kind=None, fomc=None):
     """Check all event windows and auxiliary anchors before any calculation."""
     if ctx is None:
         return
@@ -3812,7 +3866,7 @@ def _h_preflight(ctx, strategy, card, *, event_kind=None):
         return
     for symbol, bars in ctx["bars"].items():
         _bind_h_strategy(strategy, ctx, symbol)
-        _h_event_setup(ctx, symbol, bars, kind, {})  # availability uses timestamps only
+        _h_event_setup(ctx, symbol, bars, kind, {}, fomc=fomc)  # availability uses timestamps only
 
 
 def _h_coverage_report(ctx):
@@ -3825,6 +3879,11 @@ def _h_coverage_report(ctx):
         for a, b in actual["gaps"]:
             lines.append(f"\n- {key} merged gap：{a} → {b}")
     lines.append(f"\n- 可用事件：{ctx.get('usable_events', {})}（逐事件时间窗与信号锚点已核对）\n")
+    for symbol, report in (ctx.get("fomc_calendar") or {}).items():
+        # R3/C005：FOMC 日历事件的覆盖登记（dropped_no_bar/dropped_no_anchor
+        # 丢弃出证——裁定 E6"缺锚 fail-closed 各自出证"；报告层只登记）。
+        lines.append(f"- FOMC 日历事件登记（{symbol}）："
+                     + json.dumps(report, ensure_ascii=False, sort_keys=True))
     return "\n".join(lines)
 
 
@@ -3863,6 +3922,13 @@ def cmd_screen(args) -> int:
     if research_mode:
         print(f"— 研究库模式（T27/H3；T38/D24 起为缺省）：data_root={data_root}"
               f"（无 tick，成本经缓存文件；台账 {ledger_path}）")
+    # R3/C005：fomc_calendar 事件的 CLI 绑定（缺一/搭配错误在装配与任何
+    # runs 写入之前拒绝）
+    try:
+        fomc_binding = _fomc_event_binding(args)
+    except ValueError as e:
+        print(f"✗ {e}")
+        return 1
     # R6/C6：--ops-ack 已在入口拒绝，研究命令 actor 恒为原值
     # （T61：标定样品卡例外——actor 已在候选状态守卫里定为 calibration）
     with Ledger(ledger_path) as ledger:
@@ -3922,7 +3988,8 @@ def cmd_screen(args) -> int:
                     load_plain=load_series, load_merged=merged_research_series)
                 bars_by_sym = h_ctx["bars"]
                 _h_preflight(h_ctx, strategy_cls(), card,
-                             event_kind=getattr(args, "event_kind", None))
+                             event_kind=getattr(args, "event_kind", None),
+                             fomc=fomc_binding)
             else:
                 bars_by_sym = {sym: load_series(data_root, sym,
                                                 card.timeframe, args.end,
@@ -4324,6 +4391,13 @@ def cmd_gate(args) -> int:
     if research_mode:
         print(f"— 研究库模式（T27/H3；T38/D24 起为缺省）：data_root={data_root}"
               f"（无 tick，成本经缓存文件；台账 {ledger_path}）")
+    # R3/C005：fomc_calendar 事件的 CLI 绑定（缺一/搭配错误在 V3 预检、
+    # 装配与任何 runs 写入之前拒绝）
+    try:
+        fomc_binding = _fomc_event_binding(args)
+    except ValueError as e:
+        print(f"✗ {e}")
+        return 1
     # T38/D24 + R6/C6：G5 需读主库锁箱段，且**主库校验对所有数据根模式
     # 生效**——研究库（缺省数据根）没有锁箱段，一律拒绝（即使已
     # --approve）；自定义 --data-root 同样拒绝（第六轮审核 C6：custom
@@ -4415,7 +4489,7 @@ def cmd_gate(args) -> int:
                     if not args.event_kind:
                         print("✗ 事件模式卡（轮次 [evaluation] mode=\"event\"）"
                               "跑关卡 V3 必须显式声明事件窗类别 --event-kind"
-                              " month_end|london_fix（事件窗按预注册机制锚定，"
+                              " month_end|london_fix|fomc_calendar（事件窗按预注册机制锚定，"
                               "不静默取缺省）")
                         return 1
                     comp_pre = _v3_n_composition(
@@ -4470,7 +4544,8 @@ def cmd_gate(args) -> int:
                     load_plain=load_series, load_merged=merged_research_series)
                 bars_by_sym = h_ctx["bars"]
                 _h_preflight(h_ctx, strategy, card,
-                             event_kind=getattr(args, "event_kind", None))
+                             event_kind=getattr(args, "event_kind", None),
+                             fomc=fomc_binding)
             else:
                 bars_by_sym = {sym: load_series(data_root, sym,
                                                 card.timeframe, args.end,
@@ -4628,7 +4703,9 @@ def cmd_gate(args) -> int:
         try:
             strategy = _bind_h_strategy(strategy, h_ctx, symbol)
             if h_ctx is not None and (v3_ctx or {}).get("mode") == "event":
-                v3_ctx["event_setup"] = _h_event_setup(h_ctx, symbol, bars, v3_ctx["kind"], params)
+                v3_ctx["event_setup"] = _h_event_setup(h_ctx, symbol, bars,
+                                                      v3_ctx["kind"], params,
+                                                      fomc=fomc_binding)
                 v3_ctx["side_rule"] = h_declared.side_rule
         except ValueError as exc:
             print(f"✗ {exc}")
@@ -5267,8 +5344,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_screen.add_argument("--risk-per-trade", type=float, default=None,
                           help="按风险定手数的单笔风险比例（缺省 0.005；0=固定手数；"
                                "与 --volume-lots 同时显式给且>0 会拒绝）")
-    p_screen.add_argument("--event-kind", choices=("month_end", "london_fix"),
+    p_screen.add_argument("--event-kind",
+                          choices=("month_end", "london_fix", "fomc_calendar"),
                           default=None, help="Explicit event window when strategy has no event_kind declaration")
+    p_screen.add_argument("--fomc-calendar", default=None,
+                          help="fomc_calendar 必选成对：冻结 FOMC 日历工件路径"
+                               "（fomc_meetings.json；--fomc-calendar-sha256 绑定"
+                               "校验，不符 fail-closed）")
+    p_screen.add_argument("--fomc-calendar-sha256", default=None,
+                          help="fomc_calendar 必选成对：冻结工件的期望 SHA256"
+                               "（64 位十六进制）")
+    p_screen.add_argument("--event-days-start", default=None,
+                          help="fomc_calendar 必选成对：主段窗起点（含）——事件"
+                               "构造与随机化抽样池同用（E10：防对照入口落入"
+                               " MT5/延长非盲段）")
+    p_screen.add_argument("--event-days-end", default=None,
+                          help="fomc_calendar 必选成对：主段窗终点（不含；"
+                               "R3 主段 = 2021-05-17）")
     p_screen.add_argument("--initial-capital", type=float, default=10_000.0)
     p_screen.add_argument("--spread-fraction", type=float, default=0.1)
     p_screen.add_argument("--commission", type=float, default=0.0)
@@ -5339,11 +5431,26 @@ def build_parser() -> argparse.ArgumentParser:
                              " actor=calibration，不进入研究轮次统计；"
                              "非样品卡给出则拒绝")
     p_gate.add_argument("--out", default=None, help="关卡报告 Markdown 落盘路径")
-    p_gate.add_argument("--event-kind", choices=("month_end", "london_fix"),
+    p_gate.add_argument("--event-kind",
+                        choices=("month_end", "london_fix", "fomc_calendar"),
                         default=None,
                         help="T86：关卡 V3 事件分支的事件窗类别（轮次 "
                              "[evaluation] mode=\"event\" 的卡必填——事件窗"
                              "按预注册机制锚定，不静默取缺省）")
+    p_gate.add_argument("--fomc-calendar", default=None,
+                        help="fomc_calendar 必选成对：冻结 FOMC 日历工件路径"
+                             "（fomc_meetings.json；--fomc-calendar-sha256 绑定"
+                             "校验，不符 fail-closed——R3 绑定 SHA a53577d9…）")
+    p_gate.add_argument("--fomc-calendar-sha256", default=None,
+                        help="fomc_calendar 必选成对：冻结工件的期望 SHA256"
+                             "（64 位十六进制）")
+    p_gate.add_argument("--event-days-start", default=None,
+                        help="fomc_calendar 必选成对：主段窗起点（含）——事件"
+                             "构造与随机化抽样池同用（E10：防对照入口落入"
+                             " MT5/延长非盲段）")
+    p_gate.add_argument("--event-days-end", default=None,
+                        help="fomc_calendar 必选成对：主段窗终点（不含；"
+                             "R3 主段 = 2021-05-17）")
     p_gate.add_argument("--event-side", choices=("long", "short"),
                         default=None,
                         help="Explicit static direction override; must match declared side_rule")
