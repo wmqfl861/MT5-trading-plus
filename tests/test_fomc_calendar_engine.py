@@ -426,3 +426,142 @@ def test_prefomc_strategy_identity_and_baseline():
 def test_library_exports_prefomc():
     from mt5quant.strategies import library
     assert library.PreFomcAnnouncementDrift.event_kind == "fomc_calendar"
+
+
+# ================= F1/N1 修复（聚焦评审 docs/reviews/2026-11-07-fomc-engine-review.md）
+
+def _registered_payload(sha, *, window_events=2, events=2,
+                        dropped_no_bar=None, dropped_no_anchor=None,
+                        default_event_set=3):
+    """与登记侧 C005.precheck.json 同构的合成 precheck 载荷（F1 机械核对
+    的登记期望源：precheck_source.calendar_sha256 + calendar_coverage）。"""
+    return {"candidate_id": "C004", "decision": "pass",
+            "checks": {"power": {"years": 799 / 365.25,
+                                 "years_detail": {"XAUUSD/D1": 799 / 365.25}}},
+            "precheck_source": {"stable_key": "N1:C004:main-only-real-precheck",
+                                "calendar_sha256": sha},
+            "calendar_coverage": {
+                "era_start": "1994-09-27",
+                "default_event_set": default_event_set,
+                "window_events": window_events,
+                "events_with_announcement_bar": window_events - len(dropped_no_bar or []),
+                "events_with_entry_anchor": events,
+                "dropped_no_bar": dropped_no_bar or [],
+                "dropped_no_anchor": dropped_no_anchor or []}}
+
+
+def test_fomc_registration_binding_unit(tmp_path):
+    """F1 单元：登记载荷一致 → report 带 precheck_binding+pool；SHA 不符/
+    窗口计数不符 → ValueError；无载荷 → no_registered_precheck（合成路径
+    保持现状）。"""
+    mod = load_bt()
+    cal_days = pd.date_range("2024-01-01", "2026-03-31", freq="D")
+    times = pd.date_range("2024-01-01", "2026-03-09", freq="D")
+    bars = pd.DataFrame({"time": times, "open": 100., "close": 100.})
+    path, sha = write_calendar(tmp_path, [meeting("2024-01-31"),
+                                           meeting("2024-03-20"),
+                                           meeting("2025-06-18")])
+    fomc = (path, sha, pd.Timestamp("2024-01-01"), pd.Timestamp("2024-12-31"))
+    # 无载荷：合成测试路径保持现状 + 标注
+    ctx = _h_ctx(bars, cal_days)
+    mod._h_event_setup(ctx, "X", bars, "fomc_calendar", {}, fomc=fomc)
+    rep = ctx["fomc_calendar"]["X"]
+    assert rep["precheck_binding"] == {"no_registered_precheck": True}
+    assert rep["pool"] == ["2024-01-01", "2024-12-31"]
+    # 一致载荷：比对通过（window_events=2/events=2/default=3 与构造器一致）
+    ctx = _h_ctx(bars, cal_days)
+    ctx["candidate_precheck"] = _registered_payload(sha)
+    mod._h_event_setup(ctx, "X", bars, "fomc_calendar", {}, fomc=fomc)
+    binding = ctx["fomc_calendar"]["X"]["precheck_binding"]
+    assert binding["calendar_sha256_match"] is True
+    assert binding["coverage_match"] is True
+    assert "window_events" in binding["checked"]
+    assert "dropped_no_anchor" in binding["checked"]
+    # SHA 不符（自洽重抓日历，CLI=工件一致但 ≠ 登记绑定）→ ValueError
+    ctx = _h_ctx(bars, cal_days)
+    ctx["candidate_precheck"] = _registered_payload("b" * 64)
+    with pytest.raises(ValueError, match="precheck_source"):
+        mod._h_event_setup(ctx, "X", bars, "fomc_calendar", {}, fomc=fomc)
+    # 窗口计数不符（登记 213/0/0 vs 运行偏离的同型）→ ValueError
+    ctx = _h_ctx(bars, cal_days)
+    ctx["candidate_precheck"] = _registered_payload(sha, window_events=3)
+    with pytest.raises(ValueError, match="window_events"):
+        mod._h_event_setup(ctx, "X", bars, "fomc_calendar", {}, fomc=fomc)
+
+
+def test_gate_fomc_registered_binding_pass_and_details(tmp_path, monkeypatch, capsys):
+    """F1 正例（CLI）：登记 precheck 载荷一致 → 完整运行通过，V3
+    details_json 含 fomc_calendar 报告（SHA/池界/比对结果）——机器审计链。"""
+    from mt5quant.research.ledger import Ledger
+    mod = load_bt()
+    root, cards_dir, ledger_path = _setup_fomc_round(tmp_path, monkeypatch, mod)
+    cal_path, sha = write_calendar(
+        tmp_path, [meeting("2024-01-01"), meeting("2024-01-31"),
+                   meeting("2024-03-20"), meeting("2024-11-29"),
+                   meeting("2025-06-18")])
+    with Ledger(ledger_path) as led:      # 追加最新 precheck（装载器取 rows[-1]）
+        led.record_candidate_check(
+            "C004", decision="pass",
+            result=_registered_payload(sha, window_events=4, events=3,
+                                       default_event_set=5,
+                                       dropped_no_anchor=["2024-01-01"]))
+    mod.main(_fomc_gate_args(root, cards_dir, ledger_path, cal_path, sha))
+    out = capsys.readouterr().out
+    with Ledger(ledger_path) as led:
+        assert led.conn.execute(
+            "SELECT COUNT(*) FROM runs WHERE card_id='H704'").fetchone()[0] == 1
+        row = led.conn.execute(
+            "SELECT details_json FROM gates WHERE gate='V3'").fetchone()
+    assert row is not None, out
+    rep = json.loads(row["details_json"])["fomc_calendar"]["XAUUSD"]
+    assert rep["calendar_sha256"] == sha
+    assert rep["pool"] == ["2024-01-01", "2024-12-31"]
+    assert rep["precheck_binding"]["calendar_sha256_match"] is True
+    assert rep["precheck_binding"]["coverage_match"] is True
+    assert rep["window_events"] == 4 and rep["dropped_no_anchor"] == ["2024-01-01"]
+
+
+def test_gate_fomc_registered_mismatch_zero_runs(tmp_path, monkeypatch, capsys):
+    """F1 反例（CLI）：登记 SHA 不符 / 窗口计数不符 → 装配段 ValueError，
+    零 runs（自洽重抓日历不得无机器异议跑主检验）。"""
+    from mt5quant.research.ledger import Ledger
+    mod = load_bt()
+    root, cards_dir, ledger_path = _setup_fomc_round(tmp_path, monkeypatch, mod)
+    cal_path, sha = write_calendar(tmp_path, [meeting("2024-01-31")])
+    cases = [
+        (_registered_payload("b" * 64, window_events=1, events=1,
+                             default_event_set=1), "precheck_source"),
+        (_registered_payload(sha, window_events=9, events=1,
+                             default_event_set=1), "window_events"),
+    ]
+    for payload, needle in cases:
+        with Ledger(ledger_path) as led:
+            led.record_candidate_check("C004", decision="pass", result=payload)
+        assert mod.main(_fomc_gate_args(root, cards_dir, ledger_path,
+                                        cal_path, sha)) == 1
+        out = capsys.readouterr().out
+        assert needle in out
+        with Ledger(ledger_path) as led:
+            assert led.conn.execute(
+                "SELECT COUNT(*) FROM runs WHERE card_id='H704'"
+            ).fetchone()[0] == 0
+
+
+def test_fomc_binding_strict_dates():
+    """N1：主段窗日期严格 YYYY-MM-DD——宽松格式（'2024-1-1'/本地语序/
+    月日斜杠/带时间）与 tz-aware 串一律拒绝，不再落入宽松解析。"""
+    from types import SimpleNamespace
+    mod = load_bt()
+
+    def binding(start, end):
+        return mod._fomc_event_binding(SimpleNamespace(
+            event_kind="fomc_calendar", fomc_calendar="p",
+            fomc_calendar_sha256="a" * 64, event_days_start=start,
+            event_days_end=end))
+
+    assert binding("2024-01-01", "2024-12-31")[2:] == (
+        pd.Timestamp("2024-01-01"), pd.Timestamp("2024-12-31"))
+    for bad in ("2024-1-1", "Jan 1 2024", "01/02/2024", "2024-01-31T00:00:00",
+                "2024-01-01 00:00", "2024-01-01Z", "2024-01-01+00:00"):
+        with pytest.raises(ValueError, match="YYYY-MM-DD"):
+            binding(bad, "2024-12-31")

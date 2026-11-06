@@ -3677,7 +3677,11 @@ def _load_h_research_inputs(ledger, card, *, candidate_id, declared, data_root,
                for s in segments.get(key, [])):
             merged_keys.add(key)
     ctx = {"bars": {}, "signals": {}, "coverage": {}, "calendars": {},
-           "declared": declared, "merged": bool(merged_keys), "gaps": {}}
+           "declared": declared, "merged": bool(merged_keys), "gaps": {},
+           # F1（聚焦评审 2026-11-07）：最近 precheck 载荷随 ctx 下行——
+           # fomc 分支据此做登记绑定机械核对（precheck_source.calendar_sha256
+           # 与 calendar_coverage）；其他 kind 不消费。
+           "candidate_precheck": pre}
     cache = {}
 
     def load_calendar(symbol):
@@ -3785,6 +3789,13 @@ def _h_event_setup(ctx, symbol, bars, kind, params, *, fomc=None):
         path, sha, pool_start, pool_end = fomc
         main_days = days[(days >= pool_start) & (days < pool_end)]
         events, report = vevents.fomc_calendar_events(path, sha, main_days)
+        # F1：登记绑定机械核对（CLI SHA ↔ 台账登记 SHA；report ↔ 登记
+        # calendar_coverage 逐字段）+ 池界入 report（供 V3 details_json
+        # 机器审计）；无登记载荷（合成路径）标注 no_registered_precheck。
+        report["pool"] = [pool_start.date().isoformat(),
+                          pool_end.date().isoformat()]
+        report["precheck_binding"] = _verify_fomc_registration(
+            report, ctx.get("candidate_precheck"), sha)
         ctx.setdefault("fomc_calendar", {})[symbol] = report
         days = main_days         # 随机化抽样池 = 主段日历（下方再 ∩ 观察日）
     else:
@@ -3822,7 +3833,9 @@ def _fomc_event_binding(args):
     仅 --event-kind fomc_calendar 时必需，且四参**成对**给出（缺一即拒）；
     其他事件 kind 携带任一参数即拒绝（既有 month_end/london_fix 行为
     不受影响）。返回 (path, sha, start, end) 或 None；start >= end 拒绝
-    （主段窗 [start, end) 为空/逆序无意义）。"""
+    （主段窗 [start, end) 为空/逆序无意义）。日期严格 'YYYY-MM-DD'
+    （N1：本地语序/月日斜杠/带时间/tz-aware 串一律拒绝——主段窗边界
+    必须无歧义）。"""
     kind = getattr(args, "event_kind", None)
     path = getattr(args, "fomc_calendar", None)
     sha = getattr(args, "fomc_calendar_sha256", None)
@@ -3840,15 +3853,82 @@ def _fomc_event_binding(args):
                          "--fomc-calendar/--fomc-calendar-sha256 与 "
                          "--event-days-start/--event-days-end 成对显式给出"
                          "（冻结工件+主段窗绑定，fail-closed）")
-    try:
-        lo, hi = pd.Timestamp(start), pd.Timestamp(end)
-    except ValueError as exc:
-        raise ValueError(f"--event-days-start/--event-days-end 须为可解析日期："
-                         f"{exc}") from exc
+    lo = _strict_event_day(start, "--event-days-start")
+    hi = _strict_event_day(end, "--event-days-end")
     if lo >= hi:
         raise ValueError(f"--event-days-start {start} 须早于 --event-days-end "
                          f"{end}（主段窗 [start, end)）")
     return path, sha, lo, hi
+
+
+def _strict_event_day(value, flag) -> pd.Timestamp:
+    """严格 'YYYY-MM-DD' 日期（N1）——拒绝宽松解析与 tz-aware 串。"""
+    if not isinstance(value, str):
+        raise ValueError(f"{flag} 须为 'YYYY-MM-DD' 字符串，收到 {value!r}")
+    try:
+        stamp = pd.Timestamp(value)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"{flag} 须为 'YYYY-MM-DD'：{value!r}（{exc}）") from exc
+    if stamp is pd.NaT or stamp.tzinfo is not None:
+        raise ValueError(f"{flag} 须为无时区的 'YYYY-MM-DD' 日期：{value!r}")
+    if stamp.isoformat()[:10] != value:
+        raise ValueError(f"{flag} 须为严格 'YYYY-MM-DD'：{value!r}")
+    return stamp.normalize()
+
+
+# F1（聚焦评审 2026-11-07）：构造器 report ↔ 登记 precheck 的机械核对
+# 字段对（report 键, calendar_coverage 键）——运行侧与登记侧逐字段相等。
+_FOMC_COVERAGE_PAIRS = (
+    ("era_start", "era_start"),
+    ("default_event_set", "default_event_set"),
+    ("window_events", "window_events"),
+    ("events", "events_with_entry_anchor"),
+    ("dropped_no_bar", "dropped_no_bar"),
+    ("dropped_no_anchor", "dropped_no_anchor"),
+)
+
+
+def _verify_fomc_registration(report, precheck, cli_sha256) -> dict:
+    """F1：fomc 构造器 report 与登记 precheck 载荷的机械交叉核对。
+
+    登记 = 台账最近 precheck 的 precheck_source.calendar_sha256 +
+    calendar_coverage（_load_h_research_inputs 已随 ctx 下行）。有登记
+    载荷时：(a) CLI --fomc-calendar-sha256 必须等于登记绑定 SHA——自洽
+    的重抓日历（CLI=工件一致但 ≠ 登记）不得无机器异议跑主检验
+    （H102 falsified_if 的日历绑定 fail-closed）；(b) report 与登记
+    calendar_coverage 逐字段相等（window_events/events_with_entry_anchor/
+    dropped 双列/default_event_set/era_start）——主段窗参数偏离登记
+    （如 --event-days-start 落在首事件上 → 212 vs 登记 213/0/0）在此
+    机器化拦截。任一不符 ValueError（装配段，零 runs）。
+    载荷缺失（合成测试路径）：不比对，标注 no_registered_precheck。
+    返回并入 report["precheck_binding"] 的比对结果 dict。"""
+    source = precheck.get("precheck_source") if isinstance(precheck, dict) else None
+    coverage = precheck.get("calendar_coverage") if isinstance(precheck, dict) else None
+    registered_sha = source.get("calendar_sha256") if isinstance(source, dict) else None
+    if not isinstance(coverage, dict) or not registered_sha:
+        return {"no_registered_precheck": True}
+    if str(registered_sha).strip().lower() != str(cli_sha256).strip().lower():
+        raise ValueError(
+            "fomc_calendar：--fomc-calendar-sha256 "
+            f"（{str(cli_sha256)[:12]}…）与台账最近 precheck 的登记绑定 "
+            f"precheck_source.calendar_sha256（{str(registered_sha)[:12]}…）"
+            "不符——自洽的重抓日历不得跑主检验（H102 falsified_if 日历"
+            "绑定 fail-closed，F1 机械核对）")
+    checked = []
+    for report_key, coverage_key in _FOMC_COVERAGE_PAIRS:
+        if coverage_key not in coverage:
+            raise ValueError(f"fomc_calendar：登记 precheck 的 calendar_coverage "
+                             f"缺字段 {coverage_key}——登记载荷不完整，fail-closed")
+        if report[report_key] != coverage[coverage_key]:
+            raise ValueError(
+                f"fomc_calendar：构造器 report 与登记 precheck 不符 "
+                f"（{coverage_key}）：运行 {report[report_key]!r} vs 登记 "
+                f"{coverage[coverage_key]!r}——主段窗/参数偏离登记绑定"
+                f"（核对 --event-days-start/--event-days-end 与登记窗），"
+                "fail-closed（F1 机械核对）")
+        checked.append(coverage_key)
+    return {"calendar_sha256_match": True, "coverage_match": True,
+            "checked": checked}
 
 
 def _h_preflight(ctx, strategy, card, *, event_kind=None, fomc=None):
@@ -4878,6 +4958,12 @@ def cmd_gate(args) -> int:
             if h_ctx is not None:
                 details["runtime_coverage"] = h_ctx["coverage"]
                 details["usable_events"] = h_ctx.get("usable_events")
+                # F1：FOMC 日历事件登记报告（calendar_sha256/主段窗池界/
+                # 登记比对结果/丢弃登记）随关卡 details 入台账——机器审计
+                # 链不断（fomc 分支之外恒 None，不落入 details）。
+                if h_ctx.get("fomc_calendar") is not None:
+                    details["fomc_calendar"] = h_ctx["fomc_calendar"]
+                    results[name]["fomc_calendar"] = h_ctx["fomc_calendar"]
                 results[name]["runtime_coverage"] = h_ctx["coverage"]
                 results[name]["usable_events"] = h_ctx.get("usable_events")
             ledger.record_gate(run_id, name, bool(results[name]["passed"]),
