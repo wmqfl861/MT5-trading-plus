@@ -31,7 +31,7 @@ python scripts/h_assemble_real_precheck.py \
   --output <独占输出目录>
 ```
 
-产物 `result.json`（payload SHA256 `0c976e42e1f8edd38ddedfd33c37e02b43a893665c08b4d516189fc697435cd3`；stdout 与文件逐字节一致）：候选 C002（T114 离线草案，未提升）；`diagnostic_status=engineering_waiting`，reasons = `single_power_below_minimum` + `cumulative_n_unknown`。EURUSD/H1 交付 88,260 bar（窗口内 88,786 − 2020-10 违例月 526），覆盖 14.098 年、29 段；USTEC/D1 交付 3,644 bar（26 根预热），13.136 年。缺口：EURUSD 显式 1 + 推导 28（并后 28，2019-10 空洞恰为 [2019-10-01T00:00, 2019-11-01T00:00)）；USTEC 推导 132。事前成本倍数 **3.448**（来回 8.99bp：点差 7.93bp×1.5 来源加成 + 滑点 1.06bp + 佣金 0 + 隔夜 0；参考价 1.21498）≥ 3 通过；单次检验力 **42.4%** < 50%（σ=0.00182、implied SR 0.419 < min-detectable 0.785；年数取 min=13.14，USTEC 侧因空洞切段连周末日一并扣除属冻结 runtime_coverage 口径）——主段（不含 2021-05 后 MT5 延长段）不过功效门，如实记录，等待聚焦评审与 A1 裁量。
+产物 `result.json`（payload SHA256 `0c976e42e1f8edd38ddedfd33c37e02b43a893665c08b4d516189fc697435cd3`；stdout 与文件逐字节一致）：候选 C002（T114 离线草案，未提升）；`diagnostic_status=engineering_waiting`，reasons = `single_power_below_minimum` + `cumulative_n_unknown`。EURUSD/H1 交付 88,260 bar（窗口内 88,786 − 2020-10 违例月 526），覆盖 14.098 年、29 段；USTEC/D1 交付 3,644 bar（26 根预热），13.136 年。缺口：EURUSD 显式 1 + 推导 28（并后 28，2019-10 空洞恰为 [2019-10-01T00:00, 2019-11-01T00:00)）；USTEC 推导 132。事前成本倍数 **3.448**（来回 0.899bp = 8.99e-05：点差 0.793bp（p90 0.529bp×1.5 来源加成） + 滑点 0.106bp + 佣金 0 + 隔夜 0；参考价 1.21498）≥ 3 通过；单次检验力 **42.4%** < 50%（σ=0.00182、implied SR 0.419 < min-detectable 0.785；年数取 min=13.14，USTEC 侧因空洞切段连周末日一并扣除属冻结 runtime_coverage 口径）——主段（不含 2021-05 后 MT5 延长段）不过功效门，如实记录；聚焦评审已确认计算正确并解除 provisional，等待 A1 裁量。
 
 ## 测试与证据
 
