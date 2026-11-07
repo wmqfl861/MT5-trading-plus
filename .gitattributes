@@ -1,0 +1,15 @@
+# Line-ending policy per S8b ruling, item (d) in principle approved:
+#   docs/reviews/2026-11-07-r3-s8b-lineending-ruling.md (§4, matter (d))
+# Motivation: core.autocrlf=true materialized ledger-pinned LF bytes as CRLF on
+#   checkout (research/rounds/R3.toml and research/candidates/C005.toml),
+#   causing the run3 H-08 frozen-state raw-byte check to reject. Pinning these
+#   paths to eol=lf makes future checkouts materialize LF bytes only.
+# Effect boundary: these attributes ONLY prevent future checkout materialization
+#   drift. They neither detect nor repair existing CRLF working-tree bytes
+#   (detection layer = original-byte sha256 pins in the ledger; repair layer =
+#   S8b §2 restoration protocol). git status staying clean is NOT proof of
+#   byte-level integrity for these files.
+research/rounds/*.toml text eol=lf
+research/cards/*.toml text eol=lf
+research/candidates/*.toml text eol=lf
+.superpowers/h-new-candidates/** text eol=lf
