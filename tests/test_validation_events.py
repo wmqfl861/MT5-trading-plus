@@ -796,6 +796,126 @@ def test_v3_event_diagnostics_reports_four_items():
     assert diags["known_gaps"]["passed"] is True   # 注记只报告，恒不否决
 
 
+# ------------- V3 诊断层 window_shift 异常降级（范围裁定 2026-11-07 §4，TDD）
+
+def _midmonth_tuesday_windows(years):
+    """每年 6 月第 2 个周二→周三的合成事件窗（+1 天平移后仍全在交易日历
+    上——供"唯一 strict 失败=假日命中"的受控形状）。"""
+    out = []
+    for y in years:
+        entry = (pd.Timestamp(year=int(y), month=6, day=1)
+                 + pd.offsets.Week(weekday=1) + pd.offsets.Week(1))
+        out.append(ev.EventWindow(
+            kind="synthetic", label=f"synthetic:{entry.date().isoformat()}",
+            entry_time=entry, exit_time=entry + pd.Timedelta(days=1)))
+    return out
+
+
+def test_v3_event_diagnostics_window_shift_degrades_on_strict_holiday_hit():
+    """V3 诊断层 window_shift 异常降级（docs/reviews/
+    2026-11-07-v3-diag-degrade-scope-ruling.md §4.1）——strict 平移副本
+    撞假日缺口（1996-07-04 无 bar，裁定 §0.3 复现形状的最小合成版）时，
+    诊断项降级记录而非使整关卡错误行化。"""
+    days = synthetic_trading_days("1994-01-03", 365 * 4 + 40,
+                                  drop={date(1996, 7, 4)})
+    bars = daily_bars(days, vol=0.002)
+    fomc = ev.EventWindow(kind="fomc_calendar",
+                          label="fomc_calendar:1996-07-03",
+                          entry_time=pd.Timestamp("1996-07-02"),
+                          exit_time=pd.Timestamp("1996-07-03"))
+    evs = [fomc] + _midmonth_tuesday_windows([1994, 1995, 1997])
+    # 受控形状前提：原始窗全在日历上、平移后唯一缺口=独立日 1996-07-04
+    assert pd.Timestamp("1996-07-03") in set(days)
+    assert pd.Timestamp("1996-07-04") not in set(days)
+    for e in evs:
+        assert e.entry_time in set(days) and e.exit_time in set(days)
+    side = ev.declared_event_side("static_long")
+    assert side.strict_windows is True
+    # 断言 1（RED：修复前 SignalUnavailable 传播）：诊断调用不抛异常
+    diags = ev.v3_event_diagnostics(
+        bars, evs, side_fn=side, costs=ConstCosts(), symbol="TST",
+        contract_size=100.0, sims=50, seed=3)
+    # 断言 2：passed 恒 True；reason=异常原文（含失败事件标签）
+    ws = diags["window_shift_1_bar"]
+    assert ws["passed"] is True
+    assert "exact window missing" in ws["reason"]
+    assert "fomc_calendar:1996-07-03" in ws["reason"]
+    # 断言 3：降级键集与 year_block 降级分支同构——不合成计数/均值
+    single_year = [e for e in evs if e.entry_time.year == 1997]
+    d_one = ev.v3_event_diagnostics(      # 单年块 → year_block 必然降级
+        bars, single_year, side_fn=side, costs=ConstCosts(), symbol="TST",
+        contract_size=100.0, sims=50, seed=3)
+    assert "reason" in d_one["year_block_vs_zero"]
+    assert set(ws) == set(d_one["year_block_vs_zero"])
+    assert not ({"net_mean", "n_events", "dropped"} & set(ws))
+    # 断言 4：其余三项诊断照常齐全（非降级结构）
+    assert "p_value" in diags["year_block_vs_zero"]
+    assert diags["segmented_means"]["segments"]
+    assert diags["known_gaps"]["passed"] is True
+    assert diags["known_gaps"]["hits"] == []
+    # 断言 5：降级不改变关卡结论（与 diagnostics=None 判定一致）
+    from mt5quant.validation import gates as vgate
+    veto = dict(g0={"passed": True}, primary={"passed": True},
+                cost_scale={"passed": True},
+                delay={"passed": True, "applicable": False},
+                buyhold={"passed": True, "applicable": False})
+    v_deg = vgate.evaluate_v3(diagnostics=diags, **veto)
+    v_none = vgate.evaluate_v3(diagnostics=None, **veto)
+    assert v_deg["passed"] is True
+    assert v_deg["passed"] == v_none["passed"]
+    assert v_deg["diagnostics"]["window_shift_1_bar"] is True
+
+
+def test_v3_event_diagnostics_window_shift_strict_normal_path_pinned():
+    """回归 (b)（裁定 §4.2b）：strict side_fn + 平移集全部可解析 →
+    window_shift 正常产出（net_mean/n_events/dropped，两侧计数守恒），
+    无降级分支——钉定正常路径不受修复影响。"""
+    days = synthetic_trading_days("2020-01-01", 365 * 3)
+    bars = daily_bars(days, vol=0.002)
+    evs = _midmonth_tuesday_windows([2020, 2021, 2022])
+    diags = ev.v3_event_diagnostics(
+        bars, evs, side_fn=ev.declared_event_side("static_long"),
+        costs=ConstCosts(), symbol="TST", contract_size=100.0, sims=50,
+        seed=3)
+    ws = diags["window_shift_1_bar"]
+    assert "reason" not in ws
+    assert {"net_mean", "n_events", "dropped"} <= set(ws)
+    assert ws["passed"] is True
+    assert ws["n_events"] + ws["dropped"] == len(evs)
+
+
+def test_strict_event_returns_still_raises_signal_unavailable():
+    """回归 (c)（裁定 §4.2c，主检验域 fail-closed 钉定）：strict side_fn 下
+    event_returns 缺窗（"window missing" 分支）与不精确匹配（"exact window
+    missing" 分支）仍抛 SignalUnavailable；主检验路径 randomization_test
+    对缺窗事件同样传播——修复只作用于诊断层，不越过合法域。"""
+    side = ev.declared_event_side("static_long")
+    days = synthetic_trading_days("2024-01-01", 60,
+                                  drop={date(2024, 1, 15)})   # 月中假日缺口
+    bars = daily_bars(days)
+    off_calendar = ev.EventWindow(          # exit 落在缺口日 → 非精确匹配
+        kind="t", label="t:gap-exit",
+        entry_time=pd.Timestamp("2024-01-12"),
+        exit_time=pd.Timestamp("2024-01-15"))
+    with pytest.raises(ev.SignalUnavailable,
+                       match="event unavailable: exact window missing"):
+        ev.event_returns(bars, [off_calendar], side_fn=side,
+                         costs=ConstCosts(), symbol="TST",
+                         contract_size=100.0)
+    beyond_tail = ev.EventWindow(           # exit 超出数据尾 → 窗缺失
+        kind="t", label="t:tail",
+        entry_time=days[-1], exit_time=days[-1] + pd.Timedelta(days=1))
+    with pytest.raises(ev.SignalUnavailable,
+                       match="event unavailable: window missing"):
+        ev.event_returns(bars, [beyond_tail], side_fn=side,
+                         costs=ConstCosts(), symbol="TST",
+                         contract_size=100.0)
+    with pytest.raises(ev.SignalUnavailable):   # 主检验路径同语义
+        ev.randomization_test(bars, [off_calendar], side_fn=side,
+                              costs=ConstCosts(), symbol="TST",
+                              contract_size=100.0, sims=3, seed=1)
+
+
 # ------------------------------------- H-07：ScaledCosts 的 swap 分量随 factor 缩放
 
 def test_h07_robustness_scaled_costs_swap_scales_overnight():

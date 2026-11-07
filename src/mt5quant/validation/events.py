@@ -1031,7 +1031,9 @@ def v3_event_diagnostics(bars, events, *, side_fn, costs, symbol: str,
     - segmented_means：10 年分段的净收益均值（制度变化的粗看）；
     - known_gaps：与事件窗相交的已知缺口（meta.json known_gaps）注记。
 
-    passed 恒 True（报告层语义：诊断失败不改变关卡结论）。
+    passed 恒 True（报告层语义：诊断失败不改变关卡结论）。诊断段异常
+    （如 strict 平移副本撞数据缺口抛 SignalUnavailable⊂ValueError）按
+    year_block 段先例同构降级记录，不向上传播（范围裁定 2026-11-07）。
     """
     obs = event_returns(bars, events, side_fn=side_fn, costs=costs,
                         symbol=symbol, contract_size=contract_size)
@@ -1048,15 +1050,26 @@ def v3_event_diagnostics(bars, events, *, side_fn, costs, symbol: str,
     except ValueError as e:
         out["year_block_vs_zero"] = {"passed": True, "reason": str(e),
                                      "note": "年块自助对 0 只作诊断"}
-    shifted = shift_events_by_bars(events, bars, n_bars=1)
-    frame = event_returns(bars, shifted, side_fn=side_fn, costs=costs,
-                          symbol=symbol, contract_size=contract_size)
-    out["window_shift_1_bar"] = {
-        "passed": True,
-        "net_mean": (float(pd.to_numeric(frame["net"]).mean())
-                     if len(frame) else None),
-        "n_events": int(len(frame)), "dropped": int(frame.attrs["dropped"]),
-        "note": "事件窗整体移一根 bar 的净均值（只报告）"}
+    try:
+        shifted = shift_events_by_bars(events, bars, n_bars=1)
+        frame = event_returns(bars, shifted, side_fn=side_fn, costs=costs,
+                              symbol=symbol, contract_size=contract_size)
+        out["window_shift_1_bar"] = {
+            "passed": True,
+            "net_mean": (float(pd.to_numeric(frame["net"]).mean())
+                         if len(frame) else None),
+            "n_events": int(len(frame)), "dropped": int(frame.attrs["dropped"]),
+            "note": "事件窗整体移一根 bar 的净均值（只报告）"}
+    except ValueError as e:
+        # 诊断层异常降级（只报告不否决，与 year_block 段同构）：SignalUnavailable
+        # ⊂ ValueError（strict 平移副本撞数据缺口时抛出）；reason=异常原文
+        # （含失败事件标签），不合成 dropped/net_mean/n_events——范围裁定
+        # docs/reviews/2026-11-07-v3-diag-degrade-scope-ruling.md §2/§3.1。
+        out["window_shift_1_bar"] = {
+            "passed": True, "reason": str(e),
+            "note": "事件窗平移诊断降级（只报告，不否决关卡结论）——"
+                    "strict 平移副本不可解析，记录异常原文；依据范围裁定 "
+                    "2026-11-07-v3-diag-degrade-scope-ruling §2/§3.1"}
     out["segmented_means"] = {
         "passed": True, "segments": segmented_means(obs, years=10),
         "note": "10 年分段均值（只报告；制度变化点由报告层并列）"}
