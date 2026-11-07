@@ -569,3 +569,105 @@ def test_event_mode_scaffold_strategy_refused_before_runs(
     assert "不生成事件窗信号" in out and "D66" in out
     with Ledger(ledger_path) as led:
         assert led.conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+
+
+# ====================================== T151 聚焦评审修复（F-1/F-2，2026-11-07）
+
+def test_screen_combo_strategy_holds_injected_event_windows(
+        tmp_path, monkeypatch, capsys):
+    """F-1（T151 聚焦评审）：bt screen 组合回测的每组合策略实例持有装配
+    段注入的**真实**事件窗（冻结工件构造的事件集，非每 6 周三的同序列
+    近似）+ 显式交易日历——组合回测成交逐位落在事件窗锚日（非近似断言）。
+    gate 路径用持久实例（不经 _combo_strategy），既有 gate 测试作证零变化。"""
+    from tests.test_fomc_calendar_engine import (
+        _setup_fomc_round, meeting, write_calendar,
+    )
+    from mt5quant.research.ledger import Ledger
+    mod = load_bt()
+    root, cards_dir, ledger_path = _setup_fomc_round(tmp_path, monkeypatch, mod)
+    cal_path, sha = write_calendar(
+        tmp_path, [meeting("2024-01-31"), meeting("2024-03-20"),
+                   meeting("2024-05-01"), meeting("2024-11-29")])
+    captured = []
+    real_run = mod.run_backtest
+
+    def spy(strategy, *a, **k):
+        result = real_run(strategy, *a, **k)
+        captured.append((strategy, result))
+        return result
+
+    monkeypatch.setattr(mod, "run_backtest", spy)
+    rc = mod.main(
+        ["screen", "--card", "H704", "--allow-unbounded-data",
+         "--cards-dir", str(cards_dir), "--data-root", str(root),
+         "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.fomc_preannouncement:"
+                       "PreFomcAnnouncementDrift",
+         "--costs", "zero", "--volume-lots", "0.01",
+         "--event-kind", "fomc_calendar",
+         "--fomc-calendar", str(cal_path), "--fomc-calendar-sha256", sha,
+         "--event-days-start", "2024-01-01", "--event-days-end", "2024-12-31"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert captured, out
+    st, res = captured[0]
+    # 实例级：持有装配段注入的事件窗 + 显式日历（修复前为 None → 近似）
+    assert st.event_windows is not None
+    assert [e.label for e in st.event_windows] == [
+        "fomc_calendar:2024-01-31", "fomc_calendar:2024-03-20",
+        "fomc_calendar:2024-05-01", "fomc_calendar:2024-11-29"]
+    assert st.event_calendar is not None
+    # 行为级（非近似）：4 事件 4 笔、入场逐位 = 事件锚日（前一交易日），
+    # 1 根持仓——近似路径给的是每 6 周三节奏（入场为周一，集合不同）
+    assert len(res.trades) == 4
+    assert set(res.trades["bars_held"]) == {1}
+    assert set(pd.to_datetime(res.trades["entry_time"])) == {
+        e.entry_time for e in st.event_windows}
+
+
+def test_screen_warns_dropped_event_when_signal_day_bar_missing(
+        tmp_path, monkeypatch, capsys):
+    """F-2（T151 聚焦评审）：7 事件、1 个信号日（锚日前一显式交易日）
+    缺 bar → 引擎 6 笔（缺 bar fail-closed 丢事件，成交语义不变），screen
+    输出显式 dropped_events=1 告警行，计数随 metrics 入台账——丢事件不再
+    静默（评审实证：删除信号日 bar 后 6 vs 7 零告警）。"""
+    import pandas as _pd
+    from tests.test_fomc_calendar_engine import (
+        _setup_fomc_round, meeting, write_calendar,
+    )
+    from mt5quant.research.ledger import Ledger
+    mod = load_bt()
+    root, cards_dir, ledger_path = _setup_fomc_round(tmp_path, monkeypatch, mod)
+    # 7 个公告日（锚=前一交易日、信号日=锚前一交易日，连续日历下即 D-2/D-1）；
+    # 删 2024-06-17 bar（2024-06-19 事件的信号日；非其他事件的锚/公告日）
+    meetings = [meeting(d) for d in ("2024-02-28", "2024-03-20", "2024-05-01",
+                                     "2024-06-19", "2024-07-31", "2024-09-18",
+                                     "2024-11-27")]
+    cal_path, sha = write_calendar(tmp_path, meetings)
+    pq = root / "bars" / "XAUUSD" / "D1" / "data.parquet"
+    bars = _pd.read_parquet(pq)
+    kept = bars[_pd.to_datetime(bars["time"]).dt.normalize()
+                != _pd.Timestamp("2024-06-17")]
+    assert len(kept) == len(bars) - 1
+    kept.to_parquet(pq)
+    rc = mod.main(
+        ["screen", "--card", "H704", "--allow-unbounded-data",
+         "--cards-dir", str(cards_dir), "--data-root", str(root),
+         "--ledger", str(ledger_path),
+         "--strategy", "mt5quant.strategies.library.fomc_preannouncement:"
+                       "PreFomcAnnouncementDrift",
+         "--costs", "zero", "--volume-lots", "0.01",
+         "--event-kind", "fomc_calendar",
+         "--fomc-calendar", str(cal_path), "--fomc-calendar-sha256", sha,
+         "--event-days-start", "2024-01-01", "--event-days-end", "2024-12-31"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    # 显式告警行：7 事件 vs 6 笔 → dropped_events=1
+    assert "事件对账" in out and "dropped_events=1" in out
+    with Ledger(ledger_path) as led:
+        row = led.conn.execute(
+            "SELECT metrics_json FROM runs WHERE card_id='H704'").fetchone()
+    m = json.loads(row["metrics_json"])["metrics"]   # record_run 包一层 metrics
+    assert m["usable_events"]["XAUUSD"] == 7   # 事件覆盖仍在（锚/公告日有 bar）
+    assert m["trade_count"] == 6               # 引擎丢 1 事件（语义不变）
+    assert m["dropped_events"] == 1            # 计数随 metrics 入台账

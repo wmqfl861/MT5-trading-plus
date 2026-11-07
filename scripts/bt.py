@@ -3933,7 +3933,32 @@ def _h_event_setup(ctx, symbol, bars, kind, params, *, fomc=None,
         strategy.event_windows = list(events)
         if strategy.event_calendar is None:
             strategy.event_calendar = raw
+        # F-1（T151 聚焦评审 2026-11-07）：同一注入（事件窗+显式日历）按
+        # 品种记入 ctx——screen 组合回测逐组合新建实例，凭此把装配段注入
+        # 传播到每组合实例（gate 路径用持久实例，不读该记录）。
+        ctx.setdefault("event_window_injection", {})[symbol] = (
+            list(events), raw)
     return events, days, side_fn
+
+
+def _event_trade_reconciliation(ctx, symbol, strategy, trade_count):
+    """F-2（T151 聚焦评审 2026-11-07）：事件窗基线的运行时逐事件对账。
+
+    装配段 usable_events（= event_returns 登记口径的同一事件集的事件数）
+    vs 引擎成交数：信号日（锚日前一显式交易日）无观测 bar 时引擎按缺
+    bar fail-closed 静默丢该事件——成交语义正确、不改；缺的是可见性。
+    本函数把差值显式化（dropped_events 计数 + 告警文案），由 screen/gate
+    输出并随 summary/关卡 details 入台账。仅对显式标记
+    ``generates_event_window_signals`` 的类（1 事件 1 成交契约）对账；
+    其余路径返回 None（零行为变化）。"""
+    if ctx is None or not getattr(
+            type(strategy), "generates_event_window_signals", False):
+        return None
+    usable = (ctx.get("usable_events") or {}).get(symbol)
+    if usable is None:
+        return None
+    return {"usable_events": int(usable), "trades": int(trade_count),
+            "dropped_events": int(usable) - int(trade_count)}
 
 
 def _fomc_event_binding(args):
@@ -4216,6 +4241,7 @@ def cmd_screen(args) -> int:
             h_declared = _h_declared(ledger, card, actor=actor,
                                       event_side=getattr(args, "event_side", None))
             h_ctx = None
+            _event_inject = {}   # F-1：装配段注入的事件窗+日历（按品种）
             if h_declared is not None:
                 from mt5data.ext.merge import merged_research_series
                 h_ctx = _load_h_research_inputs(
@@ -4226,6 +4252,11 @@ def cmd_screen(args) -> int:
                 _h_preflight(h_ctx, strategy_cls(), card,
                              event_kind=getattr(args, "event_kind", None),
                              fomc=fomc_binding)
+                # F-1（T151 聚焦评审 2026-11-07）：_h_preflight 的一次性
+                # 实例注入后即丢弃——注入载荷（事件窗+显式日历，按品种）
+                # 已记入 h_ctx["event_window_injection"]，组合回测逐组合
+                # 实例据此传播同一注入（见 _combo_strategy）。
+                _event_inject = h_ctx.get("event_window_injection") or {}
             else:
                 bars_by_sym = {sym: load_series(data_root, sym,
                                                 card.timeframe, args.end,
@@ -4339,6 +4370,22 @@ def cmd_screen(args) -> int:
 
         gates_hash = _gates_hash()
         combos = card.param_grid()
+
+        # F-1（T151 聚焦评审 2026-11-07）：screen 组合回测逐组合新建策略
+        # 实例——对显式标记 generates_event_window_signals 的类，把装配段
+        # （_h_preflight → _h_event_setup）注入的同一事件窗+显式交易日历
+        # 按品种传播到每组合实例；否则该实例无注入、bar 级基线会静默跑
+        # 同序列近似事件集（评审 F-1，与"不得静默以近似事件集跑研究"的
+        # D66 主张矛盾）。gate 路径用持久实例（bt 装配段直接注入），不经
+        # 此处；非标记类（b7 等）零改动。
+        def _combo_strategy(sym):
+            s = _bind_h_strategy(strategy_cls(), h_ctx, sym)
+            payload = _event_inject.get(sym)
+            if payload is not None and getattr(
+                    type(s), "generates_event_window_signals", False):
+                s.event_windows, s.event_calendar = payload
+            return s
+
         failed = 0
         # P-10：P 卡（probability / P2 决策卡）成功行入账带原子预算上限
         # （检查与写入同一事务）；H 卡不带——共享路径行为逐位不变。
@@ -4363,7 +4410,7 @@ def cmd_screen(args) -> int:
             data_first = pd_iso(times.iloc[0])
             data_last = pd_iso(times.iloc[-1])
             try:
-                _bind_h_strategy(strategy_cls(), h_ctx, sym)
+                _combo_strategy(sym)
             except ValueError as exc:
                 print(f"✗ {exc}")
                 return 1
@@ -4410,9 +4457,10 @@ def cmd_screen(args) -> int:
                           "被拒（不记 runs）")
                     continue
                 try:
+                    combo_st = _combo_strategy(sym)   # F-1：同一注入传播
                     if sizing is not None:
                         result = run_backtest(
-                            _bind_h_strategy(strategy_cls(), h_ctx, sym), bars, costs_by_sym[sym], symbol=sym,
+                            combo_st, bars, costs_by_sym[sym], symbol=sym,
                             params=dict(params), contract_size=sizes[sym],
                             volume_lots=None, sizing=sizing,
                             vol_min=vols_by_sym[sym][0],
@@ -4423,7 +4471,7 @@ def cmd_screen(args) -> int:
                             session_policy=policy_by_sym[sym])
                     else:
                         result = run_backtest(
-                            _bind_h_strategy(strategy_cls(), h_ctx, sym), bars, costs_by_sym[sym], symbol=sym,
+                            combo_st, bars, costs_by_sym[sym], symbol=sym,
                             params=dict(params), contract_size=sizes[sym],
                             volume_lots=lots,
                             initial_capital=args.initial_capital,
@@ -4448,6 +4496,23 @@ def cmd_screen(args) -> int:
                     if h_ctx is not None:
                         summary["runtime_coverage"] = h_ctx["coverage"]
                         summary["usable_events"] = h_ctx.get("usable_events")
+                        # F-2（T151 聚焦评审 2026-11-07）：运行时逐事件
+                        # 对账——引擎成交数 vs 装配段事件数（event_returns
+                        # 同一事件集）；不等 → 显式告警行 + dropped_events
+                        # 随 metrics 入台账（丢事件是缺 bar fail-closed 的
+                        # 正确行为，不改成交语义；缺的是可见性）。
+                        _rec = _event_trade_reconciliation(
+                            h_ctx, sym, combo_st, summary["trade_count"])
+                        if _rec is not None:
+                            summary["dropped_events"] = _rec["dropped_events"]
+                            if _rec["dropped_events"]:
+                                print(f"⚠ {label} 事件对账：引擎成交 "
+                                      f"{_rec['trades']} 笔 < 事件 "
+                                      f"{_rec['usable_events']} 个 → "
+                                      f"dropped_events={_rec['dropped_events']}"
+                                      "（信号日缺 bar 的事件被引擎按缺 bar "
+                                      "fail-closed 丢弃、不进 bar 级基线；"
+                                      "V3 主检验 event_returns 仍登记全事件集）")
                     summary["sizing"] = dict(   # T23：定手数方式随 metrics 落台账
                         sizing_info,
                         vol_min=vols_by_sym[sym][0] if vols_by_sym else None,
@@ -5026,6 +5091,7 @@ def cmd_gate(args) -> int:
                       "计算前占位）")
                 return 1
             resv.advance(_gate_tk, "reached_primary")
+        dropped_rec = None   # F-2：基准运行逐事件对账结果（关卡 details 用）
         try:
             base_kwargs = dict(symbol=symbol, params=dict(params),
                                contract_size=sizes[symbol],
@@ -5056,6 +5122,24 @@ def cmd_gate(args) -> int:
             if h_ctx is not None:
                 summary["runtime_coverage"] = h_ctx["coverage"]
                 summary["usable_events"] = h_ctx.get("usable_events")
+                # F-2（T151 聚焦评审 2026-11-07）：基准运行逐事件对账——
+                # 引擎成交数 vs 装配段事件数；不等 → 显式告警行 +
+                # dropped_events 随 metrics/关卡 details 入台账（丢事件是
+                # 缺 bar fail-closed 的正确行为，不改成交语义）。
+                dropped_rec = _event_trade_reconciliation(
+                    h_ctx, symbol, strategy, summary["trade_count"])
+                if dropped_rec is not None:
+                    summary["dropped_events"] = dropped_rec["dropped_events"]
+                    if dropped_rec["dropped_events"]:
+                        print(f"⚠ run 基准事件对账：引擎成交 "
+                              f"{dropped_rec['trades']} 笔 < 事件 "
+                              f"{dropped_rec['usable_events']} 个 → "
+                              f"dropped_events="
+                              f"{dropped_rec['dropped_events']}"
+                              "（信号日缺 bar 的事件被引擎按缺 bar "
+                              "fail-closed 丢弃、不进 bar 级基线与 G1/G2 "
+                              "诊断材料；V3 主检验 event_returns 仍登记全"
+                              "事件集，计数随关卡 details 入台账）")
             summary["sizing"] = dict(
                 sizing_info,
                 vol_min=(vols_by_sym[symbol][0] if vols_by_sym else None),
@@ -5170,6 +5254,13 @@ def cmd_gate(args) -> int:
             if h_ctx is not None:
                 details["runtime_coverage"] = h_ctx["coverage"]
                 details["usable_events"] = h_ctx.get("usable_events")
+                # F-2（T151 聚焦评审 2026-11-07）：基准运行的逐事件对账
+                # 计数随每个关卡 details 入台账（机器可审计——缺 bar 丢
+                # 事件不再静默）。
+                if dropped_rec is not None:
+                    details["dropped_events"] = dropped_rec["dropped_events"]
+                    results[name]["dropped_events"] = \
+                        dropped_rec["dropped_events"]
                 # F1：FOMC 日历事件登记报告（calendar_sha256/主段窗池界/
                 # 登记比对结果/丢弃登记）随关卡 details 入台账——机器审计
                 # 链不断（fomc 分支之外恒 None，不落入 details）。
