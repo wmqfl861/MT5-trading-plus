@@ -15,7 +15,12 @@
 78 = T141 断线专用：--loop 下连续 15 分钟连不上交易服务器，降级轮（文件
      级检查照常、角色心跳照写）耗尽容忍后以本码退出交给 supervisor，并留
      data/live/disconnect-exit-risk.json 标记（不写 halt——重启后果由
-     supervisor 决定）。
+     supervisor 决定）；
+79 = T142 主循环不可恢复：已知可恢复异常（数据暂缺/文件被占用/锁等待
+     超时——断线走 78 不进此计数）连续 5 轮失败，或任何未知异常 → 写
+     data/live/loop-exit-risk.json（reason=unrecoverable_loop/<具体>）+
+     halt（fail-closed：监视者离开必须停交易）后退出。完整码表见
+     src/mt5live/monitor.py 的 T142 注释块（supervisor/取证统一汇总）。
 
 用法：
     .venv/Scripts/python.exe scripts/risk_process.py --config config/risk.toml --once
@@ -42,7 +47,9 @@ from mt5gw.errors import DataUnavailableError, NotConnectedError  # noqa: E402
 from mt5live.monitor import (  # noqa: E402
     ALERT_ACCOUNT_POLL_ERROR,
     ALERT_DISCONNECTED,
+    LOOP_EXIT_RC,
     DisconnectWatch,
+    LoopFailureWatch,
     append_alert,
     guarded_main,
     reset_watchdog,
@@ -59,6 +66,13 @@ from mt5live.riskproc import (  # noqa: E402
 
 # T141：断线计时的单调钟接缝（测试注入虚拟钟；生产恒 time.monotonic）。
 _mono = time.monotonic
+
+# T142：主循环"已知可恢复"异常类（记录后继续、连续 5 轮才退出）——
+# 数据暂缺（DataUnavailableError）、文件被占用（PermissionError——11-01
+# 签名）、跨进程文件锁等待超时（TimeoutError，fileio 锁预算耗尽）。
+# 断线（NotConnectedError）不在此列：只走 T141 的 15 分钟时间窗（78），
+# 不进 5 轮计数（时间契约优先，见 monitor.LoopFailureWatch 边界注释）。
+_RECOVERABLE = (DataUnavailableError, PermissionError, TimeoutError)
 
 
 def _open_gateway(gw_config_path: str) -> MT5Gateway:
@@ -183,12 +197,49 @@ def _run(args) -> int:
     #（disconnect-exit-risk.json 留痕，供 T143 supervisor 演练与取证）。
     watch = DisconnectWatch(risk.live_dir, "risk", clock=_mono)
 
+    # T142：已知可恢复异常的连续失败轮计数——记录后继续，连续 5 轮或
+    # 未知异常才以专用退出码 79 退出（loop-exit-risk.json + halt 留痕）。
+    failures = LoopFailureWatch(risk.live_dir, "risk")
+
+    def _round_failed(e: Exception) -> int | None:
+        """T142：已知可恢复异常——告警/打印后继续；连续 5 轮 → 专用退出。"""
+        try:
+            if isinstance(e, DataUnavailableError):
+                _poll_failed(e)          # 账户轮询失败：既有告警口径
+            else:
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                print(f"× {now:%H:%M:%S} 本轮失败（可恢复，文件访问类）：{e}",
+                      flush=True)
+            # 降级照写角色心跳（与 T141 断线降级轮同口径：进程还活着）
+            write_role_heartbeat(risk.live_dir, "risk",
+                                 interval=args.interval)
+        except Exception as nested:      # 留痕本身失败不推翻分级
+            print(f"× 失败轮留痕异常（继续计数）：{nested}", flush=True)
+        failures.note_failure(e)
+        print(f"· 连续可恢复失败 {failures.consecutive_failures}/"
+              f"{failures.limit} 轮（满 {failures.limit} 轮以退出码 "
+              f"{LOOP_EXIT_RC} 退出，T142）", flush=True)
+        if failures.expired():
+            return failures.exit_code(exc=e, cause="consecutive_failures")
+        return None
+
+    def _unknown_failed(e: Exception) -> int:
+        """T142：未知异常——立即写退出标记并以专用码退出（不再落到 rc=2）。"""
+        return failures.exit_code(exc=e, cause="unknown_exception")
+
     def _handle_disconnect(exc: NotConnectedError) -> int | None:
         """断线降级轮；返回非 None = 容忍耗尽（调用方直接 return 专用码）。"""
         watch.note_failure(exc)
         if watch.expired():
             return watch.exit_code(last_error=f"{type(exc).__name__}: {exc}")
-        run_one_cycle(risk, gw, degraded_reason=str(exc))
+        try:
+            run_one_cycle(risk, gw, degraded_reason=str(exc))
+        except _RECOVERABLE as e2:            # T142：降级轮同样分级
+            rc = _round_failed(e2)
+            if rc is not None:
+                return rc
+        except Exception as e2:
+            return _unknown_failed(e2)
         reconnect = getattr(gw, "reconnect", None)
         if callable(reconnect):
             # T141 有界重连：到点才真试（5/10/30/60 退避在网关层），
@@ -202,14 +253,19 @@ def _run(args) -> int:
                 reset_watchdog(args.interval)
                 try:
                     run_one_cycle(risk, gw)
-                except DataUnavailableError as e:
-                    _poll_failed(e)  # 瞬时失败：告警后下一轮重试
                 except NotConnectedError as e:
                     rc = _handle_disconnect(e)      # T141：断线降级继续
+                    if rc is not None:              # （不进 T142 计数）
+                        return rc
+                except _RECOVERABLE as e:
+                    rc = _round_failed(e)           # T142：可恢复——继续
                     if rc is not None:
                         return rc
+                except Exception as e:
+                    return _unknown_failed(e)       # T142：未知——专用退出
                 else:
                     watch.note_ok()                 # T141：恢复（段内才告警）
+                    failures.note_ok()              # T142：完整成功轮清零
                 time.sleep(args.interval)
         try:
             run_one_cycle(risk, gw)
