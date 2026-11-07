@@ -27,7 +27,7 @@
 
   ```
   ✓ 轮次 R3 已关闭（T63/D32）：报告骨架
-  C:\Users\Administrator\.zcode\workspace\demo-next-20261105\docs\research\round-R3-2026-11-07.md；
+  <workspace>\docs\research\round-R3-2026-11-07.md；
   该轮的卡不能再运行（screen/gate 拒），runs 已带 round_id 如实留痕；后续试验须预注册新轮次
   ```
 
