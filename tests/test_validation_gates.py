@@ -943,6 +943,146 @@ def test_gate_params_auto_without_candidates_rejected(tmp_path, monkeypatch,
         assert led.stats("H701")["total_runs"] == 0
 
 
+# ----------------- single_spec（范围裁定 2026-11-07：事件卡选参能力扩展）
+
+# RED-1 用卡：single_spec（登记语义=恒等选择，不做网格挑选）。
+# 无 [params] 值（H102 形态，param_grid()==[{}]）与单点 [params]
+# threshold_pct=[0.0]（H101 形态）各一；RED-2 用两点网格（登记笔误）。
+_CARD_SINGLE_SPEC_TMPL = """\
+id = "{cid}"
+version = 1
+symbols = ["XAUUSD"]
+timeframe = "H1"
+session = "全时段"
+phenomenon = "日历事件窗固定规格"
+mechanism = "事件溢价"
+should_fail_when = "事件窗漂移消失"
+falsified_if = "样本内净利为负"
+graveyard_checked = []
+selection_rule = "single_spec"
+
+[rules]
+entry = "第一根可交易 bar 买入"
+exit = "数据末尾"
+stop = "无"
+
+[params]
+{params_body}
+
+[expected]
+trades_per_year = "1"
+win_rate = "50%+"
+payoff_ratio = "不适用"
+"""
+
+
+def test_gate_single_spec_no_params_card_uses_empty_spec(tmp_path, monkeypatch):
+    """RED-1（范围裁定 2026-11-07 §5.3）：single_spec 卡（无 [params] 网格，
+    H102 形态）不预置任何 screen 运行、不传 --params → 恒等选择卡唯一
+    规格 params={}，selection="single_spec" 落 runs/gates details，rc==0。"""
+    mod = load_bt()
+    root, _, _ = ramp_data_root(tmp_path, n=1800)
+    body = _CARD_SINGLE_SPEC_TMPL.format(cid="H705", params_body="")
+    cards_dir = write_card(tmp_path, body, name="H705.toml")
+    ledger = tmp_path / "l.sqlite"
+    patch_card_git(monkeypatch, mod)
+    rc = mod.main(["gate", "--card", "H705", "--cards-dir", str(cards_dir),
+                   "--data-root", str(root), "--ledger", str(ledger),
+                   "--strategy", BUY_HOLD, "--costs", "zero", "--gates", "G0",
+                   "--allow-no-round", "--allow-unbounded-data"])
+    assert rc == 0
+    with Ledger(ledger) as led:
+        base = led.conn.execute(
+            "SELECT params_json FROM runs ORDER BY run_id DESC").fetchone()
+        assert json.loads(base["params_json"]) == {}   # 卡唯一组合（H102 形态）
+        det = json.loads(led.conn.execute(
+            "SELECT details_json FROM gates WHERE gate='G0'"
+        ).fetchone()["details_json"])
+        sel = det["params_selection"]
+        assert sel["selection"] == "single_spec"
+        assert sel["rule"] == "single_spec"
+        assert sel["grid_points"] == 1
+        assert sel["params"] == {}
+
+
+def test_gate_single_spec_single_point_grid_card_uses_registered_spec(
+        tmp_path, monkeypatch):
+    """RED-1（范围裁定 2026-11-07 §5.3）：single_spec 卡带单点 [params]
+    threshold_pct=[0.0]（H101 形态）→ params_json=={"threshold_pct": 0.0}
+    （与 R1 manual 通道 run 450 已实证执行的值逐字节相同），不依赖 screen。"""
+    import sys
+
+    # 测试替身：threshold_pct 单参数（网格同 b7）、信号恒多——gate 对
+    # params 的唯一消费点=engine validate_params，与真实 b7 同构。G0 静态
+    # 扫描按策略类所在**模块文件**读源码（lookahead.static_scan），替身
+    # 须有自己的干净源文件（放测试文件里会把整份测试文件当策略源扫）。
+    fake_src = (
+        "import pandas as pd\n"
+        "from mt5quant.strategies.base import BaseStrategy, ParamSpec\n"
+        "\n"
+        "\n"
+        "class ThresholdLong(BaseStrategy):\n"
+        "    params_schema = (ParamSpec(\n"
+        "        name='threshold_pct', type='float', grid=(0.0, 0.02)),)\n"
+        "\n"
+        "    def generate_signals(self, bars, params):\n"
+        "        return pd.Series(1, index=bars.index, dtype='int64')\n"
+    )
+    fake_mod = types_mod.ModuleType("_threshold_long_fake")
+    fake_file = tmp_path / "_threshold_long_fake.py"
+    fake_file.write_text(fake_src, encoding="utf-8")
+    fake_mod.__file__ = str(fake_file)
+    exec(compile(fake_src, str(fake_file), "exec"), fake_mod.__dict__)
+    sys.modules["_threshold_long_fake"] = fake_mod
+    ThresholdLong = fake_mod.__dict__["ThresholdLong"]
+
+    mod = load_bt()
+    root, _, _ = ramp_data_root(tmp_path, n=1800)
+    body = _CARD_SINGLE_SPEC_TMPL.format(
+        cid="H706", params_body="threshold_pct = [0.0]")
+    cards_dir = write_card(tmp_path, body, name="H706.toml")
+    ledger = tmp_path / "l.sqlite"
+    patch_card_git(monkeypatch, mod)
+    monkeypatch.setattr(mod, "load_strategy", lambda ref: ThresholdLong)
+    rc = mod.main(["gate", "--card", "H706", "--cards-dir", str(cards_dir),
+                   "--data-root", str(root), "--ledger", str(ledger),
+                   "--strategy", BUY_HOLD, "--costs", "zero", "--gates", "G0",
+                   "--allow-no-round", "--allow-unbounded-data"])
+    assert rc == 0
+    with Ledger(ledger) as led:
+        base = led.conn.execute(
+            "SELECT params_json FROM runs ORDER BY run_id DESC").fetchone()
+        assert json.loads(base["params_json"]) == {"threshold_pct": 0.0}
+        det = json.loads(led.conn.execute(
+            "SELECT details_json FROM gates WHERE gate='G0'"
+        ).fetchone()["details_json"])
+        sel = det["params_selection"]
+        assert sel["selection"] == "single_spec"
+        assert sel["grid_points"] == 1
+        assert sel["params"] == {"threshold_pct": 0.0}
+
+
+def test_gate_single_spec_multi_point_grid_fail_closed(tmp_path, monkeypatch,
+                                                        capsys):
+    """RED-2（范围裁定 2026-11-07 §5.3）：single_spec 误配多点网格（登记
+    笔误）→ fail-closed：rc==1、零 runs、消息含"网格"。"""
+    mod = load_bt()
+    root, _, _ = ramp_data_root(tmp_path, n=1800)
+    body = _CARD_SINGLE_SPEC_TMPL.format(
+        cid="H707", params_body="entry_days = [10, 20]")
+    cards_dir = write_card(tmp_path, body, name="H707.toml")
+    ledger = tmp_path / "l.sqlite"
+    patch_card_git(monkeypatch, mod)
+    rc = mod.main(["gate", "--card", "H707", "--cards-dir", str(cards_dir),
+                   "--data-root", str(root), "--ledger", str(ledger),
+                   "--strategy", DONCHIAN, "--costs", "zero", "--gates", "G0",
+                   "--allow-no-round", "--allow-unbounded-data"])
+    assert rc == 1
+    assert "网格" in capsys.readouterr().out
+    with Ledger(ledger) as led:
+        assert led.stats("H707")["total_runs"] == 0
+
+
 # ------------------------------------------------- G5 编排（T21a 协议接线）
 
 def h001_card(mod):

@@ -346,6 +346,23 @@ def test_signal_identity_closes_reservation_dedup_auto_and_g3_g5(tmp_path):
         assert led.stats()["project_n_dedup_research"] == 2
 
 
+def test_select_params_auto_single_spec_direct_call_defends(tmp_path):
+    """C2（范围裁定 2026-11-07）：single_spec 直调 _select_params_auto 仍
+    ValueError（auto 算法本体零改动——single_spec 不进 _SELECTION_METRICS，
+    从 screen 运行选参的语义不稀释），且消息自持（含规则名），不退化为
+    ValueError(None)。"""
+    from mt5quant.research.ledger import Ledger
+    mod = load_bt()
+    with Ledger(tmp_path / "c2-defense.sqlite") as led:
+        card = SimpleNamespace(id="H900-v1", timeframe="H1",
+                               selection_rule="single_spec")
+        with pytest.raises(ValueError) as ei:
+            mod._select_params_auto(led, card, symbol="EURUSD",
+                                    data_sha256="a" * 64,
+                                    cost_model_version="cost")
+        assert "single_spec" in str(ei.value)
+
+
 def test_dynamic_v3_consumes_callback_and_differs_from_static(tmp_path, monkeypatch):
     mod = load_bt()
     from mt5quant.research.ledger import Ledger

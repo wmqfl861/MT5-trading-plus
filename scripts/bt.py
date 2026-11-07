@@ -62,9 +62,11 @@
   与冻结值不符 → 拒绝运行（不产生任何 runs）。G5（锁箱一次性）必须显式
   --approve。
 - 参数选择（T21e/M5）：--params 缺省或 "auto" 时按卡 selection_rule（附录 A
-  枚举：max_net_profit / max_sharpe）从同 data_sha256 + cost_model_version
-  的 screen 运行里自动选参，候选数与选中 run_id 写进关卡报告与 gates 表
-  details（params_selection）；显式 --params 记 selection="manual"。
+  枚举：max_net_profit / max_sharpe；single_spec=卡登记固定规格恒等采用，
+  网格恰 1 组、≠1 组拒绝——范围裁定 2026-11-07）从同 data_sha256 +
+  cost_model_version 的 screen 运行里自动选参，候选数与选中 run_id 写进
+  关卡报告与 gates 表 details（params_selection）；显式 --params 记
+  selection="manual"。
 - G5 编排（T21a 协议；H-02/H-03 修订）：关卡结果随评估**即时入账**
   （先可靠保存研究关卡结果），_g5_orchestrate = 参照重建（G3 拼接的
   样本外收益，只读研究段）→ begin_lockbox（读锁箱数据**之前**原子占位：
@@ -491,10 +493,15 @@ def _run_class_for(actor: str) -> str:
 
 
 def _check_card_lineage(card, source: str) -> str | None:
-    """selection_rule 枚举校验（M5：非法值定义时拒）；返回错误信息或 None。"""
-    if card.selection_rule not in _SELECTION_METRICS:
+    """selection_rule 枚举校验（M5：非法值定义时拒）；返回错误信息或 None。
+
+    范围裁定 2026-11-07 §2.2/§3：合法集=两枚举规则 ∪ single_spec（修复性
+    对齐——H101/H101-v2/H102 已登记实物该值；单一合法集同时服务 card check
+    与选参层，不引入第二套枚举）；_SELECTION_METRICS dict 本体不动。"""
+    legal = set(_SELECTION_METRICS) | {"single_spec"}
+    if card.selection_rule not in legal:
         return (f"{source}：selection_rule {card.selection_rule!r} 不在支持"
-                f"枚举 {sorted(_SELECTION_METRICS)} 内（附录 A v2；"
+                f"枚举 {sorted(legal)} 内（附录 A v2；"
                 "bt gate --params auto 按该规则自动选参）")
     return None
 
@@ -1191,7 +1198,15 @@ def _select_params_auto(ledger, card, *, symbol: str, data_sha256: str,
     """
     rule = card.selection_rule
     if rule not in _SELECTION_METRICS:
-        raise ValueError(_check_card_lineage(card, f"卡 {card.id}"))
+        # C2（范围裁定 2026-11-07 §2.4）：判据仍用 dict 原体（single_spec
+        # 不在其中 → 仍 raise，fail-closed 语义不变）；错误消息须自持，
+        # 不得再借 _check_card_lineage——其合法集已放宽（§2.2），对
+        # single_spec 返回 None，沿用会把消息退化为 ValueError(None)。
+        raise ValueError(
+            f"卡 {card.id}：selection_rule {rule!r} 不能用于自动选参"
+            f"（--params auto 可自动规则：{sorted(_SELECTION_METRICS)}"
+            "，从 screen 运行选参；single_spec 卡的固定规格在参数选择"
+            "入口直接采用，不经本函数）")
     metric = _SELECTION_METRICS[rule]
     rows = ledger.conn.execute(
         "SELECT run_id, params_json, metrics_json FROM runs"
@@ -4406,6 +4421,24 @@ def _gate_choose_params(ledger, card, args, *, symbol, dsha, cost_version):
     screen 运行自动选参；显式 JSON 记 manual。失败 → ValueError（调用方
     打印并退 1）。返回 (params, selection)。"""
     if args.params is None or args.params == "auto":
+        # single_spec（范围裁定 2026-11-07 §2.1）：登记语义=恒等选择——
+        # 卡 param_grid() 恰 1 组时直接采用该组（不依赖 screen 运行、不
+        # 引入选择自由度，产出与 R1 manual 通道已实证值逐字节相同）；
+        # ≠1 组=登记语义矛盾 → ValueError fail-closed（RED-2 钉死，消息
+        # 含"网格"）；其后两枚举路径原样走 _select_params_auto。
+        if card.selection_rule == "single_spec":
+            combos = card.param_grid()
+            if len(combos) != 1:
+                raise ValueError(
+                    f"卡 {card.id} selection_rule=single_spec 但参数网格有 "
+                    f"{len(combos)} 组——single_spec 只跑登记主规格（网格恰 "
+                    "1 组才与登记语义一致），不做网格挑选，拒绝运行"
+                    "（fail-closed）")
+            params = combos[0]
+            selection = {"selection": "single_spec", "rule": "single_spec",
+                         "grid_points": 1, "params": params}
+            print(f"— 参数选择（single_spec）：卡固定规格 -> {params}")
+            return params, selection
         selection = _select_params_auto(
             ledger, card, symbol=symbol, data_sha256=dsha,
             cost_model_version=cost_version)
@@ -5111,6 +5144,13 @@ def cmd_gate(args) -> int:
                 f" screen 运行\n"
                 f"- 选中：run#{selection['selected_run_id']} -> `{params}`"
                 f"（{selection['metric']}={selection['selected_value']:.2f}）\n")
+        elif selection["selection"] == "single_spec":
+            # C3（范围裁定 2026-11-07 §2.3）：第三分支——卡登记固定规格，
+            # 无选参；漏此分支会把 single_spec 误标为 manual。
+            report += ("\n## 参数选择（single_spec）\n\n"
+                       "- 卡登记固定规格（网格恰 1 组），不做挑选、不依赖"
+                       " screen 运行\n"
+                       f"- 参数：`{params}`\n")
         else:
             report += "\n## 参数选择（manual）\n\n- 显式 --params 指定\n"
         # T64/D33：G4 报告同时列谱系/轮次/项目三种 N 与取数口径

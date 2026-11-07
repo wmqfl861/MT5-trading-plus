@@ -477,6 +477,19 @@ def test_card_check_rejects_unknown_selection_rule(tmp_path, capsys):
     assert "selection_rule" in out and "max_moon_phase" in out
 
 
+@pytest.mark.parametrize("cid", ["H101", "H101-v2", "H102"])
+def test_card_check_accepts_registered_single_spec_cards(capsys, cid):
+    """RED-3（范围裁定 2026-11-07 §3）：三张已提交 single_spec 卡
+    （H101/H101-v2/H102）bt card check 由拒转过——单一合法集修复性对齐
+    登记实物；真非法值（max_moon_phase）仍拒（见上例，双向钉死）。"""
+    mod = load_bt()
+    rc = mod.main(["card", "check",
+                   str(REPO_ROOT / "research" / "cards" / f"{cid}.toml")])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "single_spec" in out
+
+
 def test_gates_hash_lf_normalized_under_crlf(tmp_path):
     """P7 计划失败测试：CRLF 检出下 bt 的 gates_hash 与关卡侧同一口径
     （LF 归一；裸字节哈希会得到另一个值）。"""
