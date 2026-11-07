@@ -43,6 +43,7 @@ from datetime import datetime, timedelta, timezone
 
 from mt5gw.errors import (
     RETCode, NotConnectedError, TradeRejectedError, describe_retcode,
+    DISCONNECTION_RETCODES,
 )
 from mt5gw.models import DEAL_REASON_SL, DEAL_REASON_SO, DEAL_REASON_TP
 from mt5gw.trading import sanitize_comment
@@ -1043,17 +1044,24 @@ class LiveExecutor:
           read_pause 只暂停**本 magic** 的开仓（平仓不受限），对账/风控
           进程识别为外来 pause 文件不会覆盖，人工确认后解除（删除文件
           或改 paused=false）；
-        - 无决策的轮次（flatten）拒单只回报+告警，不计入连拒（非决策 bar）。
+        - 无决策的轮次（flatten）拒单只回报+告警，不计入连拒（非决策 bar）；
+        - 断线类返回码（DISCONNECTION_RETCODES，如 10031 半连接窗）不计入
+          连拒也不清零——断线路径归 T141 的 900s 时间窗契约（R2，T141
+          评审），避免瞬时断线被 3-bar pause 误伤且需人工解除。
         """
-        streak = (self._rej_streak + 1) if decision is not None else 0
+        rc_disconnect = getattr(exc, "retcode", None) in DISCONNECTION_RETCODES
+        streak = ((self._rej_streak + 1)
+                  if (decision is not None and not rc_disconnect) else 0)
         tail = ""
-        if decision is not None:
+        if decision is not None and not rc_disconnect:
             self._rej_streak = streak
             if streak >= ORDER_REJECTED_STREAK_PAUSE:
                 self._write_rejected_streak_pause(exc, n)
                 tail = (f"；连续第 {streak} 个 bar 被拒，已写 pause-"
                         f"{self._magic}.json（reason=order_rejected_streak，"
                         "只暂停本策略开仓，人工确认后解除）")
+        elif decision is not None and rc_disconnect:
+            tail = "；retcode 属断线类（DISCONNECTION_RETCODES），不计连拒、归 T141 断线时间窗"
         append_alert(
             self._live_dir, ALERT_ORDER_REJECTED,
             f"magic {self._magic} "
@@ -1064,8 +1072,13 @@ class LiveExecutor:
             + tail, n)
         try:
             net_now = self._adapter.net_volume()
+            net_unknown = False
         except Exception:
             net_now = 0.0 if net_before is None else net_before
+            # R1（T140/T141 评审）：net_volume 同轮也失败且无前值时，字段
+            # 0.0 仅是 float schema 的占位，不是"净持仓=0"的测量——在
+            # error 中明示未知，防止值班把占位当真实持仓读。
+            net_unknown = net_before is None
         return RoundReport(
             action="rejected",
             decision_id=(decision.decision_id if decision is not None
@@ -1073,7 +1086,9 @@ class LiveExecutor:
             net_before=(net_before if net_before is not None else net_now),
             net_after=net_now,
             orders=(),
-            error=f"order_rejected: retcode={exc.retcode}: {exc}")
+            error=f"order_rejected: retcode={exc.retcode}: {exc}"
+                  + ("（净持仓未知：net_volume 查询失败且无前值，"
+                     "net 字段 0.0 为占位非测量）" if net_unknown else ""))
 
     def _write_rejected_streak_pause(self, exc: TradeRejectedError,
                                      n: datetime) -> None:
@@ -1143,15 +1158,20 @@ class LiveExecutor:
               " supervisor（T141）", n)
         try:
             net_now = self._adapter.net_volume()
+            net_unknown = False
         except Exception:
             net_now = 0.0 if net_before is None else net_before
+            # R1（T141 评审）：同上——占位非测量，error 明示未知。
+            net_unknown = net_before is None
         return RoundReport(
             action="blocked_broker_unavailable",
             decision_id=did,
             net_before=(net_before if net_before is not None else net_now),
             net_after=net_now,
             orders=(),
-            error=f"broker_unavailable: NotConnectedError: {exc}")
+            error=f"broker_unavailable: NotConnectedError: {exc}"
+                  + ("（净持仓未知：net_volume 查询失败且无前值，"
+                     "net 字段 0.0 为占位非测量）" if net_unknown else ""))
 
     def _after_orders(self, decision, report: RoundReport,
                       n: datetime) -> RoundReport:
