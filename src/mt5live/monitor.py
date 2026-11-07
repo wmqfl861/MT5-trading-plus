@@ -40,6 +40,17 @@ ALERT_HEARTBEAT_WRITE_ERROR = "HEARTBEAT_WRITE_ERROR"  # 心跳写入连续失�
 
 DEFAULT_HEARTBEAT_TIMEOUT_S = 120.0
 
+# T141（第十六轮计划 §2，O16-3）：断线容忍与专用退出。
+# - 风控/对账进程对断线降级继续（文件级检查照常、角色心跳照写），连续
+#   DISCONNECT_LIMIT_S 连不上才以专用退出码 DISCONNECT_EXIT_RC 退出，
+#   交给 supervisor（T143），并留 disconnect-exit-<component>.json 标记；
+# - 专用码取值避开既有退出码：0=正常/中断、1=单轮业务失败、2=fatal
+#   （guarded_main）、3=单实例拒绝、75=T110 网关期限硬停。
+DISCONNECT_EXIT_RC = 78
+DISCONNECT_LIMIT_S = 15 * 60.0        # 连续断线容忍上限：15 分钟
+ALERT_DISCONNECTED = "DISCONNECTED"   # 断线段首/恢复/专用退出告警
+DISCONNECT_EXIT_FILE_FMT = "disconnect-exit-{component}.json"
+
 # 成交流水的交易类 entry（mt5gw.models.Deal.entry）；出入金等流水绝不计入盈亏
 TRADE_ENTRY_KINDS = frozenset({"in", "out", "inout", "out_by"})
 
@@ -233,6 +244,96 @@ def write_halt_once(live_dir: str, reason: str, now: datetime, *,
 def reset_watchdog(interval: float) -> None:
     # Stack evidence only: the independent supervisor handles hard process stalls.
     faulthandler.dump_traceback_later(health_timeout(interval), repeat=True, file=2)
+
+
+class DisconnectWatch:
+    """T141：进程级连续断线计时（风控/对账主循环用）。
+
+    - note_failure(exc)：每轮网关调用抛 NotConnectedError 后调用；断线段
+      首写一次告警（不刷屏），单调钟累计连续断线时长；
+    - note_ok()：每轮成功后调用；若此前处于断线段，写恢复告警并清零；
+    - expired()：连续断线 ≥ limit_s（默认 15 分钟）；
+    - exit_code()：写 disconnect-exit-<component>.json 退出标记（T143
+      supervisor 演练与取证读它：reason/rc/首末时刻/时长/最后错误/pid）
+      + 退出告警，返回专用退出码 78——调用方直接 return，guarded_main
+      的 finally 会再落 exit-<component>.json（rc=78）。断线退出**不写
+      halt**：进程死亡/重启的后果由 supervisor 决定，不自作主张。
+    """
+
+    def __init__(self, live_dir: str, component: str, *,
+                 limit_s: float = DISCONNECT_LIMIT_S,
+                 clock=time.monotonic):
+        self.live_dir = str(live_dir)
+        self.component = str(component)
+        self.limit_s = float(limit_s)
+        self._clock = clock
+        self._first_mono: float | None = None
+        self._first_wall: datetime | None = None
+        self._last_error = ""
+
+    @property
+    def disconnected_s(self) -> float:
+        if self._first_mono is None:
+            return 0.0
+        return self._clock() - self._first_mono
+
+    def note_failure(self, exc: BaseException | None = None) -> None:
+        if exc is not None:
+            self._last_error = f"{type(exc).__name__}: {exc}"
+        if self._first_mono is not None:
+            return                       # 断线段已在计时（告警只写段首）
+        self._first_mono = self._clock()
+        self._first_wall = datetime.now(timezone.utc)
+        append_alert(
+            self.live_dir, ALERT_DISCONNECTED,
+            f"{self.component} 进程与交易服务器断线（{self._last_error}）——"
+            f"降级继续（文件级检查照常），网关按 5/10/30/60 秒退避重连；"
+            f"连续 {self.limit_s / 60:.0f} 分钟连不上将以退出码 "
+            f"{DISCONNECT_EXIT_RC} 交给 supervisor（T141）",
+            self._first_wall)
+
+    def note_ok(self) -> None:
+        if self._first_mono is None:
+            return
+        duration = self.disconnected_s
+        self._first_mono = self._first_wall = None
+        append_alert(
+            self.live_dir, ALERT_DISCONNECTED,
+            f"{self.component} 进程与交易服务器恢复连接（断线 {duration:.0f} "
+            "秒）——恢复正常轮询（T141）")
+
+    def expired(self) -> bool:
+        return (self._first_mono is not None
+                and self.disconnected_s >= self.limit_s)
+
+    def exit_code(self, *, last_error: str | None = None) -> int:
+        """落退出标记 + 告警，返回专用退出码（调用方直接 return 它）。"""
+        detail = last_error or self._last_error
+        duration = self.disconnected_s
+        first = iso_utc(self._first_wall) if self._first_wall else None
+        marker = {
+            "component": self.component,
+            "rc": DISCONNECT_EXIT_RC,
+            "reason": "disconnect_timeout",
+            "first_failure_utc": first,
+            "duration_s": round(duration, 3),
+            "limit_s": self.limit_s,
+            "last_error": detail,
+            "ts": iso_utc(datetime.now(timezone.utc)),
+            "pid": os.getpid(),
+        }
+        write_json_atomic(os.path.join(
+            self.live_dir,
+            DISCONNECT_EXIT_FILE_FMT.format(component=self.component)),
+            marker)
+        append_alert(
+            self.live_dir, ALERT_DISCONNECTED,
+            f"{self.component} 进程连续断线 {duration / 60:.0f} 分钟"
+            f"（≥ {self.limit_s / 60:.0f} 分钟上限，最后错误：{detail}）——"
+            f"以专用退出码 {DISCONNECT_EXIT_RC} 退出交给 supervisor；退出"
+            f"标记 {DISCONNECT_EXIT_FILE_FMT.format(component=self.component)}"
+            "（T141，供 T143 演练与取证）")
+        return DISCONNECT_EXIT_RC
 
 
 def guarded_main(component: str, live_dir: str, interval: float, function) -> int:

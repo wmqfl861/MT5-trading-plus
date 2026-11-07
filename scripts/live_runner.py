@@ -47,7 +47,10 @@
   （含无决策轮次），风控进程按 ts 判活；决策异常记 last_error 后继续轮询；
   执行异常中**确定态拒单（TradeRejectedError）不退出**（T140/O16-2：
   记 last_error 后心跳继续，下一 bar 正常决策，连续 3 个 bar 被拒由执行器
-  写 pause-<magic>.json 只暂停该策略），其余执行异常（含
+  写 pause-<magic>.json 只暂停该策略），**断线（NotConnectedError）同样
+  不退出**（T141/O16-3：本轮 blocked_broker_unavailable、不开新仓、写
+  告警，心跳照写——风控不把断线误判成运行器死亡；网关按 5/10/30/60 秒
+  退避重连，恢复后下个网格点照常决策），其余执行异常（含
   OrderResultUnknownError 状态未知）原样上抛并停机退出（等人工/风控处置）；
   **心跳写入失败不退出**（T33/M1：记日志下一轮重试，连续 3 次写告警——
   跨进程文件写入一律经 mt5live.fileio 的原子写/追加）。
@@ -77,7 +80,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mt5data.store import load_bars  # noqa: E402
-from mt5gw.errors import TradeRejectedError  # noqa: E402
+from mt5gw.errors import NotConnectedError, TradeRejectedError  # noqa: E402
 from mt5live.monitor import guarded_main, reset_watchdog  # noqa: E402
 from mt5live.config import (  # noqa: E402
     LiveConfig, ModelConfigError, ParsedConfigError, load as load_config,
@@ -945,6 +948,15 @@ def _run(args, cfg: LiveConfig, strategy) -> int:
                 decision = runner.decide()
             except MarketClosedError:
                 pass   # 理论上 runner 已捕获；双保险不刷错误
+            except NotConnectedError as exc:
+                # T141（第十六轮计划）：断线——本轮无决策；进程不退出，
+                # 心跳照写（降级在途：风控据此不把断线误判成运行器死亡而
+                # 全局停机）；网关按 5/10/30/60 秒退避重连，恢复后下个
+                # 网格点照常决策。连续 15 分钟的容忍与专用退出码在风控/
+                # 对账进程（supervisor 接管），运行器不因断线退出。
+                error = f"NotConnectedError: {exc}"
+                print(f"[{now.isoformat()}] 断线（进程不退出，等待重连）："
+                      f"{error}", flush=True)
             except Exception as exc:   # 决策侧异常：记录并继续（数据滞后等可自愈）
                 cycle_complete = False
                 error = f"{type(exc).__name__}: {exc}"
@@ -977,6 +989,14 @@ def _run(args, cfg: LiveConfig, strategy) -> int:
                     rr = None
                     print(f"[{now.isoformat()}] 确定态拒单（进程不退出，"
                           f"下一 bar 重新决策）：{error}", flush=True)
+                except NotConnectedError as exc:
+                    # T141 兜底：执行器已把断线路径落成 blocked 回报（含
+                    # journal/意图处理），这里兜住任何残余上抛（如发送后
+                    # 意图回写时的断线）——不退出进程，心跳照写。
+                    error = f"broker_unavailable: NotConnectedError: {exc}"
+                    rr = None
+                    print(f"[{now.isoformat()}] 断线（进程不退出，等待重连）："
+                          f"{error}", flush=True)
                 except Exception:
                     # No completed-loop heartbeat on an interrupted execution.
                     # guarded_main records traceback and exit evidence.
@@ -992,7 +1012,13 @@ def _run(args, cfg: LiveConfig, strategy) -> int:
                               f"{' [部分成交]' if o.partial else ''}", flush=True)
                     if rr.error:
                         error = rr.error
-                        if (rr.action == "blocked_broker_unavailable"
+                        # H2-02（2C）：券商不可用/风控取数异常 → 本轮不写
+                        # 心跳（持续不可用由心跳超时全局停机兜底）。T141
+                        # 例外：断线（NotConnectedError）时进程活着、降级
+                        # 在途——心跳照写，15 分钟容忍交给风控/对账进程的
+                        # 专用退出码与 supervisor。
+                        if ((rr.action == "blocked_broker_unavailable"
+                             and "NotConnectedError" not in rr.error)
                                 or "risk_gate_error:" in rr.error):
                             cycle_complete = False
             elif decision is not None:

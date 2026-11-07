@@ -475,6 +475,7 @@ class CycleResult:
     flatten_written: bool     # 本轮新写入 flatten 指令
     daily_loss_breached: bool
     flatten_archived: bool = False   # 本轮把 flatten 指令归档（全员已确认）
+    degraded: bool = False    # T141：断线降级轮（snapshot=None，账户侧检查跳过）
 
 
 def registered_magics(live_dir: str) -> set[int]:
@@ -676,8 +677,16 @@ class RiskProcess:
     # -- 主循环单轮 --
 
     def run_cycle(self, snapshot: AccountSnapshot | None,
-                  now: datetime | None = None, *, health_clock=None) -> CycleResult:
-        """一轮；业务快照截止时间与读取后健康观测时钟分离。"""
+                  now: datetime | None = None, *, health_clock=None,
+                  degraded: bool = False) -> CycleResult:
+        """一轮；业务快照截止时间与读取后健康观测时钟分离。
+
+        T141：degraded=True = 断线降级轮（snapshot=None）——文件级检查
+        （心跳/killSwitch/flatten 归档）照常，账户侧检查（日亏/分线）本轮
+        跳过；line_caps 的"缺快照即拒"是闸门路径的底线，降级轮不适用
+        （调用方已在网关断线，无法取快照）。连续断线的退出决策在进程
+        主循环（DisconnectWatch），不在本层。
+        """
         observe = health_clock or (lambda: datetime.now(timezone.utc))
         n = naive_utc(now if now is not None
                       else datetime.now(timezone.utc))
@@ -740,10 +749,9 @@ class RiskProcess:
                 halt_written |= self._write_halt("daily_loss_cap", n)
 
         # T78: account consequence is already durable before parsing sublimits.
-        if self.config.line_caps and not daily_breached:
-            if snapshot is None:
-                raise ValueError("line_cap_data: missing account snapshot")
-            totals = line_daily_pnl(snapshot.deals, snapshot.positions, self.config.line_caps)
+        if self.config.line_caps and not daily_breached and snapshot is not None:
+            totals = line_daily_pnl(snapshot.deals, snapshot.positions,
+                                    self.config.line_caps)
             if not all(_finite_number(v) for v in (realized, floating, realized + floating)):
                 raise ValueError("line_cap_data: invalid account PnL")
             magics = {p.magic for p in snapshot.positions} | {
@@ -752,6 +760,11 @@ class RiskProcess:
             for reason in blocked.values():
                 if not reason.startswith("line_cap:"):
                     append_alert(self.live_dir, "LINE_CAP_STATE", reason, n)
+        elif (self.config.line_caps and not daily_breached
+              and snapshot is None and not degraded):
+            # 闸门路径的底线（check_loss_limits 之外唯一入口）：配置了
+            # line_caps 却拿不到快照且并非 T141 断线降级——如实拒绝。
+            raise ValueError("line_cap_data: missing account snapshot")
 
         # 4) flatten 指令归档（T32/D21 编号协议）：所有登记 magic 的
         #    ack.id == 当前指令 id 才归档并删除 ack（旧编号不算数——C3），
@@ -764,7 +777,7 @@ class RiskProcess:
             heartbeat_ok=heartbeat_ok, heartbeat_reason=heartbeat_reason,
             halt_written=halt_written, halt_active=os.path.exists(self.halt_path),
             flatten_written=flatten_written, daily_loss_breached=daily_breached,
-            flatten_archived=flatten_archived)
+            flatten_archived=flatten_archived, degraded=degraded)
 
     def _archive_flatten_if_acked(self, now: datetime) -> bool:
         """T32/D21：所有登记 magic 的 ack 编号对应当前指令 → 归档并删 ack

@@ -24,6 +24,12 @@ _EVIDENCE_LOCK = threading.Lock()
 _FATAL_LOCK = threading.Lock()
 _TERMINATING = threading.Event()
 
+# T141（第十六轮计划 §2）：网关内有界重连的退避序列（秒）——指数退避
+# 5、10、30、60，此后封顶 60。等待在锁外、由调用方按轮询节奏驱动
+# （reconnect()/隐式重连到点才真试）；每次尝试本身走 T110 期限
+# （_serialized/_invoke 的既有超时——本任务不改期限常量）。
+RECONNECT_BACKOFF_S = (5.0, 10.0, 30.0, 60.0)
+
 
 def _await_terminal_exit():
     if _TERMINATING.is_set():
@@ -59,7 +65,8 @@ def _is_success(error_tuple) -> bool:
 
 
 class MT5Connection:
-    def __init__(self, config: GatewayConfig | None = None, mt5_module=None):
+    def __init__(self, config: GatewayConfig | None = None, mt5_module=None,
+                 monotonic=time.monotonic):
         self.config = config or GatewayConfig()
         if mt5_module is None:
             import MetaTrader5 as mt5_module
@@ -67,6 +74,12 @@ class MT5Connection:
         self._lock = threading.RLock()
         self._initialized = False
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mt5-deadline")
+        # T141：有界重连的退避状态（单调钟可注入，供测试虚拟时间）。
+        # 读（_reconnect_due）在锁外、写在 _attempt_reconnect 的锁内——
+        # 最坏竞态是多一次 initialize 尝试，无正确性影响。
+        self._monotonic = monotonic
+        self._reconnect_failures = 0
+        self._next_reconnect_at = 0.0
 
     def _fatal_timeout(self, name: str, started: float, timeout: float):
         if not _FATAL_LOCK.acquire(blocking=False):
@@ -194,13 +207,59 @@ class MT5Connection:
         info = self._raw("terminal_info")
         return bool(info is not None and info.connected)
 
+    # ---- T141：网关内有界重连（指数退避 5/10/30/60，封顶 60） ----
+
+    def _reconnect_due(self) -> bool:
+        return self._monotonic() >= self._next_reconnect_at
+
+    def _attempt_reconnect(self) -> tuple[bool, str]:
+        """一次重连尝试（受 T110 期限约束：_serialized/_invoke 既有超时）。
+
+        成功 → 重置退避并返回 (True, "")；失败 → 推进退避计数、安排下次
+        到点，返回 (False, 供上抛/日志的原因文案)。
+        """
+        try:
+            with self._serialized("reconnect"):
+                self._ensure_initialized()
+                if self._terminal_ok():
+                    self._reconnect_failures = 0
+                    self._next_reconnect_at = 0.0
+                    return True, ""
+                self._initialized = False
+                reason = f"终端已初始化但交易服务器未连接：{self.last_error()}"
+        except NotConnectedError as exc:
+            reason = str(exc)
+        self._reconnect_failures += 1
+        delay = RECONNECT_BACKOFF_S[
+            min(self._reconnect_failures - 1, len(RECONNECT_BACKOFF_S) - 1)]
+        self._next_reconnect_at = self._monotonic() + delay
+        return False, reason
+
+    def reconnect(self) -> bool:
+        """T141 有界重连的到点单次尝试：退避窗口内不触终端（防逐调用砸
+        initialize），到点即试一次。返回是否已连上。
+
+        调用方（风控/对账/运行器的轮询循环）按自己的间隔反复调用即可得到
+        5/10/30/60（封顶 60）的重连节奏；连续断线的总容忍（15 分钟专用
+        退出码）由进程层把关，不在网关层。
+        """
+        if not self._reconnect_due():
+            return False
+        ok, _ = self._attempt_reconnect()
+        return ok
+
     def _ready_or_raise(self) -> None:
         if not self._initialized or not self._terminal_ok():
-            self._ensure_initialized()
-            if not self._terminal_ok():
-                self._initialized = False
+            if not self._reconnect_due():
+                # T141：退避窗口内不再重复 initialize——立即如实抛断线，
+                # 调用方（执行器/运行器）按 blocked_broker_unavailable 降级。
+                wait = self._next_reconnect_at - self._monotonic()
                 raise NotConnectedError(
-                    f"终端已初始化但交易服务器未连接：{self.last_error()}")
+                    f"终端与交易服务器断开，重连退避中（约 {max(wait, 0.0):.0f} "
+                    f"秒后再试）：{self.last_error()}")
+            ok, reason = self._attempt_reconnect()
+            if not ok:
+                raise NotConnectedError(reason)
 
     def __enter__(self) -> "MT5Connection":
         self.connect()

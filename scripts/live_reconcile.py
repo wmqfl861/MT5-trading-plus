@@ -8,7 +8,11 @@
 - pending 意图在 --grace-s（默认 60 秒）宽限内的 magic 本轮不判（下单
   在途不误报）；
 - 意图文件缺失/不合法、持仓查询失败：exit 2（--loop 模式等待重试，
-  运行器启动写出 expected-<magic>.json 后自愈）。
+  运行器启动写出 expected-<magic>.json 后自愈）；
+- T141（第十六轮计划）：断线（NotConnectedError）不退出——--loop 下降级
+  继续（本轮跳过核对、角色心跳照写、网关按 5/10/30/60 秒退避重连），
+  连续 15 分钟连不上才以专用退出码 78 退出交给 supervisor，并留
+  data/live/disconnect-exit-reconcile.json 标记（不写 halt）。
 
 用法：
     .venv/Scripts/python.exe scripts/live_reconcile.py --data-dir data --once
@@ -31,9 +35,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mt5gw import GatewayConfig, MT5Gateway  # noqa: E402
-from mt5gw.errors import DataUnavailableError  # noqa: E402
+from mt5gw.errors import DataUnavailableError, NotConnectedError  # noqa: E402
 from mt5live.monitor import (  # noqa: E402
+    ALERT_DISCONNECTED,
     ALERT_RECONCILE_MISMATCH,
+    DisconnectWatch,
     append_alert,
     naive_utc,
     guarded_main,
@@ -49,6 +55,9 @@ from mt5live.reconcile import (  # noqa: E402
     load_intents,
     write_pause,
 )
+
+# T141：断线计时的单调钟接缝（测试注入虚拟钟；生产恒 time.monotonic）。
+_mono = time.monotonic
 
 
 def _open_gateway(gw_config_path: str) -> MT5Gateway:
@@ -147,20 +156,52 @@ def _run(args) -> int:
     except Exception:
         raise  # guarded_main records the original traceback
 
+    # T141：连续断线计时——降级继续，连续 15 分钟才以专用退出码 78 退出
+    #（disconnect-exit-reconcile.json 留痕，供 T143 supervisor 演练与取证）。
+    watch = DisconnectWatch(live_dir, "reconcile", clock=_mono)
+
+    def _handle_disconnect(exc: NotConnectedError) -> int | None:
+        """断线降级轮：本轮跳过核对（断线中持仓不可见也改不动）；角色
+        心跳照写（supervisor 判活不受降级影响）；网关有界重连（到点才真
+        试）。返回非 None = 容忍耗尽（调用方直接 return 专用码）。"""
+        watch.note_failure(exc)
+        if watch.expired():
+            return watch.exit_code(last_error=f"{type(exc).__name__}: {exc}")
+        print(f"× {datetime.now(timezone.utc):%H:%M:%S} 断线（降级继续，"
+              f"本轮跳过核对）：{exc}", flush=True)
+        write_role_heartbeat(live_dir, "reconcile", interval=args.interval)
+        reconnect = getattr(gw, "reconnect", None)
+        if callable(reconnect):
+            reconnect()
+        return None
+
     try:
         if args.loop:
             was_ok: bool | None = None  # 首轮与跳变时告警；持续不一致不重复告警
             while True:
                 reset_watchdog(args.interval)
-                _, res = run_once(live_dir, gw,
-                                  volume_tolerance=args.volume_tolerance,
-                                  grace_s=args.grace_s,
-                                  alert=was_ok is not False)
-                if res is not None:
-                    was_ok = res.ok
+                try:
+                    _, res = run_once(live_dir, gw,
+                                      volume_tolerance=args.volume_tolerance,
+                                      grace_s=args.grace_s,
+                                      alert=was_ok is not False)
+                except NotConnectedError as e:
+                    rc = _handle_disconnect(e)      # T141：断线降级继续
+                    if rc is not None:
+                        return rc
+                else:
+                    watch.note_ok()                 # T141：恢复（段内才告警）
+                    if res is not None:
+                        was_ok = res.ok
                 time.sleep(args.interval)
-        rc, _ = run_once(live_dir, gw, volume_tolerance=args.volume_tolerance,
-                         grace_s=args.grace_s)
+        try:
+            rc, _ = run_once(live_dir, gw, volume_tolerance=args.volume_tolerance,
+                             grace_s=args.grace_s)
+        except NotConnectedError as e:
+            # 单轮模式遇断线：与持仓查询失败同口径（exit 2，不 fatal）。
+            print(f"× 断线：{e}")
+            append_alert(live_dir, ALERT_DISCONNECTED, f"reconcile 单轮断线：{e}")
+            return 2
         return rc
     except KeyboardInterrupt:
         print("· 手动停止")

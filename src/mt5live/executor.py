@@ -41,7 +41,9 @@ import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
-from mt5gw.errors import RETCode, TradeRejectedError, describe_retcode
+from mt5gw.errors import (
+    RETCode, NotConnectedError, TradeRejectedError, describe_retcode,
+)
 from mt5gw.models import DEAL_REASON_SL, DEAL_REASON_SO, DEAL_REASON_TP
 from mt5gw.trading import sanitize_comment
 from mt5live.commands import (
@@ -509,7 +511,9 @@ ALERT_BROKER_PENDING_ORDER = "BROKER_PENDING_ORDER"  # H2-01：未关联到
 ALERT_EXECUTION_RECOVERED = "EXECUTION_RECOVERED"   # H2-01（1B）：重启核对
 #   裁决落定（confirmed/rejected）——expected 已恢复为实际净持仓
 ALERT_BROKER_UNAVAILABLE = "BROKER_UNAVAILABLE" # H2-02（2C）：券商持仓查询
-#   失败/超时——本轮不开新仓、不清空 pending exit（fail-closed），不 crash
+#   失败/超时——本轮不开新仓、不清空 pending exit（fail-closed），不 crash；
+#   T141（第十六轮计划）：断线（NotConnectedError，含下单路径——请求未
+#   发出）同用本类别：本轮 blocked_broker_unavailable + 告警，不重抛
 ALERT_ORDER_REJECTED = "ORDER_REJECTED"     # T140（第十六轮 O16-2）：服务器
 #   确定态拒单（TradeRejectedError）——订单确定未成交，本轮作罢不重试，
 #   下一 bar 重新决策；告警含 retcode；连续 3 个 bar 被拒写 pause 只暂停
@@ -617,6 +621,10 @@ class LiveExecutor:
         self._undecided: dict[str, dict] = {}
         self._journal_size = -1                 # stat 变化才重读
         self._journal_active: str | None = None  # 本轮已 journal pending 的决策
+        # T141：本轮登记了 journal 且**尚未发出**订单的决策——断线
+        # （请求未发出）只对这些决策落终态 rejected；已发出（sent/unknown）
+        # 的绝不动，交重启核对。
+        self._journal_unsent: set[str] = set()
         self._torn_alerted: set[str] = set()
         # T140：连续被拒的决策 bar 计数（内存态；写下的 pause-<magic>.json
         # 才是跨重启持久的暂停信号，人工确认后解除）
@@ -633,6 +641,13 @@ class LiveExecutor:
         rejected 回报；flatten / 只平仓腿等不入 journal 的路径在此兜底
         捕获，同样返回 rejected 回报（告警 + 连拒计数）。OrderResultUnknown
         Error（状态未知）照旧上抛，交给重启核对。
+
+        T141（第十六轮计划）：断线（NotConnectedError）与查询路径同样
+        处理——下单路径在 _plan_and_execute 内落 journal 终态后返回
+        blocked_broker_unavailable；其余路径（flatten / 发送后的意图
+        回写等）在此兜底捕获，同样返回 blocked 回报（告警），绝不带崩
+        运行器。已发出的请求（journal 到 sent/unknown）不动 journal，
+        交重启核对裁决。
         """
         n = naive_utc(now if now is not None
                       else datetime.now(timezone.utc).replace(tzinfo=None))
@@ -644,6 +659,8 @@ class LiveExecutor:
             # 不适用这些路径（close-only 不入 journal、flatten 有独立确认
             # 协议）——如实返回 rejected 回报 + 告警，绝不带崩运行器。
             return self._order_rejected(decision, exc, None, n)
+        except NotConnectedError as exc:
+            return self._broker_disconnected(decision, exc, n)
 
     def _poll(self, decision, n: datetime) -> RoundReport:
         # R10/T58（C-2）：deals 证据行的 decision_bar——当轮决策的信号 bar
@@ -986,6 +1003,17 @@ class LiveExecutor:
             # retcode）；本 bar 内不再重试（journal 终态幂等拦住同决策
             # 重投，见 poll 3a）；连拒计数在 _order_rejected 内维护。
             return self._order_rejected(decision, exc, net, n)
+        except NotConnectedError as exc:
+            # T141（第十六轮计划）：断线——请求从未发出（网关在
+            # order_send 之前抛出 NotConnectedError），与查询路径同样
+            # 处理：本轮 blocked_broker_unavailable、不开新仓、写告警。
+            # journal 落终态 rejected（detail 注明 not_connected）——
+            # 决策本轮作废、下一 bar 重新决策，绝不留未决项挡住恢复后
+            # 的正常开仓。注：反向决策的平仓腿若在断线前已执行，
+            # "请求未发出"只对失败腿成立；意图按可查的实际净持仓回写，
+            # 查不到时退回 net_before，差异交给对账进程（fail-closed）。
+            return self._broker_disconnected(decision, exc, n,
+                                             net_before=net)
         except Exception as exc:
             # R2/H2-01：回报未知（IPC 中断等）——旧实现把未知也洗白成
             # confirmed(当前可见持仓)，无法证明该请求最终没有成交。改为：
@@ -1073,6 +1101,57 @@ class LiveExecutor:
                     f"{self._magic} 的开仓（平仓不受限）；人工核对券商与"
                     "策略后解除（删除本文件或改 paused=false）"),
             })
+
+    def _broker_disconnected(self, decision, exc: NotConnectedError,
+                             n: datetime,
+                             net_before: float | None = None) -> RoundReport:
+        """T141（第十六轮计划）：断线轮的统一回报——与查询路径同样处理：
+        本轮 blocked_broker_unavailable、不开新仓、写告警，不重抛。
+
+        - 仅当本决策已登记 journal 且订单**尚未发出**（_journal_unsent，
+          断线 = 网关在 order_send 之前抛出）才落终态 rejected
+          （detail=not_connected）：决策本轮作废，下一 bar 重新决策；
+          已发出（sent/unknown）的决策绝不动——那是重启核对/仲裁的事；
+        - 意图：订单确定未发出 → 按可查的实际净持仓 confirmed；断线期
+          查不到时退回 net_before（下单前一刻的净头寸，step 5 刚查过），
+          若有差异（反向决策的平仓腿已执行等）由对账进程按实际持仓
+          核对并暂停（fail-closed），绝不带崩运行器；
+        - 断线不是服务器拒单：不计入 T140 的连拒计数（不写
+          order_rejected_streak 的 pause）；重连节奏（5/10/30/60 退避）
+          在网关层，恢复后的下一网格点照常决策。
+        """
+        did = decision.decision_id if decision is not None else None
+        if did is not None and did in self._journal_unsent:
+            self._journal_finish(did, "rejected", n=n,
+                                 detail=f"not_connected: 断线，请求未发出：{exc}")
+            try:
+                self._write_confirmed(did, n)
+            except Exception:
+                if net_before is not None:
+                    write_intent(self._intent_path, Intent(
+                        symbol=self._symbol, magic=self._magic,
+                        side="buy" if net_before >= 0 else "sell",
+                        volume=abs(net_before), status=STATUS_CONFIRMED,
+                        cause=did, ts=n))
+        append_alert(
+            self._live_dir, ALERT_BROKER_UNAVAILABLE,
+            f"magic {self._magic} "
+            + (f"{did} " if did is not None else "")
+            + f"断线（NotConnectedError：{exc}）——本轮不开新仓、订单未"
+              "发出，下一 bar 重新决策；网关按 5/10/30/60 秒退避重连，"
+              "连续 15 分钟连不上由风控/对账进程以专用退出码交给"
+              " supervisor（T141）", n)
+        try:
+            net_now = self._adapter.net_volume()
+        except Exception:
+            net_now = 0.0 if net_before is None else net_before
+        return RoundReport(
+            action="blocked_broker_unavailable",
+            decision_id=did,
+            net_before=(net_before if net_before is not None else net_now),
+            net_after=net_now,
+            orders=(),
+            error=f"broker_unavailable: NotConnectedError: {exc}")
 
     def _after_orders(self, decision, report: RoundReport,
                       n: datetime) -> RoundReport:
@@ -1249,6 +1328,7 @@ class LiveExecutor:
                   "open" if net == 0 else
                   "add" if abs(target) > abs(net) else "reduce")
         self._journal_active = decision.decision_id
+        self._journal_unsent.add(decision.decision_id)   # T141：未发出集合
         self._journal_append({
             "ts": iso_utc(n), "decision_id": decision.decision_id,
             "request_uuid": uuid.uuid4().hex, "action": action,
@@ -1262,6 +1342,7 @@ class LiveExecutor:
         """发送已回（首个开/平腿的 retcode/ticket 如实入行）。"""
         first = next((o for o in report.orders
                       if o.kind in ("open", "close")), None)
+        self._journal_unsent.discard(decision_id)        # T141：已发出
         self._journal_append({
             "ts": iso_utc(n), "decision_id": decision_id, "status": "sent",
             "retcode": first.retcode if first else None,
@@ -1271,6 +1352,7 @@ class LiveExecutor:
                         detail: str | None = None,
                         retcode: int | None = None) -> None:
         """落终态（confirmed/rejected）或中间态（unknown）。"""
+        self._journal_unsent.discard(decision_id)        # T141：终态/未知即离集
         record = {"ts": iso_utc(n), "decision_id": decision_id,
                   "status": status}
         if detail is not None:
