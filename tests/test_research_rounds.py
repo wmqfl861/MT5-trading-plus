@@ -13,12 +13,14 @@
 文件名与 id 不一致）→ RoundError。runs.round_id：新运行记录轮次，
 旧运行无 round_id 兼容（NULL = 轮次制之前，含 pre-T63 旧库迁移）。
 """
+import calendar as _calendar
 import importlib.util
 import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -27,6 +29,36 @@ from mt5quant.research import cards as cards_mod
 from mt5quant.research import rounds as rounds_mod
 from mt5quant.research.ledger import Ledger, LedgerTamperedError
 from mt5quant.research.rounds import RoundError, load_round
+from mt5quant.strategies.base import BaseStrategy, RequiredData
+
+
+class LondonFixEventWindowStrategy(BaseStrategy):
+    """T151/D66（第十六轮）：事件模式卡的合法策略形状——自生成事件窗
+    信号（月末最后交易日伦敦 14:00 bar 给出信号 → 引擎 15:00 入场、
+    16:00 定盘出场，b7 同一窗语义），替代旧用例的 BuyHold 脚手架
+    （H16-2：事件模式卡的脚手架策略现被 _h_preflight 直接拒绝）。纯
+    bar 时间戳算术（G0 截断/窗口不变性安全）。"""
+
+    event_kind = "london_fix"
+    side_rule = "static_long"
+    required_data = RequiredData(symbols=("XAUUSD",), timeframe="H1",
+                                 lookback_bars=1)
+
+    def generate_signals(self, bars, params):
+        local = (pd.to_datetime(bars["time"]).dt.tz_localize("UTC")
+                 .dt.tz_convert("Europe/London"))
+        out = np.zeros(len(bars), dtype="int64")
+        for i, t in enumerate(local):
+            if t.hour != 14:
+                continue
+            d = t.date()
+            last = _calendar.monthrange(d.year, d.month)[1]
+            if _calendar.weekday(d.year, d.month, d.day) >= 5 or any(
+                    _calendar.weekday(d.year, d.month, dd) < 5
+                    for dd in range(d.day + 1, last + 1)):
+                continue                 # 周末 / 当月此后仍有工作日
+            out[i] = 1
+        return pd.Series(out, index=bars.index, dtype="int64")
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "bt.py"
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -377,11 +409,13 @@ def test_open_records_round_row_in_chain(tmp_path, monkeypatch, capsys):
 # ------------------------------------------------------- 运行约束（3–6）
 
 def run_screen(mod, cards_dir, root, ledger_path, *, card="H100"):
+    # T151/D66：事件模式卡的策略类须生成事件窗信号（BuyHold 脚手架被
+    # _h_preflight 直接拒绝）——换用本文件的事件窗 fixture 策略。
     return mod.main(
         ["screen", "--card", card, "--allow-unbounded-data",
          "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
-         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--strategy", "tests.test_research_rounds:LondonFixEventWindowStrategy",
          "--costs", "zero", "--volume-lots", "0.01", "--event-kind", "london_fix"])
 
 
@@ -527,11 +561,18 @@ def test_screen_rejects_over_trial_budget(tmp_path, monkeypatch, capsys):
 
 def test_gate_rejects_over_lockbox_uses_max(tmp_path, monkeypatch, capsys):
     """失败测试 5：本轮 G5 次数达 lockbox_uses_max → 拒（计数查台账：
-    该轮内跑过的卡的 lockbox_uses 行数）。"""
+    该轮内跑过的卡的 lockbox_uses 行数）。T151/D65 起 G5 对事件模式卡
+    整体拒绝（先于本检查）——本用例改用 standard 轮次（测的就是轮次
+    锁箱上限本身，与评估模式无关；事件卡的 D65 拒绝另有专门测试
+    tests/test_t151_event_identity.py）。"""
     mod = load_bt()
     cards_dir = write_card(tmp_path)
     ledger_path = tmp_path / "ledger.sqlite"
-    assert open_round(mod, tmp_path, ledger_path, monkeypatch) == 0
+    assert open_round(
+        mod, tmp_path, ledger_path, monkeypatch,
+        body=ROUND_TOML.replace(
+            'C001 = { mode = "event", primary = "event_mean_return_one_sided" }',
+            'C001 = { mode = "standard", primary = "dsr_v0" }')) == 0
     with Ledger(ledger_path) as led:        # 同轮另一张卡已消耗一次 G5
         led.record_run(card_id="H101", card_version=1, strategy="s:X",
                        params={}, symbol="XAUUSD", timeframe="H1",

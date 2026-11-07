@@ -818,7 +818,11 @@ class LockboxTrial:
       成本、代码与冻结关卡版本；
     - require_v3：D34 冻结（gates.toml = v3）后缺省 True——当前试验身份
       下还须有**当前通过的 V3 判决**（最新 V3 行 passed=1）；已见 V3
-      失败的试验不进入 G5。
+      失败的试验不进入 G5；
+    - verdict_code_sha（T151/D66，第十六轮）：事件模式试验的裁决代码
+      指纹（validation/events.py + bt.py 事件分支 + 日历工件哈希）——
+      H16-2 的结构性口子：改判决路径必须计新试验。None = bar 级/
+      旧行（SQL IS NULL 匹配，bar 级行为逐位不变）。
     """
     params: dict
     data_sha256: str
@@ -826,6 +830,7 @@ class LockboxTrial:
     strategy_sha: str
     gates_hash: str
     require_v3: bool = True
+    verdict_code_sha: str | None = None
 
 
 def _canonical_params(params) -> str:
@@ -838,16 +843,19 @@ def _canonical_params(params) -> str:
 def _matching_gate_runs(ledger, cid: str, trial: LockboxTrial,
                         gate: str) -> list[tuple[int, bool]]:
     """与 trial 身份完全一致（参数规范化相等 + 数据/成本/代码/门槛哈希
-    相同）且带有 gate 行的 runs，按 run_id 降序——[0] 即该试验身份下
-    这道关卡的**当前判决**。"""
+    相同 + T151/D66 裁决代码指纹（verdict_code_sha，NULL 安全 IS 比较））
+    且带有 gate 行的 runs，按 run_id 降序——[0] 即该试验身份下这道关卡
+    的**当前判决**。"""
     rows = ledger.conn.execute(
         "SELECT r.run_id AS run_id, r.params_json AS pj, g.passed AS passed"
         " FROM gates g JOIN runs r ON r.run_id = g.run_id"
         " WHERE r.card_id=? AND r.data_sha256=? AND r.cost_model_version=?"
         " AND r.strategy_sha=? AND r.gates_hash=? AND g.gate=?"
+        " AND r.verdict_code_sha IS ?"
         " ORDER BY r.run_id DESC",
         (cid, trial.data_sha256, trial.cost_model_version,
-         trial.strategy_sha, trial.gates_hash, gate)).fetchall()
+         trial.strategy_sha, trial.gates_hash, gate,
+         trial.verdict_code_sha)).fetchall()
     out: list[tuple[int, bool]] = []
     want = _canonical_params(trial.params)
     for r in rows:
@@ -928,6 +936,8 @@ def _verify_lockbox_trial(ledger, cid: str, trial: LockboxTrial) -> dict:
             "cost_model_version": trial.cost_model_version,
             "strategy_sha": trial.strategy_sha,
             "gates_hash": trial.gates_hash,
+            # T151/D66：试验身份含裁决代码指纹（None = bar 级/旧行）
+            "verdict_code_sha": trial.verdict_code_sha,
         },
     }
 

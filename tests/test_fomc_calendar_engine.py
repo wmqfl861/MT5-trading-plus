@@ -13,7 +13,8 @@
 3. 随机化抽样池限主段 [start, end)（E10：MT5/延长非盲段不得作对照
    入口）；month_end/london_fix 的 days 取值行为逐字节不变；
 4. 事件策略身份类 ``PreFomcAnnouncementDrift``（event_kind/side_rule
-   声明 + buy&hold 基线脚手架，b7/T112 先例分工）。
+   声明；T151/D66 重写为事件窗信号实现——不再继承 buy&hold 脚手架，
+   逐事件对账见 tests/test_t151_event_identity.py）。
 """
 import hashlib
 import importlib.util
@@ -409,7 +410,10 @@ def test_gate_fomc_bad_sha_rejected_before_runs(tmp_path, monkeypatch, capsys):
 
 # ================================================== 部件 4：事件策略身份类
 
-def test_prefomc_strategy_identity_and_baseline():
+def test_prefomc_strategy_identity_and_event_window_signals():
+    """T151/D66 重写后：事件窗信号策略（不再继承 BuyHold 脚手架——
+    H16-2 的被测对象）。身份声明不变；信号形状=事件窗（详见
+    tests/test_t151_event_identity.py 的逐事件对账）。"""
     from mt5quant.strategies.library.fomc_preannouncement import (
         PreFomcAnnouncementDrift,
     )
@@ -420,7 +424,13 @@ def test_prefomc_strategy_identity_and_baseline():
     assert st.required_data.symbols == ("USTEC",)
     bars = pd.DataFrame({"time": pd.date_range("2024-01-01", periods=3),
                          "close": [1., 1., 1.]})
-    assert list(st.generate_signals(bars, {})) == [1, 1, 1]   # buy&hold 基线脚手架
+    # 无注入日历 → 同序列日历近似（仅诊断，非恒多脚手架）：信号只可能
+    # 落在"伪公告日（每 6 周一个周三）的前一交易日"（bdate 数据=周一）。
+    sig = st.generate_signals(bars, {})
+    dates = pd.to_datetime(bars["time"]).dt.normalize()
+    expect = ((dates + pd.Timedelta(days=2) - pd.Timestamp("1970-01-05"))
+              .dt.days // 7) % 6 == 0
+    assert list(sig) == list((dates.dt.weekday == 0) & expect)
 
 
 def test_library_exports_prefomc():
