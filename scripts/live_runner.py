@@ -44,10 +44,13 @@
 - 启动校验（M1）：策略用到 time_stop_bars / week_close_exit 直接拒绝启动
   （实盘未实现，dry-run 同样校验）。
 - 心跳：每策略一个 {data_root}/live/heartbeat-<magic>.json，每轮更新
-  （含无决策轮次），风控进程按 ts 判活；决策异常记 last_error 后继续轮询，
-  执行异常原样上抛并停机退出（等人工/风控处置）；**心跳写入失败不退出**
-  （T33/M1：记日志下一轮重试，连续 3 次写告警——跨进程文件写入一律经
-  mt5live.fileio 的原子写/追加）。
+  （含无决策轮次），风控进程按 ts 判活；决策异常记 last_error 后继续轮询；
+  执行异常中**确定态拒单（TradeRejectedError）不退出**（T140/O16-2：
+  记 last_error 后心跳继续，下一 bar 正常决策，连续 3 个 bar 被拒由执行器
+  写 pause-<magic>.json 只暂停该策略），其余执行异常（含
+  OrderResultUnknownError 状态未知）原样上抛并停机退出（等人工/风控处置）；
+  **心跳写入失败不退出**（T33/M1：记日志下一轮重试，连续 3 次写告警——
+  跨进程文件写入一律经 mt5live.fileio 的原子写/追加）。
 - 点差闸门（T33/L3）：实盘（非 dry-run、非 paper）找不到 --spread-model
   文件 → 拒绝启动（不再静默关闸）；确要关闭须显式 --no-spread-gate（启动
   日志标红）。影子模式缺点差模型只标红警告（模拟成交无真实风险，全链路
@@ -74,6 +77,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mt5data.store import load_bars  # noqa: E402
+from mt5gw.errors import TradeRejectedError  # noqa: E402
 from mt5live.monitor import guarded_main, reset_watchdog  # noqa: E402
 from mt5live.config import (  # noqa: E402
     LiveConfig, ModelConfigError, ParsedConfigError, load as load_config,
@@ -961,23 +965,36 @@ def _run(args, cfg: LiveConfig, strategy) -> int:
             if executor is not None:
                 try:
                     rr = executor.poll(decision, now)
+                except TradeRejectedError as tre:
+                    # T140（第十六轮 O16-2）：executor.poll 的确定态拒单路径
+                    # 不再整进程退出——执行器主路径已改为返回 rejected 回报
+                    #（journal/意图/告警均已落盘），这里兜底捕获未被包住的
+                    # 路径（flatten/只平仓腿等）。订单确定未成交：心跳继续，
+                    # 下一 bar 正常决策；连续被拒由执行器写 pause 只暂停该
+                    # 策略。状态未知（OrderResultUnknownError）仍走下面的
+                    # 兜底重抛退出，交给重启核对。
+                    error = f"order_rejected: {tre}"
+                    rr = None
+                    print(f"[{now.isoformat()}] 确定态拒单（进程不退出，"
+                          f"下一 bar 重新决策）：{error}", flush=True)
                 except Exception:
                     # No completed-loop heartbeat on an interrupted execution.
                     # guarded_main records traceback and exit evidence.
                     raise
-                print(f"    执行 {rr.action}：net {rr.net_before} → "
-                      f"{rr.net_after}，{len(rr.orders)} 笔请求"
-                      + (f"（{rr.error}）" if rr.error else ""), flush=True)
-                for o in rr.orders:
-                    print(f"      {o.kind} ticket={o.ticket} "
-                          f"vol={o.filled_volume}/{o.requested_volume} "
-                          f"price={o.price}"
-                          f"{' [部分成交]' if o.partial else ''}", flush=True)
-                if rr.error:
-                    error = rr.error
-                    if (rr.action == "blocked_broker_unavailable"
-                            or "risk_gate_error:" in rr.error):
-                        cycle_complete = False
+                if rr is not None:
+                    print(f"    执行 {rr.action}：net {rr.net_before} → "
+                          f"{rr.net_after}，{len(rr.orders)} 笔请求"
+                          + (f"（{rr.error}）" if rr.error else ""), flush=True)
+                    for o in rr.orders:
+                        print(f"      {o.kind} ticket={o.ticket} "
+                              f"vol={o.filled_volume}/{o.requested_volume} "
+                              f"price={o.price}"
+                              f"{' [部分成交]' if o.partial else ''}", flush=True)
+                    if rr.error:
+                        error = rr.error
+                        if (rr.action == "blocked_broker_unavailable"
+                                or "risk_gate_error:" in rr.error):
+                            cycle_complete = False
             elif decision is not None:
                 print("    [dry-run] 不下单", flush=True)
             if cycle_complete:

@@ -333,15 +333,16 @@ def test_intent_pending_then_confirmed_across_order(tmp_path):
     assert it["cause"] == d.decision_id
 
 
-def test_intent_confirmed_when_order_raises(tmp_path):
-    """订单异常返回（被拒）：意图如实写为当前实际净持仓（confirmed），
-    绝不留一个等不到回报的 pending。"""
+def test_intent_confirmed_when_order_rejected(tmp_path):
+    """订单被服务器确定拒绝（T140 起不重抛，返回 rejected 回报）：意图如实
+    写为当前实际净持仓（confirmed），绝不留一个等不到回报的 pending。"""
     b = FakeBroker()
     b.error_on_market_order = TradeRejectedError(10019, "no money")
     ex = _mk_executor(b, tmp_path)
     d = mk_decision(signal=1, volume_lots=0.02)
-    with pytest.raises(TradeRejectedError):
-        ex.poll(d, NOW)
+    rr = ex.poll(d, NOW)                                # T140：不再上抛
+    assert rr.action == "rejected"
+    assert "10019" in rr.error
     it = read_intent(tmp_path)
     assert it["status"] == "confirmed"
     assert it["volume"] == 0.0                          # 实际净持仓（空仓）

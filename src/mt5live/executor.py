@@ -17,11 +17,17 @@
   可重投**，重发须先过对账/仲裁——语义变更，与审计"任何重发先过对账"
   一致）；回报未知（异常）→ 意图保持 pending + journal 记 unknown，
   重启由 _run_journal_recovery 核对券商裁决（R2/R3/R5）。
-- retcode 分类复用 mt5gw 异常：TradeRejectedError / OrderResultUnknownError /
-  LiveTradingBlockedError 原样上抛；执行器层唯一例外是 **Requote(10004)**
-  ——确定态拒绝（订单未成交，重发安全），网关内部有界重试耗尽后仍上抛时
-  执行器再重试一次（T89/R14-L5，2026-10-29 交易日 2 平仓腿 requote 崩溃
-  事故）；其余被拒零重试；Unknown 必须先对账再决定，绝不盲目重发。
+- retcode 分类复用 mt5gw 异常：ExecutionAdapter 原样上抛 TradeRejectedError /
+  OrderResultUnknownError / LiveTradingBlockedError；执行器层唯一例外是
+  **Requote(10004)**——确定态拒绝（订单未成交，重发安全），网关内部有界
+  重试耗尽后仍上抛时执行器再重试一次（T89/R14-L5，2026-10-29 交易日 2
+  平仓腿 requote 崩溃事故）；其余被拒零重试；Unknown 必须先对账再决定，
+  绝不盲目重发。**T140（第十六轮 O16-2，2026-11-08 计划）**：LiveExecutor
+  对确定态 TradeRejectedError 不再重抛——journal 记 rejected、意图写
+  confirmed（现状保持）后返回 RoundReport(action="rejected")、写告警
+  ORDER_REJECTED（含 retcode）、本 bar 内不再重试；同一 magic 连续
+  ORDER_REJECTED_STREAK_PAUSE 个 bar 被拒 → 写 pause-<magic>.json 只暂停
+  该策略。OrderResultUnknownError（状态未知）保持上抛退出（交给重启核对）。
 - 部分成交（DONE_PARTIAL）如实回报（filled_volume < requested_volume），
   不追单——差额留给下个决策点或人工/风控处置。
 - 绝不 import MetaTrader5 直连；实盘保险丝语义（mt5gw.config）不在本层。
@@ -35,7 +41,7 @@ import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
-from mt5gw.errors import RETCode, TradeRejectedError
+from mt5gw.errors import RETCode, TradeRejectedError, describe_retcode
 from mt5gw.models import DEAL_REASON_SL, DEAL_REASON_SO, DEAL_REASON_TP
 from mt5gw.trading import sanitize_comment
 from mt5live.commands import (
@@ -45,8 +51,19 @@ from mt5live.commands import (
     read_flatten,
     write_ack,
 )
-from mt5live.fileio import append_jsonl, append_line, write_json_atomic
-from mt5live.gate import ORDER_LOG_MAGIC_FMT, LiveSizer, RiskGate, alert_reject
+from mt5live.fileio import (
+    append_jsonl,
+    append_line,
+    file_lock,
+    write_json_atomic,
+)
+from mt5live.gate import (
+    ORDER_LOG_MAGIC_FMT,
+    PAUSE_MAGIC_FMT,
+    LiveSizer,
+    RiskGate,
+    alert_reject,
+)
 from mt5live.monitor import append_alert, iso_utc, naive_utc, parse_iso
 from mt5live.reconcile import (
     DEFAULT_VOLUME_TOLERANCE,
@@ -260,8 +277,9 @@ class ExecutionAdapter:
         耗尽后 TradeRejectedError(REQUOTE) 上抛，runner 未捕获崩溃退出、
         风控停机。requote 不同于 Unknown（状态未知须先对账）：服务器给了
         新价、原单确定未成交——执行器作为第二道防线再重试一次（send 内部
-        会重取参考价）；仍 requote 则原样上抛（持续行情背离交给风控停机
-        路径，绝不无限重试）。其余异常（含其他 retcode 的被拒）不在此列。
+        会重取参考价）；仍 requote 则原样上抛（T140 起由 LiveExecutor 落
+        rejected 回报不再退出进程，持续行情背离交给连续拒单暂停/风控路径，
+        绝不无限重试）。其余异常（含其他 retcode 的被拒）不在此列。
         """
         try:
             return send()
@@ -492,6 +510,13 @@ ALERT_EXECUTION_RECOVERED = "EXECUTION_RECOVERED"   # H2-01（1B）：重启核�
 #   裁决落定（confirmed/rejected）——expected 已恢复为实际净持仓
 ALERT_BROKER_UNAVAILABLE = "BROKER_UNAVAILABLE" # H2-02（2C）：券商持仓查询
 #   失败/超时——本轮不开新仓、不清空 pending exit（fail-closed），不 crash
+ALERT_ORDER_REJECTED = "ORDER_REJECTED"     # T140（第十六轮 O16-2）：服务器
+#   确定态拒单（TradeRejectedError）——订单确定未成交，本轮作罢不重试，
+#   下一 bar 重新决策；告警含 retcode；连续 3 个 bar 被拒写 pause 只暂停
+#   本策略（ORDER_REJECTED_STREAK_PAUSE）
+# T140：同一 magic 连续 N 个决策 bar 被拒 → 写 pause-<magic>.json
+#（reason=order_rejected_streak），只暂停该策略，人工确认后解除。
+ORDER_REJECTED_STREAK_PAUSE = 3
 
 
 def _event_dt(value) -> datetime | None:
@@ -540,7 +565,8 @@ class RoundReport:
                                     # close/blocked_reentry/blocked_external_exit/
                                     # blocked_state_corrupt/blocked_execution_
                                     # unknown/blocked_broker_unavailable/
-                                    # skipped_zero_lots/risk_rejected
+                                    # skipped_zero_lots/risk_rejected/rejected
+                                    # (T140：服务器确定态拒单，不重抛)
     decision_id: str | None
     net_before: float
     net_after: float
@@ -592,14 +618,34 @@ class LiveExecutor:
         self._journal_size = -1                 # stat 变化才重读
         self._journal_active: str | None = None  # 本轮已 journal pending 的决策
         self._torn_alerted: set[str] = set()
+        # T140：连续被拒的决策 bar 计数（内存态；写下的 pause-<magic>.json
+        # 才是跨重启持久的暂停信号，人工确认后解除）
+        self._rej_streak = 0
         self._state = self._load_state()
 
     # ---- 主入口 ----
 
     def poll(self, decision, now: datetime | None = None) -> RoundReport:
-        """一轮：先消费 flatten 指令（每轮必查），再按决策差分下单。"""
+        """一轮：先消费 flatten 指令（每轮必查），再按决策差分下单。
+
+        T140（O16-2）：确定态拒单（TradeRejectedError）不再重抛整进程退出
+        ——主下单路径在 _plan_and_execute 内落 journal/意图后返回
+        rejected 回报；flatten / 只平仓腿等不入 journal 的路径在此兜底
+        捕获，同样返回 rejected 回报（告警 + 连拒计数）。OrderResultUnknown
+        Error（状态未知）照旧上抛，交给重启核对。
+        """
         n = naive_utc(now if now is not None
                       else datetime.now(timezone.utc).replace(tzinfo=None))
+        try:
+            return self._poll(decision, n)
+        except TradeRejectedError as exc:
+            # 未被 _plan_and_execute 主路径包住的确定态拒单（flatten 全平
+            # 腿、开仓腿被挡时的只平仓腿等）：订单确定未成交，journal 语义
+            # 不适用这些路径（close-only 不入 journal、flatten 有独立确认
+            # 协议）——如实返回 rejected 回报 + 告警，绝不带崩运行器。
+            return self._order_rejected(decision, exc, None, n)
+
+    def _poll(self, decision, n: datetime) -> RoundReport:
         # R10/T58（C-2）：deals 证据行的 decision_bar——当轮决策的信号 bar
         # 收盘时刻（与 decision_id 后缀同源）；无决策轮（休市轮询/flatten）
         # 为 None（external_exit 语义："检测当轮 bar 或 null"）
@@ -733,6 +779,10 @@ class LiveExecutor:
         report = self._plan_and_execute(decision, target, net, n)
         report = self._after_orders(decision, report, n)
         self._finish(n, decision.decision_id, report.orders)
+        # T140：连拒计数按"连续"计——本轮发出过订单请求且未被拒即中断
+        #（hold/duplicate/risk_rejected/blocked_* 等零请求轮不动计数）
+        if any(o.kind in ("open", "close") for o in report.orders):
+            self._rej_streak = 0
         return report
 
     # ---- 各环节 ----
@@ -931,7 +981,11 @@ class LiveExecutor:
                                  detail=f"retcode={exc.retcode}: {exc}",
                                  retcode=exc.retcode)
             self._write_confirmed(decision.decision_id, n)
-            raise
+            # T140（O16-2）：确定态拒单不再重抛（旧实现整进程退出，无
+            # supervisor 时数小时停机）——返回 rejected 回报 + 告警（含
+            # retcode）；本 bar 内不再重试（journal 终态幂等拦住同决策
+            # 重投，见 poll 3a）；连拒计数在 _order_rejected 内维护。
+            return self._order_rejected(decision, exc, net, n)
         except Exception as exc:
             # R2/H2-01：回报未知（IPC 中断等）——旧实现把未知也洗白成
             # confirmed(当前可见持仓)，无法证明该请求最终没有成交。改为：
@@ -944,6 +998,81 @@ class LiveExecutor:
         # 发送已回：journal "sent"（此后到终态前的崩溃由重启核对裁决）
         self._journal_sent(decision.decision_id, report, n)
         return self._from_execution(report)
+
+    # ---- T140（第十六轮 O16-2）：确定态拒单不退出 ----
+
+    def _order_rejected(self, decision, exc: TradeRejectedError,
+                        net_before: float | None,
+                        n: datetime) -> RoundReport:
+        """确定态拒单的统一回报：告警（含 retcode）+ 连拒计数/暂停 +
+        RoundReport(action="rejected")——不再重抛（11-05 14:22 '10021 No
+        prices' 致运行器整进程退出数小时的教训）。
+
+        - journal 记 rejected、意图写 confirmed（实际净持仓）由调用方
+          （_plan_and_execute）先行完成——本方法只做回报与防护；
+        - 同一 magic 连续 ORDER_REJECTED_STREAK_PAUSE 个决策 bar 被拒 →
+          写 pause-<magic>.json（reason=order_rejected_streak）：闸门
+          read_pause 只暂停**本 magic** 的开仓（平仓不受限），对账/风控
+          进程识别为外来 pause 文件不会覆盖，人工确认后解除（删除文件
+          或改 paused=false）；
+        - 无决策的轮次（flatten）拒单只回报+告警，不计入连拒（非决策 bar）。
+        """
+        streak = (self._rej_streak + 1) if decision is not None else 0
+        tail = ""
+        if decision is not None:
+            self._rej_streak = streak
+            if streak >= ORDER_REJECTED_STREAK_PAUSE:
+                self._write_rejected_streak_pause(exc, n)
+                tail = (f"；连续第 {streak} 个 bar 被拒，已写 pause-"
+                        f"{self._magic}.json（reason=order_rejected_streak，"
+                        "只暂停本策略开仓，人工确认后解除）")
+        append_alert(
+            self._live_dir, ALERT_ORDER_REJECTED,
+            f"magic {self._magic} "
+            + (f"{decision.decision_id} " if decision is not None else "")
+            + f"订单被服务器确定拒绝：retcode={exc.retcode} "
+              f"{describe_retcode(exc.retcode)}（{exc.comment}）——订单确定"
+              "未成交，本轮作罢不重试，下一 bar 重新决策"
+            + tail, n)
+        try:
+            net_now = self._adapter.net_volume()
+        except Exception:
+            net_now = 0.0 if net_before is None else net_before
+        return RoundReport(
+            action="rejected",
+            decision_id=(decision.decision_id if decision is not None
+                         else None),
+            net_before=(net_before if net_before is not None else net_now),
+            net_after=net_now,
+            orders=(),
+            error=f"order_rejected: retcode={exc.retcode}: {exc}")
+
+    def _write_rejected_streak_pause(self, exc: TradeRejectedError,
+                                     n: datetime) -> None:
+        """连拒暂停落盘（T140）：pause-<magic>.json，只暂停本策略。
+
+        与闸门（read_pause）/对账（write_pause 只认自己的 owner 形态）/
+        风控（line_cap 写手不覆盖外来 pause）共用同一文件契约与
+        file_lock——外来（人工/执行器）pause 不会被任何自动写手清除，
+        解除必须人工确认。
+        """
+        path = os.path.join(
+            self._live_dir, PAUSE_MAGIC_FMT.format(magic=self._magic))
+        with file_lock(path + ".lock"):
+            write_json_atomic(path, {
+                "magic": self._magic,
+                "paused": True,
+                "reason": "order_rejected_streak",
+                "ts": iso_utc(n),
+                "streak": self._rej_streak,
+                "last_retcode": exc.retcode,
+                "detail": (
+                    f"连续 {self._rej_streak} 个 bar 订单被服务器确定拒绝"
+                    f"（最近 retcode={exc.retcode} "
+                    f"{describe_retcode(exc.retcode)}）——只暂停 magic "
+                    f"{self._magic} 的开仓（平仓不受限）；人工核对券商与"
+                    "策略后解除（删除本文件或改 paused=false）"),
+            })
 
     def _after_orders(self, decision, report: RoundReport,
                       n: datetime) -> RoundReport:
