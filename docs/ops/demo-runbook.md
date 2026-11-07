@@ -537,3 +537,9 @@ halt、风险 halt 从不自动删除。若 supervisor halt 已存在时又触�
 不能替代实际故障演练。离线 blocked-fake、未知订单、PID 复用/父子树、健康
 窗口与 PowerShell 接线测试通过，仅说明代码契约可验证；**CI、真实 Demo
 断线/硬卡死/重启演练和计划任务安装均待主控在维护窗口单独执行**。
+
+## 7. 执行方分工（D63/D64，2026-11-07 第十六轮生效）
+
+- **运行时唯一执行方＝主会话**（用户指定，D64）：重启进程、清除 halt/pause/killSwitch、演练、部署、正式窗口计数，只由主会话做；git 身份 `zcode-main`；main 分支只由主会话写入。
+- **每日调度会话只读**（13:15 UTC，标题"每日只读运维检查"）：只做检查与日检记录（git 身份 `zcode-scheduler`，提交到 `ops/phase-f-log` 分支或本地 ops 目录由主会话合并）；不做任何运行时动作、不计数交易日、不运行 `demo_check --accept`、不推 main。发现"需要处理"事项（进程死亡/心跳过期/新 halt 或 pause/对账差异/日报缺失/磁盘<30GB/真实账户迹象）只报告，由主会话处置。
+- **正式窗口按 D63 起算**：部署树旧版 `demo_check --accept` 结果不作为 A5；验收只用 main 新版 `--accept --formal-window`；A5 材料交外部审核会话。
