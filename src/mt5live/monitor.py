@@ -67,7 +67,9 @@ DISCONNECT_EXIT_FILE_FMT = "disconnect-exit-{component}.json"
 # 退出码表（supervisor/取证统一汇总；三进程共用 guarded_main 边界）：
 #   0  = 正常完成 / Ctrl-C 中断（exit-<component>.json：completed/interrupted）
 #   1  = 单轮业务失败（--once 轮询失败 / 对账不一致——动作不是故障）
-#   2  = fatal：启动失败或主循环外的未知异常（guarded_main，写 halt）
+#   2  = fatal：启动失败或主循环外的未知异常（guarded_main，写 halt；
+#        例外：reconcile --once 的业务性 rc=2=意图缺失/持仓查询失败，
+#        不写 halt、不经 guarded_main——见 live_reconcile 文档）
 #   3  = 单实例拒绝（instances 内核锁，首道拒绝不连网关）
 #   75 = T110 网关期限硬停：单次 MT5 调用超 30s（os._exit，防原生/GIL 挂死；
 #        落 gateway-stall.json + exit-<component>.json，不写 halt）
