@@ -717,6 +717,24 @@ print('sha256=' + hashlib.sha256(data).hexdigest())
        skipped_alive_runners = @($aliveRunners.Keys | ForEach-Object { [int]$_ })
        processes = $manifest } | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 $manifestFile
 
+    # ---- T180：锚点证据留存（Demo 部署启动；锁内、原件原字节） ----
+    # manifest/launcher/instances 三副本进 <DataDir>\live\evidence\run-<序号>\，
+    # 各自 sha256 打印在启动输出里，供 phase-f-log 部署记录引用。留存失败
+    # 退出 1：进程已启动，但本次启动不能作正式窗口锚点（fail-closed，见
+    # runbook §4.1/§6.3）。
+    if ($Mode -eq "Demo") {
+        Write-Host ""
+        Write-Host "== 证据留存（T180；formal_descriptor.py 的锚点输入） =="
+        & powershell -NoProfile -ExecutionPolicy Bypass -File `
+            (Join-Path $PSScriptRoot "save_run_evidence.ps1") `
+            -LiveDir $LiveDirAbs -RunIndex ($runs.Count - 1) `
+            -Manifest $RunManifestFile -Launcher $manifestFile -Instances $InstanceRegistryFile
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "× 锚点证据留存不完整（run-$($runs.Count - 1)）——进程已启动，但正式窗口不能用本次启动作锚点；排查后重新部署再起算。" -ForegroundColor Red
+            exit 1
+        }
+    }
+
     Write-Host ""
     Write-Host ("模式 {0}：本次新启动 {1} 个进程（登记表：{2}；PID 历史日志（追加式）：{3}；运行清单：{4}；运行窗：{5}）" -f $Mode, $manifest.Count, $InstanceRegistryFile, $pidsFile, $manifestFile, $RunManifestFile)
     Write-Host "停止（killSwitch）：New-Item -ItemType File data/live/killSwitch   （先停开仓；恢复=只移除停机信号，重启仅针对已确认退出的进程）"

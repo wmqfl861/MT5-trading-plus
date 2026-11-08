@@ -255,6 +255,46 @@ Calendar = {
   若与部署 PID 或初始材料矛盾则拒绝；全套原件一起被替换，机械比较本身
   无法证明或发现，因此历史未核实/A5 未评估始终不变。
 
+#### 4.1.1 运行时自动留存的工件与描述符生成器（T180）
+
+上述原件由运行时自动产生，不靠事后手工复制：
+
+- **部署启动**（`demo_run.ps1 -Mode Demo`，锁内）：把本次
+  `run-manifest.json`、本次运行清单（launcher 盘存）、最终 `instances.json`
+  原字节复制到 `<DataDir>\live\evidence\run-<序号>\{manifest,launcher,
+  instances}.json`（序号＝runs 里本次启动的零基下标；首次部署即 run-0
+  锚点件），并在启动输出打印各 sha256 供 phase-f-log 部署记录引用。任一
+  复制失败退出 1：进程可能已启动，但**本次启动不能作锚点**，须排查后
+  重新部署再起算。PaperSoak 模式不留存（不进正式窗口）。
+- **supervisor 重启**（`live_supervisor.py::supervise`，instances.lock 内）：
+  重启前把当前 `instances.json` 原字节复制到
+  `evidence/instances/<UTC时刻>-<序号>-before.json`，写入新登记后再复制
+  `-after.json`（序号＝该次重启在 `ops-restarts.jsonl` 的一基物理行号），
+  并把两条 `{path, sha256}` 写入 `evidence/instances/index.jsonl`（seq/utc/
+  component 与 journal 行对应）。**journal 行本身保持恰好六字段**——检查器
+  正式分支要求行键集合与之逐字相等，把证据字段写进 journal 行会使
+  `journal.schema` 退出 2（已实测），因此绑定关系放在 index.jsonl（第十七
+  轮计划 T180 第 1 条"写进同一条记录"按此口径落地）。复制失败写告警
+  `SUPERVISOR_EVIDENCE` 并**照常重启**（重启优先于证据）；该告警类型不在
+  检查器白名单里，出现即让正式检查退出 2——证据不全时这是预期的
+  fail-closed。
+- **描述符生成器**（`scripts/formal_descriptor.py`）：只从已留存工件
+  （run-\*/、evidence/instances/）、`ops-restarts.jsonl`、phase-f-log 部署
+  记录行号与日历源文件组装 `formal.json`（同根另写 `calendar.json`），
+  任何一项缺失、哈希不符或记录有歧义即报错退出，不补、不猜。用法：
+
+```text
+python scripts/formal_descriptor.py --root <离线证据根（含 data/）> \
+    --deploy-log <根内 phase-f-log 副本> --deploy-lines <first> <last> \
+    --calendar <根内日历源>
+```
+
+  部署记录行区间须恰好含**一个完整 40hex SHA、一个显式 UTC 完成时刻**
+  （`...Z` 或 `+00:00`）并逐字包含锚点全部启动器 PID；锚点＝记录所列且
+  launcher 全角色拉起的唯一 run。日历源每行 `YYYY-MM-DD
+  weekday|weekend|holiday [理由]`，须逐自然日覆盖完成日至生成当日，
+  缺日即报错。生成与检查同一天执行（检查器另取自身观测时刻）。
+
 ### 4.2 日历、事件与当前保护
 
 日历必须从声明部署完成 C 的 UTC 日期逐自然日覆盖到程序一次观测 T 的
@@ -481,6 +521,13 @@ $sha = '<40-character-fixed-sha>'
   -SpreadModel $spread -ResearchCache $research -LogDir $logs
 ```
 
+Demo 启动会在锁内自动留存锚点证据（`evidence\run-<序号>\` 三副本，§4.1.1）
+并打印各 sha256；留存失败退出 1，本次启动不能作锚点。随后写进 phase-f-log
+的部署记录必须能让 `formal_descriptor.py` 机械解析：记录行内恰好一个完整
+SHA、一个显式 UTC 完成时刻（如 `2026-11-12T04:35:12Z`），并逐字写出
+instances.json 登记的全部启动器 PID（解释器 PID 另列并注明口径，不算入
+锚点 PID）。
+
 supervisor 拒绝非 Demo/实盘解锁配置、缺失或损坏登记、不符 SHA/路径/参数、
 PID 创建时间不符、未知子进程或缺 launcher 但 worker 仍活着的情况：写 halt
 与 SUPERVISOR_REFUSED，留给人工核验，不猜测身份。PID、创建时间、脚本及
@@ -523,7 +570,12 @@ Unregister-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor' -Con
 
 supervisor 发现 risk 丢失时先写自己所有的 halt 与告警；发现缺失/停止推进的
 角色时仅重启该角色，追加 `ops-restarts.jsonl`（utc、component、reason_code、
-old_pid、new_pid、deployment_sha），不清运行窗。失败重启会在下次任务继续
+old_pid、new_pid、deployment_sha——恰好六字段，正式检查器按行键集合逐字
+校验），同时在同一临界区内留存重启前/后的 instances 原字节副本并把
+`{path, sha256}` 绑定写入 `evidence/instances/index.jsonl`（§4.1.1；T180）。
+留存失败写告警 `SUPERVISOR_EVIDENCE` 并照常重启——重启优先于证据，但该次
+重启的副本缺失会让描述符生成与正式检查如实失败，须按 §5 证据缺失处置。
+不清运行窗。失败重启会在下次任务继续
 核验，身份不确定时拒绝。人工停机后应保持任务禁用，直至维护完成。
 
 自动解除只处理 `owner=supervisor` 且 token 未变化的 halt；要求三角色完成

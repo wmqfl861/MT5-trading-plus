@@ -792,3 +792,59 @@ def test_dead_legacy_registry_requires_verified_tree_before_replacement(tmp_path
     assert proc.returncode == 1, _diag(proc)
     assert "verified-tree-required" in out_text(proc)
     assert (_data_dir(tmp_path) / "live" / "instances.json").read_bytes() == before
+
+
+# ------------------------------------------------ T180：锚点证据留存（save_run_evidence.ps1）
+
+SAVE_EVIDENCE = REPO_ROOT / "scripts" / "save_run_evidence.ps1"
+
+
+def run_save_evidence(live, run_index, manifest, launcher, instances):
+    """直接 -File 执行留存脚本（run_ps1 固定指向 demo_run.ps1）。"""
+    return subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+         str(SAVE_EVIDENCE), "-LiveDir", str(live), "-RunIndex", str(run_index),
+         "-Manifest", str(manifest), "-Launcher", str(launcher),
+         "-Instances", str(instances)],
+        capture_output=True, timeout=120)
+
+
+def test_save_run_evidence_copies_bytes_and_prints_sha256(tmp_path):
+    """demo_run.ps1 部署启动的留存步：三副本原字节 + 输出各 sha256。"""
+    live = tmp_path / "live"
+    live.mkdir()
+    srcs = {}
+    for name, body in (("manifest", '{"schema_version":1,"runs":[1]}'),
+                       ("launcher", '{"started_utc":"2026-11-12T04:35:01Z"}'),
+                       ("instances", '{"schema_version":1,"instances":[]}')):
+        srcs[name] = tmp_path / f"{name}.json"
+        srcs[name].write_text(body, encoding="utf-8")
+    proc = run_save_evidence(live, 0, srcs["manifest"], srcs["launcher"], srcs["instances"])
+    assert proc.returncode == 0, _diag(proc)
+    out = out_text(proc)
+    run0 = live / "evidence" / "run-0"
+    for name, src in srcs.items():
+        dst = run0 / f"{name}.json"
+        assert dst.read_bytes() == src.read_bytes()
+        digest = hashlib.sha256(src.read_bytes()).hexdigest()
+        assert f"evidence run-0/{name}.json sha256={digest}" in out
+
+
+def test_save_run_evidence_fails_closed_on_missing_source(tmp_path):
+    live = tmp_path / "live"
+    live.mkdir()
+    src = tmp_path / "manifest.json"
+    src.write_text("{}", encoding="utf-8")
+    proc = run_save_evidence(live, 2, src, tmp_path / "nope.json", src)
+    assert proc.returncode == 1
+    out = proc.stdout.decode("utf-8", errors="replace")
+    assert "[X] evidence run-2/launcher.json retention failed" in out
+    assert "anchor evidence incomplete" in out
+
+
+def test_demo_run_wires_demo_mode_retention_and_fails_closed():
+    """Demo 启动路径必须接上留存步且失败退出 1（PaperSoak 不留存）。"""
+    src = SCRIPT.read_text(encoding="utf-8-sig")
+    assert 'save_run_evidence.ps1' in src and "-RunIndex" in src
+    assert "锚点证据留存不完整" in src
+    assert 'if ($Mode -eq "Demo") {\n        Write-Host ""' in src

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -182,6 +183,35 @@ def verified_tree(entry, table, argv):
     return result
 
 
+def _next_journal_line(path):
+    """One-based physical line number the next append_jsonl row will occupy.
+
+    The formal-window generator binds retained registry copies to ops-restarts
+    rows by physical line number; seq must be counted the same way (non-empty
+    lines, append-only one row per restart).
+    """
+    try:
+        with open(path, "rb") as fh:
+            return sum(1 for line in fh if line.strip()) + 1
+    except FileNotFoundError:
+        return 1
+
+
+def _retain_registry_copy(src, dst):
+    """Raw-byte copy of a registry file for formal-window evidence (T180).
+
+    Returns the sha256 of the copied bytes so the runtime index records the
+    digest observed at restart time. The caller decides how failures surface;
+    a retention failure must never block the restart itself.
+    """
+    data = Path(src).read_bytes()
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with open(dst, "wb") as fh:
+        fh.write(data)
+    return hashlib.sha256(data).hexdigest()
+
+
 def _clear_owned(live, token):
     """Delete only our exact token. Windows exclusive handle closes the read/delete race."""
     with file_lock(str(live / "halt.lock")):
@@ -322,7 +352,7 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
     now = observe()
     live = Path(cfg.data_dir) / "live"
     live.mkdir(parents=True, exist_ok=True)
-    result = {"restarted": [], "refused": False, "cleared": False}
+    result = {"restarted": [], "refused": False, "cleared": False, "evidence_failures": []}
     state_path = live / "supervisor-state.json"
     try:
         with registry_lock(str(live / "instances.lock")), file_lock(str(live / "supervisor.lock"), attempts=1):
@@ -365,11 +395,26 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
                 write_json_atomic(str(state_path), {"healthy_since": None, "signature": signature})
                 for key, reason in stale.items():
                     entry = mapped.get(key)
+                    # T180: retain pre-restart registry bytes inside the same lock.
+                    # The journal row itself keeps the checker's exact 6-field
+                    # schema; the copy paths/digests go to the runtime evidence
+                    # index, which is what the descriptor generator consumes.
+                    seq = _next_journal_line(live / "ops-restarts.jsonl")
+                    stamp = now.strftime("%Y%m%d-%H%M%S")
+                    before_rel = f"evidence/instances/{stamp}-{seq}-before.json"
+                    after_rel = f"evidence/instances/{stamp}-{seq}-after.json"
+                    before_hash = None
+                    try:
+                        before_hash = _retain_registry_copy(live / "instances.json", live / before_rel)
+                    except Exception as exc:
+                        append_alert(str(live), "SUPERVISOR_EVIDENCE",
+                                     f"seq={seq} component={key} before copy failed: {type(exc).__name__}", now)
+                        result["evidence_failures"].append(key)
                     if entry:
                         terminate_verified_tree(entry, processes, command(cfg, roles[key]))
-                    stamp = now.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
+                    log_stamp = stamp + "-" + uuid.uuid4().hex[:8]
                     kind = roles[key]["kind"]
-                    log = str(Path(cfg.log_dir) / f"{kind}-{key}-{stamp}.log")
+                    log = str(Path(cfg.log_dir) / f"{kind}-{key}-{log_stamp}.log")
                     argv = command(cfg, roles[key])
                     proc = processes.launch(argv, cfg.directory, log,
                                             {**os.environ, "MT5_DEPLOYMENT_SHA": cfg.sha,
@@ -379,10 +424,27 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
                                deployment_sha=cfg.sha, deployment_dir=cfg.directory, data_dir=cfg.data_dir)
                     mapped[key] = new
                     write_json_atomic(str(live / "instances.json"), {"schema_version": 1, "instances": list(mapped.values())})
+                    after_hash = None
+                    try:
+                        after_hash = _retain_registry_copy(live / "instances.json", live / after_rel)
+                    except Exception as exc:
+                        append_alert(str(live), "SUPERVISOR_EVIDENCE",
+                                     f"seq={seq} component={key} after copy failed: {type(exc).__name__}", now)
+                        result["evidence_failures"].append(key)
                     append_jsonl(str(live / "ops-restarts.jsonl"), {
                         "utc": iso_utc(now), "component": key, "reason_code": reason,
                         "old_pid": entry["pid"] if entry else None, "new_pid": proc["pid"],
                         "deployment_sha": cfg.sha})
+                    if before_hash and after_hash:
+                        try:
+                            append_jsonl(str(live / "evidence/instances/index.jsonl"), {
+                                "seq": seq, "utc": iso_utc(now), "component": key,
+                                "before_instances": {"path": before_rel, "sha256": before_hash},
+                                "after_instances": {"path": after_rel, "sha256": after_hash}})
+                        except Exception as exc:
+                            append_alert(str(live), "SUPERVISOR_EVIDENCE",
+                                         f"seq={seq} component={key} index append failed: {type(exc).__name__}", now)
+                            result["evidence_failures"].append(key)
                     result["restarted"].append(key)
                 return result
             # Health must be observed continuously, not inferred from two samples
