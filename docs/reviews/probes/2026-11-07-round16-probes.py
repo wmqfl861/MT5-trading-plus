@@ -227,7 +227,10 @@ def probe_live_rejection_exit(repo: Path) -> None:
            f"RETCode 含 10021={has_10021}；执行器确定态拒单后重抛={exec_reraises}；"
            f"运行器主循环对 executor.poll 异常一律重抛={runner_reraises}；"
            f"运行器单独处理 TradeRejectedError={runner_handles_reject}"
-           "——11-05 14:22 '10021 No prices' 致运行器退出的路径在 main 上仍在")
+           + ("——11-05 '10021 No prices' 致运行器退出的路径在 main 上仍在"
+              if status == "REPRODUCED" else
+              "——该路径已关闭（第十七轮更正：11-05 运行器退出时刻为 14:45:06，"
+              "不是 14:22）"))
 
 
 # --------------------------------------------------------------------- P16-4
