@@ -7,17 +7,22 @@
   全局 ``pause.json`` 只留给人工，本进程**绝不写**；
 - pending 意图在 --grace-s（默认 60 秒）宽限内的 magic 本轮不判（下单
   在途不误报）；
-- 意图文件缺失/不合法、持仓查询失败：exit 2（--once 模式；--loop 模式
-  原为无限等待重试——T142 起按"已知可恢复"计数：连续 5 轮以专用退出码
-  79 退出并留标记，运行器启动写出 expected-<magic>.json 后 supervisor
-  重启本进程即自愈）；
+- 意图文件缺失/不合法：exit 2（--once 模式；--loop 模式原为无限等待
+  重试——T142 起按"已知可恢复"计数：连续 5 轮以专用退出码 79 退出并留
+  标记，运行器启动写出 expected-<magic>.json 后 supervisor 重启本进程
+  即自愈）；
+- 持仓查询失败（DataUnavailableError，数据暂缺）：--once 仍 exit 2（业务
+  性失败，不写 halt）；--loop 下自 T184（O17-4）起不进 5 轮计数，改独立
+  时间窗——段首/恢复各一条告警、段内不刷屏，连续
+  --account-unavailable-limit-s（缺省 300 秒）才以 79 退出并写 halt
+  （cause=account_unavailable_window）；
 - T141（第十六轮计划）：断线（NotConnectedError）不退出——--loop 下降级
   继续（本轮跳过核对、角色心跳照写、网关按 5/10/30/60 秒退避重连），
   连续 15 分钟连不上才以专用退出码 78 退出交给 supervisor，并留
   data/live/disconnect-exit-reconcile.json 标记（不写 halt）；
-- T142（第十六轮计划）：主循环异常分级——已知可恢复（数据暂缺=run_once
-  rc=2、文件被占用 PermissionError、锁等待 TimeoutError；断线走 78 不进
-  计数）记录后继续；连续 5 轮或任何未知异常 → 写
+- T142（第十六轮计划）：主循环异常分级——已知可恢复（run_once rc=2、
+  文件被占用 PermissionError、锁等待 TimeoutError；断线走 78 不进计数）
+  记录后继续；连续 5 轮或任何未知异常 → 写
   data/live/loop-exit-reconcile.json（reason=unrecoverable_loop/<具体>）
   + halt（fail-closed）后以专用退出码 79 退出。对账不一致（rc=1，按规则
   写 pause）是动作不是故障，视为成功轮。完整码表见
@@ -46,9 +51,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from mt5gw import GatewayConfig, MT5Gateway  # noqa: E402
 from mt5gw.errors import DataUnavailableError, NotConnectedError  # noqa: E402
 from mt5live.monitor import (  # noqa: E402
+    ACCOUNT_UNAVAILABLE_LIMIT_S,
     ALERT_DISCONNECTED,
     ALERT_RECONCILE_MISMATCH,
     LOOP_EXIT_RC,
+    AccountUnavailableWatch,
     DisconnectWatch,
     LoopFailureWatch,
     append_alert,
@@ -70,10 +77,13 @@ from mt5live.reconcile import (  # noqa: E402
 # T141：断线计时的单调钟接缝（测试注入虚拟钟；生产恒 time.monotonic）。
 _mono = time.monotonic
 
-# T142：主循环"已知可恢复"异常类（文件被占用/锁等待超时；数据暂缺在本
-# 进程表现为 run_once 的 rc=2，不抛异常）。断线（NotConnectedError）不在
-# 此列：只走 T141 的 15 分钟时间窗（78），不进 5 轮计数。
-_RECOVERABLE = (DataUnavailableError, PermissionError, TimeoutError)
+# T142：主循环"已知可恢复"异常类（文件被占用/锁等待超时；意图文件问题
+# 在本进程表现为 run_once 的 rc=2，不抛异常）。断线（NotConnectedError）
+# 与持仓查询的数据暂缺（DataUnavailableError，T184/O17-4）都不在此列：
+# 前者只走 T141 的 15 分钟时间窗（78），后者走 AccountUnavailableWatch 的
+# 独立时间窗（缺省 300 秒，同样以 79 退出），均不进 5 轮计数
+#（tests/test_t184_account_window.py 钉死三套计时互不干扰）。
+_RECOVERABLE = (PermissionError, TimeoutError)
 
 
 def _open_gateway(gw_config_path: str) -> MT5Gateway:
@@ -99,6 +109,10 @@ def run_once(live_dir: str, gw, *,
 
     有差分的 magic 写 pause-<magic>.json（paused=true），其余登记 magic
     写回 paused=false；全局 pause.json 只留给人工，本函数不写。
+
+    持仓查询的 DataUnavailableError **上抛不吞**（T184/O17-4）：--once 由
+    调用处按业务性 exit 2 处理；--loop 由主循环走账户取数失败的独立时间窗
+    （缺省 300 秒），不再折成 rc=2 进 5 轮计数。
     """
     n = naive_utc(now if now is not None
                   else datetime.now(timezone.utc).replace(tzinfo=None))
@@ -107,11 +121,7 @@ def run_once(live_dir: str, gw, *,
     except ExpectedStateError as e:
         print(f"× {e}")
         return 2, None
-    try:
-        actual = gw.account.positions()
-    except DataUnavailableError as e:
-        print(f"× 持仓查询失败：{e}")
-        return 2, None
+    actual = gw.account.positions()        # DUA 上抛（见 docstring，T184）
 
     res = diff_positions(intents, actual, now=n, grace_s=grace_s,
                          volume_tolerance=volume_tolerance)
@@ -152,6 +162,11 @@ def main(argv=None) -> int:
     ap.add_argument("--once", action="store_true", help="单轮后退出（默认行为）")
     ap.add_argument("--loop", action="store_true", help="常驻轮询")
     ap.add_argument("--interval", type=float, default=30.0, help="轮询间隔（秒）")
+    ap.add_argument("--account-unavailable-limit-s", type=float,
+                    default=ACCOUNT_UNAVAILABLE_LIMIT_S,
+                    help="持仓查询失败的连续时间窗上限（秒，T184/O17-4）——"
+                         "连续这么久取不到持仓才以 79 退出并写 halt；缺省 "
+                         f"{ACCOUNT_UNAVAILABLE_LIMIT_S:.0f} 秒")
     ap.add_argument("--volume-tolerance", type=float, default=1e-6,
                     help="净手数比较容差（手）")
     ap.add_argument("--grace-s", type=float, default=DEFAULT_GRACE_S,
@@ -176,10 +191,32 @@ def _run(args) -> int:
     #（disconnect-exit-reconcile.json 留痕，供 T143 supervisor 演练与取证）。
     watch = DisconnectWatch(live_dir, "reconcile", clock=_mono)
 
+    # T184（O17-4）：持仓查询失败的连续时间窗——段首/恢复各一条告警、
+    # 段内不刷屏，连续 --account-unavailable-limit-s（缺省 300 秒）才以
+    # 79 退出并写 halt（cause=account_unavailable_window）。
+    acct_watch = AccountUnavailableWatch(
+        live_dir, "reconcile", limit_s=args.account_unavailable_limit_s,
+        clock=_mono)
+
     # T142：已知可恢复失败的连续轮计数（run_once rc=2 或可恢复异常）——
     # 连续 5 轮或未知异常才以专用退出码 79 退出（loop-exit-reconcile.json
     # + halt 留痕）。rc=1（按规则写 pause）是动作不是故障，视为成功轮。
     failures = LoopFailureWatch(live_dir, "reconcile")
+
+    def _account_failed(e: Exception) -> int | None:
+        """T184：持仓查询失败（数据暂缺）——独立时间窗计，不进 5 轮。"""
+        acct_watch.note_failure(e)       # 段首一条告警，段内不刷屏
+        print(f"× {datetime.now(timezone.utc):%H:%M:%S} 持仓查询失败"
+              f"（数据暂缺，T184 时间窗 {acct_watch.unavailable_s:.0f}/"
+              f"{acct_watch.limit_s:.0f} 秒）：{e}", flush=True)
+        try:   # 降级照写角色心跳（与 T141/T142 失败轮同口径：进程还活着）
+            write_role_heartbeat(live_dir, "reconcile", interval=args.interval)
+        except Exception as nested:
+            print(f"× 失败轮心跳留痕异常（继续计时）：{nested}", flush=True)
+        if acct_watch.expired():
+            return acct_watch.exit_code(
+                last_error=f"{type(e).__name__}: {e}")
+        return None
 
     def _round_failed(detail: str) -> int | None:
         """T142：已知可恢复失败轮——留痕后继续；连续 5 轮 → 专用退出。"""
@@ -234,7 +271,11 @@ def _run(args) -> int:
                                        alert=was_ok is not False)
                 except NotConnectedError as e:
                     rc2 = _handle_disconnect(e)     # T141：断线降级继续
-                    if rc2 is not None:             # （不进 T142 计数）
+                    if rc2 is not None:             # （不进其他两套计时）
+                        return rc2
+                except DataUnavailableError as e:
+                    rc2 = _account_failed(e)        # T184：时间窗计
+                    if rc2 is not None:             # （不进 5 轮计数）
                         return rc2
                 except _RECOVERABLE as e:
                     rc2 = _round_failed(f"{type(e).__name__}: {e}")
@@ -244,12 +285,14 @@ def _run(args) -> int:
                     return _unknown_failed(e)       # T142：未知——专用退出
                 else:
                     watch.note_ok()                 # T141：恢复（段内才告警）
+                    acct_watch.note_ok()            # T184：恢复告警+清零
                     if rc == 2:
-                        # T142：意图文件缺失/不合法或持仓查询失败（数据
-                        # 暂缺）——run_once 已打印具体原因并返回 rc=2。
+                        # T142：意图文件缺失/不合法（run_once 已打印具体
+                        # 原因并返回 rc=2；持仓查询失败自 T184 起上抛走
+                        # 时间窗，不落这里）。
                         rc2 = _round_failed(
-                            "run_once rc=2：意图文件缺失/不合法或持仓查询"
-                            "失败（数据暂缺，具体见本轮输出）")
+                            "run_once rc=2：意图文件缺失/不合法"
+                            "（具体见本轮输出）")
                         if rc2 is not None:
                             return rc2
                     else:
@@ -264,6 +307,11 @@ def _run(args) -> int:
             # 单轮模式遇断线：与持仓查询失败同口径（exit 2，不 fatal）。
             print(f"× 断线：{e}")
             append_alert(live_dir, ALERT_DISCONNECTED, f"reconcile 单轮断线：{e}")
+            return 2
+        except DataUnavailableError as e:
+            # 单轮模式持仓查询失败：业务性 exit 2（不写 halt、不经
+            # guarded_main 的 fatal 分支）——T184 起上抛，口径不变。
+            print(f"× 持仓查询失败：{e}")
             return 2
         return rc
     except KeyboardInterrupt:

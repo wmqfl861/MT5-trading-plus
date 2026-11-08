@@ -397,8 +397,11 @@ shutdown 和下单）由同一个专用 worker 执行，锁等待也有 deadline
 其他不可恢复异常输出 CRITICAL + traceback 并写 exit marker（rc、原因、时间）。
 完成心跳分别为 `heartbeat-<magic>.json`、`heartbeat-risk.json`、
 `heartbeat-reconcile.json`，含 PID 与 deployment_sha。数据读取失败不刷新
-完成心跳；risk 的 DataUnavailableError 记录失败后有界轮询重试，其他异常
-停机退出。heartbeat open PermissionError 最多重试 3 次（间隔 50ms），
+完成心跳；risk/reconcile 的 DataUnavailableError（账户/持仓取数失败）按
+T184 独立时间窗计——段首/恢复各一条告警，连续 `--account-unavailable-limit-s`
+（缺省 300 秒）才以 79 退出并写 halt；文件访问类（PermissionError/
+TimeoutError）连续 5 轮、其他异常停机退出（断线走 T141 的 15 分钟窗/78）。
+heartbeat open PermissionError 最多重试 3 次（间隔 50ms），
 持续失败保留 traceback 和退出证据。
 
 RiskGate 在组装账户快照前检查 halt/killSwitch 与独立 risk 心跳；缺失、未来、

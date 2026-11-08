@@ -55,8 +55,9 @@ DISCONNECT_EXIT_FILE_FMT = "disconnect-exit-{component}.json"
 # T142（第十六轮计划，O16-3）：主循环异常分级与专用退出。
 #
 # 风控/对账主循环异常分两类（scripts/risk_process.py、scripts/live_reconcile.py）：
-# - 已知可恢复（数据暂缺 DataUnavailableError、文件被占用 PermissionError、
-#   文件锁等待 TimeoutError、断线 NotConnectedError）：记录后继续；
+# - 已知可恢复（文件被占用 PermissionError、文件锁等待 TimeoutError；T142
+#   期还包括数据暂缺 DataUnavailableError——T184 起后者改走独立时间窗，
+#   见下）：记录后继续；
 # - 断线只走 T141 的 15 分钟时间窗（78），**不进 5 轮计数**——统一计数会让
 #   5 轮 × interval 早于 900s 触发，破坏 T141 验收场景"断线 3 分钟恢复
 #   三进程不退出"；两套计时互不读写（钉死在 tests/test_t142_loop_grading.py）；
@@ -75,13 +76,32 @@ DISCONNECT_EXIT_FILE_FMT = "disconnect-exit-{component}.json"
 #        落 gateway-stall.json + exit-<component>.json，不写 halt）
 #   78 = T141 断线专用：连续 15 分钟连不上（disconnect-exit-<component>.json，
 #        不写 halt——重启后果由 supervisor 决定）
-#   79 = T142 主循环不可恢复：已知可恢复异常连续 5 轮失败或未知异常
-#        （loop-exit-<component>.json + halt——fail-closed）
+#   79 = T142 主循环不可恢复：文件访问类可恢复异常连续 5 轮失败或未知异常
+#        （loop-exit-<component>.json + halt——fail-closed）；T184 起账户取数
+#        连续不可用达 ACCOUNT_UNAVAILABLE_LIMIT_S 也走本码（cause=
+#        account_unavailable_window，halt 语义不变——O17-4 只改触发条件）
 LOOP_EXIT_RC = 79
 LOOP_FAILURE_LIMIT = 5              # 连续失败轮上限（只数可恢复失败轮）
 ALERT_RECOVERABLE_FAILURE = "RECOVERABLE_FAILURE"  # 失败段首告警（不刷屏）
 ALERT_LOOP_EXIT = "LOOP_EXIT"       # 专用退出告警
 LOOP_EXIT_FILE_FMT = "loop-exit-{component}.json"
+
+# T184（第十七轮计划 §T184，O17-4/P17-4）：账户取数失败改按独立时间窗计。
+# - T142 把 DataUnavailableError 计入 5 轮上限：风控 --interval 10 下约 50
+#   秒取不到账户就以 79 退出并写 owner=<component> 的 halt，而 supervisor
+#   只清自己写的 halt——终端一抖就把交易停到人工解除；
+# - 与 T141 DisconnectWatch 同构（时间契约优先）：单调钟累计连续失败时长，
+#   段首一条告警、恢复一条、段内不刷屏；连续 ACCOUNT_UNAVAILABLE_LIMIT_S
+#   （缺省 300 秒，CLI --account-unavailable-limit-s）才退出；
+# - 退出仍复用 T142 的 79 语义（halt 分层不变）：loop-exit-<component>.json
+#   （cause=account_unavailable_window）+ halt（fail-closed）+ LOOP_EXIT 告警；
+# - 三套计时互不读写（钉死在 tests/test_t184_account_window.py）：断线只走
+#   T141 的 900s 窗（78）；文件占用/锁超时（PermissionError/TimeoutError）
+#   仍走 T142 的 5 轮计数；断线轮对其他两套计时中性（不 note_ok 不
+#   note_failure），只有完整成功的轮清零。
+ACCOUNT_UNAVAILABLE_LIMIT_S = 300.0    # 连续账户取数失败容忍上限：5 分钟
+ALERT_ACCOUNT_UNAVAILABLE = "ACCOUNT_UNAVAILABLE"  # 段首/恢复告警（不刷屏）
+ACCOUNT_UNAVAILABLE_CAUSE = "account_unavailable_window"  # 退出标记 cause
 
 # 成交流水的交易类 entry（mt5gw.models.Deal.entry）；出入金等流水绝不计入盈亏
 TRADE_ENTRY_KINDS = frozenset({"in", "out", "inout", "out_by"})
@@ -374,6 +394,9 @@ class LoopFailureWatch:
     与 T141 DisconnectWatch 的边界（时间契约优先，测试钉死）：
     - 断线轮**既不 note_failure 也不 note_ok**——只归 DisconnectWatch 的
       900s 时间窗管；本类根本不该看到 NotConnectedError；
+    - T184 起账户取数失败（DataUnavailableError）同样不进本计数——只归
+      AccountUnavailableWatch 的 300s 时间窗管；本类只数文件访问类
+      （PermissionError/TimeoutError）失败轮；
     - 只有完整成功的轮清零（risk=run_one_cycle 正常返回；reconcile=
       run_once rc∈{0,1}——1 是"按规则写 pause"的动作不是故障）；
     - 恢复（note_ok）静默清零，不写告警（瞬时失败是常态，避免刷屏；
@@ -482,6 +505,139 @@ class LoopFailureWatch:
                 f"{LOOP_EXIT_FILE_FMT.format(component=self.component)} 并以"
                 f"专用退出码 {LOOP_EXIT_RC} 退出；已写 halt（fail-closed）"
                 "（T142）", now)
+        except Exception as e:
+            print(f"× 退出告警写入失败（{reason}）：{e}",
+                  file=sys.stderr, flush=True)
+        return LOOP_EXIT_RC
+
+
+class AccountUnavailableWatch:
+    """T184：账户/持仓取数失败（DataUnavailableError）的连续时间窗。
+
+    与 DisconnectWatch 同构（时间契约优先）：单调钟累计连续失败时长；
+    note_failure 失败段首写一次告警（不刷屏）；note_ok 恢复写一条并清零
+    （只有完整成功的轮调用）；expired() = 连续失败 ≥ limit_s（缺省
+    ACCOUNT_UNAVAILABLE_LIMIT_S=300 秒，CLI --account-unavailable-limit-s）。
+
+    与另两套计时的边界（钉死在 tests/test_t184_account_window.py）：
+    - 断线轮（NotConnectedError）不进本计时——只归 DisconnectWatch 的
+      900s 窗（78）；断线段内的单调流逝如实累计（账户确实一直取不到），
+      重连后首个失败轮按真实累计时长裁决；
+    - 本计时的失败轮不进 LoopFailureWatch 的 5 轮计数；PermissionError/
+      TimeoutError 也不进本计时；
+    - 混合并发时先到期的窗先裁决（300s 账户窗早于 900s 断线窗）。
+
+    exit_code()：与 T142 的 79 语义完全一致（O17-4 修复只改触发条件，
+    不改 halt 分层）——loop-exit-<component>.json（cause=
+    account_unavailable_window、reason=unrecoverable_loop/<具体>、首末
+    时刻/时长/上限）+ halt（fail-closed：监视者离开必须停交易）+
+    LOOP_EXIT 告警，返回 LOOP_EXIT_RC=79——调用方直接 return，guarded_main
+    的 finally 会再落 exit-<component>.json（rc=79）。留痕全部尽力而为：
+    文件系统正被占用时退到 stderr，退出不因留痕失败而取消。
+    """
+
+    def __init__(self, live_dir: str, component: str, *,
+                 limit_s: float = ACCOUNT_UNAVAILABLE_LIMIT_S,
+                 clock=time.monotonic):
+        self.live_dir = str(live_dir)
+        self.component = str(component)
+        self.limit_s = float(limit_s)
+        self._clock = clock
+        self._first_mono: float | None = None
+        self._first_wall: datetime | None = None
+        self._last_error = ""
+
+    @property
+    def unavailable_s(self) -> float:
+        if self._first_mono is None:
+            return 0.0
+        return self._clock() - self._first_mono
+
+    def note_failure(self, exc: BaseException | None = None) -> None:
+        """记一轮账户取数失败；失败段首写一次告警（不刷屏）。"""
+        if exc is not None:
+            self._last_error = f"{type(exc).__name__}: {exc}"
+        if self._first_mono is not None:
+            return                       # 失败段已在计时（告警只写段首）
+        self._first_mono = self._clock()
+        self._first_wall = datetime.now(timezone.utc)
+        try:
+            append_alert(
+                self.live_dir, ALERT_ACCOUNT_UNAVAILABLE,
+                f"{self.component} 账户取数失败（{self._last_error}）——按"
+                f"时间窗计（T184，不进 5 轮上限），降级继续（文件级检查"
+                f"照常、角色心跳照写）；连续 {self.limit_s / 60:.0f} 分钟"
+                f"取不到将以专用退出码 {LOOP_EXIT_RC} 退出（O17-4）",
+                self._first_wall)
+        except Exception as e:          # 告警写失败不推翻计时
+            print(f"× 失败段首告警写入失败（继续计时）：{e}",
+                  file=sys.stderr, flush=True)
+
+    def note_ok(self) -> None:
+        """完整成功的轮：写恢复告警（段内才写）并清零。"""
+        if self._first_mono is None:
+            return
+        duration = self.unavailable_s
+        self._first_mono = self._first_wall = None
+        try:
+            append_alert(
+                self.live_dir, ALERT_ACCOUNT_UNAVAILABLE,
+                f"{self.component} 账户取数恢复（此前连续失败 {duration:.0f} "
+                "秒，未达时间窗上限）——恢复正常轮询（T184）")
+        except Exception as e:
+            print(f"× 恢复告警写入失败（照常清零）：{e}",
+                  file=sys.stderr, flush=True)
+
+    def expired(self) -> bool:
+        return (self._first_mono is not None
+                and self.unavailable_s >= self.limit_s)
+
+    def exit_code(self, *, last_error: str | None = None) -> int:
+        """落退出标记 + halt + 告警（全部尽力而为），返回专用退出码 79。"""
+        detail = last_error or self._last_error
+        duration = self.unavailable_s
+        first = iso_utc(self._first_wall) if self._first_wall else None
+        reason = f"unrecoverable_loop/{detail}"
+        now = datetime.now(timezone.utc)
+        marker = {
+            "component": self.component,
+            "rc": LOOP_EXIT_RC,
+            "reason": reason,
+            "cause": ACCOUNT_UNAVAILABLE_CAUSE,
+            "first_failure_utc": first,
+            "duration_s": round(duration, 3),
+            "limit_s": self.limit_s,
+            "last_error": detail,
+            "ts": iso_utc(now),
+            "pid": os.getpid(),
+        }
+        logging.critical(
+            "%s account-unavailable window exit rc=%s duration=%.0fs/"
+            "limit=%.0fs: %s",
+            self.component, LOOP_EXIT_RC, duration, self.limit_s, detail)
+        try:
+            write_json_atomic(os.path.join(
+                self.live_dir,
+                LOOP_EXIT_FILE_FMT.format(component=self.component)), marker)
+        except Exception as e:
+            print(f"× 退出标记写入失败（{reason}）：{e}",
+                  file=sys.stderr, flush=True)
+        try:   # fail-closed：监视者离开必须停交易（与 T142 同分层）
+            write_halt_once(
+                self.live_dir,
+                f"{self.component}_unrecoverable_loop: {detail}", now,
+                owner=self.component)
+        except Exception as e:
+            print(f"× 退出 halt 写入失败（{reason}）：{e}",
+                  file=sys.stderr, flush=True)
+        try:
+            append_alert(
+                self.live_dir, ALERT_LOOP_EXIT,
+                f"{self.component} 账户取数连续 {duration:.0f} 秒不可用"
+                f"（≥ {self.limit_s:.0f} 秒上限，最后错误：{detail}）——写"
+                f"退出标记 {LOOP_EXIT_FILE_FMT.format(component=self.component)}"
+                f" 并以专用退出码 {LOOP_EXIT_RC} 退出；已写 halt（fail-closed）"
+                "（T184，O17-4）", now)
         except Exception as e:
             print(f"× 退出告警写入失败（{reason}）：{e}",
                   file=sys.stderr, flush=True)

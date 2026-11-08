@@ -95,12 +95,18 @@
 | 3 | 单实例拒绝（instances 内核锁） | `exit-<component>.json` | 否 |
 | 75 | T110 网关期限硬停（单次 MT5 调用 >30s，`os._exit`） | `gateway-stall.json` + `exit-<component>.json` | 否 |
 | 78 | T141 断线专用：连续 15 分钟连不上 | `disconnect-exit-<component>.json` | 否（supervisor 决定） |
-| 79 | T142 主循环不可恢复：已知可恢复异常连续 5 轮失败或未知异常 | `loop-exit-<component>.json`（reason=unrecoverable_loop/<具体>） | **写**（fail-closed：监视者离开必须停交易） |
+| 79 | T142 主循环不可恢复：文件访问类可恢复异常连续 5 轮失败或未知异常；T184（O17-4）起账户取数连续 300 秒（`--account-unavailable-limit-s`）不可用也走本码（cause=account_unavailable_window） | `loop-exit-<component>.json`（reason=unrecoverable_loop/<具体>） | **写**（fail-closed：监视者离开必须停交易） |
 
 T142 边界（测试钉死，`tests/test_t142_loop_grading.py`）：断线类只走
 T141 的 900s/78 时间窗，**不进 5 轮计数**（统一计数会让 5 轮 × interval
 早于 900s 触发，破坏 T141 验收场景"断线 3 分钟恢复三进程不退出"）；断线
 降级轮既不计数也不清零；只有完整成功的轮清零（对账 rc=1 是动作，视为成功）。
+T184 边界（测试钉死，`tests/test_t184_account_window.py`）：账户取数失败
+（DataUnavailableError——T142 期计入 5 轮，风控 `--interval 10` 下 ≈50 秒
+就 halt，O17-4 的过度反应）自第十七轮起不进 5 轮计数，改独立时间窗（缺省
+300 秒；段首/恢复各一条告警、段内不刷屏）；三套计时（300s 账户窗/79+halt、
+900s 断线窗/78、5 轮文件访问类/79+halt）互不读写，断线轮对其他两套中性，
+只有完整成功的轮清零，混合并发时先到期的窗先裁决。
 
 ——取证执行：T142 施工会话（worktree `demo-t142`，分支 `t142-grading`），
 2026-11-07；未改动任何运行时状态。
