@@ -145,8 +145,11 @@ def test_fuse_fails_closed_when_account_unreadable():
     fake.set_behavior("account_info", value=None)  # 下单前读不到账户
     fake.last_error_value = (-6, "terminal not connected")
     capture_request(fake)
-    from mt5gw.errors import DataUnavailableError
-    with pytest.raises(DataUnavailableError, match="拒绝发送"):
+    # T183（O17-3）：发送前取不到账户 = 请求确定未发出——专用异常
+    # （NotConnectedError 子类，执行器按 T141 blocked 路径处理），不再
+    # 是 DataUnavailableError（那会被当成"回报未知"重抛退出）。
+    from mt5gw.errors import PreSendUnavailableError
+    with pytest.raises(PreSendUnavailableError, match="请求未发出"):
         tr.market_order("EURUSD", "buy", 0.01)
     assert fake.calls("order_send") == 0
 

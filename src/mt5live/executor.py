@@ -1034,8 +1034,8 @@ class LiveExecutor:
                         net_before: float | None,
                         n: datetime) -> RoundReport:
         """确定态拒单的统一回报：告警（含 retcode）+ 连拒计数/暂停 +
-        RoundReport(action="rejected")——不再重抛（11-05 14:22 '10021 No
-        prices' 致运行器整进程退出数小时的教训）。
+        RoundReport(action="rejected")——不再重抛（11-05 14:45:06 '10021
+        No prices' 致运行器整进程退出数小时的教训）。
 
         - journal 记 rejected、意图写 confirmed（实际净持仓）由调用方
           （_plan_and_execute）先行完成——本方法只做回报与防护；

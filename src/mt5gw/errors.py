@@ -9,6 +9,18 @@ class NotConnectedError(GatewayError):
     """终端不可达：初始化失败或重连仍失败。"""
 
 
+class PreSendUnavailableError(NotConnectedError):
+    """发送前无法确认账户状态，请求未发出（T183/O17-3）。
+
+    trade_send 在调用 order_send 前的账户检查读不到账户（account_info
+    为空）——此时请求**确定没有发出**（区别于回报未知）。归入
+    NotConnectedError：执行器按 T141 的 blocked 路径处理（本轮作废、
+    journal 终态 rejected/not_connected、不开新仓、不退出、写告警）。
+    保险丝与账号不符（LiveTradingBlockedError）不在归并范围，仍照常
+    上抛退出。
+    """
+
+
 class DataUnavailableError(GatewayError):
     """行情/品种数据取不到（含 mt5.last_error 详情）。"""
 
@@ -46,8 +58,8 @@ class RETCode:
     DONE = 10009
     DONE_PARTIAL = 10010
     # T140（第十六轮 O16-2）：补齐 MQL5 文档中的确定态拒单码——此前缺失
-    # 10021 等码，11-05 14:22 的 "10021 No prices" 拒单只能按"未知返回码"
-    # 落日志/告警。
+    # 10021 等码，11-05 14:45:06 的 "10021 No prices" 拒单只能按"未知
+    # 返回码"落日志/告警。
     INVALID_REQUEST = 10013     # TRADE_RETCODE_INVALID：请求无效
     INVALID_PRICE = 10015  # noqa: 保留语义映射（部分券商市价单要求参考价）
     INVALID_VOLUME = 10014

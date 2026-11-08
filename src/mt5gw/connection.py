@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from mt5gw.config import GatewayConfig
-from mt5gw.errors import DataUnavailableError, NotConnectedError
+from mt5gw.errors import NotConnectedError, PreSendUnavailableError
 from mt5gw.snapshot import write_json_atomic
 
 _TIMEOUT_EVIDENCE = {}
@@ -184,8 +184,15 @@ class MT5Connection:
             self._ready_or_raise()
             account = self._raw("account_info")
             if account is None:
-                raise DataUnavailableError(
-                    f"下单前无法确认账户状态，拒绝发送：{self._raw('last_error')}")
+                # T183（第十七轮 O17-3）：发送前取不到账户——请求确定未
+                # 发出（order_send 尚未调用）。抛 PreSendUnavailableError
+                #（NotConnectedError 子类），执行器按 T141 blocked 路径
+                # 处理；不再是 DataUnavailableError（那会被当成"回报
+                # 未知"重抛，运行器退出）。保险丝与账号不符
+                # （LiveTradingBlockedError）不受影响，仍照常上抛退出。
+                raise PreSendUnavailableError(
+                    f"发送前无法确认账户状态，请求未发出："
+                    f"{self._raw('last_error')}")
             fuse_check(account.trade_mode)
             if login_check is not None:
                 login_check(account.login)
