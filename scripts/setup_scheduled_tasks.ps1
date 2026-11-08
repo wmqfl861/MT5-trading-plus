@@ -109,7 +109,7 @@ function New-DailyTask($name, $time, $wrapper) {
 
 function New-SaturdayTask($name, $time, $utcTime, $wrapper) {
     # T182：数据采集改每周六本机白天（$utcTime 为对应 UTC 时刻，仅供输出核对；
-    # 换算依据见文件头"任务一览"——周六全天休市，无纽约盘中重叠）。
+    # 换算依据见文件头"任务一览"——所选白天时刻（>=06:00）处于周末休市段，无纽约盘中重叠）。
     schtasks /Create /F /TN "MT5Quant\$name" /SC WEEKLY /D SAT /ST $time /TR "`"$wrapper`""
     if ($LASTEXITCODE -ne 0) {
         throw "schtasks 创建 MT5Quant\$name 失败（退出码 $LASTEXITCODE）"
