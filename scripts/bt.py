@@ -1242,7 +1242,8 @@ def _dedup_trial_sharpes(ledger, card_id: str, bars_per_year: float, *,
     """T21c/M4：试验夏普按 (strategy, params, symbol, timeframe,
     data_sha256, cost_model_version, strategy_sha) 去重——同一组参数先
     screen 后 gate 只计 1 次；T37：策略代码指纹进键（改代码重跑 = 新
-    试验）；失败运行不计。
+    试验）；T151/D66：verdict_code_sha 进键（事件模式改判决代码/换日历
+    工件重跑 = 新试验；bar 级行恒 None，计数逐位不变）；失败运行不计。
 
     scope（T64/D33，[g4].dsr_trial_scope）：
     - "family"（函数缺省，**语义逐位不变**）：谱系（cards.family_of）内
@@ -1269,7 +1270,7 @@ def _dedup_trial_sharpes(ledger, card_id: str, bars_per_year: float, *,
     rows = ledger.conn.execute(
         "SELECT card_id, strategy, params_json, symbol, timeframe,"
         " data_sha256, strategy_sha, cost_model_version, actor, run_class,"
-        " round_id, metrics_json FROM runs").fetchall()
+        " round_id, verdict_code_sha, metrics_json FROM runs").fetchall()
     by_key: dict[tuple, float | None] = {}
     for r in rows:
         rc = r["run_class"] or run_class_for_actor(r["actor"])
@@ -1293,7 +1294,8 @@ def _dedup_trial_sharpes(ledger, card_id: str, bars_per_year: float, *,
                json.dumps(json.loads(r["params_json"]), sort_keys=True,
                           ensure_ascii=False),
                r["symbol"], r["timeframe"], r["data_sha256"],
-               r["cost_model_version"], r["strategy_sha"])
+               r["cost_model_version"], r["strategy_sha"],
+               r["verdict_code_sha"] if "verdict_code_sha" in r.keys() else None)
         if key in by_key:
             continue
         s = (payload.get("metrics") or {}).get("sharpe")
@@ -1458,6 +1460,72 @@ def _round_eval_mode(card) -> str:
     return str(ev.get("mode", "") or "")
 
 
+def _sha256_lf_normalized(path) -> str:
+    """文件内容的 CRLF→LF 规范化 sha256（与 gates_sha256 同一防 CRLF 折损
+    语义：同一提交在 Windows/Linux 检出上指纹一致）。"""
+    raw = Path(path).read_bytes().replace(bytes([13, 10]), bytes([10]))
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _verdict_code_sha(*, calendar_component: str | None = None,
+                      events_path=None, bt_path=None) -> str:
+    """T151/D66：事件模式试验身份的裁决代码指纹（verdict_code_sha）。
+
+    组成（D66 逐字）：``mt5quant/validation/events.py``（事件收益/检验/
+    随机化的全部实现）+ **bt.py 事件分支**（以 bt.py 模块整文件字节为
+    指纹——事件分支函数 _h_declared/_load_h_research_inputs/_bind_h_strategy/
+    _h_event_setup/_fomc_event_binding/_verify_fomc_registration/_h_preflight/
+    _v3_gate_evaluate 事件分支/_g5_orchestrate 都住在该模块内，整文件是
+    其超集：任何裁决路径改动必变指纹，反之不漏）+ **日历工件哈希**
+    （fomc_calendar → 冻结工件 sha256；其他事件 kind → 实际消费的显式
+    交易日历 JSON 的规范化内容哈希；None → "none"）。
+
+    语义（H16-2 的结构性口子）：试验身份进 runs.verdict_code_sha 与
+    LockboxTrial——改判决代码/换日历工件 = 新试验（N 计数），不再出现
+    "改了判决路径而不计试验"。bar 级卡不计算（None，旧行为逐位不变）。
+    """
+    import mt5quant.validation.events as _vevents
+    events_file = Path(events_path if events_path is not None
+                       else _vevents.__file__)
+    bt_file = Path(bt_path if bt_path is not None else __file__)
+    digest = hashlib.sha256()
+    digest.update(b"verdict-code-v1")
+    digest.update(f"\nevents.py:{_sha256_lf_normalized(events_file)}"
+                  .encode("utf-8"))
+    digest.update(f"\nbt.py:{_sha256_lf_normalized(bt_file)}".encode("utf-8"))
+    digest.update(f"\ncalendar:{calendar_component or 'none'}"
+                  .encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _event_calendar_component(h_ctx, symbol: str) -> str | None:
+    """verdict_code_sha 的日历成分：fomc → 冻结工件 sha256；其余事件
+    kind → 实际消费的显式交易日历（成交品种 + 信号品种）规范化 JSON 的
+    内容哈希。无日历 → None（指纹按 "none" 折算）。"""
+    report = (h_ctx.get("fomc_calendar") or {}).get(symbol) \
+        if isinstance(h_ctx, dict) else None
+    if isinstance(report, dict) and report.get("calendar_sha256"):
+        return f"fomc:{report['calendar_sha256']}"
+    declared = h_ctx.get("declared") if isinstance(h_ctx, dict) else None
+    signal_symbol = (getattr(declared, "signal_symbol", None) or symbol)
+    parts = []
+    for sym in dict.fromkeys((symbol, signal_symbol)):
+        raw = (h_ctx.get("calendars") or {}).get(sym)
+        if raw is None:
+            continue
+        inner = hashlib.sha256(json.dumps(
+            _canonical_calendar(raw), sort_keys=True,
+            ensure_ascii=False).encode("utf-8")).hexdigest()
+        parts.append(f"{sym}:{inner}")
+    return "calendar:" + ";".join(parts) if parts else None
+
+
+def _canonical_calendar(raw) -> dict:
+    """日历 dict 的可哈希化（NaN/inf → None，与台账 _san 同口径）。"""
+    from mt5quant.research.ledger import _san
+    return _san(dict(raw))
+
+
 def _declared_continues_family(card, cards_dir) -> tuple[str, str]:
     """候选登记声明的 continues_family（T85/K1；R14 §3 语义提示：候选
     声明的延续谱系与卡自身 family 不同时，**按候选声明取**——lineage
@@ -1619,6 +1687,10 @@ def _v3_gate_evaluate(ledger, card, *, cfg, ctx, cards_dir, strategy, spec,
         return {
             "passed": bool(verdict["passed"]),
             "mode": "event",
+            # T151-4/D66：本次事件判决的裁决代码指纹（validation/events.py
+            # + bt.py 事件分支 + 日历工件哈希）——随 V3 details 入台账，
+            # 与 runs.verdict_code_sha / LockboxTrial 同一身份。
+            "verdict_code_sha": ctx.get("verdict_code_sha"),
             "primary": primary,
             "vetoes": {"cost_scale_x15": cost_scale, "delay_1_bar": delay,
                        "buyhold_excess": buyhold},
@@ -1749,6 +1821,17 @@ def _g5_orchestrate(ledger, card, *, strategy, spec, params, base_summary,
     expected_trades = 样本内交易频率（基准运行 trade_count / 研究段 bar 数）
     × 锁箱评估窗 bar 数。
     """
+    # T151/D65（第十六轮，保护性）：事件模式卡（轮次 [evaluation]
+    # mode="event"）的 G5 在 begin_lockbox 之前拒绝——事件模式 G5 的设计
+    # 未经外部审核批准（现在的 _g5_orchestrate 只会回测 bar 级策略类，
+    # H16-1：白白消耗三次锁箱中的一次）；C005 不申请 G5（T150）。
+    if _round_eval_mode(card) == "event":
+        raise ValueError(
+            f"卡 {card.id} 是事件模式卡（轮次 [evaluation] mode=\"event\"）"
+            "——事件模式 G5 设计未经外部审核批准，拒绝执行（D65：在 "
+            "begin_lockbox 之前拒绝，不消耗锁箱一次性；H16-1——现行 G5 "
+            "编排回测的是 bar 级策略类而非事件收益）。事件模式 G5 的设计"
+            "经外部审核批准前，任何会话不得执行（施工计划 §5 停止条件）")
     # 1) 参照分布（获准 G3 的样本外收益；任何失败都发生在 begin_lockbox
     #    之前，不消耗锁箱一次性）
     reference, reference_binding = _g3_reference_returns(
@@ -3780,7 +3863,8 @@ def _bind_h_strategy(strategy, ctx, symbol):
     return strategy
 
 
-def _h_event_setup(ctx, symbol, bars, kind, params, *, fomc=None):
+def _h_event_setup(ctx, symbol, bars, kind, params, *, fomc=None,
+                   strategy=None):
     from mt5quant.validation import events as vevents
     declared = ctx["declared"]
     signal_symbol = declared.signal_symbol or symbol
@@ -3839,7 +3923,42 @@ def _h_event_setup(ctx, symbol, bars, kind, params, *, fomc=None):
     # Scheduled future sessions remain in the anchor calendar, but the frozen
     # randomizer receives only calendar days with observed trade timestamps.
     days = days.intersection(times.normalize().unique())
+    # T151-2/D66（事件引擎消费端最小适配）：事件窗信号策略（声明
+    # generates_event_window_signals 的类）在此拿到**本次运行的事件窗**与
+    # 显式交易日历——bar 级基线运行（引擎 A）即事件窗形状，与
+    # event_returns 同一事件集。只注入声明标记的类（b7 等既有策略类零
+    # 改动、信号路径不变）；strategy=None 的既有调用零变化。
+    if strategy is not None and getattr(
+            strategy, "generates_event_window_signals", False):
+        strategy.event_windows = list(events)
+        if strategy.event_calendar is None:
+            strategy.event_calendar = raw
+        # F-1（T151 聚焦评审 2026-11-07）：同一注入（事件窗+显式日历）按
+        # 品种记入 ctx——screen 组合回测逐组合新建实例，凭此把装配段注入
+        # 传播到每组合实例（gate 路径用持久实例，不读该记录）。
+        ctx.setdefault("event_window_injection", {})[symbol] = (
+            list(events), raw)
     return events, days, side_fn
+
+
+def _event_trade_reconciliation(ctx, symbol, strategy, trade_count):
+    """F-2（T151 聚焦评审 2026-11-07）：事件窗基线的运行时逐事件对账。
+
+    装配段 usable_events（= event_returns 登记口径的同一事件集的事件数）
+    vs 引擎成交数：信号日（锚日前一显式交易日）无观测 bar 时引擎按缺
+    bar fail-closed 静默丢该事件——成交语义正确、不改；缺的是可见性。
+    本函数把差值显式化（dropped_events 计数 + 告警文案），由 screen/gate
+    输出并随 summary/关卡 details 入台账。仅对显式标记
+    ``generates_event_window_signals`` 的类（1 事件 1 成交契约）对账；
+    其余路径返回 None（零行为变化）。"""
+    if ctx is None or not getattr(
+            type(strategy), "generates_event_window_signals", False):
+        return None
+    usable = (ctx.get("usable_events") or {}).get(symbol)
+    if usable is None:
+        return None
+    return {"usable_events": int(usable), "trades": int(trade_count),
+            "dropped_events": int(usable) - int(trade_count)}
 
 
 def _fomc_event_binding(args):
@@ -3946,6 +4065,31 @@ def _verify_fomc_registration(report, precheck, cli_sha256) -> dict:
             "checked": checked}
 
 
+def _generates_event_window_signals(strategy) -> bool:
+    """T151-5/D66：策略类是否生成事件窗信号。
+
+    判定（b7 等既有策略类零改动）：
+    - 显式标记 ``generates_event_window_signals = True``（T151 起的事件窗
+      信号类，如 PreFomcAnnouncementDrift）；
+    - 或类自身（MRO 上先于 BuyHold/BaseStrategy 脚手架基类）覆写了
+      ``generate_signals``——b7（MonthEndHedgeRebalance）先例；H16-2 的
+      反例正是旧 PreFomc 继承 BuyHold.generate_signals（信号恒 1），
+      解析到脚手架基类即 False。
+    """
+    cls = type(strategy)
+    if getattr(cls, "generates_event_window_signals", False) is True:
+        return True
+    from mt5quant.strategies.base import BaseStrategy
+    from mt5quant.strategies.library.buy_hold import BuyHold
+    scaffolds = (BuyHold, BaseStrategy)
+    for base in cls.__mro__:
+        if base in scaffolds or base is object:
+            return False                # 到脚手架基类仍无自身实现 → 不生成
+        if "generate_signals" in base.__dict__:
+            return True
+    return False
+
+
 def _h_preflight(ctx, strategy, card, *, event_kind=None, fomc=None):
     """Check all event windows and auxiliary anchors before any calculation."""
     if ctx is None:
@@ -3957,11 +4101,33 @@ def _h_preflight(ctx, strategy, card, *, event_kind=None, fomc=None):
     is_event = _round_eval_mode(card) == "event"
     if is_event and kind is None:
         raise ValueError("event research requires --event-kind before screen/gate baseline")
+    # T151-5/D66（H16-2）：事件模式卡的策略类**不生成事件窗信号**（如
+    # BuyHold 脚手架——被检验的将是事件收益，将来交易的代码从没被检验）
+    # → 直接拒绝运行（screen/gate 装配段，零 runs）。
+    if is_event and not _generates_event_window_signals(strategy):
+        raise ValueError(
+            f"事件模式卡（轮次 [evaluation] mode=\"event\"）的策略类 "
+            f"{type(strategy).__name__} 不生成事件窗信号（D66 所测即所交易："
+            "继承 BuyHold/BaseStrategy 脚手架信号——bar 级基线与关卡记录"
+            "描述的不是事件窗交易）。直接拒绝运行；策略类必须实现事件窗"
+            "信号（参照 b7/PreFomcAnnouncementDrift 先例）")
     if not is_event and native_kind is None:
         return
     for symbol, bars in ctx["bars"].items():
         _bind_h_strategy(strategy, ctx, symbol)
-        _h_event_setup(ctx, symbol, bars, kind, {}, fomc=fomc)  # availability uses timestamps only
+        _h_event_setup(ctx, symbol, bars, kind, {}, fomc=fomc,
+                       strategy=strategy)  # availability uses timestamps only
+    # T151-5/D66：事件窗信号类在研究装配后必须实际持有注入的事件窗
+    # （构造注入或 _h_event_setup 注入）——不得静默以同序列近似事件集
+    # 跑研究（PreFomc 的无日历回落仅诊断）。
+    if is_event and getattr(type(strategy), "generates_event_window_signals",
+                            False) and getattr(strategy, "event_windows",
+                                               None) is None:
+        raise ValueError(
+            f"事件模式研究的事件窗未注入策略实例（{type(strategy).__name__}"
+            ".event_windows 为空）——研究事件集必须来自冻结日历工件/显式"
+            "交易日历（构造注入或 bt._h_event_setup 装配注入），不得静默"
+            "用同序列近似事件集（D66 fail-closed）")
 
 
 def _h_coverage_report(ctx):
@@ -4075,6 +4241,7 @@ def cmd_screen(args) -> int:
             h_declared = _h_declared(ledger, card, actor=actor,
                                       event_side=getattr(args, "event_side", None))
             h_ctx = None
+            _event_inject = {}   # F-1：装配段注入的事件窗+日历（按品种）
             if h_declared is not None:
                 from mt5data.ext.merge import merged_research_series
                 h_ctx = _load_h_research_inputs(
@@ -4085,6 +4252,11 @@ def cmd_screen(args) -> int:
                 _h_preflight(h_ctx, strategy_cls(), card,
                              event_kind=getattr(args, "event_kind", None),
                              fomc=fomc_binding)
+                # F-1（T151 聚焦评审 2026-11-07）：_h_preflight 的一次性
+                # 实例注入后即丢弃——注入载荷（事件窗+显式日历，按品种）
+                # 已记入 h_ctx["event_window_injection"]，组合回测逐组合
+                # 实例据此传播同一注入（见 _combo_strategy）。
+                _event_inject = h_ctx.get("event_window_injection") or {}
             else:
                 bars_by_sym = {sym: load_series(data_root, sym,
                                                 card.timeframe, args.end,
@@ -4198,6 +4370,22 @@ def cmd_screen(args) -> int:
 
         gates_hash = _gates_hash()
         combos = card.param_grid()
+
+        # F-1（T151 聚焦评审 2026-11-07）：screen 组合回测逐组合新建策略
+        # 实例——对显式标记 generates_event_window_signals 的类，把装配段
+        # （_h_preflight → _h_event_setup）注入的同一事件窗+显式交易日历
+        # 按品种传播到每组合实例；否则该实例无注入、bar 级基线会静默跑
+        # 同序列近似事件集（评审 F-1，与"不得静默以近似事件集跑研究"的
+        # D66 主张矛盾）。gate 路径用持久实例（bt 装配段直接注入），不经
+        # 此处；非标记类（b7 等）零改动。
+        def _combo_strategy(sym):
+            s = _bind_h_strategy(strategy_cls(), h_ctx, sym)
+            payload = _event_inject.get(sym)
+            if payload is not None and getattr(
+                    type(s), "generates_event_window_signals", False):
+                s.event_windows, s.event_calendar = payload
+            return s
+
         failed = 0
         # P-10：P 卡（probability / P2 决策卡）成功行入账带原子预算上限
         # （检查与写入同一事务）；H 卡不带——共享路径行为逐位不变。
@@ -4222,7 +4410,7 @@ def cmd_screen(args) -> int:
             data_first = pd_iso(times.iloc[0])
             data_last = pd_iso(times.iloc[-1])
             try:
-                _bind_h_strategy(strategy_cls(), h_ctx, sym)
+                _combo_strategy(sym)
             except ValueError as exc:
                 print(f"✗ {exc}")
                 return 1
@@ -4269,9 +4457,10 @@ def cmd_screen(args) -> int:
                           "被拒（不记 runs）")
                     continue
                 try:
+                    combo_st = _combo_strategy(sym)   # F-1：同一注入传播
                     if sizing is not None:
                         result = run_backtest(
-                            _bind_h_strategy(strategy_cls(), h_ctx, sym), bars, costs_by_sym[sym], symbol=sym,
+                            combo_st, bars, costs_by_sym[sym], symbol=sym,
                             params=dict(params), contract_size=sizes[sym],
                             volume_lots=None, sizing=sizing,
                             vol_min=vols_by_sym[sym][0],
@@ -4282,7 +4471,7 @@ def cmd_screen(args) -> int:
                             session_policy=policy_by_sym[sym])
                     else:
                         result = run_backtest(
-                            _bind_h_strategy(strategy_cls(), h_ctx, sym), bars, costs_by_sym[sym], symbol=sym,
+                            combo_st, bars, costs_by_sym[sym], symbol=sym,
                             params=dict(params), contract_size=sizes[sym],
                             volume_lots=lots,
                             initial_capital=args.initial_capital,
@@ -4307,6 +4496,23 @@ def cmd_screen(args) -> int:
                     if h_ctx is not None:
                         summary["runtime_coverage"] = h_ctx["coverage"]
                         summary["usable_events"] = h_ctx.get("usable_events")
+                        # F-2（T151 聚焦评审 2026-11-07）：运行时逐事件
+                        # 对账——引擎成交数 vs 装配段事件数（event_returns
+                        # 同一事件集）；不等 → 显式告警行 + dropped_events
+                        # 随 metrics 入台账（丢事件是缺 bar fail-closed 的
+                        # 正确行为，不改成交语义；缺的是可见性）。
+                        _rec = _event_trade_reconciliation(
+                            h_ctx, sym, combo_st, summary["trade_count"])
+                        if _rec is not None:
+                            summary["dropped_events"] = _rec["dropped_events"]
+                            if _rec["dropped_events"]:
+                                print(f"⚠ {label} 事件对账：引擎成交 "
+                                      f"{_rec['trades']} 笔 < 事件 "
+                                      f"{_rec['usable_events']} 个 → "
+                                      f"dropped_events={_rec['dropped_events']}"
+                                      "（信号日缺 bar 的事件被引擎按缺 bar "
+                                      "fail-closed 丢弃、不进 bar 级基线；"
+                                      "V3 主检验 event_returns 仍登记全事件集）")
                     summary["sizing"] = dict(   # T23：定手数方式随 metrics 落台账
                         sizing_info,
                         vol_min=vols_by_sym[sym][0] if vols_by_sym else None,
@@ -4510,6 +4716,17 @@ def cmd_gate(args) -> int:
         fomc_binding = _fomc_event_binding(args)
     except ValueError as e:
         print(f"✗ {e}")
+        return 1
+    # T151/D65 预检（事件模式卡的 G5）：先于数据根/研究库/一次性/预算
+    # 检查与 begin_lockbox **之前**拒绝——事件模式 G5 的设计未经外部
+    # 审核批准，不烧一次性、不跑任何运行（第十六轮 H16-1/P16-1；
+    # 施工计划 §5 停止条件：T151 代码拒绝落地之前任何会话不得执行，
+    # 拒绝理由按 D65 归类，不落进 R6/C6 数据根口径）。
+    if "G5" in wanted and _round_eval_mode(card) == "event":
+        print("✗ 事件模式卡（轮次 [evaluation] mode=\"event\"）的 G5 "
+              "被拒（D65：事件模式 G5 设计未经外部审核批准——在 "
+              "begin_lockbox 之前拒绝，不消耗锁箱一次性）。C005 不申请 "
+              "G5（T150）；事件模式 G5 设计获批前任何会话不得执行")
         return 1
     # T38/D24 + R6/C6：G5 需读主库锁箱段，且**主库校验对所有数据根模式
     # 生效**——研究库（缺省数据根）没有锁箱段，一律拒绝（即使已
@@ -4818,11 +5035,21 @@ def cmd_gate(args) -> int:
             if h_ctx is not None and (v3_ctx or {}).get("mode") == "event":
                 v3_ctx["event_setup"] = _h_event_setup(h_ctx, symbol, bars,
                                                       v3_ctx["kind"], params,
-                                                      fomc=fomc_binding)
+                                                      fomc=fomc_binding,
+                                                      strategy=strategy)
                 v3_ctx["side_rule"] = h_declared.side_rule
         except ValueError as exc:
             print(f"✗ {exc}")
             return 1
+        # T151-4/D66：事件模式试验身份的裁决代码指纹——validation/events.py
+        # + bt.py 事件分支 + 日历工件哈希（_verdict_code_sha 的组成逐字见
+        # D66）。进 runs 行（新列）、reservation trial_key（extra，占位身份
+        # 随之区分）与 LockboxTrial；bar 级卡恒 None（行为不变）。
+        verdict_code_sha = None
+        if (v3_ctx or {}).get("mode") == "event" and h_ctx is not None:
+            verdict_code_sha = _verdict_code_sha(
+                calendar_component=_event_calendar_component(h_ctx, symbol))
+            v3_ctx["verdict_code_sha"] = verdict_code_sha
         # 基准运行（引擎 A）：先入台账（失败的也记），关卡结果挂在它名下
         data_first, data_last = pd_iso(bars["time"].iloc[0]), pd_iso(bars["time"].iloc[-1])
         rec_params, _unused = _prob_run_fields(fit_ctx, params, None)
@@ -4834,7 +5061,8 @@ def cmd_gate(args) -> int:
             engine_version=ENGINE_VERSION, cost_model_version=cost_version,
             gates_hash=gsha, actor=actor, strategy_sha=strategy_sha,
             run_class=run_class,
-            round_id=(round_ctx or {}).get("round_id"))
+            round_id=(round_ctx or {}).get("round_id"),
+            verdict_code_sha=verdict_code_sha)   # T151-4/D66：事件模式裁决指纹
         # X-01：reservation 口径轮——基准回测**之前**占位（预算拒绝发生在
         # 计算之前，零回测/关卡调用）+ advance reached_primary；同 trial_key
         # 幂等（screen→gate 同身份不被已占自己的最后额度堵死）。
@@ -4846,13 +5074,16 @@ def cmd_gate(args) -> int:
                 _gate_tk = _pre_gate_key
                 _pre_gate_key = None      # 只消费一次
             else:
+                _extra = ({"model_sha256": fit_ctx["model_sha"]}
+                          if fit_ctx is not None else None)
+                if verdict_code_sha is not None:   # T151/D66：裁决指纹进占位身份
+                    _extra = {**(_extra or {}), "verdict_code_sha": verdict_code_sha}
                 _gate_tk = _trial_key(
                     strategy=args.strategy, params=rec_params, symbol=symbol,
                     timeframe=card.timeframe, data_sha256=dsha,
                     cost_model_version=cost_version,
                     strategy_sha=strategy_sha,
-                    extra=({"model_sha256": fit_ctx["model_sha"]}
-                           if fit_ctx is not None else None))
+                    extra=_extra)
             try:
                 resv.reserve(_gate_tk)
             except TrialBudgetExceededError as e:
@@ -4860,6 +5091,7 @@ def cmd_gate(args) -> int:
                       "计算前占位）")
                 return 1
             resv.advance(_gate_tk, "reached_primary")
+        dropped_rec = None   # F-2：基准运行逐事件对账结果（关卡 details 用）
         try:
             base_kwargs = dict(symbol=symbol, params=dict(params),
                                contract_size=sizes[symbol],
@@ -4890,6 +5122,24 @@ def cmd_gate(args) -> int:
             if h_ctx is not None:
                 summary["runtime_coverage"] = h_ctx["coverage"]
                 summary["usable_events"] = h_ctx.get("usable_events")
+                # F-2（T151 聚焦评审 2026-11-07）：基准运行逐事件对账——
+                # 引擎成交数 vs 装配段事件数；不等 → 显式告警行 +
+                # dropped_events 随 metrics/关卡 details 入台账（丢事件是
+                # 缺 bar fail-closed 的正确行为，不改成交语义）。
+                dropped_rec = _event_trade_reconciliation(
+                    h_ctx, symbol, strategy, summary["trade_count"])
+                if dropped_rec is not None:
+                    summary["dropped_events"] = dropped_rec["dropped_events"]
+                    if dropped_rec["dropped_events"]:
+                        print(f"⚠ run 基准事件对账：引擎成交 "
+                              f"{dropped_rec['trades']} 笔 < 事件 "
+                              f"{dropped_rec['usable_events']} 个 → "
+                              f"dropped_events="
+                              f"{dropped_rec['dropped_events']}"
+                              "（信号日缺 bar 的事件被引擎按缺 bar "
+                              "fail-closed 丢弃、不进 bar 级基线与 G1/G2 "
+                              "诊断材料；V3 主检验 event_returns 仍登记全"
+                              "事件集，计数随关卡 details 入台账）")
             summary["sizing"] = dict(
                 sizing_info,
                 vol_min=(vols_by_sym[symbol][0] if vols_by_sym else None),
@@ -4986,11 +5236,31 @@ def cmd_gate(args) -> int:
         def _run_recorded(name, fn):
             _run(name, fn)
             details = dict(results[name])
+            # T151-5/D66（第十六轮）：事件模式下 bar 级 G1–G4 明确标
+            # "诊断，不进判定"——标记随关卡 details 入台账（机器可审计），
+            # 报告与退出码同口径；passed 照实登记（数据保留），不改变
+            # 关卡结论（判定 = V3 事件分支 + G0 数据卫生否决）。
+            if (v3_ctx or {}).get("mode") == "event" \
+                    and name in ("G1", "G2", "G3", "G4"):
+                _diag_note = ("事件模式：bar 级 G1–G4 为诊断，不进判定"
+                              "（D66——主检验与否决在 V3 事件分支；本行 "
+                              "passed 照实登记，不进关卡判定）")
+                details["diagnostic_only"] = True
+                details["diagnostic_note"] = _diag_note
+                results[name]["diagnostic_only"] = True
+                results[name]["diagnostic_note"] = _diag_note
             # M5：参数选择过程（候选数、选中 run_id）随每个关卡落台账
             details["params_selection"] = selection
             if h_ctx is not None:
                 details["runtime_coverage"] = h_ctx["coverage"]
                 details["usable_events"] = h_ctx.get("usable_events")
+                # F-2（T151 聚焦评审 2026-11-07）：基准运行的逐事件对账
+                # 计数随每个关卡 details 入台账（机器可审计——缺 bar 丢
+                # 事件不再静默）。
+                if dropped_rec is not None:
+                    details["dropped_events"] = dropped_rec["dropped_events"]
+                    results[name]["dropped_events"] = \
+                        dropped_rec["dropped_events"]
                 # F1：FOMC 日历事件登记报告（calendar_sha256/主段窗池界/
                 # 登记比对结果/丢弃登记）随关卡 details 入台账——机器审计
                 # 链不断（fomc 分支之外恒 None，不落入 details）。
@@ -5099,11 +5369,13 @@ def cmd_gate(args) -> int:
             _run_recorded("G4", _g4)
         if "V3" in wanted or "G5" in wanted:
             # X-02：本次运行的试验身份（V3 的 G3 参照回退与 G5 准入同一
-            # 绑定——参数/数据哈希/成本版本/代码指纹/冻结门槛）
+            # 绑定——参数/数据哈希/成本版本/代码指纹/冻结门槛）；
+            # T151/D66：事件模式另带裁决代码指纹（bar 级 None，行为不变）
             run_trial = vgate.LockboxTrial(
                 params=rec_params, data_sha256=dsha,
                 cost_model_version=cost_version,
-                strategy_sha=strategy_sha, gates_hash=gsha)
+                strategy_sha=strategy_sha, gates_hash=gsha,
+                verdict_code_sha=verdict_code_sha)
         else:
             run_trial = None
         if "V3" in wanted:
@@ -5134,6 +5406,18 @@ def cmd_gate(args) -> int:
                 approved_by=args.approved_by or args.actor, cfg=cfg))
 
         report = vgate.render_gate_report(card.id, params, results)
+        # T151-5/D66：事件模式报告明确标注 bar 级 G1–G4 的诊断地位。
+        if (v3_ctx or {}).get("mode") == "event":
+            _diag_gates = [g for g in ("G1", "G2", "G3", "G4") if g in results]
+            report += (
+                "\n## 事件模式诊断关卡（T151/D66）\n\n"
+                f"- bar 级 {('、'.join(_diag_gates)) or '—'} 本轮为"
+                "**诊断，不进判定**——事件模式的判定 = 关卡 V3 事件分支"
+                "（随机化参照主检验 + 成本 ×1.5 否决 + G0 数据卫生）。\n"
+                f"- 试验身份 verdict_code_sha="
+                f"{(verdict_code_sha or '—')[:12]}"
+                + ("…（validation/events.py + bt.py 事件分支 + 日历工件"
+                   "哈希，D66）\n" if verdict_code_sha else "（bar 级不适用）\n"))
         if h_ctx is not None:
             report += _h_coverage_report(h_ctx)
         if selection["selection"] == "auto":
@@ -5249,7 +5533,12 @@ def cmd_gate(args) -> int:
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(report, encoding="utf-8")
             print(f"报告：{out}")
-        return 0 if all(r["passed"] for r in results.values()) else 1
+        # T151-5/D66：退出码按**判定关卡**计算——事件模式下被标
+        # diagnostic_only 的 bar 级 G1–G4 不进判定（其失败不改变本轮
+        # 关卡结论）；非事件路径 results 无该标记，行为逐位不变。
+        _verdict_results = {g: r for g, r in results.items()
+                            if not r.get("diagnostic_only")}
+        return 0 if all(r["passed"] for r in _verdict_results.values()) else 1
 
 
 # ---------------------------------------------------------------- ledger stats

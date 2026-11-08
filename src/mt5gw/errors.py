@@ -45,15 +45,27 @@ class RETCode:
     PLACED = 10008
     DONE = 10009
     DONE_PARTIAL = 10010
+    # T140（第十六轮 O16-2）：补齐 MQL5 文档中的确定态拒单码——此前缺失
+    # 10021 等码，11-05 14:22 的 "10021 No prices" 拒单只能按"未知返回码"
+    # 落日志/告警。
+    INVALID_REQUEST = 10013     # TRADE_RETCODE_INVALID：请求无效
     INVALID_PRICE = 10015  # noqa: 保留语义映射（部分券商市价单要求参考价）
     INVALID_VOLUME = 10014
     INVALID_STOPS = 10016
     TRADE_DISABLED = 10017
     MARKET_CLOSED = 10018
     NO_MONEY = 10019
+    PRICE_CHANGED = 10020       # TRADE_RETCODE_PRICE_CHANGED：价格已变化
+    PRICE_OFF = 10021           # TRADE_RETCODE_PRICE_OFF：无报价可处理请求
+    TOO_MANY_REQUESTS = 10024   # TRADE_RETCODE_TOO_MANY_REQUESTS：请求过频
     INVALID_FILL = 10030
     AUTO_TRADING_DISABLED = 10027  # 客户端（终端）侧未开启自动交易
-    CLIENT_DISABLED = 10031  # 客户端禁止此类交易
+    # T140（O16-7 更正）：MQL5 文档中 10031 是 TRADE_RETCODE_CONNECTION
+    #（与交易服务器无连接），不是"客户端禁止此类交易"；10027 才是终端侧
+    # 禁自动交易。旧名 CLIENT_DISABLED 已移除。
+    NO_CONNECTION = 10031
+    LIMIT_ORDERS = 10033        # TRADE_RETCODE_LIMIT_ORDERS：挂单数达上限
+    LIMIT_VOLUME = 10034        # TRADE_RETCODE_LIMIT_VOLUME：总量达上限
 
 
 _RETCODE_TEXT = {
@@ -64,16 +76,29 @@ _RETCODE_TEXT = {
     RETCode.PLACED: "订单已受理（成交未确认）",
     RETCode.DONE: "请求已完成",
     RETCode.DONE_PARTIAL: "请求部分成交",
+    RETCode.INVALID_REQUEST: "请求无效（缺必填字段或字段值非法）",
     RETCode.INVALID_PRICE: "请求中的价格无效",
     RETCode.INVALID_VOLUME: "请求中的订单量无效",
     RETCode.INVALID_STOPS: "请求中的止损/止盈无效",
     RETCode.TRADE_DISABLED: "交易被禁用",
     RETCode.MARKET_CLOSED: "市场关闭",
     RETCode.NO_MONEY: "资金不足",
+    RETCode.PRICE_CHANGED: "价格已变化（请求发出后报价变动，需重新请求）",
+    RETCode.PRICE_OFF: "无报价可处理请求（No prices）",
+    RETCode.TOO_MANY_REQUESTS: "请求过于频繁（服务器限流）",
     RETCode.INVALID_FILL: "不支持的成交方式（filling mode）",
     RETCode.AUTO_TRADING_DISABLED: "终端未开启自动交易（Algo Trading 按钮）",
-    RETCode.CLIENT_DISABLED: "客户端禁止此类交易",
+    RETCode.NO_CONNECTION: "与交易服务器无连接（TRADE_RETCODE_CONNECTION）",
+    RETCode.LIMIT_ORDERS: "挂单数量已达账户上限",
+    RETCode.LIMIT_VOLUME: "订单与持仓总量已达账户上限",
 }
+
+# T140（O16-7）：断线语义的 retcode。10031 在 MQL5 中是 TRADE_RETCODE_
+# CONNECTION（与交易服务器无连接）——此前误标为"客户端禁止此类交易"会把
+# 断线误导成配置问题。本次只更正描述与归类（网关仍按确定态被拒上抛
+# TradeRejectedError，describe_retcode/日志按断线口径呈现）；断线的
+# 有界重连与不退出处理属 T141，不在本层做。
+DISCONNECTION_RETCODES = frozenset({RETCode.NO_CONNECTION})
 
 
 def describe_retcode(retcode: int) -> str:

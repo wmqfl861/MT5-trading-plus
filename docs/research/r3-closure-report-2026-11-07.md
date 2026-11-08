@@ -1,0 +1,288 @@
+# R3 轮次关闭报告——C005（Pre-FOMC 公告前漂移，H102/USTEC D1，事件模式）
+
+2026-11-07。执行=T150（施工计划 docs/handoff/2026-11-08-round16-plan.md T150 逐字）；
+关轮路径=run6 授权裁定 docs/reviews/2026-11-07-r3-run6-authorization-ruling.md §4
+（V3 行出现后）。本报告与引擎自动骨架 `docs/research/round-R3-2026-11-07.md`
+（`bt round close R3` 生成）并列；台账（研究库 `data/research/ledger.sqlite`）为
+唯一权威记录，本文全部数字直读台账或按注明的来源转录/机械重算。
+
+---
+
+## 0. 结论（先行）
+
+- **C005 主检验判定：通过**（run#452 V3 行，gates rowid 89，passed=1：
+  随机化参照检验单侧 p=0.0085 ≤ α/N=0.05/2=0.025；G0 通过；唯一适用
+  否决项成本 ×1.5 后每事件净均值 +0.0033856>0 通过；诊断四项只报告）。
+- **C005 定位：历史复现**。不申请 G5（D65）；不进入 Demo 路线（D68）；
+  只有当它成为某个每年独立观测数多得多的组合的一部分时才重新考虑
+  （详见 §9，T150 第 3 条逐字）。
+- **R3 已按引擎正式命令关闭**（2026-11-07T13:28:37Z，close_rule (a)(b)
+  同时到达；台账链校验 problems=[]，见 §1）。
+
+---
+
+## 1. 关闭事实与台账终态
+
+- 关闭命令（研究库 cwd，主树 bt.py——blob==065abf7==run6 运行版，解释器=研究库 .venv）：
+
+  ```
+  ✓ 轮次 R3 已关闭（T63/D32）：报告骨架
+  <workspace>\docs\research\round-R3-2026-11-07.md；
+  该轮的卡不能再运行（screen/gate 拒），runs 已带 round_id 如实留痕；后续试验须预注册新轮次
+  ```
+
+  （全文留档：研究库 `.superpowers/sdd/2026-11-07-r3-main-test-run6/t150-round-close-output.txt`）
+
+- 台账写入恰一处：rounds 表 R3 行 `open→closed`（closed_utc=
+  2026-11-07T13:28:37.194341+00:00）+ ledger_events 第 4 行
+  （`rounds / round_id=R3 / open->closed`）。runs（max=452）与 gates
+  （max rowid=89）零改动；trial_reservations 仍 1 行；lockbox_uses/
+  lockbox_budget 仍 0 行。关闭前后全量状态留档：同目录
+  `t150-preclose-ledger-state.txt`（文件 sha256 95fe98a2…）与
+  `t150-postclose-ledger-state.txt`（daab68f3…）。
+- 链校验（临时副本 verify_chain）：关闭前 problems=[]、关闭后
+  problems=[]。
+- 预算终态（两口径并列，均台账事实）：
+  - **close_rule 口径 2/2 已用尽**——run#451（主规格，2026-11-07T00:47:20Z）
+    + run#452（代码修复后重跑，2026-11-07T07:21:59Z）＝预注册注释
+    "1 次主规格 + 1 次代码修复后的重跑"两个槽位全部消费（处置裁定
+    §5"路径 A 终态：第 2 次运行落账后 2/2，close_rule (a)(b) 同时触发"；
+    run6 授权裁定 Case D 同口径"预算已 2/2——R3 内无修复重跑空间"）。
+  - **引擎七元组去重计数器 1/2**——run#451/run#452 七元组恒等（§2），
+    `round_n_dedup(R3)=1`（与 R1 关闭报告"试验预算 1/2 七元组去重口径"
+    同口径；主检验 N 的取数用 G4/V3 的 project_n_dedup_rounds=2，
+    见 §4）。
+- G5 用量 0/1（lockbox_uses 0 行）：**未使用、不申请**（R3.toml 明文
+  "锁箱使用需另经批准"；D65——详见 §9）。
+
+## 2. 身份核对（run#452 vs run#451，台账 mode=ro 逐项直查）
+
+| 字段 | run#451 | run#452 | 恒等 |
+| --- | --- | --- | --- |
+| strategy | mt5quant.strategies.library.fomc_preannouncement:PreFomcAnnouncementDrift | 同左 | ✓ |
+| params_json | `{}` | `{}` | ✓ |
+| symbol | USTEC | USTEC | ✓ |
+| timeframe | D1 | D1 | ✓ |
+| data_sha256 | h-input-v1:f233c9bb…f84f645 | 同左（逐字节） | ✓ |
+| cost_model_version | tick-spread-p90[rel@NY/bar_open_m1#abed3b8f]+slip0.1-comm0-cli-swap-snapshot[d5b50486]-relref[257d0355]-no-overshoot-missNY[17]-sess[76278259] | 同左（逐字节） | ✓ |
+| strategy_sha | 8742cd4f53ab5dc8c2e5168fc4388ba1309a83b1b04b5905949bdf1da3f1d780 | 同左 | ✓ |
+
+辅助字段同样恒等：card H102 v1、data_first 1986-01-02、data_last
+2025-10-23、engine A-1.7、gates_hash d0a8b2f3…、actor bt-gate、
+round_id R3、run_class research。→ 七元组恒等，去重=1 次研究试验，
+primary_test_n 的 N 组成不变（§4）。
+
+**V3 行归属**：全台账 V3 行恰两条——rowid 77/run#450（R1，passed=0）
+与 **rowid 89/run#452（R3，passed=1）**；run#451 无 V3 行（run5 被
+外部终止，run5 报告在案）。run#452 关卡行 84-89：
+G0 ✓ / G1 ✗ / G2 ✗ / G3 ✓ / G4 ✗ / **V3 ✓**。
+
+## 3. advance_rule 机械判定（冻结 R3.toml，toml_sha256=72dc6403…，钉定未动）
+
+| 判定项（advance_rule 原文要素） | 台账事实 | 判定 |
+| --- | --- | --- |
+| 主检验 = 随机化参照检验，单侧 p ≤ α/N（α=0.05；N 按台账实际取数） | V3 行：p=0.0085，threshold=0.025（n_tests=2＝G4 project_n_dedup_rounds 实际取数）；随机化 1999 次 ≥ max(1999, ⌈20N/α⌉=800)；事件从同一冻结日历工件（a53577d9…，64 字符 SHA 绑定）与同一主段交易日历抽取，方向 static_long | **过** |
+| G0 通过 | run#452 gates rowid 84：passed=1（truncation/window/window_sweep violations 与 static_findings 全空；usable_events USTEC=213） | **过** |
+| 否决仅一项适用 = 成本 ×1.5 后每事件净均值 > 0（swap_free 申报口径） | V3 行：net_mean_scaled=+0.0033856041（scale=1.5，n=213）> 0 | **过** |
+| "延迟一根"与"多头相对买入持有超额"不适用、不运行 | V3 行两项 applicable=false、passed=true（[v3.event] 两 veto=false） | 不适用（如登记） |
+| 诊断四项只报告不否决 | 见 §5/§8；window_shift_1_bar 降级行 passed=True（范围裁定 2026-11-07-v3-diag-degrade-scope-ruling §2/§3.1，钉定测试断言 5+evaluate_v3 结构保证不进关卡结论） | 不进判定 |
+
+**判定结论：通过**（台账事实与 R3.toml 判定项全部相符，无停下报告事项）。
+
+确定性预期对照（run6 授权裁定 §4.1，仅异常检测）：observed=+0.0035718 ✓、
+p=0.0085 ✓、成本 ×1.5 净均值 +0.0033856 ✓、seed=10640155159524715549
+（G4 details 与 run5 离线复现一致）✓——零偏离。
+
+## 4. 主检验结果（V3 行全文摘录，gates rowid 89 / run#452 / passed=1）
+
+```
+mode = event；primary.test = randomization
+p_value = 0.0085                     单侧随机化参照检验
+threshold = 0.025                    α=0.05 / N=2
+n_tests = 2                          N 组成：project_n_dedup_rounds=2（轮次内跨轮去重）
+                                     + lineage_n_dedup=0（C005 全新机制，无延续谱系）
+                                     = 2；pre_round_other_n_dedup=395 只报告不进门槛
+sims = 1999（draws_min=1999）        随机化次数达下限
+n_events = 213                       FOMC 默认事件集，主段窗 pool=[1986-01-02, 2021-05-17)
+observed_mean = +0.003571836737750819   （213 事件，dropped=0）
+null_mean = +0.0009019775120127234
+event_kind = fomc_calendar；event_side/side_rule = static_long
+vetoes.cost_scale_x15：net_mean_scaled=+0.0033856041007693993（×1.5，n=213）> 0 → 过
+vetoes.delay_1_bar / buyhold_excess：applicable=false（D35 修改 2）→ 不适用
+veto 汇总：G0=true，primary=true，cost_scale_x15=true，delay_1_bar=true，buyhold_excess=true
+failed_vetoes = []
+```
+
+诊断四项（只报告）：year_block_vs_zero p=0.003、mean=+0.0035718、28 年块；
+window_shift_1_bar 降级（见 §8 F2 义务）；segmented_means 见 §5；
+known_gaps hits=[]（无已知缺口与事件窗相交）。
+
+## 5. 分段均值
+
+**台账口径（V3 行 details.diagnostics.segmented_means 原文转录，固定 10 年段，
+entry_time 年分组）**：
+
+| 段 | 事件均值（净，相对价格/事件） |
+| --- | --- |
+| 1990-1999 | +0.0067362414 |
+| 2000-2009 | +0.0040797199 |
+| 2010-2019 | +0.0012600077 |
+| 2020-2029 | +0.0043964633 |
+
+**T150 三段（1994–2003、2004–2013、2014–2021-05）——台账分段口径与 T150
+三段不同，按 T150 三段从同一逐事件收益机械重算**：重算用生产函数在冻结输入
+上离线复算（研究库 `.superpowers/sdd/2026-11-07-r3-main-test-run6/
+t150-closure-segments.py/.json/.txt`），身份对 run#452 四项核对全 MATCH
+（data_sha256/cost_model_version/params/strategy_sha 前缀），且 **213 事件
+observed_mean 与上表 10 年段四桶均与台账逐位相同**（等价性锚点）；分段
+口径=同一 `segmented_means` 的 entry_time 年分组惯例，边界取
+1994-01-01 / 2004-01-01 / 2014-01-01 / 主段窗终点 2021-05-17（开区间）。
+
+| T150 段 | n | 事件均值 |
+| --- | --- | --- |
+| 1994–2003 | 75 | **+0.0037808413** |
+| 2004–2013 | 80 | **+0.0053473465** |
+| 2014–2021-05 | 58 | **+0.0008525933** |
+
+（213 事件恰全部落入三段，段外 0；首事件入场 1994-09-26——日历 era_start
+1994-09-27。）并列观察：最后一段（2014 起）均值约 8.5bp/事件，量级与
+H16-3 引用的文献"2016 年后约 9bp"一致（§8.4）。
+
+## 6. MT5 诊断段（2021-05 之后）均值——登记为非盲、不进主检验
+
+按 R3.toml advance_rule 原文："主段外（MT5 段与 FRED 2021-05-17 之后段）
+只作诊断、**标非盲**"，不进主检验、不进 N、不进判定。台账 V3 行分段诊断
+仅覆盖主段 213 事件，无该段数字；本文按同一冻结装配（日历工件同 SHA、
+成本/日历/序列同一）机械复算该段（同一离线脚本留档）：
+
+| 子段 | n | 事件均值 |
+| --- | --- | --- |
+| FRED 延长尾段 2021-05-17..2021-07-01 | 1（公告日 2021-06-16） | −0.0037478329 |
+| MT5 段 2021-07-02..2025-10-23 | 34 | **−0.0002874809** |
+| **合计（2021-05 之后全部）** | **35**（公告日 2021-06-16..2025-09-17） | **−0.0003863481** |
+
+35 事件全部可解析（dropped=0，无越过数据末尾事件）。**该段均值为负**
+（−3.9bp/事件）——与"历史复现、当下不可交易"的定位（§9）一致；再次
+强调该段为非盲诊断段，按登记不进主检验结论。
+
+## 7. 月末重叠子集（A1-D，机械分列，非否决项）
+
+来源：run5 报告 §6 / 离线复现 `v3-offline-replication.json`（a1d 节）；
+run6 与 run5 同确定性输入（§3 零偏离），数值可直接引用（run6 授权裁定
+总-3：可直接引用 run5 复现值并注明等价依据）。
+
+| 口径 | n | 净均值/事件 |
+| --- | --- | --- |
+| 全集 | 213 | **+0.0035718367** |
+| 月末重叠子集（15 日全匹配） | 15 | **−0.0011462301** |
+| 其余事件 | 198 | +0.0039292660 |
+
+月末子集加权贡献 −8.07e-05、占全集净和 −2.26%：**月末重叠子集为负贡献
+拖累项**，主检验效应由非月末事件驱动——"月末效应伪装"解释被数据否定。
+（15 个重叠日清单在 run5 报告 §6 与 `a1d-e7-obligations.txt`。）
+
+## 8. charged 口径夜数复检（E7）与 F2 报告义务
+
+### 8.1 E7（来源：run5 报告 §7；同确定性输入等价引用）
+
+- 引擎实测夜数分布 **{1 夜: 212 事件, 2 夜: 1 事件} = 214 夜 ≠ 申报
+  213×1.0**——恰好一个事件不符。唯一 2 夜事件=**fomc_calendar:2002-01-30**
+  （入场 2002-01-28 周一 → 出场 2002-01-30 周三；合并序列无 2002-01-29
+  bar——run1 纯日历枚举按周二入场近似，与实际装配差这一个事件）。
+- 申报口径 swap_free：登记 power 0.5949=pass（multiple 21.3864 /
+  implied_sharpe 0.39646）；**charged 并列参考 4.0740 / 0.31382 / 0.4475**
+  （multiple/implied_sharpe/power，decision=fail，非门控参考）逐值在案。
+- 引擎实际计费=点数快照最不利侧 −6.52/夜/手（相对价 0.00025902/夜，
+  参考价 25171.46）——即 **运行净额（含 observed_mean +0.0035718）已按
+  charged 口径扣除隔夜费**（保守侧）。E7 为机械复检义务：214≠213 如实
+  记录，不改判定。
+
+### 8.2 F2 读账义务（window_shift_1_bar 单标签不得误读）
+
+V3 行 `window_shift_1_bar.reason` 只含迭代序首个失败标签
+（`event unavailable: exact window missing for fomc_calendar:1996-07-03`）。
+**报告层并列真实计数 2/213**：1996-07-03 与 2002-01-30 两个事件的 strict
+平移副本不可解析（范围裁定 §0.3 确证、聚焦评审 F2）——不得把单标签
+误读为"仅一事件受影响"。该降级行 passed=True、只报告不否决。
+
+### 8.3 H16-3 数字（第十六轮审核 §3.2 原文数字，引用）
+
+- 主检验段 1994-09 至 2021-05 共 213 个事件，按每年 8 次估算，**约 62%
+  在 Lucca 与 Moench 的原作样本期（1994–2011）内**，约 80% 在 2016 年
+  之前。
+- Kurov 等的延伸样本：原作期平均约 49bp，2011–2015 有发布会的会议约
+  44bp，**2016–2019 约 9bp**（作者把下降归因于 2015 年底加息后不确定性
+  降低）。R3 观测净均值约 35.7bp/事件（扣基础成本后），与"历史上存在"
+  一致，不说明现在还在。
+- 按真实预筛的 σ=1.666%：**登记效应 24.5bp 时，单侧 α=0.025 下达到 50%
+  检验力约需 22 年；按 2016 年后的约 9bp，约需 165 年**（P16-6）。
+- **8 个事件的锁箱上，"期望 > 0"在无效应时通过 50%，登记效应时 66%，
+  似然比 1.32**——几乎不提供信息。
+- 收费口径（charged）的预筛检验力 **44.75% < 50%**。C005 只在免隔夜费
+  账户下过预筛门，真实账户的隔夜费状态未确认（U5）。
+
+## 9. C005 结论定位（T150 第 3 条逐字）
+
+**C005 的结论写"历史复现"**：
+
+- **不申请 G5（D65）**——R3 G5 用量 0/1，锁箱未开启；H16-1/H16-3 在案
+  （G5 事件模式走 bar 级策略类的缺陷 + 8 事件锁箱似然比 1.32 无区分力）。
+- **不进入 Demo 路线（D68）**。
+- **只有当它成为某个每年独立观测数多得多的组合的一部分时才重新考虑**。
+
+支撑事实（并列）：约 62% 事件在原作样本期内、2014-2021-05 段均值降至
+约 8.5bp、2021-05 之后非盲诊断段均值为负（−3.9bp/事件）、2016 年后
+9bp 口径下 50% 检验力约需 165 年、charged 口径检验力 44.75%<50%。
+
+## 10. run1–run6 执行史（四类机械故障 + 修复 + 授权链）
+
+R3 登记后约 11 小时内执行 5 次（run#451 入账 2026-11-07 00:47 UTC），
+出现 **4 类机械故障**，全部发生在装配段或载体层，零统计挑选：
+
+1. **run1（拒绝，0 runs）**：预筛载荷缺 `coverage_segments` 字段 → FRED
+   合并装载路径未激活 → 运行时覆盖落到研究库 MT5 段 4.31 年 < 预筛
+   24.39 年的 90%。修复=fix1（装配器补既有格式载荷，candidate_checks
+   rowid 26 supersedes 25，冻结源零改动）+ 导出 `calendars/USTEC.json`。
+   （证据：主仓 `.superpowers/sdd/2026-11-07-r3-main-test/`）
+2. **run2（拒绝，0 runs，机制不同）**：merge.py 的 FRED 逐年闸门
+   （T94/R14）滤除无逐年声明的 fred 段。修复=fix2（SHA 绑定 FRED
+   manifest 增补 `yearly_verification` 41 条 + 预筛重登记 rowid 27，
+   S8 裁定 E1/E3 放行为 R3 研究运行输入）。（证据：主仓
+   `.superpowers/sdd/2026-11-07-r3-main-test-fix1/`、S8 裁定）
+3. **run3（拒绝，0 runs）**：主仓工作树 `research/rounds/R3.toml` 换行
+   物化为 CRLF，与台账钉定的 LF 原始字节不符（内容零变更）→ H-08 冻结
+   核对 fail-closed。处置=S8b 裁定授权恰两文件 LF 形态复原。（证据：
+   研究库 `…-run3/`）
+4. **run4（拒绝，0 runs）**：卡 `selection_rule="single_spec"` 不在引擎
+   支持枚举内 → 参数选择段拒绝。处置=事件卡能力扩展（bt.py 至 065abf7，
+   single_spec 单点网格；范围裁定+聚焦评审授权链）。（证据：`…-run4/`）
+5. **run5（真实落账，被外部终止）**：首次越过全部装配拒绝，落账
+   **run#451**+关卡行 79-83（G0✓/G1✗/G2✗/G3✓/G4✗）；V3 随机化
+   （约 6.1 小时）途中被 harness 后台任务存活窗（约 1 小时）终止
+   （exit 137），无 V3 行。离线确定性复现：p=0.0085 过门、成本 ×1.5
+   过；并发现诊断层 window_shift 遇 1996-07-04 假日 strict 窗抛
+   SignalUnavailable 会把关卡记为失败的缺陷。（证据：`…-run5/`，
+   A1 整体裁量裁定）
+6. **处置与修复重跑（路径 A）**：处置裁定确认 trial_budget=2 预注册注释
+   "1 主规格+1 修复重跑"明文预留、修复授权恰一处 diff（ca626ae：诊断层
+   异常降级只报告不否决，主检验数值不变）；聚焦评审 PASS；run6 授权
+   裁定改用 **Windows 计划任务一次性载体**（r3-run6-once，
+   ExecutionTimeLimit=PT12H）针对 run5 死因。**run6 于 2026-11-07
+   15:21:51+08 自触发，20:51:56+08 正常结束（约 5.5 小时，LastTaskResult=0，
+   任务已回 Ready）**：run#452+关卡行 84-89，**V3 rowid 89 passed=1**
+   ——本报告全部判定依据。（证据：`…-run6/`，含 73/73 运行前核验、
+   argv 19 元逐字传代、监控三循环）
+
+授权链：S8（fix2 重绑）→ S8b（LF 复原）→ run5 整体裁量（A1）→ 处置
+裁定（路径 A）→ v3-diag-degrade 范围裁定（ca626ae）→ 聚焦评审 → run6
+授权裁定（A1，计划任务载体）。每次修复均新治理链，零事后追认。
+
+## 11. 证据目录与移交
+
+- run6 全量证据：研究库 `.superpowers/sdd/2026-11-07-r3-main-test-run6/`
+  （命令副本/运行前核验 73/73/stdout/stderr/timing/任务 XML/台账前后
+  状态/监控循环/本关轮的 t150-* 留档）。
+- run1-run5 证据：主仓 `.superpowers/sdd/2026-11-07-r3-main-test*/`
+  与研究库 `…-run3/…-run4/…-run5/`（各 RUN*-REPORT.md）。
+- 本报告+关闭材料按 D70 备好待转外部审核（主会话裁量）。
+- 本文不 commit（主会话提交）；引擎骨架 `round-R3-2026-11-07.md` 同。

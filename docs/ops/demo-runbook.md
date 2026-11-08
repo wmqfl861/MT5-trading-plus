@@ -543,3 +543,5 @@ halt、风险 halt 从不自动删除。若 supervisor halt 已存在时又触�
 - **运行时唯一执行方＝主会话**（用户指定，D64）：重启进程、清除 halt/pause/killSwitch、演练、部署、正式窗口计数，只由主会话做；git 身份 `zcode-main`；main 分支只由主会话写入。
 - **每日调度会话只读**（13:15 UTC，标题"每日只读运维检查"）：只做检查与日检记录（git 身份 `zcode-scheduler`，提交到 `ops/phase-f-log` 分支或本地 ops 目录由主会话合并）；不做任何运行时动作、不计数交易日、不运行 `demo_check --accept`、不推 main。发现"需要处理"事项（进程死亡/心跳过期/新 halt 或 pause/对账差异/日报缺失/磁盘<30GB/真实账户迹象）只报告，由主会话处置。
 - **正式窗口按 D63 起算**：部署树旧版 `demo_check --accept` 结果不作为 A5；验收只用 main 新版 `--accept --formal-window`；A5 材料交外部审核会话。
+
+**读数注记（R1，T140/T141 评审）**：`rejected` / `blocked_broker_unavailable` 回报里，若 error 串含"净持仓未知"，表示该轮 net_volume 查询也失败且无前值——net 字段的 0.0 是 float 结构占位、**不是"净持仓=0"的测量**；处置前先从券商侧核实实际持仓，不要按 0 处理。

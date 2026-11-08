@@ -42,6 +42,11 @@ class MT5Gateway:
     def shutdown(self) -> None:
         self._conn.shutdown()
 
+    def reconnect(self) -> bool:
+        """T141 有界重连（指数退避 5/10/30/60，封顶 60；到点单次尝试，
+        每次尝试仍受 T110 期限约束）——透传 MT5Connection.reconnect。"""
+        return self._conn.reconnect()
+
     @property
     def connected(self) -> bool:
         return self._conn.connected

@@ -7,8 +7,21 @@
   全局 ``pause.json`` 只留给人工，本进程**绝不写**；
 - pending 意图在 --grace-s（默认 60 秒）宽限内的 magic 本轮不判（下单
   在途不误报）；
-- 意图文件缺失/不合法、持仓查询失败：exit 2（--loop 模式等待重试，
-  运行器启动写出 expected-<magic>.json 后自愈）。
+- 意图文件缺失/不合法、持仓查询失败：exit 2（--once 模式；--loop 模式
+  原为无限等待重试——T142 起按"已知可恢复"计数：连续 5 轮以专用退出码
+  79 退出并留标记，运行器启动写出 expected-<magic>.json 后 supervisor
+  重启本进程即自愈）；
+- T141（第十六轮计划）：断线（NotConnectedError）不退出——--loop 下降级
+  继续（本轮跳过核对、角色心跳照写、网关按 5/10/30/60 秒退避重连），
+  连续 15 分钟连不上才以专用退出码 78 退出交给 supervisor，并留
+  data/live/disconnect-exit-reconcile.json 标记（不写 halt）；
+- T142（第十六轮计划）：主循环异常分级——已知可恢复（数据暂缺=run_once
+  rc=2、文件被占用 PermissionError、锁等待 TimeoutError；断线走 78 不进
+  计数）记录后继续；连续 5 轮或任何未知异常 → 写
+  data/live/loop-exit-reconcile.json（reason=unrecoverable_loop/<具体>）
+  + halt（fail-closed）后以专用退出码 79 退出。对账不一致（rc=1，按规则
+  写 pause）是动作不是故障，视为成功轮。完整码表见
+  src/mt5live/monitor.py 的 T142 注释块（supervisor/取证统一汇总）。
 
 用法：
     .venv/Scripts/python.exe scripts/live_reconcile.py --data-dir data --once
@@ -31,9 +44,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mt5gw import GatewayConfig, MT5Gateway  # noqa: E402
-from mt5gw.errors import DataUnavailableError  # noqa: E402
+from mt5gw.errors import DataUnavailableError, NotConnectedError  # noqa: E402
 from mt5live.monitor import (  # noqa: E402
+    ALERT_DISCONNECTED,
     ALERT_RECONCILE_MISMATCH,
+    LOOP_EXIT_RC,
+    DisconnectWatch,
+    LoopFailureWatch,
     append_alert,
     naive_utc,
     guarded_main,
@@ -49,6 +66,14 @@ from mt5live.reconcile import (  # noqa: E402
     load_intents,
     write_pause,
 )
+
+# T141：断线计时的单调钟接缝（测试注入虚拟钟；生产恒 time.monotonic）。
+_mono = time.monotonic
+
+# T142：主循环"已知可恢复"异常类（文件被占用/锁等待超时；数据暂缺在本
+# 进程表现为 run_once 的 rc=2，不抛异常）。断线（NotConnectedError）不在
+# 此列：只走 T141 的 15 分钟时间窗（78），不进 5 轮计数。
+_RECOVERABLE = (DataUnavailableError, PermissionError, TimeoutError)
 
 
 def _open_gateway(gw_config_path: str) -> MT5Gateway:
@@ -147,20 +172,99 @@ def _run(args) -> int:
     except Exception:
         raise  # guarded_main records the original traceback
 
+    # T141：连续断线计时——降级继续，连续 15 分钟才以专用退出码 78 退出
+    #（disconnect-exit-reconcile.json 留痕，供 T143 supervisor 演练与取证）。
+    watch = DisconnectWatch(live_dir, "reconcile", clock=_mono)
+
+    # T142：已知可恢复失败的连续轮计数（run_once rc=2 或可恢复异常）——
+    # 连续 5 轮或未知异常才以专用退出码 79 退出（loop-exit-reconcile.json
+    # + halt 留痕）。rc=1（按规则写 pause）是动作不是故障，视为成功轮。
+    failures = LoopFailureWatch(live_dir, "reconcile")
+
+    def _round_failed(detail: str) -> int | None:
+        """T142：已知可恢复失败轮——留痕后继续；连续 5 轮 → 专用退出。"""
+        failures.note_failure(detail)
+        print(f"· 连续可恢复失败 {failures.consecutive_failures}/"
+              f"{failures.limit} 轮（满 {failures.limit} 轮以退出码 "
+              f"{LOOP_EXIT_RC} 退出，T142）", flush=True)
+        try:   # 降级照写角色心跳（与 T141 断线降级轮同口径：进程还活着）
+            write_role_heartbeat(live_dir, "reconcile", interval=args.interval)
+        except Exception as nested:
+            print(f"× 失败轮心跳留痕异常（继续计数）：{nested}", flush=True)
+        if failures.expired():
+            return failures.exit_code(detail=detail,
+                                      cause="consecutive_failures")
+        return None
+
+    def _unknown_failed(e: Exception) -> int:
+        """T142：未知异常——立即写退出标记并以专用码退出（不再落到 rc=2）。"""
+        return failures.exit_code(exc=e, cause="unknown_exception")
+
+    def _handle_disconnect(exc: NotConnectedError) -> int | None:
+        """断线降级轮：本轮跳过核对（断线中持仓不可见也改不动）；角色
+        心跳照写（supervisor 判活不受降级影响）；网关有界重连（到点才真
+        试）。返回非 None = 容忍耗尽（调用方直接 return 专用码）。"""
+        watch.note_failure(exc)
+        if watch.expired():
+            return watch.exit_code(last_error=f"{type(exc).__name__}: {exc}")
+        print(f"× {datetime.now(timezone.utc):%H:%M:%S} 断线（降级继续，"
+              f"本轮跳过核对）：{exc}", flush=True)
+        try:
+            write_role_heartbeat(live_dir, "reconcile", interval=args.interval)
+        except _RECOVERABLE as e2:                 # T142：降级轮同样分级
+            rc = _round_failed(f"{type(e2).__name__}: {e2}")
+            if rc is not None:
+                return rc
+        except Exception as e2:
+            return _unknown_failed(e2)
+        reconnect = getattr(gw, "reconnect", None)
+        if callable(reconnect):
+            reconnect()
+        return None
+
     try:
         if args.loop:
             was_ok: bool | None = None  # 首轮与跳变时告警；持续不一致不重复告警
             while True:
                 reset_watchdog(args.interval)
-                _, res = run_once(live_dir, gw,
-                                  volume_tolerance=args.volume_tolerance,
-                                  grace_s=args.grace_s,
-                                  alert=was_ok is not False)
-                if res is not None:
-                    was_ok = res.ok
+                try:
+                    rc, res = run_once(live_dir, gw,
+                                       volume_tolerance=args.volume_tolerance,
+                                       grace_s=args.grace_s,
+                                       alert=was_ok is not False)
+                except NotConnectedError as e:
+                    rc2 = _handle_disconnect(e)     # T141：断线降级继续
+                    if rc2 is not None:             # （不进 T142 计数）
+                        return rc2
+                except _RECOVERABLE as e:
+                    rc2 = _round_failed(f"{type(e).__name__}: {e}")
+                    if rc2 is not None:
+                        return rc2
+                except Exception as e:
+                    return _unknown_failed(e)       # T142：未知——专用退出
+                else:
+                    watch.note_ok()                 # T141：恢复（段内才告警）
+                    if rc == 2:
+                        # T142：意图文件缺失/不合法或持仓查询失败（数据
+                        # 暂缺）——run_once 已打印具体原因并返回 rc=2。
+                        rc2 = _round_failed(
+                            "run_once rc=2：意图文件缺失/不合法或持仓查询"
+                            "失败（数据暂缺，具体见本轮输出）")
+                        if rc2 is not None:
+                            return rc2
+                    else:
+                        failures.note_ok()   # rc 0/1：完成（1=按规则暂停）
+                    if res is not None:
+                        was_ok = res.ok
                 time.sleep(args.interval)
-        rc, _ = run_once(live_dir, gw, volume_tolerance=args.volume_tolerance,
-                         grace_s=args.grace_s)
+        try:
+            rc, _ = run_once(live_dir, gw, volume_tolerance=args.volume_tolerance,
+                             grace_s=args.grace_s)
+        except NotConnectedError as e:
+            # 单轮模式遇断线：与持仓查询失败同口径（exit 2，不 fatal）。
+            print(f"× 断线：{e}")
+            append_alert(live_dir, ALERT_DISCONNECTED, f"reconcile 单轮断线：{e}")
+            return 2
         return rc
     except KeyboardInterrupt:
         print("· 手动停止")

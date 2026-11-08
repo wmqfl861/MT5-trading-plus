@@ -1655,12 +1655,42 @@ def _setup_t86_round(tmp_path, monkeypatch, mod, *, mode="event",
     return root, cards_dir, ledger_path
 
 
+def _define_t86_event_strategy():
+    from mt5quant.strategies.base import BaseStrategy, RequiredData
+
+    class T86MonthEndEventStrategy(BaseStrategy):
+        """T151/D66 后事件模式卡的合法形状：自生成事件窗信号（月末窗：
+        月末前一日给出信号 → 引擎月末 bar 开盘入场、次月第 3 根开盘离场，
+        与 month_end_events 同窗）。纯 bar 自身日期算术（G0 截断/窗口
+        不变性安全）；替代旧用例的 BuyHold 脚手架（H16-2：事件模式卡
+        脚手架策略现被 _h_preflight 直接拒绝）。"""
+
+        event_kind = "month_end"
+        side_rule = "static_long"
+        required_data = RequiredData(symbols=("XAUUSD",), timeframe="H1",
+                                     lookback_bars=1)
+
+        def generate_signals(self, bars, params):
+            dates = pd.to_datetime(bars["time"]).dt.normalize()
+            on = ((dates + pd.Timedelta(days=1)).dt.is_month_end  # 月末前一日
+                  | dates.dt.is_month_end                        # 月末（入场 bar）
+                  | (dates.dt.day == 1))          # 次月 1 日（2 日信号归零 → 3 日开盘出）
+            return pd.Series(on.astype("int64"), index=bars.index)
+
+    return T86MonthEndEventStrategy
+
+
+T86MonthEndEventStrategy = _define_t86_event_strategy()
+
+
 def test_gate_v3_event_card_skips_buyhold_and_delay_vetoes(
         tmp_path, monkeypatch, capsys):
     """T86 失败测试 1：轮次 [evaluation] mode="event" 的卡，关卡 V3 走
     事件分支——随机化参照主检验（p ≤ alpha/N，阈值随 N 收紧）+ 成本 ×1.5
     否决；**买入持有超额与延迟一根两项否决不运行**（D35 修改 2：标记
-    不适用，绝不调用对应实现）。"""
+    不适用，绝不调用对应实现）。T151/D66 起改用事件窗信号策略（BuyHold
+    脚手架在事件模式卡上被 _h_preflight 直接拒绝——见
+    tests/test_t151_event_identity.py）。"""
     mod = load_bt()
     root, cards_dir, ledger_path = _setup_t86_round(
         tmp_path, monkeypatch, mod, mode="event")
@@ -1673,7 +1703,7 @@ def test_gate_v3_event_card_skips_buyhold_and_delay_vetoes(
     rc = mod.main(
         ["gate", "--card", "H703", "--allow-unbounded-data", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
-         "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
+         "--strategy", "tests.test_research_bt_script:T86MonthEndEventStrategy",
          "--costs", "zero", "--gates", "V3", "--params", "{}",
          "--event-kind", "month_end", "--event-side", "long"])
     out = capsys.readouterr().out

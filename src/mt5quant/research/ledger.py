@@ -195,6 +195,7 @@ CREATE TABLE IF NOT EXISTS runs(
   actor              TEXT NOT NULL,
   round_id           TEXT,
   run_class          TEXT NOT NULL DEFAULT 'research',
+  verdict_code_sha   TEXT,
   prev_hash          TEXT NOT NULL DEFAULT '',
   row_hash           TEXT NOT NULL DEFAULT ''
 );
@@ -544,6 +545,26 @@ class Ledger:
                          datetime.now(timezone.utc).isoformat()))
                     self._rechain("runs")
                     self._snapshot_refresh("runs")
+        # T151 迁移（D66，第十六轮 2026-11-08）：runs 加 verdict_code_sha
+        # （事件模式试验身份的裁决代码指纹——validation/events.py +
+        # bt.py 事件分支 + 日历工件哈希，bt 侧计算写入）。**旧行不改**：
+        # 只补列（旧行 NULL = 裁决指纹概念之前的运行，不回填、不改任何
+        # 内容值），值由新行写入——与 round_id 迁移同一信任边界：列进
+        # 哈希规范化内容，已有 T37 链的旧库补列后 runs 链按新内容整体
+        # 重算一次（生产台账迁移后须 scripts/ledger_anchor.py
+        # --accept-rechain 重锚）；pre-T37 旧库由随后的 T37 一次性重建
+        # 覆盖本列（幂等：列已存在即跳过）。
+        if "verdict_code_sha" not in runs_cols:
+            with self._txn():
+                self.conn.execute(
+                    "ALTER TABLE runs ADD COLUMN verdict_code_sha TEXT")
+            if not pre_migration:
+                n_runs = int(self.conn.execute(
+                    "SELECT COUNT(*) n FROM runs").fetchone()["n"])
+                if n_runs:
+                    with self._txn():
+                        self._rechain("runs")
+                        self._snapshot_refresh("runs")
         # T37 迁移（H3/M6，D23/D27）：runs 加 strategy_sha/prev_hash/
         # row_hash，gates 与 lockbox_uses 加 prev_hash/row_hash；旧行
         # strategy_sha='legacy'，三链自第一行重建，迁移记一行
@@ -968,6 +989,7 @@ class Ledger:
                    created_utc=None, strategy_sha: str = "legacy",
                    round_id: str | None = None,
                    run_class: str | None = None,
+                   verdict_code_sha: str | None = None,
                    round_trial_budget: int | None = None) -> int:
         """记一行运行（成功的与抛异常的 alike）；返回 run_id。
 
@@ -982,6 +1004,10 @@ class Ledger:
         卡 research；运维通道 reconcile_ab 的 actor=ops 经缺省推断为 ops）；
         缺省 None = 按 actor 推断（run_class_for_actor）；枚举外 →
         ValueError。
+        verdict_code_sha（T151/D66，第十六轮）：事件模式试验的裁决代码
+        指纹（validation/events.py + bt.py 事件分支 + 日历工件哈希），
+        进 runs 行与去重身份（改判决代码/换日历工件重跑 = 新试验）；
+        None = bar 级卡/旧行为（计数逐位不变）。
         round_trial_budget（P-10/T99，调用路径传入）：给出且 round_id
         非空时，与写入在同一个 BEGIN IMMEDIATE 事务内做预算相关处理——
         **X-01 起按本轮口径分流**：
@@ -1038,6 +1064,7 @@ class Ledger:
                 rows = self.conn.execute(
                     "SELECT strategy, params_json, symbol, timeframe,"
                     " data_sha256, cost_model_version, strategy_sha,"
+                    " verdict_code_sha,"
                     " metrics_json, actor, run_class FROM runs"
                     " WHERE round_id=?",
                     (round_id,)).fetchall()
@@ -1046,7 +1073,8 @@ class Ledger:
                            json.dumps(_san(params), sort_keys=True,
                                       ensure_ascii=False),
                            symbol, timeframe, data_sha256,
-                           cost_model_version, strategy_sha)
+                           cost_model_version, strategy_sha,
+                           verdict_code_sha)
                 if new_key not in keys and len(keys) >= round_trial_budget:
                     raise RoundTrialBudgetExceededError(
                         f"轮次 {round_id} 的试验预算已满"
@@ -1068,6 +1096,7 @@ class Ledger:
                 "created_utc": _iso(created_utc), "actor": actor,
                 "round_id": round_id,
                 "run_class": run_class,
+                "verdict_code_sha": verdict_code_sha,   # T151/D66
             })
             # X-01 对账后盾（仅新口径轮 + 成功行 + 带上限）：reservation
             # 已把本轮试验钉在 ≤上限，成功行去重数超限 = 有试验绕过占位
@@ -1395,12 +1424,13 @@ class Ledger:
     def round_n_dedup(self, round_id: str) -> int:
         """本轮累计去重试验数（trial_budget 的计数口径）：runs 中
         round_id 匹配的成功运行按 (strategy, params, symbol, timeframe,
-        data_sha256, cost_model_version, strategy_sha) 七元组去重——与
-        stats 的 n_dedup 同键同口径（迁移行与失败运行不计）。"""
+        data_sha256, cost_model_version, strategy_sha, verdict_code_sha)
+        八元组去重——与 stats 的 n_dedup 同键同口径（迁移行与失败运行
+        不计；T151/D66：裁决代码指纹进键，bar 级/旧行 NULL 计数不变）。"""
         rows = self.conn.execute(
             "SELECT strategy, params_json, symbol, timeframe, data_sha256,"
             " cost_model_version, strategy_sha, actor, run_class,"
-            " metrics_json FROM runs WHERE round_id=?",
+            " verdict_code_sha, metrics_json FROM runs WHERE round_id=?",
             (round_id,)).fetchall()
         return self._dedup_n(rows)
 
@@ -1782,9 +1812,11 @@ class Ledger:
 
     def _dedup_keys(self, rows: list) -> set:
         """成功运行按 (strategy, params, symbol, timeframe, data_sha256,
-        cost_model_version, strategy_sha) 七元组的键集（与 _dedup_n 同键
-        同口径；失败行/迁移行不计）。X-01：record_run 旧口径预算检查用它
-        区分"同身份幂等重录"与"新身份占新名额"。"""
+        cost_model_version, strategy_sha, verdict_code_sha) 八元组的键集
+        （与 _dedup_n 同键同口径；失败行/迁移行不计）。X-01：record_run
+        旧口径预算检查用它区分"同身份幂等重录"与"新身份占新名额"。
+        T151/D66：verdict_code_sha 进键（事件模式改判决代码/换日历工件
+        重跑 = 新试验；bar 级/旧行恒 NULL，计数逐位不变）。"""
         keys: set = set()
         for r in rows:
             rc = r["run_class"] if "run_class" in r.keys() else None
@@ -1798,15 +1830,19 @@ class Ledger:
                       json.dumps(json.loads(r["params_json"]),
                                  sort_keys=True, ensure_ascii=False),
                       r["symbol"], r["timeframe"], r["data_sha256"],
-                      r["cost_model_version"], r["strategy_sha"]))
+                      r["cost_model_version"], r["strategy_sha"],
+                      r["verdict_code_sha"]
+                      if "verdict_code_sha" in r.keys() else None))
         return keys
 
     def _dedup_n(self, rows: list, *, only_research: bool = False,
                  rounds: str | None = None) -> int:
         """按 (strategy, params, symbol, timeframe, data_sha256,
-        cost_model_version, strategy_sha) 对成功运行去重计数（params 键序
-        无关；T37：指纹进键——改代码重跑即新试验；run_class=migration 的
-        迁移行不是试验，不计入——与旧行为 actor=migration 等价）。
+        cost_model_version, strategy_sha, verdict_code_sha) 对成功运行去重
+        计数（params 键序无关；T37：指纹进键——改代码重跑即新试验；
+        T151/D66：裁决代码指纹进键——事件模式改判决路径重跑即新试验，
+        bar 级/旧行 NULL、计数逐位不变；run_class=migration 的迁移行不是
+        试验，不计入——与旧行为 actor=migration 等价）。
         only_research=True（T64/D33）：只计 run_class=research（排除
         calibration/ops/migration——标定与运维不是研究试验）；行缺
         run_class 键时按 actor 推断（迁移前旧数据）。
@@ -1833,13 +1869,15 @@ class Ledger:
             keys.add((r["strategy"],
                       json.dumps(params, sort_keys=True, ensure_ascii=False),
                       r["symbol"], r["timeframe"], r["data_sha256"],
-                      r["cost_model_version"], r["strategy_sha"]))
+                      r["cost_model_version"], r["strategy_sha"],
+                      r["verdict_code_sha"]
+                      if "verdict_code_sha" in r.keys() else None))
         return len(keys)
 
     _RUN_COLS_FOR_STATS = (
         "card_id, metrics_json, strategy, params_json, symbol,"
         " timeframe, data_sha256, strategy_sha, cost_model_version,"
-        " created_utc, actor, run_class, round_id")
+        " created_utc, actor, run_class, round_id, verdict_code_sha")
 
     def lineage_n_dedup(self, family: str) -> int:
         """候选所延续**历史谱系**的去重研究试验数（T85/第十三轮 §4.1）：

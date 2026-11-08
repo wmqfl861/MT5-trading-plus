@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import faulthandler
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -39,6 +40,48 @@ ALERT_RISK_REJECT = "RISK_REJECT"                # 开仓被风控/闸门拒绝�
 ALERT_HEARTBEAT_WRITE_ERROR = "HEARTBEAT_WRITE_ERROR"  # 心跳写入连续失败（T33/M1）
 
 DEFAULT_HEARTBEAT_TIMEOUT_S = 120.0
+
+# T141（第十六轮计划 §2，O16-3）：断线容忍与专用退出。
+# - 风控/对账进程对断线降级继续（文件级检查照常、角色心跳照写），连续
+#   DISCONNECT_LIMIT_S 连不上才以专用退出码 DISCONNECT_EXIT_RC 退出，
+#   交给 supervisor（T143），并留 disconnect-exit-<component>.json 标记；
+# - 专用码取值避开既有退出码：0=正常/中断、1=单轮业务失败、2=fatal
+#   （guarded_main）、3=单实例拒绝、75=T110 网关期限硬停。
+DISCONNECT_EXIT_RC = 78
+DISCONNECT_LIMIT_S = 15 * 60.0        # 连续断线容忍上限：15 分钟
+ALERT_DISCONNECTED = "DISCONNECTED"   # 断线段首/恢复/专用退出告警
+DISCONNECT_EXIT_FILE_FMT = "disconnect-exit-{component}.json"
+
+# T142（第十六轮计划，O16-3）：主循环异常分级与专用退出。
+#
+# 风控/对账主循环异常分两类（scripts/risk_process.py、scripts/live_reconcile.py）：
+# - 已知可恢复（数据暂缺 DataUnavailableError、文件被占用 PermissionError、
+#   文件锁等待 TimeoutError、断线 NotConnectedError）：记录后继续；
+# - 断线只走 T141 的 15 分钟时间窗（78），**不进 5 轮计数**——统一计数会让
+#   5 轮 × interval 早于 900s 触发，破坏 T141 验收场景"断线 3 分钟恢复
+#   三进程不退出"；两套计时互不读写（钉死在 tests/test_t142_loop_grading.py）；
+# - 其余可恢复异常连续 LOOP_FAILURE_LIMIT 轮失败，或任何未知异常：写
+#   loop-exit-<component>.json（reason=unrecoverable_loop/<具体>）+ halt
+#   （fail-closed：安全监视者离开必须停交易）后以 LOOP_EXIT_RC 退出。
+#
+# 退出码表（supervisor/取证统一汇总；三进程共用 guarded_main 边界）：
+#   0  = 正常完成 / Ctrl-C 中断（exit-<component>.json：completed/interrupted）
+#   1  = 单轮业务失败（--once 轮询失败 / 对账不一致——动作不是故障）
+#   2  = fatal：启动失败或主循环外的未知异常（guarded_main，写 halt；
+#        例外：reconcile --once 的业务性 rc=2=意图缺失/持仓查询失败，
+#        不写 halt、不经 guarded_main——见 live_reconcile 文档）
+#   3  = 单实例拒绝（instances 内核锁，首道拒绝不连网关）
+#   75 = T110 网关期限硬停：单次 MT5 调用超 30s（os._exit，防原生/GIL 挂死；
+#        落 gateway-stall.json + exit-<component>.json，不写 halt）
+#   78 = T141 断线专用：连续 15 分钟连不上（disconnect-exit-<component>.json，
+#        不写 halt——重启后果由 supervisor 决定）
+#   79 = T142 主循环不可恢复：已知可恢复异常连续 5 轮失败或未知异常
+#        （loop-exit-<component>.json + halt——fail-closed）
+LOOP_EXIT_RC = 79
+LOOP_FAILURE_LIMIT = 5              # 连续失败轮上限（只数可恢复失败轮）
+ALERT_RECOVERABLE_FAILURE = "RECOVERABLE_FAILURE"  # 失败段首告警（不刷屏）
+ALERT_LOOP_EXIT = "LOOP_EXIT"       # 专用退出告警
+LOOP_EXIT_FILE_FMT = "loop-exit-{component}.json"
 
 # 成交流水的交易类 entry（mt5gw.models.Deal.entry）；出入金等流水绝不计入盈亏
 TRADE_ENTRY_KINDS = frozenset({"in", "out", "inout", "out_by"})
@@ -233,6 +276,216 @@ def write_halt_once(live_dir: str, reason: str, now: datetime, *,
 def reset_watchdog(interval: float) -> None:
     # Stack evidence only: the independent supervisor handles hard process stalls.
     faulthandler.dump_traceback_later(health_timeout(interval), repeat=True, file=2)
+
+
+class DisconnectWatch:
+    """T141：进程级连续断线计时（风控/对账主循环用）。
+
+    - note_failure(exc)：每轮网关调用抛 NotConnectedError 后调用；断线段
+      首写一次告警（不刷屏），单调钟累计连续断线时长；
+    - note_ok()：每轮成功后调用；若此前处于断线段，写恢复告警并清零；
+    - expired()：连续断线 ≥ limit_s（默认 15 分钟）；
+    - exit_code()：写 disconnect-exit-<component>.json 退出标记（T143
+      supervisor 演练与取证读它：reason/rc/首末时刻/时长/最后错误/pid）
+      + 退出告警，返回专用退出码 78——调用方直接 return，guarded_main
+      的 finally 会再落 exit-<component>.json（rc=78）。断线退出**不写
+      halt**：进程死亡/重启的后果由 supervisor 决定，不自作主张。
+    """
+
+    def __init__(self, live_dir: str, component: str, *,
+                 limit_s: float = DISCONNECT_LIMIT_S,
+                 clock=time.monotonic):
+        self.live_dir = str(live_dir)
+        self.component = str(component)
+        self.limit_s = float(limit_s)
+        self._clock = clock
+        self._first_mono: float | None = None
+        self._first_wall: datetime | None = None
+        self._last_error = ""
+
+    @property
+    def disconnected_s(self) -> float:
+        if self._first_mono is None:
+            return 0.0
+        return self._clock() - self._first_mono
+
+    def note_failure(self, exc: BaseException | None = None) -> None:
+        if exc is not None:
+            self._last_error = f"{type(exc).__name__}: {exc}"
+        if self._first_mono is not None:
+            return                       # 断线段已在计时（告警只写段首）
+        self._first_mono = self._clock()
+        self._first_wall = datetime.now(timezone.utc)
+        append_alert(
+            self.live_dir, ALERT_DISCONNECTED,
+            f"{self.component} 进程与交易服务器断线（{self._last_error}）——"
+            f"降级继续（文件级检查照常），网关按 5/10/30/60 秒退避重连；"
+            f"连续 {self.limit_s / 60:.0f} 分钟连不上将以退出码 "
+            f"{DISCONNECT_EXIT_RC} 交给 supervisor（T141）",
+            self._first_wall)
+
+    def note_ok(self) -> None:
+        if self._first_mono is None:
+            return
+        duration = self.disconnected_s
+        self._first_mono = self._first_wall = None
+        append_alert(
+            self.live_dir, ALERT_DISCONNECTED,
+            f"{self.component} 进程与交易服务器恢复连接（断线 {duration:.0f} "
+            "秒）——恢复正常轮询（T141）")
+
+    def expired(self) -> bool:
+        return (self._first_mono is not None
+                and self.disconnected_s >= self.limit_s)
+
+    def exit_code(self, *, last_error: str | None = None) -> int:
+        """落退出标记 + 告警，返回专用退出码（调用方直接 return 它）。"""
+        detail = last_error or self._last_error
+        duration = self.disconnected_s
+        first = iso_utc(self._first_wall) if self._first_wall else None
+        marker = {
+            "component": self.component,
+            "rc": DISCONNECT_EXIT_RC,
+            "reason": "disconnect_timeout",
+            "first_failure_utc": first,
+            "duration_s": round(duration, 3),
+            "limit_s": self.limit_s,
+            "last_error": detail,
+            "ts": iso_utc(datetime.now(timezone.utc)),
+            "pid": os.getpid(),
+        }
+        write_json_atomic(os.path.join(
+            self.live_dir,
+            DISCONNECT_EXIT_FILE_FMT.format(component=self.component)),
+            marker)
+        append_alert(
+            self.live_dir, ALERT_DISCONNECTED,
+            f"{self.component} 进程连续断线 {duration / 60:.0f} 分钟"
+            f"（≥ {self.limit_s / 60:.0f} 分钟上限，最后错误：{detail}）——"
+            f"以专用退出码 {DISCONNECT_EXIT_RC} 退出交给 supervisor；退出"
+            f"标记 {DISCONNECT_EXIT_FILE_FMT.format(component=self.component)}"
+            "（T141，供 T143 演练与取证）")
+        return DISCONNECT_EXIT_RC
+
+
+class LoopFailureWatch:
+    """T142：主循环"已知可恢复异常"的连续失败轮计数（风控/对账用）。
+
+    与 T141 DisconnectWatch 的边界（时间契约优先，测试钉死）：
+    - 断线轮**既不 note_failure 也不 note_ok**——只归 DisconnectWatch 的
+      900s 时间窗管；本类根本不该看到 NotConnectedError；
+    - 只有完整成功的轮清零（risk=run_one_cycle 正常返回；reconcile=
+      run_once rc∈{0,1}——1 是"按规则写 pause"的动作不是故障）；
+    - 恢复（note_ok）静默清零，不写告警（瞬时失败是常态，避免刷屏；
+      失败段首有 RECOVERABLE_FAILURE 告警）。
+
+    exit_code()：写 loop-exit-<component>.json（reason=unrecoverable_loop/
+    <具体>、cause=consecutive_failures|unknown_exception、轮数/上限/首末
+    信息）+ halt（fail-closed：监视者离开必须停交易）+ LOOP_EXIT 告警，
+    返回专用退出码 79——调用方直接 return，guarded_main 的 finally 会再落
+    exit-<component>.json（rc=79）。标记/halt/告警全部尽力而为：文件系统
+    正是被占用的故障源时，退到 stderr 打印（.log.err 可见），退出不因
+    留痕失败而取消。
+    """
+
+    def __init__(self, live_dir: str, component: str, *,
+                 limit: int = LOOP_FAILURE_LIMIT):
+        self.live_dir = str(live_dir)
+        self.component = str(component)
+        self.limit = int(limit)
+        self._count = 0
+        self._first_wall: datetime | None = None
+        self._last_detail = ""
+
+    @property
+    def consecutive_failures(self) -> int:
+        return self._count
+
+    @staticmethod
+    def _detail_of(exc_or_detail) -> str:
+        if isinstance(exc_or_detail, BaseException):
+            return f"{type(exc_or_detail).__name__}: {exc_or_detail}"
+        return str(exc_or_detail)
+
+    def note_failure(self, exc_or_detail) -> None:
+        """记一轮可恢复失败；失败段首写一次告警（不刷屏）。"""
+        detail = self._detail_of(exc_or_detail)
+        self._count += 1
+        self._last_detail = detail
+        if self._first_wall is None:
+            self._first_wall = datetime.now(timezone.utc)
+        if self._count == 1:                    # 段首告警一次
+            try:
+                append_alert(
+                    self.live_dir, ALERT_RECOVERABLE_FAILURE,
+                    f"{self.component} 主循环已知可恢复异常（{detail}）——"
+                    f"记录后继续；连续 {self.limit} 轮失败将以专用退出码 "
+                    f"{LOOP_EXIT_RC} 退出（T142）", self._first_wall)
+            except Exception as e:              # 告警写失败不推翻计数
+                print(f"× 失败段首告警写入失败（继续计数）：{e}",
+                      file=sys.stderr, flush=True)
+
+    def note_ok(self) -> None:
+        """完整成功的轮：静默清零。"""
+        self._count = 0
+        self._first_wall = None
+
+    def expired(self) -> bool:
+        return self._count >= self.limit
+
+    def exit_code(self, *, exc: BaseException | None = None,
+                  detail: str | None = None,
+                  cause: str = "consecutive_failures") -> int:
+        """落退出标记 + halt + 告警（全部尽力而为），返回专用退出码 79。"""
+        last = detail or (self._detail_of(exc) if exc is not None
+                          else self._last_detail)
+        reason = f"unrecoverable_loop/{last}"
+        now = datetime.now(timezone.utc)
+        marker = {
+            "component": self.component,
+            "rc": LOOP_EXIT_RC,
+            "reason": reason,
+            "cause": cause,
+            "consecutive_failures": self._count,
+            "limit_rounds": self.limit,
+            "first_failure_utc": (iso_utc(self._first_wall)
+                                  if self._first_wall else None),
+            "last_error": last,
+            "ts": iso_utc(now),
+            "pid": os.getpid(),
+        }
+        logging.critical(
+            "%s unrecoverable loop exit rc=%s cause=%s failures=%d/%d: %s",
+            self.component, LOOP_EXIT_RC, cause, self._count, self.limit,
+            last, exc_info=exc)
+        try:
+            write_json_atomic(os.path.join(
+                self.live_dir,
+                LOOP_EXIT_FILE_FMT.format(component=self.component)), marker)
+        except Exception as e:
+            print(f"× 退出标记写入失败（{reason}）：{e}",
+                  file=sys.stderr, flush=True)
+        try:   # fail-closed：安全监视者离开必须停交易（78 断线除外，见码表）
+            write_halt_once(
+                self.live_dir,
+                f"{self.component}_unrecoverable_loop: {last}", now,
+                owner=self.component)
+        except Exception as e:
+            print(f"× 退出 halt 写入失败（{reason}）：{e}",
+                  file=sys.stderr, flush=True)
+        try:
+            append_alert(
+                self.live_dir, ALERT_LOOP_EXIT,
+                f"{self.component} 主循环{'连续 ' + str(self._count) + ' 轮失败'
+                   if cause == 'consecutive_failures' else '未知异常'}"
+                f"（{last}）——写退出标记 "
+                f"{LOOP_EXIT_FILE_FMT.format(component=self.component)} 并以"
+                f"专用退出码 {LOOP_EXIT_RC} 退出；已写 halt（fail-closed）"
+                "（T142）", now)
+        except Exception as e:
+            print(f"× 退出告警写入失败（{reason}）：{e}",
+                  file=sys.stderr, flush=True)
+        return LOOP_EXIT_RC
 
 
 def guarded_main(component: str, live_dir: str, interval: float, function) -> int:
