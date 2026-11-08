@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     T180：部署启动时留存锚点证据副本（manifest/launcher/instances）。
 
@@ -52,7 +52,14 @@ foreach ($item in $items) {
         }
         # 原字节复制（含 BOM/换行原样），证据以字节为准。
         [IO.File]::Copy($item.src, $dst, $true)
-        $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $dst).Hash.ToLowerInvariant()
+        # CI runner 的受限 PowerShell 会话可能未加载 Microsoft.PowerShell.Utility
+        # （Get-FileHash 不可用，CI#316 实证）——改用 .NET 直调，处处可用。
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $fs = [System.IO.File]::OpenRead($dst)
+            try { $hash = ([System.BitConverter]::ToString($sha.ComputeHash($fs))).Replace('-', '').ToLowerInvariant() }
+            finally { $fs.Dispose() }
+        } finally { $sha.Dispose() }
         Write-Output ("evidence run-{0}/{1}.json sha256={2}" -f $RunIndex, $item.name, $hash)
     } catch {
         $failed = $true
