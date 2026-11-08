@@ -229,9 +229,11 @@ cutoff 直接报错（绝不静默截断）；MCP `get_bars` 同一约束（越�
 ## 每日调度
 
 `scripts/setup_scheduled_tasks.ps1`（安装：右键"使用 PowerShell 运行"或
-`powershell -File`；删除命令在其头注释）：每日 00:05 品种参数快照比对、
-00:10 K 线增量刷新（`scripts/refresh_all.py`，日志在 `data/logs/`）、
-00:15 tick 增量刷新（有 tick 库才装）。`scripts/measure_server_clock.py`
+`powershell -File`；删除命令在其头注释）：品种参数快照比对、K 线增量
+刷新（`scripts/refresh_all.py`，日志在 `data/logs/`）与 tick 增量刷新
+（有 tick 库才装）为**每周六**任务（T182：避开纽约盘中占用交易终端）；
+日报任务在 XAUUSD 换日休市窗口（本机 05:57）——旧"每日 00:05/00:10/
+00:15/00:20"时刻已废止（第十七轮 O17-2））。`scripts/measure_server_clock.py`
 可随时补测服务器时钟偏移（证据存 `data/server_clock.json`，供夏令时
 切换前后对比）。
 

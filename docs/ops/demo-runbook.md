@@ -103,7 +103,7 @@ trade_mode=0）在**启动前**把过一道关；但预检通过与 runner 实�
 # 日常档 --day（宽松：无异常证据即退出码 0；"无样本"如实标注、不判不通过）
 .venv/Scripts/python.exe scripts/demo_check.py --day 2026-11-10
 
-# 日报（00:20 计划任务自动生成；PaperSoak 读 paper 状态 + 决策日志点差比对）
+# 日报（换日休市窗口 05:57 计划任务自动生成（T182，旧 00:20 已废止）；PaperSoak 读 paper 状态 + 决策日志点差比对）
 type data\reports\live\daily-2026-11-10.md
 type data\logs\task_live_daily_report.log      # 任务输出（排查用）
 ```
