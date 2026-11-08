@@ -285,7 +285,6 @@ def _run(args) -> int:
                     return _unknown_failed(e)       # T142：未知——专用退出
                 else:
                     watch.note_ok()                 # T141：恢复（段内才告警）
-                    acct_watch.note_ok()            # T184：恢复告警+清零
                     if rc == 2:
                         # T142：意图文件缺失/不合法（run_once 已打印具体
                         # 原因并返回 rc=2；持仓查询失败自 T184 起上抛走
@@ -296,7 +295,9 @@ def _run(args) -> int:
                         if rc2 is not None:
                             return rc2
                     else:
-                        failures.note_ok()   # rc 0/1：完成（1=按规则暂停）
+                        acct_watch.note_ok()  # T184 F-1：只有 rc 0/1 的完整
+                        failures.note_ok()    # 成功轮才清账户窗（rc=2 无网关
+                                              # 接触，不得写无证据的恢复）
                     if res is not None:
                         was_ok = res.ok
                 time.sleep(args.interval)
