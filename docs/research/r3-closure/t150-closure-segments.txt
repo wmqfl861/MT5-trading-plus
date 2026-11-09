@@ -1,0 +1,10 @@
+T150 closure segment means (offline, report-layer; started 21:27:33 )
+⚠ 缓存无止损越幅表（no-table）：stop 出场不加越幅（A-1.5 行为）——重建加 --overshoot（scripts/build_cost_model.py）
+✓ 成本：研究库缓存命中（导出时已对照主库 tick 水位）（rel@NY/bar_open_m1#abed3b8f p90×成交价）；comm0-cli；swap-snapshot[d5b50486]-relref[257d0355]；缺统计 1 个纽约小时（forbid 禁入）
+assembly: bars=10292 events=213 pool_days=8917
+identity vs run#452: {'data_sha256': True, 'cost_model_version': True, 'params': True, 'strategy_sha_prefix': True}
+main segment: n=213 dropped=0 observed_mean=0.003571836737750819
+10-year buckets recomputed == ledger: True {'1990-1999': 0.006736241445628673, '2000-2009': 0.004079719908665203, '2010-2019': 0.0012600077198422093, '2020-2029': 0.0043964632698298214}
+T150 three segments: {"1994-2003": {"n": 75, "mean": 0.0037808413254069445}, "2004-2013": {"n": 80, "mean": 0.0053473464574708305}, "2014-2021-05": {"n": 58, "mean": 0.0008525932609954632}} ; events outside segments: 0
+diagnostic post-boundary: calendar post events=35 resolved=35 dropped_by_returns=0 mean=-0.00038634814502349165
+written: <workspace>/664d5945-068c-46aa-ba82-7141f134aa13/.superpowers/sdd/2026-11-07-r3-main-test-run6/t150-closure-segments.json

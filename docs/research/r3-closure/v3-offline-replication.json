@@ -1,0 +1,150 @@
+{
+ "identity": {
+  "data_sha256": true,
+  "cost_model_version": true,
+  "params": true,
+  "gates_hash": true
+ },
+ "seed": 10640155159524715549,
+ "sims": 1999,
+ "count_null_ge_obs": 16,
+ "n_valid": 1999,
+ "engine_equivalent_v3_result": {
+  "passed": false,
+  "error": "SignalUnavailable: event unavailable: exact window missing for fomc_calendar:1996-07-03",
+  "_engine_equivalent_note": "result above = exact engine counterfactual: production _v3_gate_evaluate on identical inputs with the identical precomputed randomization result; its exception caught exactly like bt.py _run() would -> the V3 row the engine would have written had it not been killed. NOT written to the ledger; the authoritative ledger still has NO V3 row for run#451."
+ },
+ "report_only_precrash": {
+  "primary": {
+   "passed": true,
+   "test": "randomization",
+   "p_value": 0.0085,
+   "threshold": 0.025,
+   "alpha": 0.05,
+   "n_tests": 2,
+   "sims": 1999,
+   "draws_min": 1999,
+   "n_events": 213,
+   "observed_mean": 0.003571836737750819,
+   "null_mean": 0.0009019775120127234,
+   "null_std": 0.001080182047803147,
+   "event_kind": "fomc_calendar",
+   "event_side": "static_long",
+   "side_rule": "static_long",
+   "note": "随机化参照（D35 修改 1）；N 口径同 [v3] 主检验（rounds_lineage），不吃 n_min"
+  },
+  "cost_scale_x15": {
+   "passed": true,
+   "net_mean_scaled": 0.0033856041007693993,
+   "scale": 1.5,
+   "n_events": 213,
+   "note": "事件模式否决=成本 ×1.5 后净均值 > 0（D35 修改 2）[report-only pre-crash]"
+  },
+  "delay_1_bar": {
+   "passed": true,
+   "applicable": false,
+   "note": "事件模式不适用（D35 修改 2：[v3.event].delay_bars_veto = false——按时钟定义的事件窗上'延迟一根落到定盘后反转段'会误杀）"
+  },
+  "buyhold_excess": {
+   "passed": true,
+   "applicable": false,
+   "note": "事件模式不适用（D35 修改 2：[v3.event].buyhold_excess_veto = false——按时钟定义的事件窗上'真实月末效应夏普通常低于全程持有'会误杀）"
+  },
+  "diagnostics_items": {
+   "year_block_vs_zero": {
+    "p_value": 0.003,
+    "mean": 0.003571836737750819,
+    "n_blocks": 28,
+    "n_events": 213
+   },
+   "window_shift_1_bar": {
+    "error": "SignalUnavailable: event unavailable: exact window missing for fomc_calendar:1996-07-03"
+   },
+   "segmented_means": {
+    "1990-1999": 0.006736241445628673,
+    "2000-2009": 0.004079719908665203,
+    "2010-2019": 0.0012600077198422093,
+    "2020-2029": 0.0043964632698298214
+   }
+  },
+  "note": "values computed by the engine's V3 block before the deterministic diagnostics exception; in the engine's fail-closed error row these partial values are NOT recorded — replicated here report-only"
+ },
+ "n_composition": {
+  "n": 2,
+  "continues_family": "",
+  "project_n_dedup_rounds": 2,
+  "lineage_n_dedup": 0,
+  "pre_round_other_n_dedup": 395,
+  "note": "主检验 N = 轮次内（跨轮累计）+ 延续谱系的轮次外历史；pre_round_other_n_dedup 只报告不进门槛（T85/§4.1）",
+  "continues_family_source": "按候选登记 C005.toml 声明（≠卡自身谱系时以声明为准）"
+ },
+ "a1d": {
+  "full_set_n": 213,
+  "full_set_net_mean": 0.003571836737750819,
+  "subset_n": 15,
+  "subset_net_mean": -0.001146230133063299,
+  "subset_dates": [
+   "1996-01-31",
+   "1997-09-30",
+   "1998-03-31",
+   "1999-06-30",
+   "2001-01-31",
+   "2004-06-30",
+   "2005-06-30",
+   "2006-01-31",
+   "2007-01-31",
+   "2007-10-31",
+   "2008-04-30",
+   "2013-07-31",
+   "2014-04-30",
+   "2018-01-31",
+   "2019-07-31"
+  ],
+  "others_n": 198,
+  "others_net_mean": 0.0039292660461458274,
+  "subset_weight": 0.07042253521126761,
+  "subset_weighted_contribution": -8.072043190586612e-05,
+  "subset_share_of_net_sum": -0.02259913815565257,
+  "note": "A1 D-section obligation: mechanical breakdown, NOT a veto item"
+ },
+ "e7": {
+  "nights_value_counts": {
+   "1": 212,
+   "2": 1
+  },
+  "all_one_night": false,
+  "total_nights": 214,
+  "n_events": 213,
+  "overnight_by_entry_weekday": {
+   "Tuesday": 122,
+   "Monday": 83,
+   "Wednesday": 8
+  },
+  "announcement_day_weekday": {
+   "Wednesday": 123,
+   "Tuesday": 82,
+   "Thursday": 8
+  },
+  "swap_rule": {
+   "long_per_day": "-6.5200000000000005",
+   "short_per_day": "0.0"
+  },
+  "worst_side_rate": 6.5200000000000005,
+  "per_event_overnight_relprice": 0.0002590235131374978,
+  "declared_basis": "swap_free (registration swap_basis.decision_basis)",
+  "registered_swap_free": {
+   "multiple": 21.386366454794768,
+   "implied_sharpe": 0.39646021117234875,
+   "power": 0.5948863577998579,
+   "decision": "pass"
+  },
+  "registered_charged_reference": {
+   "multiple": 4.073989795394991,
+   "implied_sharpe": 0.31381902600128775,
+   "power": 0.4474553469118876,
+   "decision": "fail",
+   "reported_as": "4.0740 / 0.31382 / 0.4475",
+   "note": "charged = swap_free round-trip + point-snapshot worst side x 1 night (spec_snapshot_not_deal_measured, non-gating reference)"
+  }
+ }
+}

@@ -1,0 +1,11 @@
+V3 offline deterministic replication + A1-D + E7 (started 09:51:46 )
+================================================================================================
+⚠ 缓存无止损越幅表（no-table）：stop 出场不加越幅（A-1.5 行为）——重建加 --overshoot（scripts/build_cost_model.py）
+✓ 成本：研究库缓存命中（导出时已对照主库 tick 水位）（rel@NY/bar_open_m1#abed3b8f p90×成交价）；comm0-cli；swap-snapshot[d5b50486]-relref[257d0355]；缺统计 1 个纽约小时（forbid 禁入）
+assembly: bars=10292 merged=True events=213 pool_days=8917 contract_size=1.0
+identity : cost_model_version=tick-spread-p90[rel@NY/bar_open_m1#abed3b8f]+slip0.1-comm0-cli-swap-snapshot[d5b50486]-relref[257d0355]-no-overshoot-missNY[17]-sess[76278259]
+          data_sha256=h-input-v1:f233c9bbf070916ac87d0445b1f4d0e44a21f23b9d422fc5009ebf012f84f645
+          gates_sha256=d0a8b2f3105366e4173adcf15fb6dc650a032e277425ca7277abdc92086bb17b
+identity vs run#451: {'data_sha256': True, 'cost_model_version': True, 'params': True} ; strategy_sha = 8742cd4f53ab5dc8c2e5168f (8742cd4f... prefix: True )
+observed frame: 213 events, dropped=0, observed_mean=0.003571836737750819 (9.4s)
+checkpoint: 0/1999 draws already computed; resuming

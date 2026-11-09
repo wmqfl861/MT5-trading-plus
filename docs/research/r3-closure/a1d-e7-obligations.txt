@@ -1,0 +1,20 @@
+A1-D / E7 obligations — run5 (2026-11-07; same frozen inputs as run#451)
+========================================================================================
+
+[A1-D] month-end 15/213 subset breakdown (mechanical, NOT a veto)
+  full-set   : n=213  net mean = 0.003571836737750819
+  subset-15  : n=15  net mean = -0.001146230133063299
+  others-198 : n=198  net mean = 0.0039292660461458274
+  weighted contribution (15/213 x subset mean) = -8.072043190586612e-05
+  share of full-set net sum = -0.02259913815565257
+  subset dates matched: 1996-01-31, 1997-09-30, 1998-03-31, 1999-06-30, 2001-01-31, 2004-06-30, 2005-06-30, 2006-01-31, 2007-01-31, 2007-10-31, 2008-04-30, 2013-07-31, 2014-04-30, 2018-01-31, 2019-07-31
+
+[E7] per-event nights (fee-engine measured) + swap calibers
+  nights value counts: {'1': 212, '2': 1}
+  all events exactly 1 night: False; total nights = 214 over 213 events
+  overnight by entry-day weekday: {'Tuesday': 122, 'Monday': 83, 'Wednesday': 8}
+  announcement-day weekday: {'Wednesday': 123, 'Tuesday': 82, 'Thursday': 8}
+  swap rule: {'long_per_day': '-6.5200000000000005', 'short_per_day': '0.0'}; worst-side rate = 6.5200000000000005
+  per-event overnight (relative price): 0.0002590235131374978
+  declared caliber = swap_free; registered swap_free: multiple 21.386366454794768 implied_sharpe 0.39646021117234875 power 0.5948863577998579 decision=pass
+  charged parallel reference (registered): multiple 4.073989795394991 (4.0740), implied_sharpe 0.31381902600128775 (0.31382), power 0.4474553469118876 (0.4475), decision=fail — non-gating reference
