@@ -6,6 +6,12 @@
 按年块自助；同一机制的多个品种合并时**同一天按日聚合**后再检验
 （跨品种同日相关性的简化处理：折叠成单一观测）。
 
+事件窗按**价格时点**定义（D74/T187/H17-1）：EventWindow.price_timepoint
+区分 bar_open（历史语义，bar 开盘成交）与 day_close（某交易日收盘）；
+FOMC 登记窗（锚日收 → 公告日收）用 day_close 显式表示，配合合并序列
+接缝两侧统一 bar 口径（mt5data.ext.merge.rewrite_close_only_segment），
+消除"MT5 段 00:00 行开≈前收"造成的错一天窗口。
+
 成本口径（与 T62 预筛 `_ex_ante_cost_per_symbol` 同一份语义，铁律：
 成本模型只有一份口径）：
 - 点差 p90 是**来回点差全幅、每来回恰收一次**——方向未定时取入/出场
@@ -58,7 +64,8 @@ from mt5quant.costs.swap import charge_nights
 from mt5quant.research.power import _norm_ppf, _phi, _z_alpha
 
 __all__ = [
-    "EventWindow", "month_end_events", "london_fix_events",
+    "EventWindow", "PRICE_TIMEPOINTS", "month_end_events",
+    "london_fix_events",
     "fomc_calendar_events", "FOMC_ERA_START",
     "event_returns", "event_test", "randomize_event_times",
     "randomization_test", "aggregate_daily", "window_volatility",
@@ -69,20 +76,41 @@ _HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 _MONTH_BUCKETS = 3          # 月内位置分桶数（三分位：早/中/晚）
 
 
+PRICE_TIMEPOINTS = ("bar_open", "day_close")
+
+
 @dataclass(frozen=True)
 class EventWindow:
-    """一个事件窗（naive UTC；入场/出场均为**成交参考时刻**）。
+    """一个事件窗（naive UTC；入场/出场均为**价格时点**，D74/T187/H17-1）。
 
     kind：事件机制标识（"month_end" / "london_fix" / 自定义）；
     label：唯一标识（随机化事件加 rand 前缀防撞）；
-    entry_time/exit_time：入场/出场的最早成交时刻——event_returns 取
-    该时刻之后首根 bar 的开盘价成交。
+    entry_time/exit_time：入场/出场的价格时点标签（见 price_timepoint）；
+    price_timepoint：时点语义，决定 event_returns 的成交价解析——
+
+    - ``"bar_open"``（缺省，历史语义）：entry_time/exit_time 是成交参考
+      时刻，成交价 = 该时刻之后首根 bar 的**开盘价**（month_end /
+      london_fix 沿用；信号在 bar 级引擎上"下一根开盘成交"同构）；
+    - ``"day_close"``（D74/T187）：entry_time/exit_time 标记交易日
+      （零点标签），价格时点 = 该交易日的**收盘**，成交价 = 该日 bar 的
+      **收盘价**。FOMC 登记窗即此口径（H102：前一交易日纽约 16:00 收盘
+      进、公告日收盘出）。在 T187 统一后的合并序列口径（close-only 外部
+      段改写为"开=前一观测收盘、收=当日收盘"，与 MT5 D1 同口径）下，
+      "某日收盘"与"次一 bar 开盘"是同一价格时点——研究口径（本函数，
+      取 bar 收盘）与引擎 A（bar 开盘成交）在同一改写序列上逐位一致。
     """
 
     kind: str
     label: str
     entry_time: pd.Timestamp
     exit_time: pd.Timestamp
+    price_timepoint: str = "bar_open"
+
+    def __post_init__(self):
+        if self.price_timepoint not in PRICE_TIMEPOINTS:
+            raise ValueError(
+                f"price_timepoint 须为 {PRICE_TIMEPOINTS} 之一"
+                f"（D74/T187），收到 {self.price_timepoint!r}")
 
 
 # ---------------------------------------------------------------- 日历工具
@@ -197,10 +225,14 @@ def fomc_calendar_events(calendar_path, expected_sha256,
       与默认条目 announcement_date == end_date、公告日无重复）；
     - 每个默认事件（in_default_event_set=true 且公告日 D 落在主段日历
       span 内）生成：announcement_day=D（工件 announcement_date），
-      entry_anchor=D 的**前一主段交易日**；entry/exit 时刻取交易日零点
-      （与 month_end 同一成交解析口径——FRED D1 close-only 序列
-      open==close，bar 开盘成交价=该日官方收盘价，恰为登记的
-      "前收进/公告日收出"D1 近似窗，H102 与 C005 declared 同一口径）；
+      entry_anchor=D 的**前一主段交易日**；事件窗按**价格时点**定义
+      （D74/T187/H17-1）：入场 = 锚日收盘、出场 = 公告日收盘——
+      EventWindow.price_timepoint="day_close"，entry_time/exit_time 为
+      锚日/公告日的零点标签，event_returns 取该日 bar 的**收盘价**成交。
+      这就是 H102/C005 登记窗"前收进/公告日收出"的显式表示；对
+      close-only 段（open==close）与 bar_open 解析逐位同值，对 MT5 段
+      不再把"锚日开盘→公告日开盘"（≈锚日自己的收益，错一天）当作
+      事件窗；
     - D 不在主段日历上（无公告 bar）→ 丢弃并登记 dropped_no_bar；D 是
       主段首日（无前一交易日）→ 丢弃并登记 dropped_no_anchor——
       **不移窗、不补锚**（H102 should_fail_when / 裁定 E6 同一规则）；
@@ -295,7 +327,8 @@ def fomc_calendar_events(calendar_path, expected_sha256,
             continue                     # 首日无前交易日：丢弃，不移窗不补锚
         events.append(EventWindow(
             kind="fomc_calendar", label=f"fomc_calendar:{d.date().isoformat()}",
-            entry_time=days[pos - 1], exit_time=d))
+            entry_time=days[pos - 1], exit_time=d,
+            price_timepoint="day_close"))
     report = {
         "calendar_sha256": want,
         "era_start": FOMC_ERA_START,
@@ -461,8 +494,19 @@ def event_returns(bars, events, *, side_fn: Callable[[EventWindow], object],
                   reference_price: float | None = None) -> pd.DataFrame:
     """每事件净收益（相对价格）：毛收益 − 来回成本 − 隔夜费。
 
-    成交口径：入场 = entry_time 之后首根 bar 的开盘价、出场 = exit_time
-    之后首根 bar 的开盘价（searchsorted；出场 bar 须严格晚于入场 bar），
+    成交口径按 EventWindow.price_timepoint（D74/T187）解析：
+
+    - ``bar_open``（缺省，历史语义）：入场 = entry_time 之后首根 bar 的
+      开盘价、出场 = exit_time 之后首根 bar 的开盘价（searchsorted；出场
+      bar 须严格晚于入场 bar）；
+    - ``day_close``：入场 = entry_time 所标记交易日的 bar **收盘价**、
+      出场 = exit_time 所标记交易日的 bar 收盘价（searchsorted 定位该日
+      bar；strict 窗要求逐日精确命中）——登记窗"锚日收 → 公告日收"的
+      显式成交表示。close-only 段（open==close）两种口径逐位同值
+      （R3 主检验段的等价锚点）；统一口径（开=前一观测收盘）的序列上
+      "某日收盘"与"次一 bar 开盘"同一价格时点，与引擎 A 的开盘成交
+      逐位一致（T151 三方对账）。
+
     出场越过数据末尾的事件剔除（attrs["dropped"] 计数，绝不静默外推）。
     成本按事件入场/出场 bar 的**纽约本地小时**取点差/滑点（DST 感知），
     口径见模块 docstring（与 T62 预筛同一份语义）。
@@ -515,7 +559,11 @@ def event_returns(bars, events, *, side_fn: Callable[[EventWindow], object],
         sign = _side_sign(side_fn(e))
         entry_ts = pd.Timestamp(arr[i_e])   # 直接从 numpy 取（iloc 逐条太慢）
         exit_ts = pd.Timestamp(arr[i_x])
-        entry, exit_ = float(opens[i_e]), float(opens[i_x])
+        if getattr(e, "price_timepoint", "bar_open") == "day_close":
+            # D74/T187：价格时点 = 该交易日收盘（登记窗"锚日收→公告日收"）
+            entry, exit_ = float(closes[i_e]), float(closes[i_x])
+        else:
+            entry, exit_ = float(opens[i_e]), float(opens[i_x])
         if not (entry > 0.0 and exit_ > 0.0):
             dropped += 1
             continue
@@ -782,7 +830,8 @@ def randomize_event_times(events, trading_days, *,
         out.append(EventWindow(
             kind=e.kind, label=f"{e.kind}:rand{seed}:{seq}",
             entry_time=pd.Timestamp(day_values[new_a]) + e_off,
-            exit_time=pd.Timestamp(day_values[new_b]) + x_off))
+            exit_time=pd.Timestamp(day_values[new_b]) + x_off,
+            price_timepoint=getattr(e, "price_timepoint", "bar_open")))
     return out
 
 
@@ -979,8 +1028,11 @@ def shift_events_by_bars(events, bars, *, n_bars: int = 1) -> list[EventWindow]:
         raise ValueError("时间列无正间隔——bar 时长无从推断，平移无定义")
     step = pd.Timedelta(seconds=int(np.min(pos))) * int(n_bars)
     return [EventWindow(kind=e.kind, label=e.label,
-                        entry_time=e.entry_time + step,
-                        exit_time=e.exit_time + step) for e in events]
+                         entry_time=e.entry_time + step,
+                         exit_time=e.exit_time + step,
+                         price_timepoint=getattr(e, "price_timepoint",
+                                                 "bar_open"))
+            for e in events]
 
 
 def segmented_means(returns, *, years: int = 10) -> dict[str, float]:

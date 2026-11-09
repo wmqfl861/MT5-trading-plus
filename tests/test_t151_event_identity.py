@@ -112,8 +112,14 @@ def _fomc_events(bars):
 
 
 def test_prefomc_event_window_signals_from_injected_calendar():
-    """注入（构造参数）事件窗 + 显式交易日历 → 信号只落在锚日前一交易日；
-    引擎成交 = 事件窗（1 根 D1 持仓、signal 出场）。"""
+    """注入（构造参数）事件窗 + 显式交易日历 → 信号落在**锚日本身**
+    （D74/T187：day_close 价格时点——锚日收盘进场，即统一口径下公告日
+    bar 开盘成交）；引擎持仓恰为公告日 bar（1 根 D1、signal 出场）。
+
+    T187 前旧口径：信号=锚日前一交易日、成交=锚日 bar 开盘 → 持仓落在
+    公告日前一天（H17-1 错位）；口径变更后断言随之更新（论证：入场
+    价格时点=锚日收盘=公告日 bar 开盘（open==prev close 夹具），出场
+    =公告日收盘=次一 bar 开盘）。"""
     from mt5quant.strategies.library.fomc_preannouncement import (
         PreFomcAnnouncementDrift,
     )
@@ -122,6 +128,10 @@ def test_prefomc_event_window_signals_from_injected_calendar():
     cal = _v1_calendar_dict(pd.bdate_range("2023-08-01", "2024-08-31"))
     events = _fomc_events(bars)
     st = PreFomcAnnouncementDrift(event_windows=events, event_calendar=cal)
+    # 信号 mask 直接可查：信号日 = 锚日集合（day_close 窗，T187）
+    sig = st.generate_signals(bars, {})
+    sig_days = pd.to_datetime(bars["time"]).dt.normalize()[sig.to_numpy() == 1]
+    assert set(sig_days) == {pd.Timestamp(e.entry_time) for e in events}
     res = run_backtest(st, bars, FlatRelCosts(), symbol="USTEC", params={},
                        contract_size=1.0, volume_lots=1.0, timeframe="D1")
     assert len(res.trades) == len(events)
@@ -130,10 +140,10 @@ def test_prefomc_event_window_signals_from_injected_calendar():
     assert set(res.trades["side"]) == {"long"}
     times = pd.DatetimeIndex(pd.to_datetime(bars["time"]))
     for ev in events:
-        i_entry = int(times.searchsorted(ev.entry_time))
-        trade = res.trades[res.trades["entry_time"] == times[i_entry]]
-        assert len(trade) == 1, f"事件 {ev.label} 无引擎成交"
-        assert trade["exit_time"].iloc[0] == times[i_entry + 1]
+        i_ann = int(times.searchsorted(ev.exit_time))   # 公告日 bar
+        trade = res.trades[res.trades["entry_time"] == times[i_ann]]
+        assert len(trade) == 1, f"事件 {ev.label} 无引擎成交于公告日 bar"
+        assert trade["exit_time"].iloc[0] == times[i_ann + 1]
 
 
 def test_prefomc_diagnostic_fallback_shape_multiple_one_day_trades():
@@ -195,43 +205,86 @@ def _engine_relative_nets(trades, bars, *, lots, contract_size):
 
 
 def test_c005_per_event_reconciliation_engine_vs_event_returns():
-    """C005/H102：引擎 A 成交与 event_returns 逐事件对账——入场/出场
-    **时刻**（bar 时间）逐笔一致；净收益差只来自已说明的成本口径差。
+    """C005/H102（T187/D74 加强为三方一致）：引擎 A 成交 = event_returns
+    研究口径 = 登记窗（锚日收 → 公告日收），逐事件核对。
 
-    口径差闭合推导（FlatRelCosts：点差全幅 P、单边滑点 L，零佣金/隔夜）：
-    - event_returns：毛收益（开盘 mid 对开盘 mid）− [max(点差两侧，基准
-      价=入场价) + 双边滑点（基准价=入场价）] = gross − (P + 2L)；
-    - 引擎 A 把成本折进成交价：多头 entry = O_e(1+P+L)、exit = O_x(1−L)
-      → 相对净 = gross − P − L(1+r)（r = O_x/O_e），差 = L(1−r)；
-      空头 entry = O_e(1−L)、exit = O_x(1+P+L)（点差计在**出场腿**，
-      基准价=出场价 O_x）→ 差 = (P+L)(1−r)；
-    - 闭合界（覆盖双向）：|引擎相对净 − event 净| = (P+L)×|毛收益|——
-      点差/滑点折进成交价与显式扣除之间的二阶交叉项。"""
+    - **三方逐位**（零成本运行）：day_close 研究口径取锚日/公告日 bar
+      **收盘**；统一口径序列（open==前一收盘，本夹具与 T187 改写后的
+      合并序列同口径）上，引擎"信号=锚日 bar → 公告日 bar 开盘进、次一
+      bar 开盘出"的两个开盘价与两个收盘**同一 float**——引擎相对收益、
+      研究毛收益、登记窗收益三者逐位相等；
+    - **成本口径差闭合界**（FlatRelCosts：点差全幅 P、单边滑点 L，零
+      佣金/隔夜）：event_returns 毛收益 − (P + 2L)；引擎 A 把成本折进
+      成交价：多头 entry = O_e(1+P+L)、exit = O_x(1−L) → 相对净 =
+      gross − P − L(1+r)，差 = L(1−r)；空头点差计在出场腿 → 差 =
+      (P+L)(1−r)；闭合界（覆盖双向）：|引擎相对净 − event 净| =
+      (P+L)×|毛收益|。
+
+    时刻映射（T187 口径更新，论证：研究口径的成交 bar 是价格时点所在
+    bar——入场 bar=锚日、出场 bar=公告日；引擎的开盘成交 bar 是同一
+    价格时点的次一 bar——入场 bar=公告日、出场 bar=再下一根）：引擎
+    entry_time == 研究 exit_bar_time（同为公告日 bar）、引擎 exit_time
+    == 出场 bar 的次一根。"""
     from mt5quant.strategies.library.fomc_preannouncement import (
         PreFomcAnnouncementDrift,
     )
     from mt5quant.backtest.engine_a import run_backtest
     from mt5quant.validation.events import declared_event_side, event_returns
+
+    class _Zero:
+        def spread_p90(self, *a, **k):
+            return 0.0
+
+        def slippage(self, *a, **k):
+            return 0.0
+
+        def commission_per_lot(self, *a, **k):
+            return 0.0
+
+        def overnight_fee(self, *a, **k):
+            return 0.0
+
+        def stop_overshoot(self, *a, **k):
+            return 0.0
+
     bars = _fomc_daily_bars()
     events = _fomc_events(bars)
     cal = _v1_calendar_dict(pd.bdate_range("2023-08-01", "2024-08-31"))
     st = PreFomcAnnouncementDrift(event_windows=events, event_calendar=cal)
-    res = run_backtest(st, bars, FlatRelCosts(), symbol="USTEC", params={},
-                       contract_size=1.0, volume_lots=1.0, timeframe="D1")
+    times = pd.DatetimeIndex(pd.to_datetime(bars["time"]))
+    closes = bars["close"].to_numpy(dtype="float64")
     side_fn = declared_event_side("static_long")
     frame = event_returns(bars, events, side_fn=side_fn, costs=FlatRelCosts(),
                           symbol="USTEC", contract_size=1.0)
     assert len(frame) == len(events)
+
+    # ---- 三方逐位（零成本）：引擎 = 研究口径 = 登记窗
+    res0 = run_backtest(st, bars, _Zero(), symbol="USTEC", params={},
+                        contract_size=1.0, volume_lots=1.0, timeframe="D1")
+    assert len(res0.trades) == len(events)
+    for label, row in frame.iterrows():
+        i_ann = int(times.get_loc(pd.Timestamp(row["exit_bar_time"])))
+        registered = float(closes[i_ann] / closes[i_ann - 1] - 1.0)
+        trade0 = res0.trades[res0.trades["entry_time"] == times[i_ann]]
+        assert len(trade0) == 1, label
+        eng0 = float(trade0["exit_price"].iloc[0]
+                     / trade0["entry_price"].iloc[0] - 1.0)
+        assert eng0 == float(row["gross"]) == registered, (
+            label, eng0, float(row["gross"]), registered)
+
+    # ---- 成本口径差（FlatRelCosts）与时刻映射
+    res = run_backtest(st, bars, FlatRelCosts(), symbol="USTEC", params={},
+                       contract_size=1.0, volume_lots=1.0, timeframe="D1")
     eng_by_entry = {pd.Timestamp(t["entry_time"]): t
                     for _, t in res.trades.iterrows()}
     assert len(eng_by_entry) == len(events)
     for label, row in frame.iterrows():
-        trade = eng_by_entry[pd.Timestamp(row["entry_bar_time"])]
-        # 入场/出场时刻逐笔一致（引擎 bar 时间 = event_returns 成交 bar）
+        trade = eng_by_entry[pd.Timestamp(row["exit_bar_time"])]
+        # 引擎入场 bar = 公告日 bar（= 研究 exit_bar_time）；出场 = 次一根
         assert pd.Timestamp(trade["entry_time"]) == pd.Timestamp(
-            row["entry_bar_time"]), label
-        assert pd.Timestamp(trade["exit_time"]) == pd.Timestamp(
             row["exit_bar_time"]), label
+        assert pd.Timestamp(trade["exit_time"]) == times[
+            int(times.get_loc(pd.Timestamp(row["exit_bar_time"]))) + 1], label
         assert trade["side"] == row["side"]
         assert int(trade["bars_held"]) == 1
         gross = float(row["gross"])
@@ -617,20 +670,31 @@ def test_screen_combo_strategy_holds_injected_event_windows(
         "fomc_calendar:2024-01-31", "fomc_calendar:2024-03-20",
         "fomc_calendar:2024-05-01", "fomc_calendar:2024-11-29"]
     assert st.event_calendar is not None
-    # 行为级（非近似）：4 事件 4 笔、入场逐位 = 事件锚日（前一交易日），
-    # 1 根持仓——近似路径给的是每 6 周三节奏（入场为周一，集合不同）
+    # 行为级（非近似）：4 事件 4 笔、1 根持仓。入场逐位 = **公告日**
+    # （T187/D74 口径更新，论证：入场价格时点=锚日收盘=公告日 bar 开盘，
+    # 引擎开盘成交落在公告日 bar——断言由 e.entry_time（锚日）改为
+    # e.exit_time（公告日））；近似路径给的是每 6 周三节奏（信号为周二
+    # =伪锚日，入场为周三，集合不同）
     assert len(res.trades) == 4
     assert set(res.trades["bars_held"]) == {1}
     assert set(pd.to_datetime(res.trades["entry_time"])) == {
-        e.entry_time for e in st.event_windows}
+        e.exit_time for e in st.event_windows}
 
 
-def test_screen_warns_dropped_event_when_signal_day_bar_missing(
+def test_screen_anchor_bar_missing_fails_closed_and_reconciliation_unit(
         tmp_path, monkeypatch, capsys):
-    """F-2（T151 聚焦评审）：7 事件、1 个信号日（锚日前一显式交易日）
-    缺 bar → 引擎 6 笔（缺 bar fail-closed 丢事件，成交语义不变），screen
-    输出显式 dropped_events=1 告警行，计数随 metrics 入台账——丢事件不再
-    静默（评审实证：删除信号日 bar 后 6 vs 7 零告警）。"""
+    """F-2（T151 聚焦评审）场景在 T187/D74 口径下的重述与机制单测。
+
+    **口径变化论证（逐条）**：T187 前信号 bar = 锚日的**前一显式交易日**
+    ——该日缺 bar 时引擎静默丢事件（usable=7、成交=6、零告警），即原
+    F-2 场景；T187 后 day_close 窗的信号 bar = **锚日本身**，而锚日 bar
+    缺失本就被装配段 fail-closed 拒绝（`event coverage unavailable:
+    exact trade window`，H102 不移窗不补锚）——"信号日缺 bar 而事件仍
+    可解析"对 fomc_calendar 不复存在，改为断言 fail-closed（rc=1、
+    零 runs、消息可见）。
+
+    `_event_trade_reconciliation`（F-2 的 dropped_events 机制）保留给
+    未来事件类/防御性告警，单测覆盖其计数语义不回退。"""
     import pandas as _pd
     from tests.test_fomc_calendar_engine import (
         _setup_fomc_round, meeting, write_calendar,
@@ -638,8 +702,8 @@ def test_screen_warns_dropped_event_when_signal_day_bar_missing(
     from mt5quant.research.ledger import Ledger
     mod = load_bt()
     root, cards_dir, ledger_path = _setup_fomc_round(tmp_path, monkeypatch, mod)
-    # 7 个公告日（锚=前一交易日、信号日=锚前一交易日，连续日历下即 D-2/D-1）；
-    # 删 2024-06-17 bar（2024-06-19 事件的信号日；非其他事件的锚/公告日）
+    # 7 个公告日（锚=前一交易日=信号日，连续日历下即 D-1）；
+    # 删 2024-06-18 bar（2024-06-19 事件的锚日/信号日；非其他事件的锚/公告日）
     meetings = [meeting(d) for d in ("2024-02-28", "2024-03-20", "2024-05-01",
                                      "2024-06-19", "2024-07-31", "2024-09-18",
                                      "2024-11-27")]
@@ -647,7 +711,7 @@ def test_screen_warns_dropped_event_when_signal_day_bar_missing(
     pq = root / "bars" / "XAUUSD" / "D1" / "data.parquet"
     bars = _pd.read_parquet(pq)
     kept = bars[_pd.to_datetime(bars["time"]).dt.normalize()
-                != _pd.Timestamp("2024-06-17")]
+                != _pd.Timestamp("2024-06-18")]
     assert len(kept) == len(bars) - 1
     kept.to_parquet(pq)
     rc = mod.main(
@@ -661,13 +725,20 @@ def test_screen_warns_dropped_event_when_signal_day_bar_missing(
          "--fomc-calendar", str(cal_path), "--fomc-calendar-sha256", sha,
          "--event-days-start", "2024-01-01", "--event-days-end", "2024-12-31"])
     out = capsys.readouterr().out
-    assert rc == 0, out
-    # 显式告警行：7 事件 vs 6 笔 → dropped_events=1
-    assert "事件对账" in out and "dropped_events=1" in out
+    assert rc == 1, out
+    assert "event coverage unavailable" in out and "2024-06-19" in out
     with Ledger(ledger_path) as led:
-        row = led.conn.execute(
-            "SELECT metrics_json FROM runs WHERE card_id='H704'").fetchone()
-    m = json.loads(row["metrics_json"])["metrics"]   # record_run 包一层 metrics
-    assert m["usable_events"]["XAUUSD"] == 7   # 事件覆盖仍在（锚/公告日有 bar）
-    assert m["trade_count"] == 6               # 引擎丢 1 事件（语义不变）
-    assert m["dropped_events"] == 1            # 计数随 metrics 入台账
+        assert led.conn.execute(
+            "SELECT COUNT(*) FROM runs WHERE card_id='H704'"
+        ).fetchone()[0] == 0
+    # F-2 机制单测：usable vs 成交差显式化（防御性告警语义不回退；
+    # 策略类须声明 generates_event_window_signals，与 screen 路径同构）
+    from mt5quant.strategies.library.fomc_preannouncement import (
+        PreFomcAnnouncementDrift,
+    )
+    ctx = {"usable_events": {"XAUUSD": 7}}
+    st = PreFomcAnnouncementDrift()
+    assert mod._event_trade_reconciliation(ctx, "XAUUSD", st, 6) == {
+        "usable_events": 7, "trades": 6, "dropped_events": 1}
+    assert mod._event_trade_reconciliation(
+        ctx, "XAUUSD", st, 7)["dropped_events"] == 0

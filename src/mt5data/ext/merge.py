@@ -35,6 +35,15 @@
   histdata 一个 H1 来源（fred/cdd 为 D1 指数/加密日线，对 H1 品种
   自然落空；stooq/yahoo 不批准）——多来源竞争路径尚未出现，按字母序
   简单实现。
+- **close-only 段合并时改写为 MT5 D1 同口径（D74/T187/H17-1）**：
+  manifest 声明 ``close_only=true`` 的 ext 段（FRED 指数日线）在并入
+  合并序列前改写为"开 = 前一观测收盘、收 = 当日收盘"——接缝两侧对
+  "00:00 行"的含义一致（MT5 D1 行开≈前收；旧 FRED 行开=收，事件窗在
+  MT5 段会量到错一天的窗口）。close 列逐字节不动；high/low = max/min
+  (开, 收)（仍非真实高低价，manifest close_only 声明语义不变）。此
+  改写改变合并序列内容 → data_sha256 变化，**此后的运行计为新试验**
+  （D74；等价锚点：R3 主检验段 213 事件的收益在改写前后逐位相同，
+  见 docs/research/r3-closure-report-2026-11-07.md 附录 A）。
 - **月度周日开盘小时自检（先决 4，仅 ext 段；MT5 段豁免——实证其
   周日首 bar 多为 0 点属券商时段结构）**：对每个自然月 × 来源段，收集
   该月内每个周日（weekday==6）第一根 bar 的 UTC 小时；不含美国 DST
@@ -96,6 +105,35 @@ def concat_mt5_priority(mt5_df, ext_df) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------- ext 装载
+
+def rewrite_close_only_segment(df: pd.DataFrame) -> pd.DataFrame:
+    """close-only ext 段 → MT5 D1 同口径（D74/T187/H17-1）。
+
+    改写规则（close 列逐字节不动）：
+
+    - ``open[t] = close[t-1]``（前一**观测**的收盘——与 MT5 D1"00:00 行
+      开≈前收"同一含义；周末/节假日自然取最近可得收盘）；
+    - 首行无前一观测 → ``open[0] = close[0]``（退化，同旧行形态）；
+    - ``high = max(open, close)``、``low = min(open, close)``——仍非
+      真实高低价（manifest close_only 声明的下游义务不变）。
+
+    目的：合并序列接缝两侧采用同一种 bar 口径——研究事件窗
+    （validation.events 的 day_close 价格时点）与引擎 A 的开盘成交在
+    两段上都解析到同一价格时点，消除"MT5 段量到公告日前一天"的错位。
+    改写发生在**合并读取**时：ext 库原始文件与 manifest（close_only
+    声明）零改动；合并序列内容变化 → data_sha256 变化，此后的运行计为
+    新试验（D74）。返回拷贝，不改入参。
+    """
+    out = df.copy()
+    close = pd.to_numeric(out["close"]).to_numpy(dtype="float64")
+    if len(close) == 0:
+        return out
+    prev = np.r_[close[0], close[:-1]]
+    out["open"] = prev
+    out["high"] = np.maximum(prev, close)
+    out["low"] = np.minimum(prev, close)
+    return out
+
 
 def _load_ext_segment(data_root, symbol: str, timeframe: str):
     """已批准来源按字母序探测（来源优先级，见模块 docstring）。
@@ -177,7 +215,7 @@ def merged_research_series(data_root, symbol: str, timeframe: str, *,
     布局：``{data_root}/bars/{symbol}/{tf}``（MT5，mt5data.store）与
     ``{data_root}/ext/<来源>/<品种>/<周期>/``（mt5data.ext.core）。
     全部语义（前向延长 / cutoff 口径 / 年份闸门 / 来源优先级 / 周日
-    自检 / gap 口径）见模块 docstring。
+    自检 / gap 口径 / close-only 段合并时改写）见模块 docstring。
 
     X-03：有效上界**唯一**由 ``mt5data.lockbox.effective_research_bound``
     决定（本函数直接消费，不再独立取最严）：声明上界冲突 → LockboxError；
@@ -236,6 +274,12 @@ def merged_research_series(data_root, symbol: str, timeframe: str, *,
         if mt5_first is not None:
             ext_part = ext_part[ext_part["time"] < mt5_first]
         ext_part = ext_part.reset_index(drop=True)
+        # D74/T187：close-only 外部段（manifest 声明）合并前改写为
+        # "开=前一观测收盘、收=当日收盘"（MT5 D1 同口径）——按**保留后**
+        # 的行取前一观测（被年份闸门/前向延长滤除的行不喂 open）。
+        if len(ext_part) and manifest is not None \
+                and manifest.get("close_only") is True:
+            ext_part = rewrite_close_only_segment(ext_part)
 
     mt5_part = None
     if mt5 is not None and len(mt5):

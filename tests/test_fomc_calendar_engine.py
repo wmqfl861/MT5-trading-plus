@@ -425,12 +425,13 @@ def test_prefomc_strategy_identity_and_event_window_signals():
     bars = pd.DataFrame({"time": pd.date_range("2024-01-01", periods=3),
                          "close": [1., 1., 1.]})
     # 无注入日历 → 同序列日历近似（仅诊断，非恒多脚手架）：信号只可能
-    # 落在"伪公告日（每 6 周一个周三）的前一交易日"（bdate 数据=周一）。
+    # 落在"伪公告日（每 6 周一个周三）的前一交易日=伪锚日"（bdate 数据
+    # =周二；T187/D74：信号=锚日、持仓=公告日 bar，与注入路径同形状）。
     sig = st.generate_signals(bars, {})
     dates = pd.to_datetime(bars["time"]).dt.normalize()
-    expect = ((dates + pd.Timedelta(days=2) - pd.Timestamp("1970-01-05"))
+    expect = ((dates + pd.Timedelta(days=1) - pd.Timestamp("1970-01-05"))
               .dt.days // 7) % 6 == 0
-    assert list(sig) == list((dates.dt.weekday == 0) & expect)
+    assert list(sig) == list((dates.dt.weekday == 1) & expect)
 
 
 def test_library_exports_prefomc():
