@@ -196,6 +196,7 @@ CREATE TABLE IF NOT EXISTS runs(
   round_id           TEXT,
   run_class          TEXT NOT NULL DEFAULT 'research',
   verdict_code_sha   TEXT,
+  verdict_commit     TEXT,
   prev_hash          TEXT NOT NULL DEFAULT '',
   row_hash           TEXT NOT NULL DEFAULT ''
 );
@@ -558,6 +559,25 @@ class Ledger:
             with self._txn():
                 self.conn.execute(
                     "ALTER TABLE runs ADD COLUMN verdict_code_sha TEXT")
+            if not pre_migration:
+                n_runs = int(self.conn.execute(
+                    "SELECT COUNT(*) n FROM runs").fetchone()["n"])
+                if n_runs:
+                    with self._txn():
+                        self._rechain("runs")
+                        self._snapshot_refresh("runs")
+        # T188 迁移（D75，第十七轮 2026-11-09）：runs 加 verdict_commit
+        # （裁决指纹所在提交号——verdict_code_sha 的 tree 哈希不唯一确定
+        # 提交，提交号随行记录；bt 侧计算写入）。**旧行不改**：只补列
+        # （旧行 NULL = 提交号记录概念之前的运行，不回填、不改任何内容
+        # 值），与 verdict_code_sha 迁移同一信任边界：列进哈希规范化内容，
+        # 已有链的旧库补列后 runs 链按新内容整体重算一次（生产台账迁移后
+        # 须 scripts/ledger_anchor.py --accept-rechain 重锚）；pre-T37
+        # 旧库由随后的 T37 一次性重建覆盖本列（幂等：列已存在即跳过）。
+        if "verdict_commit" not in runs_cols:
+            with self._txn():
+                self.conn.execute(
+                    "ALTER TABLE runs ADD COLUMN verdict_commit TEXT")
             if not pre_migration:
                 n_runs = int(self.conn.execute(
                     "SELECT COUNT(*) n FROM runs").fetchone()["n"])
@@ -990,6 +1010,7 @@ class Ledger:
                    round_id: str | None = None,
                    run_class: str | None = None,
                    verdict_code_sha: str | None = None,
+                   verdict_commit: str | None = None,
                    round_trial_budget: int | None = None) -> int:
         """记一行运行（成功的与抛异常的 alike）；返回 run_id。
 
@@ -1004,10 +1025,15 @@ class Ledger:
         卡 research；运维通道 reconcile_ab 的 actor=ops 经缺省推断为 ops）；
         缺省 None = 按 actor 推断（run_class_for_actor）；枚举外 →
         ValueError。
-        verdict_code_sha（T151/D66，第十六轮）：事件模式试验的裁决代码
-        指纹（validation/events.py + bt.py 事件分支 + 日历工件哈希），
-        进 runs 行与去重身份（改判决代码/换日历工件重跑 = 新试验）；
-        None = bar 级卡/旧行为（计数逐位不变）。
+        verdict_code_sha（T151/D66，第十六轮；T188/D75 修订组成）：事件
+        模式试验的裁决代码指纹（判决路径三处 src/mt5quant、src/mt5data、
+        scripts/bt.py 的 HEAD git tree 哈希 + 日历工件哈希），进 runs 行
+        与去重身份（改判决代码/换日历工件重跑 = 新试验）；None = bar 级
+        卡/旧行为（计数逐位不变）。
+        verdict_commit（T188/D75，第十七轮）：裁决指纹所在的提交号
+        （runs 行同时记录——tree 哈希不唯一确定提交，提交号只作溯源，
+        **不进去重身份**：同树异提交不重复计试验）；None = bar 级卡/
+        旧行。
         round_trial_budget（P-10/T99，调用路径传入）：给出且 round_id
         非空时，与写入在同一个 BEGIN IMMEDIATE 事务内做预算相关处理——
         **X-01 起按本轮口径分流**：
@@ -1097,6 +1123,7 @@ class Ledger:
                 "round_id": round_id,
                 "run_class": run_class,
                 "verdict_code_sha": verdict_code_sha,   # T151/D66
+                "verdict_commit": verdict_commit,       # T188/D75
             })
             # X-01 对账后盾（仅新口径轮 + 成功行 + 带上限）：reservation
             # 已把本轮试验钉在 ≤上限，成功行去重数超限 = 有试验绕过占位

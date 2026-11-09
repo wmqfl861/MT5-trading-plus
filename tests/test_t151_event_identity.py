@@ -12,8 +12,9 @@
    `event_returns` 的入场/出场**时刻**一致，净收益差只来自已说明的成本
    口径差（闭合推导：引擎把滑点折进成交价 → 差 = 单边滑点 × 毛收益，
    二阶小量）；
-4. D66：试验身份 verdict_code_sha（validation/events.py + bt.py 事件
-   分支 + 日历工件哈希）——台账 additive 迁移（旧行不改）、改指纹 =
+4. D66（T188/D75 修订组成）：试验身份 verdict_code_sha（判决路径三处
+   src/mt5quant、src/mt5data、scripts/bt.py 的 HEAD git tree 哈希 + 日历
+   工件哈希）——台账 additive 迁移（旧行不改）、改指纹 =
    新试验（N 计数）、LockboxTrial 匹配；
 5. D66：事件模式下 bar 级 G1–G4 标"诊断，不进判定"；策略类不生成
    事件窗信号 → 直接拒绝运行。
@@ -466,25 +467,35 @@ def test_gate_cli_rejects_g5_for_event_card_before_any_runs(
 # ================================================== T151-4：verdict_code_sha
 
 def test_verdict_code_sha_composition_and_sensitivity(tmp_path):
-    """指纹组成逐字（D66）：events.py + bt.py（事件分支所在模块）+ 日历
-    工件哈希——任一成分变化 → 指纹变化；CRLF 规范化后同指纹（跨平台）。"""
+    """指纹组成（T188/D75 修订 D66——断言逐条论证更新）：
+    判决路径三处（src/mt5quant、src/mt5data、scripts/bt.py）在干净检出
+    （HEAD 提交）下的 git tree 哈希 + 日历工件哈希（D66 成分保留）。
+
+    - 旧断言"改 events.py **文件字节** → 指纹变"：D66 哈希工作树文件，
+      D75 改哈希 HEAD 提交——工作树改动不提交**必须不影响**指纹值
+      （脏树另由拒绝运行把守，见 tests/test_t188_verdict_fingerprint.py），
+      改为"**提交后**的 events.py 改动 → 指纹变"（events.py ⊂
+      src/mt5quant 子树，tree 哈希涵盖）；
+    - 旧断言"CRLF 规范化后同指纹（跨平台）"：D75 下指纹与检出字节形态
+      无关（git 对象层归一），改为"同一提交两次计算逐位相同"；
+    - 日历成分敏感与确定性断言不变。"""
+    from tests.test_t188_verdict_fingerprint import (
+        build_synth_repo, _commit_change)
     mod = load_bt()
-    a1 = mod._verdict_code_sha(calendar_component=f"fomc:{'a' * 64}")
-    a2 = mod._verdict_code_sha(calendar_component=f"fomc:{'a' * 64}")
+    repo = build_synth_repo(tmp_path)
+    a1 = mod._verdict_code_sha(calendar_component=f"fomc:{'a' * 64}",
+                               repo_root=repo)
+    a2 = mod._verdict_code_sha(calendar_component=f"fomc:{'a' * 64}",
+                               repo_root=repo)
     assert a1 == a2 and len(a1) == 64
-    assert a1 != mod._verdict_code_sha(calendar_component=f"fomc:{'b' * 64}")
-    assert a1 != mod._verdict_code_sha(calendar_component=None)
-    ev_py = tmp_path / "events.py"
-    bt_py = tmp_path / "bt.py"
-    ev_py.write_text("x = 1\n", encoding="utf-8")
-    bt_py.write_text("y = 1\n", encoding="utf-8")
-    comp = dict(calendar_component="none", events_path=ev_py, bt_path=bt_py)
-    c1 = mod._verdict_code_sha(**comp)
-    ev_py.write_text("x = 2\n", encoding="utf-8")     # 判决代码改动 → 指纹变
-    c2 = mod._verdict_code_sha(**comp)
-    assert c1 != c2
-    ev_py.write_bytes(b"x = 2\r\n")                   # CRLF 检出 → 同指纹
-    assert mod._verdict_code_sha(**comp) == c2
+    assert a1 != mod._verdict_code_sha(calendar_component=f"fomc:{'b' * 64}",
+                                       repo_root=repo)
+    assert a1 != mod._verdict_code_sha(calendar_component=None,
+                                       repo_root=repo)
+    _commit_change(repo, "src/mt5quant/validation/events.py",
+                   "def event_returns():\n    return 1\n")   # 判决代码提交
+    assert mod._verdict_code_sha(calendar_component=f"fomc:{'a' * 64}",
+                                 repo_root=repo) != a1
 
 
 def test_ledger_verdict_code_sha_additive_migration(tmp_path):

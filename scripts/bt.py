@@ -1460,42 +1460,105 @@ def _round_eval_mode(card) -> str:
     return str(ev.get("mode", "") or "")
 
 
-def _sha256_lf_normalized(path) -> str:
-    """文件内容的 CRLF→LF 规范化 sha256（与 gates_sha256 同一防 CRLF 折损
-    语义：同一提交在 Windows/Linux 检出上指纹一致）。"""
-    raw = Path(path).read_bytes().replace(bytes([13, 10]), bytes([10]))
-    return hashlib.sha256(raw).hexdigest()
+# T188/D75（第十七轮 H17-2，2026-11-09）：verdict_code_sha 的组成=
+# 判决路径三处（src/mt5quant、src/mt5data、scripts/bt.py）。事件模式
+# V3 判决调用的 lookahead.py（G0）、robustness.py（ScaledCosts ×1.5
+# 否决）、gates.py（evaluate_v3）、costs/* 全在 src/mt5quant 子树内——
+# tree 哈希天然涵盖子树全部文件；三处之外（mt5gw、其他 scripts）的改动
+# 不再生成新试验（D66 整份 bt.py 口径的"过宽"一面收窄）。
+_VERDICT_CODE_PATHS = ("src/mt5quant", "src/mt5data", "scripts/bt.py")
+
+
+def _verdict_code_identity(*, calendar_component: str | None = None,
+                           repo_root=None) -> dict:
+    """T188/D75：事件模式试验的裁决代码身份（指纹 + 提交号）。
+
+    组成（D75 逐字）：三判决路径（_VERDICT_CODE_PATHS）在**干净检出**
+    （HEAD 提交）下的 git tree/blob 哈希（``git rev-parse HEAD:<path>``）
+    + 日历工件哈希（D66 成分保留：fomc → 冻结工件 sha256；其他事件
+    kind → 显式交易日历内容哈希；None → "none"）。
+
+    - tree 哈希是提交内容的纯函数：同一提交在任意平台检出/任意工作树
+      字节形态下指纹逐位相同（取代 D66 的手工 CRLF→LF 归一 sha256，
+      跨平台一致由 git 对象层保证）；
+    - 提交号（HEAD）随身份返回并记 runs.verdict_commit——tree 哈希
+      刻意**不**进指纹也不唯一确定提交（同树异提交不重复计试验），
+      提交号只作溯源；
+    - 工作树不干净（三路径任一有未提交改动/未跟踪文件）→ RuntimeError
+      （fail-closed 拒绝运行：指纹声明的是干净检出的判决代码，工作树
+      实际执行的可能不同；口径=预检 preflight_integrity.check_worktree_
+      clean 的 git status --porcelain，T170 已查全仓，这里接到运行路径、
+      范围=三判决路径——指纹只描述这三处）。git 失败/超时/三路径不在
+      HEAD → RuntimeError（指纹算不出就拒绝运行，与 strategy_
+      fingerprint 同 fail-fast）；git 可执行缺失如实抛 FileNotFoundError。
+    - 返回 {"verdict_code_sha", "commit", "trees", "calendar_component"}；
+      repo_root 缺省=bt.py 所在仓库根（指纹对象就是该仓库的判决代码）。
+    """
+    import subprocess as _sp
+
+    repo = Path(repo_root) if repo_root is not None \
+        else Path(__file__).resolve().parents[1]
+
+    def _git(*args):
+        return _sp.run(["git", "-C", str(repo), *args],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=10)
+
+    # 脏树拒绝（计划 T188 第 1 条："工作树不干净时拒绝运行"）——先查
+    # 后算：porcelain 非空（改动/暂存/未跟踪）即拒，消息列出条目。
+    st = _git("status", "--porcelain", "--", *_VERDICT_CODE_PATHS)
+    if st.returncode != 0:
+        raise RuntimeError(
+            f"git status 失败（rc={st.returncode}）："
+            f"{(st.stderr or '').strip() or (st.stdout or '').strip()}"
+            "——裁决代码指纹（T188/D75）的干净检出无从证明，拒绝运行")
+    dirty = [ln for ln in (st.stdout or "").splitlines() if ln.strip()]
+    if dirty:
+        raise RuntimeError(
+            "判决路径工作树不干净（T188/D75：verdict_code_sha 取干净检出"
+            "（HEAD）下 src/mt5quant、src/mt5data、scripts/bt.py 三处的"
+            " git tree 哈希，工作树与 HEAD 不一致时指纹不描述实际执行的"
+            " 判决代码）——先提交（或还原）后再运行：\n  "
+            + "\n  ".join(dirty))
+    head = _git("rev-parse", "HEAD")
+    if head.returncode != 0 or not (head.stdout or "").strip():
+        raise RuntimeError(
+            f"git rev-parse HEAD 失败（{repo}）——裁决代码指纹"
+            "（T188/D75）算不出，拒绝运行")
+    commit = head.stdout.strip()
+    trees: dict[str, str] = {}
+    for rel in _VERDICT_CODE_PATHS:
+        proc = _git("rev-parse", f"HEAD:{rel}")
+        out = (proc.stdout or "").strip()
+        if proc.returncode != 0 or not out:
+            raise RuntimeError(
+                f"git rev-parse HEAD:{rel} 失败（{repo}，rc="
+                f"{proc.returncode}）——判决路径不在 HEAD 提交中，"
+                "裁决代码指纹（T188/D75）算不出，拒绝运行")
+        trees[rel] = out
+    digest = hashlib.sha256()
+    digest.update(b"verdict-code-v2")     # T188/D75：组成变更（v1=D66）
+    for rel in _VERDICT_CODE_PATHS:
+        digest.update(f"\n{rel}:{trees[rel]}".encode("utf-8"))
+    digest.update(f"\ncalendar:{calendar_component or 'none'}"
+                  .encode("utf-8"))
+    return {"verdict_code_sha": digest.hexdigest(), "commit": commit,
+            "trees": dict(trees),
+            "calendar_component": calendar_component or "none"}
 
 
 def _verdict_code_sha(*, calendar_component: str | None = None,
-                      events_path=None, bt_path=None) -> str:
-    """T151/D66：事件模式试验身份的裁决代码指纹（verdict_code_sha）。
+                      repo_root=None) -> str:
+    """T188/D75：事件模式试验身份的裁决代码指纹（verdict_code_sha）。
 
-    组成（D66 逐字）：``mt5quant/validation/events.py``（事件收益/检验/
-    随机化的全部实现）+ **bt.py 事件分支**（以 bt.py 模块整文件字节为
-    指纹——事件分支函数 _h_declared/_load_h_research_inputs/_bind_h_strategy/
-    _h_event_setup/_fomc_event_binding/_verify_fomc_registration/_h_preflight/
-    _v3_gate_evaluate 事件分支/_g5_orchestrate 都住在该模块内，整文件是
-    其超集：任何裁决路径改动必变指纹，反之不漏）+ **日历工件哈希**
-    （fomc_calendar → 冻结工件 sha256；其他事件 kind → 实际消费的显式
-    交易日历 JSON 的规范化内容哈希；None → "none"）。
-
-    语义（H16-2 的结构性口子）：试验身份进 runs.verdict_code_sha 与
-    LockboxTrial——改判决代码/换日历工件 = 新试验（N 计数），不再出现
-    "改了判决路径而不计试验"。bar 级卡不计算（None，旧行为逐位不变）。
-    """
-    import mt5quant.validation.events as _vevents
-    events_file = Path(events_path if events_path is not None
-                       else _vevents.__file__)
-    bt_file = Path(bt_path if bt_path is not None else __file__)
-    digest = hashlib.sha256()
-    digest.update(b"verdict-code-v1")
-    digest.update(f"\nevents.py:{_sha256_lf_normalized(events_file)}"
-                  .encode("utf-8"))
-    digest.update(f"\nbt.py:{_sha256_lf_normalized(bt_file)}".encode("utf-8"))
-    digest.update(f"\ncalendar:{calendar_component or 'none'}"
-                  .encode("utf-8"))
-    return digest.hexdigest()
+    组成与 fail-closed 语义逐字见 _verdict_code_identity（三判决路径
+    src/mt5quant / src/mt5data / scripts/bt.py 的 HEAD tree 哈希 + 日历
+    工件哈希；脏树拒绝）。试验身份进 runs.verdict_code_sha 与
+    LockboxTrial——改判决代码/换日历工件 = 新试验（N 计数）。bar 级卡
+    不计算（None，旧行为逐位不变）。"""
+    return _verdict_code_identity(
+        calendar_component=calendar_component, repo_root=repo_root)[
+        "verdict_code_sha"]
 
 
 def _event_calendar_component(h_ctx, symbol: str) -> str | None:
@@ -1687,10 +1750,12 @@ def _v3_gate_evaluate(ledger, card, *, cfg, ctx, cards_dir, strategy, spec,
         return {
             "passed": bool(verdict["passed"]),
             "mode": "event",
-            # T151-4/D66：本次事件判决的裁决代码指纹（validation/events.py
-            # + bt.py 事件分支 + 日历工件哈希）——随 V3 details 入台账，
-            # 与 runs.verdict_code_sha / LockboxTrial 同一身份。
+            # T151-4/D66（T188/D75 修订）：本次事件判决的裁决代码指纹
+            # （判决路径三处 HEAD tree 哈希 + 日历工件哈希）与所在提交号
+            # ——随 V3 details 入台账，与 runs.verdict_code_sha /
+            # runs.verdict_commit / LockboxTrial 同一身份。
             "verdict_code_sha": ctx.get("verdict_code_sha"),
+            "verdict_commit": ctx.get("verdict_commit"),
             "primary": primary,
             "vetoes": {"cost_scale_x15": cost_scale, "delay_1_bar": delay,
                        "buyhold_excess": buyhold},
@@ -5041,15 +5106,28 @@ def cmd_gate(args) -> int:
         except ValueError as exc:
             print(f"✗ {exc}")
             return 1
-        # T151-4/D66：事件模式试验身份的裁决代码指纹——validation/events.py
-        # + bt.py 事件分支 + 日历工件哈希（_verdict_code_sha 的组成逐字见
-        # D66）。进 runs 行（新列）、reservation trial_key（extra，占位身份
-        # 随之区分）与 LockboxTrial；bar 级卡恒 None（行为不变）。
+        # T188/D75（修订 T151-4/D66）：事件模式试验身份的裁决代码指纹——
+        # 判决路径三处（src/mt5quant、src/mt5data、scripts/bt.py）在干净
+        # 检出（HEAD）下的 git tree 哈希 + 日历工件哈希（组成逐字见
+        # _verdict_code_identity）。进 runs 行（新列）、reservation
+        # trial_key（extra，占位身份随之区分）与 LockboxTrial；提交号随
+        # runs 行记录（verdict_commit）；bar 级卡恒 None（行为不变）。
+        # 脏树/指纹算不出 → 拒绝运行（fail-closed，预检 T170 同口径），
+        # 此时尚未占位未入账——零 runs 零预算。
         verdict_code_sha = None
+        verdict_commit = None
         if (v3_ctx or {}).get("mode") == "event" and h_ctx is not None:
-            verdict_code_sha = _verdict_code_sha(
-                calendar_component=_event_calendar_component(h_ctx, symbol))
+            try:
+                _verdict_ident = _verdict_code_identity(
+                    calendar_component=_event_calendar_component(h_ctx,
+                                                                 symbol))
+            except RuntimeError as exc:
+                print(f"✗ {exc}")
+                return 1
+            verdict_code_sha = _verdict_ident["verdict_code_sha"]
+            verdict_commit = _verdict_ident["commit"]
             v3_ctx["verdict_code_sha"] = verdict_code_sha
+            v3_ctx["verdict_commit"] = verdict_commit
         # 基准运行（引擎 A）：先入台账（失败的也记），关卡结果挂在它名下
         data_first, data_last = pd_iso(bars["time"].iloc[0]), pd_iso(bars["time"].iloc[-1])
         rec_params, _unused = _prob_run_fields(fit_ctx, params, None)
@@ -5062,7 +5140,8 @@ def cmd_gate(args) -> int:
             gates_hash=gsha, actor=actor, strategy_sha=strategy_sha,
             run_class=run_class,
             round_id=(round_ctx or {}).get("round_id"),
-            verdict_code_sha=verdict_code_sha)   # T151-4/D66：事件模式裁决指纹
+            verdict_code_sha=verdict_code_sha,   # T151-4/D66：事件模式裁决指纹
+            verdict_commit=verdict_commit)       # T188/D75：指纹所在提交号
         # X-01：reservation 口径轮——基准回测**之前**占位（预算拒绝发生在
         # 计算之前，零回测/关卡调用）+ advance reached_primary；同 trial_key
         # 幂等（screen→gate 同身份不被已占自己的最后额度堵死）。
@@ -5416,8 +5495,11 @@ def cmd_gate(args) -> int:
                 "（随机化参照主检验 + 成本 ×1.5 否决 + G0 数据卫生）。\n"
                 f"- 试验身份 verdict_code_sha="
                 f"{(verdict_code_sha or '—')[:12]}"
-                + ("…（validation/events.py + bt.py 事件分支 + 日历工件"
-                   "哈希，D66）\n" if verdict_code_sha else "（bar 级不适用）\n"))
+                + (f"…（判决路径 src/mt5quant、src/mt5data、scripts/bt.py"
+                   f" 的 HEAD git tree 哈希 + 日历工件哈希，D75/T188；"
+                   f"提交号 verdict_commit="
+                   f"{(verdict_commit or '—')[:12]}…）\n"
+                   if verdict_code_sha else "（bar 级不适用）\n"))
         if h_ctx is not None:
             report += _h_coverage_report(h_ctx)
         if selection["selection"] == "auto":

@@ -819,8 +819,9 @@ class LockboxTrial:
     - require_v3：D34 冻结（gates.toml = v3）后缺省 True——当前试验身份
       下还须有**当前通过的 V3 判决**（最新 V3 行 passed=1）；已见 V3
       失败的试验不进入 G5；
-    - verdict_code_sha（T151/D66，第十六轮）：事件模式试验的裁决代码
-      指纹（validation/events.py + bt.py 事件分支 + 日历工件哈希）——
+    - verdict_code_sha（T151/D66，第十六轮；T188/D75 修订组成）：事件
+      模式试验的裁决代码指纹（判决路径三处 src/mt5quant、src/mt5data、
+      scripts/bt.py 的 HEAD git tree 哈希 + 日历工件哈希）——
       H16-2 的结构性口子：改判决路径必须计新试验。None = bar 级/
       旧行（SQL IS NULL 匹配，bar 级行为逐位不变）。
     """

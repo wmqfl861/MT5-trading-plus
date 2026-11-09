@@ -178,27 +178,43 @@ def probe_event_time_convention() -> None:
 def probe_verdict_fingerprint(repo: Path, bt) -> None:
     src = inspect.getsource(bt._v3_gate_evaluate)
     fp_src = inspect.getsource(bt._verdict_code_sha)
+    if hasattr(bt, "_verdict_code_identity"):
+        fp_src += "\n" + inspect.getsource(bt._verdict_code_identity)
     # 事件分支：从函数开头到 bar 级主检验的实际调用（vgate.run_primary_test(）之前
     # （docstring 里也出现 run_primary_test 字样，按调用形态切分）
     cut = src.find("vgate.run_primary_test(")
     event_part = src[:cut] if cut > 0 else src
     used = sorted(set(re.findall(r"\b(vlook|vrob|vgate|vstats|vwf)\.[A-Za-z_][A-Za-z0-9_]*", event_part)))
     used_calls = sorted(set(re.findall(r"\b(?:vlook|vrob|vgate|vstats|vwf)\.[A-Za-z_][A-Za-z0-9_]*", event_part)))
-    alias = {"vlook": "validation/lookahead.py", "vrob": "validation/robustness.py",
-             "vgate": "validation/gates.py", "vstats": "validation/stats.py",
-             "vwf": "validation/walkforward.py"}
-    covered = {"validation/events.py", "scripts/bt.py"}
-    missing = sorted({alias[a] for a in used} - covered)
-    # 指纹输入按函数体里 digest.update 的三段前缀判定（events.py: / bt.py: / calendar:）
-    in_fp = [label for label, key in (("validation/events.py", '"\\nevents.py:'),
-                                      ("scripts/bt.py", '"\\nbt.py:'),
-                                      ("日历工件", '"\\ncalendar:'))
-             if key in fp_src]
+    alias = {"vlook": "src/mt5quant/validation/lookahead.py",
+             "vrob": "src/mt5quant/validation/robustness.py",
+             "vgate": "src/mt5quant/validation/gates.py",
+             "vstats": "src/mt5quant/validation/stats.py",
+             "vwf": "src/mt5quant/validation/walkforward.py"}
+    # 指纹实际覆盖的判决路径：T188/D75 起按模块常量 _VERDICT_CODE_PATHS
+    # （src/mt5quant、src/mt5data、scripts/bt.py 三处 HEAD git tree 哈希）
+    # 声明；修复前（D66）指纹只有 events.py/bt.py 两段 digest 前缀——
+    # 从函数源码判定，修复前后同一探针都能给出正确状态。
+    verdict_paths = [p for p in ("src/mt5quant", "src/mt5data",
+                                 "scripts/bt.py")
+                     if p in fp_src]
+    def _covered(file: str) -> bool:
+        return any(file == p or file.startswith(p + "/")
+                   for p in verdict_paths)
+    missing = sorted({alias[a] for a in used if not _covered(alias[a])})
     status = "REPRODUCED" if missing else "NOT-REPRODUCED"
-    report("P17-2", status,
-           f"事件模式 V3 判决调用了 {', '.join(used_calls)}；指纹函数只引用 "
-           f"{', '.join(in_fp)}；未进指纹的判决模块：{', '.join(missing)}，"
-           "另有 costs/*（成本计算代码，cost_model_version 只描述配置）")
+    if missing:
+        detail = (f"事件模式 V3 判决调用了 {', '.join(used_calls)}；指纹只"
+                  f"覆盖 {', '.join(verdict_paths) or 'events.py + bt.py'}；"
+                  f"未进指纹的判决模块：{', '.join(missing)}，另有 costs/*"
+                  "（成本计算代码，cost_model_version 只描述配置）")
+    else:
+        detail = (f"事件模式 V3 判决调用了 {', '.join(used_calls)}；指纹="
+                  f"判决路径三处（{', '.join(verdict_paths)}）HEAD git tree"
+                  " 哈希 + 日历工件哈希（T188/D75），全部判决模块都在"
+                  " src/mt5quant 子树内（costs/* 亦然），提交号另行记录"
+                  "（runs.verdict_commit）")
+    report("P17-2", status, detail)
 
 
 # --------------------------------------------------------------------- P17-3
