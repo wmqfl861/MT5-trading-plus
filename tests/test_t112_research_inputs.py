@@ -690,7 +690,7 @@ def test_h_only_candidates_p_functions_constants_and_sampler_unchanged():
     import subprocess
     repo = Path(__file__).resolve().parents[1]
     # 漂移守卫基线：candidates.py 自 f6c7b811 不变；events.py 的
-    # randomize_event_times 于 T187（H17-1/D74，提交 b1ae153）有意改动——
+    # randomize_event_times 于 T187（H17-1/D74，提交 b4eeddb）有意改动——
     # 随机化副本传播 EventWindow.price_timepoint（day_close 事件随机化后
     # 保持同一价格时点口径，否则零假设窗与观测窗口径不一致），基线随之
     # 重钉到该提交（逐条论证见该提交与 docs/reviews/2026-11-08-review-round17.md
@@ -698,7 +698,7 @@ def test_h_only_candidates_p_functions_constants_and_sampler_unchanged():
     pins = {
         "src/mt5quant/research/candidates.py":
             "f6c7b8112a73f111b3553f5413521fc75940a81e",
-        "src/mt5quant/validation/events.py": "b1ae153",
+        "src/mt5quant/validation/events.py": "b4eeddb",
     }
     for rel, module, names in (
         ("src/mt5quant/research/candidates.py", candidates,
