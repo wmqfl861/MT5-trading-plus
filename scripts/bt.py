@@ -1204,7 +1204,8 @@ def cmd_round_rehearse(args) -> int:
             path, bt_script=Path(__file__).resolve(),
             sandbox_root=args.sandbox_root,
             formal_ledger=args.formal_ledger, report_dir=args.report_dir,
-            bars=args.bars, stage_timeout=args.stage_timeout)
+            bars=args.bars, stage_timeout=args.stage_timeout,
+            keep_sandbox=args.keep_sandbox)
     except rnd.RoundError as e:
         print(f"✗ {e}")
         return 1
@@ -1226,6 +1227,12 @@ def cmd_round_rehearse(args) -> int:
     print(f"— 正式台账无污染断言：{'一致' if report['pollution']['unchanged'] else '不一致！'}"
           f"（{report['pollution']['formal_ledger']} 只读快照前后对比）；"
           f"影子台账 {report['pollution']['shadow_ledger']}")
+    if report.get("sandbox_cleaned"):
+        print(f"— 沙盒已自动清理：{report['sandbox']}"
+              "（彩排成功缺省清理自含沙盒目录、绝不递归上级；md 报告"
+              "保留；--keep-sandbox 可保留沙盒供排查）")
+    else:
+        print(f"— 沙盒保留：{report['sandbox']}（事后删除该目录即清理）")
     print(f"— 彩排报告（A1 材料）：{report['report_md']}；"
           f"原始 JSON：{report['report_json']}")
     print(f"{'✓' if report['verdict'] == 'pass' else '✗'} 彩排结论："
@@ -5847,19 +5854,36 @@ def build_parser() -> argparse.ArgumentParser:
                           "round-R#-<日期>.md")
     prc.set_defaults(func=cmd_round_close)
     prh = round_sub.add_parser(
-        "rehearse", help="开轮前彩排（T153/D67）：安慰剂输入端到端跑同一条"
-                         "命令链（round open→screen→gate→ledger verify），"
-                         "写影子台账、逐阶段计时、产出 A1 彩排报告")
+        "rehearse",
+        help="开轮前彩排（T153/D67）：安慰剂输入端到端跑同一条命令链"
+             "（round open→screen→gate→ledger verify），写影子台账、"
+             "逐阶段计时、产出 A1 彩排报告（覆盖边界见 --help 详述）",
+        description="开轮前彩排（T153/D67）：安慰剂输入端到端跑同一条命令链"
+                    "（round open→screen→gate→ledger verify），写影子台账、"
+                    "逐阶段计时、产出 A1 彩排报告。\n"
+                    "覆盖边界（F-5，如实声明）：① screen/gate 带 "
+                    "--allow-unbounded-data——安慰剂合成库无上界语义，豁免"
+                    "必要，而真实运行不带此 flag，故裸库被拒（X-03）类故障"
+                    "不在彩排暴露面内；② 多候选混合 mode 轮 v1 只彩排首候选"
+                    "（其余候选 mode 的命令形状不在本次彩排面内）；"
+                    "③ 概率轮只彩排开轮段（P 线休眠 D69）。")
     prh.add_argument("round", help="轮次 id（R1）或 research/rounds/R1.toml 路径")
     prh.add_argument("--rounds-dir",
                      default=str(REPO_ROOT / "research" / "rounds"))
     prh.add_argument("--sandbox-root", default=str(Path("data") / "rehearse"),
                      help="彩排沙盒根目录（影子台账/安慰剂数据/迷你 git 仓库"
-                          "落此处，data/ 不入库；事后删除沙盒目录即清理）")
+                          "落此处，data/ 不入库；保留时事后删除沙盒目录"
+                          "即清理）")
+    prh.add_argument("--keep-sandbox", action="store_true",
+                     help="保留彩排沙盒供排查（缺省：彩排成功后自动清理"
+                          "沙盒目录——只删 data/rehearse/<R#>-<时刻> 自含"
+                          "沙盒、绝不递归上级，md 报告保留；失败/被拒时"
+                          "不清理）")
     prh.add_argument("--formal-ledger",
                      default=str(Path("data") / "research" / "ledger.sqlite"),
                      help="正式台账路径（只读快照做无污染断言；该轮已开启"
-                          "则拒绝彩排——D67 是开轮前彩排）")
+                          "或状态读不到均拒绝彩排——D67 是开轮前彩排，"
+                          "fail-closed）")
     prh.add_argument("--report-dir", default=str(REPO_ROOT / "docs" / "research"),
                      help="人读彩排报告（md，A1 材料）落盘目录")
     prh.add_argument("--bars", type=int, default=REHEARSE_PLACEBO_BARS,
