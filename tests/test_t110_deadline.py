@@ -33,7 +33,7 @@ blocked = sys.argv[1]
 def stuck(*a, **k):
     threading.Event().wait()
 class Fake:
-    def initialize(self, *a): return True
+    def initialize(self, *a, **k): return True  # T201：initialize 带 MT5 timeout 关键字
     def terminal_info(self): return SimpleNamespace(connected=True)
     def account_info(self): return SimpleNamespace(trade_mode=0, login=123)
     def last_error(self): return (1, 'Success')
@@ -87,7 +87,7 @@ from mt5live.executor import LiveExecutor, ExecutionAdapter
 from mt5quant.strategies.base import ExitRules
 from tests.fakes_live import FakeBroker, mk_decision
 class Fake:
-    def initialize(self, *a): return True
+    def initialize(self, *a, **k): return True  # T201：initialize 带 MT5 timeout 关键字
     def terminal_info(self): return SimpleNamespace(connected=True)
     def account_info(self): return SimpleNamespace(trade_mode=0, login=123)
     def last_error(self): return (1, 'Success')
@@ -128,7 +128,7 @@ from mt5quant.strategies.base import ExitRules
 from tests.fakes_live import FakeBroker, mk_decision
 entered = threading.Event()
 class Fake:
-    def initialize(self, *a): return True
+    def initialize(self, *a, **k): return True  # T201：initialize 带 MT5 timeout 关键字
     def terminal_info(self): return SimpleNamespace(connected=True)
     def account_info(self): return SimpleNamespace(trade_mode=0, login=123)
     def last_error(self): return (1, 'Success')
