@@ -630,19 +630,87 @@ def test_real_cli_dynamic_random_chain_fails_closed_without_null_refill(tmp_path
         assert "primary" not in detail  # no spurious significant p value
 
 
-def baseline_module(relpath, name, *, revision="f6c7b8112a73f111b3553f5413521fc75940a81e"):
-    """Execute only a trusted committed task blob, not store code."""
+# G18-3 锚口径：基线锚从提交号改为 git blob 哈希（按文件内容寻址，与
+# git ls-tree / git hash-object 同口径，等价于"钉内容哈希"）。提交号在
+# rebase 下必然改写——动机实例 b2a8282：T187 提交 b1ae153→b4eeddb 即碎钉；
+# 而内容未变的文件 rebase 前后是同一 blob（本仓库实证：b1ae153 与 b4eeddb
+# 提交号不同、树不同，但 events.py 同为 c4b0717852d2508d359e02fe319592a8bf45921c，
+# 机器可复现的论证见 test_blob_anchor_survives_rebase）。故钉 blob 只在
+# 基线内容真的变了才断，rebase 改写历史不再碎；断言的被测对象不变（仍取
+# 基线内容与当前代码比较），只换锚的表达。常量名里的提交号仅作溯源标注。
+BLOB_ENGINE_A_F6C7B811 = "3228ca32da821a64c8a3e8ea762bfcbae69d9891"
+BLOB_CANDIDATES_F6C7B811 = "f288f1970a8b70775bb74e7e04a230c83ac0926a"
+BLOB_BT_6F33AD58 = "8ba93ade67b35cb206b896f893a6e0fd80a5b906"
+BLOB_CANDIDATES_6F33AD58 = "9efdfe41c5523927cbe2b6c5da03f2f77a2ab586"
+BLOB_EVENTS_B4EEDDB = "c4b0717852d2508d359e02fe319592a8bf45921c"
+
+
+def baseline_module(relpath, name, *, blob):
+    """Execute only a trusted committed task blob, not store code.
+
+    G18-3：blob 锚按内容取基线（git cat-file blob），不经过提交号。"""
     import subprocess
     import sys
     import types
     repo = Path(__file__).resolve().parents[1]
-    raw = subprocess.run(["git", "-C", str(repo), "show", revision + ":" + relpath],
+    raw = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", blob],
                          capture_output=True, check=True).stdout.decode("utf8")
     module = types.ModuleType(name)
     module.__file__ = str(repo / relpath)
     sys.modules[name] = module
     exec(compile(raw, module.__file__, "exec"), module.__dict__)
     return module
+
+
+def test_blob_anchor_survives_rebase_but_commit_anchor_breaks(tmp_path):
+    """G18-3 改钉论证：rebase 只改提交号与树，内容未变的文件同一 blob。
+
+    一次性仓库复现 b2a8282 的碎钉场景：feature 分支提交 A 改 file.py；
+    主干先落了别的提交 U，rebase 把 A 改写为 A'——提交号、树都必然不同，
+    但 file.py 内容未变 ⇒ blob(A:file.py) == blob(A':file.py)，且该 blob
+    在 rebase 后的全新克隆里仍可达（A' 引用它），cat-file blob 照常取到
+    基线内容；而原提交号 A 在新克隆里不存在，git show A:file.py 必败
+    ——这就是提交号锚在 CI 全新克隆下碎钉、blob 内容锚不碎的机器证明。
+    本仓库历史同型实证（溯源，不进断言——b1ae153 不在当前历史可达集内）：
+    T187 的 b1ae153（rebase 前）与 b4eeddb（rebase 后）树不同（父改变）
+    但 events.py 同为 blob c4b07178…，故 BLOB_EVENTS_B4EEDDB 锚在两次
+    改写之间无需改钉，钉提交号的旧写法正是 b2a8282 那次碎钉。"""
+    import subprocess
+
+    def git(cwd, *args, check=True):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                               "-c", "core.autocrlf=false", *args],
+                              cwd=str(cwd), check=check, capture_output=True, text=True)
+
+    baseline_text = 'BASELINE = "t187-style change"\n'
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "file.py").write_text("BASELINE = 0\n", encoding="utf8", newline="\n")
+    git(repo, "init", "-q")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base")
+    trunk = git(repo, "symbolic-ref", "--short", "HEAD").stdout.strip()
+    git(repo, "checkout", "-qb", "feature")
+    (repo / "file.py").write_text(baseline_text, encoding="utf8", newline="\n")
+    git(repo, "commit", "-qam", "A")
+    commit_a = git(repo, "rev-parse", "HEAD").stdout.strip()
+    git(repo, "checkout", "-q", trunk)
+    (repo / "upstream.txt").write_text("u\n", encoding="utf8", newline="\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "U")
+    git(repo, "rebase", trunk, "feature")
+    rebased = git(repo, "rev-parse", "feature").stdout.strip()
+    assert rebased != commit_a  # rebase 必然改写提交号
+    assert git(repo, "rev-parse", f"{rebased}^{{tree}}").stdout \
+        != git(repo, "rev-parse", f"{commit_a}^{{tree}}").stdout  # 树也变（父改变）
+    blob = git(repo, "rev-parse", f"{commit_a}:file.py").stdout.strip()
+    assert blob == git(repo, "rev-parse", f"{rebased}:file.py").stdout.strip()
+    # 模拟 rebase 后的 CI 全新克隆：只有改写后的历史（--no-local 强制走
+    # 传输打包、按可达性传对象；本地路径克隆会硬链接整个对象库，不可模拟）
+    clone = tmp_path / "clone"
+    git(tmp_path, "clone", "-q", "--no-local", "--branch", "feature", str(repo), str(clone))
+    assert git(clone, "cat-file", "blob", blob).stdout == baseline_text  # 内容锚不碎
+    assert git(clone, "show", f"{commit_a}:file.py", check=False).returncode != 0  # 提交号锚碎
 
 
 @pytest.mark.parametrize("direction", [1, -1])
@@ -652,7 +720,8 @@ def test_baseline_engine_vs_new_mt5_bitwise_and_external_context(direction, risk
     from mt5quant.sizing import RiskSizing
     from mt5quant.costs import source_costs
     from mt5quant.backtest.report import summarize
-    old = baseline_module("src/mt5quant/backtest/engine_a.py", "t112_baseline_engine")
+    old = baseline_module("src/mt5quant/backtest/engine_a.py", "t112_baseline_engine",
+                          blob=BLOB_ENGINE_A_F6C7B811)
     class Costs(FlatCosts):
         def stop_overshoot(self, symbol, hour, *, price=None, level="p50"): return .2
     costs = Costs(half=.5, slip=.1, commission=2., overnight=-3.)
@@ -689,22 +758,24 @@ def test_h_only_candidates_p_functions_constants_and_sampler_unchanged():
     import inspect
     import subprocess
     repo = Path(__file__).resolve().parents[1]
-    # 漂移守卫基线：candidates.py 自 f6c7b811 不变；events.py 的
+    # 漂移守卫基线：candidates.py 自 f6c7b811（blob f288f197）不变；events.py 的
     # randomize_event_times 于 T187（H17-1/D74，提交 b4eeddb）有意改动——
     # 随机化副本传播 EventWindow.price_timepoint（day_close 事件随机化后
     # 保持同一价格时点口径，否则零假设窗与观测窗口径不一致），基线随之
     # 重钉到该提交（逐条论证见该提交与 docs/reviews/2026-11-08-review-round17.md
     # §4.2 修复要求）。
+    # G18-3：锚从提交号（f6c7b811 / b4eeddb——正是 b2a8282 rebase 碎钉的
+    # 那颗）改为 blob 内容哈希：同一内容 rebase 前后同 blob（b1ae153 与
+    # b4eeddb 的 events.py 同为 c4b07178），只有基线内容真变才需要重钉。
     pins = {
-        "src/mt5quant/research/candidates.py":
-            "f6c7b8112a73f111b3553f5413521fc75940a81e",
-        "src/mt5quant/validation/events.py": "b4eeddb",
+        "src/mt5quant/research/candidates.py": BLOB_CANDIDATES_F6C7B811,
+        "src/mt5quant/validation/events.py": BLOB_EVENTS_B4EEDDB,
     }
     for rel, module, names in (
         ("src/mt5quant/research/candidates.py", candidates,
          ("precheck_prob", "sample_size_evidence", "_sample_size_numbers", "measured_n_required")),
         ("src/mt5quant/validation/events.py", ev, ("randomize_event_times",))):
-        old = subprocess.run(["git", "-C", str(repo), "show", pins[rel] + ":" + rel],
+        old = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", pins[rel]],
                              check=True, capture_output=True).stdout.decode("utf8")
         current = Path(module.__file__).read_text(encoding="utf8")
         def nodes(text):
@@ -864,7 +935,7 @@ def test_real_cli_changed_signal_new_reservation_and_no_old_auto_evidence(tmp_pa
         assert [r["stage"] for r in reservations] == ["completed", "completed"]
 
 
-def setup_candidate_check_chain(tmp_path, monkeypatch, *, precheck_revision=None,
+def setup_candidate_check_chain(tmp_path, monkeypatch, *, precheck_blobs=None,
                                 signal_symbol="USTEC", signal_timeframe="D1",
                                 signal_start="2022-01-03", expected_check=0):
     """Real disk cost/cache and candidate-check CLI; never insert coverage rows."""
@@ -906,9 +977,13 @@ def setup_candidate_check_chain(tmp_path, monkeypatch, *, precheck_revision=None
     (cdir / "C003.toml").write_text(body, encoding="utf8")
     path = tmp_path / "ledger.sqlite"
     checking = mod
-    if precheck_revision is not None:
-        checking = baseline_module("scripts/bt.py", "t112_old_check", revision=precheck_revision)
-        checking.cand = baseline_module("src/mt5quant/research/candidates.py", "t112_old_precheck", revision=precheck_revision)
+    if precheck_blobs is not None:
+        # G18-3：旧版 precheck 基线按内容（blob）取，原来一颗提交号
+        # （6f33ad58）要拆成逐文件的 blob 锚。
+        checking = baseline_module("scripts/bt.py", "t112_old_check",
+                                   blob=precheck_blobs["scripts/bt.py"])
+        checking.cand = baseline_module("src/mt5quant/research/candidates.py", "t112_old_precheck",
+                                        blob=precheck_blobs["src/mt5quant/research/candidates.py"])
     assert checking.main(["candidate", "check", "C003", "--candidates-dir", str(cdir),
                           "--data-root", str(root), "--ledger", str(path)]) == expected_check
     (rdir / "R1.toml").write_text(_ROUND_R1_STANDARD, encoding="utf8")
@@ -957,9 +1032,15 @@ def test_r1_old_precheck_missing_aux_baseline_cannot_borrow_trade_years(tmp_path
     from mt5quant.research.ledger import Ledger
     # Genuine previous implementation produces the incomplete ledger row; no
     # hand-inserted signal coverage, no mutation/rechain of an existing row.
-    mod, root, path, args = setup_candidate_check_chain(tmp_path, monkeypatch, precheck_revision="6f33ad585d810d17ff7cce1794ec8d15f65df0b3")
-    old = baseline_module("src/mt5quant/research/candidates.py", "t112_old_candidate", revision="6f33ad585d810d17ff7cce1794ec8d15f65df0b3")
-    old_bt = baseline_module("scripts/bt.py", "t112_old_candidate_cli", revision="6f33ad585d810d17ff7cce1794ec8d15f65df0b3")
+    # G18-3：原钉提交号 6f33ad58，改为该提交处两文件的 blob 内容锚。
+    mod, root, path, args = setup_candidate_check_chain(
+        tmp_path, monkeypatch,
+        precheck_blobs={"scripts/bt.py": BLOB_BT_6F33AD58,
+                        "src/mt5quant/research/candidates.py": BLOB_CANDIDATES_6F33AD58})
+    old = baseline_module("src/mt5quant/research/candidates.py", "t112_old_candidate",
+                          blob=BLOB_CANDIDATES_6F33AD58)
+    old_bt = baseline_module("scripts/bt.py", "t112_old_candidate_cli",
+                             blob=BLOB_BT_6F33AD58)
     old_bt.cand = old
     cdir = Path(args[args.index("--cards-dir") + 1]).parent / "candidates"
     assert old_bt.main(["candidate", "check", "C003", "--candidates-dir", str(cdir), "--data-root", str(root), "--ledger", str(path)]) == 0
@@ -1050,8 +1131,10 @@ def test_r1_legacy_h_no_fields_preserves_precheck_and_single_input(tmp_path, mon
     mod, root, path, args = setup_candidate_check_chain(tmp_path, monkeypatch, signal_symbol=None, signal_timeframe=None)
     with Ledger(path) as led:
         initial = json.loads(led.candidate_checks("C003")[-1]["result_json"])
-    old = baseline_module("scripts/bt.py", "t112_legacy_h_cli", revision="6f33ad585d810d17ff7cce1794ec8d15f65df0b3")
-    old.cand = baseline_module("src/mt5quant/research/candidates.py", "t112_legacy_h_candidate", revision="6f33ad585d810d17ff7cce1794ec8d15f65df0b3")
+    # G18-3：legacy-H 行为基线同样改钉 6f33ad58 处两文件的 blob。
+    old = baseline_module("scripts/bt.py", "t112_legacy_h_cli", blob=BLOB_BT_6F33AD58)
+    old.cand = baseline_module("src/mt5quant/research/candidates.py", "t112_legacy_h_candidate",
+                               blob=BLOB_CANDIDATES_6F33AD58)
     cdir = Path(args[args.index("--cards-dir") + 1]).parent / "candidates"
     assert old.main(["candidate", "check", "C003", "--candidates-dir", str(cdir), "--data-root", str(root), "--ledger", str(path)]) == 0
     with Ledger(path) as led:
