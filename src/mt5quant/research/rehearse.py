@@ -38,15 +38,36 @@ D67 原文：**开轮前彩排——同一条命令在安慰剂输入上端到�
 - 纯离线合成——不连任何 MT5/终端（本模块不 import 任何 mt5live/
   mt5gw 路径，数据为内存生成后落 parquet）；
 - 不跑真实候选收益（数据根是沙盒合成库；正式研究库/主库不读）；
-- 不写 approved_by、不触碰锁箱（G5 不彩排——一次性资源，彩排命令
-  不传 --approve，也不调用任何 lockbox 写方法）；
+- 不伪造批准、不触碰锁箱（G5 不彩排——一次性资源，彩排命令不传
+  --approve、不调用任何 lockbox 写方法、不写正式台账任何行）；影子
+  台账 rounds 行的 approved_by 是轮次预注册必填字段的**继承值**（沙盒
+  内随真实 round open 代码路径写入，非彩排新增批准）；
 - 不改 config/gates.toml（只读冻结门槛，与正式运行同一文件）。
+
+沙盒清理（F-4）：缺省（CLI 不带 ``--keep-sandbox``）彩排**成功**后自动
+清理沙盒目录 ``data/rehearse/<R#>-<时刻>/``（自含：repo/store/影子
+台账/原始 JSON；只删该目录本身、绝不递归上级，护栏见 _cleanup_sandbox）；
+人读 md 报告（A1 材料）保留。彩排失败/被拒时不清理（排查需要）；
+``--keep-sandbox`` 一律保留沙盒供排查。
+
+覆盖边界（F-5，如实声明；各阶段 argv 全量落报告可审计）：
+
+- screen/gate 带 ``--allow-unbounded-data``：安慰剂合成库无"声明研究
+  上界/数据来源"语义（X-03），豁免必要；真实运行**不带**此 flag——
+  因此"裸库未声明上界被拒（X-03）"一类故障不在彩排暴露面内；
+- 多候选轮 v1 只彩排**首候选**（candidates_all 全列于报告）：混合
+  mode 轮次（如首候选 bar、次候选 event）只彩排首候选 mode 的命令
+  形状，其余候选 mode 的 screen/gate 事件绑定与关卡集不在本次彩排
+  面内；概率轮（P 线休眠 D69）只彩排开轮段。
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -187,7 +208,13 @@ def formal_chain_heads(path) -> dict | None:
 
 
 def formal_round_status(path, round_id: str) -> str | None:
-    """正式台账里该轮次的 status（None = 未开启/无台账/无表）。"""
+    """正式台账里该轮次的 status（None = 未开启/无台账）。
+
+    文件不存在 → None（无台账可查，与 formal_chain_heads 同口径）；
+    读取失败（损坏/占用/无 rounds 表等 sqlite3.Error）→ RehearseError
+    （F-1：读不到就按"无法确认轮次状态"处理、拒绝彩排——fail-closed，
+    不得视为未开启而放行；formal_chain_heads 的头快照 fail-closed 兜底
+    不变）。"""
     p = Path(path)
     if not p.is_file():
         return None
@@ -199,8 +226,10 @@ def formal_round_status(path, round_id: str) -> str | None:
                 (round_id,)).fetchone()
         finally:
             con.close()
-    except sqlite3.Error:
-        return None            # 旧库无 rounds 表等——视为未开启
+    except sqlite3.Error as e:
+        raise RehearseError(
+            f"正式台账 {p} 无法只读查询轮次 {round_id} 的状态（{e}）——"
+            "无法确认该轮是否已开启，拒绝彩排（fail-closed，F-1）") from e
     return row[0] if row else None
 
 
@@ -325,9 +354,45 @@ def _write_placebo_store(store: Path, round_id: str, bars_n: int
     return bars, cal_path, sha
 
 
-def _seed_shadow_checks(ledger_path: Path, round_obj, years: float) -> None:
+def _fomc_fixture_binding(round_obj, cal_path: Path, cal_sha: str,
+                          days: pd.DatetimeIndex) -> dict | None:
+    """F-3：事件候选的 F1 登记绑定载荷（precheck_source.calendar_sha256
+    + calendar_coverage）。coverage 用与运行侧**同一构造器函数**
+    （mt5quant.validation.events.fomc_calendar_events）在安慰剂日历上、
+    以同式主段窗 [首根日, 末根日) 计算——按构造与 screen/gate 运行侧
+    一致，使 F1 机械核对（CLI SHA ↔ 登记绑定 SHA、构造器 report ↔
+    登记 calendar_coverage 逐字段）走真实路径，而非 no_registered_
+    precheck 兼容路径。轮次无事件候选 → None。"""
+    if not any((round_obj.evaluation.get(cid) or {}).get("mode") == "event"
+               for cid in round_obj.candidates):
+        return None
+    from mt5quant.validation.events import fomc_calendar_events
+
+    main_days = days[(days >= days[0]) & (days < days[-1])]
+    _, rep = fomc_calendar_events(cal_path, cal_sha, main_days)
+    return {"calendar_sha256": cal_sha,
+            "calendar_coverage": {
+                "era_start": rep["era_start"],
+                "default_event_set": rep["default_event_set"],
+                "window_events": rep["window_events"],
+                "events_with_entry_anchor": rep["events"],
+                "dropped_no_bar": rep["dropped_no_bar"],
+                "dropped_no_anchor": rep["dropped_no_anchor"]}}
+
+
+def _seed_shadow_checks(ledger_path: Path, round_obj, years: float,
+                        candidates_dir: Path,
+                        fomc_binding: dict | None = None) -> None:
     """影子台账夹具：每候选一条 pass 预筛（含覆盖基线；概率候选另带
-    per_hypothesis 触发日数——使开轮的 D52 复核在安慰剂上机械可走）。"""
+    per_hypothesis 触发日数——使开轮的 D52 复核在安慰剂上机械可走）。
+
+    F-3 载荷补齐（开轮机械核对的真实路径覆盖）：
+    - 每行带 candidate_sha256（沙盒候选登记文件的当前字节摘要）——
+      H-08"候选内容与预筛结论一致"绑定核对不再走"旧记录未绑定"兼容
+      路径（改候选文件会被机器拒绝）；
+    - 事件候选另带 precheck_source/calendar_coverage（见
+      _fomc_fixture_binding）——F1 日历登记交叉核对不再标注
+      no_registered_precheck。"""
     from mt5quant.research.ledger import Ledger
 
     key = f"{PLACEBO_SYMBOL}/{PLACEBO_TIMEFRAME}"
@@ -342,11 +407,51 @@ def _seed_shadow_checks(ledger_path: Path, round_obj, years: float) -> None:
                     h: {"passed": True,
                         "trigger_days": PLACEBO_TRIGGER_DAYS}
                     for h in (round_obj.hypotheses.get(cid) or ())}}
-            led.record_candidate_check(
-                cid, decision="pass",
-                result={"candidate_id": cid, "decision": "pass",
-                        "note": "T153/D67 rehearsal placebo fixture",
-                        "checks": checks})
+            result: dict = {"candidate_id": cid, "decision": "pass",
+                            "note": "T153/D67 rehearsal placebo fixture",
+                            "checks": checks}
+            cand_file = Path(candidates_dir) / f"{cid}.toml"
+            if cand_file.is_file():
+                result["candidate_sha256"] = hashlib.sha256(
+                    cand_file.read_bytes()).hexdigest()
+            if fomc_binding and (round_obj.evaluation.get(cid) or {}) \
+                    .get("mode") == "event":
+                result["precheck_source"] = {
+                    "stable_key": f"rehearse:{round_obj.id}:{cid}",
+                    "calendar_sha256":
+                        fomc_binding["calendar_sha256"]}
+                result["calendar_coverage"] = \
+                    fomc_binding["calendar_coverage"]
+            led.record_candidate_check(cid, decision="pass", result=result)
+
+
+def _cleanup_sandbox(sandbox: Path, sandbox_root: Path, tag: str) -> bool:
+    """F-4：删除本次彩排的自含沙盒目录（缺省在彩排成功后调用）。
+
+    防误删护栏：只删 sandbox_root 的**直接子目录**、目录名须等于本次
+    生成的 ``<R#>-<时刻>`` tag、目录内须有本次夹具形状（repo/ 与
+    store/ 子目录）——绝不递归上级、绝不删 sandbox_root 本身；任一
+    护栏不过或删除失败 → 返回 False（保留沙盒，如实不报清理成功）。
+    git 对象文件只读 → rmtree 回调先恢复可写再重试。"""
+    def _rm_onexc(func, target, exc):
+        try:
+            os.chmod(target, stat.S_IWRITE)
+            func(target)
+        except OSError:
+            raise exc from None
+
+    try:
+        root = sandbox_root.resolve()
+        target = sandbox.resolve()
+        if (not tag or target == root or target.parent != root
+                or sandbox.name != tag
+                or not (target / "repo").is_dir()
+                or not (target / "store").is_dir()):
+            return False
+        shutil.rmtree(target, onexc=_rm_onexc)
+        return not target.exists()
+    except OSError:
+        return False
 
 
 def _git_init_commit(repo: Path) -> None:
@@ -445,6 +550,7 @@ def _skipped(stage: dict) -> bool:
 def run_rehearsal(round_path, *, bt_script, sandbox_root=None,
                   formal_ledger=None, report_dir=None,
                   bars: int = PLACEBO_BARS, stage_timeout: float = 900.0,
+                  keep_sandbox: bool = False,
                   now: datetime | None = None) -> dict:
     """对一份轮次预注册跑彩排，返回报告 dict（同时落盘 JSON+md）。
 
@@ -453,8 +559,12 @@ def run_rehearsal(round_path, *, bt_script, sandbox_root=None,
     - bt_script：scripts/bt.py 绝对路径（阶段以子进程跑真实 CLI）；
     - sandbox_root：缺省 data/rehearse（data/ 不入库，事后整目录可清理）；
     - formal_ledger：缺省 data/research/ledger.sqlite——**只读**快照对比，
-      该轮已在正式台账开启时拒绝彩排（D67 是开轮**前**彩排）；
-    - report_dir：人读 md 落盘目录（缺省 docs/research，A1 材料）。
+      该轮已在正式台账开启时拒绝彩排（D67 是开轮**前**彩排；读不到
+      轮次状态同样拒绝——fail-closed，F-1）；
+    - report_dir：人读 md 落盘目录（缺省 docs/research，A1 材料）；
+    - keep_sandbox：F-4——缺省 False，彩排**成功**（verdict=pass）后
+      自动清理自含沙盒目录（md 报告保留；见 _cleanup_sandbox 护栏）；
+      True 一律保留沙盒供排查。失败/被拒不清理。
     """
     round_path = Path(round_path)
     bt_script = Path(bt_script)
@@ -499,11 +609,13 @@ def run_rehearsal(round_path, *, bt_script, sandbox_root=None,
         _card_toml(r.id, first_cid, mode or "bar"), encoding="utf-8")
     p_bars, cal_path, cal_sha = _write_placebo_store(store, r.id, bars)
     years = round((len(p_bars) - 1) / 365.25, 6)
-    _seed_shadow_checks(shadow_ledger, r, years)
+    days = pd.DatetimeIndex(pd.to_datetime(p_bars["time"])).normalize()
+    fomc_binding = _fomc_fixture_binding(r, cal_path, cal_sha, days)
+    _seed_shadow_checks(shadow_ledger, r, years, repo / "candidates",
+                        fomc_binding)
     _git_init_commit(repo)
     fixture_seconds = round(time.perf_counter() - t0, 3)
 
-    days = pd.DatetimeIndex(pd.to_datetime(p_bars["time"])).normalize()
     window = (str(days[0].date()), str(days[-1].date()))
     is_event = mode == "event"
     is_prob = mode == "probability"
@@ -646,25 +758,47 @@ def run_rehearsal(round_path, *, bt_script, sandbox_root=None,
                               "生成 parquet）",
             "no_real_candidate_returns": "数据根为沙盒合成库，不读研究库/"
                                          "主库，不跑真实候选收益",
-            "no_approved_by": "不彩排 G5/锁箱（不传 --approve，不写任何"
-                              " approved_by/lockbox 行）",
+            "no_approved_by": "不彩排 G5/锁箱（不传 --approve、不产生任何"
+                              "批准动作、不写正式台账任何行、不写任何 "
+                              "lockbox 行）；影子台账 rounds 行的 "
+                              "approved_by 是预注册必填字段的继承值"
+                              "（沙盒内随真实 round open 代码路径写入，"
+                              "非彩排新增批准）",
             "gates_toml_readonly": "config/gates.toml 只读（不修改）",
         },
         "verdict": verdict,
+        # F-4：缺省彩排成功后自动清理沙盒（keep_sandbox=True 保留）；
+        # 报告 md（A1 材料）不受影响
+        "sandbox_cleaned": verdict == "pass" and not keep_sandbox,
     }
-    json_path.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _dump() -> None:
+        json_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+
+    def _render() -> None:
+        md_path.write_text(
+            _render_md(report, md_name,
+                       repo_root=bt_script.resolve().parents[1]),
+            encoding="utf-8")
+
+    _dump()
     report_dir.mkdir(parents=True, exist_ok=True)
     md_name = f"rehearse-{r.id}-{now.strftime('%Y%m%d-%H%M%S')}.md"
     md_path = report_dir / md_name
-    md_path.write_text(
-        _render_md(report, md_name,
-                   repo_root=bt_script.resolve().parents[1]),
-        encoding="utf-8")
+    _render()
     report["report_md"] = str(md_path)
     report["report_json"] = str(json_path)
-    json_path.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    _dump()
+    if report["sandbox_cleaned"]:
+        # F-4：只删本次自含沙盒目录（护栏见 _cleanup_sandbox）；原始
+        # JSON 随沙盒删除属预期（md 已含结论与计时；排查保留用
+        # --keep-sandbox）。护栏不过/删除失败 → 如实改记并重写报告。
+        if not _cleanup_sandbox(sandbox, sandbox_root, tag):
+            report["sandbox_cleaned"] = False
+            _render()
+            _dump()
     return report
 
 
@@ -698,12 +832,18 @@ def _render_md(report: dict, md_name: str, *, repo_root: Path) -> str:
     p = report["placebo"]
     sandbox_disp = _display(report["sandbox"], repo_root)
     round_disp = _display(report["round_path"], repo_root)
+    if report.get("sandbox_cleaned"):
+        sandbox_note = (f"沙盒已按缺省自动清理（原路径 `{sandbox_disp}`，"
+                        "原始 JSON/影子台账随之删除）——排查需保留沙盒时"
+                        "下次彩排加 --keep-sandbox")
+    else:
+        sandbox_note = (f"原始 JSON/影子台账：`{sandbox_disp}`（保留供"
+                        "排查，事后删除该目录即清理）")
     lines = [
         f"# 彩排报告 {report['round_id']}（T153/D67，开轮前）",
         "",
         f"- 彩排时刻：{report['rehearsed_at_utc']}（版本 "
-        f"{report['version']}，本报告 {md_name}；原始 JSON/影子台账："
-        f"`{sandbox_disp}`，事后删除该目录即清理）",
+        f"{report['version']}，本报告 {md_name}；{sandbox_note}）",
         f"- 预注册：`{round_disp}`（toml_sha256="
         f"{report['round_toml_sha256'][:12]}…）；彩排口径：候选 "
         f"{report['rehearsed_candidate']}（mode="
