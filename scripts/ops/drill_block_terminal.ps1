@@ -15,9 +15,12 @@
     安全设计（三重回收，任何一层失效规则都会消失）：
     1. -Seconds 上限 120：超过直接拒绝执行（要的是有界断线，不是长时间失联）；
     2. 开始等待前先注册一个 10 分钟后一次性触发的兜底计划任务
-       （MT5Quant-drill-block-fallback，动作 = Remove-NetFirewallRule 同名规则，
-       提权运行）：脚本被杀、窗口被关、断电时，规则最迟 10 分钟自动消失；
-    3. 等待结束（或任何一步抛错）都在 finally 里删除规则、注销兜底任务。
+       （MT5Quant-drill-block-fallback，动作 = Remove-NetFirewallRule 同名规则并
+       自删任务，以 NT AUTHORITY\SYSTEM 无头运行——操作员注销也能触发）：
+       脚本被杀、窗口被关、断电时，规则最迟 10 分钟自动消失；
+    3. 等待结束（或任何一步抛错）都在 finally 里删除规则、注销兜底任务；
+       删规则失败时按"兜底任务是否建成"如实分报，并在运行时输出人工清理
+       命令原文（不藏在注释帮助里）。
 
     -TerminalPath 的保守实现（规格允许"探测常见路径"或"必填"二选一，本脚本
     取保守结合）：缺省时探测常见安装路径（Program Files、Program Files (x86)、
@@ -25,7 +28,8 @@
     或探测到多个（无法确定哪个是演练终端）→ 一律报错退出，要求用
     -TerminalPath 显式指定。绝不猜测、绝不默认取第一个。
 
-    全过程写日志（时间戳+步骤）：默认 <仓库根>\data\ops-evidence\drill-block\，
+    全过程写日志（时间戳+步骤，时刻一律系统时钟 UTC（G19-1），PS5.1 无
+    -AsUTC 故用 [DateTime]::UtcNow）：默认 <仓库根>\data\ops-evidence\drill-block\，
     可用 -LogDir 另指。每次运行一个 drill-block_时间戳.log。
 
     红线：本脚本会创建真实防火墙规则与计划任务——只由周六演练主会话/运维在
@@ -75,12 +79,13 @@ if ([string]::IsNullOrWhiteSpace($LogDir)) {
     $LogDir = Join-Path $repoRoot "data\ops-evidence\drill-block"
 }
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-$script:LogFilePath = Join-Path $LogDir ("drill-block_" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
+$script:LogFilePath = Join-Path $LogDir ("drill-block_" + [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss") + ".log")
 
 function Write-DrillLog {
-    # 时间戳+步骤各一行；文件写失败降级为仅控制台输出——清理路径绝不因日志抛错。
+    # 时间戳+步骤各一行（时刻一律系统时钟 UTC，G19-1；PS5.1 无 -AsUTC 故用
+    # [DateTime]::UtcNow）；文件写失败降级为仅控制台输出——清理路径绝不因日志抛错。
     param([Parameter(Mandatory = $true)][string]$Step)
-    $line = "{0} {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Step
+    $line = "{0} {1}" -f [DateTime]::UtcNow.ToString("yyyy-MM-dd HH:mm:ss"), $Step
     Write-Host $line
     try {
         Add-Content -LiteralPath $script:LogFilePath -Value $line -Encoding UTF8
@@ -165,11 +170,14 @@ try {
     Write-DrillLog "STEP1 规则已生效：出站 Block 仅作用于该程序，整机联网不受影响"
 
     # STEP2（规格②）：先注册 10 分钟兜底一次性任务，再开始等待——脚本被杀也能自动回收。
-    Write-DrillLog ("STEP2 注册兜底一次性计划任务 " + $FallbackTaskName + "（10 分钟后自动删除同名规则）")
-    $fallbackAction   = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ("-NoProfile -ExecutionPolicy Bypass -Command `"Remove-NetFirewallRule -Name '" + $RuleName + "'`"")
+    # Principal 用 NT AUTHORITY\SYSTEM + ServiceAccount（审核 M2）：无头免密触发，
+    # 不依赖操作员交互登录——脚本被杀后即使操作员注销，+10 分钟照样删规则
+    #（SYSTEM 删防火墙规则无障碍；Low-1：触发时自删任务，不留空任务残留）。
+    Write-DrillLog ("STEP2 注册兜底一次性计划任务 " + $FallbackTaskName + "（10 分钟后自动删除同名规则并自删任务，SYSTEM 无头触发，不依赖操作员登录）")
+    $fallbackAction   = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ("-NoProfile -ExecutionPolicy Bypass -Command `"Remove-NetFirewallRule -Name '" + $RuleName + "'; Unregister-ScheduledTask -TaskName '" + $FallbackTaskName + "' -Confirm:`$false`"")
     $fallbackTrigger  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(10)
     $fallbackSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
-    $fallbackPrincipal = New-ScheduledTaskPrincipal -UserId $winIdentity.Name -LogonType Interactive -RunLevel Highest
+    $fallbackPrincipal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
     Register-ScheduledTask -TaskName $FallbackTaskName -Action $fallbackAction -Trigger $fallbackTrigger -Settings $fallbackSettings -Principal $fallbackPrincipal -Force | Out-Null
     $taskCreated = $true
     Write-DrillLog "STEP2 兜底任务已注册（若本脚本异常中断，规则最迟 10 分钟自动消失）"
@@ -183,7 +191,10 @@ try {
     Write-DrillLog ("ERROR 步骤失败：" + $_.Exception.Message)
 } finally {
     # STEP4（规格③④）：无论成功、抛错还是中途停止，都在 finally 里删规则、删兜底任务。
+    # 人工清理命令原文（审核 M1）：失败分支必须在运行时输出，不藏在注释帮助里。
     $cleanupFailed = $false
+    $manualRuleCmd = "Remove-NetFirewallRule -Name '" + $RuleName + "'"
+    $manualTaskCmd = "Unregister-ScheduledTask -TaskName '" + $FallbackTaskName + "' " + '-Confirm:$false'
     try {
         if (Get-NetFirewallRule -Name $RuleName -ErrorAction SilentlyContinue) {
             Remove-NetFirewallRule -Name $RuleName -ErrorAction Stop
@@ -192,8 +203,14 @@ try {
             Write-DrillLog ("FINALLY 规则 " + $RuleName + " 不存在，无需删除")
         }
     } catch {
+        # 审核 M1：陈述必须按 $taskCreated 分支——兜底未建成时不得谎称"会自动删除"。
         $cleanupFailed = $true
-        Write-DrillLog ("FINALLY-ERROR 删除规则失败：" + $_.Exception.Message + "——兜底任务将在 10 分钟内自动删除它")
+        if ($taskCreated) {
+            Write-DrillLog ("FINALLY-ERROR 删除规则失败：" + $_.Exception.Message + "——兜底任务仍在，将在 10 分钟内自动删除它")
+        } else {
+            Write-DrillLog ("FINALLY-ERROR 删除规则失败：" + $_.Exception.Message + "——兜底任务未建成，无任何自动回收，请立即人工执行")
+        }
+        Write-DrillLog ("MANUAL-CLEANUP 人工清理命令原文：" + $manualRuleCmd + " ; " + $manualTaskCmd)
     }
     if ($taskCreated) {
         try {
@@ -201,7 +218,7 @@ try {
             Write-DrillLog ("FINALLY 已删除兜底任务 " + $FallbackTaskName)
         } catch {
             $cleanupFailed = $true
-            Write-DrillLog ("FINALLY-ERROR 删除兜底任务失败：" + $_.Exception.Message + "（残留的一次性任务触发时只做同名删规则，无其它副作用）")
+            Write-DrillLog ("FINALLY-ERROR 删除兜底任务失败：" + $_.Exception.Message + "（该任务 10 分钟内触发时会删同名规则并自删，无其它副作用；若仍残留请人工执行：" + $manualTaskCmd + "）")
         }
     }
     if ($cleanupFailed) {

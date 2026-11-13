@@ -17,6 +17,18 @@
   出现网卡/IP/路由/DNS/防火墙Profile级操作，不按地址/端口/协议/接口
   限定，没有 Inbound，没有本机用户目录硬编码路径。
 
+审核修复（docs/reviews/2026-11-13-t205-review.md，conditional → 追加
+断言）：
+
+- M2：兜底 Principal 必须是 NT AUTHORITY\\SYSTEM + ServiceAccount
+  （无头触发，不依赖操作员交互登录）；
+- M1：FINALLY-ERROR 陈述按 ``$taskCreated`` 分支（兜底未建成时明说
+  "无任何自动回收"，不得谎称自动删除），两分支都在**运行时**输出人工
+  清理命令原文（建规则删除 + 兜底任务注销两条）；
+- L1：兜底动作命令含自删（Unregister-ScheduledTask 同名任务）；
+- L2：日志时刻一律 UTC（G19-1，``[DateTime]::UtcNow``，PS5.1 无
+  -AsUTC）。
+
 辅助口径：``_code()`` 去掉 ``<# #>`` 块注释与行内 ``#`` 注释后按纯代码
 断言（脚本内字符串字面量保证不含 ``#``）；文件编码断言 UTF-8 BOM +
 CRLF（PS5.1 正确读中文注释的仓库约定，与既有 ps1 一致）。
@@ -176,16 +188,60 @@ def test_fallback_task_registered_before_wait_ten_minutes():
     assert re.search(
         r"New-ScheduledTaskTrigger\s+-Once\s+-At\s*\(Get-Date\)\.AddMinutes\(10\)",
         code), "兜底任务必须是 -Once + (Get-Date).AddMinutes(10)"
-    # 动作：powershell 删同名规则
+    # 动作：powershell 删同名规则并自删任务（L1：不留空任务残留）
     action_line = [ln for ln in code.splitlines()
                    if "New-ScheduledTaskAction" in ln]
     assert len(action_line) == 1
     for token in ("powershell.exe", "-NoProfile", "Remove-NetFirewallRule",
-                  "$RuleName"):
+                  "$RuleName", "Unregister-ScheduledTask", "$FallbackTaskName",
+                  "-Confirm:`$false"):
         assert token in action_line[0], f"兜底动作缺少 {token}"
     # 注册与注销都用固定任务名
     assert "Register-ScheduledTask -TaskName $FallbackTaskName" in code
     assert "Unregister-ScheduledTask -TaskName $FallbackTaskName" in code
+
+
+# --------------------------------------------------- 审核修复（M1/M2/L1/L2）
+
+def test_fallback_principal_system_headless():
+    """M2：兜底任务以 SYSTEM/ServiceAccount 无头运行，不依赖交互登录。
+
+    Interactive Principal 在操作员注销后触发被跳过、-StartWhenAvailable
+    顺延到下次登录——无人值守 soak 期间终端出站会被静默拦到周一，禁止。
+    """
+    code = _code()
+    principals = re.findall(r"New-ScheduledTaskPrincipal[^\r\n]*", code)
+    assert len(principals) == 1, "只允许一个 Principal（兜底任务）"
+    line = principals[0]
+    assert '-UserId "NT AUTHORITY\\SYSTEM"' in line
+    assert "-LogonType ServiceAccount" in line
+    assert "-RunLevel Highest" in line
+    assert "Interactive" not in code, "不允许再出现依赖交互登录的 Principal"
+
+
+def test_finally_error_honest_manual_cleanup():
+    """M1：FINALLY-ERROR 陈述按 $taskCreated 分支；两分支运行时输出清理原文。
+
+    双失效洞：兜底注册失败 + finally 删规则失败 → 无任何自动回收。此时
+    日志必须明说"无任何自动回收"，不得沿用"兜底 10 分钟内自动删除"的
+    虚假承诺；且人工清理命令必须出现在运行时输出（不藏在注释帮助里）。
+    """
+    code = _code()
+    i_fin = code.index("finally")
+    tail = code[i_fin:]
+    # 消息分支：条件判断在前，两条分支陈述在后，再输出人工清理命令
+    i_branch = tail.index("if ($taskCreated) {")
+    i_auto = tail.index("兜底任务仍在，将在 10 分钟内自动删除它")
+    i_none = tail.index("兜底任务未建成，无任何自动回收")
+    i_manual = tail.index("MANUAL-CLEANUP")
+    assert i_branch < i_auto < i_none < i_manual, \
+        "删规则失败的日志必须先按 $taskCreated 分支陈述，再输出人工清理命令"
+    # 人工清理命令原文：按固定名删规则 + 按固定名注销兜底任务（含 -Confirm:$false 原文）
+    frag_rule = "\"Remove-NetFirewallRule -Name '\" + $RuleName"
+    frag_task = "\"Unregister-ScheduledTask -TaskName '\" + $FallbackTaskName"
+    assert frag_rule in tail, "缺少规则人工清理命令原文（运行时输出）"
+    assert frag_task in tail, "缺少兜底任务人工清理命令原文（运行时输出）"
+    assert "'-Confirm:$false'" in tail, "清理命令必须保留 -Confirm:$false 原文"
 
 
 # ----------------------------------------------------------- finally 删除
@@ -221,5 +277,10 @@ def test_step_logging_to_evidence_dir():
     for marker in ("START", "STEP0", "STEP1", "STEP2", "STEP3",
                    "FINALLY", "END"):
         assert marker in code, f"缺少步骤日志标记 {marker}"
+    # L2（G19-1）：日志时刻一律 UTC（PS5.1 无 -AsUTC → [DateTime]::UtcNow；
+    # 日志行与日志文件名两处都取 UTC，本地时间格式化不得再出现）
+    assert code.count("[DateTime]::UtcNow") == 2, \
+        "日志行与日志文件名的时间戳都必须取 [DateTime]::UtcNow"
+    assert "Get-Date -Format" not in code, "不得再用本地时间 Get-Date -Format"
     # 失败必须以非零退出码暴露（不静默成功）
     assert "exit 1" in code and "exit 0" in code
