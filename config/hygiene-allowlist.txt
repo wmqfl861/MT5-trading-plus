@@ -4,7 +4,9 @@
 # 修好后请连同本行一起删除。
 # 理由文本里不得出现四段点分地址——本文件自身在扫描范围内，须自净。
 #
-# 全部现存例外都是 IPv4 模式对"非地址/非真实地址"文本的命中；
+# 现存例外两类：IPv4 模式对"非地址/非真实地址"文本的命中；T199 起
+# account_number（账号关键词 + 8–10 位数字，写法同探针 P18-7）对 tests/
+# 夹具里合成的顺序数字假 login 元数据值的命中（非真实账号）。
 # 账号@服务器、服务器名、本机路径三类当前零例外（保持零例外）。
 
 docs/ops/mcp-remote-access.md:ipv4  # 全零通配绑定地址与 Windows 能力名 OpenSSH.Server 的四段版本号，均非真实服务器 IP
@@ -12,3 +14,7 @@ docs/reviews/2026-10-22-review-round1.md:ipv4  # 历史审核记录陈述 mcp.js
 docs/reviews/2026-10-23-review-round2.md:ipv4  # 同上：复审记录里 host 全零通配绑定的事实陈述
 tests/test_mt5mcp_auth.py:ipv4  # 夹具用全零通配地址测试"明文公网监听 fail-closed"，非真实地址
 tests/test_mt5mcp_config.py:ipv4  # 夹具：全零通配 + RFC 5737 TEST-NET-3 文档示例段（非路由地址）
+tests/test_config.py:account_number  # 夹具：JSON 里 9 位顺序数字的假 expected_login 值，非真实账号
+tests/test_export_research_store_scoped.py:account_number  # 夹具：save_bars 水位的 8 位顺序数字假来源字段值，非真实账号
+tests/test_mt5data_store.py:account_number  # 夹具：save_bars 水位的 9 位顺序数字假来源字段值，非真实账号
+tests/test_mt5data_ticks.py:account_number  # 夹具：save_ticks 水位的 9 位顺序数字假来源字段值，非真实账号
