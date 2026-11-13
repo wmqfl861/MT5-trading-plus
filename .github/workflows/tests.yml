@@ -1,7 +1,16 @@
 name: tests
 
-# 每次推送到 main 与每个 PR 都在 Windows 上跑全量 pytest。
+# 每次推送到 main 与每个 PR 都在 Windows 上跑全量 pytest（T172 起拆分提速）。
 # 测试不连 MT5 终端（MetaTrader5 为延迟导入，纯逻辑用 FakeMT5），只需装依赖。
+#
+# 提速手段（不减覆盖，G16-5）：
+# - pytest 拆 4 个 matrix 分片并行：tests/test_*.py 按文件名排序后按 i%4
+#   轮转分配（新增文件自动入片，四个分片并集恒等于全量，无需维护清单）；
+# - tests/test_repo_hygiene.py 不入分片，由 hygiene job 单独一道门跑
+#   （敏感信息扫描独立失败可见，且只扫 git ls-files，秒级完成）。
+# 触发规则、fetch-depth、退出码处理与注解逻辑保持不变。
+# 注意：若日后按 docs/p6/permissions.md §9 配置分支保护 required checks，
+# 检查名由单个 pytest 变为 pytest (0)…(3) 与 hygiene。
 on:
   push:
     branches: [main]
@@ -12,9 +21,9 @@ permissions:
   contents: read
 
 jobs:
-  pytest:
+  hygiene:
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 15
     env:
       PYTHONUTF8: "1"
     steps:
@@ -28,14 +37,53 @@ jobs:
           cache-dependency-path: requirements-dev.txt
       - name: Install dependencies
         run: python -m pip install -r requirements-dev.txt
-      - name: Run tests
+      - name: Run hygiene gate
         shell: pwsh
         run: |
-          python -m pytest -q -p no:cacheprovider 2>&1 | Tee-Object -FilePath pytest-output.txt
+          python -m pytest -q -p no:cacheprovider tests/test_repo_hygiene.py 2>&1 | Tee-Object -FilePath pytest-output.txt
+          $code = $LASTEXITCODE
+          # 把汇总行写成注解：在 PR/提交的检查结果里直接可见
+          $summary = Get-Content pytest-output.txt | Where-Object { $_ -match '\d+ (passed|failed|error)' } | Select-Object -Last 1
+          Write-Output "::notice title=hygiene::$summary"
+          # 失败时把每个 FAILED/ERROR 测试写成 error 注解（免鉴权可经 API 读到名单）
+          if ($code -ne 0) {
+            Get-Content pytest-output.txt |
+              Where-Object { $_ -match '^(FAILED|ERROR)' } |
+              Select-Object -First 30 |
+              ForEach-Object { Write-Output "::error title=failing-test::$($_.Trim())" }
+          }
+          exit $code
+  pytest:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    strategy:
+      matrix:
+        shard: ["0", "1", "2", "3"]
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run tests (shard ${{ matrix.shard }}/4)
+        shell: pwsh
+        run: |
+          # 分片选择与本地验证用同一段 Python：文件名排序后按 i%4 轮转，
+          # 排除 test_repo_hygiene.py（hygiene job 单独跑）
+          $shardFiles = python -c "import pathlib,sys; n=int(sys.argv[1]); s=int(sys.argv[2]); fs=sorted((p for p in pathlib.Path('tests').glob('test_*.py') if p.name != 'test_repo_hygiene.py'), key=lambda p: p.name); print('\n'.join(p.as_posix() for i, p in enumerate(fs) if i % n == s))" 4 ${{ matrix.shard }}
+          Write-Output "shard ${{ matrix.shard }}: $($shardFiles.Count) files"
+          python -m pytest -q -p no:cacheprovider $shardFiles 2>&1 | Tee-Object -FilePath pytest-output.txt
           $code = $LASTEXITCODE
           # 把汇总行（如 "388 passed in 20.1s"）写成注解：在 PR/提交的检查结果里直接可见
           $summary = Get-Content pytest-output.txt | Where-Object { $_ -match '\d+ (passed|failed|error)' } | Select-Object -Last 1
-          Write-Output "::notice title=pytest::$summary"
+          Write-Output "::notice title=pytest(shard ${{ matrix.shard }})::$summary"
           # 失败时把每个 FAILED/ERROR 测试写成 error 注解（免鉴权可经 API 读到名单）
           if ($code -ne 0) {
             Get-Content pytest-output.txt |
