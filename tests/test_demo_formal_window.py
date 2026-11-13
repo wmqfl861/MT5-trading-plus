@@ -1148,3 +1148,30 @@ def test_fix2_loop_exit_after_recoverable_failure_judges_failure(tmp_path):
     ])
     out = assert_result(formal(tmp_path), 1)
     assert "LOOP_EXIT" in out
+
+
+# fix3 (T202, 第十九轮计划 §2.2)：未闭降级段的两种截断（O19-2/D88）。
+
+
+def test_fix3_unclosed_segment_truncated_by_same_component_restart(tmp_path):
+    # ①：未配对 DISCONNECTED 段首 + 3 分钟后同组件 supervisor 重启行
+    # （ops-restarts.jsonl）→ 只计 180 秒；新进程不补写恢复，不得计到检查时刻。
+    f = build_evidence(tmp_path)
+    append_restart(f, component="risk")   # 第 1 条重启行 utc = f.start + 8 小时
+    t0 = f.start + timedelta(hours=8) - timedelta(minutes=3)
+    add_alerts(f, [(t0, "DISCONNECTED",
+                    "risk 进程与交易服务器断线（NotConnectedError: synthetic）——降级继续")])
+    out = assert_result(formal(tmp_path), 3)
+    assert "降级 180 秒" in out
+
+
+def test_fix3_unclosed_segment_truncated_by_new_run_start(tmp_path):
+    # ②：未配对段首 + 窗口内新运行 → 在新运行 started_utc 截断；截断对所有
+    # 组件生效（段属于 reconcile，换运行截的是全部组件）。
+    f = build_evidence(tmp_path)
+    append_run(f)                          # 新运行起点 = f.start + 1 天 + 1 小时
+    t0 = f.start + timedelta(days=1, hours=1) - timedelta(minutes=20)
+    add_alerts(f, [(t0, "DISCONNECTED",
+                    "reconcile 进程与交易服务器断线（NotConnectedError: synthetic）——降级继续")])
+    out = assert_result(formal(tmp_path), 3)
+    assert "降级 1200 秒" in out
