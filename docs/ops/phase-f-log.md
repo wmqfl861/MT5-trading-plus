@@ -268,3 +268,14 @@
 **当日无成交**（周六休市）。**注**：正式窗口未起算（D63）；本记录不计数"交易日"。旧调度任务（13:15 UTC 每日）待 T144 改造为只读日检。
 
 **勘误（2026-11-07 T142 评审 F-1）**：本日志 11-05/11-06 节与第十六轮报告中的三处时间事实有误，正确值以 docs/ops/exit-forensics-2026-11-05.md 修正版为准——①runner 死于 11-05 **14:45:06**（journal/日志/exit 标记三件一致；"14:22" 期间 runner 尚在正常运行）；②该 halt 由 **runner 自身 guarded_main** 于 14:45:06 写下（风控 14:45:15 见 halt 时心跳尚=ok，120s 超时未到，非风控所写）；③风控/对账进程自 11-04 **13:22 UTC** 起运行（文件名 -20261104-212206 为本地时刻）。历史条目不改写，以本注记为准。
+
+## 2026-11-13（周五）· 第二基线 PaperSoak 启动（用户指令，P 线会话执行留痕）
+
+- **指令来源**：用户 2026-11-13 对本会话指令"重新看下项目新的代码，然后开始第二基线的模拟交易"；与主会话同日平行指令（第一基线 MaCross，a2291da 留痕）序数对应。
+- **代码复审**（执行前）：候选 `cd6fc4a` CI 5/5 绿、回归 4393、独立审核×4 approved（第二十轮 D92–D95）；T201 核心 diff 亲读（三分支重连+partial 真传+探活重置，O19-1 闭合）。
+- **第二基线定义**：BuyHold XAUUSD H1，**magic 902501**，PaperSoak 模式——仓库既有 T45 基线对的第二份（BUY-HOLD-XAUUSD-H1.toml）；与第一基线互补的验收覆盖（信号恒 1→首格开多持有、零调仓、链路最纯粹样本）。固定 0.01 手。
+- **隔离**：独立 data-dir `workspace/shadow-data-b2`（实例注册/paper state/锁/日志/心跳/drill-archive 全按目录隔离；demo-configs 仅 SHADOW-BUYHOLD 一份）；与第一基线（shadow-data-r19，902610）零共享可写路径；gateway.json/risk.toml/sessions.toml 只读共用。--paper=PaperBroker 影子券商，结构性不下任何 MT5 订单。
+- **启动**：12:50:52 UTC（本地 20:50）经 demo_run.ps1 -Mode PaperSoak（全显式参数镜像 r19 argv）；预检 9 项全过；三进程（runner pid 13092/risk 15324/reconcile 11900）起，instances.json/run-manifest/paper state 就位。
+- **双基线核验（12:57 UTC）**：B2 三心跳新鲜、三 .err 全 0 字节、paper 持仓 0（BuyHold 待下一根 H1 收线后首开）；B1 三心跳新鲜、.err 全 0、持仓 1——互不干扰。
+- **停止期限**：最迟 **11-16 周一换日窗部署（21:55–23:00 UTC）前**停止 b2，硬上限 11-17 第 1 天试跑（01:00 UTC）前（D82 正式窗口终端只服务三实盘进程）。**回退方法**：-Stop 对 PaperSoak 不可用（supervisor 要求 mode==Demo）——置 `shadow-data-b2/live/killSwitch` → 按 instances.json argv/PID 核验进程树后手工终止 → 清 killSwitch/halt（11-13 影子清理先例）。
+- 本会话不触碰终端/Demo 三进程/计划任务；周一部署序列归主会话（D64）。PaperSoak 证据不进正式窗口（runbook §1）。
