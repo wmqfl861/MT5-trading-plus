@@ -1,20 +1,24 @@
 """CI 敏感信息扫描（T70 / 审核第十一轮 F2 的 CI 侧防线，铁律 9）。
 
-对 `git ls-files` 的文本文件扫描四类敏感信息：
+对 `git ls-files` 的文本文件扫描五类敏感信息：
 1. ``\\d{7,}@``——账号@服务器（MT5 账号 7 位以上数字紧接 @；
    6 位 magic 不会命中）；
 2. ``Exness-MT5(Trial|Real)\\d+``——真实服务器名；
 3. ``C:[/\\\\]Users[/\\\\](?!<)``——本机绝对路径（Windows 用户目录）；
    ``<`` 开头的占位符（如 ``C:/Users/<用户名>/``、``<demo-login>``）豁免；
 4. 非私有网段 IPv4（10./127./192.168./172.16–31. 豁免；localhost 非地址，
-   天然不命中）。
+   天然不命中）；
+5. 账号关键词 + 8–10 位数字（T199，写法同探针 P18-7）：关键词
+   login/账号/账户/模拟盘/demo（不区分大小写）后只隔引号/空白/冒号/
+   等号跟 8–10 位数字（后面不能再有数字）。``demo-next-20261105``
+   这类日期后缀写法中间隔着 ``-next-``，不命中。
 
 已知例外写 config/hygiene-allowlist.txt：每行 ``路径`` 或 ``路径:模式名``，
 后跟 ``# 一行理由``（缺理由即失败）；allowlist 里没有对应残留的条目
 （失效条目）同样失败，防止"修好了但豁免永久留下去"。
 
 扫描器自身的夹具字符串在源码里拆分拼接（如 ``"9"*8 + "@"``），使本文件
-自身对这四个模式干净，无需自豁免。
+自身对这五个模式干净，无需自豁免。
 """
 from __future__ import annotations
 
@@ -32,6 +36,10 @@ HYGIENE_PATTERNS: dict[str, re.Pattern[str]] = {
     "ipv4": re.compile(
         r"\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}"
         r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\b"),
+    # T199（写法逐字同探针 P18-7）：账号关键词后只隔引号/空白/冒号/等号
+    # 跟 8–10 位数字；demo-next-20261105 这类写法中间是 "-next-"，不命中。
+    "account_number": re.compile(
+        r"(?i)(?:login|账号|账户|模拟盘|demo)[\"']?\s*[:：=]?\s*[\"']?\d{8,10}(?!\d)"),
 }
 
 # 私有/回环网段（豁免）；localhost 是主机名，不会被 IPv4 模式命中
@@ -191,6 +199,46 @@ def test_scan_ipv4_public_flagged_private_exempt(tmp_path):
     assert len(hits) == 2      # 公网 DNS 地址与 172 豁免段外地址各一
 
 
+def test_scan_account_number_keyword_digits(tmp_path):
+    """T199（写法同探针 P18-7）：账号关键词 + 8/9/10 位数字必须命中。
+
+    关键词与数字之间允许引号/空白/冒号/等号——JSON、config、散文、
+    中文冒号写法都覆盖。夹具拆分拼接，保持本文件对该模式干净。
+    """
+    f = tmp_path / "note.md"
+    f.write_text(
+        "eq8: " + "login" + "=" + "1" * 8 + "\n"
+        "cn9: " + "账号" + "：" + "2" * 9 + "\n"
+        "space10: " + "账户 " + "3" * 10 + "\n"
+        "json8: " + "expected_" + "login" + '": ' + "4" * 8 + "\n"
+        "demo9: " + "DEMO " + "5" * 9 + "\n"
+        "cn8: " + "模拟盘" + "=" + "6" * 8 + "\n",
+        encoding="utf-8")
+    violations = scan_files(tmp_path, ["note.md"],
+                            allowlist_path=tmp_path / "absent.txt")
+    hits = [v for v in violations if "account_number" in v]
+    assert len(hits) == 6, violations
+
+
+def test_scan_account_number_demo_next_and_width_edges(tmp_path):
+    """T199：demo-next-<日期>（8 位日期后缀）不命中；位数边界不命中。
+
+    demo-next-20261105 中间隔着 "-next-"，不在关键词后允许的
+    引号/空白/冒号/等号之内；不足 8 位（如 6 位演练 magic）与
+    超过 10 位的数字串也不是账号形态。
+    """
+    f = tmp_path / "note.md"
+    f.write_text(
+        "demo-next-20261105\n"
+        "目录 demo-next-20261105/ 下的文件\n"
+        "under8: " + "login" + "=" + "9" * 6 + "\n"
+        "over10: " + "login" + "=" + "7" * 11 + "\n",
+        encoding="utf-8")
+    violations = scan_files(tmp_path, ["note.md"],
+                            allowlist_path=tmp_path / "absent.txt")
+    assert not [v for v in violations if "account_number" in v], violations
+
+
 def test_scan_skips_binary_and_venv(tmp_path):
     """二进制（NUL / 后缀）与 .venv 路径跳过。"""
     (tmp_path / "blob.bin").write_bytes(b"12345678" + b"\x00" + b"9" * 20)
@@ -205,7 +253,7 @@ def test_scan_skips_binary_and_venv(tmp_path):
 def test_allowlist_entry_with_reason_suppresses(tmp_path):
     """allowlist 命中的条目（文件:模式）被豁免；缺理由的条目本身报错。"""
     f = tmp_path / "note.md"
-    f.write_text("login 1234567" + "8@srv", encoding="utf-8")
+    f.write_text("9" * 8 + "@srv", encoding="utf-8")
     al = tmp_path / "al.txt"
     al.write_text("note.md:account_at_server  # 演练用的示例豁免\n",
                   encoding="utf-8")
