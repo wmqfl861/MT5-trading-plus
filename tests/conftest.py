@@ -26,12 +26,22 @@ skip 异常若在这里逃逸会让所有 import pandas 的测试文件被连坐
 
 机器装齐全部依赖时本机制完全惰性：finder 挂在末位，已安装的包由
 PathFinder 先行解析，永远不会走到这里——行为零变化。
+
+严格模式（T206/O19-6）：设 ``MT5_STRICT_DEPS``（任何非空值，CI 用
+``1``）后该跳过机制整体失效——finder 不注册；若 conftest 已在变量
+置位前加载（finder 已在场），被问到时也改抛普通 ``ModuleNotFoundError``
+（缺包 = 测试失败，红）。用途：CI 依赖装齐是前提，缺包静默 skip 会
+掩盖安装问题；本地不设该变量，行为与上面描述完全一致。
 """
 from __future__ import annotations
 
+import os
 import sys
 
 from _pytest.outcomes import Skipped
+
+# 严格模式开关（T206/O19-6）：任何非空值开启；CI 的 pytest job 置 1。
+STRICT_DEPS_ENV = "MT5_STRICT_DEPS"
 
 # 可选重依赖（与 src/ 的顶层 import 对齐）：
 # - pyarrow：src/mt5data/ticks.py 顶层 + pandas parquet 引擎（bars 全套）；
@@ -52,6 +62,15 @@ class _OptionalDependencySkipped(Skipped):
         Skipped.__init__(self, msg, allow_module_level=True)
 
 
+def _strict_deps_enabled() -> bool:
+    """严格依赖模式是否开启：``MT5_STRICT_DEPS`` 置任何非空值即开。
+
+    CI 用它关掉缺包跳过——依赖装齐是 CI 的前提，缺包必须红；本地
+    不设该变量，走 T190 的惰性 skip。
+    """
+    return bool(os.environ.get(STRICT_DEPS_ENV))
+
+
 def _in_pandas_compat_probe() -> bool:
     """本次 import 是否发自 pandas 的可选依赖降级探测模块。
 
@@ -69,11 +88,22 @@ def _in_pandas_compat_probe() -> bool:
 
 
 class _OptionalDepSkipFinder:
-    """meta_path 兜底 finder：只在可选依赖真实缺席时被问到。"""
+    """meta_path 兜底 finder：只在可选依赖真实缺席时被问到。
+
+    严格模式（MT5_STRICT_DEPS 置位）下被问到时抛普通
+    ModuleNotFoundError 而非 Skipped——正常情况下严格模式根本不会注册
+    它（见 _register_skip_finder），这里兜住"先加载 conftest 后设变量"
+    的进程形态，保证严格模式下缺包永远是失败。
+    """
 
     def find_spec(self, fullname, path=None, target=None):
         root = fullname.split(".", 1)[0]
         if root in OPTIONAL_HEAVY_DEPS:
+            if _strict_deps_enabled():
+                # 严格模式（CI）：缺包按原生 ImportError 失败（T206/O19-6）
+                raise ModuleNotFoundError(
+                    f"可选重依赖 {root} 未安装"
+                    f"（{STRICT_DEPS_ENV} 严格模式：缺包即失败）")
             msg = f"可选重依赖 {root} 未安装（T190：缺包跳过，不算失败）"
             if _in_pandas_compat_probe():
                 # pandas 的降级探测：给它普通缺席异常，import pandas 不炸
@@ -82,6 +112,15 @@ class _OptionalDepSkipFinder:
         return None
 
 
-# 末尾追加（幂等）：已安装时前置 PathFinder 已解析，永远走不到这里。
-if not any(isinstance(f, _OptionalDepSkipFinder) for f in sys.meta_path):
-    sys.meta_path.append(_OptionalDepSkipFinder())
+def _register_skip_finder() -> None:
+    """幂等把兜底 finder 挂到 sys.meta_path 末位；严格模式下不挂。
+
+    已安装时前置 PathFinder 已解析，finder 永远不会被问到。
+    """
+    if _strict_deps_enabled():
+        return  # 严格模式（CI）：不注册，缺包走 Python 原生 ImportError
+    if not any(isinstance(f, _OptionalDepSkipFinder) for f in sys.meta_path):
+        sys.meta_path.append(_OptionalDepSkipFinder())
+
+
+_register_skip_finder()

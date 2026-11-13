@@ -8,6 +8,10 @@ name: tests
 #   轮转分配（新增文件自动入片，四个分片并集恒等于全量，无需维护清单）；
 # - tests/test_repo_hygiene.py 不入分片，由 hygiene job 单独一道门跑
 #   （敏感信息扫描独立失败可见，且只扫 git ls-files，秒级完成）。
+# T206（O19-6）严格依赖模式：pytest job 设 MT5_STRICT_DEPS=1——
+# tests/conftest.py 的缺包跳过（T190）失效，缺包按原生 ImportError 失败
+# 而非静默 skip；并在跑测试前逐个导入 OPTIONAL_HEAVY_DEPS 里的可选
+# 依赖（缺哪个红哪个）。本地不设该变量，行为不变。
 # 触发规则、fetch-depth、退出码处理与注解逻辑保持不变。
 # 注意：若日后按 docs/p6/permissions.md §9 配置分支保护 required checks，
 # 检查名由单个 pytest 变为 pytest (0)…(3) 与 hygiene。
@@ -61,6 +65,9 @@ jobs:
         shard: ["0", "1", "2", "3"]
     env:
       PYTHONUTF8: "1"
+      # T206/O19-6 严格依赖模式：conftest 的缺包跳过（T190）失效，
+      # CI 缺包按原生 ImportError 失败，不静默 skip。
+      MT5_STRICT_DEPS: "1"
     steps:
       - uses: actions/checkout@v5
         with:
@@ -72,6 +79,30 @@ jobs:
           cache-dependency-path: requirements-dev.txt
       - name: Install dependencies
         run: python -m pip install -r requirements-dev.txt
+      - name: Verify optional deps importable (T206 strict mode)
+        shell: pwsh
+        run: |
+          # T206/O19-6：逐个导入 CI 应装的可选重依赖，缺哪个红哪个
+          # （含装了但导入即炸的损坏安装）。清单以 tests/conftest.py 的
+          # OPTIONAL_HEAVY_DEPS 为源，不在此处另维护一份。
+          $deps = python -c "from tests.conftest import OPTIONAL_HEAVY_DEPS as d; print(' '.join(d))"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $missing = @()
+          foreach ($dep in $deps -split '\s+') {
+            if (-not $dep) { continue }
+            python -c "import $dep"
+            if ($LASTEXITCODE -ne 0) {
+              $missing += $dep
+              Write-Output "::error title=missing-dep::$dep import failed (traceback above)"
+            } else {
+              Write-Output "ok: $dep"
+            }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Output "FAIL: missing/broken optional deps: $($missing -join ', ')"
+            exit 1
+          }
+          Write-Output "all optional deps importable: $deps"
       - name: Run tests (shard ${{ matrix.shard }}/4)
         shell: pwsh
         run: |
