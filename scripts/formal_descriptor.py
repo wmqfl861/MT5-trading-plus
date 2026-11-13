@@ -125,6 +125,9 @@ def main(argv=None) -> int:
     ap.add_argument("--deploy-lines", nargs=2, type=int, required=True, metavar=("FIRST", "LAST"),
                     help="部署记录的一基物理行区间")
     ap.add_argument("--calendar", required=True, help="日历源文件（须在根内）")
+    ap.add_argument("--drill-magic", action="append", type=int, metavar="MAGIC", default=[],
+                    help="演练 magic（可重复；写入描述符可选字段 drill_magics，"
+                         "与部署清单 magics 不得相交——换日禁入探针等用）")
     ap.add_argument("--out", help="描述符输出（缺省 <root>/formal.json，须在根内）")
     ap.add_argument("--calendar-out", help="日历 JSON 输出（缺省 <root>/calendar.json，须在根内）")
     args = ap.parse_args(argv)
@@ -193,6 +196,11 @@ def main(argv=None) -> int:
     magics = sorted(int(k) for k in anchor_roles if k.isdigit())
     if sorted(manifest.get("magics", [])) != magics or not magics:
         fail("anchor: run-manifest magics disagree with the anchor instances snapshot")
+    drill_magics = sorted(set(args.drill_magic))
+    if any(m <= 0 for m in drill_magics):
+        fail("--drill-magic: must be positive integers")
+    if set(drill_magics) & set(magics):
+        fail(f"--drill-magic: must not overlap the deployment magics {magics}")
 
     # -- every post-anchor run needs retained snapshots.
     run_bindings = []
@@ -267,6 +275,7 @@ def main(argv=None) -> int:
 
     descriptor = {
         "schema_version": 1, "mode": "Demo", "deployment_sha": deployment_sha, "magics": magics,
+        **({"drill_magics": drill_magics} if drill_magics else {}),
         "anchor": {"run_index": anchor_i, **{
             name + "_snapshot": _ref(root, anchor_base / f"{name}.json")
             for name in ("manifest", "launcher", "instances")},
@@ -291,7 +300,7 @@ def main(argv=None) -> int:
         fail(f"internal: assembled descriptor failed demo_check validation ({exc})")
     out_path.write_bytes((json.dumps(descriptor, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
     print(f"anchor run_index={anchor_i} runs_bound={len(run_bindings)} restarts_bound={len(restart_bindings)} "
-          f"calendar_days={len(days)} descriptor={out_path.name}")
+          f"calendar_days={len(days)} drill_magics={drill_magics or '—'} descriptor={out_path.name}")
     return 0
 
 

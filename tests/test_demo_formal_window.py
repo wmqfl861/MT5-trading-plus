@@ -912,3 +912,239 @@ def test_fix1_standalone_and_daily_help_remain_normal(tmp_path, flags):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "usage:" in result.stdout
     assert "historical_identity_verified" not in result.stdout
+
+
+# fix2 (T191, 第十八轮 §3.1)：记录类告警、历史范围、窗口内 stderr 与演练 magic。
+
+
+def add_alerts(f, rows):
+    with (f.live / "alerts.log").open("a", encoding="utf-8") as out:
+        for t, kind, msg in rows:
+            out.write(f"{iso(t)}\t{kind}\t{msg}\n")
+
+
+def prepend_alerts(f, rows):
+    """把行插到 alerts.log 最前（构造早于锚点的历史行）。"""
+    p = f.live / "alerts.log"
+    old = p.read_text(encoding="utf-8")
+    with p.open("w", encoding="utf-8") as out:
+        for t, kind, msg in rows:
+            out.write(f"{iso(t)}\t{kind}\t{msg}\n")
+        out.write(old)
+
+
+def drill_magic():
+    return 902603 if 902603 not in MAGICS else max(MAGICS) + 7
+
+
+def test_fix2_recovered_recorded_pairs_are_recorded_not_failures(tmp_path):
+    # 场景①：窗口内已恢复的 DISCONNECTED 对、ACCOUNT_UNAVAILABLE 对 → 3，
+    # 逐日统计照常输出（55 + 40 = 95 秒 < 1800）。
+    f = build_evidence(tmp_path)
+    t0 = f.start + timedelta(hours=5)
+    add_alerts(f, [
+        (t0, "DISCONNECTED", "risk 进程与交易服务器断线（NotConnectedError: synthetic）——降级继续"),
+        (t0 + timedelta(seconds=55), "DISCONNECTED",
+         "risk 进程与交易服务器恢复连接（断线 55 秒）——恢复正常轮询（T141）"),
+        (t0 + timedelta(hours=1), "ACCOUNT_UNAVAILABLE",
+         "risk 账户取数失败（DataUnavailableError: synthetic）——按时间窗计"),
+        (t0 + timedelta(hours=1, seconds=40), "ACCOUNT_UNAVAILABLE",
+         "risk 账户取数恢复（此前连续失败 40 秒，未达时间窗上限）——恢复正常轮询（T184）"),
+    ])
+    out = assert_result(formal(tmp_path), 3)
+    assert "记录类 4 次" in out and "降级 95 秒" in out
+
+
+def test_fix2_disconnect_exit_alert_is_treated_as_anomaly(tmp_path):
+    # 场景②："进程连续断线"（T141 rc=78 退出告警）→ 1。
+    f = build_evidence(tmp_path)
+    add_alerts(f, [(f.start + timedelta(hours=6), "DISCONNECTED",
+                    "risk 进程连续断线 15 分钟（≥ 15 分钟上限，最后错误：NotConnectedError）——"
+                    "以专用退出码 78 退出交给 supervisor（T141）")])
+    out = assert_result(formal(tmp_path), 1)
+    assert "DISCONNECTED" in out
+
+
+def test_fix2_daily_degradation_1860s_fails(tmp_path):
+    # 场景③：当日累计降级 1860 秒（>1800）→ 1，失败名"环境降级超限"。
+    f = build_evidence(tmp_path)
+    t0 = f.start + timedelta(hours=6)
+    add_alerts(f, [
+        (t0, "DISCONNECTED", "risk 进程与交易服务器断线（NotConnectedError: synthetic）——降级继续"),
+        (t0 + timedelta(seconds=1860), "DISCONNECTED",
+         "risk 进程与交易服务器恢复连接（断线 1860 秒）——恢复正常轮询（T141）"),
+    ])
+    out = assert_result(formal(tmp_path), 1)
+    assert "环境降级超限" in out and "1860" in out
+
+
+def test_fix2_degradation_is_union_across_components_per_day(tmp_path):
+    # 同日各组件段取并集而非求和：[0,1200] ∪ [600,1801] = 1801 秒（>1800）。
+    f = build_evidence(tmp_path)
+    t0 = f.start + timedelta(hours=6)
+    add_alerts(f, [
+        (t0, "DISCONNECTED", "risk 进程与交易服务器断线（NotConnectedError: synthetic）——降级继续"),
+        (t0 + timedelta(seconds=1200), "DISCONNECTED",
+         "risk 进程与交易服务器恢复连接（断线 1200 秒）——恢复正常轮询（T141）"),
+        (t0 + timedelta(seconds=600), "ACCOUNT_UNAVAILABLE",
+         "reconcile 账户取数失败（DataUnavailableError: synthetic）——按时间窗计"),
+        (t0 + timedelta(seconds=1801), "ACCOUNT_UNAVAILABLE",
+         "reconcile 账户取数恢复（此前连续失败 1201 秒，未达时间窗上限）——恢复正常轮询（T184）"),
+    ])
+    out = assert_result(formal(tmp_path), 1)
+    assert "环境降级超限" in out and "1801 秒" in out and "2401" not in out
+
+
+def test_fix2_unknown_alert_kind_in_window_is_invalid(tmp_path):
+    # 场景④：窗口内未知类型 → 2。
+    f = build_evidence(tmp_path)
+    add_alerts(f, [(f.now - timedelta(seconds=2), "UNCLASSIFIED_KIND", "synthetic failure")])
+    assert_result(formal(tmp_path), 2, "alerts.unknown_kind")
+
+
+def test_fix2_pre_anchor_alerts_are_format_checked_only(tmp_path):
+    # 场景⑤：锚点前的未知类型与锚点前演练 magic 的告警 → 只校验行格式 → 3。
+    f = build_evidence(tmp_path)
+    old = f.start - timedelta(days=1)
+    prepend_alerts(f, [
+        (old, "LEGACY_KIND", "锚点前的未知类型（只校验行格式）"),
+        (old + timedelta(seconds=5), "RISK_REJECT",
+         f"magic {drill_magic()} legacy forbidden_session（锚点前演练 magic）"),
+    ])
+    assert_result(formal(tmp_path), 3)
+
+
+def test_fix2_pre_anchor_stderr_file_is_not_read(tmp_path):
+    # 场景⑥：锚点前修改过的 .log.err 含无时间戳 CRITICAL → 不读 → 3。
+    f = build_evidence(tmp_path)
+    err = f.logs / "risk-account-20201110-033459.log.err"
+    err.write_text("CRITICAL:root:MT5 deadline call=initialize duration=66.422s "
+                   "limit=30.000s rc=75\n", encoding="utf-8")
+    old = (f.start - timedelta(days=1)).timestamp()
+    os.utime(err, (old, old))
+    assert_result(formal(tmp_path), 3)
+
+
+def test_fix2_pre_anchor_log_file_with_untimed_lines_is_not_read(tmp_path):
+    f = build_evidence(tmp_path)
+    old_log = f.logs / "runner-902601-20260101-000000.log"
+    old_log.write_text("mt5live 启动：XAUUSD M15 magic=902601 [LIVE]\n垃圾行（无时间戳）\n",
+                       encoding="utf-8")
+    old = (f.start - timedelta(days=1)).timestamp()
+    os.utime(old_log, (old, old))
+    assert_result(formal(tmp_path), 3)
+
+
+def test_fix2_nonempty_stderr_file_in_window_fails_with_exit_one(tmp_path):
+    # 场景⑦：窗口内非空 .log.err → "窗口内异常：stderr 输出 <文件名>"，返回 1。
+    f = build_evidence(tmp_path)
+    name = "risk-account-20261116-030000.log.err"
+    (f.logs / name).write_text(
+        "CRITICAL:root:MT5 deadline call=terminal_info duration=31.002s rc=75\n",
+        encoding="utf-8")   # mtime=当前时刻，落在窗口内
+    out = assert_result(formal(tmp_path), 1)
+    assert "窗口内异常" in out and f"stderr 输出 {name}" in out
+
+
+def test_fix2_supervisor_evidence_in_window_is_invalid(tmp_path):
+    # 场景⑧：窗口内 SUPERVISOR_EVIDENCE → 2（evidence.retention_failed）。
+    f = build_evidence(tmp_path)
+    add_alerts(f, [(f.now - timedelta(seconds=3), "SUPERVISOR_EVIDENCE",
+                    "seq=3 component=risk before copy failed: OSError")])
+    assert_result(formal(tmp_path), 2, "evidence.retention_failed")
+
+
+def test_fix2_declared_drill_magic_reject_satisfies_forbidden_session(tmp_path):
+    # 场景⑨：声明演练 magic 后其 forbidden_session 拒单 → 3，且"换日禁入"
+    # 演练项计满（基线 1 条 + 探针 1 条）。
+    f = build_evidence(tmp_path)
+    drill = drill_magic()
+    f.descriptor["drill_magics"] = [drill]
+    save_descriptor(f)
+    add_alerts(f, [(f.start + timedelta(hours=4, minutes=30), "RISK_REJECT",
+                    f"magic {drill} XAUUSD UTC 21:56 换日窗禁止开仓 forbidden_session（演练探针）")])
+    out = assert_result(formal(tmp_path), 3)
+    assert "换日禁入拒单×2" in out
+
+
+@pytest.mark.parametrize("which", ["deals", "orders"])
+def test_fix2_drill_magic_trading_evidence_is_invalid(tmp_path, which):
+    # 场景⑩：演练 magic 有成交（deals-<d>.jsonl 非空 / orders-<d>.jsonl 有行）→ 2。
+    f = build_evidence(tmp_path)
+    drill = drill_magic()
+    f.descriptor["drill_magics"] = [drill]
+    save_descriptor(f)
+    if which == "deals":
+        lines(f.live / f"deals-{drill}.jsonl",
+              [dict(ts=iso(f.start + timedelta(hours=2)), magic=drill, ticket=9,
+                    event="fill_open", price=4000.0, side="buy", volume=.01,
+                    reason=None, decision_bar=iso(f.start))])
+    else:
+        lines(f.live / f"orders-{drill}.jsonl",
+              [dict(ts=iso(f.start + timedelta(hours=2)), magic=drill, kind="open",
+                    symbol="XAUUSD", side="buy", lots=.01, decision_id="XAUUSD|M15|synthetic")])
+    assert_result(formal(tmp_path), 2)
+
+
+def test_fix2_undeclared_drill_magic_in_alert_is_invalid(tmp_path):
+    # 场景⑪：未声明的演练 magic 出现在告警里 → 2（alerts.magic）。
+    f = build_evidence(tmp_path)
+    add_alerts(f, [(f.start + timedelta(hours=4, minutes=30), "RISK_REJECT",
+                    f"magic {drill_magic()} XAUUSD forbidden_session（未声明演练 magic）")])
+    assert_result(formal(tmp_path), 2, "alerts.magic")
+
+
+def test_fix2_drill_magic_state_files_do_not_join_current_state(tmp_path):
+    # 演练 magic 的 state/pause/expected/heartbeat 与为空的 orders/deals 允许
+    # 存在且不参与当前状态判定（演练 pause 置位不得拖垮窗口）。
+    f = build_evidence(tmp_path)
+    drill = drill_magic()
+    f.descriptor["drill_magics"] = [drill]
+    save_descriptor(f)
+    put(f.live / f"state-{drill}.json", dict(magic=drill, known_positions={},
+        pending_external_exits={}, updated_at_utc=iso(f.now)))
+    put(f.live / f"pause-{drill}.json", dict(magic=drill, paused=True, reason="drill",
+        ts=iso(f.now), diffs=[]))
+    put(f.live / f"expected-{drill}.json", dict(magic=drill, symbol="XAUUSD", side="buy",
+        volume=0.0, status="confirmed", cause="drill", ts=iso(f.now)))
+    put(f.live / f"heartbeat-{drill}.json", dict(magic=drill, ts=iso(f.now)))
+    (f.live / f"orders-{drill}.jsonl").write_text("", encoding="utf-8")
+    (f.live / f"deals-{drill}.jsonl").write_text("", encoding="utf-8")
+    assert_result(formal(tmp_path), 3)
+
+
+def test_fix2_declared_drill_magic_in_wrong_alert_kind_is_invalid(tmp_path):
+    # 演练 magic 只允许出现在 RISK_REJECT/RISK_HALT 告警里。
+    f = build_evidence(tmp_path)
+    drill = drill_magic()
+    f.descriptor["drill_magics"] = [drill]
+    save_descriptor(f)
+    add_alerts(f, [(f.now - timedelta(seconds=5), "EXTERNAL_EXIT",
+                    f"magic {drill} synthetic external exit（非 RISK 类告警）")])
+    assert_result(formal(tmp_path), 2, "alerts.magic")
+
+
+def test_fix2_recoverable_failure_without_exit_is_recorded_only(tmp_path):
+    # RECOVERABLE_FAILURE 只有段首、只记录：其后 10 分钟内无同组件 LOOP_EXIT
+    # 时降级按 10 分钟封顶（600 秒 < 1800），不判失败。
+    f = build_evidence(tmp_path)
+    t0 = f.start + timedelta(hours=5)
+    add_alerts(f, [(t0, "RECOVERABLE_FAILURE",
+                    "risk 主循环已知可恢复异常（PermissionError: synthetic）——记录后继续（T142）")])
+    out = assert_result(formal(tmp_path), 3)
+    assert "记录类 1 次" in out and "降级 600 秒" in out
+
+
+def test_fix2_loop_exit_after_recoverable_failure_judges_failure(tmp_path):
+    # RECOVERABLE_FAILURE 之后 10 分钟内同组件 LOOP_EXIT：由 LOOP_EXIT 判失败 → 1。
+    f = build_evidence(tmp_path)
+    t0 = f.start + timedelta(hours=5)
+    add_alerts(f, [
+        (t0, "RECOVERABLE_FAILURE",
+         "risk 主循环已知可恢复异常（PermissionError: synthetic）——记录后继续（T142）"),
+        (t0 + timedelta(minutes=2), "LOOP_EXIT",
+         "risk 主循环连续 5 轮失败（PermissionError: synthetic）——写退出标记 "
+         "loop-exit-risk.json 并以专用退出码 79 退出；已写 halt（fail-closed）（T142）"),
+    ])
+    out = assert_result(formal(tmp_path), 1)
+    assert "LOOP_EXIT" in out
