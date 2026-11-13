@@ -167,14 +167,24 @@ def _role(doc, magics, alias):
     return kind
 
 
+DESCRIPTOR_REQUIRED_FIELDS = frozenset(
+    "schema_version mode deployment_sha magics anchor run_bindings restart_bindings calendar".split())
+
+
 def validate_formal_descriptor(doc):
     alias = "descriptor"
-    _fields(doc, "schema_version mode deployment_sha magics anchor run_bindings restart_bindings calendar", alias)
+    # T191：drill_magics 为可选字段（整数列表、与 magics 不相交、缺省为空）
+    _require(isinstance(doc, dict) and set(doc) <= DESCRIPTOR_REQUIRED_FIELDS | {"drill_magics"}
+             and DESCRIPTOR_REQUIRED_FIELDS <= set(doc), alias + ".schema")
     _require(type(doc["schema_version"]) is int and doc["schema_version"] == 1, alias + ".version")
     _require(doc["mode"] == "Demo" and _hex(doc["deployment_sha"], 40), alias + ".identity")
     magics = doc["magics"]
     _require(isinstance(magics, list) and magics and all(_integer(m, 1) for m in magics)
              and len(set(magics)) == len(magics), alias + ".magics")
+    drill_magics = doc.get("drill_magics", [])
+    _require(isinstance(drill_magics, list) and all(_integer(m, 1) for m in drill_magics)
+             and len(set(drill_magics)) == len(drill_magics)
+             and not set(drill_magics) & set(magics), alias + ".drill_magics")
     _require(isinstance(doc["run_bindings"], list) and isinstance(doc["restart_bindings"], list), alias + ".bindings")
     for n, binding in enumerate([doc["anchor"], *doc["run_bindings"]]):
         _fields(binding, "run_index manifest_snapshot launcher_snapshot instances_snapshot" +
@@ -552,6 +562,14 @@ def _formal_exists(path, alias):
         raise FormalInvalid(alias + ".unreadable") from None
 
 
+def _formal_mtime(path):
+    """文件最后修改时间（epoch 秒）；不可 stat = 不可读（fail-closed）。"""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        raise FormalInvalid("logs.unreadable") from None
+
+
 def _number(value, *, minimum=0):
     return type(value) in (int, float) and math.isfinite(value) and value >= minimum
 
@@ -583,9 +601,33 @@ FORMAL_ANOMALY_ALERTS = frozenset({
     "EXECUTION_UNKNOWN", "BROKER_PENDING_ORDER", "BROKER_UNAVAILABLE", "EXECUTION_RECOVERED",
     "PAUSE_UNREADABLE", "ORDER_LOG_BAD_LINE", "RISK_HEALTH", "SUPERVISOR_REFUSED",
     "TRADE_MODE", "ORDER_ERROR", "LINE_CAP_STATE",
+    # T191（第十八轮 §3.1）：运行时还会写的异常类
+    "ORDER_REJECTED", "LOOP_EXIT", "COMMAND_UNREADABLE", "DRILL_ARCHIVE_ERROR",
 })
 FORMAL_DRILL_ALERTS = frozenset({"RISK_HALT", "RISK_FLATTEN", "HEARTBEAT_TIMEOUT",
-                               "RECONCILE_MISMATCH", "RISK_REJECT", "SUPERVISOR"})
+                               "RECONCILE_MISMATCH", "RISK_REJECT", "SUPERVISOR",
+                               "LINE_CAP"})   # T191：LINE_CAP 与 RISK_HALT 同类
+# T191 记录类：只记录不判失败（降级时长另计，见 formal_recorded_degradation）
+FORMAL_RECORDED_ALERTS = frozenset({"DISCONNECTED", "ACCOUNT_UNAVAILABLE",
+                                    "RECOVERABLE_FAILURE"})
+# T191 无效证据类：窗口内出现即 FormalInvalid
+FORMAL_INVALID_ALERTS = frozenset({"SUPERVISOR_EVIDENCE"})
+FORMAL_CLASSIFIED_ALERTS = (FORMAL_ANOMALY_ALERTS | FORMAL_DRILL_ALERTS
+                            | FORMAL_RECORDED_ALERTS | FORMAL_INVALID_ALERTS)
+
+# 记录类告警的消息角色标记（生产端 monitor.py 的三种 watch，均为
+# f"{component} {标记}…" 形态；组件名取首段空白前的整段）
+DISCONNECT_EXIT_MARK = "进程连续断线"             # T141 rc=78 退出告警（按异常处理）
+RECORDED_DISCONNECT_START = "进程与交易服务器断线"
+RECORDED_DISCONNECT_RECOVERY = "进程与交易服务器恢复连接"
+ACCOUNT_START_MARK = "账户取数失败"
+ACCOUNT_RECOVERY_MARK = "账户取数恢复"
+RECOVERABLE_START_MARK = "主循环已知可恢复异常"
+# T142：RECOVERABLE_FAILURE 只写段首（note_ok 静默清零），其后同组件 LOOP_EXIT
+# 只可能在这条告警后约 5 轮×间隔内出现——未配对的段最多按 10 分钟计
+RECOVERABLE_EXIT_WINDOW_S = 600.0
+# 每个 UTC 自然日各组件降级段并集的累计上限（秒）；超过判"环境降级超限"
+FORMAL_DEGRADATION_DAY_LIMIT_S = 1800.0
 
 
 def _normal_log_metadata(line):
@@ -628,6 +670,11 @@ def load_formal_raw(args, descriptor, batch, *, now):
             last = t
     window = resolve_formal_window(manifest, descriptor, batch, now=now)
     magics = set(descriptor["magics"])
+    drills = set(descriptor.get("drill_magics") or [])
+    # T191 历史范围锚点 = 锚点运行的 started_utc：早于锚点的告警行只校验
+    # 行格式、不参与任何判定；日志目录与 live 目录下 mtime 早于锚点的
+    # *.log、*.log.err 不读。
+    anchor_ts = _utc(manifest["runs"][descriptor["anchor"]["run_index"]]["started_utc"], "manifest")
     try:
         policy = _session_policy_from_dict(tomllib.loads(batch.text(args.sessions_config, "sessions")), "sessions")
     except Exception:
@@ -637,9 +684,14 @@ def load_formal_raw(args, descriptor, batch, *, now):
         seen_magics = set()
         for path in _formal_glob(live, prefix + "-*.json", prefix):
             m = re.fullmatch(prefix + r"-([0-9]+)\.json", path.name)
-            _require(m and int(m[1]) in magics, prefix + ".magic")
+            _require(m, prefix + ".magic")
             magic = int(m[1])
             _require(path.name == f"{prefix}-{magic}.json", prefix + ".filename")
+            if magic in drills:
+                # T191：演练 magic 的状态/暂停/意图文件允许存在，不参与
+                # 当前状态判定（heartbeat-<d>.json 本就不在读取范围内）。
+                continue
+            _require(magic in magics, prefix + ".magic")
             _require(magic not in seen_magics, prefix + ".duplicate_magic")
             seen_magics.add(magic)
             doc = batch.json(path, prefix)
@@ -710,7 +762,19 @@ def load_formal_raw(args, descriptor, batch, *, now):
     for prefix in ("deals", "orders"):
         for path in _formal_glob(live, prefix + "-*.jsonl", prefix):
             m = re.fullmatch(prefix + r"-(\d+)\.jsonl", path.name)
-            _require(m and int(m[1]) in magics, prefix + ".magic")
+            _require(m, prefix + ".magic")
+            magic = int(m[1])
+            if magic in drills:
+                # T191：演练不得下单——orders-<d>.jsonl 有行、deals-<d>.jsonl
+                # 存在且非空即无效证据；两者为空时允许存在、不参与判定。
+                text = batch.text(path, prefix)
+                if prefix == "orders":
+                    _require(not [ln for ln in text.splitlines() if ln.strip()],
+                             "drill.orders_nonempty")
+                else:
+                    _require(not text.strip(), "drill.deals_nonempty")
+                continue
+            _require(magic in magics, prefix + ".magic")
             for _, row in _formal_jsonl(batch, path, prefix):
                 _require(type(row.get("magic")) is int and row["magic"] == int(m[1]), prefix + ".magic")
                 row["_t"] = _utc(row.get("ts"), prefix, naive=True)
@@ -734,17 +798,33 @@ def load_formal_raw(args, descriptor, batch, *, now):
         if not line.strip():
             continue
         parts = line.split("\t", 2)
+        # 行格式（三段、时间可解析、类型大写标识符）对包括锚点前在内的全部
+        # 历史行校验；类型归属与 magic 归属只对窗口内行校验。
         _require(len(parts) == 3 and bool(re.fullmatch(r"[A-Z][A-Z_0-9]*", parts[1])) and bool(parts[2]), "alerts.row")
-        _utc(parts[0], "alerts", naive=True)
-        _require(parts[1] in FORMAL_ANOMALY_ALERTS | FORMAL_DRILL_ALERTS, "alerts.unknown_kind")
-        if parts[1] in ("RECONCILE_MISMATCH", "EXTERNAL_EXIT", "HEARTBEAT_TIMEOUT", "RISK_REJECT"):
-            _require(_alert_magics(parts[2], magics), "alerts.unattributed")
-        alerts.append(Alert(_utc(parts[0], "alerts", naive=True), parts[1], parts[2]))
+        t = _utc(parts[0], "alerts", naive=True)
+        if t < anchor_ts:
+            continue
+        kind = parts[1]
+        if kind in FORMAL_INVALID_ALERTS:
+            # SUPERVISOR_EVIDENCE：证据保全失败，窗口内出现即证据无效
+            raise FormalInvalid("evidence.retention_failed")
+        _require(kind in FORMAL_CLASSIFIED_ALERTS, "alerts.unknown_kind")
+        # T191：演练 magic 只允许出现在 RISK_REJECT/RISK_HALT 告警里
+        allowed = magics | (drills if kind in ("RISK_REJECT", "RISK_HALT") else set())
+        found = _alert_magics(parts[2], allowed)
+        if kind in ("RECONCILE_MISMATCH", "EXTERNAL_EXIT", "HEARTBEAT_TIMEOUT", "RISK_REJECT"):
+            _require(found, "alerts.unattributed")
+        alerts.append(Alert(t, kind, parts[2]))
     logs = []
+    stderr_files = []
     seen = set()
+    anchor_epoch = anchor_ts.replace(tzinfo=timezone.utc).timestamp()
     for directory in (Path(args.log_dir), live):
         for path in _formal_glob(directory, "*.log", "logs") + _formal_glob(directory, "*.log.err", "logs"):
             if path == live / "alerts.log":
+                continue
+            if _formal_mtime(path) < anchor_epoch:
+                # T191 历史范围：最后修改时间早于锚点的文件不读
                 continue
             key, raw = batch.read(path, "logs")
             if key in seen:
@@ -756,6 +836,11 @@ def load_formal_raw(args, descriptor, batch, *, now):
                 raise FormalInvalid("logs.encoding") from None
             if not text.strip():
                 continue
+            is_stderr = path.name.endswith(".log.err")
+            if is_stderr:
+                # T191：窗口内 .log.err 允许无时间戳的行；文件非空即按
+                # "stderr 输出 <文件名>" 记窗口内异常（exit 1，不是 2）。
+                stderr_files.append(path.name)
             _require(PAPER_LOG_MARK not in text, "logs.paper_mode_conflict")
             magic_matches = {int(x) for x in re.findall(r"mt5live 启动：.*?magic=(\d+)", text)}
             _require(len(magic_matches) <= 1 and magic_matches <= magics, "logs.magic")
@@ -768,7 +853,8 @@ def load_formal_raw(args, descriptor, batch, *, now):
                     continue
                 ts = _formal_log_time(line)
                 if ts is None:
-                    _require(_normal_log_metadata(line), "logs.missing_event_time")
+                    if not is_stderr:
+                        _require(_normal_log_metadata(line), "logs.missing_event_time")
                     continue
                 if "决策 " in line:
                     decision = re.search(r"决策 (\S+?)：", line)
@@ -811,6 +897,7 @@ def load_formal_raw(args, descriptor, batch, *, now):
     return dict(manifest=manifest, window=window, deals=deals, orders=orders, alerts=alerts,
                 log_events=logs, pauses=pauses, executor_states=states, intents=intents,
                 current_controls=controls, reports=reports, drill_rounds=rounds, session_policy=policy,
+                stderr_files=stderr_files,
                 paper_state_files=_formal_glob(live / "paper", "state-*.json", "paper"))
 
 
@@ -952,10 +1039,120 @@ def formal_report(ctx, day):
     return Check("日报和点差样本", ok, detail)
 
 
+def _alert_component(message):
+    """记录类/退出类告警的组件名（生产端消息形态 f"{component} {标记}…"）。"""
+    return message.split(" ", 1)[0].strip() if message else ""
+
+
+def _recorded_role(kind, message):
+    """记录类/退出类告警 →（角色, 表种）。角色 ∈ start/recovery/exit/recorded/none。
+
+    - DISCONNECTED 含"进程连续断线"= T141 rc=78 退出告警（按异常处理）；
+      "进程与交易服务器断线"= 段首、"恢复连接"= 恢复；其余形态（如单轮
+      模式的"单轮断线"）只按记录类事件计数、不开段；
+    - ACCOUNT_UNAVAILABLE："账户取数失败"= 段首、"账户取数恢复"= 恢复
+      （退出时生产端写的是 LOOP_EXIT，已归异常类）；
+    - RECOVERABLE_FAILURE：只有段首（生产端恢复静默清零，无恢复告警）；
+    - LOOP_EXIT：一律退出类。"""
+    if kind == "LOOP_EXIT":
+        return "exit", None
+    if kind == "DISCONNECTED":
+        if DISCONNECT_EXIT_MARK in message:
+            return "exit", None
+        if RECORDED_DISCONNECT_START in message:
+            return "start", "DISCONNECTED"
+        if RECORDED_DISCONNECT_RECOVERY in message:
+            return "recovery", "DISCONNECTED"
+        return "recorded", None
+    if kind == "ACCOUNT_UNAVAILABLE":
+        if ACCOUNT_START_MARK in message:
+            return "start", "ACCOUNT_UNAVAILABLE"
+        if ACCOUNT_RECOVERY_MARK in message:
+            return "recovery", "ACCOUNT_UNAVAILABLE"
+        return "recorded", None
+    if kind == "RECOVERABLE_FAILURE":
+        return "start", "RECOVERABLE_FAILURE"
+    return "none", None
+
+
+def _recorded_degradation(alerts, now):
+    """记录类告警 →（降级段 [(start, end)]，逐日记录类事件次数）。
+
+    按组件把每个段首与其后第一条同表种恢复配对；没配上的计到同组件下一
+    条退出类告警（LOOP_EXIT / DISCONNECTED"进程连续断线"）或检查时刻；
+    RECOVERABLE_FAILURE 没有恢复告警，其段最多计到段首后
+    RECOVERABLE_EXIT_WINDOW_S 内的同组件退出类告警，否则按同一窗口封顶
+    （瞬时可恢复失败不得被计到检查时刻）。"""
+    events = sorted(alerts, key=lambda a: (a.time, a.kind, a.message))
+    segments, open_segs, daily_events = [], [], {}
+    for a in events:
+        if a.kind in FORMAL_RECORDED_ALERTS and not (
+                a.kind == "DISCONNECTED" and DISCONNECT_EXIT_MARK in a.message):
+            daily_events[a.time.date()] = daily_events.get(a.time.date(), 0) + 1
+        role, watch = _recorded_role(a.kind, a.message)
+        component = _alert_component(a.message)
+        if role == "start":
+            open_segs.append(dict(component=component, watch=watch, start=a.time, end=None))
+        elif role == "recovery":
+            for seg in open_segs:
+                if (seg["end"] is None and seg["component"] == component
+                        and seg["watch"] == watch):
+                    seg["end"] = a.time
+                    break
+        elif role == "exit":
+            cap = timedelta(seconds=RECOVERABLE_EXIT_WINDOW_S)
+            for seg in open_segs:
+                if seg["end"] is not None or seg["component"] != component:
+                    continue
+                seg["end"] = min(a.time, seg["start"] + cap) if seg["watch"] == "RECOVERABLE_FAILURE" else a.time
+    for seg in open_segs:
+        end = seg["end"]
+        if end is None:
+            if seg["watch"] == "RECOVERABLE_FAILURE":
+                end = min(now, seg["start"] + timedelta(seconds=RECOVERABLE_EXIT_WINDOW_S))
+            else:
+                end = now
+        segments.append((seg["start"], min(end, now)))
+    return segments, daily_events
+
+
+def _daily_degradation_seconds(segments, days):
+    """每个 UTC 自然日：各组件降级段裁剪到当日后取并集的累计秒数。"""
+    out = {}
+    for day in days:
+        lo = datetime.combine(day, datetime.min.time())
+        hi = lo + timedelta(days=1)
+        merged: list[list[datetime]] = []
+        for s, e in sorted((max(s, lo), min(e, hi)) for s, e in segments if s < hi and e > lo):
+            if merged and s <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e])
+        out[day] = sum((e - s).total_seconds() for s, e in merged)
+    return out
+
+
+def formal_recorded_degradation(ctx):
+    """T191：记录类告警只记录不判失败；每个 UTC 自然日各组件降级段取并集，
+    当日累计超过 FORMAL_DEGRADATION_DAY_LIMIT_S 秒判"环境降级超限"。逐日
+    记录类事件次数与降级秒数始终输出（A5 材料用）。"""
+    w = ctx["formal_window"]
+    segments, daily_events = _recorded_degradation(ctx["alerts"], ctx["now"])
+    daily = _daily_degradation_seconds(segments, w.required_calendar_days)
+    over = [d for d in w.required_calendar_days if daily[d] > FORMAL_DEGRADATION_DAY_LIMIT_S]
+    detail = "；".join(f"{d} 记录类 {daily_events.get(d, 0)} 次、降级 {daily[d]:.0f} 秒"
+                      for d in w.required_calendar_days
+                      if daily_events.get(d) or daily[d]) or "窗口内无记录类事件"
+    if over:
+        return Check("环境降级超限", False,
+                     "；".join(f"{d} 降级 {daily[d]:.0f} 秒（>1800）" for d in over) + "；" + detail)
+    return Check("记录类告警与降级（逐日）", True, detail)
+
+
 def run_formal_accept(ctx):
     checks = [accept_evidence_source(ctx), formal_current_state(ctx), formal_day_coverage(ctx),
               formal_process_liveness(ctx), accept_sl_tp_samples(ctx), accept_drills(ctx),
-              accept_double_flatten(ctx), accept_slippage(ctx)]
+              accept_double_flatten(ctx), accept_slippage(ctx), formal_recorded_degradation(ctx)]
     w = ctx["formal_window"]
     for day in w.required_calendar_days:
         for fn in (check_deal_attribution, check_zero_rebalance, check_protective_exit,
@@ -967,12 +1164,15 @@ def run_formal_accept(ctx):
             checks.append(formal_report(ctx, day))
         elif day == w.end_utc.date() and day in ctx["reports"] and "**超标**" in ctx["reports"][day]:
             checks.append(Check("当日点差", False, f"{day} 点差超标"))
-    anomalies = [(a.time, a.kind) for a in ctx["alerts"] if a.kind in FORMAL_ANOMALY_ALERTS]
-    anomalies += [(ts, "日志异常") for _, _, _, events in ctx["log_events"]
+    anomalies = [f"{a.time} {a.kind}" for a in ctx["alerts"]
+                 if a.kind in FORMAL_ANOMALY_ALERTS
+                 or (a.kind == "DISCONNECTED" and DISCONNECT_EXIT_MARK in a.message)]
+    anomalies += [f"{ts} 日志异常" for _, _, _, events in ctx["log_events"]
                   for ts, ln in events if _in_window(ctx, ts)
                   and any(mark in ln for mark in ("Traceback", "执行异常", "决策异常", "CRITICAL", "ERROR"))]
+    anomalies += [f"stderr 输出 {name}" for name in ctx.get("stderr_files", ())]
     if anomalies:
-        checks.append(Check("窗口内异常", False, "；".join(f"{t} {kind}" for t, kind in anomalies)))
+        checks.append(Check("窗口内异常", False, "；".join(anomalies)))
     return checks
 
 
