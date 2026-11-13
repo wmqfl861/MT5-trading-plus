@@ -7,6 +7,10 @@
   ModuleNotFoundError，import pandas 照常降级、不连坐别的测试。
 端到端（缺 pyarrow/duckdb/mcp 的整文件跳过、退出码 0）由外部模拟
 验证：把包从 PathFinder 可见范围屏蔽后跑 pytest。
+
+本文件钉的全是"本地（无环境变量）契约"：autouse 夹具清掉 CI pytest
+job 可能带入的 MT5_STRICT_DEPS 并恢复 finder 注册（T206 严格模式的
+契约由 tests/test_strict_deps_mode.py 单独钉）。
 """
 from __future__ import annotations
 
@@ -19,10 +23,20 @@ from _pytest.outcomes import Skipped
 
 from tests.conftest import (
     OPTIONAL_HEAVY_DEPS,
+    STRICT_DEPS_ENV,
     _OptionalDependencySkipped,
     _OptionalDepSkipFinder,
     _in_pandas_compat_probe,
+    _register_skip_finder,
 )
+
+
+@pytest.fixture(autouse=True)
+def _pin_local_mode(monkeypatch):
+    """钉住本地形态：清掉严格变量（T206），并确保兜底 finder 已注册
+    （严格模式进程里 conftest 加载时不注册；这里恢复，幂等）。"""
+    monkeypatch.delenv(STRICT_DEPS_ENV, raising=False)
+    _register_skip_finder()
 
 
 def test_all_optional_deps_installed_and_finder_inert():
