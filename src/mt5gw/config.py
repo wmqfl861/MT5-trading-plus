@@ -30,7 +30,8 @@ ACCOUNT_TRADE_MODE_CONTEST = 1
 ACCOUNT_TRADE_MODE_REAL = 2
 
 _EXPECTED_TYPES = {"terminal_path": str, "allow_live_trading": bool, "magic": int,
-                   "expected_login": int, "server_utc_offset_hours": float}
+                   "expected_login": int, "server_utc_offset_hours": float,
+                   "initialize_timeout_ms": int}
 
 # 类型不符时的补充说明（按字段类型给最贴切的提示）
 _TYPE_HINTS = {
@@ -53,6 +54,12 @@ class GatewayConfig:
     server_utc_offset_hours: float = 0.0
     query_timeout_s: float = 30.0
     order_timeout_s: float = 60.0
+    # T201（第十九轮 O19-1）：mt5.initialize 的 MT5 侧超时（毫秒）。必须
+    # 显式传给 mt5.initialize——官方缺省 60 秒，会在"终端在线、只是与交易
+    # 服务器断开"时挂过 T110 的 query_timeout_s 期限（11-10 三进程 rc=75
+    # 的根因）。上界钉在查询期限减 10 秒：1000 ≤ 值 ≤ query_timeout_s×1000
+    # −10000（缺省 30 秒期限 → 上界 20000）。
+    initialize_timeout_ms: int = 15000
 
     def __post_init__(self):
         for key in ("query_timeout_s", "order_timeout_s"):
@@ -74,6 +81,22 @@ class GatewayConfig:
                     f"配置项 {key} 类型应为 {expected.__name__}，"
                     f"实际为 {type(value).__name__}：{value!r}"
                 )
+        # T201：initialize 的 MT5 侧超时（毫秒）。下界 1000；上界随查询
+        # 期限联动（query_timeout_s×1000−10000），确保它永远低于 T110 给
+        # initialize 的期限。期限小到上界不足 1000 的配置（T110 期限测试
+        # 用亚秒级 query_timeout_s）不存在可成立的生产值，跳过上界——
+        # 该值只透传给假模块，从不实际等待。
+        if self.initialize_timeout_ms < 1000:
+            raise ValueError(
+                f"initialize_timeout_ms must be >= 1000 (ms): "
+                f"{self.initialize_timeout_ms!r}")
+        init_upper_ms = int(self.query_timeout_s * 1000) - 10_000
+        if init_upper_ms >= 1000 and self.initialize_timeout_ms > init_upper_ms:
+            raise ValueError(
+                f"initialize_timeout_ms={self.initialize_timeout_ms!r} 超出上界 "
+                f"{init_upper_ms}（query_timeout_s×1000−10000，须给 T110 查询"
+                f"期限留 10 秒余量）"
+            )
         require_login_pinned(self.allow_live_trading, self.expected_login)
 
 

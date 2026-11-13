@@ -107,8 +107,11 @@ class _Mono:
 
 def _down_terminal(fake: FakeMT5) -> None:
     fake.initialize_result = False
-    fake.terminal_info_value = type(fake.terminal_info_value)(
-        connected=False, trade_allowed=False)
+    # T201 后"断线"按真实包形态建模：终端进程不在（terminal_info 返回
+    # None → 走 initialize 重建路径）。"终端在线、仅交易服务器断开"已不再
+    # 调 initialize（等终端自行重连），那一形态由 tests/test_t201_reconnect_fix.py
+    # 覆盖，故这里不再用 connected=False 的对象。
+    fake.terminal_info_value = None
     fake.last_error_value = (-6, "terminal is not connected")
 
 

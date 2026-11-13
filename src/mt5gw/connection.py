@@ -6,6 +6,7 @@ is flushed before os._exit(75); an external supervisor covers native GIL hangs.
 """
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import sys
@@ -204,7 +205,15 @@ class MT5Connection:
             return str(self._raw("last_error"))
 
     def _ensure_initialized(self) -> None:
-        ok = self._raw("initialize", self.config.terminal_path)
+        # T201（O19-1）：initialize 一律带 MT5 自己的 timeout（毫秒）——官方
+        # 缺省 60 秒，会在终端未就绪时挂过 T110 期限（11-10 三进程 rc=75 的
+        # 根因）。注意 _invoke 的 timeout 形参是 T110 期限（秒），写成
+        # _raw("initialize", path, timeout=ms) 会被吞成期限而到不了 MT5；
+        # 用 partial 把值真传进 mt5.initialize（启动 connect() 与重连同一条
+        # 路径，都带 timeout）。
+        init = functools.partial(self._mt5.initialize, self.config.terminal_path,
+                                 timeout=self.config.initialize_timeout_ms)
+        ok = self._invoke("initialize", init)
         if not ok:
             self._initialized = False
             raise NotConnectedError(f"MT5 终端初始化失败：{self.last_error()}")
@@ -222,18 +231,42 @@ class MT5Connection:
     def _attempt_reconnect(self) -> tuple[bool, str]:
         """一次重连尝试（受 T110 期限约束：_serialized/_invoke 既有超时）。
 
+        T201（O19-1）：先探 terminal_info（本身仍在 T110 期限内）——终端
+        进程在线、只是与交易服务器断开时**不调 initialize**：它会等服务器
+        连上，MT5 缺省 60 秒，挂过 T110 的 30 秒期限（11-10 三进程 rc=75
+        的根因）。只有 IPC 不通（terminal_info 返回 None，终端进程不在）
+        才用 initialize 重建 IPC，且带不超过期限的 MT5 timeout。
+
         成功 → 重置退避并返回 (True, "")；失败 → 推进退避计数、安排下次
         到点，返回 (False, 供上抛/日志的原因文案)。
         """
         try:
             with self._serialized("reconnect"):
-                self._ensure_initialized()
-                if self._terminal_ok():
-                    self._reconnect_failures = 0
-                    self._next_reconnect_at = 0.0
-                    return True, ""
-                self._initialized = False
-                reason = f"终端已初始化但交易服务器未连接：{self.last_error()}"
+                if self._initialized:
+                    info = self._raw("terminal_info")
+                    if info is not None:
+                        if info.connected:
+                            # 服务器已自行恢复：视为成功，重置退避。
+                            self._reconnect_failures = 0
+                            self._next_reconnect_at = 0.0
+                            return True, ""
+                        # 终端在线、交易服务器未连接——不调 initialize，
+                        # 保持 _initialized 不变，等待终端自行重连，
+                        # 退避照常推进。
+                        reason = ("终端在线、交易服务器未连接——等待终端自行重连："
+                                  f"{self.last_error()}")
+                    else:
+                        # IPC 不通（终端进程不在）：initialize 是重建 IPC 的
+                        # 唯一途径；先把 _initialized 置假再 initialize。
+                        self._initialized = False
+                if not self._initialized:
+                    self._ensure_initialized()
+                    if self._terminal_ok():
+                        self._reconnect_failures = 0
+                        self._next_reconnect_at = 0.0
+                        return True, ""
+                    self._initialized = False
+                    reason = f"终端已初始化但交易服务器未连接：{self.last_error()}"
         except NotConnectedError as exc:
             reason = str(exc)
         self._reconnect_failures += 1
@@ -267,6 +300,11 @@ class MT5Connection:
             ok, reason = self._attempt_reconnect()
             if not ok:
                 raise NotConnectedError(reason)
+        elif self._reconnect_failures or self._next_reconnect_at:
+            # T201：探活即成功（connected 为真）——视为成功重置退避，
+            # 不必等到点的重连尝试才清零。
+            self._reconnect_failures = 0
+            self._next_reconnect_at = 0.0
 
     def __enter__(self) -> "MT5Connection":
         self.connect()
