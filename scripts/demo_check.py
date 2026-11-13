@@ -414,6 +414,9 @@ class FormalWindow:
     registry: dict = field(repr=False)
     restart_rows: tuple[dict, ...] = field(default=(), repr=False)
     registry_starts: tuple[dict, ...] = field(default=(), repr=False)
+    # T202（O19-2）：窗口内各新运行的 started_utc（run_bindings 的运行起点），
+    # 用于截断所有组件的未闭降级段
+    run_starts: tuple[datetime, ...] = field(default=(), repr=False)
 
 
 def resolve_formal_window(manifest, descriptor, bound_records, *, now):
@@ -436,7 +439,7 @@ def resolve_formal_window(manifest, descriptor, bound_records, *, now):
         _require(re.search(r"(?<!\d)" + str(p["pid"]) + r"(?!\d)", text), "deployment_claim.pid_literal")
     bindings = [anchor, *d["run_bindings"]]
     _require([b["run_index"] for b in bindings] == list(range(idx, len(runs))), "manifest.bindings")
-    events, baseline, registry_starts = [], None, []
+    events, baseline, registry_starts, run_starts = [], None, [], []
     for b in bindings:
         i = b["run_index"]
         snap = batch.bound_json(b["manifest_snapshot"], "manifest_snapshot")
@@ -459,6 +462,7 @@ def resolve_formal_window(manifest, descriptor, bound_records, *, now):
         else:
             _require(ts >= completed, "launcher.before_anchor")
             events.append((ts, "launcher", registry, launched))
+            run_starts.append(ts)   # T202：新运行起点（未闭降级段的跨组件截断）
             registry_starts.extend(dict(magic=int(role), ts=registry[role]["started_utc"],
                                         log="launcher-retained", retained=True)
                                    for role in launched if role.isdigit())
@@ -531,7 +535,7 @@ def resolve_formal_window(manifest, descriptor, bound_records, *, now):
     return FormalWindow(d["deployment_sha"], anchor, start, now,
         tuple(day for day in trading if start.date() <= day < now.date()),
         tuple(day for day in dates if day >= start.date()), current,
-        tuple(row for _, row in relevant), tuple(registry_starts))
+        tuple(row for _, row in relevant), tuple(registry_starts), tuple(run_starts))
 
 
 def _formal_jsonl(batch, path, alias):
@@ -1075,14 +1079,20 @@ def _recorded_role(kind, message):
     return "none", None
 
 
-def _recorded_degradation(alerts, now):
+def _recorded_degradation(alerts, now, restarts=(), run_starts=()):
     """记录类告警 →（降级段 [(start, end)]，逐日记录类事件次数）。
 
     按组件把每个段首与其后第一条同表种恢复配对；没配上的计到同组件下一
     条退出类告警（LOOP_EXIT / DISCONNECTED"进程连续断线"）或检查时刻；
     RECOVERABLE_FAILURE 没有恢复告警，其段最多计到段首后
     RECOVERABLE_EXIT_WINDOW_S 内的同组件退出类告警，否则按同一窗口封顶
-    （瞬时可恢复失败不得被计到检查时刻）。"""
+    （瞬时可恢复失败不得被计到检查时刻）。
+
+    T202（O19-2）未闭段不得计到检查时刻：段中途进程被重启/换运行时，
+    新进程不会补写恢复——同组件的下一条 supervisor 重启行（restarts，
+    来自 ops-restarts.jsonl 的 (component, utc)）截断该组件的未闭段；
+    窗口内任何新运行的 started_utc（run_starts，描述符 run_bindings 的
+    运行起点）截断所有组件的未闭段。已由恢复/退出类告警闭合的段不改判。"""
     events = sorted(alerts, key=lambda a: (a.time, a.kind, a.message))
     segments, open_segs, daily_events = [], [], {}
     for a in events:
@@ -1108,10 +1118,13 @@ def _recorded_degradation(alerts, now):
     for seg in open_segs:
         end = seg["end"]
         if end is None:
+            caps = [now]
             if seg["watch"] == "RECOVERABLE_FAILURE":
-                end = min(now, seg["start"] + timedelta(seconds=RECOVERABLE_EXIT_WINDOW_S))
-            else:
-                end = now
+                caps.append(seg["start"] + timedelta(seconds=RECOVERABLE_EXIT_WINDOW_S))
+            # T202：段首之后的下一条同组件重启行 / 任意新运行起点截断未闭段
+            caps += [t for c, t in restarts if c == seg["component"] and seg["start"] < t]
+            caps += [t for t in run_starts if seg["start"] < t]
+            end = min(caps)
         segments.append((seg["start"], min(end, now)))
     return segments, daily_events
 
@@ -1135,9 +1148,12 @@ def _daily_degradation_seconds(segments, days):
 def formal_recorded_degradation(ctx):
     """T191：记录类告警只记录不判失败；每个 UTC 自然日各组件降级段取并集，
     当日累计超过 FORMAL_DEGRADATION_DAY_LIMIT_S 秒判"环境降级超限"。逐日
-    记录类事件次数与降级秒数始终输出（A5 材料用）。"""
+    记录类事件次数与降级秒数始终输出（A5 材料用）。T202（O19-2）：未闭段
+    按同组件 supervisor 重启行与窗口内新运行起点截断，不计到检查时刻。"""
     w = ctx["formal_window"]
-    segments, daily_events = _recorded_degradation(ctx["alerts"], ctx["now"])
+    restarts = [(row["component"], _utc(row["utc"], "journal")) for row in w.restart_rows]
+    segments, daily_events = _recorded_degradation(ctx["alerts"], ctx["now"],
+                                                   restarts=restarts, run_starts=w.run_starts)
     daily = _daily_degradation_seconds(segments, w.required_calendar_days)
     over = [d for d in w.required_calendar_days if daily[d] > FORMAL_DEGRADATION_DAY_LIMIT_S]
     detail = "；".join(f"{d} 记录类 {daily_events.get(d, 0)} 次、降级 {daily[d]:.0f} 秒"
