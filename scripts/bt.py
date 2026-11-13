@@ -26,7 +26,10 @@
   G5 次数达 lockbox_uses_max 拒（占位事务内复查；标定样品运行
   actor=calibration 豁免——不进轮次统计）。bt round close 生成
   docs/research/round-R#-<日期>.md 骨架（列全部运行含失败 + 按
-  advance_rule 的判定占位）并关闭轮次。
+  advance_rule 的判定占位）并关闭轮次。bt round rehearse R#（T153/D67）
+  开轮前彩排：同一条命令链在安慰剂输入上端到端跑通（写 data/rehearse/
+  影子台账，正式台账只读断言无污染），逐阶段计时并产出 A1 彩排报告
+  （mt5quant.research.rehearse）。
 - 候选预筛（T62/D31，铁律 17/18）：bt candidate check 读附录 C 候选登记
   → precheck 五条件（文献/持仓 ≥H1/事前成本倍数 ≥3/检验力 ≥50%/机制空缺）
   → 写 research/candidates/C###.precheck.json 并记入台账 candidate_checks
@@ -168,6 +171,7 @@ from mt5quant.research import cards  # noqa: E402
 from mt5quant.research import candidates as cand  # noqa: E402
 from mt5quant.research import power  # noqa: E402
 from mt5quant.research import rounds as rnd  # noqa: E402
+from mt5quant.research.rehearse import PLACEBO_BARS as REHEARSE_PLACEBO_BARS  # noqa: E402
 from mt5quant.prob.gaps import ELIGIBILITY_VERSION  # noqa: E402
 from mt5quant.research.ledger import (  # noqa: E402
     Ledger, LedgerTamperedError, RESERVED_ACTORS, RoundTrialBudgetExceededError,
@@ -1185,6 +1189,48 @@ def cmd_round_close(args) -> int:
           "该轮的卡不能再运行（screen/gate 拒），runs 已带 round_id 如实"
           "留痕；后续试验须预注册新轮次")
     return 0
+
+
+def cmd_round_rehearse(args) -> int:
+    """bt round rehearse R#（T153/D67）：开轮前彩排——同一条命令在
+    安慰剂输入上端到端跑通（含诊断与临时/影子台账写入），逐阶段计时，
+    产出彩排报告（A1 材料）。实现与安慰剂预写规则见
+    mt5quant.research.rehearse 模块 docstring。"""
+    from mt5quant.research import rehearse
+
+    path = _round_path(args.round, Path(args.rounds_dir))
+    try:
+        report = rehearse.run_rehearsal(
+            path, bt_script=Path(__file__).resolve(),
+            sandbox_root=args.sandbox_root,
+            formal_ledger=args.formal_ledger, report_dir=args.report_dir,
+            bars=args.bars, stage_timeout=args.stage_timeout)
+    except rnd.RoundError as e:
+        print(f"✗ {e}")
+        return 1
+    except rehearse.RehearseError as e:
+        print(f"✗ {e}")
+        return 1
+    for stage in report["stages"]:
+        if stage.get("skipped"):
+            print(f"— {stage['stage']}：跳过——{stage['skipped']}")
+        else:
+            print(f"— {stage['stage']}：rc={stage['rc']}，"
+                  f"耗时 {stage['seconds']:.3f}s"
+                  + ("（超时）" if stage["timeout"] else ""))
+    if report["gate_rows"]:
+        outcome = "、".join(
+            f"{g['gate']}={'过' if g['passed'] else '不过'}"
+            for g in report["gate_rows"])
+        print(f"— 关卡（安慰剂上只报告）：{outcome}")
+    print(f"— 正式台账无污染断言：{'一致' if report['pollution']['unchanged'] else '不一致！'}"
+          f"（{report['pollution']['formal_ledger']} 只读快照前后对比）；"
+          f"影子台账 {report['pollution']['shadow_ledger']}")
+    print(f"— 彩排报告（A1 材料）：{report['report_md']}；"
+          f"原始 JSON：{report['report_json']}")
+    print(f"{'✓' if report['verdict'] == 'pass' else '✗'} 彩排结论："
+          f"{report['verdict']}（T153/D67：未经彩排不开新研究轮次）")
+    return 0 if report["verdict"] == "pass" else 1
 
 
 def _select_params_auto(ledger, card, *, symbol: str, data_sha256: str,
@@ -5800,6 +5846,27 @@ def build_parser() -> argparse.ArgumentParser:
                      help="报告骨架落盘路径；缺省 docs/research/"
                           "round-R#-<日期>.md")
     prc.set_defaults(func=cmd_round_close)
+    prh = round_sub.add_parser(
+        "rehearse", help="开轮前彩排（T153/D67）：安慰剂输入端到端跑同一条"
+                         "命令链（round open→screen→gate→ledger verify），"
+                         "写影子台账、逐阶段计时、产出 A1 彩排报告")
+    prh.add_argument("round", help="轮次 id（R1）或 research/rounds/R1.toml 路径")
+    prh.add_argument("--rounds-dir",
+                     default=str(REPO_ROOT / "research" / "rounds"))
+    prh.add_argument("--sandbox-root", default=str(Path("data") / "rehearse"),
+                     help="彩排沙盒根目录（影子台账/安慰剂数据/迷你 git 仓库"
+                          "落此处，data/ 不入库；事后删除沙盒目录即清理）")
+    prh.add_argument("--formal-ledger",
+                     default=str(Path("data") / "research" / "ledger.sqlite"),
+                     help="正式台账路径（只读快照做无污染断言；该轮已开启"
+                          "则拒绝彩排——D67 是开轮前彩排）")
+    prh.add_argument("--report-dir", default=str(REPO_ROOT / "docs" / "research"),
+                     help="人读彩排报告（md，A1 材料）落盘目录")
+    prh.add_argument("--bars", type=int, default=REHEARSE_PLACEBO_BARS,
+                     help="安慰剂合成 K 线根数（缺省 800 根 D1）")
+    prh.add_argument("--stage-timeout", type=float, default=900.0,
+                     help="单阶段子进程超时秒数（超时=机械故障，如实报告）")
+    prh.set_defaults(func=cmd_round_rehearse)
 
     p_screen = sub.add_parser("screen", help="在卡的网格上跑 A 层并记入台账")
     p_screen.add_argument("--card", required=True,
