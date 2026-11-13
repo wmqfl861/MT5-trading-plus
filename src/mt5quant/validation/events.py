@@ -115,16 +115,40 @@ class EventWindow:
 
 # ---------------------------------------------------------------- 日历工具
 
+# T152（随机化检验性能）：_normalize_days / _day_strata 是 trading_days
+# 索引值的**纯函数**（DatetimeIndex 不可变），而 randomization_test 的
+# draws 循环对**同一** days 对象逐次调用它们（randomize_event_times 源码
+# 冻结于 b4eeddb，不得改其逐 draw 调用形状）——按对象身份（id + is 复核）
+# 记忆化：同对象直接复用上次结果，不同对象照常重算（值相同则结果也相同，
+# 逐位不变）。缓存持有索引的强引用防 id 复用；容量上限防长期进程膨胀。
+_PURE_MEMO_LIMIT = 8
+_DAYS_NORM_MEMO: dict[int, tuple] = {}
+_DAYS_STRATA_MEMO: dict[int, tuple] = {}
+
+
+def _memoized_by_id(memo: dict, obj, compute):
+    hit = memo.get(id(obj))
+    if hit is not None and hit[0] is obj:
+        return hit[1]
+    out = compute()
+    if len(memo) >= _PURE_MEMO_LIMIT:
+        memo.clear()
+    memo[id(obj)] = (obj, out)
+    return out
+
+
 def _normalize_days(trading_days) -> pd.DatetimeIndex:
     """交易日历 → 升序去重的零点 naive UTC 日期索引（向量化：np.unique，
     不逐元素装箱）。"""
-    idx = pd.DatetimeIndex(pd.to_datetime(trading_days))
-    if idx.tz is not None:
-        idx = idx.tz_convert("UTC").tz_localize(None)
-    values = np.unique(idx.normalize().to_numpy())
-    if len(values) == 0:
-        raise ValueError("交易日历为空——事件无从构造")
-    return pd.DatetimeIndex(values)
+    def _compute() -> pd.DatetimeIndex:
+        idx = pd.DatetimeIndex(pd.to_datetime(trading_days))
+        if idx.tz is not None:
+            idx = idx.tz_convert("UTC").tz_localize(None)
+        values = np.unique(idx.normalize().to_numpy())
+        if len(values) == 0:
+            raise ValueError("交易日历为空——事件无从构造")
+        return pd.DatetimeIndex(values)
+    return _memoized_by_id(_DAYS_NORM_MEMO, trading_days, _compute)
 
 
 def _months_of(days: pd.DatetimeIndex) -> list[tuple[tuple[int, int],
@@ -426,16 +450,26 @@ class DeclaredEventSide:
         self.rule, self.threshold = rule, float(threshold)
         self.bars = signal_bars
         self.calendar = trading_calendar(calendar) if rule == "mtd_sign" else None
+        self._anchor_cache: dict = {}   # T152：entry → anchor 下标（纯函数记忆化）
         self.close_times = (signal_close_times(signal_bars, signal_timeframe, calendar)
                             if rule == "mtd_sign" and signal_bars is not None else None)
         if rule == "mtd_sign" and (signal_bars is None or not len(signal_bars)):
             raise SignalUnavailable("signal unavailable: missing signal bars")
 
     def anchor_indices(self, entry_time):
-        """Timestamp-only availability; no prices or derived returns read here."""
+        """Timestamp-only availability; no prices or derived returns read here.
+
+        T152：本方法是 (entry 时刻, 冻结日历, 冻结信号序列) 的纯函数——
+        calendar/close_times 构造后不可变，同一 entry 时刻必得同一结果。
+        随机化 draws 反复以相同时刻调用（mtd_sign 每事件两次），按 entry
+        记忆化；SignalUnavailable 不缓存（异常路径照常逐次抛出，行为不变）。
+        """
         entry = pd.Timestamp(entry_time)
         if entry.tzinfo is not None:
             entry = entry.tz_convert("UTC").tz_localize(None)
+        cached = self._anchor_cache.get(entry)
+        if cached is not None:
+            return cached
         month = entry.to_period("M")
         indices = []
         for m in (month - 1, month):
@@ -451,7 +485,11 @@ class DeclaredEventSide:
             if len(hits) != 1:
                 raise SignalUnavailable(f"signal unavailable: missing/duplicate anchor close {close_at}")
             indices.append(int(hits[0]))
-        return tuple(indices)
+        out = tuple(indices)
+        if len(self._anchor_cache) >= 65536:
+            self._anchor_cache.clear()
+        self._anchor_cache[entry] = out
+        return out
 
     def __call__(self, event):
         if self.rule == "static_long":
@@ -488,37 +526,13 @@ def _side_sign(side) -> int:
     raise ValueError(f"side_fn 须返回 'long'/'short'（或 ±1/0），收到 {side!r}")
 
 
-def event_returns(bars, events, *, side_fn: Callable[[EventWindow], object],
-                  costs, symbol: str,
-                  contract_size: float | None = None,
-                  reference_price: float | None = None) -> pd.DataFrame:
-    """每事件净收益（相对价格）：毛收益 − 来回成本 − 隔夜费。
+def _bars_ctx(bars) -> dict:
+    """event_returns 的 bars 侧预计算（T152 随机化检验性能）。
 
-    成交口径按 EventWindow.price_timepoint（D74/T187）解析：
-
-    - ``bar_open``（缺省，历史语义）：入场 = entry_time 之后首根 bar 的
-      开盘价、出场 = exit_time 之后首根 bar 的开盘价（searchsorted；出场
-      bar 须严格晚于入场 bar）；
-    - ``day_close``：入场 = entry_time 所标记交易日的 bar **收盘价**、
-      出场 = exit_time 所标记交易日的 bar 收盘价（searchsorted 定位该日
-      bar；strict 窗要求逐日精确命中）——登记窗"锚日收 → 公告日收"的
-      显式成交表示。close-only 段（open==close）两种口径逐位同值
-      （R3 主检验段的等价锚点）；统一口径（开=前一观测收盘）的序列上
-      "某日收盘"与"次一 bar 开盘"同一价格时点，与引擎 A 的开盘成交
-      逐位一致（T151 三方对账）。
-
-    出场越过数据末尾的事件剔除（attrs["dropped"] 计数，绝不静默外推）。
-    成本按事件入场/出场 bar 的**纽约本地小时**取点差/滑点（DST 感知），
-    口径见模块 docstring（与 T62 预筛同一份语义）。
-
-    contract_size：佣金/隔夜费从每手金额折成相对价格需要它；两者都为零
-    时可不传，任一非零而不传 → ValueError（fail-closed）。
-
-    reference_price：隔夜费率的折算基准（缺省 = 序列最后一根收盘价）。
-    点数/每手计的隔夜费是**当前价格水平**的绝对金额——跨 40 年价格差
-    190 倍的序列上按事件当时价格折会严重失真（1986 年的名义值被放大成
-    每夜百分之几），按参考价折成相对比率再乘计费夜数（与相对点差模型
-    "近期结构外推到历史价格水平"同一理由，蓝图 §6.5 早年成本口径）。
+    把**与事件集无关**的逐 bar 换算（时间解析/排序、开收价数组、纽约
+    本地小时、来源标签）提出来：randomization_test 的 draws 循环里 bars
+    逐 draw 不变，算一次复用——这些是 bars 值的纯函数，输出与逐次重算
+    逐位相同。逐事件部分见 _event_returns_core（表达式与原实现逐字同）。
     """
     times = pd.to_datetime(bars["time"])
     if not times.is_monotonic_increasing:
@@ -533,25 +547,49 @@ def event_returns(bars, events, *, side_fn: Callable[[EventWindow], object],
     hours_ny = (times.dt.tz_localize("UTC")
                 .dt.tz_convert("America/New_York").dt.hour.to_numpy(
                     dtype="int64"))
+    tags = bars.get("_research_source")
+    # T152：tags.iloc[i] 在箭头字符串列上逐条太慢；一次转 ndarray（值与
+    # .iloc 逐条相同，to_numpy 走零拷贝/快速路径），循环内按下标取。
+    tags_arr = None if tags is None else tags.to_numpy()
+    return {"arr": arr, "opens": opens, "closes": closes,
+            "hours_ny": hours_ny, "tags": tags_arr}
+
+
+def _event_returns_core(ctx, events, *, side_fn, costs, symbol: str,
+                        contract_size: float | None = None,
+                        reference_price: float | None = None,
+                        nights_memo: dict | None = None) -> pd.DataFrame:
+    """event_returns 的逐事件主体（T152 拆出；语义/表达式与原实现逐字同）。
+
+    nights_memo：charge_nights(entry, exit, rule) 是 (时刻, 规则) 的纯
+    函数——随机化 draws 反复抽到相同 (入场日, 出场日) 窗（1 日窗的池只有
+    数千个日期对，1999×213 次调用高度重复），按 (规则对象, 两端时刻)
+    记忆化；None = 不缓存（单次调用路径与原实现完全一致）。键含规则对象
+    身份，不同 swap 模型绝不串值。
+    """
+    from mt5quant.costs import source_costs
+    arr, opens, closes = ctx["arr"], ctx["opens"], ctx["closes"]
+    hours_ny, tags = ctx["hours_ny"], ctx["tags"]
     swap_model = getattr(costs, "swap", None)
     ref_price = (float(reference_price) if reference_price is not None
                  else float(closes[-1]))
+    strict = bool(getattr(side_fn, "strict_windows", False))
 
     rows: list[dict] = []
     dropped = 0
     for e in events:
-        if getattr(side_fn, "strict_windows", False):
+        if strict:
             # Validate direction even when the trade window is absent. Missing
             # observations must not disappear from a randomized null sample.
             side_fn(e)
         i_e = int(np.searchsorted(arr, e.entry_time.to_datetime64(), "left"))
         i_x = int(np.searchsorted(arr, e.exit_time.to_datetime64(), "left"))
         if i_e >= len(arr) or i_x >= len(arr) or i_x <= i_e:
-            if getattr(side_fn, "strict_windows", False):
+            if strict:
                 raise SignalUnavailable(f"event unavailable: window missing for {e.label}")
             dropped += 1
             continue
-        if getattr(side_fn, "strict_windows", False) and (
+        if strict and (
                 i_e >= len(arr) or i_x >= len(arr)
                 or arr[i_e] != e.entry_time.to_datetime64()
                 or arr[i_x] != e.exit_time.to_datetime64()):
@@ -580,10 +618,8 @@ def event_returns(bars, events, *, side_fn: Callable[[EventWindow], object],
         gross = sign * (exit_ / entry - 1.0)
         h_e, h_x = int(hours_ny[i_e]), int(hours_ny[i_x])
         # Metadata context changes spread only; fill references remain untouched.
-        from mt5quant.costs import source_costs
-        tags = bars.get("_research_source")
-        ce = source_costs(costs, tags.iloc[i_e] if tags is not None else None)
-        cx = source_costs(costs, tags.iloc[i_x] if tags is not None else None)
+        ce = source_costs(costs, tags[i_e] if tags is not None else None)
+        cx = source_costs(costs, tags[i_x] if tags is not None else None)
         spr_e = ce.spread_p90(symbol, h_e, price=entry)
         spr_x = cx.spread_p90(symbol, h_x, price=entry)
         spread = max(spr_e, spr_x) / entry
@@ -594,7 +630,14 @@ def event_returns(bars, events, *, side_fn: Callable[[EventWindow], object],
         worst_rate = 0.0
         if swap_model is not None:
             rule = swap_model.rule(symbol)
-            nights = int(charge_nights(entry_ts, exit_ts, rule))
+            if nights_memo is not None:
+                key = (id(rule), entry_ts, exit_ts)
+                nights = nights_memo.get(key)
+                if nights is None:
+                    nights = int(charge_nights(entry_ts, exit_ts, rule))
+                    nights_memo[key] = nights
+            else:
+                nights = int(charge_nights(entry_ts, exit_ts, rule))
             worst_rate = max(abs(float(rule.long_per_day)),
                              abs(float(rule.short_per_day)))
         if (comm_lot > 0.0 or worst_rate > 0.0) and contract_size is None:
@@ -624,6 +667,46 @@ def event_returns(bars, events, *, side_fn: Callable[[EventWindow], object],
     frame.attrs["dropped"] = dropped
     frame.attrs["symbol"] = str(symbol)
     return frame
+
+
+def event_returns(bars, events, *, side_fn: Callable[[EventWindow], object],
+                  costs, symbol: str,
+                  contract_size: float | None = None,
+                  reference_price: float | None = None) -> pd.DataFrame:
+    """每事件净收益（相对价格）：毛收益 − 来回成本 − 隔夜费。
+
+    成交口径按 EventWindow.price_timepoint（D74/T187）解析：
+
+    - ``bar_open``（缺省，历史语义）：入场 = entry_time 之后首根 bar 的
+      开盘价、出场 = exit_time 之后首根 bar 的开盘价（searchsorted；出场
+      bar 须严格晚于入场 bar）；
+    - ``day_close``：入场 = entry_time 所标记交易日的 bar **收盘价**、
+      出场 = exit_time 所标记交易日的 bar 收盘价（searchsorted 定位该日
+      bar；strict 窗要求逐日精确命中）——登记窗"锚日收 → 公告日收"的
+      显式成交表示。close-only 段（open==close）两种口径逐位同值
+      （R3 主检验段的等价锚点）；统一口径（开=前一观测收盘）的序列上
+      "某日收盘"与"次一 bar 开盘"同一价格时点，与引擎 A 的开盘成交
+      逐位一致（T151 三方对账）。
+
+    出场越过数据末尾的事件剔除（attrs["dropped"] 计数，绝不静默外推）。
+    成本按事件入场/出场 bar 的**纽约本地小时**取点差/滑点（DST 感知），
+    口径见模块 docstring（与 T62 预筛同一份语义）。
+
+    contract_size：佣金/隔夜费从每手金额折成相对价格需要它；两者都为零
+    时不传，任一非零而不传 → ValueError（fail-closed）。
+
+    reference_price：隔夜费率的折算基准（缺省 = 序列最后一根收盘价）。
+    点数/每手计的隔夜费是**当前价格水平**的绝对金额——跨 40 年价格差
+    190 倍的序列上按事件当时价格折会严重失真（1986 年的名义值被放大成
+    每夜百分之几），按参考价折成相对比率再乘计费夜数（与相对点差模型
+    "近期结构外推到历史价格水平"同一理由，蓝图 §6.5 早年成本口径）。
+
+    T152：bars 侧预计算拆到 _bars_ctx（单次调用零行为变化——见其注记）。
+    """
+    return _event_returns_core(_bars_ctx(bars), events, side_fn=side_fn,
+                               costs=costs, symbol=symbol,
+                               contract_size=contract_size,
+                               reference_price=reference_price)
 
 
 def aggregate_daily(frames: Mapping[str, pd.DataFrame]) -> pd.Series:
@@ -726,16 +809,20 @@ def _day_strata(days: pd.DatetimeIndex) -> tuple[np.ndarray, np.ndarray]:
 
     桶 = 月内交易日序（从月初数）× 3 ÷ 当月交易日数，夹在 [0, 2]——
     月末事件落在"晚"桶；保持分桶的边缘分布即保持粗粒度月内位置。
+    T152：days 值的纯函数，按对象身份记忆化（draws 循环同一 days 对象
+    逐次调用——见 _normalize_days 处注记；重算路径与原实现逐字相同）。
     """
-    n = len(days)
-    rank = np.empty(n, dtype="int64")
-    month_len = np.empty(n, dtype="int64")
-    for _key, idxs in _months_of(days):
-        rank[idxs] = np.arange(len(idxs))
-        month_len[idxs] = len(idxs)
-    bucket = np.minimum(_MONTH_BUCKETS - 1,
-                        rank * _MONTH_BUCKETS // np.maximum(1, month_len))
-    return days.weekday.to_numpy(dtype="int64"), bucket
+    def _compute() -> tuple[np.ndarray, np.ndarray]:
+        n = len(days)
+        rank = np.empty(n, dtype="int64")
+        month_len = np.empty(n, dtype="int64")
+        for _key, idxs in _months_of(days):
+            rank[idxs] = np.arange(len(idxs))
+            month_len[idxs] = len(idxs)
+        bucket = np.minimum(_MONTH_BUCKETS - 1,
+                            rank * _MONTH_BUCKETS // np.maximum(1, month_len))
+        return days.weekday.to_numpy(dtype="int64"), bucket
+    return _memoized_by_id(_DAYS_STRATA_MEMO, days, _compute)
 
 
 def randomize_event_times(events, trading_days, *,
@@ -844,14 +931,23 @@ def randomization_test(bars, events, *, side_fn, costs, symbol: str,
     p = (1 + #{随机化均值 ≥ 观测均值}) / (sims + 1)（保守加一，标准
     随机化检验约定）。随机化种子由 (seed, k) 派生，同种子逐位一致。
     trading_days 缺省用 bars 的交易日历。
+
+    T152（性能）：draws 循环里 bars/days 不变——bars 预计算上下文与
+    charge_nights 记忆化各建一次、逐 draw 复用；每 draw 的
+    randomize_event_times + 逐事件净收益表达式与原实现逐字相同，
+    种子派生（master → child_seeds）不变，输出逐位一致。
     """
     if not isinstance(sims, int) or sims < 1:
         raise ValueError(f"sims 须为 ≥1 的整数，收到 {sims!r}")
     days = (_normalize_days(trading_days) if trading_days is not None
             else _normalize_days(pd.DatetimeIndex(
                 pd.to_datetime(bars["time"])).normalize()))
-    obs_frame = event_returns(bars, events, side_fn=side_fn, costs=costs,
-                              symbol=symbol, contract_size=contract_size)
+    ctx = _bars_ctx(bars)
+    nights_memo: dict = {}
+    obs_frame = _event_returns_core(ctx, events, side_fn=side_fn,
+                                    costs=costs, symbol=symbol,
+                                    contract_size=contract_size,
+                                    nights_memo=nights_memo)
     if len(obs_frame) == 0:
         raise ValueError("事件全部不可解析——随机化检验无定义")
     observed = float(pd.to_numeric(obs_frame["net"]).mean())
@@ -860,8 +956,10 @@ def randomization_test(bars, events, *, side_fn, costs, symbol: str,
     null_stats = np.empty(int(sims), dtype="float64")
     for k, cs in enumerate(child_seeds):
         rand = randomize_event_times(events, days, seed=int(cs))
-        frame = event_returns(bars, rand, side_fn=side_fn, costs=costs,
-                              symbol=symbol, contract_size=contract_size)
+        frame = _event_returns_core(ctx, rand, side_fn=side_fn, costs=costs,
+                                    symbol=symbol,
+                                    contract_size=contract_size,
+                                    nights_memo=nights_memo)
         null_stats[k] = (float(pd.to_numeric(frame["net"]).mean())
                          if len(frame) else np.nan)
     valid = null_stats[~np.isnan(null_stats)]
