@@ -1,0 +1,302 @@
+{
+ "doc": "P-Daily v1 步骤 2：数据资格与计数清单（审核条件 D2）",
+ "purpose": "逐品种来源/边界/合格日数/排除原因；三品种共同覆盖；预热与切分后的实际样本外长度。全部数字直接读取研究库 parquet/manifest（只读），非文档引用。",
+ "method": {
+  "trading_day": "UTC 日历日（bar 时间戳）；仅周一~周五可合格；周末一律排除",
+  "qualified_day_rule": "合格日 = 任一已批准来源该日 H1 根数>=20（真日内会话，杜绝伪 H1）且任一来源该日存在合法 D1 OHLC（四价>0，low<=min(open,close)，high>=max(open,close)）",
+  "cutoff": "全局研究/锁箱 cutoff 2025-10-24T00:00Z（bar time < cutoff 才计入；USDJPY 库已更新至 2026-11，按 cutoff 截断）",
+  "histdata_year_rule": "只用 manifest.yearly_verification 标 used=true 的年份（EURUSD 2003-2005 inconsistent、2006 undetermined 不用；实际首日 2007-01-02）",
+  "source_union": "同日多来源时资格取并集（任一来源满足即合格）",
+  "warmup": "预热 200 个共同合格交易日（日频特征最长回看规划值，如 MA200；扣于共同覆盖起点）",
+  "split_primary": "24/6 月滚动 walk-forward（与 gates.toml [g3] hourly 档一致）：前 24 个日历月初始训练，其后每 6 个月重训；第 24 个月起每个合格日恰属一个样本外窗",
+  "split_alt": "单切分 70/30 备选（仅对照）",
+  "moments_note": "moments 为价格数据二阶矩（D1 收盘对数收益，共同覆盖相邻合格日），非策略收益；closes 来源优先级 histdata 先于 mt5（setdefault 保先）；相关矩阵作策略收益相关的代理，符号与幅度不保证适用于策略净收益"
+ },
+ "ledger_trial_N": {
+  "source": "data/research/ledger.sqlite（只读 SQL）",
+  "project_n_dedup_rounds": 2,
+  "new_family_lineage_n_dedup": 0,
+  "n_eff_today": 2,
+  "planning_n_for_power": 3,
+  "note": "P-Daily v1 为新谱系（无延续谱系历史）；台账 rounds 口径今日 N=2（R1+R3），正式开卡时其自身轮次试验计入后 N>=3；检验力按 N=3 规划（比 N=2 严格，方向保守）"
+ },
+ "qualification": {
+  "meta": {
+   "generated_by": "P-Daily v1 step-2 qualification (read-only)",
+   "cutoff_utc": "2025-10-24T00:00:00Z",
+   "min_h1_bars_per_utc_day": 20,
+   "weekday_only": true
+  },
+  "symbols": {
+   "XAUUSD": {
+    "sources": {
+     "histdata": {
+      "h1_rows": 70620,
+      "h1_first": "2009-05-01 00:00:00+00:00",
+      "h1_last": "2021-12-31 21:00:00+00:00",
+      "d1_rows": 3657,
+      "d1_first": "2009-05-01 00:00:00+00:00",
+      "d1_last": "2021-12-31 00:00:00+00:00",
+      "days_h1_ge20": 2984,
+      "days_d1_legal": 3657,
+      "d1_illegal_days": 0,
+      "data_sha256": {
+       "H1": "f9c0d63233330c94fbea48fc398137364c429b7e3c408236d25519f911b35742",
+       "D1": "bbdd6babd266013a67e9f5d14b88d1d38aa5552c4841cb655e3a49b5e501f86c"
+      }
+     },
+     "mt5": {
+      "h1_rows": 52146,
+      "h1_first": "2014-01-14 00:00:00+00:00",
+      "h1_last": "2025-10-23 23:00:00+00:00",
+      "d1_rows": 3622,
+      "d1_first": "2014-01-14 00:00:00+00:00",
+      "d1_last": "2025-10-23 00:00:00+00:00",
+      "days_h1_ge20": 2195,
+      "days_d1_legal": 3622,
+      "d1_illegal_days": 0,
+      "data_sha256": {
+       "H1": "8a88b0bb507fd31b70c64f95bcb6655aaba1e48f1a522b9cf2196ef53eec8089",
+       "D1": "ae9d5391a71c214408dba24ab3fe18eb3bf9fe91139474e2dfe57a9c420bef56"
+      }
+     }
+    },
+    "union_days_seen": 4849,
+    "active_span": [
+     "2009-05-01",
+     "2025-10-23"
+    ],
+    "qualified_days": 3969,
+    "qualified_first": "2009-05-01",
+    "qualified_last": "2025-10-23",
+    "excluded_weekdays_by_reason": {
+     "weekday_no_data_any_source_holiday_or_gap": 253,
+     "h1_lt20_pseudo_or_incomplete_day": 78,
+     "d1_missing_or_illegal_ohlc": 0
+    },
+    "by_year_qualified": {
+     "2009": 148,
+     "2010": 193,
+     "2011": 174,
+     "2012": 193,
+     "2013": 253,
+     "2014": 252,
+     "2015": 252,
+     "2016": 256,
+     "2017": 255,
+     "2018": 256,
+     "2019": 254,
+     "2020": 251,
+     "2021": 253,
+     "2022": 257,
+     "2023": 256,
+     "2024": 257,
+     "2025": 209
+    }
+   },
+   "EURUSD": {
+    "sources": {
+     "histdata": {
+      "h1_rows": 112318,
+      "h1_first": "2007-01-02 01:00:00+00:00",
+      "h1_last": "2025-10-23 23:00:00+00:00",
+      "d1_rows": 5636,
+      "d1_first": "2007-01-02 00:00:00+00:00",
+      "d1_last": "2025-10-23 00:00:00+00:00",
+      "days_h1_ge20": 4672,
+      "days_d1_legal": 5636,
+      "d1_illegal_days": 0,
+      "data_sha256": {
+       "H1": "10543bb6afa0c14ef033e1b719233c570830af7911a617519681e91dd0ec1863",
+       "D1": "6931b951560755c02d6a6bd25ef5fd08405819792972b3f7cbcac0c8fae8beed"
+      }
+     },
+     "mt5": {
+      "h1_rows": 27210,
+      "h1_first": "2021-05-17 13:00:00+00:00",
+      "h1_last": "2025-10-23 23:00:00+00:00",
+      "d1_rows": 1365,
+      "d1_first": "2021-05-17 00:00:00+00:00",
+      "d1_last": "2025-10-23 00:00:00+00:00",
+      "days_h1_ge20": 1133,
+      "days_d1_legal": 1365,
+      "d1_illegal_days": 0,
+      "data_sha256": {
+       "H1": "48601fdd34d205477ead5c306049d57ad39c0319e7992d6374ac63bf37d364a9",
+       "D1": "4bed6828def08e981e67256da187365d4aba2832de89ff486935c99c62212df6"
+      }
+     }
+    },
+    "union_days_seen": 5845,
+    "active_span": [
+     "2007-01-02",
+     "2025-10-23"
+    ],
+    "qualified_days": 4846,
+    "qualified_first": "2007-01-02",
+    "qualified_last": "2025-10-23",
+    "excluded_weekdays_by_reason": {
+     "weekday_no_data_any_source_holiday_or_gap": 32,
+     "h1_lt20_pseudo_or_incomplete_day": 30,
+     "d1_missing_or_illegal_ohlc": 0
+    },
+    "by_year_qualified": {
+     "2007": 258,
+     "2008": 259,
+     "2009": 259,
+     "2010": 260,
+     "2011": 259,
+     "2012": 258,
+     "2013": 258,
+     "2014": 258,
+     "2015": 258,
+     "2016": 259,
+     "2017": 258,
+     "2018": 259,
+     "2019": 235,
+     "2020": 259,
+     "2021": 259,
+     "2022": 260,
+     "2023": 259,
+     "2024": 260,
+     "2025": 211
+    }
+   },
+   "USDJPY": {
+    "sources": {
+     "mt5": {
+      "h1_rows": 173647,
+      "h1_first": "1971-01-03 22:00:00+00:00",
+      "h1_last": "2025-10-23 23:00:00+00:00",
+      "d1_rows": 15489,
+      "d1_first": "1971-01-03 00:00:00+00:00",
+      "d1_last": "2025-10-23 00:00:00+00:00",
+      "days_h1_ge20": 6923,
+      "days_d1_legal": 15489,
+      "d1_illegal_days": 0,
+      "data_sha256": {
+       "H1": "48855f911a535aa5ce07f2e0ffa16f5a6d976f2d7a3886c32c9cbe0d494ebdd7",
+       "D1": "94d969bdfa51e212f9e5016dced2deb43a1e778246d10dd0996875d96ffc1f64"
+      }
+     }
+    },
+    "union_days_seen": 15489,
+    "active_span": [
+     "1971-01-03",
+     "2025-10-23"
+    ],
+    "qualified_days": 6923,
+    "qualified_first": "1999-01-05",
+    "qualified_last": "2025-10-23",
+    "excluded_weekdays_by_reason": {
+     "weekday_no_data_any_source_holiday_or_gap": 1553,
+     "h1_lt20_pseudo_or_incomplete_day": 5823,
+     "d1_missing_or_illegal_ohlc": 0
+    },
+    "by_year_qualified": {
+     "1999": 258,
+     "2000": 259,
+     "2001": 259,
+     "2002": 260,
+     "2003": 260,
+     "2004": 259,
+     "2005": 260,
+     "2006": 259,
+     "2007": 255,
+     "2008": 256,
+     "2009": 255,
+     "2010": 259,
+     "2011": 258,
+     "2012": 257,
+     "2013": 256,
+     "2014": 256,
+     "2015": 256,
+     "2016": 260,
+     "2017": 258,
+     "2018": 257,
+     "2019": 256,
+     "2020": 260,
+     "2021": 260,
+     "2022": 260,
+     "2023": 259,
+     "2024": 260,
+     "2025": 211
+    }
+   }
+  },
+  "common": {
+   "days": 3931,
+   "first": "2009-05-01",
+   "last": "2025-10-23",
+   "years_span": 16.479
+  },
+  "moments": {
+   "XAUUSD": {
+    "n_logret_pairs": 3930,
+    "daily_logret_mean": 0.00039093362312298636,
+    "daily_logret_std": 0.010010887259008453,
+    "annualized_std": 0.15891790854264853
+   },
+   "EURUSD": {
+    "n_logret_pairs": 3930,
+    "daily_logret_mean": -3.3887634177984584e-05,
+    "daily_logret_std": 0.005554626037766682,
+    "annualized_std": 0.08817695473136827
+   },
+   "USDJPY": {
+    "n_logret_pairs": 3930,
+    "daily_logret_mean": 0.00010986343069166254,
+    "daily_logret_std": 0.006219113372994698,
+    "annualized_std": 0.0987253641615603
+   },
+   "correlation_matrix": {
+    "XAUUSD": {
+     "XAUUSD": 1.0,
+     "EURUSD": 0.339334261197247,
+     "USDJPY": -0.3582505570765166
+    },
+    "EURUSD": {
+     "XAUUSD": 0.339334261197247,
+     "EURUSD": 1.0,
+     "USDJPY": -0.32653464930423154
+    },
+    "USDJPY": {
+     "XAUUSD": -0.3582505570765166,
+     "EURUSD": -0.32653464930423154,
+     "USDJPY": 1.0
+    }
+   },
+   "pairwise_on_common_days": {
+    "XAUUSD-EURUSD": 0.339334261197247,
+    "XAUUSD-USDJPY": -0.3582505570765166,
+    "EURUSD-USDJPY": -0.32653464930423154
+   },
+   "n_pairs": 3930,
+   "source_mix_on_common_days": {
+    "histdata|histdata|mt5": 2952,
+    "mt5|histdata|mt5": 806,
+    "mt5|mt5|mt5": 173
+   }
+  },
+  "split": {
+   "warmup_trading_days": 200,
+   "usable_after_warmup": 3731,
+   "usable_first": "2010-03-22",
+   "rolling_24_6": {
+    "initial_train_months": 24,
+    "test_months": 6,
+    "train_days": 504,
+    "oos_days": 3227,
+    "oos_first": "2013-01-02",
+    "oos_last": "2025-10-23",
+    "oos_years_span": 12.805
+   },
+   "single_split_70_30": {
+    "train_days": 2611,
+    "oos_days": 1120,
+    "oos_first": "2021-06-14",
+    "oos_last": "2025-10-23"
+   }
+  }
+ }
+}
