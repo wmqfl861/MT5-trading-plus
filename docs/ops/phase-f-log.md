@@ -367,3 +367,15 @@
 | 11-15 12:3x | PaperSoak 以 Windows 计划任务载体重启（独立于会话生命周期）；从当前起跑至周一 21:50 UTC 评估 |
 
 **教训**：PaperSoak 不能以会话子进程运行——会话崩溃（ZCode runtime 已知不稳定因素）会连带杀死三进程。后续 PaperSoak/影子盘一律走计划任务或等独立载体。
+
+## 2026-11-16（周一）· 两基线切换 Demo 模式（用户指令）
+
+| 时刻（UTC） | 事件 |
+| --- | --- |
+| ~11:44 | 用户指令：PaperSoak→Demo 模式切换（"不要纸面交易，直接在本地 mt5 里投注，用专门的 magic 号区分"）；停两 PaperSoak 实例、清 instances/halt |
+| 11:45 | 两基线以 **-Mode Demo** 从 cd6fc4a 部署树重启（B1 MaCross 902610 shadow-data-r19 / B2 BuyHold 902501 shadow-data-b2）；B2 首评 11:00 bar 被 journal 幂等标 duplicate |
+| 11:46 | B2 对账发现 PaperSoak 纸面持仓 902501007000001 在 Demo 账户不存在→EXTERNAL_EXIT+RECONCILE_MISMATCH→暂停 902501 |
+| 12:03 | `live_ack_external.py` 确认外部出场（PaperSoak→Demo 迁移：纸面仓位从未在 Demo 存在）；对账自动解除暂停 |
+| 12:04+ | 两基线正常运行（心跳新鲜/暂停解除/零 halt）；BuyHold 下一评估=13:00 UTC H1 bar 收线（届时在 Demo 账户开多 0.01 XAUUSD） |
+
+**教训**：PaperSoak→Demo 切换需先清空 PaperSoak 的 journal/paper state/意图登记，或先走 `live_ack_external.py` 确认纸面仓位出场——否则对账会检测到不一致并暂停开仓。
