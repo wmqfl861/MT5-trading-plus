@@ -426,3 +426,13 @@
 **数据目录**：`data/live`（合并部署——两运行器+一风控+一对账共用）
 
 **归档**：shadow-data-r19 + shadow-data-b2 → data/ops-evidence/2026-11-17-baselines-pre-consolidation/（26 项 data/live 旧文件 → 2026-11-17-live-pre-consolidation/，仅保留 run-manifest.json）
+
+### 演练 A（结束风控）结果
+- 06:21:40 杀 risk（PID 12516/17320）→ supervisor 于 06:25:34 写 halt（reason=supervisor_refused）
+- **supervisor 拒绝重启**：`ValueError: process script/arguments mismatch`——supervisor 传 `--risk-config` 而注册进程用 `--config`（参数名不匹配）
+- 06:30 处置：停用 supervisor（防止持续拒绝循环）→ 清 halt → 手动重启 risk（用注册的精确参数）→ 心跳恢复
+- **supervisor 参数修复**：待后续修——非阻塞（核心部署已运行；deadline 06:07 已满足）
+- 演练 B（结束 runner-902610）待 supervisor 修好后补做
+
+### 步骤 9：调度日检指令更新
+已在"每日只读运维检查"指令末尾追加："正式部署清单为 902610、902501（data/live）；旧的 shadow-data-* 目录已归档，不再检查。"
