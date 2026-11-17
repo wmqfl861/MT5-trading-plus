@@ -400,3 +400,29 @@
 
 ### 更正（2026-11-17，不改原文）
 11-16 记的"清 instances/halt"与实际不符——instances.json 已清但 **halt.json 遗漏**（shadow-data-r19/live/halt.json，11-15 12:35 UTC 遗留）。B1 的 Demo 模式交易被此 halt 阻断至今。
+
+## 2026-11-17（周二）· 合并部署记录（第二十一轮 D96/D98）
+
+**部署完成时刻**：2026-11-17T06:07:20 UTC（reconcile 进程启动完成——四个进程全部在位的时刻）
+
+**部署 SHA**：`cd6fc4aaac7d3886be0fbdfa4f437345b6b1b8c5`
+
+**instances.json 启动器 PID**（逐字照录）：
+- runner（magic 902501，BuyHold XAUUSD H1）：**7800**
+- runner（magic 902610，MaCrossATR XAUUSD M15）：**4836**
+- risk：**17320**
+- reconcile：**17252**
+
+**解释器 PID**（另列）：6264（902501）、15704（902610）、12516（risk）、6740（reconcile）
+
+**父进程**：全部 4 个启动器的 PPID=1276（计划任务宿主 `svchost.exe -k netsvcs`——D98 合规，非 agent 会话）
+
+**策略配置 sha256**：
+- DEMO-MA-XAUUSD-M15.toml：`d983a2420a1dd5d95b9651a9d7250860a2f4226c48f9a524deeac87d552a497b`
+- BUY-HOLD-XAUUSD-H1.toml：`e0498f28a49ccd75d93a3af0a56112143f37111431fa947e82929419cce3f06f`
+
+**风控配置**：`config/risk.toml`，sha256=`e8db707b91177f4695bce888e011583892019a622011bb754a450ff75fd3e05a`，**daily_loss_cap_usd = 500.0**（命令行 `--config` 实测确认=risk.toml，非 risk-demo.toml）
+
+**数据目录**：`data/live`（合并部署——两运行器+一风控+一对账共用）
+
+**归档**：shadow-data-r19 + shadow-data-b2 → data/ops-evidence/2026-11-17-baselines-pre-consolidation/（26 项 data/live 旧文件 → 2026-11-17-live-pre-consolidation/，仅保留 run-manifest.json）
