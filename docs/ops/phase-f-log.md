@@ -379,3 +379,24 @@
 | 12:04+ | 两基线正常运行（心跳新鲜/暂停解除/零 halt）；BuyHold 下一评估=13:00 UTC H1 bar 收线（届时在 Demo 账户开多 0.01 XAUUSD） |
 
 **教训**：PaperSoak→Demo 切换需先清空 PaperSoak 的 journal/paper state/意图登记，或先走 `live_ack_external.py` 确认纸面仓位出场——否则对账会检测到不一致并暂停开仓。
+
+## 2026-11-17（周二）· 步骤 0-1 实况与 O21-2 取证（第二十一轮合并部署）
+
+### 步骤 0：进程实况（05:47 UTC）
+- **B1**（MaCross 902610）：runner 17904→11236 / risk 10864→8700 / reconcile 14908→10208；dd=shadow-data-r19；cd6fc4a 树；risk-config=risk.toml ✓
+- **B2**（BuyHold 902501）：runner 10960→13164 / risk 12228→4560 / reconcile 13856→17652；dd=shadow-data-b2；cd6fc4a 树；risk-config=risk.toml ✓
+- **父进程**：B1 PPID=13496 / B2 PPID=15376（均为 agent 会话子进程——D98 合规问题，合并部署时改用计划任务）
+- **shadow-data-r19**：halt.json **未清**（11-15 12:35 遗留）+ pause=False
+- **shadow-data-b2**：pause=False（已解除）无 halt
+- **data/live**：旧 instances.json（死 PID 10620/4960/2060）+ halt.lock + pause-902601.json——全部待归档
+- **计划任务**：无 supervisor/MT5Quant 任务在启用
+- **11-16 晚部署**：未做过（两基线各自独立运行）
+
+### 步骤 1：O21-2 取证结论
+- **根因=risk-demo.toml 模板错误（O21-7）**：11-15 12:34 首次重启时误用 risk-demo.toml（daily_loss_cap_usd=0.5）；风控启动即检测日亏 19.48 USD > 0.5 → 12:35:00 写 halt+flatten
+- **flatten 价格正常**（3883.279，非零），排除"非正报价把浮亏算爆"路径
+- **Demo 模式不会发生同样问题**：Demo 用真实账户权益（非 PaperBroker 纸面盈亏），risk.toml 500 USD 上限不会被 19.48 USD 触发
+- **11-15 的 halt.json 未被清理**：切换 risk.toml 重启时只清了 instances.json，遗漏了 halt.json → B1 自 11-15 起一直在 halt 状态下运行（不影响进程存活，但阻断开仓）
+
+### 更正（2026-11-17，不改原文）
+11-16 记的"清 instances/halt"与实际不符——instances.json 已清但 **halt.json 遗漏**（shadow-data-r19/live/halt.json，11-15 12:35 UTC 遗留）。B1 的 Demo 模式交易被此 halt 阻断至今。
