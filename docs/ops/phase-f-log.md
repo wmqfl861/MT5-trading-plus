@@ -443,3 +443,23 @@
 - **烧机连续性已断**（06:07→10:44 仅 4.6 小时 < 12 小时要求）
 - 处置：重启进程（同参数同 SHA），烧机从重启时刻重新计时——11:54 UTC 起到 24:00 UTC 约 12.1 小时（含换日窗），仍可满足最低要求
 - 第 1 天是否仍为 11-18 取决于烧机结论
+
+## 2026-11-19（周五）· 僵局恢复执行（codex gpt-6.2-astra/max 决策，用户授权执行）
+
+**窗口裁定（codex）**：D1-D3（11-17/18/19）作废，计数 **0/10**；同 SHA 快速重试；烧机至 11-22 24:00Z 后新 D1=11-23，第 10 天 12-08，正式检查 ≥12-09 21:57Z。
+
+| 步骤 | 结果 |
+| --- | --- |
+| 决策来源 | 本地 codex -m gpt-6.2-astra -c max（34KB 执行单 mt5-external-handoff-20261119/recovery-decision.md；两轮：主决策+演练 A 裁定 B） |
+| 取证 | recovery-20261119A/：10 marker+sha256、common.ini 备份、force-stop 说明、interrupt-console.py、start.ps1/wrapper、host.py、pause 释放件 |
+| Algo Trading | UI 自动化两次安全中止（跨会话前台锁）→ codex 备选：停终端→common.ini [Experts] Enabled 0→1→重启→**trade_allowed=True**（备份在案） |
+| 平仓 | 编号 flatten 5e9b3bad…→双 ack+持仓归零+journal 零未裁定 ✓ |
+| 旧树退役 | interrupt-console.py 校验全过但 worker 不响应 Ctrl+C（创建标志）→ runbook §3③ 兜底强杀四已核验 PID（文档留痕）；登记归档 sha256 100461c4…、零孤儿 |
+| 发现① | MT5 SDK 的 initialize 会把重启的终端收养为 worker 子进程（PPID 竞态）——处置=外部重启使 PPID 悬空 |
+| 四角色重启 | 计划任务宿主+start.ps1（NoNewWindow，RepoRoot/脚本路径钉定）→ **conhost=0 全部**；inspect `refused:false alive×4` |
+| supervisor | 标准 §6.3 任务安装；**演练 A 首跑暴露真根因**：supervisor 重启用 CREATE_NO_WINDOW 产生 conhost 子进程→自证失败；codex 裁定 B=树外 host.py 包装器（creationflags→0+隐藏控制台继承）→ live_supervisor2 注册 |
+| 演练 A | PASS：杀 risk→41s 外拉起→连续健康→**halt 自动解除** ✓ |
+| 演练 B | PASS：杀 902610→41s 拉起、902501 无恙 ✓ |
+| pause 902610 | 原件逐字节校验后释放归档；reconcile 置清除态；trade_allowed=True 下不再 10027 |
+
+**遗留（交下轮审核）**：①supervisor 重启链 CREATE_NO_WINDOW 缺陷属部署树代码（冻结中）——树外 host.py 为运维级补丁，建议 T197 类正式修复；②11-22 休市窗需按执行单做干净部署+新 F-8 记录（四角色 PID/配置 hash/T180 三副本）；③烧机期 11-19→11-22 24:00Z。
