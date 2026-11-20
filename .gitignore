@@ -16,3 +16,6 @@ config.json
 gateway.json
 *.local.json
 full-suite.log
+deploy-consolidated.ps1
+install-supervisor.ps1
+supervisor-wrapper.cmd
