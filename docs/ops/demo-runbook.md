@@ -540,8 +540,24 @@ PID 创建时间不符、未知子进程或缺 launcher 但 worker 仍活着的�
 
 ### 6.3 每分钟计划任务安装、卸载和人工停机
 
+**当前实际安装方式（临时——树外 host.py 包装器，D102）**：11-19 恢复后生产在用的
+`live_supervisor2` 任务不直接引用部署树的 `live_supervisor.py`，而是经包装链：
+任务（每分钟）→ `sup-launcher.vbs`（wscript 静默启动，避免 powershell 隐藏窗闪现）
+→ `sup-wrapper.ps1`（§6.2 全套参数固化）→ 树外 `host.py`（唯一改动＝把重启子进程的
+`CREATE_NO_WINDOW` 改为 0、继承本宿主隐藏控制台，不再产生 conhost 子进程——O22-4
+临时运维级补丁；其余判定/校验/停止逻辑 import 部署树原版，一行未改）。包装器占位符
+副本、任务 XML 与生产文件 sha256 见 `docs/ops/ops-patches/2026-11-19/`（生产原件在
+`data/ops-evidence/recovery-20261119A/`，不入库）。正式修复（T197 类）合入并独立
+审核通过前，安装/重装 supervisor 一律按该 README 的链路；本节其余流程（停用、
+`--inspect`/`--stop` 人工停机、卸载）对包装链任务同样适用，任务名不变。
+
 沿用 §6.2 的变量，仅在维护窗口明确批准后安装。任务只运行一次 supervisor，
 由 Windows 每分钟触发；不要在本次开发验证中安装或执行真实业务动作。
+
+**下面的原注册命令会复现 O22-4（conhost 子进程），A5 前不用**——直接指向部署树
+`live_supervisor.py` 的任务，supervisor 每次重启子进程都会附带 conhost 子进程，被
+verified-tree 身份校验拒绝（演练 A 实测）。保留仅作对照与将来 T197 修复后的回迁
+参考；停用/卸载/人工停机命令（任务名 `live_supervisor2`）继续有效。
 
 ```powershell
 $supervisor = Join-Path $deploy 'scripts\live_supervisor.py'
