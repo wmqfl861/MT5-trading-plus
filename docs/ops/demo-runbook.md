@@ -554,11 +554,11 @@ $action = New-ScheduledTaskAction -Execute $python -Argument $quoted -WorkingDir
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
   -RepetitionInterval (New-TimeSpan -Minutes 1)
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew
-Register-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor' `
+Register-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor2' `
   -Action $action -Trigger $trigger -Settings $settings
 
 # 计划内停止业务前先停用 supervisor，防它按职责补回缺失进程。
-Disable-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor'
+Disable-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor2'
 # 然后设置 killSwitch，核验并停止整个父子树；仅杀 venv launcher 不够。
 New-Item -ItemType File -Force (Join-Path $data 'live\killSwitch')
 # $argv 已含解释器之后的脚本及全部固定部署参数。
@@ -568,7 +568,7 @@ if ($LASTEXITCODE -ne 0) { throw 'identity verification refused; keep halted' }
 if ($LASTEXITCODE -ne 0) { throw 'tree stop incomplete; preserve registry and investigate' }
 # Stop 保留登记；不要自动删除 halt/killSwitch/journal。
 # 卸载（不改变业务进程、halt、killSwitch 或历史证据）
-Unregister-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor' -Confirm:$false
+Unregister-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor2' -Confirm:$false
 ```
 
 supervisor 发现 risk 丢失时先写自己所有的 halt 与告警；发现缺失/停止推进的
