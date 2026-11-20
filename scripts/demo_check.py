@@ -417,6 +417,8 @@ class FormalWindow:
     # T202（O19-2）：窗口内各新运行的 started_utc（run_bindings 的运行起点），
     # 用于截断所有组件的未闭降级段
     run_starts: tuple[datetime, ...] = field(default=(), repr=False)
+    # T210(b)：日历 trading=false 的日子（rc=78 退出告警的记录类判定用）
+    non_trading_days: frozenset = field(default=frozenset(), repr=False)
 
 
 def resolve_formal_window(manifest, descriptor, bound_records, *, now):
@@ -535,7 +537,8 @@ def resolve_formal_window(manifest, descriptor, bound_records, *, now):
     return FormalWindow(d["deployment_sha"], anchor, start, now,
         tuple(day for day in trading if start.date() <= day < now.date()),
         tuple(day for day in dates if day >= start.date()), current,
-        tuple(row for _, row in relevant), tuple(registry_starts), tuple(run_starts))
+        tuple(row for _, row in relevant), tuple(registry_starts), tuple(run_starts),
+        non_trading_days=frozenset(set(dates) - set(trading)))
 
 
 def _formal_jsonl(batch, path, alias):
@@ -621,7 +624,7 @@ FORMAL_CLASSIFIED_ALERTS = (FORMAL_ANOMALY_ALERTS | FORMAL_DRILL_ALERTS
 
 # 记录类告警的消息角色标记（生产端 monitor.py 的三种 watch，均为
 # f"{component} {标记}…" 形态；组件名取首段空白前的整段）
-DISCONNECT_EXIT_MARK = "进程连续断线"             # T141 rc=78 退出告警（按异常处理）
+DISCONNECT_EXIT_MARK = "进程连续断线"   # T141 rc=78 退出告警（异常；T210(b)：非交易日且 supervisor 已接管 → 记录类）
 RECORDED_DISCONNECT_START = "进程与交易服务器断线"
 RECORDED_DISCONNECT_RECOVERY = "进程与交易服务器恢复连接"
 ACCOUNT_START_MARK = "账户取数失败"
@@ -632,6 +635,13 @@ RECOVERABLE_START_MARK = "主循环已知可恢复异常"
 RECOVERABLE_EXIT_WINDOW_S = 600.0
 # 每个 UTC 自然日各组件降级段并集的累计上限（秒）；超过判"环境降级超限"
 FORMAL_DEGRADATION_DAY_LIMIT_S = 1800.0
+# T210(a)（第二十二轮 §2.2）：连接类 BROKER_UNAVAILABLE 的消息标记——网关
+# 断线期间的订单路由/查询失败（mt5gw.errors 的连接类异常名）。属记录类：
+# 同一断线的时长已由风控/对账的 DISCONNECTED 段计入，只逐日计数、不开降级段。
+BROKER_UNAVAILABLE_RECORDED_MARKS = ("NotConnectedError", "PreSendUnavailableError",
+                                     "DataUnavailableError")
+# T210(b)：非交易日 rc=78 退出告警的同组件 supervisor 重启判定窗（秒）
+RC78_RESTART_WINDOW_S = 600.0
 
 
 def _normal_log_metadata(line):
@@ -1079,7 +1089,32 @@ def _recorded_role(kind, message):
     return "none", None
 
 
-def _recorded_degradation(alerts, now, restarts=(), run_starts=()):
+def _broker_unavailable_recorded(message):
+    """T210(a)：连接类 BROKER_UNAVAILABLE（消息含 mt5gw 连接类异常名）。"""
+    return any(mark in message for mark in BROKER_UNAVAILABLE_RECORDED_MARKS)
+
+
+def _alert_is_recorded_class(alert, restarts=(), non_trading_days=frozenset()):
+    """T210（第二十二轮 §2.2）：按消息与日历判为记录类的告警（不进"窗口内异常"）。
+
+    - BROKER_UNAVAILABLE 消息含连接类异常名（NotConnectedError 等）→ 记录类：
+      逐日计数、不开降级段（同一断线的时长已由 DISCONNECTED 段计入）；
+    - DISCONNECTED"进程连续断线"（rc=78 退出告警）落在日历 trading=false 的
+      日子、且同组件 RC78_RESTART_WINDOW_S 秒内有 supervisor 重启行
+      （supervisor 已接管）→ 记录类；没有重启行或交易日 → 照旧异常。"""
+    if alert.kind == "BROKER_UNAVAILABLE":
+        return _broker_unavailable_recorded(alert.message)
+    if alert.kind == "DISCONNECTED" and DISCONNECT_EXIT_MARK in alert.message:
+        if alert.time.date() not in non_trading_days:
+            return False
+        component = _alert_component(alert.message)
+        return any(c == component
+                   and abs((t - alert.time).total_seconds()) <= RC78_RESTART_WINDOW_S
+                   for c, t in restarts)
+    return False
+
+
+def _recorded_degradation(alerts, now, restarts=(), run_starts=(), non_trading_days=frozenset()):
     """记录类告警 →（降级段 [(start, end)]，逐日记录类事件次数）。
 
     按组件把每个段首与其后第一条同表种恢复配对；没配上的计到同组件下一
@@ -1087,6 +1122,9 @@ def _recorded_degradation(alerts, now, restarts=(), run_starts=()):
     RECOVERABLE_FAILURE 没有恢复告警，其段最多计到段首后
     RECOVERABLE_EXIT_WINDOW_S 内的同组件退出类告警，否则按同一窗口封顶
     （瞬时可恢复失败不得被计到检查时刻）。
+
+    T210（第二十二轮 §2.2）：连接类 BROKER_UNAVAILABLE 与非交易日已被
+    supervisor 接管的 rc=78 退出告警也计逐日记录类次数，但均不开降级段。
 
     T202（O19-2）未闭段不得计到检查时刻：段中途进程被重启/换运行时，
     新进程不会补写恢复——同组件的下一条 supervisor 重启行（restarts，
@@ -1096,8 +1134,9 @@ def _recorded_degradation(alerts, now, restarts=(), run_starts=()):
     events = sorted(alerts, key=lambda a: (a.time, a.kind, a.message))
     segments, open_segs, daily_events = [], [], {}
     for a in events:
-        if a.kind in FORMAL_RECORDED_ALERTS and not (
-                a.kind == "DISCONNECTED" and DISCONNECT_EXIT_MARK in a.message):
+        if (a.kind in FORMAL_RECORDED_ALERTS and not (
+                a.kind == "DISCONNECTED" and DISCONNECT_EXIT_MARK in a.message)
+                or _alert_is_recorded_class(a, restarts, non_trading_days)):
             daily_events[a.time.date()] = daily_events.get(a.time.date(), 0) + 1
         role, watch = _recorded_role(a.kind, a.message)
         component = _alert_component(a.message)
@@ -1149,13 +1188,16 @@ def formal_recorded_degradation(ctx):
     """T191：记录类告警只记录不判失败；每个 UTC 自然日各组件降级段取并集，
     当日累计超过 FORMAL_DEGRADATION_DAY_LIMIT_S 秒判"环境降级超限"。逐日
     记录类事件次数与降级秒数始终输出（A5 材料用）。T202（O19-2）：未闭段
-    按同组件 supervisor 重启行与窗口内新运行起点截断，不计到检查时刻。"""
+    按同组件 supervisor 重启行与窗口内新运行起点截断，不计到检查时刻。
+    T210(c)：1800 秒上限只对 required_trading_days（已结束交易日）判定；
+    逐日输出仍覆盖全部日子。"""
     w = ctx["formal_window"]
     restarts = [(row["component"], _utc(row["utc"], "journal")) for row in w.restart_rows]
     segments, daily_events = _recorded_degradation(ctx["alerts"], ctx["now"],
-                                                   restarts=restarts, run_starts=w.run_starts)
+                                                   restarts=restarts, run_starts=w.run_starts,
+                                                   non_trading_days=w.non_trading_days)
     daily = _daily_degradation_seconds(segments, w.required_calendar_days)
-    over = [d for d in w.required_calendar_days if daily[d] > FORMAL_DEGRADATION_DAY_LIMIT_S]
+    over = [d for d in w.required_trading_days if daily[d] > FORMAL_DEGRADATION_DAY_LIMIT_S]
     detail = "；".join(f"{d} 记录类 {daily_events.get(d, 0)} 次、降级 {daily[d]:.0f} 秒"
                       for d in w.required_calendar_days
                       if daily_events.get(d) or daily[d]) or "窗口内无记录类事件"
@@ -1180,9 +1222,14 @@ def run_formal_accept(ctx):
             checks.append(formal_report(ctx, day))
         elif day == w.end_utc.date() and day in ctx["reports"] and "**超标**" in ctx["reports"][day]:
             checks.append(Check("当日点差", False, f"{day} 点差超标"))
+    # T210：连接类 BROKER_UNAVAILABLE 与非交易日已被 supervisor 接管的
+    # rc=78 退出告警属记录类，不进"窗口内异常"（逐日计数见
+    # formal_recorded_degradation）。
+    restarts = [(row["component"], _utc(row["utc"], "journal")) for row in w.restart_rows]
     anomalies = [f"{a.time} {a.kind}" for a in ctx["alerts"]
-                 if a.kind in FORMAL_ANOMALY_ALERTS
-                 or (a.kind == "DISCONNECTED" and DISCONNECT_EXIT_MARK in a.message)]
+                 if (a.kind in FORMAL_ANOMALY_ALERTS
+                     or (a.kind == "DISCONNECTED" and DISCONNECT_EXIT_MARK in a.message))
+                 and not _alert_is_recorded_class(a, restarts, w.non_trading_days)]
     anomalies += [f"{ts} 日志异常" for _, _, _, events in ctx["log_events"]
                   for ts, ln in events if _in_window(ctx, ts)
                   and any(mark in ln for mark in ("Traceback", "执行异常", "决策异常", "CRITICAL", "ERROR"))]

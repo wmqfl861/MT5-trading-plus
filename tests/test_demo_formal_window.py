@@ -250,7 +250,7 @@ def append_run(f, sha=SHA):
     save_descriptor(f)
 
 
-def append_restart(f, sha=SHA, component=None):
+def append_restart(f, sha=SHA, component=None, when=None):
     component = str(MAGICS[0]) if component is None else component
     journal = f.live / "ops-restarts.jsonl"
     rows = [json.loads(x) for x in journal.read_text().splitlines()] if journal.exists() else []
@@ -259,7 +259,8 @@ def append_restart(f, sha=SHA, component=None):
     after = copy.deepcopy(before)
     e = next(e for e in after["instances"] if (str(e["magic"]) if e["kind"] == "runner" else e["kind"]) == component)
     old = e["pid"]
-    when = f.start + timedelta(hours=7 + n)
+    # T210：重启时刻可指定（默认固定在窗口第 1 天，保持既有测试不变）
+    when = f.start + timedelta(hours=7 + n) if when is None else when
     e.update(pid=old + 20, started_utc=iso(when + timedelta(seconds=3)), deployment_sha=sha)
     # supervisor omits launcher-only fields and records observation before launch.
     e.pop("gateway_config", None)
@@ -1175,3 +1176,100 @@ def test_fix3_unclosed_segment_truncated_by_new_run_start(tmp_path):
                     "reconcile 进程与交易服务器断线（NotConnectedError: synthetic）——降级继续")])
     out = assert_result(formal(tmp_path), 3)
     assert "降级 1200 秒" in out
+
+
+# fix4 (T210, 第二十二轮计划 §2.2)：正式检查告警分类对齐 T201。
+# 计划 §2.2 的 7 条测试里的前 6 条；第 7 条（交易日 1860 秒 → 1）即上面的
+# test_fix2_daily_degradation_1860s_fails，保持不变。
+
+EXIT_78_MSG = ("risk 进程连续断线 15 分钟（≥ 15 分钟上限，最后错误：NotConnectedError）——"
+               "以专用退出码 78 退出交给 supervisor（T141）")
+
+
+def trading_day_ts(f, i=1, hours=9):
+    """窗口内第 i 个（0 基）已结束交易日的给定小时时刻。"""
+    t = datetime.combine(f.trading[i], datetime.min.time()) + timedelta(hours=hours)
+    assert t < f.now
+    return t
+
+
+def window_saturday(f, hours=5):
+    """窗口内第一个周六（日历 trading=false 的日子）。"""
+    sat = f.start + timedelta(days=(5 - f.start.weekday()) % 7 or 7, hours=hours)
+    assert sat.weekday() == 5 and sat < f.now
+    return sat
+
+
+def test_fix4_trading_day_connection_broker_unavailable_is_recorded(tmp_path):
+    # ①：交易日连接类 BROKER_UNAVAILABLE（executor.py 断线分支同形）→ 3，
+    # 逐日计数写进"记录类告警与降级（逐日）"；不开降级段（同一断线时长
+    # 已由风控/对账的 DISCONNECTED 段计入）。
+    f = build_evidence(tmp_path)
+    t = trading_day_ts(f)
+    magic = MAGICS[0]
+    add_alerts(f, [(t, "BROKER_UNAVAILABLE",
+                    f"magic {magic} 断线（NotConnectedError：terminal online, trade server not connected）"
+                    "——本轮不开新仓、订单未发出，下一 bar 重新决策；网关按 5/10/30/60 秒退避重连，"
+                    "连续 15 分钟连不上由风控/对账进程以专用退出码交给 supervisor（T141）")])
+    out = assert_result(formal(tmp_path), 3)
+    assert f"{f.trading[1]} 记录类 1 次、降级 0 秒" in out   # 不开降级段
+    assert "窗口内异常" not in out
+
+
+def test_fix4_trading_day_non_connection_broker_unavailable_fails(tmp_path):
+    # ②：交易日非连接类 BROKER_UNAVAILABLE（如 TimeoutError）→ 1（照旧异常）。
+    f = build_evidence(tmp_path)
+    t = trading_day_ts(f)
+    add_alerts(f, [(t, "BROKER_UNAVAILABLE",
+                    f"magic {MAGICS[0]} 券商持仓查询失败（TimeoutError: MT5 call timeout）"
+                    "——fail-closed：本轮不开新仓、不清空未决出场，状态原样保留")])
+    out = assert_result(formal(tmp_path), 1)
+    assert "窗口内异常" in out and "BROKER_UNAVAILABLE" in out
+
+
+def test_fix4_saturday_rc78_with_timely_restart_is_recorded(tmp_path):
+    # ③：周六 rc=78 退出，2 分钟后同组件有 supervisor 重启行 → 3（记录类）。
+    f = build_evidence(tmp_path)
+    sat = window_saturday(f)
+    append_restart(f, component="risk", when=sat + timedelta(minutes=2))
+    add_alerts(f, [(sat, "DISCONNECTED", EXIT_78_MSG)])
+    out = assert_result(formal(tmp_path), 3)
+    assert f"{sat.date()} 记录类 1 次、降级 0 秒" in out   # 不开降级段
+    assert "窗口内异常" not in out
+
+
+def test_fix4_saturday_rc78_without_restart_fails(tmp_path):
+    # ④：周六 rc=78 退出、无重启行 → 1（照旧异常）。
+    f = build_evidence(tmp_path)
+    sat = window_saturday(f)
+    add_alerts(f, [(sat, "DISCONNECTED", EXIT_78_MSG)])
+    out = assert_result(formal(tmp_path), 1)
+    assert "DISCONNECTED" in out
+
+
+def test_fix4_trading_day_rc78_with_restart_still_fails(tmp_path):
+    # ⑤：交易日 rc=78 退出（即使 10 分钟内有重启行）→ 1（交易日不变）。
+    f = build_evidence(tmp_path)
+    t = trading_day_ts(f)
+    append_restart(f, component="risk", when=t + timedelta(minutes=2))
+    add_alerts(f, [(t, "DISCONNECTED", EXIT_78_MSG)])
+    out = assert_result(formal(tmp_path), 1)
+    assert "DISCONNECTED" in out
+
+
+def test_fix4_saturday_3077s_recorded_degradation_within_daily_output(tmp_path):
+    # ⑥：周六两段共 3077 秒断线 → 3（1800 秒上限只对已结束交易日判定），
+    # 逐日输出仍覆盖全部日子（秒数照常写出）。
+    f = build_evidence(tmp_path)
+    sat = window_saturday(f)
+    add_alerts(f, [
+        (sat, "DISCONNECTED", "risk 进程与交易服务器断线（NotConnectedError: synthetic）——降级继续"),
+        (sat + timedelta(seconds=1554), "DISCONNECTED",
+         "risk 进程与交易服务器恢复连接（断线 1554 秒）——恢复正常轮询（T141）"),
+        (sat + timedelta(hours=2), "DISCONNECTED",
+         "risk 进程与交易服务器断线（NotConnectedError: synthetic）——降级继续"),
+        (sat + timedelta(hours=2, seconds=1523), "DISCONNECTED",
+         "risk 进程与交易服务器恢复连接（断线 1523 秒）——恢复正常轮询（T141）"),
+    ])
+    out = assert_result(formal(tmp_path), 3)
+    assert f"{sat.date()} 记录类 4 次、降级 3077 秒" in out
