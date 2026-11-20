@@ -70,19 +70,57 @@ def p22_1() -> None:
            f"判'窗口内异常'={failed}（基线证据本身返回 3）")
 
 
+def append_restart_at(fx, f, when, component):
+    """同 tests 的 append_restart，但重启时刻可指定（原函数固定在窗口第 1 天）。"""
+    import copy
+    import json
+    journal = f.live / "ops-restarts.jsonl"
+    rows = [json.loads(x) for x in journal.read_text().splitlines()] if journal.exists() else []
+    n = len(rows) + 1
+    before = fx.get(f.live / "instances.json")
+    after = copy.deepcopy(before)
+    e = next(e for e in after["instances"]
+             if (str(e["magic"]) if e["kind"] == "runner" else e["kind"]) == component)
+    old = e["pid"]
+    e.update(pid=old + 20, started_utc=fx.iso(when + timedelta(seconds=3)), deployment_sha=fx.SHA)
+    e.pop("gateway_config", None)
+    e.pop("account_hint", None)
+    for label, doc in (("before", before), ("after", after)):
+        fx.put(f.root / f"retained/restart-{n}-{label}.json", doc)
+    rows.append(dict(utc=fx.iso(when), component=component, reason_code="process_missing",
+                     old_pid=old, new_pid=e["pid"], deployment_sha=fx.SHA))
+    fx.lines(journal, rows)
+    fx.put(f.live / "instances.json", after)
+    f.descriptor["restart_bindings"].append(dict(line_number=n, **{
+        label + "_instances": fx.ref(f.root, f.root / f"retained/restart-{n}-{label}.json")
+        for label in ("before", "after")}))
+    fx.save_descriptor(f)
+
+
+EXIT_78 = ("risk 进程连续断线 15 分钟（≥ 15 分钟上限，最后错误：NotConnectedError）——"
+           "以专用退出码 78 退出交给 supervisor（T141）")
+
+
 def p22_2() -> None:
     fx = fixture()
-    # ① 周六的 T141 rc=78 退出告警
+    # ① 周六的 T141 rc=78 退出告警，2 分钟后 supervisor 按设计重启了 risk
     root = Path(tempfile.mkdtemp(prefix="r22-p2a-"))
     f = fx.build_evidence(root)
     sat = f.start + timedelta(days=(5 - f.start.weekday()) % 7 or 7, hours=5)
     assert sat.weekday() == 5 and sat < f.now
-    fx.add_alerts(f, [(sat, "DISCONNECTED",
-                       "risk 进程连续断线 15 分钟（≥ 15 分钟上限，最后错误：NotConnectedError）——"
-                       "以专用退出码 78 退出交给 supervisor（T141）")])
+    append_restart_at(fx, f, sat + timedelta(minutes=2), "risk")
+    fx.add_alerts(f, [(sat, "DISCONNECTED", EXIT_78)])
     res_a = fx.formal(root)
     out_a = res_a.stdout + res_a.stderr
     exit_fails = res_a.returncode == 1 and "窗口内异常" in out_a
+    # 对照（T210 之后也应判异常）：周六 rc=78 但没有 supervisor 重启
+    root = Path(tempfile.mkdtemp(prefix="r22-p2c-"))
+    f = fx.build_evidence(root)
+    sat_c = f.start + timedelta(days=(5 - f.start.weekday()) % 7 or 7, hours=5)
+    fx.add_alerts(f, [(sat_c, "DISCONNECTED", EXIT_78)])
+    res_c = fx.formal(root)
+    report("P22-2c", "INFO",
+           f"对照：周六 rc=78、无 supervisor 重启 → 返回 {res_c.returncode}（T210 前后都应为 1）")
     # ② 周六一段已恢复、长 1554 秒的断线（11-15 周日实况之一）
     root = Path(tempfile.mkdtemp(prefix="r22-p2b-"))
     f = fx.build_evidence(root)
@@ -102,7 +140,7 @@ def p22_2() -> None:
     status = "REPRODUCED" if (exit_fails and cap_fails) else (
         "PARTIAL" if (exit_fails or cap_fails) else "NOT-REPRODUCED")
     report("P22-2", status,
-           f"周六 rc=78 退出告警 → 返回 {res_a.returncode}（判异常={exit_fails}）；"
+           f"周六 rc=78 退出告警且 2 分钟后 supervisor 已重启 → 返回 {res_a.returncode}（判异常={exit_fails}）；"
            f"周六两段已恢复断线共 3077 秒 → 返回 {res_b.returncode}（判降级超限={cap_fails}）")
 
 
