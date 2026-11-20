@@ -463,3 +463,16 @@
 | pause 902610 | 原件逐字节校验后释放归档；reconcile 置清除态；trade_allowed=True 下不再 10027 |
 
 **遗留（交下轮审核）**：①supervisor 重启链 CREATE_NO_WINDOW 缺陷属部署树代码（冻结中）——树外 host.py 为运维级补丁，建议 T197 类正式修复；②11-22 休市窗需按执行单做干净部署+新 F-8 记录（四角色 PID/配置 hash/T180 三副本）；③烧机期 11-19→11-22 24:00Z。
+
+## 2026-11-20（周五）· 第二十二轮 §2.6 记录补齐（更正，不改原文）
+
+- **更正 1（星期）**：11-19 是**周四**——本 log 11-19 节标题"2026-11-19（周五）"记错星期
+  （11-20 才是周五）。日检/汇报引用该节时按周四理解。
+- **更正 2（演练 A 根因）**：11-17 演练 A 中 supervisor 拒绝重启 risk 的根因是 **O22-4
+  （supervisor 重启子进程用 CREATE_NO_WINDOW，每个子进程附带 conhost.exe，verified-tree
+  身份校验拒绝未知后代）**，不是当时记录的"参数名不匹配（supervisor 传 --risk-config
+  而注册进程用 --config）"。codex 11-19 执行单复核：固定树的 supervisor `command` 与
+  `demo_run.ps1` 给 risk 的本就都是 `--config`、给 runner 的都是 `--risk-config`，
+  11-19 本机复核四条登记 argv 全部匹配；树外 host.py 包装器（裁定 B）绕开 conhost 后
+  演练 A 即通过——证实真根因。11-17 节"supervisor 参数修复：待后续修"的说法作废，
+  由 T197 类正式修复取代。
