@@ -568,6 +568,37 @@ PID 创建时间不符、未知子进程或缺 launcher 但 worker 仍活着的�
 `demo_run.ps1` 的 `Start-Process -WindowStyle Hidden`）在 `tests/test_t110_supervisor.py` 里，都先断言快照里
 确实有以该角色为父的 conhost，否则按失败处理并打印进程树。
 
+**"无法判定"不是拒绝（T212，2026-11-23）**：核验部署时 git 超时或起不来，这一轮记为无法判定——发
+`SUPERVISOR_DEFERRED`（记录类），不重启任何角色。只读的进程树和心跳检查照常：四个角色都健康就不写 halt；
+有角色缺失或失活照旧写 halt，重启留到核验成功的那一轮。无法判定期间也不解除已有的 halt。SHA 不符、工作树
+不干净、非 Demo 配置照旧是拒绝。角色缺失或失活、而部署不干净要到重启前的完整核验才发现时，halt 的原因是
+`risk_lost` 或 `component_lost`，"不干净"这个原因写在 `SUPERVISOR_REFUSED` 告警和 `supervisor-state.json` 的
+`last_refusal` 里。
+
+计数与升级：一轮里只要有一次核验无法判定——本轮开头那一次，或者重启前的完整核验——这一轮就计一次；连续
+三轮无法判定，第三轮升级为拒绝（发 `SUPERVISOR_REFUSED`，异常类）。`supervisor-state.json` 的
+`undeterminable` 记这个连续轮数：沿用缓存的"干净"结论本身既不计数也不清零，只有整轮都没有出现无法判定
+才归零。升级时如果还没有 halt，写 halt `supervisor_refused`；已经有 halt（不论是 supervisor 早先或这一轮
+写的，还是别的进程写的），保留它原有的原因、owner 和 token，不改写成 `supervisor_refused`。升级之后计数
+从 1 重新开始：git 一直不回答时，告警按"推迟、推迟、拒绝"每三轮循环一次，其中拒绝是异常类。
+
+开销与缓存：SHA 和 detached 状态每轮都查。`.git/HEAD` 的内容和索引文件的大小、修改时间都没变时，沿用上次
+"干净"的结论（链接工作树按 `.git` 文件里的 `gitdir:` 找到真正的 git 目录），不需要重启的轮次里完整的
+`git status` 至多 15 分钟一次。**要重启任何角色的那一轮，先做一次完整核验，不用缓存**。
+
+缓存的盲区：上一次完整核验之后的 15 分钟内，新增的未跟踪文件、已跟踪文件的未提交改动（包括删除）都不会被
+发现；要到下一次完整核验才发现，届时按拒绝处理（发 `SUPERVISOR_REFUSED`，之前没有 halt 时写
+halt `supervisor_refused`）。`git add` 会改写索引，指纹随之改变，下一轮就做完整核验并发现。这段时间里，
+已有 halt 的自动解除沿用的是缓存的"干净"结论。重启不受这个盲区影响：要重启角色的那一轮一定先做完整
+核验，部署不干净就拒绝，不重启。
+
+git 和 powershell 都按绝对路径调用。git 找不到按无法判定处理。powershell 找不到是**拒绝**：没有进程清点
+就不知道各角色是否健康，按拒绝处理才稳妥（发 `SUPERVISOR_REFUSED`，之前没有 halt 时写 halt
+`supervisor_refused`）。
+
+以上各段写于 2026-11-23；其中计数与升级的口径、缓存的盲区、powershell 找不到的处理，是同日独立评审
+（`docs/reviews/2026-11-23-t212-review.md`）之后修订的。
+
 **安装方式**：T211 合入后直接指向部署树的 `live_supervisor.py`，用下面的注册命令。11-19 到 11-23 用的树外
 `host.py` 包装是临时补丁，随新候选部署时撤除；留档见 `docs/ops/ops-patches/2026-11-19/`。撤除之前，
 生产上的观察运行继续用包装链，不对它热改。
