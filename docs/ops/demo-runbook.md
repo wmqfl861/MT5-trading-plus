@@ -540,24 +540,40 @@ PID 创建时间不符、未知子进程或缺 launcher 但 worker 仍活着的�
 
 ### 6.3 每分钟计划任务安装、卸载和人工停机
 
-**当前实际安装方式（临时——树外 host.py 包装器，D102）**：11-19 恢复后生产在用的
-`live_supervisor2` 任务不直接引用部署树的 `live_supervisor.py`，而是经包装链：
-任务（每分钟）→ `sup-launcher.vbs`（wscript 静默启动，避免 powershell 隐藏窗闪现）
-→ `sup-wrapper.ps1`（§6.2 全套参数固化）→ 树外 `host.py`（唯一改动＝把重启子进程的
-`CREATE_NO_WINDOW` 改为 0、继承本宿主隐藏控制台，不再产生 conhost 子进程——O22-4
-临时运维级补丁；其余判定/校验/停止逻辑 import 部署树原版，一行未改）。包装器占位符
-副本、任务 XML 与生产文件 sha256 见 `docs/ops/ops-patches/2026-11-19/`（生产原件在
-`data/ops-evidence/recovery-20261119A/`，不入库）。正式修复（T197 类）合入并独立
-审核通过前，安装/重装 supervisor 一律按该 README 的链路；本节其余流程（停用、
-`--inspect`/`--stop` 人工停机、卸载）对包装链任务同样适用，任务名不变。
+**身份校验的失效模式表（T211，2026-11-23）**。supervisor 只重启"干净、钉死"的部署里的角色；
+进程树里有它不认识的进程就拒绝，并且不结束任何没有通过校验的进程。下表每一行对应
+`tests/test_t211_supervisor_identity.py` 里的一个用例（第 12、13 行对应其中走 `supervise()` 的用例）：
+
+| # | 进程形态 | 结果 |
+| --- | --- | --- |
+| 1 | 启动器 + 解释器 worker | 通过 |
+| 2 | 形态 1，启动器或 worker 下挂一个系统 conhost 叶子 | 通过；conhost 不进终止清单 |
+| 3 | 形态 2，另有进程的 `parent_pid` 指向 conhost，但创建时间早于 conhost | 通过（陈旧父链接） |
+| 4 | conhost 下有创建时间不早于它的子进程 | 拒绝 |
+| 5 | 不在系统目录的 `conhost.exe` | 拒绝 |
+| 6 | 启动器已退出，只剩它的系统 conhost | 视为缺失，可重启 |
+| 7 | 启动器已退出，PID 上是创建时间不符且参数不符的进程 | 视为缺失，可重启 |
+| 8 | 启动器 PID 上是参数相符、创建时间不符的进程 | 拒绝 |
+| 9 | 启动器已退出，worker 还在 | 拒绝 |
+| 10 | worker 下有未知子进程，包括 terminal64.exe | 拒绝；被拒绝点名的进程是终端时，另发 `SUPERVISOR_TERMINAL_CHILD` |
+| 11 | 登记之外有参数相符的 worker | 拒绝 |
+| 12 | supervisor 的 halt 在场，同时有 `halt-risk-veto.json` 或 killSwitch | 不自动解除；`supervisor-state.json` 记 `clear_blocked`，人工核对后移除 |
+| 13 | 角色被判 `heartbeat_or_log_stale` | 写 halt 并重启；`SUPERVISOR` 告警的 `checks=` 和 `supervisor-state.json` 的 `stale_checks` 列出该角色每条子条件的取值（通过的也在内） |
+
+"系统 conhost"指映像的完整路径等于 `<SystemRoot>\System32\conhost.exe`（按 `ntpath` 归一大小写和分隔符后
+比较）；系统根目录取不到时不放过任何进程。第 7 行的孤儿判断：`parent_pid` 等于该 PID、创建时间落在
+"登记时间减 1 秒"到"占用者创建时间"之间的进程，仍按孤儿处理（拒绝）；创建时间不早于占用者的，是占用者
+自己的子进程，不算。拒绝原因带角色、PID、映像文件名、父 PID，写进 `SUPERVISOR_REFUSED` 告警和
+`supervisor-state.json` 的 `last_refusal`。两条走生产启动路径的测试（`WindowsProcesses.launch()` 和
+`demo_run.ps1` 的 `Start-Process -WindowStyle Hidden`）在 `tests/test_t110_supervisor.py` 里，都先断言快照里
+确实有以该角色为父的 conhost，否则按失败处理并打印进程树。
+
+**安装方式**：T211 合入后直接指向部署树的 `live_supervisor.py`，用下面的注册命令。11-19 到 11-23 用的树外
+`host.py` 包装是临时补丁，随新候选部署时撤除；留档见 `docs/ops/ops-patches/2026-11-19/`。撤除之前，
+生产上的观察运行继续用包装链，不对它热改。
 
 沿用 §6.2 的变量，仅在维护窗口明确批准后安装。任务只运行一次 supervisor，
 由 Windows 每分钟触发；不要在本次开发验证中安装或执行真实业务动作。
-
-**下面的原注册命令会复现 O22-4（conhost 子进程），A5 前不用**——直接指向部署树
-`live_supervisor.py` 的任务，supervisor 每次重启子进程都会附带 conhost 子进程，被
-verified-tree 身份校验拒绝（演练 A 实测）。保留仅作对照与将来 T197 修复后的回迁
-参考；停用/卸载/人工停机命令（任务名 `live_supervisor2`）继续有效。
 
 ```powershell
 $supervisor = Join-Path $deploy 'scripts\live_supervisor.py'
@@ -603,6 +619,8 @@ old_pid、new_pid、deployment_sha——恰好六字段，正式检查器按行�
 halt、风险 halt 从不自动删除。若 supervisor halt 已存在时又触发独立风险
 停机，保留首次原因/owner，同时写 `halt-risk-veto.json`；该 veto 只能经人工
 核对原因、确认风险消除后移除，不可为恢复自动开仓直接删它。
+**清除 halt 时要一并核对 `halt-risk-veto.json`**：它留着，supervisor 以后写的任何 halt 都不会
+自动解除（`supervisor-state.json` 里出现 `clear_blocked`）；11-23 实测因此停了 3 小时 24 分。
 
 ### 6.4 验收与部署边界
 
