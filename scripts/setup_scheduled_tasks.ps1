@@ -73,8 +73,9 @@
 #
 # T213（2026-11-23）：部署树是纯检出，没有 .venv，也不放运行数据。解释器、
 # 网关配置、数据、运行器日志、任务日志、日报、点差模型、会话配置都可以用参数
-# 显式给出；不给的沿用仓库根下的旧位置。解释器或会话配置不存在就拒绝安装
-#（不写任何包装器、不建任务）——11-17 起日报和周检任务因为命令指向部署树里
+# 显式给出；不给的沿用仓库根下的旧位置。解释器、会话配置、点差模型、Demo 模式的
+# 网关配置不存在，或者路径里有系统 ANSI 代码页表示不了的字符，就拒绝安装
+#（不建目录、不写包装器、不建任务）——11-17 起日报和周检任务因为命令指向部署树里
 # 不存在的 .venv，每次都以 rc=1 失败，Python 根本没有启动。安装结束打印一行
 # TASK_PARAMETERS {…}，任务参数随部署形态写进部署记录。
 
@@ -123,7 +124,8 @@ if (-not [string]::IsNullOrWhiteSpace($GatewayConfig)) {
     }
 }
 
-# T213：先核对任务命令里要用的文件都在，再产生任何副作用（写包装器、建目录、建任务）。
+# T213：先核对任务命令里要用的文件都在、路径写得进包装器，再产生任何副作用（建目录、
+# 写包装器、建任务）。缺哪一项都拒绝安装并说明缺什么，一个目录都不建。
 $missing = @()
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
     $missing += "解释器 $python（用 -PythonExe 给出实际的 python.exe）"
@@ -131,25 +133,48 @@ if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $sessionsPath -PathType Leaf)) {
     $missing += "会话配置 $sessionsPath（用 -SessionsConfig 给出部署树里的 sessions.toml）"
 }
+if (-not (Test-Path -LiteralPath $spreadPath -PathType Leaf)) {
+    $missing += "点差模型 $spreadPath（用 -SpreadModel 给出部署实际使用的 spread_model.json）"
+}
 if ($null -ne $cfgPath -and -not (Test-Path -LiteralPath $cfgPath -PathType Leaf)) {
     $missing += "网关配置 $cfgPath"
 }
+if ($Mode -eq "Demo" -and $null -eq $cfgPath) {
+    $missing += "网关配置（Demo 日报必需）：部署树里没有 config.json 或 gateway.json，请用 -GatewayConfig 指定"
+}
 if ($missing.Count -gt 0) {
     throw ("任务命令引用的文件不存在，拒绝安装：" + ($missing -join "；"))
+}
+
+# 评审 R7（2026-11-23）：.cmd 包装器按系统 ANSI 代码页写，不再按 ASCII——按 ASCII
+# 写时，中文等字符全变成 "?"，任务装得上却跑不起来。任何路径在这个代码页里表示不了
+#（往返编码后不相等），同样在产生副作用之前拒绝。
+$acp = [int](Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage' -Name ACP).ACP
+if ($acp -eq 65001) {
+    # UTF-8 不带 BOM：BOM 会被 cmd 当成第一条命令的一部分
+    $wrapperEncoding = New-Object System.Text.UTF8Encoding($false)
+} else {
+    $wrapperEncoding = [System.Text.Encoding]::GetEncoding($acp)
+}
+foreach ($location in @($python, $repoRoot, $dataDir, $logsDir, $runnerLogs, $reportsDir, $spreadPath, $sessionsPath, $cfgPath)) {
+    if ($null -eq $location) { continue }
+    if ($wrapperEncoding.GetString($wrapperEncoding.GetBytes($location)) -cne $location) {
+        throw ("路径含系统 ANSI 代码页（$acp）表示不了的字符，写出的 .cmd 包装器跑不起来，拒绝安装：$location。请改用这个代码页能表示的路径（建议只用 ASCII 字符）。")
+    }
 }
 New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
 $cfgArg = ""
 if ($null -ne $cfgPath) { $cfgArg = " --config `"$cfgPath`"" }
 
 function New-TaskWrapper($name, $pyScript, $pyArgs) {
-    # 生成 scripts\task_<name>.cmd：cd 仓库根 → 跑 python → 输出落日志
+    # 生成 scripts\task_<name>.cmd：cd 仓库根 → 跑 python → 输出落日志。按系统 ANSI 代码页写（见上）。
     $cmd = Join-Path $scriptsDir ("task_" + $name + ".cmd")
-    $lines = @(
+    $lines = [string[]]@(
         "@echo off",
         "cd /d `"$repoRoot`"",
         "`"$python`" `"$scriptsDir\$pyScript`"$pyArgs >> `"$logsDir\task_$name.log`" 2>&1"
     )
-    Set-Content -Path $cmd -Value $lines -Encoding ASCII
+    [System.IO.File]::WriteAllLines($cmd, $lines, $wrapperEncoding)
     return $cmd
 }
 
@@ -169,10 +194,6 @@ function New-SaturdayTask($name, $time, $utcTime, $wrapper) {
         throw "schtasks 创建 MT5Quant\$name 失败（退出码 $LASTEXITCODE）"
     }
     Write-Host "已创建 MT5Quant\$name（每周六 $time 本地 = $utcTime UTC）→ $wrapper"
-}
-
-if ($Mode -eq "Demo" -and [string]::IsNullOrWhiteSpace($cfgArg)) {
-    throw "Demo 日报缺少网关配置；请配置 config.json 或 gateway.json，或用 -GatewayConfig 指定。"
 }
 
 # 默认只安装演练日报/周报；数据任务需运维另行显式选择（T182 后仍每周六运行）。
@@ -229,13 +250,14 @@ $weeklyDow = @{ [DayOfWeek]::Sunday = "SUN"; [DayOfWeek]::Monday = "MON";
                 [DayOfWeek]::Thursday = "THU"; [DayOfWeek]::Friday = "FRI";
                 [DayOfWeek]::Saturday = "SAT" }[$weeklyLocal.DayOfWeek]
 $weeklyCmd = Join-Path $scriptsDir "task_demo_weekly_check.cmd"
-Set-Content -Path $weeklyCmd -Encoding ASCII -Value @(
+$weeklyLines = [string[]]@(
     "@echo off",
     "cd /d `"$repoRoot`"",
     "set PYTHONUTF8=1",
     "if not exist `"$runnerLogs`" mkdir `"$runnerLogs`"",
     "`"$python`" `"$scriptsDir\demo_check.py`" --summary --data-dir `"$dataDir`" --log-dir `"$runnerLogs`" --reports-dir `"$reportsDir`" > `"$runnerLogs\weekly-check.md`" 2>&1"
 )
+[System.IO.File]::WriteAllLines($weeklyCmd, $weeklyLines, $wrapperEncoding)
 schtasks /Create /F /TN "MT5Quant\demo_weekly_check" /SC WEEKLY /D $weeklyDow `
     /ST $weeklyLocal.ToString("HH:mm") /TR "`"$weeklyCmd`""
 if ($LASTEXITCODE -ne 0) {
@@ -250,8 +272,9 @@ Write-Host ("已创建 MT5Quant\demo_weekly_check（每周本地 {0} {1:HH:mm} =
 Write-Host ""
 Write-Host "完成。删除命令见本文件头部注释（五条 schtasks /Delete；watch_swap 残留清理另见头部）。"
 
-# T213：任务参数随部署形态写进部署记录（F-8）。这一行是给部署记录抄用的：
-# 里面只有路径和任务名，没有 SHA 和时刻，不影响正式检查对部署记录的机械解析。
+# T213：任务参数随部署形态写进部署记录（F-8）。这一行是给部署记录抄用的。里面是
+# 本机的绝对路径、任务名和两个时刻字段（daily_report.local_time、weekly_check.utc）。
+# 抄进入库的部署记录之前，路径要换成占位符。
 $taskParameters = [ordered]@{
     mode            = $Mode
     python          = $python
