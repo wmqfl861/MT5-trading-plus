@@ -41,17 +41,20 @@ JSON；表格格式每个日一行。一个 UTC 日要等它结束之后、终�
 - 零点前开始、进了交易日不足 900 秒就恢复的尾巴不判失败，记
   tails_into_trading_day；这时窗口是否失败取决于进程被拉起的时刻。
 日历用 --calendar（正式检查的日历 JSON，或日历源文件）；不给时周一至周五算
-交易日。日历没覆盖到的日子也按周一至周五算（把节假日当交易日，偏严），并把
-缺的日期列在 calendar_missing_days 里。
+交易日，输出里 calendar 记为 weekday，baseline_day 一律为假。给了日历而日历没覆盖
+到的日子也按周一至周五算（把节假日当交易日，偏严），并把会影响到这一天判定的
+日期（当天和前后各一天）列在 calendar_missing_days 里；这样的日子同样不计入。
 
 终端在不在：终端在线时大约每 6 小时写一条扫描行。当天相邻两条日志行相隔达到
 --absent-gap-s（默认 7 小时），或者"终端不在"的段落落在当天的部分达到这个数，
 就记 terminal_absent。
 
-baseline_day 为真（这一天计入基线）要同时满足：是交易日；日志覆盖了全天；
-终端全程在；没有让窗口失败的中断；没有到数据末尾仍未恢复的中断；
-near_breach_segments 和 tails_into_trading_day 都是 0。后两条取偏严的口径：
-这些情形窗口可能失败，脚本不下结论，这一天不计入，要人逐条看。
+baseline_day 为真（这一天计入基线）要同时满足：给了日历且日历覆盖这一天、这一天是
+交易日；日志在当天开始之前和结束之后都接得上（没被截断）；终端全程在；没有让窗口
+失败的中断；没有到数据末尾仍未恢复的中断；near_breach_segments 和
+tails_into_trading_day 都是 0；当天的日志里至多一个账号。后几条取偏严的口径：这些
+情形窗口可能失败、中断可能被交叉配对，脚本不下结论，这一天不计入，要人逐条看。
+不给 --calendar 的日子一律不计入。
 
 退出码：0 出了统计；3 有日子出不了统计（该日 stdout 一行 JSON，error 说明是
 哪一种：no_terminal_log、log_unreadable、log_dir_unreadable）；2 参数错误。
@@ -243,8 +246,9 @@ def read_logs(log_dir, start: datetime, end: datetime, utc_offset_hours: float) 
         try:
             text = _decode(path.read_bytes())
         except (OSError, UnicodeError):
+            # 这个文件的行读不到。读得到的前后两行照样接成一段空档：这一段里确实
+            # 读不到任何日志行，紧随其后的那一天不能因此被当成"终端在"。
             reading.unreadable.append(file_day.isoformat())
-            previous = None                          # 这个文件的行不知道，不做跨文件的间隔判断
             continue
         base = local_midnight - timedelta(hours=utc_offset_hours)   # 本地零点对应的 UTC 时刻
         accounts = parse_accounts(text)
@@ -412,7 +416,8 @@ def summarize(day: date, reading: Reading, dns: "int | None" = None,
             return moment.weekday() < 5
         key = moment.date().isoformat()
         if key not in calendar:                  # 日历没覆盖这一天：按工作日算（偏严），记下来
-            calendar_missing.add(key)
+            if abs((moment.date() - day).days) <= 1:      # 只记会影响到这一天判定的前后三天
+                calendar_missing.add(key)
             return moment.weekday() < 5
         return calendar[key]
 
@@ -486,13 +491,16 @@ def summarize(day: date, reading: Reading, dns: "int | None" = None,
     unresolved = [row for row in rows if row["end"] is None]
     # 只在有数据的部分里找空档：数据到头了不算终端不在
     gaps = list(reading.gaps)
-    if first_line is not None and start < first_line < min(end, limit):
-        gaps.append((start, first_line))           # 读到的数据从当天中途才开始
+    if first_line is not None and first_line > start:
+        gaps.append((start, first_line))           # 读到的数据从当天开始之后才有：前面没有行
     silent = longest_silent_gap(start, min(end, limit), gaps) if limit > start else None
     down_inside = [inside_span(part[0], part[1]) for row in rows for part in row["parts"]
                    if part[2] == "terminal_down"]
-    absent = None if missing else ((silent or 0.0) >= absent_gap_s
-                                   or max(down_inside, default=0.0) >= absent_gap_s)
+    if missing or data_end is None:
+        absent = None                              # 日志不全，或者读不到任何一行：判断不了
+    else:
+        absent = ((silent or 0.0) >= absent_gap_s
+                  or max(down_inside, default=0.0) >= absent_gap_s)
     complete = bool(not missing and data_end is not None and data_end >= end
                     and (first_line is None or first_line <= start))
     down = sum(1 for row in rows if row["kind"] == "terminal_down")
@@ -536,9 +544,11 @@ def summarize(day: date, reading: Reading, dns: "int | None" = None,
         "dns_timeouts": dns,
         "accounts_seen": len(accounts),              # 这一天的日志里出现过的账号个数
         "unreadable_log_days": sorted(reading.unreadable),
-        # 偏严：临界段和跨零点的尾巴都可能是窗口失败，这样的日子不计入，要人逐条看
-        "baseline_day": bool(is_trading(start) and complete and absent is False and breach is None
-                             and not unresolved and near == 0 and tails == 0),
+        # 偏严：临界段和跨零点的尾巴都可能是窗口失败；日历没覆盖到、或者日志里出现多个
+        # 账号（中断可能被交叉配对），也都不下结论。这样的日子不计入，要人逐条看。
+        "baseline_day": bool(calendar is not None and calendar.get(day.isoformat()) is True
+                             and not calendar_missing and len(accounts) <= 1 and complete and absent is False
+                             and breach is None and not unresolved and near == 0 and tails == 0),
     }
 
 
@@ -563,12 +573,20 @@ def markdown_row(summary: dict) -> str:
     if summary["calendar_missing_days"]:
         trading += f"（日历缺 {len(summary['calendar_missing_days'])} 天）"
     dns = "未查" if summary["dns_timeouts"] is None else str(summary["dns_timeouts"])
+    verdict = "计入"
+    if not summary["baseline_day"]:
+        verdict = "**不计入**"
+        for shown, why in ((summary["calendar"] == "weekday", "没有日历"),
+                           (bool(summary["calendar_missing_days"]), "日历没覆盖到"),
+                           (summary["accounts_seen"] > 1, "日志里有多个账号")):
+            if shown:
+                verdict += f"（{why}）"
+                break
     return (f"| {summary['date_utc']} | {trading} | "
             f"{summary['disconnect_segments']}（{summary['terminal_down_segments']}） | "
             f"{summary['unresolved_at_day_end']} | {longest} | "
             f"{'**失败**' if summary['would_fail_window'] else '不失败'} | {edges} | "
-            f"{presence} | {ping} | {summary['ap_switches']} | {summary['scans']} | {dns} | "
-            f"{'计入' if summary['baseline_day'] else '**不计入**'} |")
+            f"{presence} | {ping} | {summary['ap_switches']} | {summary['scans']} | {dns} | {verdict} |")
 
 
 def _parse_day(text: str) -> date:
@@ -624,6 +642,9 @@ def main(argv=None) -> int:
             print(json.dumps({"date_utc": day.isoformat(), "error": error}), flush=True)
         return 3
 
+    if args.format == "table":                    # 表头先出：全是出错行的表也有表头
+        print(TABLE_HEAD)
+        print("| --- " * 13 + "|")
     if not log_dir.is_dir():
         return emit_error(first, "log_dir_unreadable")
     begin = datetime(first.year, first.month, first.day) - timedelta(days=args.lookback_days)
@@ -635,7 +656,7 @@ def main(argv=None) -> int:
         finish = min(max(finish, through), finish + timedelta(days=FORWARD_DAYS))
     reading = read_logs(log_dir, begin, finish, offset)
     system_root = os.environ.get("SystemRoot")
-    status, header = 0, args.format == "table"
+    status = 0
     for day in days:
         begin_day = datetime(day.year, day.month, day.day)
         own_days = [file_day.isoformat() for file_day, _, _ in
@@ -650,10 +671,6 @@ def main(argv=None) -> int:
         summary = summarize(day, reading, dns, calendar, absent_gap_s=args.absent_gap_s,
                             missing_log_days=[own for own in own_days if own not in reading.found],
                             own_days=own_days)
-        if header:
-            print(TABLE_HEAD)
-            print("| --- " * 13 + "|")
-            header = False
         print(markdown_row(summary) if args.format == "table" else json.dumps(summary, ensure_ascii=True), flush=True)
     return status
 

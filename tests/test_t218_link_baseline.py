@@ -92,6 +92,23 @@ def run_main(mod, capsys, logs, *options):
     return code, capsys.readouterr().out
 
 
+def weekdays(first=date(2026, 11, 1), days=45):
+    """A calendar that knows nothing but weekdays, for the days a test needs to count."""
+    return {(first + timedelta(days=step)).isoformat(): (first + timedelta(days=step)).weekday() < 5
+            for step in range(days)}
+
+
+CAL = weekdays()
+
+
+def calendar_file(tmp_path, calendar=None) -> str:
+    path = tmp_path / "calendar.json"
+    path.write_text(json.dumps({"schema_version": 1, "timezone": "UTC", "market": "XAUUSD",
+                                "days": [{"date": name, "trading": trading, "reason": "weekday" if trading else "holiday"}
+                                         for name, trading in sorted((calendar or CAL).items())]}), encoding="utf-8")
+    return f"--calendar={path}"
+
+
 def test_parse_events_keeps_the_network_events_that_matter(mod):
     text = "".join([
         "QQ\t0\t01:02:03.004\tTrades\tdeal #12 buy 0.01 XAUUSD\n",     # not network
@@ -294,16 +311,16 @@ def test_outages_near_the_line_are_counted_apart_and_keep_the_day_out_of_the_bas
     finer = [(at("11-24 10:00"), "lost", None), (at("11-24 10:00") + timedelta(seconds=899.96), "authorized", 300.0)]
     almost = summary_for(mod, DAY, finer)
     assert (almost["longest_s"], almost["would_fail_window"]) == (899.9, False)      # not rounded up to the line
-    comfortable = summary_for(mod, DAY, outage("11-24 10:00", "11-24 10:10:00"))
+    comfortable = summary_for(mod, DAY, outage("11-24 10:00", "11-24 10:10:00"), calendar=CAL)
     assert (comfortable["near_breach_segments"], comfortable["tails_into_trading_day"], comfortable["baseline_day"]) == (0, 0, True)
     # started before midnight, back 5 minutes into the trading day: reported, not called a failure, not in the baseline
-    tail = summary_for(mod, date(2026, 11, 30), outage("11-29 23:40", "11-30 00:05"))
+    tail = summary_for(mod, date(2026, 11, 30), outage("11-29 23:40", "11-30 00:05"), calendar=CAL)
     assert (tail["would_fail_window"], tail["tails_into_trading_day"], tail["continuing_from_previous_day"]) == (False, 1, 1)
     assert (tail["longest_s"], tail["longest_trading_s"], tail["baseline_day"]) == (300.0, 300.0, False)
     # the near miss belongs to the day the exit would have landed on, not to the day the outage began
-    evening = summary_for(mod, date(2026, 11, 23), outage("11-23 23:52", "11-24 00:06:30"))
+    evening = summary_for(mod, date(2026, 11, 23), outage("11-23 23:52", "11-24 00:06:30"), calendar=CAL)
     assert (evening["near_breach_segments"], evening["tails_into_trading_day"], evening["baseline_day"]) == (0, 0, True)
-    next_day = summary_for(mod, DAY, outage("11-23 23:52", "11-24 00:06:30"))
+    next_day = summary_for(mod, DAY, outage("11-23 23:52", "11-24 00:06:30"), calendar=CAL)
     assert (next_day["near_breach_segments"], next_day["tails_into_trading_day"]) == (1, 0)    # would have exited at 00:07 on Tuesday
     assert next_day["baseline_day"] is False
 
@@ -319,10 +336,13 @@ def test_exit_code_separates_no_log_unreadable_and_a_quiet_day(mod, tmp_path, ca
     write_log(logs, date(2026, 11, 23), scan("21:00:00.000"))                     # a line before the day began
     write_log(logs, date(2026, 11, 24), scan("09:00:00.000") + scan("15:00:00.000") + scan("21:00:00.000"))
     write_log(logs, date(2026, 11, 25), scan("03:00:00.000") + scan("09:00:00.000"))
-    code, out = run_main(mod, capsys, logs, "--date", "2026-11-24")
+    code, out = run_main(mod, capsys, logs, "--date", "2026-11-24", calendar_file(tmp_path))
     summary = json.loads(out)
     assert code == 0 and (summary["disconnect_segments"], summary["scans"]) == (0, 4)
     assert (summary["terminal_absent"], summary["data_complete"], summary["baseline_day"]) == (False, True, True)
+    # the same healthy day without a calendar: not counted, and the table says why
+    code, out = run_main(mod, capsys, logs, "--date", "2026-11-24", "--format", "table")
+    assert code == 0 and out.rstrip().endswith("| **不计入**（没有日历） |"), out
     # a file that cannot be read: said so, without the path or the operating system's text
     real = Path.read_bytes
     def denied(self):
@@ -385,7 +405,7 @@ def test_a_busy_journal_does_not_look_like_an_absent_terminal(mod, tmp_path, cap
     result = mod.read_logs(logs, datetime(2026, 11, 24), datetime(2026, 11, 25), 8.0)
     # a line every minute from 08:00 to 07:59: no gap of five minutes anywhere inside the day
     assert mod.longest_silent_gap(datetime(2026, 11, 24), datetime(2026, 11, 25), result.gaps) is None
-    summary = json.loads(run_main(mod, capsys, logs, "--date", "2026-11-24")[1])
+    summary = json.loads(run_main(mod, capsys, logs, "--date", "2026-11-24", calendar_file(tmp_path))[1])
     assert (summary["terminal_absent"], summary["max_silent_gap_s"], summary["baseline_day"]) == (False, None, True)
     assert "在（日志行相隔不到 5 分钟）" in mod.markdown_row(summary)
     # eight solid hours of lines every minute, quiet around them: still present
@@ -394,7 +414,7 @@ def test_a_busy_journal_does_not_look_like_an_absent_terminal(mod, tmp_path, cap
         note((datetime(2026, 11, 24, 8) + timedelta(minutes=step)).strftime("%H:%M:%S.000")) for step in range(8 * 60))
         + note("21:00:00.000"))
     write_log(logs, date(2026, 11, 25), note("01:00:00.000") + note("07:30:00.000") + note("08:30:00.000"))
-    summary = json.loads(run_main(mod, capsys, logs, "--date", "2026-11-24")[1])
+    summary = json.loads(run_main(mod, capsys, logs, "--date", "2026-11-24", calendar_file(tmp_path))[1])
     assert (summary["terminal_absent"], summary["baseline_day"], summary["max_silent_gap_s"]) == (False, True, 6.5 * 3600.0)
 
 
@@ -468,7 +488,7 @@ def test_cli_output_carries_counts_only(mod, tmp_path, capsys):
         for format_ in ("json", "table"):
             code, out = run_main(mod, capsys, logs, "--date", "2026-11-24", "--format", format_)
             assert code == 0 and all(secret not in out for secret in secrets), (secrets, format_)
-    code, out = run_main(mod, capsys, logs, "--date", "2026-11-24")
+    code, out = run_main(mod, capsys, logs, "--date", "2026-11-24", calendar_file(tmp_path))
     summary = json.loads(out)
     assert (summary["disconnect_segments"], summary["longest_s"]) == (1, 540.0)
     assert (summary["dns_timeouts"], summary["ping_min_ms"], summary["baseline_day"]) == (None, 321.4, True)
@@ -559,7 +579,7 @@ def test_markdown_row_shows_open_outages_presence_and_the_verdict(mod):
     evts = events(("11-24 00:59", "lost"), ("11-24 01:03", "authorized", 350.0), ("11-24 10:00", "lost"),
                   ("11-24 10:02:30", "authorized", 400.0), ("11-24 12:00", "ap_switch"), ("11-24 12:30", "scan"),
                   ("11-24 23:58", "lost"), ("11-25 00:04", "authorized", 320.0), ("11-25 01:00", "scan"))
-    summary = summary_for(mod, DAY, evts, dns=7)
+    summary = summary_for(mod, DAY, evts, dns=7, calendar=CAL)
     assert (summary["disconnect_segments"], summary["continuing_from_previous_day"], summary["unresolved_at_day_end"]) == (3, 0, 1)
     assert (summary["longest_s"], summary["total_s"], summary["authorizations"], summary["ping_min_ms"]) == (360.0, 750.0, 2, 350.0)
     assert (summary["longest_trading_s"], summary["baseline_day"], summary["open_segments"]) == (360.0, True, [])
@@ -579,3 +599,95 @@ def test_markdown_row_shows_open_outages_presence_and_the_verdict(mod):
     assert "| 不失败 | 1/2 |" in mod.markdown_row(edges)
     quiet = dict(summary, gaps=None, max_silent_gap_s=12600.0)
     assert "在（最长空档 3.5 小时）" in mod.markdown_row(quiet)
+
+
+# ------------------------------------------------- 第二次复核（M-1、M-3 等）
+
+def six_hourly(day):
+    """Four journal lines a day: the terminal was there."""
+    return "".join(note(f"{clock}:00.000") for clock in ("02:30", "08:30", "14:30", "20:30"))
+
+
+def test_an_unreadable_file_does_not_hide_the_silence_that_follows_it(mod, tmp_path, capsys, monkeypatch):
+    """Local 11-25 cannot be read and 11-26 has no line until 20:00: the first half of UTC 11-26 has no line anywhere."""
+    logs = tmp_path / "logs"
+    write_log(logs, date(2026, 11, 23), note("21:00:00.000"))
+    write_log(logs, date(2026, 11, 24), six_hourly(date(2026, 11, 24)))
+    write_log(logs, date(2026, 11, 25), six_hourly(date(2026, 11, 25)))
+    write_log(logs, date(2026, 11, 26), note("20:00:00.000") + note("23:00:00.000"))
+    write_log(logs, date(2026, 11, 27), note("08:30:00.000"))
+    real = Path.read_bytes
+    def denied(self):
+        if self.name == "20261125.log":
+            raise PermissionError(13, "Permission denied")
+        return real(self)
+    monkeypatch.setattr(Path, "read_bytes", denied)
+    calendar = calendar_file(tmp_path)
+    code, out = run_main(mod, capsys, logs, "--from", "2026-11-24", "--to", "2026-11-26", calendar)
+    rows = [json.loads(text) for text in out.splitlines()]
+    assert code == 3 and [row.get("error") for row in rows] == ["log_unreadable", "log_unreadable", None]
+    after = rows[2]                                       # 11-26: readable files of its own, but silent until 12:00 UTC
+    assert (after["terminal_absent"], after["data_complete"], after["baseline_day"]) == (True, True, False)
+    assert after["max_silent_gap_s"] == 43200.0           # 23:00 local on the 24th → 20:00 local on the 26th, cut at the day
+    # the same files with the 25th readable: its last line (20:30 local) is where the silence starts
+    monkeypatch.undo()
+    after = json.loads(run_main(mod, capsys, logs, "--date", "2026-11-26", calendar)[1])
+    assert (after["terminal_absent"], after["max_silent_gap_s"]) == (True, 43200.0)     # silence from 20:30 local on the 25th, cut at the day
+
+
+def test_a_day_with_no_line_at_all_is_absent_or_unknown_never_present(mod, tmp_path, capsys):
+    logs = tmp_path / "blank"
+    write_log(logs, date(2026, 11, 24), "")
+    write_log(logs, date(2026, 11, 25), "")
+    summary = json.loads(run_main(mod, capsys, logs, "--date", "2026-11-24")[1])
+    assert (summary["terminal_absent"], summary["data_complete"], summary["baseline_day"]) == (None, False, False)
+    write_log(logs, date(2026, 11, 26), note("01:00:00.000"))           # the first line of all comes the day after
+    summary = json.loads(run_main(mod, capsys, logs, "--date", "2026-11-24")[1])
+    assert (summary["terminal_absent"], summary["data_complete"], summary["max_silent_gap_s"]) == (True, False, 86400.0)
+
+
+def test_a_day_counts_only_with_a_calendar_that_covers_it_and_one_account(mod, tmp_path, capsys):
+    logs = tmp_path / "logs"
+    write_log(logs, date(2026, 11, 23), six_hourly(date(2026, 11, 23)))
+    write_log(logs, date(2026, 11, 24), six_hourly(date(2026, 11, 24)))
+    write_log(logs, date(2026, 11, 25), six_hourly(date(2026, 11, 25)))
+    healthy = json.loads(run_main(mod, capsys, logs, "--date", "2026-11-24", calendar_file(tmp_path))[1])
+    assert (healthy["trading_day"], healthy["baseline_day"], healthy["calendar_missing_days"]) == (True, True, [])
+    holiday = dict(CAL, **{"2026-11-24": False})
+    off = json.loads(run_main(mod, capsys, logs, "--date", "2026-11-24", calendar_file(tmp_path, holiday))[1])
+    assert (off["trading_day"], off["baseline_day"]) == (False, False)       # a day the market is closed is no baseline day
+    # the calendar that does not reach the day: weekdays are assumed, the gap is named, the day does not count
+    blind = json.loads(run_main(mod, capsys, logs, "--date", "2026-11-24", calendar_file(tmp_path, {"2026-11-23": True}))[1])
+    assert (blind["trading_day"], blind["calendar_missing_days"], blind["baseline_day"]) == (True, ["2026-11-24"], False)
+    out = run_main(mod, capsys, logs, "--date", "2026-11-24", calendar_file(tmp_path, {"2026-11-23": True}), "--format", "table")[1]
+    assert "| 是（日历缺 1 天） |" in out and out.rstrip().endswith("| **不计入**（日历没覆盖到） |")
+    # two accounts in the day's journal: outages may have been paired across accounts
+    write_log(logs, date(2026, 11, 24), six_hourly(date(2026, 11, 24)) + scan("09:00:00.000")
+              + line("10:00:00.000", "authorized on x (ping: 1 ms)", account=OTHER))
+    many = json.loads(run_main(mod, capsys, logs, "--date", "2026-11-24", calendar_file(tmp_path))[1])
+    assert (many["accounts_seen"], many["baseline_day"]) == (2, False)
+    out = run_main(mod, capsys, logs, "--date", "2026-11-24", calendar_file(tmp_path), "--format", "table")[1]
+    assert out.rstrip().endswith("| **不计入**（日志里有多个账号） |")
+
+
+def test_calendar_gaps_are_listed_only_where_they_can_affect_the_day(mod):
+    summary = summary_for(mod, DAY, outage("11-20 10:00", "11-24 12:00"), calendar={"2026-11-24": True})
+    assert (summary["would_fail_window"], summary["calendar_missing_days"]) == (True, ["2026-11-23"])
+
+
+def test_an_error_only_table_still_has_its_header(mod, tmp_path, capsys):
+    code, out = run_main(mod, capsys, tmp_path / "nowhere", "--date", "2026-11-24", "--format", "table")
+    lines = out.splitlines()
+    assert code == 3 and lines[0] == mod.TABLE_HEAD and len(lines) == 3
+    assert lines[2].startswith("| 2026-11-24 | — | log_dir_unreadable |")
+
+
+def test_the_last_baseline_day_needs_the_next_local_date_file(mod, tmp_path, capsys):
+    logs = tmp_path / "logs"
+    for day in (date(2026, 11, 23), date(2026, 12, 1), date(2026, 12, 2)):
+        write_log(logs, day, six_hourly(day))
+    summary = json.loads(run_main(mod, capsys, logs, "--date", "2026-12-02", calendar_file(tmp_path))[1])
+    assert (summary["missing_log_days"], summary["terminal_absent"], summary["baseline_day"]) == (["2026-12-03"], None, False)
+    write_log(logs, date(2026, 12, 3), six_hourly(date(2026, 12, 3)))      # the second half of UTC 12-02 lives in this file
+    summary = json.loads(run_main(mod, capsys, logs, "--date", "2026-12-02", calendar_file(tmp_path))[1])
+    assert (summary["missing_log_days"], summary["terminal_absent"], summary["baseline_day"]) == ([], False, True)
