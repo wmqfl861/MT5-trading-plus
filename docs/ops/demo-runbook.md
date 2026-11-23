@@ -116,6 +116,37 @@ type data\logs\task_live_daily_report.log      # 任务输出（排查用）
   `demo_check --summary` 全周汇总，落 `data\demo\weekly-check.md`（覆盖写）；
   平时手动：`.venv/Scripts/python.exe scripts/demo_check.py --summary`。
 
+### 2a. 链路基线（T218，第二十三轮；只读）
+
+```powershell
+# 一个 UTC 日（不给 --date：取 UTC 的前一天，不是本地日历的前一天）
+.venv/Scripts/python.exe scripts/ops/link_baseline.py --terminal-log-dir <终端数据目录>\logs --date 2026-11-24 --format table
+# 连续几天（一次最多 63 天）；表格只有计数和秒数，可以直接抄进 phase-f-log
+.venv/Scripts/python.exe scripts/ops/link_baseline.py --terminal-log-dir <终端数据目录>\logs --from 2026-11-24 --to 2026-11-28 --format table
+```
+
+- 只读终端日志文件和系统日志（DNS-Client 1014），不 import MetaTrader5、不连接
+  终端。输出不含账号、服务器名、接入点、IP、本机路径。
+- 读的是交易终端数据目录下的 `logs`。终端日志会被终端清理（保留多少天没有
+  核实），记基线期间每天把当天的日志复制到 `data\ops-evidence\` 下留存（不入库），
+  事后统计用副本。
+- 一个 UTC 日**计入基线**（`baseline_day`）要同时满足：是交易日（不给
+  `--calendar` 时按周一至周五，节假日不排除）；日志覆盖到当天结束；终端全程在
+  （相邻两条日志行相隔不到 7 小时——终端在线时约每 6 小时写一条扫描行）；
+  没有让窗口失败的中断；没有到数据末尾仍未恢复的中断。连续 5 个交易日都计入
+  才起算（D116）；任何一天 `would_fail_window` 为真就不起算。
+- 窗口判据与 `demo_check.py` 一致、不放宽：中断开始后第 900 秒还没恢复、那一刻
+  是交易日，记失败；中断跨进后面的交易日，落在交易日里满 900 秒按失败计。
+  `near_breach_segments`（离 900 秒不到一分钟就恢复）和 `tails_into_trading_day`
+  （零点前开始、进了交易日不足 900 秒就恢复）只计数、不判失败，起算前逐条看。
+- 退出码：0 出了统计；3 有日子出不了统计（`no_terminal_log`、`log_unreadable`、
+  `log_dir_unreadable`，stdout 一行 JSON）；2 参数错误。退出码 3 的日子一律按
+  不计入处理，不要当成"没有断线"。
+- 退出码 3、`terminal_absent` 为 null（当天的日志缺了一个本地日期）、`dns_timeouts`
+  为 null（系统日志不覆盖那一天）都是"不知道"，不是"没问题"。
+- 已知限制：进程的计时起点和终端日志的 lost 时刻相差约一分钟；终端日志的时钟
+  按固定偏移换算（`--log-utc-offset-hours`，默认 8），换主机或换时区后要改。
+
 ## 3. 常见问题（恢复原则：只移除停机信号；仅重启已确认退出的进程）
 
 **killSwitch 一键停机后恢复**（演练项，预期会触发一次）：
