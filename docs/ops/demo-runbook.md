@@ -20,7 +20,7 @@
 ```powershell
 # 一次性：在维护窗口显式指定模式安装每日/每周计划任务。
 # 部署树与运行目录分离时，解释器和各目录要用参数显式给出（T213，见 §6.3.1）；
-# 任务命令要用的文件不在，或路径含系统 ANSI 代码页表示不了的字符时，脚本拒绝安装。
+# 任务命令要用的文件不在，或路径里有包装器写不了的字符时，脚本拒绝安装（见 §6.3.1）。
 powershell -ExecutionPolicy Bypass -File scripts\setup_scheduled_tasks.ps1 -Mode Demo
 
 # 影子盘延长观察（PaperSoak；示例配置 demo-configs\MA-XAUUSD-M15.toml）
@@ -632,8 +632,16 @@ powershell -ExecutionPolicy Bypass -File "$deploy\scripts\setup_scheduled_tasks.
 `-GatewayConfig`）。缺哪一项就拒绝安装并说明缺什么，**不建目录、不写包装器、不建任务**。
 不带 `-IncludeDataTasks`（D82）。
 
-两份包装器（`.cmd`）按系统 ANSI 代码页写；任何路径里有这个代码页表示不了的字符时，同样在
-建目录之前拒绝安装并说明是哪个路径。生产根目录的名字建议只用 ASCII 字符。
+两份包装器（`.cmd`）由 cmd.exe 按控制台代码页读取，新开控制台的缺省值是系统 OEM 代码页。
+安装脚本在建目录之前读出系统的 ANSI 和 OEM 两个代码页，分两种情形，都在建目录、建任务之前
+判断：
+
+- 两个代码页相同：包装器按这个代码页写；任何路径里有它表示不了的字符，就拒绝安装并说明是
+  哪个路径。
+- 两个代码页不同：这台机器上带非 ASCII 字符的路径装出来的任务跑不起来，脚本不去猜哪种编码
+  对 cmd 有效——路径里只要有一个非 ASCII 字符就拒绝安装；纯 ASCII 路径照常安装。
+
+生产根目录的名字建议只用 ASCII 字符。
 
 安装脚本最后打印一行 `TASK_PARAMETERS {…}`，抄进部署记录（§4 部署核对单第③条；抄之前路径
 要换成占位符）。

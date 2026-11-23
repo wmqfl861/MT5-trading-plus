@@ -74,7 +74,8 @@
 # T213（2026-11-23）：部署树是纯检出，没有 .venv，也不放运行数据。解释器、
 # 网关配置、数据、运行器日志、任务日志、日报、点差模型、会话配置都可以用参数
 # 显式给出；不给的沿用仓库根下的旧位置。解释器、会话配置、点差模型、Demo 模式的
-# 网关配置不存在，或者路径里有系统 ANSI 代码页表示不了的字符，就拒绝安装
+# 网关配置不存在，或者路径写不进能跑起来的 .cmd 包装器（含系统 ANSI 代码页表示
+# 不了的字符；或者两个系统代码页不同而路径里有非 ASCII 字符），就拒绝安装
 #（不建目录、不写包装器、不建任务）——11-17 起日报和周检任务因为命令指向部署树里
 # 不存在的 .venv，每次都以 rc=1 失败，Python 根本没有启动。安装结束打印一行
 # TASK_PARAMETERS {…}，任务参数随部署形态写进部署记录。
@@ -146,10 +147,32 @@ if ($missing.Count -gt 0) {
     throw ("任务命令引用的文件不存在，拒绝安装：" + ($missing -join "；"))
 }
 
-# 评审 R7（2026-11-23）：.cmd 包装器按系统 ANSI 代码页写，不再按 ASCII——按 ASCII
-# 写时，中文等字符全变成 "?"，任务装得上却跑不起来。任何路径在这个代码页里表示不了
-#（往返编码后不相等），同样在产生副作用之前拒绝。
-$acp = [int](Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage' -Name ACP).ACP
+# 评审 R7（2026-11-23）：.cmd 包装器由 cmd.exe 按控制台代码页读取，新开控制台的缺省值
+# 是系统 OEM 代码页。原先按 ASCII 写，中文等字符全变成 "?"，任务装得上却跑不起来。
+# 现在分两种情形，都在产生副作用之前判断：
+#   - ANSI 和 OEM 两个代码页相同：包装器按这个代码页写；任何路径里有它表示不了的
+#     字符（往返编码后不相等）就拒绝安装。
+#   - 两个代码页不同：不去猜哪种编码对 cmd 有效，路径里只要有一个非 ASCII 字符就
+#     拒绝安装；纯 ASCII 路径照常。
+# 两个代码页做成可以替身的命令：调用方事先定义同名函数，脚本就用它（和 schtasks 的
+# 替身同一个方式）；没有定义才用这里的真实实现。
+if (-not (Get-Command Get-SystemCodePages -ErrorAction SilentlyContinue)) {
+    function Get-SystemCodePages {
+        if (-not ("MT5Quant.SetupCodePages" -as [type])) {
+            Add-Type -Namespace MT5Quant -Name SetupCodePages -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern uint GetACP();
+[DllImport("kernel32.dll")] public static extern uint GetOEMCP();
+'@
+        }
+        return [pscustomobject]@{
+            ACP   = [int][MT5Quant.SetupCodePages]::GetACP()
+            OEMCP = [int][MT5Quant.SetupCodePages]::GetOEMCP()
+        }
+    }
+}
+$codePages = Get-SystemCodePages
+$acp = [int]$codePages.ACP
+$oemcp = [int]$codePages.OEMCP
 if ($acp -eq 65001) {
     # UTF-8 不带 BOM：BOM 会被 cmd 当成第一条命令的一部分
     $wrapperEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -158,6 +181,9 @@ if ($acp -eq 65001) {
 }
 foreach ($location in @($python, $repoRoot, $dataDir, $logsDir, $runnerLogs, $reportsDir, $spreadPath, $sessionsPath, $cfgPath)) {
     if ($null -eq $location) { continue }
+    if ($acp -ne $oemcp -and $location -match '[^\x00-\x7F]') {
+        throw ("这台机器的控制台代码页（OEM $oemcp）和系统 ANSI 代码页（$acp）不同，带非 ASCII 字符的路径装出来的任务跑不起来，拒绝安装：$location。请把项目放在纯 ASCII 路径下。")
+    }
     if ($wrapperEncoding.GetString($wrapperEncoding.GetBytes($location)) -cne $location) {
         throw ("路径含系统 ANSI 代码页（$acp）表示不了的字符，写出的 .cmd 包装器跑不起来，拒绝安装：$location。请改用这个代码页能表示的路径（建议只用 ASCII 字符）。")
     }

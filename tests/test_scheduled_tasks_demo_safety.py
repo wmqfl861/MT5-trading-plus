@@ -34,13 +34,14 @@ def entries(root):
 def install_in_sandbox(tmp_path, mode=None, *, paper=False, config_name="gateway.json",
                        with_config=True, include_data=False, with_ticks=False,
                        with_python=True, with_sessions=True, with_spread=True,
-                       paths=None, code_page=None, before=None):
+                       paths=None, code_pages=None, before=None):
     """paths（T213）：显式参数 {参数名: 路径}，逐个变成 -参数名 '路径'。
 
     with_spread：在点差模型的位置（显式路径或缺省的 data\\costs 下）放一个空文件占位
     ——评审 R6 起安装脚本先核对这个文件。
-    code_page：把安装脚本读到的"系统 ANSI 代码页"固定成这个值（驱动脚本里的
-    Get-ItemProperty 替身），用来在本机代码页之外核对 R7 的两个分支。
+    code_pages：把安装脚本读到的两个系统代码页固定成 (ANSI, OEM)。驱动脚本里事先定义
+    一个同名的 Get-SystemCodePages 函数，安装脚本就用它——和 schtasks 的替身是同一个
+    方式，不改系统设置。
     before（字典）：运行安装脚本之前把沙箱里已有的条目记到 before["entries"]。
     """
     scripts = tmp_path / "scripts"
@@ -77,8 +78,8 @@ def install_in_sandbox(tmp_path, mode=None, *, paper=False, config_name="gateway
         flags += f" -{name} '{value}'"
     driver.write_text(
         "function global:schtasks { ($args -join '|') | Add-Content -LiteralPath $env:TASK_CALLS; $global:LASTEXITCODE = 0 }\n"
-        + (f"function global:Get-ItemProperty {{ [pscustomobject]@{{ ACP = '{code_page}' }} }}\n"
-           if code_page else "")
+        + (f"function global:Get-SystemCodePages {{ [pscustomobject]@{{ ACP = {code_pages[0]}; OEMCP = {code_pages[1]} }} }}\n"
+           if code_pages else "")
         + "$env:TASK_CALLS = Join-Path $PSScriptRoot 'task-calls.txt'\n"
         "& $PSScriptRoot/scripts/setup_scheduled_tasks.ps1" + flags + "\n",
         encoding="utf-8-sig")
@@ -391,11 +392,12 @@ def test_install_refuses_when_the_spread_model_is_missing(tmp_path):
     assert not (tmp_path / "task-calls.txt").exists()
 
 
-WESTERN_ACP = "1252"       # 单字节代码页：表示得了 é，表示不了汉字
+WESTERN = (1252, 1252)      # ANSI 和控制台两个代码页相同（都是西欧的 1252）：表示得了 é，表示不了汉字
+SPLIT = (1252, 437)         # ANSI 是 1252、控制台是 437：多数西欧系统的样子
 
 
 def system_code_pages():
-    """系统的 ANSI 与 OEM 代码页（读注册表；与安装脚本的读法互不依赖）。"""
+    """系统的 ANSI 与 OEM 代码页（读注册表）。安装脚本用的是 GetACP / GetOEMCP，两边互不依赖。"""
     import winreg
 
     with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
@@ -419,15 +421,21 @@ def non_ascii_char(encoding):
 @pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
 def test_wrappers_keep_non_ascii_paths_in_the_system_ansi_code_page(tmp_path):
     """评审 R7：包装器按系统 ANSI 代码页写。按 ASCII 写时中文等字符变成 "?"，
-    任务装得上、跑不起来，安装脚本却报告成功。"""
-    acp, _ = system_code_pages()
+    任务装得上、跑不起来，安装脚本却报告成功。两个代码页不同的机器上这种路径会被
+    拒绝（见 test_non_ascii_paths_are_refused_where_console_and_ansi_code_pages_differ），
+    所以这里按本机真实的两个代码页分两种情形核对。"""
+    acp, oemcp = system_code_pages()
     encoding = f"cp{acp}"
     mark = non_ascii_char(encoding)
     if mark is None:
         pytest.skip(f"系统代码页 {acp} 表示不了任何非 ASCII 字符")
     deploy = tmp_path / f"{mark} deploy"
     deploy.mkdir()
-    result, wrapper = install_in_sandbox(deploy, "Demo")
+    before = {}
+    result, wrapper = install_in_sandbox(deploy, "Demo", before=before)
+    if acp != oemcp:
+        assert result.returncode != 0 and entries(deploy) == before["entries"]
+        return
     assert result.returncode == 0, _output(result)
     for path in (wrapper, deploy / "scripts" / "task_demo_weekly_check.cmd"):
         raw = path.read_bytes()
@@ -437,12 +445,13 @@ def test_wrappers_keep_non_ascii_paths_in_the_system_ansi_code_page(tmp_path):
 
 @pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
 def test_install_refuses_paths_the_ansi_code_page_cannot_represent(tmp_path):
-    """评审 R7：路径里有代码页表示不了的字符时，在副作用之前拒绝安装并说明原因。
-    本机的系统代码页多半是 UTF-8（什么都表示得了），所以把代码页固定成 1252。"""
+    """评审 R7：两个代码页相同的机器上，路径里有这个代码页表示不了的字符时，在副作用
+    之前拒绝安装并说明原因。本机的系统代码页多半是 UTF-8（什么都表示得了），所以把
+    两个代码页都固定成 1252。"""
     before = {}
     deploy = tmp_path / "部署 tree"
     deploy.mkdir()
-    result, wrapper = install_in_sandbox(deploy, "Demo", code_page=WESTERN_ACP, before=before)
+    result, wrapper = install_in_sandbox(deploy, "Demo", code_pages=WESTERN, before=before)
     assert result.returncode != 0
     assert "1252" in _output(result) and "tree" in _output(result)
     assert entries(deploy) == before["entries"]            # 一个目录都没建
@@ -451,15 +460,51 @@ def test_install_refuses_paths_the_ansi_code_page_cannot_represent(tmp_path):
 
 @pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
 def test_wrapper_bytes_follow_the_ansi_code_page(tmp_path):
-    """代码页 1252 下 é 写成 0xE9（UTF-8 会是 C3 A9，ASCII 会是 "?"），文件头没有 BOM。"""
+    """两个代码页都是 1252 时，é 写成 0xE9（UTF-8 会是 C3 A9，ASCII 会是 "?"），文件头没有 BOM。"""
     deploy = tmp_path / "déploy"
     deploy.mkdir()
-    result, wrapper = install_in_sandbox(deploy, "Demo", code_page=WESTERN_ACP)
+    result, wrapper = install_in_sandbox(deploy, "Demo", code_pages=WESTERN)
     assert result.returncode == 0, _output(result)
     raw = wrapper.read_bytes()
     assert b"d\xe9ploy" in raw and b"?" not in raw
     assert str(deploy) in raw.decode("cp1252")
     assert not raw.startswith(b"\xef\xbb\xbf")             # BOM 会被 cmd 当成命令的一部分
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
+def test_non_ascii_paths_are_refused_where_console_and_ansi_code_pages_differ(tmp_path):
+    """评审 R7 的最终处置。cmd.exe 按控制台代码页读 .cmd，新开控制台的缺省值是系统 OEM
+    代码页。它和 ANSI 代码页不同的机器上，不去猜哪种编码对 cmd 有效：路径里只要有一个
+    非 ASCII 字符就拒绝安装，一个目录都不建、一个任务都不建；纯 ASCII 路径照常安装。
+    é 在 1252 里表示得了，所以这里拒绝它的是"两个代码页不同"这一条，不是"表示不了"那一条。"""
+    before = {}
+    foreign = tmp_path / "déploy tree"
+    foreign.mkdir()
+    result, wrapper = install_in_sandbox(foreign, "Demo", code_pages=SPLIT, before=before)
+    assert result.returncode != 0
+    assert "OEM 437" in _output(result) and "1252" in _output(result) and "ASCII" in _output(result)
+    assert "tree" in _output(result)
+    assert entries(foreign) == before["entries"]           # 一个目录都没建
+    assert not wrapper.exists() and not (foreign / "task-calls.txt").exists()
+
+    before = {}
+    plain = tmp_path / "plain tree"
+    plain.mkdir()
+    result, wrapper = install_in_sandbox(plain, "Demo", code_pages=SPLIT, before=before)
+    assert result.returncode == 0, _output(result)
+    assert str(plain) in wrapper.read_text(encoding="ascii")   # 照常写、照常装
+    assert [tn for tn, _ in schtasks_calls(plain)] == [
+        "MT5Quant\\live_daily_report", "MT5Quant\\demo_weekly_check"]
+
+    # 别的位置也一样算：部署树的名字是纯 ASCII，数据目录的名字里有 é，同样拒绝，也不建目录。
+    plain = tmp_path / "ascii deploy"
+    (plain / "données" / "costs").mkdir(parents=True)    # 点差模型的缺省位置跟着数据目录走，先放好占位文件
+    (plain / "données" / "costs" / "spread_model.json").write_bytes(b"")
+    before = {}
+    result, wrapper = install_in_sandbox(plain, "Demo", code_pages=SPLIT,
+                                         paths={"DataDir": plain / "données"}, before=before)
+    assert result.returncode != 0 and "1252" in _output(result) and "OEM" in _output(result)
+    assert entries(plain) == before["entries"] and not wrapper.exists()
 
 
 STANDIN = (
@@ -473,11 +518,11 @@ STANDIN = (
 def test_installed_wrappers_start_under_non_ascii_paths(tmp_path):
     """真正用 cmd.exe 跑一遍装出来的两份包装器：沙箱里的两个脚本换成只记录参数的
     替身，核对它收到的路径和 TASK_PARAMETERS 行逐项一致。cmd 按控制台代码页读 .cmd，
-    新开控制台的缺省值是系统 OEM 代码页；它和 ANSI 代码页不同的系统上非 ASCII 路径
-    不在本条范围内（安装脚本按 ANSI 代码页写，见评审 R7 的处置）。"""
+    新开控制台的缺省值是系统 OEM 代码页；它和 ANSI 代码页不同的机器上，安装脚本拒绝
+    非 ASCII 路径（见 test_non_ascii_paths_are_refused_where_console_and_ansi_code_pages_differ）。"""
     acp, oemcp = system_code_pages()
     if acp != oemcp:
-        pytest.skip(f"系统 ANSI（{acp}）与 OEM（{oemcp}）代码页不同")
+        pytest.skip(f"系统 ANSI（{acp}）与 OEM（{oemcp}）代码页不同：安装脚本拒绝非 ASCII 路径")
     mark = non_ascii_char(f"cp{acp}")
     if mark is None:
         pytest.skip(f"系统代码页 {acp} 表示不了任何非 ASCII 字符")
