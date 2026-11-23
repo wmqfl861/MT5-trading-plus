@@ -163,7 +163,8 @@ def _verdict_age(remembered) -> float | None:
         return None
     try:
         return (naive_utc(datetime.now(timezone.utc)) - parse_iso(remembered["at"])).total_seconds()
-    except ValueError:
+    except (ValueError, OverflowError):
+        # OverflowError: a zoned timestamp whose conversion to UTC leaves the range
         return None
 
 

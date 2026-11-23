@@ -380,7 +380,8 @@ def test_the_verdict_verified_in_full_before_a_restart_is_the_one_remembered(tmp
     assert timedelta(0) <= datetime.now(timezone.utc) - kept < timedelta(minutes=1)   # written by this round
 
 
-@pytest.mark.parametrize("at", ["garbage", "", "2026-13-45T99:99:99+00:00", "2026-11-23T19:00:00+00:00 later"])
+@pytest.mark.parametrize("at", ["garbage", "", "2026-13-45T99:99:99+00:00", "2026-11-23T19:00:00+00:00 later",
+                               "0001-01-01T00:00:00+14:00"])     # the last one overflows when converted to UTC
 def test_a_timestamp_that_cannot_be_read_only_means_verifying_in_full(tmp_path, monkeypatch, at):
     """A damaged record in the state file is no verdict against the deployment:
     it is neither reused nor a refusal."""
