@@ -609,6 +609,10 @@ def markdown_row(summary: dict) -> str:
     if summary["calendar_missing_days"]:
         trading += f"（日历缺 {len(summary['calendar_missing_days'])} 天）"
     dns = "未查" if summary["dns_timeouts"] is None else str(summary["dns_timeouts"])
+    if summary.get("uncertain_due_to_unreadable"):
+        window = "**不确定**"                       # 读不了的日志罩着这一天：有没有让窗口失败的中断不知道
+    else:
+        window = "**失败**" if summary["would_fail_window"] else "不失败"
     verdict = "计入"
     if not summary["baseline_day"]:
         verdict = "**不计入**"
@@ -627,8 +631,7 @@ def markdown_row(summary: dict) -> str:
                 break
     return (f"| {summary['date_utc']} | {trading} | "
             f"{summary['disconnect_segments']}（{summary['terminal_down_segments']}） | "
-            f"{summary['unresolved_at_day_end']} | {longest} | "
-            f"{'**失败**' if summary['would_fail_window'] else '不失败'} | {edges} | "
+            f"{summary['unresolved_at_day_end']} | {longest} | {window} | {edges} | "
             f"{presence} | {ping} | {summary['ap_switches']} | {summary['scans']} | {dns} | {verdict} |")
 
 

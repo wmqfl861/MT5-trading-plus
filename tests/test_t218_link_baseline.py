@@ -732,6 +732,7 @@ def test_days_after_an_unreadable_file_do_not_count_until_the_connection_is_seen
     assert [row["baseline_day"] for row in rows[1:]] == [False, True]
     out = run_main(mod, capsys, logs, "--date", "2026-11-26", calendar, "--format", "table")[1]
     assert out.rstrip().endswith("| **不计入**（前面的日志读不了） |")
+    assert "| 0（0） | 0 | 0 | **不确定** | — |" in out          # nothing visible, and nothing claimed either way
 
     # the file can be read again: the same days are judged on what they hold
     monkeypatch.undo()

@@ -167,10 +167,11 @@ type data\logs\task_live_daily_report.log      # 任务输出（排查用）
   部分，记为"延续"）：段数和合计秒数跨日相加会重复，不要跨日求和。
 - 退出码：0 出了统计；3 有日子出不了统计（`no_terminal_log`、`log_unreadable`、
   `log_dir_unreadable`，stdout 一行 JSON）；2 参数错误。退出码 3 的日子一律按
-  不计入处理，不要当成"没有断线"。原因是 `log_unreadable` 的，把那个文件重新复制
-  后重跑。修不好也不要紧：读不了的文件里可能记着一段延续到次日的中断，脚本把从它
-  覆盖的时段起、到其后第一条 `authorized` 为止的日子都判成不计入
-  （`uncertain_due_to_unreadable`）。
+  不计入处理，不要当成"没有断线"。原因是 `log_unreadable` 的，**把那个文件重新复制
+  后重跑**。不修的话多半凑不满：读不了的文件里可能记着一段延续到次日的中断，脚本
+  把从它覆盖的时段起、到其后第一条 `authorized` 为止的日子都判成不计入
+  （`uncertain_due_to_unreadable`，表格的"窗口判据"写"不确定"）；连接很稳时终端不写
+  `authorized`，这段"不知道"会一直延伸到数据末尾。
 - 退出码 3、`terminal_absent` 为 null（当天的日志缺了一个本地日期）、`dns_timeouts`
   为 null（系统日志不覆盖那一整天）都是"不知道"，不是"没问题"。
 - 已知限制：进程的计时起点和终端日志的 lost 时刻相差约一分钟；终端日志的时钟
