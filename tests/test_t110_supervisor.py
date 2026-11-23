@@ -391,8 +391,8 @@ def test_windows_fixed_entrypoints_share_verified_fake_tree(tmp_path, orphan):
             assert any(item["pid"] in backend.snapshot() for item in known[:-1])
         inspected = mod.inspect_deployment(cfg, backend, verify_deployment=lambda c: None)
         stopped = mod.stop_deployment(cfg, backend, verify_deployment=lambda c: None)
-        assert inspected["refused"] is orphan
-        assert stopped["refused"] is orphan
+        assert inspected["refused"] is orphan, inspected  # show the refusal reason if this flakes
+        assert stopped["refused"] is orphan, stopped
         if orphan:
             assert killed == []
         else:
@@ -486,3 +486,100 @@ def test_powershell_fixed_deployment_inspect_and_stop(tmp_path, monkeypatch):
         if proc.poll() is None:
             proc.kill()
         proc.wait(timeout=5)
+
+
+# ---- T211: the two production launch paths (a real console host is required) ----
+
+def sleeping_role(tmp_path):
+    fake = tmp_path / "scripts" / "risk_process.py"
+    fake.parent.mkdir(parents=True, exist_ok=True)
+    fake.write_text("import time\ntime.sleep(120)\n")
+    return [sys.executable, "-u", str(fake)]
+
+
+def console_hosts(table, launcher_pid):
+    import ntpath
+    return [row for row in table.values() if row.get("parent_pid") == launcher_pid
+            and ntpath.basename(row.get("executable") or "").lower() == "conhost.exe"]
+
+
+def await_console_host(backend, launcher_pid, seconds=15):
+    """Fail with the launcher's tree when no console host shows up: the test would prove nothing."""
+    import time
+    table, deadline = {}, time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        table = backend.snapshot()
+        if console_hosts(table, launcher_pid):
+            return table
+        time.sleep(0.1)
+    tree = {pid: row for pid, row in table.items()
+            if pid == launcher_pid or row.get("parent_pid") == launcher_pid}
+    pytest.fail(f"no console host under the launched role; launcher tree = {tree}")
+
+
+def verify_and_terminate(mod, backend, launcher_pid, started_utc, argv):
+    entry = dict(pid=launcher_pid, started_utc=started_utc)
+    table = await_console_host(backend, launcher_pid)
+    hosts = {row["pid"] for row in console_hosts(table, launcher_pid)}
+    tree = mod.verified_tree(entry, table, argv)
+    assert tree[-1]["pid"] == launcher_pid and not hosts & {item["pid"] for item in tree}
+    mod.terminate_verified_tree(entry, backend, argv)
+    assert not mod.verified_tree(entry, backend.snapshot(), argv)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows console host")
+def test_launch_path_windows_processes_launch_is_verified_and_terminated(tmp_path):
+    """WindowsProcesses.launch() is how the supervisor restarts a role."""
+    import os
+    import subprocess
+    mod = load_supervisor()
+    argv = sleeping_role(tmp_path)
+    backend = mod.WindowsProcesses()
+    row = backend.launch(argv, str(tmp_path), str(tmp_path / "role.log"),
+                         {**os.environ, "PYTHONUNBUFFERED": "1"})
+    try:
+        verify_and_terminate(mod, backend, row["pid"], row["started_utc"], argv)
+    finally:
+        subprocess.run(["taskkill", "/PID", str(row["pid"]), "/T", "/F"], capture_output=True)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows console host")
+def test_launch_path_demo_run_start_process_hidden_is_verified_and_terminated(tmp_path):
+    """The Start-Process form demo_run.ps1 uses to launch every role."""
+    import subprocess
+    mod = load_supervisor()
+    script = (ROOT / "scripts" / "demo_run.ps1").read_text(encoding="utf-8")
+    for token in ("Start-Process -FilePath $PythonExeAbs -ArgumentList $quotedArgs",
+                  "-WindowStyle Hidden -PassThru",
+                  "-RedirectStandardOutput $log -RedirectStandardError $errLog"):
+        assert token in script, f"demo_run.ps1 launch form changed: {token!r}"
+    argv = sleeping_role(tmp_path)
+    log = str(tmp_path / "role.log")
+    launch = tmp_path / "launch.ps1"
+    launch.write_text(
+        "param([string]$PythonExe, [string]$Script, [string]$WorkDir, [string]$Log)\n"
+        "$argList = @('-u', $Script)\n"
+        "$quotedArgs = @($argList | ForEach-Object {\n"
+        "    if ($_.Contains('\"')) { throw \"Unsupported quote in process argument\" }\n"
+        "    '\"' + $_.TrimEnd('\\') + '\"'\n"
+        "})\n"
+        "$p = Start-Process -FilePath $PythonExe -ArgumentList $quotedArgs `\n"
+        "    -WorkingDirectory $WorkDir -WindowStyle Hidden -PassThru `\n"
+        "    -RedirectStandardOutput $Log -RedirectStandardError \"$Log.err\"\n"
+        "$p.Id\n")
+    # The launched role inherits what PowerShell holds, so its output goes to
+    # files: with pipes the caller would wait for the role itself to exit.
+    pid_file, err_file = tmp_path / "launcher.pid", tmp_path / "launcher.err"
+    with open(pid_file, "w") as out, open(err_file, "w") as err:
+        subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(launch),
+                        sys.executable, argv[2], str(tmp_path), log],
+                       stdin=subprocess.DEVNULL, stdout=out, stderr=err, timeout=120)
+    launcher_pid = pid_file.read_text().strip()
+    assert launcher_pid.isdigit(), err_file.read_text()
+    launcher_pid = int(launcher_pid)
+    try:
+        backend = mod.WindowsProcesses()
+        verify_and_terminate(mod, backend, launcher_pid,
+                             backend.snapshot()[launcher_pid]["started_utc"], argv)
+    finally:
+        subprocess.run(["taskkill", "/PID", str(launcher_pid), "/T", "/F"], capture_output=True)

@@ -1,5 +1,9 @@
 # ops-patches/2026-11-19 · recovery-20261119A 生产补丁留档（D102）
 
+> **撤除日期：2026-11-23（T211 合入 main）**。自 T211 起 supervisor 直接用部署树的 `live_supervisor.py`，
+> 不再安装本目录的包装链；树内实现和失效模式表见 `docs/ops/demo-runbook.md` §6.3。
+> 生产上仍在跑的 `host.py` 在新候选部署时撤除（D110），撤除前不对观察运行热改。
+
 2026-11-19 僵局恢复（codex 执行单 `docs/handoff/2026-11-19-recovery-decision.md`）期间
 实际部署的**树外运维包装器**留档。这些文件不在任何 git 树内，生产原件放在
 `<workspace>/data/ops-evidence/recovery-20261119A/`（证据目录，不入库），本目录是
