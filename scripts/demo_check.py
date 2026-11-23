@@ -618,7 +618,10 @@ FORMAL_DRILL_ALERTS = frozenset({"RISK_HALT", "RISK_FLATTEN", "HEARTBEAT_TIMEOUT
                                "LINE_CAP"})   # T191：LINE_CAP 与 RISK_HALT 同类
 # T191 记录类：只记录不判失败（降级时长另计，见 formal_recorded_degradation）
 FORMAL_RECORDED_ALERTS = frozenset({"DISCONNECTED", "ACCOUNT_UNAVAILABLE",
-                                    "RECOVERABLE_FAILURE"})
+                                    "RECOVERABLE_FAILURE",
+                                    # T212（第二十三轮 §2.3）：git 没能回答，本轮不重启；
+                                    # 真正的身份或部署不符照旧是 SUPERVISOR_REFUSED（异常类）
+                                    "SUPERVISOR_DEFERRED"})
 # T191 无效证据类：窗口内出现即 FormalInvalid
 FORMAL_INVALID_ALERTS = frozenset({"SUPERVISOR_EVIDENCE"})
 FORMAL_CLASSIFIED_ALERTS = (FORMAL_ANOMALY_ALERTS | FORMAL_DRILL_ALERTS

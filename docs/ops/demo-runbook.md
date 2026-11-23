@@ -568,6 +568,17 @@ PID 创建时间不符、未知子进程或缺 launcher 但 worker 仍活着的�
 `demo_run.ps1` 的 `Start-Process -WindowStyle Hidden`）在 `tests/test_t110_supervisor.py` 里，都先断言快照里
 确实有以该角色为父的 conhost，否则按失败处理并打印进程树。
 
+**"无法判定"不是拒绝（T212，2026-11-23）**：核验部署时 git 超时或起不来，这一轮记为无法判定——发
+`SUPERVISOR_DEFERRED`（记录类），不重启任何角色。只读的进程树和心跳检查照常：四个角色都健康就不写 halt；
+有角色缺失或失活照旧写 halt，重启留到核验成功的那一轮。无法判定期间也不解除已有的 halt。连续三轮无法判定
+才升级为拒绝（`SUPERVISOR_REFUSED`、halt `supervisor_refused`）；`supervisor-state.json` 的 `undeterminable`
+记连续次数，核验成功归零。SHA 不符、工作树不干净、非 Demo 配置照旧是拒绝。
+
+开销：SHA 和 detached 状态每轮都查；完整的 `git status` 至多 15 分钟一次——`.git/HEAD` 的内容和索引文件的
+大小、修改时间都没变时，沿用上次"干净"的结论（链接工作树按 `.git` 文件里的 `gitdir:` 找到真正的 git 目录）。
+**要重启任何角色的那一轮，先做一次完整核验，不用缓存**：缓存期内新出现的未跟踪文件只有完整核验才看得到。
+git 和 powershell 都按绝对路径调用，找不到就按无法判定处理。
+
 **安装方式**：T211 合入后直接指向部署树的 `live_supervisor.py`，用下面的注册命令。11-19 到 11-23 用的树外
 `host.py` 包装是临时补丁，随新候选部署时撤除；留档见 `docs/ops/ops-patches/2026-11-19/`。撤除之前，
 生产上的观察运行继续用包装链，不对它热改。

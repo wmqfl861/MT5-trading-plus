@@ -14,6 +14,7 @@ import json
 import ntpath
 import os
 import re
+import shutil
 import subprocess
 import sys
 import uuid
@@ -87,7 +88,82 @@ def command(cfg, role):
     return argv
 
 
-def verify_deployment(cfg):
+class DeploymentUndeterminable(Exception):
+    """git could not answer this round (timed out or failed to start).
+
+    That says nothing about the deployment: it is neither clean nor dirty here.
+    """
+
+
+UNDETERMINABLE_LIMIT = 3         # consecutive rounds; the third escalates to a refusal
+CLEAN_REUSE_S = 15 * 60          # a full "git status" runs at most this often
+
+
+def _absolute(program: str, preferred=()) -> str:
+    """Absolute path of an external program. The supervisor may end processes, so
+    nothing it runs is looked up through PATH at call time (C23-5)."""
+    for candidate in preferred:
+        if candidate and os.path.isabs(candidate) and Path(candidate).is_file():
+            return candidate
+    found = shutil.which(program)
+    if not found or not os.path.isabs(found):
+        raise DeploymentUndeterminable(f"{program} not found")
+    return found
+
+
+def powershell_exe() -> str:
+    return _absolute("powershell", (os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                                "System32", "WindowsPowerShell", "v1.0",
+                                                "powershell.exe"),))
+
+
+def _git(directory, *args) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run([_absolute("git"), "-C", directory, *args],
+                              capture_output=True, text=True, timeout=15)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise DeploymentUndeterminable(f"git {args[0]}: {type(exc).__name__}") from exc
+
+
+def _git_dir(directory) -> Path | None:
+    """The directory holding HEAD and the index: .git itself, or where the .git
+    file of a linked worktree points. None when it cannot be told."""
+    dot = Path(directory) / ".git"
+    try:
+        if dot.is_dir():
+            return dot
+        text = dot.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    if not text.startswith("gitdir:"):
+        return None
+    target = Path(text[len("gitdir:"):].strip())
+    return target if target.is_absolute() else Path(directory) / target
+
+
+def _checkout_fingerprint(directory) -> list | None:
+    """What any change to the checkout alters sooner or later: the text of HEAD
+    and the size and mtime of the index. None when they cannot be read."""
+    git_dir = _git_dir(directory)
+    if git_dir is None:
+        return None
+    try:
+        index = (git_dir / "index").stat()
+        return [(git_dir / "HEAD").read_text(encoding="utf-8").strip(), index.st_size, index.st_mtime_ns]
+    except (OSError, UnicodeError):
+        return None
+
+
+def verify_deployment(cfg, state=None, *, full=False):
+    """Only an explicitly pinned, detached and clean deployment may be touched.
+
+    The SHA and the detached state are checked on every call. The expensive
+    "git status" runs when `full` is set, when no clean verdict is remembered,
+    when HEAD or the index changed since, or when that verdict is older than
+    CLEAN_REUSE_S. Returns the record to remember from a full clean verdict,
+    else None. A real mismatch raises ValueError; git not answering raises
+    DeploymentUndeterminable, which is not a verdict about the deployment.
+    """
     if not re.fullmatch(r"[0-9a-f]{40}", cfg.sha):
         raise ValueError("deployment_sha requires full lowercase SHA")
     for field in ("directory", "data_dir", "config_dir", "python", "gateway_config",
@@ -100,16 +176,20 @@ def verify_deployment(cfg):
     for name in SCRIPTS.values():
         if not (Path(cfg.directory) / "scripts" / name).is_file():
             raise ValueError("deployment script missing")
-    def git(*args):
-        return subprocess.run(["git", "-C", cfg.directory, *args], capture_output=True,
-                              text=True, timeout=15)
-    if git("rev-parse", "HEAD").stdout.strip() != cfg.sha:
+    if _git(cfg.directory, "rev-parse", "HEAD").stdout.strip() != cfg.sha:
         raise ValueError("deployment SHA mismatch")
-    if git("symbolic-ref", "-q", "HEAD").returncode != 1:
+    if _git(cfg.directory, "symbolic-ref", "-q", "HEAD").returncode != 1:
         raise ValueError("deployment must be detached at fixed SHA")
-    dirty = git("status", "--porcelain", "--untracked-files=all")
-    if dirty.returncode or dirty.stdout.strip():
-        raise ValueError("deployment is not clean/isolated")
+    remembered = (state or {}).get("clean")
+    reuse = (not full and isinstance(remembered, dict)
+             and remembered.get("fingerprint") == _checkout_fingerprint(cfg.directory)
+             and isinstance(remembered.get("at"), str)
+             and 0 <= (naive_utc(datetime.now(timezone.utc)) - parse_iso(remembered["at"])).total_seconds()
+             < CLEAN_REUSE_S)
+    if not reuse:
+        dirty = _git(cfg.directory, "status", "--porcelain", "--untracked-files=all")
+        if dirty.returncode or dirty.stdout.strip():
+            raise ValueError("deployment is not clean/isolated")
     if load_gateway(cfg.gateway_config).allow_live_trading is not False:
         raise ValueError("nonDemo configuration: allow_live_trading")
     load_risk_config(cfg.risk_config)
@@ -117,6 +197,10 @@ def verify_deployment(cfg):
     if not Path(cfg.spread_model).is_file():
         raise ValueError("spread model missing")
     components(cfg)
+    if reuse:
+        return None
+    # Read after "git status": it may itself rewrite the index.
+    return {"fingerprint": _checkout_fingerprint(cfg.directory), "at": iso_utc(datetime.now(timezone.utc))}
 
 
 def _argv_matches(actual, expected, *, worker=False):
@@ -459,11 +543,39 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
     now = observe()
     live = Path(cfg.data_dir) / "live"
     live.mkdir(parents=True, exist_ok=True)
-    result = {"restarted": [], "refused": False, "cleared": False, "evidence_failures": []}
+    result = {"restarted": [], "refused": False, "cleared": False, "evidence_failures": [],
+              "deferred": []}
     state_path = live / "supervisor-state.json"
+    # Test doubles take only cfg; the real verifier also takes the remembered state.
+    real_verifier = verify_deployment is globals()["verify_deployment"]
+
+    def check(state, *, full=False):
+        try:
+            if real_verifier:
+                return globals()["verify_deployment"](cfg, state, full=full)
+            return verify_deployment(cfg)
+        except subprocess.TimeoutExpired as exc:
+            # A git call that ran out of time behind the verifier: not a verdict.
+            raise DeploymentUndeterminable(f"git call: {type(exc).__name__}") from exc
     try:
         with registry_lock(str(live / "instances.lock")), file_lock(str(live / "supervisor.lock"), attempts=1):
-            verify_deployment(cfg)
+            state = read_json_retry(str(state_path)) or {}
+            undeterminable = 0
+            try:
+                verified = check(state)
+            except DeploymentUndeterminable as exc:
+                # Not a verdict about the deployment: nothing is restarted this round.
+                undeterminable = int(state.get("undeterminable") or 0) + 1
+                state["undeterminable"] = undeterminable
+                result["undeterminable"] = undeterminable
+                result["deferred_reason"] = f"git could not answer: {exc}"
+                if undeterminable >= UNDETERMINABLE_LIMIT:
+                    raise ValueError(f"deployment undeterminable {undeterminable} times in a row "
+                                     f"({exc})") from exc
+            else:
+                state["undeterminable"] = 0
+                if verified:
+                    state["clean"] = verified
             roles, mapped, trees = _registered_trees(cfg, processes)
             stale, checks = {}, {}
             clean = False
@@ -501,7 +613,6 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
                 if key == "reconcile" and healthy:
                     clean = data.get("reconcile_clean") is True
             now = observe()
-            state = read_json_retry(str(state_path)) or {}
             signature = sorted((k, e["pid"], e["started_utc"]) for k, e in mapped.items())
             signature = json.loads(json.dumps(signature))
             if stale:
@@ -510,7 +621,33 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
                 append_alert(str(live), "SUPERVISOR",
                              f"unhealthy={stale}" + (f" checks={checks}" if checks else ""), now)
                 # Persist reset BEFORE any process mutation/crash.
-                write_json_atomic(str(state_path), {"healthy_since": None, "signature": signature})
+                reset = {"healthy_since": None, "signature": signature,
+                         "undeterminable": state.get("undeterminable", 0), "clean": state.get("clean")}
+                write_json_atomic(str(state_path), reset)
+                if undeterminable:
+                    # The halt just written is the protection; it stays until a round
+                    # can verify the deployment again.
+                    result["deferred"] = sorted(stale)
+                    append_alert(str(live), "SUPERVISOR_DEFERRED",
+                                 f"{result['deferred_reason']}; restarts deferred for {result['deferred']}; "
+                                 f"consecutive={undeterminable}", now)
+                    return result
+                # Only a clean, pinned deployment may be restarted. A round that restarts
+                # anything verifies it in full first, never from the cache.
+                try:
+                    verified = check(None, full=True)
+                except DeploymentUndeterminable as exc:
+                    undeterminable = int(state.get("undeterminable") or 0) + 1
+                    result["undeterminable"] = undeterminable
+                    result["deferred_reason"] = f"git could not answer: {exc}"
+                    result["deferred"] = sorted(stale)
+                    write_json_atomic(str(state_path), {**reset, "undeterminable": undeterminable})
+                    append_alert(str(live), "SUPERVISOR_DEFERRED",
+                                 f"{result['deferred_reason']}; restarts deferred for {result['deferred']}; "
+                                 f"consecutive={undeterminable}", now)
+                    return result
+                if verified:
+                    state["clean"] = verified
                 for key, reason in stale.items():
                     entry = mapped.get(key)
                     # T180: retain pre-restart registry bytes inside the same lock.
@@ -575,10 +712,17 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
             token = halt.get("token") if isinstance(halt, dict) and halt.get("owner") == "supervisor" else None
             if state.get("halt_token") != token:
                 since = iso_utc(now) if clean else None
-            if since and (naive_utc(now) - parse_iso(since)).total_seconds() >= 300 and token:
+            if undeterminable:
+                # Healthy roles, unverifiable deployment: no halt is written, and an
+                # existing one is not lifted until the deployment can be verified again.
+                append_alert(str(live), "SUPERVISOR_DEFERRED",
+                             f"{result['deferred_reason']}; all roles healthy, no halt written; "
+                             f"consecutive={undeterminable}", now)
+            elif since and (naive_utc(now) - parse_iso(since)).total_seconds() >= 300 and token:
                 result["cleared"] = _clear_owned(live, token)
             state = {"healthy_since": since, "last_checked": iso_utc(now),
-                     "signature": signature, "halt_token": token}
+                     "signature": signature, "halt_token": token,
+                     "undeterminable": state.get("undeterminable", 0), "clean": state.get("clean")}
             if token and not result["cleared"]:
                 # _clear_owned refuses silently; name the blocker so a halt that
                 # cannot clear by itself is visible without reading the directory.
@@ -610,7 +754,7 @@ class WindowsProcesses:
                   "[pscustomobject]@{pid=$_.ProcessId;parent_pid=$_.ParentProcessId;"
                   "started_utc=$_.CreationDate.ToUniversalTime().ToString('o');"
                   "executable=$_.ExecutablePath;command_line=$_.CommandLine} } | ConvertTo-Json -Depth 3 -Compress")
-        out = subprocess.run(["powershell", "-NoProfile", "-Command", source],
+        out = subprocess.run([powershell_exe(), "-NoProfile", "-Command", source],
                              capture_output=True, timeout=30)
         if out.returncode:
             raise RuntimeError("process inventory failed")
