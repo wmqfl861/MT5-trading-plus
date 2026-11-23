@@ -9,6 +9,17 @@ class NotConnectedError(GatewayError):
     """终端不可达：初始化失败或重连仍失败。"""
 
 
+class TerminalNotConnectedError(NotConnectedError):
+    """终端进程不在：网关不调 initialize（T209）。
+
+    真实的 MetaTrader5 包会在 initialize 里把终端拉起来，终端从此是调用者的
+    子进程：supervisor 拒绝这棵进程树（11-21 的 684 分钟），终端还会随这个
+    worker 一起死。终端只由看护任务或维护窗内的人工操作启动。
+    类名里保留 NotConnectedError：运行器、对账和正式检查按这个子串把告警
+    归为连接类（T141、T210）。改名之前先查这些地方。
+    """
+
+
 class PreSendUnavailableError(NotConnectedError):
     """发送前无法确认账户状态，请求未发出（T183/O17-3）。
 

@@ -17,8 +17,10 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from mt5gw.config import GatewayConfig
-from mt5gw.errors import NotConnectedError, PreSendUnavailableError
+from mt5gw.errors import (NotConnectedError, PreSendUnavailableError,
+                          TerminalNotConnectedError)
 from mt5gw.snapshot import write_json_atomic
+from mt5gw.terminal import terminal_running
 
 _TIMEOUT_EVIDENCE = {}
 _EVIDENCE_LOCK = threading.Lock()
@@ -30,6 +32,10 @@ _TERMINATING = threading.Event()
 # （reconnect()/隐式重连到点才真试）；每次尝试本身走 T110 期限
 # （_serialized/_invoke 的既有超时——本任务不改期限常量）。
 RECONNECT_BACKOFF_S = (5.0, 10.0, 30.0, 60.0)
+
+# T209：调 initialize 之前先确认终端进程在运行。模块级缺省是真实的进程内
+# 探针；只有测试套件会替换它（tests/conftest.py），生产代码从不覆盖。
+TERMINAL_PROBE = terminal_running
 
 
 def _await_terminal_exit():
@@ -67,11 +73,13 @@ def _is_success(error_tuple) -> bool:
 
 class MT5Connection:
     def __init__(self, config: GatewayConfig | None = None, mt5_module=None,
-                 monotonic=time.monotonic):
+                 monotonic=time.monotonic, terminal_running=None):
         self.config = config or GatewayConfig()
         if mt5_module is None:
             import MetaTrader5 as mt5_module
         self._mt5 = mt5_module
+        # T209：终端进程在不在的探针；None = 用模块级缺省（调用时再取，测试可替换）。
+        self._terminal_running = terminal_running
         self._lock = threading.RLock()
         self._initialized = False
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mt5-deadline")
@@ -211,6 +219,18 @@ class MT5Connection:
         # _raw("initialize", path, timeout=ms) 会被吞成期限而到不了 MT5；
         # 用 partial 把值真传进 mt5.initialize（启动 connect() 与重连同一条
         # 路径，都带 timeout）。
+        # T209：终端进程不在就不调 initialize——真实的 MetaTrader5 包会在这里把
+        # 终端拉起来，成为本进程的子进程。启动的 connect() 和重连走的都是这一条路。
+        probe = self._terminal_running or TERMINAL_PROBE
+        try:
+            running = probe(self.config.terminal_path)
+        except Exception:
+            running = False                      # 探测本身出错：按不在处理
+        if not running:
+            self._initialized = False
+            raise TerminalNotConnectedError(
+                "MT5 终端进程不在：未调用 initialize"
+                "（终端只由看护任务或维护窗内的人工操作启动，T209）")
         init = functools.partial(self._mt5.initialize, self.config.terminal_path,
                                  timeout=self.config.initialize_timeout_ms)
         ok = self._invoke("initialize", init)
@@ -268,7 +288,9 @@ class MT5Connection:
                     self._initialized = False
                     reason = f"终端已初始化但交易服务器未连接：{self.last_error()}"
         except NotConnectedError as exc:
-            reason = str(exc)
+            # 带上类名（T209）：正式检查按消息里的异常名把连接类告警定为记录类，
+            # TerminalNotConnectedError 这个子类名要能一路带到告警里。
+            reason = f"{type(exc).__name__}: {exc}"
         self._reconnect_failures += 1
         delay = RECONNECT_BACKOFF_S[
             min(self._reconnect_failures - 1, len(RECONNECT_BACKOFF_S) - 1)]

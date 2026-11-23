@@ -44,6 +44,13 @@ class FakeGateway:
         self.market = broker
         self.trading = broker
 
+    def connect(self):
+        """对齐 MT5Gateway 接口（T209 起三个入口脚本在启动段调 connect）；替身没有终端，调用即连上。"""
+
+    @property
+    def connected(self) -> bool:
+        return True
+
     def shutdown(self):
         """对齐 MT5Gateway 接口（脚本 main 的 finally 会调用；替身无资源）。"""
 

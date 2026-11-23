@@ -38,6 +38,7 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
 from _pytest.outcomes import Skipped
 
 # 严格模式开关（T206/O19-6）：任何非空值开启；CI 的 pytest job 置 1。
@@ -124,3 +125,30 @@ def _register_skip_finder() -> None:
 
 
 _register_skip_finder()
+
+
+# ---- T209：测试默认假定交易终端进程在运行 ----------------------------------
+#
+# 真实的 MetaTrader5.initialize() 在终端进程不在时会把终端拉起来，终端从此是
+# 调用者的子进程（11-21 的根因）。网关因此在 initialize 之前先查终端进程在不在
+# （mt5gw.terminal.terminal_running，进程内探测），不在就不调 initialize。
+# 测试里的 MetaTrader5 全是替身，起不了任何进程，测试机上也没有 terminal64.exe
+# 在运行；所以除了标了 real_terminal_probe 的测试，这里把缺省探针换成"在运行"。
+# 真实探针由 tests/test_t209_terminal_guard.py 对真实进程验证。
+
+REAL_TERMINAL_PROBE_MARKER = "real_terminal_probe"
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        f"{REAL_TERMINAL_PROBE_MARKER}: keep the real in-process terminal probe (T209)")
+
+
+@pytest.fixture(autouse=True)
+def _terminal_assumed_running(request, monkeypatch):
+    if request.node.get_closest_marker(REAL_TERMINAL_PROBE_MARKER) is not None:
+        return
+    from mt5gw import connection
+
+    monkeypatch.setattr(connection, "TERMINAL_PROBE", lambda terminal_path: True)

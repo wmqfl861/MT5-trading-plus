@@ -610,13 +610,17 @@ FORMAL_ANOMALY_ALERTS = frozenset({
     "TRADE_MODE", "ORDER_ERROR", "LINE_CAP_STATE",
     # T191（第十八轮 §3.1）：运行时还会写的异常类
     "ORDER_REJECTED", "LOOP_EXIT", "COMMAND_UNREADABLE", "DRILL_ARCHIVE_ERROR",
+    # T209（第二十三轮 §2.2）：终端不允许算法交易（算法交易按钮被关、API 被禁）
+    "ALGO_TRADING_DISABLED",
 })
 FORMAL_DRILL_ALERTS = frozenset({"RISK_HALT", "RISK_FLATTEN", "HEARTBEAT_TIMEOUT",
                                "RECONCILE_MISMATCH", "RISK_REJECT", "SUPERVISOR",
                                "LINE_CAP"})   # T191：LINE_CAP 与 RISK_HALT 同类
 # T191 记录类：只记录不判失败（降级时长另计，见 formal_recorded_degradation）
 FORMAL_RECORDED_ALERTS = frozenset({"DISCONNECTED", "ACCOUNT_UNAVAILABLE",
-                                    "RECOVERABLE_FAILURE"})
+                                    "RECOVERABLE_FAILURE",
+                                    # T209：终端恢复允许算法交易（关闭时的告警是异常类）
+                                    "ALGO_TRADING_RESTORED"})
 # T191 无效证据类：窗口内出现即 FormalInvalid
 FORMAL_INVALID_ALERTS = frozenset({"SUPERVISOR_EVIDENCE"})
 FORMAL_CLASSIFIED_ALERTS = (FORMAL_ANOMALY_ALERTS | FORMAL_DRILL_ALERTS
@@ -639,7 +643,10 @@ FORMAL_DEGRADATION_DAY_LIMIT_S = 1800.0
 # 断线期间的订单路由/查询失败（mt5gw.errors 的连接类异常名）。属记录类：
 # 同一断线的时长已由风控/对账的 DISCONNECTED 段计入，只逐日计数、不开降级段。
 BROKER_UNAVAILABLE_RECORDED_MARKS = ("NotConnectedError", "PreSendUnavailableError",
-                                     "DataUnavailableError")
+                                     "DataUnavailableError",
+                                     # T209：终端进程不在。类名本身含 NotConnectedError，
+                                     # 这里照旧写明，读代码的人不必靠子串推断。
+                                     "TerminalNotConnectedError")
 # T210(b)：非交易日 rc=78 退出告警的同组件 supervisor 重启判定窗（秒）
 RC78_RESTART_WINDOW_S = 600.0
 
