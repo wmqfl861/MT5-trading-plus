@@ -300,6 +300,11 @@ def _connect_demo_gateway(gw) -> None:
         # initialize 之后的第一笔取数取不到，和后面取数阶段的同类失败一样是取数失败
         gw.shutdown()
         raise RetryableFailure(f"取数失败：{type(exc).__name__}: {exc}") from exc
+    except BaseException:
+        # 其余异常不重试，但同样先关闭网关再上抛（第二次复审 N1）：原来只接上面那几种，
+        # 别的异常直接上抛，网关没有关闭（实测 initialize 1、shutdown 0）。
+        gw.shutdown()
+        raise
     if state.trade_mode != 0:
         gw.shutdown()
         raise DataUnavailableError("Demo 日报要求 trade_mode=0，停止读取")
@@ -545,7 +550,13 @@ def main(argv=None, *, gw=None, clock=None, sleep=None) -> int:
         raise
     if missing:
         if last_failure is None:
-            reason = "没有一次尝试开始：都不在换日窗内"
+            # 没有发生的失败时，缺的日子都是一次都没有尝试。整次运行一次都没开始，才说
+            # "没有一次尝试开始"；当天已生成、只有补生成日轮到时已在窗外的，另写一句
+            # （第二次复审 N4：原来这种情形也写"没有一次尝试开始"）。
+            if len(missing) == len(todo):
+                reason = "没有一次尝试开始：都不在换日窗内"
+            else:
+                reason = "未生成的日子一次都没有尝试：轮到它们时不在换日窗内"
         else:
             failed_day, count, error = last_failure
             reason = f"最近一次失败（{failed_day} 第 {count} 次）：{error}"

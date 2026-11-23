@@ -289,6 +289,33 @@ def test_the_alert_states_the_attempts_of_each_day(tmp_path):
     assert "各已尝试" not in message
 
 
+def test_the_alert_says_that_nothing_was_attempted_only_when_nothing_was(tmp_path):
+    """Second review (N4): started at 22:59:50 with a healthy gateway that takes 20
+    seconds a call. Today's report is written; the backfill days come due after the
+    window closed and are not attempted. The last sentence of the alert used to say
+    "no attempt started" for such a run as well."""
+    mod, clock = load(), Clock(datetime(2026, 12, 2, 22, 59, 50))
+    gateway = FlakyGateway(0, clock=clock, cost=20)
+    rc, out = run(tmp_path, mod, clock, gateway)
+    assert rc == mod.EXIT_INCOMPLETE and (out / f"daily-{DAY}.md").exists()
+    assert gateway.touched == [datetime(2026, 12, 2, 22, 59, 50)]   # today only: in the window
+    failed = failure_alerts(tmp_path)
+    assert len(failed) == 1
+    message = failed[0][2]
+    for day in (DAY - timedelta(days=1), DAY - timedelta(days=2)):
+        assert f"{day} 未尝试（换日窗外）" in message, day
+    assert str(DAY) not in message                         # today's report exists
+    assert "没有一次尝试开始" not in message
+    assert "未生成的日子一次都没有尝试：轮到它们时不在换日窗内" in message
+
+    # A run in which really no attempt started keeps the other sentence.
+    work = tmp_path / "outside"
+    rc, out = run(work, mod, Clock(datetime(2026, 12, 2, 23, 10)), FlakyGateway(0))
+    assert rc == mod.EXIT_INCOMPLETE and not out.exists()
+    failed = failure_alerts(work)
+    assert len(failed) == 1 and "没有一次尝试开始：都不在换日窗内" in failed[0][2]
+
+
 # ============================================== K2: the first account read is a data read
 
 class Terminal(FakeMT5):
@@ -369,6 +396,29 @@ def test_connect_failures_are_retried_and_reported_with_their_own_counts(tmp_pat
     failed = failure_alerts(tmp_path)
     assert len(failed) == 1
     assert f"{DAY} 已尝试 3 次" in failed[0][2] and f"{DAY - timedelta(days=1)} 已尝试 3 次" in failed[0][2]
+
+
+@pytest.mark.parametrize("where, error_type",
+                         [("the-call", RuntimeError), ("the-conversion", AttributeError)])
+def test_an_unretryable_exception_in_the_first_account_read_closes_the_gateway(
+        tmp_path, monkeypatch, where, error_type):
+    """Second review (N1): the first account read fails in a way that is not retried —
+    the call raises RuntimeError, or the row it returns is not a complete account
+    (AttributeError one line later, when the row is converted). The gateway used to
+    be left open (initialize 1, shutdown 0). It is closed exactly once before the
+    exception goes up; nothing is retried."""
+    mod, clock = load(), Clock(TASK_TIME)
+    if where == "the-call":
+        terminal = Terminal(failures=1, error=RuntimeError("account_info failed"))
+    else:
+        terminal = Terminal(failures=0)
+        terminal.set_behavior("account_info", value=SimpleNamespace(login=123456))
+    with pytest.raises(error_type):
+        run_terminal(tmp_path, monkeypatch, mod, clock, terminal)
+    assert terminal.calls("initialize") == 1 and terminal.calls("shutdown") == 1
+    assert clock.sleeps == []
+    failed = failure_alerts(tmp_path)
+    assert len(failed) == 1 and "未预期异常" in failed[0][2] and "退出码 1" in failed[0][2]
 
 
 # ============================================== K5: every failed run raises the alert

@@ -145,7 +145,7 @@ Remove-Item data\live\killSwitch, data\live\halt.json -ErrorAction SilentlyConti
 0. 先看 `data\live\alerts.log` 里当天的 `DAILY_REPORT_FAILED`：消息按日写了实际尝试了几次、
    没有尝试的原因，以及是哪一类失败、退出码是多少（T213，见 §6.3.1）。启动或重试的时刻不在
    换日窗内（D82）时日报不连终端、退出码 3——手工补跑或者在窗外补跑任务都会这样。
-1. `type data\logs\task_live_report.log`——最常见：影子状态不可用
+1. `type data\logs\task_live_daily_report.log`——最常见：影子状态不可用
    （退出码 2，fail-closed 不落半截日报）→ 确认运行器活着、
    `data\live\paper\state-*.json` 存在且非空；
 2. 点差比对报 `model_sha256` 不一致 → 重跑 `scripts/build_cost_model.py`
@@ -692,6 +692,12 @@ powershell -ExecutionPolicy Bypass -File "$deploy\scripts\setup_scheduled_tasks.
 
 生产根目录的名字建议只用 ASCII 字符。
 
+路径参数末尾的分隔符（`\` 或 `/`）在写进包装器之前去掉：包装器里的路径都带引号，
+写成 `"…\data\"` 时 Python 解析命令行把 `\"` 当成转义的引号，这个参数和下一个并成一个。
+作为参数的三个目录（`-DataDir`、`-RunnerLogDir`、`-ReportsDir`）不能是磁盘根目录
+（根目录的分隔符去不掉）。**路径里有 `%` 的拒绝安装**：cmd 读 `.cmd` 时把两个 `%`
+之间的内容当成变量展开，装出来的任务跑不起来。
+
 安装脚本最后打印一行 `TASK_PARAMETERS {…}`，抄进部署记录（§4 部署核对单第③条；抄之前路径
 要换成占位符）。
 
@@ -707,6 +713,10 @@ powershell -ExecutionPolicy Bypass -File "$deploy\scripts\setup_scheduled_tasks.
   时刻不在窗内就不连接，那一天的日报记为未生成（D82）。窗的定义源是 `--sessions-config`
   （`sessions.toml`），不给就用 `SessionPolicy` 的缺省窗。`--paper-state` 只读影子状态、
   不连终端，不受此限。用法和配置问题在判窗之前报告，所以窗外运行也照常看得到。
+- **任务不设"错过后尽快运行"**（`schtasks /Create` 不带 `/Z`；安装脚本就是这么写的，
+  不要手工加）。任务晚启动时脚本照样按换日窗判：窗外不连接终端，这几天的日报记为
+  未尝试，以未完成退出（退出码 3）并发一条 `DAILY_REPORT_FAILED`；缺的日报由次日
+  窗内的运行补生成。
 - 连接失败或取数失败时重试，至多 3 次（`--attempts`），间隔 300 秒（`--retry-interval-s`）。
   重试按它真正开始的时刻判窗：睡醒之后已在窗外，就不睡、不再试。
 - **夏令时不重试，这是已知的限制**。换日窗全年的交集只有本机 05:55–06:00：冬令时窗到
