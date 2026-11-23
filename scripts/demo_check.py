@@ -621,7 +621,10 @@ FORMAL_RECORDED_ALERTS = frozenset({"DISCONNECTED", "ACCOUNT_UNAVAILABLE",
                                     "RECOVERABLE_FAILURE",
                                     # T212（第二十三轮 §2.3）：git 没能回答，本轮不重启；
                                     # 真正的身份或部署不符照旧是 SUPERVISOR_REFUSED（异常类）
-                                    "SUPERVISOR_DEFERRED"})
+                                    "SUPERVISOR_DEFERRED",
+                                    # T213（第二十三轮 §2.4）：日报在重试之后仍未生成；
+                                    # 日报是否齐全照旧由正式检查原有的规则判
+                                    "DAILY_REPORT_FAILED"})
 # T191 无效证据类：窗口内出现即 FormalInvalid
 FORMAL_INVALID_ALERTS = frozenset({"SUPERVISOR_EVIDENCE"})
 FORMAL_CLASSIFIED_ALERTS = (FORMAL_ANOMALY_ALERTS | FORMAL_DRILL_ALERTS

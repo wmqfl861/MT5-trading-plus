@@ -7,8 +7,10 @@ watch_swap（T35，已过期）不再安装。
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -24,8 +26,24 @@ TAIPEI = ZoneInfo("Asia/Taipei")   # 本机时区（安装脚本注释的换算�
 DAILY_REPORT_LOCAL = "05:57"
 
 
+def entries(root):
+    """root 下的全部文件和目录（相对路径集合）——断言"拒绝安装时什么都没有新建"。"""
+    return {p.relative_to(root).as_posix() for p in root.rglob("*")}
+
+
 def install_in_sandbox(tmp_path, mode=None, *, paper=False, config_name="gateway.json",
-                       with_config=True, include_data=False, with_ticks=False):
+                       with_config=True, include_data=False, with_ticks=False,
+                       with_python=True, with_sessions=True, with_spread=True,
+                       paths=None, code_pages=None, before=None):
+    """paths（T213）：显式参数 {参数名: 路径}，逐个变成 -参数名 '路径'。
+
+    with_spread：在点差模型的位置（显式路径或缺省的 data\\costs 下）放一个空文件占位
+    ——评审 R6 起安装脚本先核对这个文件。
+    code_pages：把安装脚本读到的两个系统代码页固定成 (ANSI, OEM)。驱动脚本里事先定义
+    一个同名的 Get-SystemCodePages 函数，安装脚本就用它——和 schtasks 的替身是同一个
+    方式，不改系统设置。
+    before（字典）：运行安装脚本之前把沙箱里已有的条目记到 before["entries"]。
+    """
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     shutil.copyfile(ROOT / "scripts" / "setup_scheduled_tasks.ps1",
@@ -37,17 +55,36 @@ def install_in_sandbox(tmp_path, mode=None, *, paper=False, config_name="gateway
         (tmp_path / "data" / "live" / "paper").mkdir(parents=True)
     if with_ticks:
         (tmp_path / "data" / "ticks" / "XAUUSD").mkdir(parents=True)
+    if with_python:
+        # T213：安装脚本要求任务命令里的解释器存在；沙箱里放一个空文件占位。
+        (tmp_path / ".venv" / "Scripts").mkdir(parents=True)
+        (tmp_path / ".venv" / "Scripts" / "python.exe").write_bytes(b"")
+    if with_sessions:
+        (tmp_path / "config").mkdir()
+        shutil.copyfile(ROOT / "config" / "sessions.toml",
+                        tmp_path / "config" / "sessions.toml")
+    spread = (Path(paths["SpreadModel"]) if paths and "SpreadModel" in paths
+              else tmp_path / "data" / "costs" / "spread_model.json")
+    if with_spread:
+        spread.parent.mkdir(parents=True, exist_ok=True)
+        spread.write_bytes(b"")
     driver = tmp_path / "invoke.ps1"
     flags = ""
     if mode:
         flags += " -Mode " + mode
     if include_data:
         flags += " -IncludeDataTasks"
+    for name, value in (paths or {}).items():
+        flags += f" -{name} '{value}'"
     driver.write_text(
         "function global:schtasks { ($args -join '|') | Add-Content -LiteralPath $env:TASK_CALLS; $global:LASTEXITCODE = 0 }\n"
-        "$env:TASK_CALLS = Join-Path $PSScriptRoot 'task-calls.txt'\n"
+        + (f"function global:Get-SystemCodePages {{ [pscustomobject]@{{ ACP = {code_pages[0]}; OEMCP = {code_pages[1]} }} }}\n"
+           if code_pages else "")
+        + "$env:TASK_CALLS = Join-Path $PSScriptRoot 'task-calls.txt'\n"
         "& $PSScriptRoot/scripts/setup_scheduled_tasks.ps1" + flags + "\n",
         encoding="utf-8-sig")
+    if before is not None:
+        before["entries"] = entries(tmp_path)
     result = subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
         capture_output=True, timeout=30)
@@ -255,3 +292,270 @@ def test_daily_report_time_is_the_year_round_window_intersection():
         start, close = policy.rollover_window(ny_day)
         got = (_taipei_minutes(start), _taipei_minutes(close))
         assert got == want, f"{day} 换日窗本地分钟应为 {want}，实得 {got}"
+
+
+# ------------------------------------------------ T213：解释器与目录显式给出
+
+def _output(result):
+    return result.stdout.decode(errors="replace") + result.stderr.decode(errors="replace")
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
+def test_install_refuses_when_the_interpreter_is_missing(tmp_path):
+    """11-17 起日报和周检任务每次都以 rc=1 失败：命令指向部署树里不存在的 .venv。"""
+    before = {}
+    result, wrapper = install_in_sandbox(tmp_path, "Demo", with_python=False, before=before)
+    assert result.returncode != 0
+    assert ".venv\\Scripts\\python.exe" in _output(result)
+    assert not wrapper.exists()
+    assert not (tmp_path / "scripts" / "task_demo_weekly_check.cmd").exists()
+    assert not (tmp_path / "task-calls.txt").exists()
+    assert entries(tmp_path) == before["entries"]     # nothing was created either
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
+def test_install_refuses_when_the_sessions_config_is_missing(tmp_path):
+    result, wrapper = install_in_sandbox(tmp_path, "Demo", with_sessions=False)
+    assert result.returncode != 0
+    assert "sessions.toml" in _output(result)
+    assert not wrapper.exists() and not (tmp_path / "task-calls.txt").exists()
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
+def test_explicit_locations_outside_the_repo_root_reach_the_task_commands(tmp_path):
+    """部署树是纯检出：解释器和运行数据在别处，包装器里只能写给出的路径。"""
+    runtime = tmp_path / "runtime"
+    python = runtime / "venv" / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"")
+    gateway = runtime / "gateway.json"
+    gateway.write_text(json.dumps({"allow_live_trading": False}), encoding="utf-8")
+    paths = {"PythonExe": python, "GatewayConfig": gateway,
+             "DataDir": runtime / "data", "RunnerLogDir": runtime / "demo",
+             "TaskLogDir": runtime / "tasklogs", "ReportsDir": runtime / "reports",
+             "SpreadModel": runtime / "costs" / "spread_model.json",
+             "SessionsConfig": tmp_path / "config" / "sessions.toml"}
+    result, wrapper = install_in_sandbox(tmp_path, "Demo", with_config=False, paths=paths)
+    assert result.returncode == 0, _output(result)
+    command = wrapper.read_text(encoding="ascii")
+    for name in paths:
+        assert str(paths[name]) in command, name
+    assert "--sessions-config" in command
+    assert str(tmp_path / "data") not in command        # not the old default location
+    weekly = (tmp_path / "scripts" / "task_demo_weekly_check.cmd").read_text(encoding="ascii")
+    assert str(python) in weekly and str(paths["DataDir"]) in weekly
+    assert (runtime / "tasklogs").is_dir()              # task output goes where told
+    assert not (tmp_path / "data").exists()
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
+def test_install_prints_the_task_parameters_for_the_deployment_record(tmp_path):
+    result, wrapper = install_in_sandbox(tmp_path, "Demo")
+    assert result.returncode == 0, _output(result)
+    lines = [line for line in result.stdout.decode(errors="replace").splitlines()
+             if line.startswith("TASK_PARAMETERS ")]
+    assert len(lines) == 1
+    parameters = json.loads(lines[0].removeprefix("TASK_PARAMETERS "))
+    assert parameters["mode"] == "Demo"
+    assert parameters["python"] == str(tmp_path / ".venv" / "Scripts" / "python.exe")
+    assert parameters["data_dir"] == str(tmp_path / "data")
+    assert parameters["gateway_config"] == str(tmp_path / "gateway.json")
+    assert parameters["sessions_config"] == str(tmp_path / "config" / "sessions.toml")
+    assert parameters["daily_report"] == {
+        "task": "MT5Quant\\live_daily_report", "local_time": "05:57", "wrapper": str(wrapper)}
+
+
+# ------------------------------------------------ T213 评审（2026-11-23）：安装前核对与包装器代码页
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
+def test_missing_demo_config_creates_no_directory(tmp_path):
+    """评审 R5：Demo 模式下没有任何网关配置时，旧脚本先建了 <数据目录>\\logs 才拒绝。"""
+    before = {}
+    result, wrapper = install_in_sandbox(tmp_path, "Demo", with_config=False, before=before)
+    assert result.returncode != 0
+    assert "gateway.json" in _output(result) and "-GatewayConfig" in _output(result)
+    assert entries(tmp_path) == before["entries"]       # 一个目录都没建
+    assert not (tmp_path / "data" / "logs").exists()
+    assert not wrapper.exists()
+    assert not (tmp_path / "task-calls.txt").exists()
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
+def test_install_refuses_when_the_spread_model_is_missing(tmp_path):
+    """评审 R6：点差模型不存在也照样安装，装出来的日报任务每天退出码 2、不重试。"""
+    before = {}
+    result, wrapper = install_in_sandbox(tmp_path, "Demo", with_spread=False, before=before)
+    assert result.returncode != 0
+    assert "spread_model.json" in _output(result) and "-SpreadModel" in _output(result)
+    assert entries(tmp_path) == before["entries"]       # 一个目录都没建
+    assert not wrapper.exists()
+    assert not (tmp_path / "task-calls.txt").exists()
+
+
+WESTERN = (1252, 1252)      # ANSI 和控制台两个代码页相同（都是西欧的 1252）：表示得了 é，表示不了汉字
+SPLIT = (1252, 437)         # ANSI 是 1252、控制台是 437：多数西欧系统的样子
+
+
+def system_code_pages():
+    """系统的 ANSI 与 OEM 代码页（读注册表）。安装脚本用的是 GetACP / GetOEMCP，两边互不依赖。"""
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                        r"SYSTEM\CurrentControlSet\Control\Nls\CodePage") as key:
+        return (int(winreg.QueryValueEx(key, "ACP")[0]),
+                int(winreg.QueryValueEx(key, "OEMCP")[0]))
+
+
+def representable(text, encoding):
+    try:
+        return text.encode(encoding).decode(encoding) == text
+    except UnicodeEncodeError:
+        return False
+
+
+def non_ascii_char(encoding):
+    """该代码页表示得了的一个非 ASCII 字符（各种系统代码页各备一个候选）。"""
+    return next((c for c in "éüäñд中日한" if representable(c, encoding)), None)
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
+def test_wrappers_keep_non_ascii_paths_in_the_system_ansi_code_page(tmp_path):
+    """评审 R7：包装器按系统 ANSI 代码页写。按 ASCII 写时中文等字符变成 "?"，
+    任务装得上、跑不起来，安装脚本却报告成功。两个代码页不同的机器上这种路径会被
+    拒绝（见 test_non_ascii_paths_are_refused_where_console_and_ansi_code_pages_differ），
+    所以这里按本机真实的两个代码页分两种情形核对。"""
+    acp, oemcp = system_code_pages()
+    encoding = f"cp{acp}"
+    mark = non_ascii_char(encoding)
+    if mark is None:
+        pytest.skip(f"系统代码页 {acp} 表示不了任何非 ASCII 字符")
+    deploy = tmp_path / f"{mark} deploy"
+    deploy.mkdir()
+    before = {}
+    result, wrapper = install_in_sandbox(deploy, "Demo", before=before)
+    if acp != oemcp:
+        assert result.returncode != 0 and entries(deploy) == before["entries"]
+        return
+    assert result.returncode == 0, _output(result)
+    for path in (wrapper, deploy / "scripts" / "task_demo_weekly_check.cmd"):
+        raw = path.read_bytes()
+        assert str(deploy) in raw.decode(encoding)         # 真实的路径，不是 "?"
+        assert b"?" not in raw and not raw.startswith(b"\xef\xbb\xbf")
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
+def test_install_refuses_paths_the_ansi_code_page_cannot_represent(tmp_path):
+    """评审 R7：两个代码页相同的机器上，路径里有这个代码页表示不了的字符时，在副作用
+    之前拒绝安装并说明原因。本机的系统代码页多半是 UTF-8（什么都表示得了），所以把
+    两个代码页都固定成 1252。"""
+    before = {}
+    deploy = tmp_path / "部署 tree"
+    deploy.mkdir()
+    result, wrapper = install_in_sandbox(deploy, "Demo", code_pages=WESTERN, before=before)
+    assert result.returncode != 0
+    assert "1252" in _output(result) and "tree" in _output(result)
+    assert entries(deploy) == before["entries"]            # 一个目录都没建
+    assert not wrapper.exists() and not (deploy / "task-calls.txt").exists()
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
+def test_wrapper_bytes_follow_the_ansi_code_page(tmp_path):
+    """两个代码页都是 1252 时，é 写成 0xE9（UTF-8 会是 C3 A9，ASCII 会是 "?"），文件头没有 BOM。"""
+    deploy = tmp_path / "déploy"
+    deploy.mkdir()
+    result, wrapper = install_in_sandbox(deploy, "Demo", code_pages=WESTERN)
+    assert result.returncode == 0, _output(result)
+    raw = wrapper.read_bytes()
+    assert b"d\xe9ploy" in raw and b"?" not in raw
+    assert str(deploy) in raw.decode("cp1252")
+    assert not raw.startswith(b"\xef\xbb\xbf")             # BOM 会被 cmd 当成命令的一部分
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
+def test_non_ascii_paths_are_refused_where_console_and_ansi_code_pages_differ(tmp_path):
+    """评审 R7 的最终处置。cmd.exe 按控制台代码页读 .cmd，新开控制台的缺省值是系统 OEM
+    代码页。它和 ANSI 代码页不同的机器上，不去猜哪种编码对 cmd 有效：路径里只要有一个
+    非 ASCII 字符就拒绝安装，一个目录都不建、一个任务都不建；纯 ASCII 路径照常安装。
+    é 在 1252 里表示得了，所以这里拒绝它的是"两个代码页不同"这一条，不是"表示不了"那一条。"""
+    before = {}
+    foreign = tmp_path / "déploy tree"
+    foreign.mkdir()
+    result, wrapper = install_in_sandbox(foreign, "Demo", code_pages=SPLIT, before=before)
+    assert result.returncode != 0
+    assert "OEM 437" in _output(result) and "1252" in _output(result) and "ASCII" in _output(result)
+    assert "tree" in _output(result)
+    assert entries(foreign) == before["entries"]           # 一个目录都没建
+    assert not wrapper.exists() and not (foreign / "task-calls.txt").exists()
+
+    before = {}
+    plain = tmp_path / "plain tree"
+    plain.mkdir()
+    result, wrapper = install_in_sandbox(plain, "Demo", code_pages=SPLIT, before=before)
+    assert result.returncode == 0, _output(result)
+    assert str(plain) in wrapper.read_text(encoding="ascii")   # 照常写、照常装
+    assert [tn for tn, _ in schtasks_calls(plain)] == [
+        "MT5Quant\\live_daily_report", "MT5Quant\\demo_weekly_check"]
+
+    # 别的位置也一样算：部署树的名字是纯 ASCII，数据目录的名字里有 é，同样拒绝，也不建目录。
+    plain = tmp_path / "ascii deploy"
+    (plain / "données" / "costs").mkdir(parents=True)    # 点差模型的缺省位置跟着数据目录走，先放好占位文件
+    (plain / "données" / "costs" / "spread_model.json").write_bytes(b"")
+    before = {}
+    result, wrapper = install_in_sandbox(plain, "Demo", code_pages=SPLIT,
+                                         paths={"DataDir": plain / "données"}, before=before)
+    assert result.returncode != 0 and "1252" in _output(result) and "OEM" in _output(result)
+    assert entries(plain) == before["entries"] and not wrapper.exists()
+
+
+STANDIN = (
+    "import json, os, sys\n"
+    "with open(os.environ['STANDIN_OUT'], 'w', encoding='utf-8') as f:\n"
+    "    json.dump(sys.argv, f)\n"
+)
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
+def test_installed_wrappers_start_under_non_ascii_paths(tmp_path):
+    """真正用 cmd.exe 跑一遍装出来的两份包装器：沙箱里的两个脚本换成只记录参数的
+    替身，核对它收到的路径和 TASK_PARAMETERS 行逐项一致。cmd 按控制台代码页读 .cmd，
+    新开控制台的缺省值是系统 OEM 代码页；它和 ANSI 代码页不同的机器上，安装脚本拒绝
+    非 ASCII 路径（见 test_non_ascii_paths_are_refused_where_console_and_ansi_code_pages_differ）。"""
+    acp, oemcp = system_code_pages()
+    if acp != oemcp:
+        pytest.skip(f"系统 ANSI（{acp}）与 OEM（{oemcp}）代码页不同：安装脚本拒绝非 ASCII 路径")
+    mark = non_ascii_char(f"cp{acp}")
+    if mark is None:
+        pytest.skip(f"系统代码页 {acp} 表示不了任何非 ASCII 字符")
+    deploy = tmp_path / f"{mark} deploy"
+    deploy.mkdir()
+    result, wrapper = install_in_sandbox(deploy, "Demo", paths={"PythonExe": sys.executable})
+    assert result.returncode == 0, _output(result)
+    lines = [line for line in result.stdout.decode(errors="replace").splitlines()
+             if line.startswith("TASK_PARAMETERS ")]
+    assert len(lines) == 1
+    parameters = json.loads(lines[0].removeprefix("TASK_PARAMETERS "))
+    for script in ("live_daily_report", "demo_check"):
+        (deploy / "scripts" / f"{script}.py").write_text(STANDIN, encoding="utf-8")
+
+    def run(task, script):
+        out = tmp_path / f"{task}.argv.json"
+        env = dict(os.environ, STANDIN_OUT=str(out))
+        done = subprocess.run(["cmd.exe", "/d", "/c", f"task_{task}.cmd"],
+                              cwd=deploy / "scripts", env=env, capture_output=True, timeout=60)
+        assert done.returncode == 0, done.stdout + done.stderr      # Python 启动并跑完
+        return json.loads(out.read_text(encoding="utf-8"))
+
+    assert run("live_daily_report", "live_daily_report") == [
+        str(deploy / "scripts" / "live_daily_report.py"),
+        "--date", "yesterday", "--data-dir", parameters["data_dir"],
+        "--reports-dir", parameters["reports_dir"],
+        "--spread-model", parameters["spread_model"],
+        "--log-dir", parameters["runner_log_dir"],
+        "--sessions-config", parameters["sessions_config"],
+        "--demo", "--gw-config", parameters["gateway_config"]]
+    assert run("demo_weekly_check", "demo_check") == [
+        str(deploy / "scripts" / "demo_check.py"), "--summary",
+        "--data-dir", parameters["data_dir"], "--log-dir", parameters["runner_log_dir"],
+        "--reports-dir", parameters["reports_dir"]]
+    assert (Path(parameters["task_log_dir"]) / "task_live_daily_report.log").is_file()
+    assert (Path(parameters["runner_log_dir"]) / "weekly-check.md").is_file()

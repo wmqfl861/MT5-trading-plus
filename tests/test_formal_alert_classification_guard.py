@@ -25,7 +25,8 @@ def checker_sets() -> dict[str, set[str]]:
 def runtime_alert_kinds() -> dict[str, set[str]]:
     files = sorted(ROOT.glob("src/mt5live/*.py")) + sorted(ROOT.glob("src/mt5gw/*.py")) + [
         ROOT / "scripts" / n for n in ("risk_process.py", "live_reconcile.py",
-                                       "live_runner.py", "live_supervisor.py")]
+                                       "live_runner.py", "live_supervisor.py",
+                                       "live_daily_report.py")]  # T213：日报任务也写告警
     consts: dict[str, str] = {}
     texts: dict[Path, str] = {}
     for p in files:
