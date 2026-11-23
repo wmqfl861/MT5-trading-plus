@@ -176,10 +176,16 @@ def verified_tree(entry, table, argv):
         if item["pid"] in seen:
             raise ValueError("cyclic process tree")
         seen.add(item["pid"])
-        # O23-1: skip Windows console host (conhost.exe) — OS infrastructure,
-        # not an application worker; checking it against deployment argv fails.
-        _image = pathlib.Path(item.get("executable") or "").name.lower()
-        if _image == "conhost.exe":
+        # O23-1: skip verified system console host leaf nodes only.
+        # Full path must match %SystemRoot%\System32\conhost.exe, and the
+        # node must have no children (a console host with children is not
+        # a leaf and gets full identity checking).
+        _exe = item.get("executable") or ""
+        _sys_conhost = pathlib.Path(
+            os.environ.get("SystemRoot", r"C:\Windows"), "System32", "conhost.exe"
+        )
+        if (pathlib.Path(_exe).resolve() == _sys_conhost.resolve()
+                and not any(c.get("parent_pid") == item["pid"] for c in table.values())):
             return
         _identity(item, observed_entry, argv)
         for child in table.values():
