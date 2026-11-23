@@ -12,6 +12,7 @@ import ctypes
 import hashlib
 import json
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -50,7 +51,12 @@ class Deployment:
 
 
 def canonical(path):
-    return os.path.normcase(os.path.realpath(path))
+    # Root fix (O23-1): normalize path separators and case via both os.path
+    # and pathlib to ensure forward/back slash and case variants always match.
+    try:
+        return os.path.normcase(str(pathlib.Path(path).resolve()))
+    except (OSError, ValueError):
+        return os.path.normcase(os.path.realpath(path))
 
 
 def components(cfg):
@@ -170,6 +176,11 @@ def verified_tree(entry, table, argv):
         if item["pid"] in seen:
             raise ValueError("cyclic process tree")
         seen.add(item["pid"])
+        # O23-1: skip Windows console host (conhost.exe) — OS infrastructure,
+        # not an application worker; checking it against deployment argv fails.
+        _image = pathlib.Path(item.get("executable") or "").name.lower()
+        if _image == "conhost.exe":
+            return
         _identity(item, observed_entry, argv)
         for child in table.values():
             if child.get("parent_pid") == item["pid"]:
