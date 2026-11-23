@@ -3,36 +3,46 @@
 由独立的计划任务每小时运行一次，不依赖任何 agent 会话。不 import MetaTrader5、
 不连接交易终端；只读登记、心跳、supervisor 状态、控制文件和磁盘余量，并写自己的
 状态文件。输出一行 JSON 和退出码：0 没有生产级问题；3 有生产级问题；2 检查自身出错。
+判级和排通知的纯逻辑在 liveness_logic.py。
 
-生产级问题（当小时通知）：任一角色消失或心跳停了超过 10 分钟没有被拉起；supervisor
-超过 10 分钟没有检查；halt、pause、killSwitch 或风险否决持续超过 1 小时；磁盘低于
-10 GB；已到期的日报缺失。日报任务要到 21:57 UTC 才生成前一天的日报，所以 22:30 UTC
-之前要求前天的日报在，22:30 起要求昨天的。持续时间靠状态文件跨运行累计。
-halt.json 和 pause-<magic>.json 存在但读不出、形状不对的，按存在处理（生产是 fail-closed）。
+生产级问题：任一角色消失或心跳停了超过 10 分钟没有被拉起；supervisor 超过 10 分钟没有
+检查；halt、pause、killSwitch 或风险否决持续超过 1 小时；磁盘低于 10 GB；已到期的日报
+缺失；登记项不成形状；时间戳来自未来。日报任务要到 21:57 UTC 才生成前一天的日报，所以
+22:30 UTC 之前要求前天的日报在，22:30 起要求昨天的。不带时区的时间戳按 UTC 读；比现在
+晚 60 秒以上的不算新鲜。halt.json、pause-<magic>.json 存在但读不出的按存在处理，持续时间
+按文件修改时间算（生产对它们是 fail-closed）。
 
-通知器读本机不入库的配置（*.local.json：{"channel": "webhook", "target": "<URL>"}），
-按用户选定的渠道发一条短消息。消息里只有问题代码、角色和时长，不带账号、路径、
-服务器名。halt、pause 的 reason 原文也不进输出，只给有没有、多少字符。
-通知发不出、状态文件写不了都不改变检查结论：退出码照旧，另记 notify_error、
-state_error（只有异常类名）。退出码 2 的那一行带 step（observe 或 evaluate）和异常
-类名，不带路径和异常原文。命令行参数写错时 argparse 也用退出码 2，输出是用法说明。
+通知：同一个生产级问题第一次发现时发一条；还在的话每 24 小时最多再发一条；消失时发一条
+"已恢复"。消息里只有问题代码和时长，不带账号、路径、服务器名。
+配置读本机不入库的 *.local.json，形状是 {"type": "webhook", "target": "<URL>"}：type 选出
+发送器，其余字段归这个渠道自己。目前只有 webhook 一种，其余渠道等用户选定（U10）。
+webhook 只发 https，http 只发回环地址，不跟随重定向。
+
+输出里的 notified：none（没有要发的）、sent、failed（配 notify_error）、no_channel、
+unsupported_channel、disabled（--no-notify）。没有渠道时不管有没有问题都写 no_channel：
+"有问题但没人收到"要看得出来。通知发不出、状态文件写不了都不改变检查结论：退出码照旧，
+另记 notify_error、state_error（只有异常类名）。状态文件读不出或形状不对的当空状态重新
+起算，另记 state_reset（形状不对是 true，读不出是异常类名）。
+退出码 2 的那一行带 step（observe 或 evaluate）和异常类名，不带路径和异常原文。
+命令行参数写错时 argparse 也用退出码 2，输出是用法说明。
 """
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
-import shutil
 import sys
-from datetime import datetime, timedelta, timezone
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
-HEARTBEAT_MAX_AGE_S = 120.0        # 与 supervisor 的 health_timeout 下限相同
-NOT_REVIVED_S = 600.0              # 角色消失 / 心跳停 / supervisor 不检查：超过即生产级
-CONTROL_STUCK_S = 3600.0           # halt、pause、killSwitch、否决：超过即生产级
-DISK_MIN_GB = 10.0
-GB = 2 ** 30
-REPORT_DUE_UTC = (22, 30)          # 日报任务 21:57 UTC 才生成昨天的日报；22:30 起才要求它在
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from liveness_logic import (  # noqa: E402
+    assess, blank_state, evaluate, format_message, load_state, mark_sent, notify, observe, parse_utc)
+
 STEPS = ("observe", "evaluate", "notify", "state")     # 检查的四步；退出码 2 只带前两步
 
 
@@ -65,169 +75,55 @@ def process_started_utc(pid: int) -> str | None:
 
 def process_alive(pid: int, started_utc: str) -> bool:
     """登记的启动器是否还是登记时的那个进程：PID 在，且创建时间相差不超过 1 秒。"""
-    actual = process_started_utc(pid)
-    if actual is None:
-        return False
+    actual, registered = parse_utc(process_started_utc(pid)), parse_utc(started_utc)
+    return actual is not None and registered is not None and abs((actual - registered).total_seconds()) <= 1.0
+
+
+class RefusedTarget(Exception):
+    """webhook 的目标不合规（不是 https，或者不是回环地址的 http）：不发请求。"""
+
+
+def _loopback(host: str) -> bool:
     try:
-        gap = (datetime.fromisoformat(actual) - datetime.fromisoformat(started_utc)).total_seconds()
-    except (TypeError, ValueError):
-        return False
-    return abs(gap) <= 1.0
+        address = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return host.lower() == "localhost"
+    mapped = getattr(address, "ipv4_mapped", None)        # 只有 IPv6Address 有：::ffff:127.0.0.1 这种
+    return address.is_loopback or mapped is not None and mapped.is_loopback
 
 
-def _read_json(path: Path):
-    """→ (文件存在, 解析结果)。存在但读不出或解析不了时，第二个是 None。"""
+def _check_target(target) -> str:
+    """只允许 https；http 只允许回环地址。"""
     try:
-        return True, json.loads(path.read_text(encoding="utf-8-sig"))
-    except FileNotFoundError:
-        return False, None
-    except (OSError, ValueError):
-        return True, None
+        parts = urllib.parse.urlsplit(target if isinstance(target, str) else "")
+        host = parts.hostname or ""
+    except ValueError:                                    # 例如 IPv6 的方括号不闭合
+        raise RefusedTarget("malformed target") from None
+    if not host or not (parts.scheme == "https" or parts.scheme == "http" and _loopback(host)):
+        raise RefusedTarget("target refused")
+    return target
 
 
-def _age(now: datetime, text) -> float | None:
-    try:
-        return max((now - datetime.fromisoformat(text).astimezone(timezone.utc)).total_seconds(), 0.0)
-    except (TypeError, ValueError):
-        return None
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None                                       # 3xx 不跟随：按发送失败处理
 
 
-def _reason(value) -> dict:
-    """reason 原文不输出（里面会有路径和账号）：只给有没有、多少字符。"""
-    text = value if isinstance(value, str) else "" if value is None else str(value)
-    return {"reason_present": bool(text), "reason_chars": len(text)}
+def _open(request, timeout):
+    return urllib.request.build_opener(_NoRedirect).open(request, timeout=timeout)
 
 
-def observe(live_dir, reports_dir, disk_path, now: datetime, alive=process_alive) -> dict:
-    """只读一次现场。任何一项读不到都如实记 None，不猜。"""
-    live = Path(live_dir)
-    obs = {"roles": {}, "registry_readable": True, "supervisor_age_s": None, "halt": None,
-           "pauses": [], "kill_switch": False, "risk_veto": False, "disk_free_gb": None,
-           "due_report": None, "due_report_present": None}
-    registry = _read_json(live / "instances.json")[1]
-    if not isinstance(registry, dict) or not isinstance(registry.get("instances"), list):
-        obs["registry_readable"] = False
-    else:
-        for entry in registry["instances"]:
-            key = str(entry.get("magic")) if entry.get("kind") == "runner" else entry.get("kind")
-            try:
-                running = bool(alive(entry["pid"], entry["started_utc"]))
-            except (KeyError, TypeError, ValueError):
-                running = False
-            heartbeat = _read_json(live / f"heartbeat-{key}.json")[1] or {}
-            obs["roles"][key] = {"launcher_alive": running, "heartbeat_age_s": _age(now, heartbeat.get("ts"))}
-    supervisor = _read_json(live / "supervisor-state.json")[1] or {}
-    obs["supervisor_age_s"] = _age(now, supervisor.get("last_checked"))
-    exists, halt = _read_json(live / "halt.json")
-    if exists:
-        # 存在即停机（生产是 fail-closed）：读不出的也算存在，只标明读不出
-        obs["halt"] = ({"unreadable": True, "age_s": None} if not isinstance(halt, dict) else
-                       {**_reason(halt.get("reason")), "owner": str(halt.get("owner")),
-                        "age_s": _age(now, halt.get("ts"))})
-    for path in sorted(live.glob("pause-*.json")):
-        _, pause = _read_json(path)
-        magic = path.name[len("pause-"):-len(".json")]
-        if not isinstance(pause, dict) or type(pause.get("paused")) is not bool:
-            obs["pauses"].append({"magic": magic, "unreadable": True, "age_s": None})  # 读不出按暂停
-        elif pause["paused"]:
-            obs["pauses"].append({"magic": magic, **_reason(pause.get("reason")),
-                                  "age_s": _age(now, pause.get("ts"))})
-    obs["kill_switch"] = (live / "killSwitch").exists()
-    obs["risk_veto"] = (live / "halt-risk-veto.json").exists()
-    try:
-        obs["disk_free_gb"] = round(shutil.disk_usage(disk_path).free / GB, 2)
-    except OSError:
-        pass
-    utc = now.astimezone(timezone.utc)
-    due = (utc - timedelta(days=1 if (utc.hour, utc.minute) >= REPORT_DUE_UTC else 2)).date()
-    obs["due_report"] = due.isoformat()
-    obs["due_report_present"] = ((Path(reports_dir) / "live" / f"daily-{due.isoformat()}.md").is_file()
-                                 if Path(reports_dir).is_dir() else None)
-    return obs
-
-
-def _production(code: str, detail: dict, lasted: float) -> bool:
-    age = detail.get("age_s")
-    lasted = max(lasted, age if isinstance(age, (int, float)) else lasted)
-    if code.startswith(("role_missing:", "heartbeat_stale:")) or code in ("supervisor_stale", "registry_unreadable"):
-        return lasted >= NOT_REVIVED_S
-    if code.startswith("pause:") or code in ("halt", "kill_switch", "risk_veto"):
-        return lasted >= CONTROL_STUCK_S
-    return code in ("disk_low", "report_missing")      # these are production-level at once
-
-
-def evaluate(obs: dict, now: datetime, state: dict) -> tuple[list[dict], dict]:
-    """把现场变成问题清单。state 记每个问题第一次被看到的时刻（ISO），只保留仍在的问题。"""
-    present: dict[str, dict] = {}
-    stamp = now.astimezone(timezone.utc).isoformat()
-    if not obs["registry_readable"]:
-        present["registry_unreadable"] = {}
-    for key, role in sorted(obs["roles"].items()):
-        if not role["launcher_alive"]:
-            # The heartbeat's own age says how long the role has been down: if nobody
-            # revived it, that is already past the limit on the very first look.
-            present[f"role_missing:{key}"] = {"role": key, "age_s": role["heartbeat_age_s"]}
-        elif role["heartbeat_age_s"] is None or role["heartbeat_age_s"] > HEARTBEAT_MAX_AGE_S:
-            present[f"heartbeat_stale:{key}"] = {"role": key, "age_s": role["heartbeat_age_s"]}
-    if obs["supervisor_age_s"] is None or obs["supervisor_age_s"] > HEARTBEAT_MAX_AGE_S:
-        present["supervisor_stale"] = {"age_s": obs["supervisor_age_s"]}
-    if obs["halt"]:
-        present["halt"] = dict(obs["halt"])
-    for pause in obs["pauses"]:
-        present[f"pause:{pause['magic']}"] = dict(pause)
-    for code, flag in (("kill_switch", obs["kill_switch"]), ("risk_veto", obs["risk_veto"])):
-        if flag:
-            present[code] = {}
-    if obs["disk_free_gb"] is not None and obs["disk_free_gb"] < DISK_MIN_GB:
-        present["disk_low"] = {"free_gb": obs["disk_free_gb"]}
-    if obs["due_report_present"] is False:
-        present["report_missing"] = {"report": obs["due_report"]}
-    state = {code: state.get(code, stamp) for code in present}
-    findings = []
-    for code, detail in present.items():
-        lasted = (now.astimezone(timezone.utc) - datetime.fromisoformat(state[code])).total_seconds()
-        findings.append({"code": code, "since": state[code], "lasted_s": round(lasted),
-                         "production": _production(code, detail, lasted), **detail})
-    return findings, state
-
-
-def format_message(production: list[dict]) -> str:
-    parts = [f"{item['code']}({item['lasted_s'] // 60}分)" for item in production]
-    return "MT5 Demo 值守：" + " ".join(parts)
-
-
-def webhook_sender(target: str, message: str) -> None:
-    """通用 webhook：POST {"text": <message>}。渠道的具体格式等用户选定后（U10）再定。"""
-    import urllib.request
+def webhook_sender(config: dict, message: str) -> None:
+    """通用 webhook：POST {"text": <message>} 到 config["target"]。载荷格式等用户选定渠道后（U10）再定。
+    发送器的接口是 (渠道配置字典, 消息正文)：字典里的 type 选出发送器，其余字段归这个渠道自己。"""
     request = urllib.request.Request(
-        target, data=json.dumps({"text": message}).encode("utf-8"),
+        _check_target(config.get("target")), data=json.dumps({"text": message}).encode("utf-8"),
         headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(request, timeout=15) as response:
+    with _open(request, timeout=15) as response:
         response.read()
 
 
-SENDERS = {"webhook": webhook_sender}
-
-
-def notify(findings: list[dict], config_path, send=None) -> tuple[str, str | None]:
-    """有生产级问题才发。→ (none / no_channel / unsupported_channel / sent / failed, 异常类名)。
-    发送失败只记下来，由调用方照常下结论。配置文件只在本机（*.local.json 已被 .gitignore 忽略）。"""
-    production = [item for item in findings if item["production"]]
-    if not production:
-        return "none", None
-    config = _read_json(Path(config_path))[1]
-    channel = config.get("channel") if isinstance(config, dict) else None
-    target = config.get("target") if isinstance(config, dict) else None
-    if not channel or not target:
-        return "no_channel", None
-    sender = send or SENDERS.get(channel)
-    if sender is None:
-        return "unsupported_channel", None
-    try:
-        sender(target, format_message(production))
-    except Exception as exc:                   # sending is best effort: type name only, no paths
-        return "failed", type(exc).__name__
-    return "sent", None
+SENDERS = {"webhook": webhook_sender}       # type → 发送器。U10 没有答复：别的渠道不实现，只留接口
 
 
 def _attempt(step: str, action):
@@ -260,23 +156,29 @@ def main(argv=None, *, now=None, alive=process_alive, send=None) -> int:
     observed, failure = _attempt("observe", lambda: observe(
         args.live_dir, args.reports_dir, args.disk_path, now, alive))
     if failure is None:
-        verdict, failure = _attempt(
-            "evaluate", lambda: evaluate(observed, now, _read_json(state_path)[1] or {}))
+        # 状态文件读不出、形状不对：当空状态重新起算，不让检查因此退出码 2
+        loaded, lost = _attempt("state", lambda: load_state(state_path))
+        state, reset = loaded if lost is None else (blank_state(), lost["error"])
+        verdict, failure = _attempt("evaluate", lambda: assess(observed, now, state))
     if failure:
         print(json.dumps({"ts": now.isoformat(), "ok": None, **failure}))
         return 2
-    findings, state = verdict
-    # 先有结论：通知发不发得出去、状态文件写不写得成，都不改它
-    delivery, failure = _attempt("notify", lambda: "disabled" if args.no_notify
-                                 else notify(findings, args.notify_config, send))
-    notified, notify_error = (("disabled", None) if args.no_notify
-                              else delivery if failure is None else ("failed", failure["error"]))
-    _, failure = _attempt("state", lambda: write_state(state_path, state))
+    findings, (announce, recovered, new_state) = verdict
+    # 先有结论：通知发不发得出去、状态文件写不写得成，都不改它。先通知、后写状态文件。
+    message = format_message(announce, recovered) if announce or recovered else None
+    if args.no_notify:
+        notified, notify_error = "disabled", None
+    else:
+        delivery, failure = _attempt("notify", lambda: notify(message, args.notify_config, SENDERS, send))
+        notified, notify_error = delivery if failure is None else ("failed", failure["error"])
+        if notified == "sent":
+            mark_sent(new_state, announce, now)
+    _, failure = _attempt("state", lambda: write_state(state_path, new_state))
     production = any(item["production"] for item in findings)
     print(json.dumps({"ts": now.isoformat(), "ok": not findings, "production": production,
                       "notified": notified, "notify_error": notify_error,
-                      "state_error": failure["error"] if failure else None, "findings": findings},
-                     ensure_ascii=True))
+                      "state_error": failure["error"] if failure else None, "state_reset": reset,
+                      "findings": findings}, ensure_ascii=True))
     return 3 if production else 0
 
 
