@@ -564,3 +564,291 @@ Windows 更新（无事件，且已暂停至 12-05）。
 1. 终端停止后复核 common.ini：Enabled=1、Account=0、Profile=0（被回写则在停机态重改）；
 2. 维护窗内"重新扫描服务器"，记录前后 ping；
 3. 任务计划器历史已启用——11-22 起的计划任务事件可查（含 supervisor 每分钟 tick）。
+
+## 2026-11-23（周一）· 第二十三轮 §1：探针、观察运行补记、supervisor 任务、证据保全、11-21 取证（主会话）
+
+写入时刻 2026-11-23 17:00 UTC 前后（系统时钟）。依据：第二十三轮施工计划 §1、D109、D110、O23-6、O23-13。
+**11-23 10:51 UTC 起的运行是观察运行，不计烧机、不计窗口；窗口 0/10，11-24 不是第 1 天。**
+时间一律 UTC。路径用占位符：`<工作区>`＝主仓工作区；`<部署树>`＝主仓同级的 `demo-deploy-cd6fc4a`；
+`<用户目录>`＝用户主目录。证据目录 `data/ops-evidence/…` 不入库，本机留 sha256 清单。
+
+### 1. 第二十三轮探针在本机 Windows 上的输出（第 0 步）
+
+main 快进到 `64b8f56`（CI 45210397492 success；`4609be1`、`ded9407` 的 CI 也是 success）。
+在仓库根执行 `python -I docs/reviews/probes/2026-11-23-round23-probes.py`，原样输出：
+
+```text
+[P23-1] REPRODUCED: 健康树校验通过（2 个进程）；启动器退出、PID 被两天后启动的无关进程占用 → 返回=None，报错='process script/arguments mismatch'（期望：视为 process_missing，返回 []，由 supervisor 重启）
+[P23-2] REPRODUCED: 终端进程退出后的下一次网关调用里 initialize(path) 被调 1 次（调用成功）——真实 MetaTrader5 包这一调用会拉起 terminal64.exe 作为调用进程的子进程；verified_tree 遇到 worker 下的 terminal64.exe 报错='process script/arguments mismatch'
+[P23-3a] NOT-REPRODUCED: 启动器下挂系统 conhost 叶子 → 返回 pid=[101, 100]，报错=None（NOT-REPRODUCED = O23-1 对这一形态有效；conhost 不进终止清单）
+[P23-3b] REPRODUCED: 另有一个早一天启动的无关进程，其 parent_pid 等于 conhost 的 PID → 报错='process script/arguments mismatch'（期望：按创建时间排除陈旧父链接，conhost 仍算叶子）
+[P23-3c] REPRODUCED: 启动器已退出、只剩它的 conhost → 返回=None，报错='missing launcher with surviving/duplicate worker'（期望：不把系统 conhost 当成存活 worker）
+[P23-4] REPRODUCED: 四个角色全部健康，仅 verify_deployment 的 git 调用超时 → refused=True，reason="TimeoutExpired: Command '['git', '-C', '<deploy>', 'status']' timed out after 15 seconds"，halt.reason='supervisor_refused'，告警含 SUPERVISOR_REFUSED=True；正式检查把 SUPERVISOR_REFUSED 归异常类=True（窗口内一条即判失败）
+[P23-5] REPRODUCED: 生产启动路径：supervisor 用 CREATE_NO_WINDOW=True、demo_run.ps1 用 -WindowStyle Hidden=True；supervisor 测试经过 launch()=False（测试自己用 subprocess.Popen 起进程 4 处）；tests/ 含 conhost 的文件=[]；70cd7eb..ded9407 改动文件=['scripts/live_supervisor.py']
+[P23-6] REPRODUCED: 开仓成交后 SL/TP 修正被拒（10016）→ 回报 action='rejected'（异常=None），券商侧该 magic 持仓 1 笔，journal 状态序列=['pending', 'rejected']，告警含 ORDER_REJECTED=True，deals 证据流 0 行（期望：成交如实入 journal 与 deals，SL/TP 修正失败单独告警）
+[P23-7] INFO: tests.yml 含静态检查步骤=False；pyproject.toml 含 ruff/mypy 配置=False
+
+汇总：
+  P23-1: REPRODUCED
+  P23-2: REPRODUCED
+  P23-3a: NOT-REPRODUCED
+  P23-3b: REPRODUCED
+  P23-3c: REPRODUCED
+  P23-4: REPRODUCED
+  P23-5: REPRODUCED
+  P23-6: REPRODUCED
+  P23-7: INFO
+```
+
+`python -I docs/reviews/probes/2026-11-20-round22-probes.py`，原样输出：
+
+```text
+[P22-1] NOT-REPRODUCED: 窗口第 2 天一条运行器断线告警 BROKER_UNAVAILABLE → 返回 3，判'窗口内异常'=False（基线证据本身返回 3）
+[P22-2c] INFO: 对照：周六 rc=78、无 supervisor 重启 → 返回 1（T210 前后都应为 1）
+[P22-2] NOT-REPRODUCED: 周六 rc=78 退出告警且 2 分钟后 supervisor 已重启 → 返回 3（判异常=False）；周六两段已恢复断线共 3077 秒 → 返回 3（判降级超限=False）
+[P22-3] NOT-REPRODUCED: 仓库卫生扫描违规 0 处，涉及 []
+[P22-4] NOT-REPRODUCED: launch() 使用 CREATE_NO_WINDOW=True；无 conhost 时校验通过（2 个进程），加一个 conhost.exe 子进程后报错=None（11-17 演练 A 报错原文相同）
+
+汇总：
+  P22-1: NOT-REPRODUCED
+  P22-2c: INFO
+  P22-2: NOT-REPRODUCED
+  P22-3: NOT-REPRODUCED
+  P22-4: NOT-REPRODUCED
+```
+
+读法：P22-4 在 Windows 上不复现，是因为 `ded9407` 已在 main 上，而探针里的 conhost 路径在 Windows 上
+能解析到系统目录（审核在 Linux 上仍复现，属平台差异）。这只说明 O23-1 对"启动器下挂系统 conhost
+叶子"这一种形态有效（P23-3a），另外两种 conhost 形态仍然复现（P23-3b、P23-3c）。结论与审核一致：
+`4609be1`、`ded9407` 不作为窗口候选，由 T211 重做。当时 codex 对 `4609be1` 的否决记录见
+`docs/reviews/2026-11-23-o23-1-codex-review.md`（`ded9407` 没有再送复审）。
+
+### 2. 观察运行补记：11-23 10:51 UTC 的部署（观察运行，不计烧机、不计窗口）
+
+主会话在 11-23 做了一次紧急重启，当时没有留记录。以下全部是事后只读取证（11-23 15:53–16:45 UTC），
+**没有为了补记录去连接交易终端**。
+
+- **代码**：`cd6fc4aaac7d3886be0fbdfa4f437345b6b1b8c5`，恰好一个。`<部署树>` 是 detached（`git symbolic-ref`
+  返回非零），`git status --porcelain --untracked-files=all` 零行（只被忽略的运行产物）。按 D110，它不作为窗口候选。
+- **启动方式**：一次性任务 `\emergency-restart-1123`，11-23 10:51:00.395 UTC 注册（任务计划器事件 106/140）
+  → `<工作区>` 根目录的 `deploy-consolidated.ps1` → `<部署树>\scripts\demo_run.ps1 -Mode Demo`，参数显式写全。
+  部署发生在盘中（周一 10:51 UTC），不在休市维护窗内；此前从 11-21 12:51:47 UTC 起四个进程为零，约 46 小时。
+- **配置**（三份 sha256 与 11-17 的部署记录逐字一致）：
+  - `DEMO-MA-XAUUSD-M15.toml`（magic 902610，固定 0.01 手）：`d983a2420a1dd5d95b9651a9d7250860a2f4226c48f9a524deeac87d552a497b`
+  - `BUY-HOLD-XAUUSD-H1.toml`（magic 902501，固定 0.01 手）：`e0498f28a49ccd75d93a3af0a56112143f37111431fa947e82929419cce3f06f`
+  - `<部署树>\config\risk.toml`：`e8db707b91177f4695bce888e011583892019a622011bb754a450ff75fd3e05a`，
+    `daily_loss_cap_usd = 500.0`；风控进程命令行里的 `--config` 实测就是这份 `risk.toml`（不是 `risk-demo.toml`）。
+  - `sessions.toml`：`762782591ed839d26b1dd35c76bcdb1ae9726cf2b57a62901b8d04e56ad59fa4`。
+- **进程**（11-23 16:01:20 UTC 的进程表；"启动器"是 venv 的 `python.exe`，"解释器"是它拉起的真正工作进程）：
+
+  | 角色 | 启动器 PID / 创建时刻 | 解释器 PID | conhost 子进程 | 启动器的父进程 |
+  | --- | --- | --- | --- | --- |
+  | runner-902610 | 17336 / 10:51:13 | 11752 | 20632 | PID 5428（任务宿主的 shell，已退出） |
+  | runner-902501 | 13408 / 10:51:13 | 19204 | 4712 | 同上 |
+  | risk | 18212 / 10:51:21 | 10992 | 5736 | 同上 |
+  | reconcile | 11568 / 13:18:20（supervisor 重启） | 16968 | 快照里没有以它为父的 conhost | PID 20508（supervisor 宿主，已退出） |
+
+  四棵树都是"启动器 → 解释器 + 一个系统 conhost 叶子"；16:01 的快照里没有任何 worker 下面挂着 terminal64.exe。
+  agent 会话不是这些进程的祖先（符合 D98）；但解释器、数据目录、包装脚本都在 agent 工作区内（不符合 D112，已知）。
+- **登记与清单**：`run-manifest.json` 追加了一条 `start`（10:51:23 UTC）；`evidence/run-20/` 三个文件写于 10:51:23–24；
+  `instances.json` 由启动器重写。**旧 `data/live` 没有归档，原地沿用**（同模式、同部署形态、同数据目录，按 runbook §6.2
+  属标准重启）：各 magic 的 journal、orders、deals、expected 文件，`alerts.log` 全文，`ops-restarts.jsonl`，
+  `evidence/instances/`、`evidence/run-17`…`run-20`，以及 11-17 留下的 `exit-*.json`、`disconnect-exit-*.json` 旧标记都在原处。
+- **halt 和 pause 是怎么清掉的**：主会话在启动前（约 10:50 UTC）手工删除了 `halt.json` 和 pause 文件，
+  **删除前没有留存、也没有记录内容**（风控日志 10:51:23 UTC 显示 `halt=否`）。这是主会话的疏漏。
+  当时在场的控制文件只能从告警反推：`halt.json`（supervisor 所有）、`halt-risk-veto.json`（见 §3）、902610 的 pause
+  （11-21 12:46:46 UTC 的 `HEARTBEAT_TIMEOUT`）。11-23 启动前的登记文件是否也被删除，现在已无法确认；
+  它当时的内容与 `evidence/instances/20261121-124635-8-after.json` 相同（12:46:46 UTC 之后登记没有再变），已保全。
+- **902501 那笔多单是怎么接的**：靠 journal 原地接续。运行器 10:51:15 UTC 的第一条决策就是
+  `signal=1 target=1 volume=0.01` → `执行 hold：net 0.01 → 0.01，0 笔请求`；`expected-902501.json` 仍是 11-19 15:00:07 UTC 那份；
+  账户上这笔多单（ticket 2916…313，0.01 手）自 11-21 12:51 到 11-23 10:51 UTC 约 46 小时没有任何进程管理，BuyHold 无止损。
+  没有发平仓单、没有发新单。11-23 对账每 30 秒"对账一致"。
+- **902610 在 11-23 的成交**（都是策略自己的单，journal 回码 10009）：11:15:05 UTC 开多 0.01 手；12:30:05 UTC 反手卖出 0.01 手；
+  13:25:04 UTC 止损成交平仓（deal 2353…846，对账记为 `external_exit` 并已消费）。此后空仓。
+- **终端**：生产网关的 `gateway.json` 是 `{}`，终端路径取默认值（`Program Files` 下的正式安装）。现在的生产终端 PID 15760，
+  创建于 11-22 00:21:09 UTC，父进程是 explorer（从桌面手动打开），不是任何 worker 的子进程。
+  `trade_allowed`、`tradeapi_disabled` 没有读（D82、D104）；11:15 和 12:30 UTC 两笔单子都成交，说明当时允许算法交易。
+  机器上还跑着第二个 MT5 终端（盘根 `MT5_B1` 目录，PID 15348，11-21 13:20:33 UTC 启动，见 §5），生产网关不引用它。
+- **supervisor**：`live_supervisor2`，树外 `host.py` 包装（生产文件 sha256 `9260842ecd348729933d55d29bac4bcf291676660f431ec87637ade324e55425`，
+  `sup-wrapper.ps1` `b7445890548bf36a26f848e8e2c2ff4235256e46489182393c8e1f259e2fcb99`），见 §4。
+
+### 3. 观察运行在 11-23 13:18–16:42 UTC 处于 halt（新发现，已处置）
+
+- **事件**：13:18:18.0019 UTC supervisor 判 `unhealthy={'reconcile': 'heartbeat_or_log_stale'}`，写 `halt.json`
+  （`component_lost`，owner=supervisor）；13:18:20 UTC 重启对账（15924 → 11568，`ops-restarts.jsonl` 第 9 行，
+  `evidence/instances/20261123-131818-9-before/after.json` 和 `index.jsonl` 齐全，没有 `SUPERVISOR_EVIDENCE`）；
+  13:19:17 UTC 起 `healthy_since` 连续。旧对账日志最后一行是 13:18:17 UTC"对账一致（2 个持仓）"，节拍 30 秒，`.err` 为空。
+- **后果**：supervisor 重启成功后要连续健康 5 分钟才解除自己写的 halt，但 `_clear_owned()` 开头规定
+  **只要 `halt-risk-veto.json` 存在就不解除**。这个否决文件是 11-21 12:46:46 UTC 风控写的（`heartbeat_timeout`），
+  11-23 紧急重启时被漏清。于是 halt 持续 3 小时 24 分：902610 每根 M15 的决策都被风控以 `halted: component_lost`
+  拒绝（13:30–16:30 UTC 共 13 条 `RISK_REJECT`）；902501 持仓不动，不受影响。11-23 13:16 UTC 的日检在这之前 2 分钟，
+  没有看到。
+- **对账为什么被判陈旧**：未查明。已排除：超时（上限是 120 秒，对账 30 秒写一次）；时钟回拨（系统日志 11-23 没有
+  "系统时间已更改"事件）；崩溃（`.err` 为空，没有退出标记）；日志停写（13:18:17 UTC 刚写过）。
+  时间上的巧合：supervisor 每分钟在 `:18` 秒检查，对账每 30 秒在 `:17`/`:47` 秒写心跳和日志，两者撞在同一秒。
+  心跳文件读写相撞是可能的原因，但告警不记录是哪一条子条件失败，无法证实。
+- **处置**（D109：先保全现场再处置）：16:01:20 UTC 进程表、16:14 UTC 的 `data/live` 全量快照已存
+  `data/ops-evidence/observe-20261123/`；16:41:44 UTC 把 `halt-risk-veto.json`（sha256 `ad0bf2f8…`）
+  **移到**证据目录（没有删除）；16:42:18 UTC supervisor 自动解除 halt（`halt.json` 已不存在，没有 killSwitch）。
+  没有重启任何进程，没有改代码和配置。16:45:05 UTC 起 902610 恢复决策并开多 0.01 手（回码 10009）。
+
+### 4. supervisor 任务：只留一个（已核对，无需停用）
+
+`\MT5Quant\` 下 8 个任务（11-23 16:09 UTC，只读导出，存证据目录）：
+
+| 任务 | 状态 | 最近一次运行 / 结果 | 说明 |
+| --- | --- | --- | --- |
+| `live_supervisor2` | **Running（唯一启用）** | 每分钟；`ExecTimeLimit` PT2M；`StartWhenAvailable` | 动作 `wscript //B //Nologo sup-launcher.vbs` → `sup-wrapper.ps1` → `host.py`，指向 `<部署树>` 和 SHA `cd6fc4a…`，与 §2 的部署一致。登录类型 Interactive，RunLevel Highest |
+| `live_supervisor` | Disabled（11-19 起） | 11-19 15:16:16 UTC，rc=2 | 树内直连版，指向同一部署树和 SHA |
+| `live_daily_report` | **Disabled（11-21 12:52:23 UTC 起）** | 11-20 21:57:57 UTC，rc=1 | 原因见 §5 第 8 项 |
+| `demo_weekly_check` | Disabled（11-21 12:52:21 UTC 起） | 11-15 23:00 UTC，rc=1 | 同上 |
+| `refresh_bars`、`refresh_ticks`、`snapshot_specs` | Disabled | 11-07 | 数据任务，停用到正式检查结束（D82） |
+| `watch_swap` | Disabled | 10-27 | 旧任务 |
+
+没有两个 supervisor 任务同时启用的情况。`live_supervisor2` 指向的就是当前部署，不停用。
+11-23 的重登记记录：10:57:40 UTC 注册、11:00:29 UTC 禁用、11:07:08 UTC 再注册（主会话调试 `host.py` 期间）。
+一次性的 `\emergency-restart-1123`、`\deploy-consolidated-20261117` 两个任务仍留在任务库里（后者已禁用），待新候选部署时一并撤除。
+观察：拒绝轮次里任务结果码是 0x80070002（2147942402），而脚本设计是返回 2；来源未查明。
+
+### 5. 证据保全（不入库）
+
+`data/ops-evidence/collapse-20261121/`：138 个文件、177.2 MB，清单 `SHA256SUMS-20261123T164221Z.txt`。
+`data/ops-evidence/observe-20261123/`：11-23 的进程表、任务清单、移走的否决文件，各带清单。内容：
+
+- `live-snapshot-20261123T161427Z/live/`：`data/live` 全量（两个单实例锁文件被进程锁住，复制不了，属正常）；
+- `demo-logs/`：`data/demo` 下 11-19 14:58 UTC 之后的全部日志和 `.err`；
+- `supervisor-host/`：生产在用的 `host.py`、`sup-wrapper.ps1`、`sup-launcher.vbs`、`start.ps1`、`start-wrapper.ps1`、`common.ini.bak`；
+- `agent-logs/`：agent 桌面端 11-20 至 11-23 的运行日志；
+- `terminal-logs/`：两个终端 11-17 至 11-23 的日志和 `origin.txt`；
+- `event-logs/`：任务计划器操作日志全量、System 与 Application（11-21 00:00–14:00 UTC、11-23 12:00–17:00 UTC）、
+  远程桌面会话日志（11-20 20:00 至 11-22 02:00 UTC）、PowerShell 操作日志（11-21 12:00–13:30 UTC）、8 个任务的 XML、本项目任务的事件时间线。
+
+**没有保住或从来不存在的**：
+
+1. 任务计划器历史只保留到 11-21 05:28:01 UTC（通道上限 10 MB，循环覆盖）；01:24 前后那一段已丢。
+2. 11-21 12:46–12:52 UTC 的进程快照不存在；进程审计（Security 4688/4689）没有开启。
+3. 11-23 重启前 `data/live` 里的 halt、pause 原件和当时的登记（主会话删除时没有留存，见 §2）。
+4. Herdr 远程 shell 在 11-21 的命令记录没有留存（只剩文件传输目录的时间戳）。
+5. PowerShell 脚本块日志在 11-21 12:00–13:30 UTC 是 0 条。
+
+### 6. 11-21 取证结论（D109，对照审核 O23-6 的候选表）
+
+**第 1 项：01:24:34 第一次拒绝时四个登记的启动器是否都活着；此前有没有退出标记。**
+都活着。两个运行器 01:00–01:59 UTC 每 2 秒一条日志（各约 1,700 条），风控、对账日志连续；
+退出标记只有 11-17 21:03 UTC 的旧文件；11-21 在 01:24:34 之前没有任何告警。
+12:46:35 UTC 的登记副本（`20261121-124635-5-before.json`）里四个 PID 仍是 11-19 那批
+（902501=6984、902610=15348、risk=14208、reconcile=3136），11-19 21:51:35 到 11-21 12:46:35 UTC 之间 supervisor 没有重启过任何角色。
+
+**第 2 项：被拒绝的是哪一棵树。** 未查明：告警只有一句 `process script/arguments mismatch`，没有角色、PID、映像，也没有进程快照。
+
+**第 3 项：终端当时的 PID、父进程、创建时间；日志里 01:1x–01:2x 有没有启动记录。**
+PID 和父进程没有记录。**有启动记录**（生产终端日志，原文件是本地时间，这里换算成 UTC）：
+01:24:20.672 一个实例记 `terminal process already started` 后退出；01:24:20.943 `MetaTrader 5 x64 build 6274 started`；
+01:24:26 授权；01:24:28 同步完成、trading has been enabled。
+在此之前**没有旧实例的 `exit with code 0` / `disconnected`**——原来在跑的终端不是正常退出的（它上一条日志是 11-20 19:15 UTC）。
+**触发源是直接证据**（agent 桌面端主进程日志）：01:24:17.250 `[app-quit] explicit quit requested (tray-quit)` →
+01:24:17.4–18.4 各工作区的运行时宿主被逐个清理（含本项目工作区）→ 01:24:19.031 应用退出 →
+01:24:26.9 新的应用进程启动（版本 3.18.2，自动更新检查"已是最新"）。即：**有人从系统托盘菜单显式退出了 ZCode 桌面端，8 秒后又打开**；
+不是崩溃，也不是自动更新。同一账户的远程桌面会话在 01:09:08、01:20:48 UTC 两次重连。
+**之后的四次终端重启也是同一形态**（UTC）：旧实例正常退出 → 2–5 秒后出现"另一个实例已在运行"的短命实例 → 几百毫秒内
+真正启动。11:37:28.7 退出、11:37:33.9/34.4 启动；12:36:43.1 退出、12:36:44.7/45.2 启动；12:43:48.4 退出、12:43:50.8/50.9 启动；
+12:44:37.5 退出、12:44:40.7 和 12:44:55.7 两次启动；12:46:40.3 再次启动（前一个实例没有正常退出记录）。
+01:24 和 12:46 两次可以确定是 worker 拉起的：前者在 ZCode 应用进程退出（01:24:19.0）之后 1.6 秒，
+后者在 supervisor 拉起第一批 worker（12:46:37）之后约 3 秒，人都来不及操作。其余几次形态相同，但不能排除人工双击。无论哪一种，**supervisor 的拒绝在每一次终端重启之后都照旧**：
+如果新终端是人手动开的，它不在 worker 的进程树里，拒绝应当停止。这与"终端整天挂在 worker 的进程树下"一致。
+
+**第 4 项：12:46 之前四个进程在什么时刻、以什么方式消失。**
+最后一行日志：runner-902610 12:44:35、reconcile 12:45:30、risk 12:45:50、runner-902501 12:45:53（UTC）；
+12:46:32.349 UTC supervisor 启动，判四个角色 `process_missing`。四份 `.err` 全是 0 字节，没有退出标记，
+应用日志没有 python 崩溃记录，系统日志 12:20–13:00 UTC 没有事件，机器上次开机是 11-08 04:59:51 UTC
+→ **是被外部结束的**，前后错开约 80 秒（不是一次批量结束）。
+现场背景（都是 Administrator 账户下的操作）：Herdr 远程 shell（`hc.exe` → `cmd.exe`）10:57:10 UTC 打开；
+Herdr 文件传输 10:58、11:50 UTC；盘根 `MT5_B1` 目录 11:50:11 UTC 创建（第二个 MT5 安装）；
+生产终端被重启多次（UTC）：11:37:26–41、12:36:42–51、12:43:47–12:44:00、12:44:36–58（前一个正常退出，随后起了两个实例）、
+12:46:40（前一个实例没有正常退出记录）。runner-902610 的最后一行（12:44:35）比终端那次正常退出（12:44:36.966）早 1.6 秒。
+
+**第 5 项：agent 桌面端日志在 12:4x 有没有关闭指纹。** 没有。11-21 12:3x–12:5x UTC 桌面端一直在运行
+（唯一的生命周期事件是 12:38:07 UTC 一个会话卸载）。当时活跃的是另一个项目工作区的会话（一个主会话带三个子代理，
+12:40–12:55 UTC 约 460 条工具事件），命令内容不在这两类日志里。→ 12:46 和 12:51 的两次消失**不是** ZCode 退出造成的。
+
+**第 6 项：12:46:37–45 UTC 重启的四个进程的退出码和最后日志；是不是启动时连接失败。**
+不是。四个都正常起来并连上：运行器 12:46:46 UTC 取到报价（休市，跳过）；风控 12:46:46 UTC `心跳=timeout halt=是`，
+之后 `心跳=ok`；对账 12:46:47 UTC 起"对账一致（1 个持仓）"。
+之后四个进程在**同一秒**停止（12:51:46.6–12:51:47 UTC：runner-902610 12:51:46.686、runner-902501 12:51:46.756、
+风控 12:51:46、对账 12:51:47），`.err` 为空，没有退出标记、没有退出码 → 同时被外部结束。
+
+**第 7 项：12:51 之后 `SUPERVISOR_REFUSED` 为什么停了；supervisor 任务此后还在不在触发。**
+因为任务被禁用。任务计划器事件 142（"任务已禁用"，用户 Administrator），UTC：
+`\deploy-consolidated-20261117` 12:51:42.597 → 四个进程 12:51:46–47 被结束 →
+`\MT5Quant\live_supervisor2` 12:52:19.534 → `\MT5Quant\demo_weekly_check` 12:52:21.393 → `\MT5Quant\live_daily_report` 12:52:23.214。
+supervisor 的每分钟触发（事件 100）从保留的最早时刻 05:28:32 UTC 到 12:51:32 UTC 每分钟一次，之后到 11-23 10:57:45 UTC 一次都没有。
+
+**第 8 项：日报任务 rc=1 的 stderr 原文。** `<部署树>\data\logs\task_live_daily_report.log` 里是四行
+`The system cannot find the path specified.`（最后写入 11-20 21:57 UTC）。
+原因：任务命令 `task_live_daily_report.cmd` 调用的是 `<部署树>\.venv\Scripts\python.exe`，而 `<部署树>` 是纯检出、没有 `.venv`
+（虚拟环境在 `<工作区>`）。**Python 根本没有启动**，不是连接失败或取数失败。`task_demo_weekly_check.cmd` 同样的毛病。
+现存日报到 `daily-2026-11-15.md`。11-21、11-22 日检报的"rc=1 第二天、第三天"读到的是 11-20 那次的旧结果——任务已被禁用，并没有运行。
+
+**对照 O23-6 候选表**：
+
+| 候选 | 结论 | 依据 |
+| --- | --- | --- |
+| 终端被收养（O23-3） | **01:24 一段：采纳（证据链完整，缺进程快照）** | 托盘显式退出 ZCode → 终端无正常退出记录即消失 → 270 毫秒内两次启动尝试 → 重启后 6 秒出现第一条拒绝 → 此后每次终端重启后拒绝照旧，每分钟一条，共 684 条，直到进程被结束、任务被禁用 |
+| PID 复用（O23-2） | 这两段里没有证据支持 | 四个登记的 PID 直到 12:46:35 UTC 都对应活着的进程 |
+| conhost | 排除 | 11-20 日检四棵树 conhost 全 0；01:24 之前没有重启；`host.py` 把启动标志改成了 0 |
+| 其他子进程 | 没有发现 | — |
+| 第三种机理（不在表里） | **12:44–12:52 一段：有顺序的人工停机** | 结束进程（错开 80 秒）→ supervisor 重启 → 再次同时结束 → 禁用四个任务；其间还有终端多次重启和第二个终端的安装 |
+
+**未查明**：01:24 被重启的终端的父进程；被拒绝的是哪一棵树；从托盘退出 ZCode、以及 10:57–13:20 UTC 通过 Herdr 和交互会话
+操作机器、结束进程的具体的人或程序；对账在 11-23 13:18:18 UTC 被判陈旧的子条件；supervisor 任务结果码 0x80070002 的来源；
+11-21 05:28 UTC 之前的任务计划器历史。
+
+**已排除**：整机重启（上次开机 11-08 04:59:51 UTC）；Windows 更新或系统事件（System 日志当天 21 条，12:20–13:00 UTC 为空）；
+python 自身崩溃（应用日志无记录，`.err` 全空）；时钟回拨（11-21 只有 12:00:00.779 UTC 一次 −8 毫秒的校正，11-23 没有）；
+ZCode 退出（12:4x 那一段）。
+
+### 7. 磁盘（11-23 15:53–16:46 UTC）
+
+- 余量：11-22 13:16 UTC 25.2 GB → 11-23 13:16 UTC 13.2 GB → 15:53 UTC 11.85 GB → 16:40:58 UTC 10.47 GB →
+  **16:45:01 UTC 9.09 GB（已低于 10 GB）**。每 5 分钟采样一次，继续中。
+- **本项目不是占用方**：工作区共 4.82 GB（研究数据 `ticks` 2.57 GB、`bars` 0.74 GB，证据目录不到 0.2 GB）；
+  近 30 小时本项目新建文件不到 10 MB。本项目能清的只有两个旧 worktree（26 MB、9 MB，按 U8 要用户确认后才删）和缓存，合计不足 40 MB。
+- 占用在项目之外：agent 平台自己的数据 35.2 GB（其中别的项目工作区 22.8 GB、本工作区 4.8 GB、预置工具 2 GB、
+  agent 数据库 2.3 GB）；安卓模拟器 `ak_test` 8.5 GB（用户数据镜像 5.87 GB + 内存快照 2.5 GB，11-23 16:01 UTC 仍在写，正在运行）；
+  两个 MT5 终端的数据目录 11.0 GB（生产终端 8.35 GB、第二个终端 2.64 GB）；系统页面文件 `pagefile.sys` 18.7 GB
+  （系统自动管理，当前只用 1.5 GB，峰值 17.9 GB；物理内存 32 GB）；移动端与 Rust 工具链约 16 GB；Windows 14.7 GB。
+- 近 30 小时的新建量（GB，按小时，UTC）：
+
+  | 11-22 | 14 点 0.4 | 15 点 2.2 | 16 点 0.2 | 17 点 0.5 | 23 点 0.3 |
+  | --- | --- | --- | --- | --- | --- |
+  | 11-23 | 01 点 0.8 | 02 点 0.5 | 04 点 0.3 | 05 点 2.3 | 07 点 0.2 |
+  | 11-23 | 09 点 1.0 | 12 点 0.7 | 13 点 0.5 | **14 点 4.5** | **15 点 1.7** |
+  | 11-23 | 16 点 2.5（到 16:10） | | | | |
+
+  14 点那 4.5 GB：agent 桌面端自我升级 0.9 GB、它自动装入的预置工具（pandoc、LibreOffice）2.0 GB、盘根 `dev` 下另一个项目的构建 1.4 GB。
+  05 点、09 点的 2.2 GB、1.0 GB 是另一个项目工作区的 Rust/Flutter 构建。
+- 净变化：27.4 小时减少约 15 GB（平均 0.55 GB/小时），但其间新建约 19 GB、别处同时删掉约 4 GB——
+  这块盘被其他项目当作周转空间，余量由它们的清理节奏决定。
+
+### 8. 环境方面的其他发现（只记录，未改动）
+
+- 本机时间服务**没有在同步**：`w32tm` 状态为未同步、来源是本地 CMOS 时钟；11-10 以来每天一次幅度不超过 8 毫秒的校正。
+  证据时间戳的可信度依赖这台机器的时钟。
+- 生产终端每次启动都加载自定义指标 `SMC_Atelier (XAUUSD,Weekly)`：生产终端的图表也被用于手工看盘。
+- 生产终端在 11-21 12:47:44 UTC 到 11-22 00:21:12 UTC 之间没有运行；11-22 起由用户从桌面手动启动。
+- `docs/ops/ops-patches/2026-11-19/` 之前留档的是 11-19 的旧版 `host.py`，本次已更新为生产在用的版本并更新 sha256。
+
+### 9. 对施工计划的影响（下一步要做的事）
+
+1. **T211 的失效模式表要补**：(12) 陈旧的 `halt-risk-veto.json` 让 supervisor 的 halt 永不自动解除；
+   (13) 对账在同一秒被判陈旧（机理未查明；先把是哪条子条件失败写进告警和 `supervisor-state.json`）。
+   第 10 行（worker 下出现 terminal64.exe）已被生产证实。
+2. **T213 的根因变了**：是任务模板指向不存在的 `<部署树>\.venv`。先修模板（或把 `-PythonExe` 传进去）并加测试钉住
+   "任务命令里的 python 必须存在"，再做计划里的重试、补生成、失败告警。
+3. **T215 多了一个数据点**：11-21 01:24 ZCode 被显式退出时，经计划任务载体启动、解释器和目录都在 agent 工作区内的四个生产进程
+   **活了下来**，被连带结束的是交易终端；而 11-17 的记录是四个进程死了。对照实验要把"一次性任务由 agent 会话触发"和
+   "由调度器自行触发"分开测。
+4. **T209 的必要性有了生产证据**：终端消失后 worker 的 `initialize()` 确实把终端拉起（01:24:20 的两次启动尝试）。
+5. **T214**：小时级检查要把"halt 存在超过 N 分钟"和磁盘余量作为生产级问题。
+6. 这台机器上 D64 无法强制：11-21 的禁用任务、结束进程没有进任何日志，直到今天靠任务计划器历史才还原。
+   D112（迁出）和 U11（专用主机）要解决的正是这个。
