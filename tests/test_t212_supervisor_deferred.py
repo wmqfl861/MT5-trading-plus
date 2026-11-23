@@ -2,8 +2,10 @@
 
 git timing out says nothing about the deployment. Such a round restarts nothing,
 keeps the read-only checks, writes a halt only when a role is really down, and
-escalates to a refusal only after three rounds in a row. A round that would
-restart a role verifies the deployment in full, never from the cache.
+escalates to a refusal only after three rounds in a row. A round counts once
+wherever in it git failed to answer, the full check before a restart included.
+A round that would restart a role verifies the deployment in full, never from
+the cache.
 """
 from __future__ import annotations
 
@@ -203,6 +205,11 @@ def test_a_dirty_tree_is_caught_by_the_full_check_and_only_there(tmp_path, monke
     module.verify_deployment(cfg, {"clean": record})        # inside the window the cache still says clean
     with pytest.raises(ValueError, match="not clean"):
         module.verify_deployment(cfg, {"clean": record}, full=True)
+    # Staging the file rewrites the index, so the next round no longer reuses the verdict.
+    git("add", "stray.txt")
+    with pytest.raises(ValueError, match="not clean"):
+        module.verify_deployment(cfg, {"clean": record})
+    assert calls.count("status") == 3
     with pytest.raises(ValueError, match="SHA mismatch"):
         module.verify_deployment(replace(cfg, sha="0" * 40), {"clean": record})
     # HEAD attached to the branch: refused whatever the cache says.
@@ -265,3 +272,166 @@ def test_supervisor_deferred_is_a_recorded_alert_and_stays_classified():
     assert "SUPERVISOR_REFUSED" in check.FORMAL_ANOMALY_ALERTS     # a real mismatch still fails the window
     from tests.test_formal_alert_classification_guard import runtime_alert_kinds
     assert "live_supervisor.py" in runtime_alert_kinds().get("SUPERVISOR_DEFERRED", set())
+
+
+# ---- after the review of 9281257: the count, and a record that cannot be read ----
+
+def status_times_out(subcommand):
+    return subprocess.TimeoutExpired(["git"], 15) if subcommand == "status" else None
+
+
+# A round that reuses the cached verdict, then verifies in full before a restart.
+REUSED_THEN_FULL = ["rev-parse", "symbolic-ref", "rev-parse", "symbolic-ref", "status"]
+
+
+def cached_verdict(module, cfg, live):
+    """One full clean verdict, remembered the way a healthy round remembers it."""
+    record = module.verify_deployment(cfg)
+    (live / "supervisor-state.json").write_text(json.dumps({"clean": record}), encoding="utf-8")
+    return record
+
+
+def healthy_roles(live, cfg, now):
+    """A fresh heartbeat and log for every registered role, as a healthy deployment has."""
+    for entry in json.loads((live / "instances.json").read_text(encoding="utf-8"))["instances"]:
+        key = str(entry["magic"]) if entry["kind"] == "runner" else entry["kind"]
+        fresh(live, key, entry["pid"], cfg.sha, now)
+        log = Path(entry["log"])
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("completed loop\n")
+        os.utime(log, (now.timestamp(), now.timestamp()))
+
+
+def test_rounds_whose_check_before_the_restart_cannot_finish_count_toward_the_limit(tmp_path, monkeypatch):
+    """The real verifier over a real repository: nothing stands in for it, only
+    "git status" runs out of time. The cached verdict passes the first check of
+    every round; it is the full check before the restart that cannot finish.
+    Each such round counts, so the third in a row is a refusal."""
+    module, cfg, p, live, entries, _ = configured(tmp_path)
+    cached_verdict(module, cfg, live)
+    del p.items[role(entries, "risk")["pid"]]
+    calls = GitCalls(module, monkeypatch, fail=status_times_out)
+    for count in (1, 2):
+        healthy_roles(live, cfg, NOW + timedelta(minutes=count - 1))
+        seen = len(calls.calls)
+        result = module.supervise(cfg, p, now=NOW + timedelta(minutes=count - 1))
+        assert calls.calls[seen:] == REUSED_THEN_FULL
+        assert result["refused"] is False and result["undeterminable"] == count
+        assert result["deferred"] == ["risk"] and result["restarted"] == []
+        assert state_of(live)["undeterminable"] == count         # the reused verdict has not cleared it
+    halt = (live / "halt.json").read_bytes()
+    healthy_roles(live, cfg, NOW + timedelta(minutes=2))
+    seen = len(calls.calls)
+    third = module.supervise(cfg, p, now=NOW + timedelta(minutes=2))
+    assert calls.calls[seen:] == REUSED_THEN_FULL
+    assert third["refused"] is True and "3 times in a row" in third["reason"]
+    assert third["undeterminable"] == 3 and third["deferred"] == [] and third["restarted"] == []
+    assert p.started == [] and p.killed == []
+    assert len(lines(live, "SUPERVISOR_DEFERRED")) == 2 and len(lines(live, "SUPERVISOR_REFUSED")) == 1
+    assert (live / "halt.json").read_bytes() == halt            # a halt already there is left as it is
+    assert "undeterminable" not in state_of(live)               # a refusal starts the count over
+
+
+def test_a_round_that_restarts_after_a_full_check_starts_the_count_over(tmp_path, monkeypatch):
+    """Two rounds cannot finish the check before the restart; then git answers and
+    the role is restarted. That round was answerable throughout, so the count
+    starts over instead of turning the next failure into a refusal."""
+    module, cfg, p, live, entries, _ = configured(tmp_path)
+    cached_verdict(module, cfg, live)
+    del p.items[role(entries, "risk")["pid"]]
+    calls = GitCalls(module, monkeypatch, fail=status_times_out)
+    for minute in (0, 1):
+        healthy_roles(live, cfg, NOW + timedelta(minutes=minute))
+        result = module.supervise(cfg, p, now=NOW + timedelta(minutes=minute))
+        assert result["undeterminable"] == minute + 1 and result["refused"] is False
+    calls.fail = lambda subcommand: None                       # git answers again
+    restarted_at = NOW + timedelta(minutes=2)
+    healthy_roles(live, cfg, restarted_at)                    # only the missing role is unhealthy
+    seen = len(calls.calls)
+    restarted = module.supervise(cfg, p, now=restarted_at)
+    assert restarted["restarted"] == ["risk"] and restarted["refused"] is False
+    assert calls.calls[seen:] == REUSED_THEN_FULL              # exactly one full check before the restart
+    assert state_of(live)["undeterminable"] == 0
+    registered = json.loads((live / "instances.json").read_text(encoding="utf-8"))["instances"]
+    del p.items[role(registered, "risk")["pid"]]               # the restarted role is lost again
+    calls.fail = status_times_out
+    for minute in (3, 4):
+        now = NOW + timedelta(minutes=minute)
+        healthy_roles(live, cfg, now)
+        result = module.supervise(cfg, p, now=now)
+        assert result["refused"] is False and result["undeterminable"] == minute - 2
+    healthy_roles(live, cfg, NOW + timedelta(minutes=5))
+    again = module.supervise(cfg, p, now=NOW + timedelta(minutes=5))
+    assert again["refused"] is True and "3 times in a row" in again["reason"]
+
+
+def test_the_verdict_verified_in_full_before_a_restart_is_the_one_remembered(tmp_path, monkeypatch):
+    """A round that restarts a role verifies in full. That verdict, not the older
+    one the round started from, is what the next round finds in the state file."""
+    module, cfg, p, live, entries, _ = configured(tmp_path)
+    record = module.verify_deployment(cfg)
+    older = (datetime.now(timezone.utc) - timedelta(minutes=14)).isoformat()   # still inside the reuse window
+    (live / "supervisor-state.json").write_text(json.dumps({"clean": {**record, "at": older}}), encoding="utf-8")
+    del p.items[role(entries, "risk")["pid"]]
+    calls = GitCalls(module, monkeypatch)
+    result = module.supervise(cfg, p, now=NOW)
+    assert result["restarted"] == ["risk"] and calls.count("status") == 1   # the full check before the restart
+    kept = datetime.fromisoformat(state_of(live)["clean"]["at"])
+    assert timedelta(0) <= datetime.now(timezone.utc) - kept < timedelta(minutes=1)   # written by this round
+
+
+@pytest.mark.parametrize("at", ["garbage", "", "2026-13-45T99:99:99+00:00", "2026-11-23T19:00:00+00:00 later"])
+def test_a_timestamp_that_cannot_be_read_only_means_verifying_in_full(tmp_path, monkeypatch, at):
+    """A damaged record in the state file is no verdict against the deployment:
+    it is neither reused nor a refusal."""
+    module, cfg, p, live, _, _ = configured(tmp_path)
+    calls = GitCalls(module, monkeypatch)
+    record = module.verify_deployment(cfg)
+    assert module.verify_deployment(cfg, {"clean": {**record, "at": at}})
+    assert calls.count("status") == 2                           # verified in full again
+    (live / "supervisor-state.json").write_text(json.dumps({"clean": {**record, "at": at}}), encoding="utf-8")
+    result = module.supervise(cfg, p, now=NOW)
+    assert result["refused"] is False and result["restarted"] == []
+    assert calls.count("status") == 3
+    assert not (live / "halt.json").exists() and lines(live, "SUPERVISOR_REFUSED") == []
+    assert lines(live, "SUPERVISOR_DEFERRED") == []             # git answered: nothing to defer
+    assert state_of(live)["clean"]["at"] != at                  # the damaged record is replaced
+
+
+def test_no_verdict_is_reused_when_the_fingerprint_cannot_be_read(tmp_path, monkeypatch):
+    """None on both sides would compare equal: a fingerprint that cannot be read
+    never matches, so the deployment is verified in full."""
+    module, cfg, _, _, _, _ = configured(tmp_path)
+    calls = GitCalls(module, monkeypatch)
+    monkeypatch.setattr(module, "_checkout_fingerprint", lambda directory: None)
+    remembered = {"clean": {"fingerprint": None, "at": REAL_NOW.isoformat()}}
+    again = module.verify_deployment(cfg, remembered)
+    assert calls.count("status") == 1 and isinstance(again, dict)
+
+
+def test_a_real_change_of_head_is_verified_in_full(tmp_path, monkeypatch):
+    """HEAD really moves to another commit; the record is not rewritten to fake it."""
+    module, cfg, _, _, _, git = configured(tmp_path)
+    git("-c", "user.name=T212 fixture", "-c", "user.email=t212@example.invalid",
+        "commit", "--allow-empty", "-qm", "moved")
+    moved = replace(cfg, sha=git("rev-parse", "HEAD"))          # the deployment is pinned to the new commit
+    calls = GitCalls(module, monkeypatch)
+    record = module.verify_deployment(moved)
+    assert module.verify_deployment(moved, {"clean": record}) is None
+    assert calls.count("status") == 1                           # HEAD and index unchanged: reused
+    git("-c", "user.name=T212 fixture", "-c", "user.email=t212@example.invalid",
+        "commit", "--allow-empty", "-qm", "moved again")
+    moved = replace(cfg, sha=git("rev-parse", "HEAD"))
+    assert module.verify_deployment(moved, {"clean": record})
+    assert calls.count("status") == 2                           # HEAD changed: verified in full
+
+
+def test_after_a_refusal_the_rounds_cycle_deferred_deferred_refused(tmp_path):
+    """A refusal starts the count over: while git stays silent, every third round refuses."""
+    module, cfg, p, live, entries = setup(tmp_path)
+    verify = git_cannot_answer(module)
+    for minute in range(7):
+        module.supervise(cfg, p, now=NOW + timedelta(minutes=minute), verify_deployment=verify)
+    kinds = [line.split("\t")[1] for line in (live / "alerts.log").read_text(encoding="utf-8").splitlines()]
+    cycle = [kind for kind in kinds if kind in ("SUPERVISOR_DEFERRED", "SUPERVISOR_REFUSED")]
+    assert cycle == ["SUPERVISOR_DEFERRED", "SUPERVISOR_DEFERRED", "SUPERVISOR_REFUSED"] * 2 + ["SUPERVISOR_DEFERRED"]

@@ -155,6 +155,18 @@ def _checkout_fingerprint(directory) -> list | None:
         return None
 
 
+def _verdict_age(remembered) -> float | None:
+    """Seconds since a remembered clean verdict. None when that cannot be told:
+    no verdict, no timestamp, or one that does not parse. A record that cannot
+    be read is no verdict against the deployment, only a reason to verify in full."""
+    if not isinstance(remembered, dict) or not isinstance(remembered.get("at"), str):
+        return None
+    try:
+        return (naive_utc(datetime.now(timezone.utc)) - parse_iso(remembered["at"])).total_seconds()
+    except ValueError:
+        return None
+
+
 def verify_deployment(cfg, state=None, *, full=False):
     """Only an explicitly pinned, detached and clean deployment may be touched.
 
@@ -164,6 +176,8 @@ def verify_deployment(cfg, state=None, *, full=False):
     CLEAN_REUSE_S. Returns the record to remember from a full clean verdict,
     else None. A real mismatch raises ValueError; git not answering raises
     DeploymentUndeterminable, which is not a verdict about the deployment.
+    Whatever cannot be read out of the remembered verdict (its timestamp, the
+    fingerprint on either side) only means verifying in full, never refusing.
     """
     if not re.fullmatch(r"[0-9a-f]{40}", cfg.sha):
         raise ValueError("deployment_sha requires full lowercase SHA")
@@ -182,11 +196,12 @@ def verify_deployment(cfg, state=None, *, full=False):
     if _git(cfg.directory, "symbolic-ref", "-q", "HEAD").returncode != 1:
         raise ValueError("deployment must be detached at fixed SHA")
     remembered = (state or {}).get("clean")
-    reuse = (not full and isinstance(remembered, dict)
-             and remembered.get("fingerprint") == _checkout_fingerprint(cfg.directory)
-             and isinstance(remembered.get("at"), str)
-             and 0 <= (naive_utc(datetime.now(timezone.utc)) - parse_iso(remembered["at"])).total_seconds()
-             < CLEAN_REUSE_S)
+    age = _verdict_age(remembered)
+    fingerprint = _checkout_fingerprint(cfg.directory)
+    # None == None would pass: a fingerprint that could not be read never matches.
+    reuse = (not full and isinstance(remembered, dict) and age is not None
+             and 0 <= age < CLEAN_REUSE_S and fingerprint is not None
+             and remembered.get("fingerprint") == fingerprint)
     if not reuse:
         dirty = _git(cfg.directory, "status", "--porcelain", "--untracked-files=all")
         if dirty.returncode or dirty.stdout.strip():
@@ -572,20 +587,29 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
     try:
         with registry_lock(str(live / "instances.lock")), file_lock(str(live / "supervisor.lock"), attempts=1):
             state = read_json_retry(str(state_path)) or {}
-            undeterminable = 0
+            # Rounds in a row in which git could not answer. A round counts once
+            # wherever in it that happens, so the full check before a restart
+            # counts like the first check. A reused verdict alone neither counts
+            # nor clears: only a round in which git answered every time clears it.
+            carried = int(state.get("undeterminable") or 0)   # the rounds before this one
+            undeterminable = 0          # 1 once git could not answer in this round
+
+            def could_not_answer(exc):
+                # One count per round, and the same limit for both of its checks.
+                nonlocal undeterminable
+                undeterminable = 1
+                result["undeterminable"] = carried + 1
+                result["deferred_reason"] = f"git could not answer: {exc}"
+                if carried + 1 >= UNDETERMINABLE_LIMIT:
+                    raise ValueError(f"deployment undeterminable {carried + 1} times in a row "
+                                     f"({exc})") from exc
+
             try:
                 verified = check(state)
             except DeploymentUndeterminable as exc:
                 # Not a verdict about the deployment: nothing is restarted this round.
-                undeterminable = int(state.get("undeterminable") or 0) + 1
-                state["undeterminable"] = undeterminable
-                result["undeterminable"] = undeterminable
-                result["deferred_reason"] = f"git could not answer: {exc}"
-                if undeterminable >= UNDETERMINABLE_LIMIT:
-                    raise ValueError(f"deployment undeterminable {undeterminable} times in a row "
-                                     f"({exc})") from exc
+                could_not_answer(exc)
             else:
-                state["undeterminable"] = 0
                 if verified:
                     state["clean"] = verified
             roles, mapped, trees = _registered_trees(cfg, processes)
@@ -632,9 +656,10 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
                                 owner="supervisor", token=uuid.uuid4().hex)
                 append_alert(str(live), "SUPERVISOR",
                              f"unhealthy={stale}" + (f" checks={checks}" if checks else ""), now)
-                # Persist reset BEFORE any process mutation/crash.
+                # Persist reset BEFORE any process mutation/crash. The count is
+                # written as known so far: a reused verdict has not cleared it.
                 reset = {"healthy_since": None, "signature": signature,
-                         "undeterminable": state.get("undeterminable", 0), "clean": state.get("clean")}
+                         "undeterminable": carried + undeterminable, "clean": state.get("clean")}
                 if checks:
                     reset["stale_checks"] = checks   # same sub-conditions as the alert, for forensics
                 write_json_atomic(str(state_path), reset)
@@ -644,24 +669,26 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
                     result["deferred"] = sorted(stale)
                     append_alert(str(live), "SUPERVISOR_DEFERRED",
                                  f"{result['deferred_reason']}; restarts deferred for {result['deferred']}; "
-                                 f"consecutive={undeterminable}", now)
+                                 f"consecutive={result['undeterminable']}", now)
                     return result
                 # Only a clean, pinned deployment may be restarted. A round that restarts
                 # anything verifies it in full first, never from the cache.
                 try:
                     verified = check(None, full=True)
                 except DeploymentUndeterminable as exc:
-                    undeterminable = int(state.get("undeterminable") or 0) + 1
-                    result["undeterminable"] = undeterminable
-                    result["deferred_reason"] = f"git could not answer: {exc}"
+                    could_not_answer(exc)     # at the limit this is a refusal, as above
                     result["deferred"] = sorted(stale)
-                    write_json_atomic(str(state_path), {**reset, "undeterminable": undeterminable})
+                    write_json_atomic(str(state_path), {**reset, "undeterminable": carried + 1})
                     append_alert(str(live), "SUPERVISOR_DEFERRED",
                                  f"{result['deferred_reason']}; restarts deferred for {result['deferred']}; "
-                                 f"consecutive={undeterminable}", now)
+                                 f"consecutive={result['undeterminable']}", now)
                     return result
                 if verified:
                     state["clean"] = verified
+                # Git answered every check of this round: the count starts over, and
+                # the verdict just verified in full is the one to remember.
+                reset.update(undeterminable=0, clean=state.get("clean"))
+                write_json_atomic(str(state_path), reset)
                 for key, reason in stale.items():
                     entry = mapped.get(key)
                     # T180: retain pre-restart registry bytes inside the same lock.
@@ -731,12 +758,15 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
                 # existing one is not lifted until the deployment can be verified again.
                 append_alert(str(live), "SUPERVISOR_DEFERRED",
                              f"{result['deferred_reason']}; all roles healthy, no halt written; "
-                             f"consecutive={undeterminable}", now)
+                             f"consecutive={result['undeterminable']}", now)
             elif since and (naive_utc(now) - parse_iso(since)).total_seconds() >= 300 and token:
                 result["cleared"] = _clear_owned(live, token)
+            # Nothing is restarted below, so no other check can fail: unless git
+            # could not answer the first check, this round was answerable throughout.
             state = {"healthy_since": since, "last_checked": iso_utc(now),
                      "signature": signature, "halt_token": token,
-                     "undeterminable": state.get("undeterminable", 0), "clean": state.get("clean")}
+                     "undeterminable": carried + undeterminable if undeterminable else 0,
+                     "clean": state.get("clean")}
             if token and not result["cleared"]:
                 # _clear_owned refuses silently; name the blocker so a halt that
                 # cannot clear by itself is visible without reading the directory.
