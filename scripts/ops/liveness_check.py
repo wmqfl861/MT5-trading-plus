@@ -88,7 +88,7 @@ def _loopback(host: str) -> bool:
         address = ipaddress.ip_address(host.strip("[]"))
     except ValueError:
         return host.lower() == "localhost"
-    mapped = getattr(address, "ipv4_mapped", None)        # 只有 IPv6Address 有：::ffff:127.0.0.1 这种
+    mapped = getattr(address, "ipv4_mapped", None)        # 只有 IPv6Address 有：IPv4 映射成的 IPv6 地址
     return address.is_loopback or mapped is not None and mapped.is_loopback
 
 

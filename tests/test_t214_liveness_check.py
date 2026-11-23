@@ -551,7 +551,7 @@ def test_webhook_sends_to_https_or_loopback_only_and_never_follows_redirects(mon
     requests = []
     real_open = mod._open
     monkeypatch.setattr(mod, "_open", lambda request, timeout: requests.append(request) or _Response())
-    loopback = str(ipaddress.ip_address(2130706433))                 # 127.0.0.1, built rather than typed out
+    loopback = str(ipaddress.ip_address(2130706433))                 # the IPv4 loopback address, built rather than typed out
     private = ".".join(str(part) for part in (10, 0, 0, 5))
     allowed = ("https://example.invalid/hook", f"http://{loopback}:8080/hook", "http://localhost:8080/hook",
                "http://[::1]:8080/hook")
