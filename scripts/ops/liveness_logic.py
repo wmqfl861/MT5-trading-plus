@@ -6,18 +6,20 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HEARTBEAT_MAX_AGE_S = 120.0        # 与 supervisor 的 health_timeout 下限相同
-NOT_REVIVED_S = 600.0              # 角色消失 / 心跳停 / supervisor 不检查：超过即生产级
+NOT_REVIVED_S = 600.0              # 角色消失 / 心跳停 / supervisor 不检查 / 登记表读不出：超过即生产级
 CONTROL_STUCK_S = 3600.0           # halt、pause、killSwitch、否决：超过即生产级
 DISK_MIN_GB = 10.0
 GB = 2 ** 30
 CLOCK_SKEW_S = 60.0                # 时间戳比现在晚这么多以上，就不算新鲜
 REPORT_DUE_UTC = (22, 30)          # 日报任务 21:57 UTC 才生成昨天的日报；22:30 起才要求它在
 REMIND_AFTER_S = 86400.0           # 同一个生产级问题还在：两条通知至少隔这么久
+OWNER = re.compile(r"[a-z]{1,16}")  # halt 的 owner 只有长这样才照常输出
 
 
 def parse_utc(value) -> datetime | None:
@@ -62,6 +64,11 @@ def _reason(value) -> dict:
     return {"reason_present": bool(text), "reason_chars": len(text)}
 
 
+def _owner(value) -> str:
+    """halt 的 owner 只放行纯小写字母的标识（1 到 16 个字母）；其余（可能带路径、账号）一律写 other。"""
+    return value if isinstance(value, str) and OWNER.fullmatch(value) else "other"
+
+
 def _control(now: datetime, doc: dict, path: Path, source: str, ahead: list) -> dict:
     """halt / pause 文件：持续时间按文件修改时间算；文件里的 ts 只用来查时钟。"""
     if parse_utc(doc.get("ts")) is not None and _age(now, doc.get("ts")) is None:
@@ -83,26 +90,36 @@ def observe(live_dir, reports_dir, disk_path, now: datetime, alive) -> dict:
     live, now = Path(live_dir), now.astimezone(timezone.utc)
     ahead: list[str] = []          # 比 now 晚 60 秒以上的时间戳，按来源
     obs = {"roles": {}, "registry_readable": True, "registry_valid": True, "clock_ahead": ahead,
-           "supervisor_age_s": None, "halt": None, "pauses": [], "kill_switch": False, "risk_veto": False,
-           "disk_free_gb": None, "due_report": None, "due_report_present": None}
+           "earliest_start": None, "supervisor_age_s": None, "halt": None, "pauses": [], "kill_switch": False,
+           "risk_veto": False, "disk_known": True, "disk_free_gb": None, "due_report": None,
+           "due_report_present": None}
     registry = _read_json(live / "instances.json")[1]
-    if not isinstance(registry, dict) or not isinstance(registry.get("instances"), list):
+    if registry is None:                        # 不存在、读不出、解析不了
         obs["registry_readable"] = False
+    elif not isinstance(registry, dict) or not isinstance(registry.get("instances"), list):
+        obs["registry_valid"] = False           # 顶层不成形状：和条目不成形状同样处理
     else:
+        starts = []
         for entry in registry["instances"]:
             if not _well_formed(entry):
                 obs["registry_valid"] = False      # 身份对不上就不能证明在跑；不记成角色消失
                 continue
             key = str(entry["magic"]) if entry["kind"] == "runner" else entry["kind"]
-            heartbeat = _read_json(live / f"heartbeat-{key}.json")[1] or {}
-            age, stamp = _age(now, heartbeat.get("ts")), parse_utc(heartbeat.get("ts"))
-            if stamp is not None and age is None:
+            heartbeat = _read_json(live / f"heartbeat-{key}.json")[1]
+            # 读不出、损坏、不是对象的心跳都算陈旧（年龄记 None），不让检查因此出错
+            stamp = heartbeat.get("ts") if isinstance(heartbeat, dict) else None
+            age = _age(now, stamp)
+            if parse_utc(stamp) is not None and age is None:
                 ahead.append(f"heartbeat-{key}")
+            starts.append(parse_utc(entry["started_utc"]))
             obs["roles"][key] = {"launcher_alive": bool(alive(entry["pid"], entry["started_utc"])),
                                  "heartbeat_age_s": age}
+        if starts:
+            obs["earliest_start"] = min(starts).isoformat()
     state_path = live / "supervisor-state.json"
     exists, supervisor = _read_json(state_path)
-    checked = (supervisor or {}).get("last_checked")
+    # 不是对象的状态文件和读不出、损坏的一样：没有 last_checked，按文件修改时间算
+    checked = supervisor.get("last_checked") if isinstance(supervisor, dict) else None
     age = _age(now, checked)
     if parse_utc(checked) is None:
         age = _file_age(now, state_path) if exists else None     # 没有 last_checked：按文件修改时间算
@@ -112,8 +129,8 @@ def observe(live_dir, reports_dir, disk_path, now: datetime, alive) -> dict:
     exists, halt = _read_json(live / "halt.json")
     if exists:
         # 存在即停机（生产是 fail-closed）：读不出、形状不对的也算存在，只标明读不出
-        obs["halt"] = ({**_control(now, halt, live / "halt.json", "halt", ahead),
-                        "owner": str(halt.get("owner"))} if isinstance(halt, dict)
+        obs["halt"] = ({**_control(now, halt, live / "halt.json", "halt", ahead), "owner": _owner(halt.get("owner"))}
+                       if isinstance(halt, dict)
                        else {"unreadable": True, "age_s": _file_age(now, live / "halt.json")})
     for path in sorted(live.glob("pause-*.json")):
         _, pause = _read_json(path)
@@ -128,12 +145,19 @@ def observe(live_dir, reports_dir, disk_path, now: datetime, alive) -> dict:
     try:
         obs["disk_free_gb"] = round(shutil.disk_usage(disk_path).free / GB, 2)
     except OSError:
-        pass
+        obs["disk_known"] = False                # 查不了余量：记 disk_unknown，不静默跳过
     due = (now - timedelta(days=1 if (now.hour, now.minute) >= REPORT_DUE_UTC else 2)).date()
     obs["due_report"] = due.isoformat()
     obs["due_report_present"] = ((Path(reports_dir) / "live" / f"daily-{due.isoformat()}.md").is_file()
                                  if Path(reports_dir).is_dir() else None)
     return obs
+
+
+def _owed(report_day: str, earliest) -> bool:
+    """那一天的日报只在那个 UTC 日开始之前部署已经在跑时才要求：以登记表里最早的 started_utc 为准。
+    没有登记项可依据时也不要求（新数据目录的第一天不会因此报缺）。"""
+    started, midnight = parse_utc(earliest), parse_utc(report_day)
+    return started is not None and midnight is not None and started < midnight
 
 
 def _production(code: str, detail: dict, lasted: float) -> bool:
@@ -143,8 +167,9 @@ def _production(code: str, detail: dict, lasted: float) -> bool:
         return lasted >= NOT_REVIVED_S
     if code.startswith("pause:") or code in ("halt", "kill_switch", "risk_veto"):
         return lasted >= CONTROL_STUCK_S
-    # disk_low、report_missing、registry_invalid、clock_ahead:*：一出现就是生产级
-    return code in ("disk_low", "report_missing", "registry_invalid") or code.startswith("clock_ahead:")
+    # disk_low、disk_unknown、report_missing、registry_invalid、clock_ahead:*：一出现就是生产级
+    return (code in ("disk_low", "disk_unknown", "report_missing", "registry_invalid")
+            or code.startswith("clock_ahead:"))
 
 
 def evaluate(obs: dict, now: datetime, since: dict) -> tuple[list[dict], dict]:
@@ -174,9 +199,11 @@ def evaluate(obs: dict, now: datetime, since: dict) -> tuple[list[dict], dict]:
     for code, flag in (("kill_switch", obs["kill_switch"]), ("risk_veto", obs["risk_veto"])):
         if flag:
             present[code] = {}
-    if obs["disk_free_gb"] is not None and obs["disk_free_gb"] < DISK_MIN_GB:
+    if not obs["disk_known"]:
+        present["disk_unknown"] = {}
+    elif obs["disk_free_gb"] is not None and obs["disk_free_gb"] < DISK_MIN_GB:
         present["disk_low"] = {"free_gb": obs["disk_free_gb"]}
-    if obs["due_report_present"] is False:
+    if obs["due_report_present"] is False and _owed(obs["due_report"], obs["earliest_start"]):
         present["report_missing"] = {"report": obs["due_report"]}
     since = {code: since.get(code, stamp) for code in present}
     findings = []
@@ -193,10 +220,12 @@ def _shown(lasted: float) -> str:
 
 
 def _duration(item: dict) -> float:
-    """消息里的时长：halt、pause 按文件修改时间算（age_s），其余只有检查器自己的时钟（lasted_s）。"""
-    from_file = item["code"] == "halt" or item["code"].startswith("pause:")
+    """消息里的时长。halt、pause 取"文件修改时间距今"（age_s）和"检查器第一次看到至今"（lasted_s）里大的
+    那个，和判级用的是同一个数：对账进程每 30 秒重写自己的 pause 文件，只看文件时间会一直像刚出现。
+    其余只有检查器自己的时钟。"""
     age = item.get("age_s")
-    return age if from_file and isinstance(age, (int, float)) else item["lasted_s"]
+    from_file = item["code"] == "halt" or item["code"].startswith("pause:")
+    return max(item["lasted_s"], age) if from_file and isinstance(age, (int, float)) else item["lasted_s"]
 
 
 def format_message(items: list[dict], recovered=()) -> str:
