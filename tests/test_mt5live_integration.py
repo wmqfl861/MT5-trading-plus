@@ -1291,9 +1291,13 @@ def test_live_daily_report_script(tmp_path):
     stack.broker.seed_deal(profit=123.5, magic=MAGIC,
                            time=datetime(2026, 10, 28, 9, 0))
     mod = load_script("live_daily_report")
+    # T213 评审 K1（2026-11-23）起，连终端的模式每一次尝试开始之前都判换日窗：
+    # 注入一个落在窗内的固定时钟（2026-10-29 21:57 UTC = 纽约 17:57 EDT），不依赖真实时刻。
+    in_window = datetime(2026, 10, 29, 21, 57, tzinfo=timezone.utc)
     rc = mod.main(["--data-dir", str(tmp_path), "--reports-dir",
                    str(tmp_path / "reports"), "--date", "2026-10-28"],
-                  gw=FakeGateway(stack.broker))
+                  gw=FakeGateway(stack.broker), clock=lambda: in_window,
+                  sleep=lambda seconds: None)
     assert rc == 0
     out = tmp_path / "reports" / "live" / "daily-2026-10-28.md"
     text = out.read_text(encoding="utf-8")

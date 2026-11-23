@@ -142,24 +142,30 @@ Remove-Item data\live\killSwitch, data\live\halt.json -ErrorAction SilentlyConti
 确认整树及数据状态后迁移，不能自动补起。
 
 **日报缺失/内容异常排查**（`data\reports\live\daily-*.md` 没生成）：
-1. `type data\logs\task_live_daily_report.log`——最常见：影子状态不可用
+0. 先看 `data\live\alerts.log` 里当天的 `DAILY_REPORT_FAILED`：消息按日写了实际尝试了几次、
+   没有尝试的原因，以及是哪一类失败、退出码是多少（T213，见 §6.3.1）。启动或重试的时刻不在
+   换日窗内（D82）时日报不连终端、退出码 3——手工补跑或者在窗外补跑任务都会这样。
+1. `type data\logs\task_live_report.log`——最常见：影子状态不可用
    （退出码 2，fail-closed 不落半截日报）→ 确认运行器活着、
    `data\live\paper\state-*.json` 存在且非空；
 2. 点差比对报 `model_sha256` 不一致 → 重跑 `scripts/build_cost_model.py`
-   重建 `data\costs/spread_model.json`（日报拒绝用被动过的模型）；
-3. 手动补跑（保持已生成 `scripts/task_live_daily_report.cmd` 中的模式和配置路径；首次生成前使用与安装器相同的配置选择顺序）。Demo：
+   重建 `data\costs\spread_model.json`（日报拒绝用被动过的模型）；
+3. 手动补跑。计划任务每次顺带补最近三天的日报，缺得更多的要逐天指定 `--date`。**Demo 模式
+   同样只能在换日窗内做**（要连终端，D82）；窗外运行不连接、退出码 3。保持已生成
+   `scripts/task_live_daily_report.cmd` 中的模式和配置路径；首次生成前使用与安装器相同的
+   配置选择顺序。Demo：
 ```powershell
 $gwConfig = @("config.json", "gateway.json") | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $gwConfig) { throw "缺少 Demo 网关配置" }
 .venv/Scripts/python.exe scripts/live_daily_report.py --date 2026-11-10 `
-    --demo --gw-config $gwConfig `
+    --demo --gw-config $gwConfig --sessions-config config\sessions.toml `
     --spread-model data\costs\spread_model.json --log-dir data\demo
 ```
 
-PaperSoak 离线补跑不需要网关配置，直接使用影子状态：
+PaperSoak 离线补跑不需要网关配置，也不连终端、不受换日窗限制，直接使用影子状态：
 ```powershell
 .venv/Scripts/python.exe scripts/live_daily_report.py --date 2026-11-10 `
-    --paper-state data\live\paper `
+    --paper-state data\live\paper --sessions-config config\sessions.toml `
     --spread-model data\costs\spread_model.json --log-dir data\demo
 ```
 
@@ -638,15 +644,33 @@ powershell -ExecutionPolicy Bypass -File "$deploy\scripts\setup_scheduled_tasks.
 **日报的运行**（`live_daily_report.py`）：
 
 - `--date` 当天总是重新生成；顺带检查它之前两天的日报（`--backfill-days`，默认 3），
-  缺哪天补哪天。补生成的日报写实际的生成时刻。
+  缺哪天补哪天，已有的不覆盖。补生成的日报写实际的生成时刻；它的"账户""心跳"两行也是
+  生成时刻的快照，不是所报告那一天的情况，正文里没有另外的标注。
+- **每一次尝试开始之前都判换日窗**，每个目标日的第一次尝试和补生成的日子都一样：开始的
+  时刻不在窗内就不连接，那一天的日报记为未生成（D82）。窗的定义源是 `--sessions-config`
+  （`sessions.toml`），不给就用 `SessionPolicy` 的缺省窗。`--paper-state` 只读影子状态、
+  不连终端，不受此限。用法和配置问题在判窗之前报告，所以窗外运行也照常看得到。
 - 连接失败或取数失败时重试，至多 3 次（`--attempts`），间隔 300 秒（`--retry-interval-s`）。
-  **只有下一次尝试仍落在换日窗内才重试**：日报只许在窗内连终端（D82），窗的定义源是
-  `--sessions-config`（`sessions.toml`）。换日窗全年的交集只有本机 05:55–06:00：冬令时窗到
-  07:00，05:57 启动可以重试到第 3 次；夏令时窗到 06:00，05:57 启动后放不下第二次，所以不重试。
-  这与第二十三轮施工计划 §2.4 写的"共 3 次、间隔 5 分钟、都在换日窗内"在夏令时不一致，
-  三者不能同时满足；这里以 D82 为准，待外部审核裁定。
-- 重试之后仍有日报没生成：发一条 `DAILY_REPORT_FAILED` 告警（记录类，列出所有缺的日期），
-  退出码 3。用法或配置错误不重试，退出码 2。日报是否齐全照旧由正式检查原有的规则判。
+  重试按它真正开始的时刻判窗：睡醒之后已在窗外，就不睡、不再试。
+- **夏令时不重试，这是已知的限制**。换日窗全年的交集只有本机 05:55–06:00：冬令时窗到
+  07:00，05:57 启动可以做满 3 次（05:57、06:02、06:07）；夏令时窗到 06:00，05:57 启动后距
+  关窗只剩 3 分钟，放不下间隔 5 分钟的第二次，只尝试 1 次。逐日核对 2026-11-01 至
+  2027-10-31：冬令时 133 天都能做满 3 次，夏令时 232 天只有 1 次——**每年约 232 天脚本内
+  不重试**，当天失败要等到次日 05:57 补生成。第二十三轮施工计划 §2.4 第 2 条写的"共 3 次、
+  间隔 5 分钟、都在换日窗内"，在夏令时只有"都在换日窗内"成立（间隔仍是 5 分钟，但用不上），
+  这一条只算部分完成。固定的任务时刻下三者不能同时满足；实现保持保守方案（以 D82 为准，
+  任务时刻和间隔都不改）。不改任务时刻、不放宽 D82 而要全年做满 3 次，只能把间隔缩到
+  89 秒以内（例如 60 秒），那要另行决定。
+- 一次运行结束时有日报没生成：发一条 `DAILY_REPORT_FAILED` 告警（记录类），退出码 3。
+  告警按日写实际尝试的次数，没有尝试的写原因（换日窗外）。**其他失败也发这一种告警**，
+  每次运行最多一条，消息里写明是哪一类和退出码：配置或用法错误（点差模型坏了、会话配置
+  缺失或读不了、缺网关配置、账户不是 Demo；退出码 2，不重试）；未预期异常和日报写盘失败
+  （退出码 1，照旧带回溯）；网关期限（退出码 75，进程由网关直接结束，告警在它退出之前
+  写）。`live` 目录不存在时不写告警，也不为写告警建目录。日报是否齐全照旧由正式检查原有
+  的规则判。
+- 网关期限（退出码 75）时，网关把标记文件 `gateway-stall.json`、`exit-gateway.json` 写到
+  当前目录的 `data\live` 下。日报包装器先 `cd` 到部署树，没有设 `MT5_LIVE_DIR`，所以部署树
+  和数据目录分开时，这两个文件落在部署树的 `data\live`，不在 `-DataDir` 里。
 
 ### 6.4 验收与部署边界
 
