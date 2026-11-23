@@ -610,6 +610,8 @@ FORMAL_ANOMALY_ALERTS = frozenset({
     "TRADE_MODE", "ORDER_ERROR", "LINE_CAP_STATE",
     # T191（第十八轮 §3.1）：运行时还会写的异常类
     "ORDER_REJECTED", "LOOP_EXIT", "COMMAND_UNREADABLE", "DRILL_ARCHIVE_ERROR",
+    # T211（第二十三轮 §2.1）：交易终端出现在 worker 的进程树下
+    "SUPERVISOR_TERMINAL_CHILD",
     # T209（第二十三轮 §2.2）：终端不允许算法交易（算法交易按钮被关、API 被禁）
     "ALGO_TRADING_DISABLED",
 })
