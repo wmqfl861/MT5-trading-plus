@@ -555,10 +555,10 @@ PID 创建时间不符、未知子进程或缺 launcher 但 worker 仍活着的�
 | 7 | 启动器已退出，PID 上是创建时间不符且参数不符的进程 | 视为缺失，可重启 |
 | 8 | 启动器 PID 上是参数相符、创建时间不符的进程 | 拒绝 |
 | 9 | 启动器已退出，worker 还在 | 拒绝 |
-| 10 | worker 下有未知子进程，包括 terminal64.exe | 拒绝；另发 `SUPERVISOR_TERMINAL_CHILD` |
+| 10 | worker 下有未知子进程，包括 terminal64.exe | 拒绝；被拒绝点名的进程是终端时，另发 `SUPERVISOR_TERMINAL_CHILD` |
 | 11 | 登记之外有参数相符的 worker | 拒绝 |
 | 12 | supervisor 的 halt 在场，同时有 `halt-risk-veto.json` 或 killSwitch | 不自动解除；`supervisor-state.json` 记 `clear_blocked`，人工核对后移除 |
-| 13 | 角色被判 `heartbeat_or_log_stale` | 写 halt 并重启；`SUPERVISOR` 告警的 `checks=` 列出失败的子条件 |
+| 13 | 角色被判 `heartbeat_or_log_stale` | 写 halt 并重启；`SUPERVISOR` 告警的 `checks=` 和 `supervisor-state.json` 的 `stale_checks` 列出该角色每条子条件的取值（通过的也在内） |
 
 "系统 conhost"指映像的完整路径等于 `<SystemRoot>\System32\conhost.exe`（按 `ntpath` 归一大小写和分隔符后
 比较）；系统根目录取不到时不放过任何进程。第 7 行的孤儿判断：`parent_pid` 等于该 PID、创建时间落在
