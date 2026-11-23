@@ -2,8 +2,9 @@
 
 Only an explicitly pinned, detached and clean deployment may be restarted.
 Registry/process ambiguity halts and requires an operator; it never authorizes a
-kill or a duplicate worker. All OS actions live in WindowsProcesses for offline
-state-machine tests.
+kill or a duplicate worker. Process-table access and termination live in
+WindowsProcesses for offline state-machine tests; identity checks resolve paths
+on disk (``canonical()``) exactly as the launcher does.
 """
 from __future__ import annotations
 
@@ -238,11 +239,13 @@ def _require_launcher_gone(entry, table, argv, system_root):
 
 
 def _decide_tree(entry, table, argv, system_root):
-    """Pure decision over a process table: no environment, no filesystem.
+    """Decide over a process table with the system root as an argument.
 
-    Unknown descendants are refused. An exempted process is never verified, so
-    it never enters the result and can never be terminated. Children come
-    before their parent in the result.
+    The console-host decision reads no environment and no filesystem; the
+    worker identity checks keep their own path normalization (`canonical()`),
+    as they always have. Unknown descendants are refused. An exempted process
+    is never verified, so it never enters the result and can never be
+    terminated. Children come before their parent in the result.
     """
     root = table.get(entry["pid"])
     if root is not None and not _argv_matches(root.get("argv"), argv):
@@ -416,12 +419,21 @@ def _registered_trees(cfg, processes, *, allow_missing=False):
     return roles, mapped, trees
 
 
-def terminate_verified_tree(entry, processes, argv):
-    tree = verified_tree(entry, processes.snapshot(), argv)
-    for process in tree:
-        processes.terminate(process)
-    if verified_tree(entry, processes.snapshot(), argv):
-        raise ValueError("worker tree did not terminate")
+def terminate_verified_tree(entry, processes, argv, role=None):
+    """End a verified tree, children first.
+
+    The tree is looked at again from a fresh snapshot, so it can differ from the
+    one that passed the registry check; a refusal raised here carries the role.
+    """
+    try:
+        tree = verified_tree(entry, processes.snapshot(), argv)
+        for process in tree:
+            processes.terminate(process)
+        if verified_tree(entry, processes.snapshot(), argv):
+            raise ValueError("worker tree did not terminate")
+    except IdentityError as exc:
+        exc.role = role or exc.role
+        raise
 
 
 def inspect_deployment(cfg, processes, *, verify_deployment=verify_deployment):
@@ -447,7 +459,7 @@ def stop_deployment(cfg, processes, *, verify_deployment=verify_deployment):
             roles, mapped, trees = _registered_trees(cfg, processes)
             for key, tree in trees.items():
                 if tree:
-                    terminate_verified_tree(mapped[key], processes, command(cfg, roles[key]))
+                    terminate_verified_tree(mapped[key], processes, command(cfg, roles[key]), role=key)
                     result["stopped"].append(key)
     except Exception as exc:
         result.update(refused=True, reason=refusal_text(exc))
@@ -510,7 +522,10 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
                 append_alert(str(live), "SUPERVISOR",
                              f"unhealthy={stale}" + (f" checks={checks}" if checks else ""), now)
                 # Persist reset BEFORE any process mutation/crash.
-                write_json_atomic(str(state_path), {"healthy_since": None, "signature": signature})
+                reset = {"healthy_since": None, "signature": signature}
+                if checks:
+                    reset["stale_checks"] = checks   # same sub-conditions as the alert, for forensics
+                write_json_atomic(str(state_path), reset)
                 for key, reason in stale.items():
                     entry = mapped.get(key)
                     # T180: retain pre-restart registry bytes inside the same lock.
@@ -529,7 +544,7 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
                                      f"seq={seq} component={key} before copy failed: {type(exc).__name__}", now)
                         result["evidence_failures"].append(key)
                     if entry:
-                        terminate_verified_tree(entry, processes, command(cfg, roles[key]))
+                        terminate_verified_tree(entry, processes, command(cfg, roles[key]), role=key)
                     log_stamp = stamp + "-" + uuid.uuid4().hex[:8]
                     kind = roles[key]["kind"]
                     log = str(Path(cfg.log_dir) / f"{kind}-{key}-{log_stamp}.log")

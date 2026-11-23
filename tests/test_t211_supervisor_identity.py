@@ -293,3 +293,76 @@ def test_stale_alert_names_the_checks_that_failed(tmp_path):
     for check in ("heartbeat=timeout", "pid_in_tree=True", "deployment_sha=ok",
                   "heartbeat_not_before_registry=True", "log_age_s="):
         assert check in line, check
+
+
+def test_stale_checks_are_kept_in_the_state_file(tmp_path):
+    module, cfg, p, live, entries = setup(tmp_path)
+    e = role(entries, "reconcile")
+    (live / "heartbeat-reconcile.json").write_text(json.dumps(dict(
+        runner_alive=True, ts=(NOW - timedelta(seconds=400)).isoformat(),
+        pid=e["pid"], deployment_sha=cfg.sha, reconcile_clean=True)))
+    assert run(module, cfg, p)["restarted"] == ["reconcile"]
+    kept = json.loads((live / "supervisor-state.json").read_text(encoding="utf-8"))["stale_checks"]
+    assert set(kept) == {"reconcile"} and "heartbeat=timeout" in kept["reconcile"]
+
+
+def test_a_halt_behind_a_kill_switch_names_the_blocker(tmp_path):
+    module, cfg, p, live, entries = setup(tmp_path)
+    module.write_halt_once(str(live), "component_lost", NOW, owner="supervisor", token="ours")
+    (live / "killSwitch").touch()
+    run(module, cfg, p)
+    now = NOW + timedelta(seconds=300)
+    healthy_at(live, cfg, entries, now)
+    result = run(module, cfg, p, now)
+    assert result["cleared"] is False and (live / "halt.json").exists()
+    assert result["clear_blocked"] == "killSwitch"
+    assert json.loads((live / "supervisor-state.json").read_text(encoding="utf-8"))["clear_blocked"] == "killSwitch"
+
+
+def test_the_terminal_child_alert_is_an_anomaly():
+    spec = importlib.util.spec_from_file_location("t211_demo_check", ROOT / "scripts" / "demo_check.py")
+    check = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = check
+    spec.loader.exec_module(check)
+    assert "SUPERVISOR_TERMINAL_CHILD" in check.FORMAL_ANOMALY_ALERTS
+
+
+# ---- independent review of 506e57c: a refusal raised while a tree is being
+# ended must carry the role, because that tree is looked at again from a new
+# snapshot and may differ from the one that passed the registry check ----
+
+def tree_changes_after_the_registry_check(processes, target_pid):
+    original, calls = processes.snapshot, []
+
+    def snapshot():
+        table = original()
+        calls.append(1)
+        if len(calls) >= 2:                      # every look after the registry check
+            table[target_pid * 10] = dict(table[target_pid], pid=target_pid * 10, parent_pid=target_pid,
+                                          argv=[sys.executable, "other.py"])
+        return table
+    processes.snapshot = snapshot
+
+
+def test_refusal_while_restarting_names_the_role(tmp_path):
+    module, cfg, p, live, entries = setup(tmp_path)
+    e = role(entries, "reconcile")
+    (live / "heartbeat-reconcile.json").write_text(json.dumps(dict(
+        runner_alive=True, ts=(NOW - timedelta(seconds=400)).isoformat(),
+        pid=e["pid"], deployment_sha=cfg.sha, reconcile_clean=True)))
+    tree_changes_after_the_registry_check(p, e["pid"])
+    result = run(module, cfg, p)
+    assert result["refused"] is True and f"role=reconcile" in result["reason"]
+    assert f"pid={e['pid'] * 10}" in result["reason"]
+    refused = alerts(live, "SUPERVISOR_REFUSED")
+    assert len(refused) == 1 and "role=reconcile" in refused[0]
+    assert json.loads((live / "supervisor-state.json").read_text(encoding="utf-8"))["last_refusal"]["role"] == "reconcile"
+    assert p.started == []
+
+
+def test_refusal_while_stopping_names_the_role(tmp_path):
+    module, cfg, p, live, entries = setup(tmp_path)
+    tree_changes_after_the_registry_check(p, role(entries, "risk")["pid"])
+    (live / "killSwitch").touch()
+    stopped = module.stop_deployment(cfg, p, verify_deployment=lambda c: None)
+    assert stopped["refused"] is True and "role=risk" in stopped["reason"]
