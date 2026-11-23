@@ -11,7 +11,9 @@
     python scripts/ops/link_baseline.py --terminal-log-dir … --from 2026-11-24 --to 2026-11-28 --format table
 
 不给 --date 时取 UTC 的前一天（不是本地日历的前一天）。每个 UTC 日输出一行
-JSON；表格格式每个日一行。
+JSON；表格格式每个日一行。一个 UTC 日要等它结束之后、终端写下第一行新日志
+之后才出得完整；结果因此随运行时刻变。记基线用 --from/--to 一次算完
+（见 docs/ops/demo-runbook.md §2a）。
 
 终端日志每个本地日期一个文件（YYYYMMDD.log，UTF-16），行里的时刻是本机本地
 时间；--log-utc-offset-hours 给出它相对 UTC 的小时数（默认 8）。
@@ -22,7 +24,7 @@ JSON；表格格式每个日一行。
   到下一次 `authorized` 为止。首尾相接的段算同一段连续中断（中间没有恢复
   过）；按起头的方式分开计数，"终端不在"的秒数另计。
 - 从当天开始的段按整段计时，跨日的也算全。从前一天延续进来的段只计它落在
-  当天的部分，计入"延续"。
+  当天的部分，计入"延续"。所以一段跨日的中断会在两天里各出现一次。
 - 向前回看 --lookback-days 天，向后最多再读 30 天（或到目录里最后一个日志
   文件），跨日、跨天的中断才量得出时长。
 - 读到数据末尾（最后一个有日志行的时刻）仍未恢复的段，时长是下界
@@ -31,22 +33,25 @@ JSON；表格格式每个日一行。
 窗口判据（与正式检查 scripts/demo_check.py 一致，不放宽）：进程连续断线
 900 秒以 78 退出；退出的时刻落在 UTC 日历的交易日就算窗口失败。
 - 一段中断开始后第 900 秒还没恢复、那一刻是交易日，就在那一刻失败（第一条
-  规则；离 900 秒不到一分钟就恢复的记 near_breach_segments）。
+  规则）。离 900 秒不到一分钟就恢复的记 near_breach_segments：进程和终端
+  日志的计时起点相差大约一分钟，这种段在窗口里可能已经触发了 78。
 - 中断跨进后面的交易日时，退出的时刻取决于进程何时被拉起。这里取偏严的口径：
-  落在那个交易日里满 900 秒就按失败计，时刻记为在交易日里累计满 900 秒之时
-  （would_fail_window、first_breach_utc）。
-- 零点前开始、进了交易日不足 900 秒就恢复的尾巴不报失败，只计数
-  （tails_into_trading_day）；这时窗口是否失败以正式检查里 rc=78 的日期为准。
+  落在那个交易日里满 900 秒就按失败计，时刻记为在交易日里累计满 900 秒之时。
+  每一天单独判：前一天晚上断线、次日恢复的，两天都不合格。
+- 零点前开始、进了交易日不足 900 秒就恢复的尾巴不判失败，记
+  tails_into_trading_day；这时窗口是否失败取决于进程被拉起的时刻。
 日历用 --calendar（正式检查的日历 JSON，或日历源文件）；不给时周一至周五算
-交易日，节假日不排除，输出里 calendar 记为 weekday。
+交易日。日历没覆盖到的日子也按周一至周五算（把节假日当交易日，偏严），并把
+缺的日期列在 calendar_missing_days 里。
 
-终端在不在：终端在线时大约每 6 小时写一条扫描行。当天任意相邻两条日志行相隔
-达到 --absent-gap-s（默认 7 小时），或者"终端不在"的段落落在当天的部分达到
-这个数，就记 terminal_absent。
+终端在不在：终端在线时大约每 6 小时写一条扫描行。当天相邻两条日志行相隔达到
+--absent-gap-s（默认 7 小时），或者"终端不在"的段落落在当天的部分达到这个数，
+就记 terminal_absent。
 
-baseline_day 为真要同时满足：是交易日；日志覆盖到当天结束；终端全程在；
-没有让窗口失败的中断；没有到数据末尾仍未恢复的中断。五项里有一项不满足的
-日子不计入基线。
+baseline_day 为真（这一天计入基线）要同时满足：是交易日；日志覆盖了全天；
+终端全程在；没有让窗口失败的中断；没有到数据末尾仍未恢复的中断；
+near_breach_segments 和 tails_into_trading_day 都是 0。后两条取偏严的口径：
+这些情形窗口可能失败，脚本不下结论，这一天不计入，要人逐条看。
 
 退出码：0 出了统计；3 有日子出不了统计（该日 stdout 一行 JSON，error 说明是
 哪一种：no_terminal_log、log_unreadable、log_dir_unreadable）；2 参数错误。
@@ -64,7 +69,8 @@ from math import floor
 from pathlib import Path
 
 _LOST = re.compile(r": connection to \S+ lost")
-_AUTHORIZED = re.compile(r": authorized on .*?\(ping: ([0-9][0-9 .,]*) ms")
+_AUTHORIZED_ON = re.compile(r": authorized on ")
+_PING = re.compile(r"\(ping: ([0-9][0-9 .,]*) ms")
 _AP_SWITCH = re.compile(r": auto connecting to a better access point")
 _SCAN = re.compile(r": scanning network for access points$")
 _DISCONNECTED = re.compile(r": disconnected from ")
@@ -77,7 +83,7 @@ WINDOW_FAIL_S = 900.0              # 连续断线 15 分钟：进程以 78 退�
 NEAR_S = 60.0                      # 离判据不到一分钟：终端日志和进程的计时起点有差
 LOOKBACK_DAYS = 30                 # 量跨日、跨天的中断时向前回看的天数
 FORWARD_DAYS = 30                  # 向后最多多读的天数
-ABSENT_GAP_S = 7 * 3600.0          # 终端在线时约每 6 小时一条扫描行
+ABSENT_GAP_S = 7 * 3600.0          # 终端在线时约每 6 小时一条扫描行；样本只有 7 天
 GAP_MARK_S = 300.0                 # 相隔这么久以上的两条日志行才记下来
 DNS_CAP = 10001                    # 查询上限；到了上限就不报数
 
@@ -88,6 +94,7 @@ NEWEST_QUERY = "*[System[TimeCreated[@SystemTime>='{bound}']]]"
 
 Event = tuple[datetime, str, "float | None"]
 Span = tuple[datetime, "datetime | None", str]      # start, end (None = 未恢复), kind
+Gap = tuple[datetime, datetime]                     # 相隔久的相邻两行日志
 
 
 def _clock(parts: list[str]) -> "float | None":
@@ -118,7 +125,7 @@ def _ping(text: str) -> "float | None":
 
 def parse_events(text: str) -> list[tuple[float, str, "float | None"]]:
     """终端日志文本 → [(当日秒数, 类型, ping 毫秒)]，类型取 lost / authorized /
-    ap_switch / scan / disconnected；其余行忽略。"""
+    ap_switch / scan / disconnected；其余行忽略。authorized 行没有 ping 也算恢复。"""
     out = []
     for line in text.splitlines():
         parts = line.split("\t")
@@ -128,9 +135,9 @@ def parse_events(text: str) -> list[tuple[float, str, "float | None"]]:
         if at is None:
             continue
         message = "\t".join(parts[4:])
-        found = _AUTHORIZED.search(message)
-        if found:
-            out.append((at, "authorized", _ping(found.group(1))))
+        found = _PING.search(message)
+        if _AUTHORIZED_ON.search(message):
+            out.append((at, "authorized", _ping(found.group(1)) if found else None))
         elif _LOST.search(message):
             out.append((at, "lost", None))
         elif _AP_SWITCH.search(message):
@@ -168,27 +175,32 @@ def parse_accounts(text: str) -> set[str]:
 
 
 def _decode(raw: bytes) -> str:
-    """按 BOM 选编码；没有 BOM 的按 UTF-16 LE。正在写的文件末尾可能是半个
-    字符，截掉；最后一行没写完的，写到哪儿读到哪儿。认不出来的编码抛 UnicodeError。"""
+    """按 BOM 选编码。没有 BOM 时：前 512 字节里有 NUL 的是 UTF-16 LE，否则按
+    UTF-8 读（读不了抛 UnicodeError）。UTF-16 文件正在写、末尾可能是半个字符，
+    截掉。认不出来的编码抛 UnicodeError。"""
     if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
         body = raw[2:] if len(raw) % 2 == 0 else raw[2:len(raw) - 1]
         return body.decode("utf-16-le" if raw[:2] == b"\xff\xfe" else "utf-16-be")
     if raw[:3] == b"\xef\xbb\xbf":
         return raw[3:].decode("utf-8")
-    return (raw if len(raw) % 2 == 0 else raw[:len(raw) - 1]).decode("utf-16-le")
+    if b"\x00" in raw[:512]:
+        return (raw if len(raw) % 2 == 0 else raw[:len(raw) - 1]).decode("utf-16-le")
+    return raw.decode("utf-8")
 
 
 class Reading:
-    """读到的内容。events 是按 UTC 时刻排序的事件；marks 是各文件首末行和相隔
-    久的两行端点（判断终端在不在）；unreadable 是读不了的文件的本地日期。"""
+    """读到的内容。events 是按 UTC 时刻排序的事件；gaps 是相隔达到 GAP_MARK_S 的
+    相邻两行日志（判断终端在不在）；unreadable 是读不了的文件的本地日期。"""
 
-    def __init__(self, events=(), marks=(), unreadable=(), last_line=None, accounts=(), found=()):
+    def __init__(self, events=(), gaps=(), unreadable=(), last_line=None, first_line=None,
+                 accounts_by_day=None, found=()):
         self.events = list(events)
-        self.marks = list(marks)
+        self.gaps = list(gaps)
         self.unreadable = list(unreadable)
-        self.last_line = last_line
-        self.accounts = set(accounts)
-        self.found = set(found)                    # 有文件的本地日期
+        self.last_line = last_line                    # 读到的最后一行日志
+        self.first_line = first_line                  # 读到的第一行日志
+        self.accounts_by_day = dict(accounts_by_day or {})
+        self.found = set(found)                       # 有文件的本地日期
 
 
 def log_dates(log_dir) -> list[date]:
@@ -235,23 +247,23 @@ def read_logs(log_dir, start: datetime, end: datetime, utc_offset_hours: float) 
             previous = None                          # 这个文件的行不知道，不做跨文件的间隔判断
             continue
         base = local_midnight - timedelta(hours=utc_offset_hours)   # 本地零点对应的 UTC 时刻
-        reading.accounts.update(parse_accounts(text))
+        accounts = parse_accounts(text)
+        if accounts:
+            reading.accounts_by_day[file_day.isoformat()] = accounts
         moments = sorted(base + timedelta(seconds=at) for at in parse_line_times(text))
+        chain = ([previous] if previous is not None else []) + moments
+        for before, after in zip(chain, chain[1:]):
+            if (after - before).total_seconds() >= GAP_MARK_S:
+                reading.gaps.append((before, after))
         if moments:
-            reading.marks.append(moments[0])
-            if moments[-1] != moments[0]:
-                reading.marks.append(moments[-1])
-            chain = ([previous] if previous is not None else []) + moments
-            for before, after in zip(chain, chain[1:]):
-                if (after - before).total_seconds() >= GAP_MARK_S:
-                    reading.marks.extend((before, after))
-            previous = reading.last_line = moments[-1]
+            reading.first_line = reading.first_line or moments[0]
+            reading.last_line = previous = moments[-1]
         for at, kind, value in parse_events(text):
             moment = base + timedelta(seconds=at)
             if start <= moment < end:
                 reading.events.append((moment, kind, value))
     reading.events.sort(key=lambda item: item[0])     # 稳定排序：同一毫秒保持文件里的先后
-    reading.marks = sorted(set(reading.marks))
+    reading.gaps.sort()
     return reading
 
 
@@ -293,12 +305,6 @@ def outages(spans) -> list[list[Span]]:
     return merged
 
 
-def _trading(calendar: "dict[str, bool] | None"):
-    if calendar:
-        return lambda moment: calendar.get(moment.date().isoformat(), moment.weekday() < 5)
-    return lambda moment: moment.weekday() < 5
-
-
 def _wevtutil(system_root, *args) -> "str | None":
     tool = os.path.join(system_root, "System32", "wevtutil.exe") if system_root else "wevtutil"
     try:
@@ -325,16 +331,16 @@ def _system_time(text: "str | None") -> "datetime | None":
 def dns_timeouts(day: date, system_root=None, run=None) -> "int | None":
     """UTC 日内 DNS-Client 1014（名称解析超时）的条数。
 
-    系统日志不覆盖那一天（最早的一条不早于当天结束，或者当天开始之后一条
-    都没有）、查不到、或者到了查询上限时返回 None，不冒充 0。
+    系统日志不覆盖那一整天（最早的一条晚于当天开始，或者当天结束之前就断了，
+    例如被清空过）、查不到、或者到了查询上限时返回 None，不冒充 0。
     """
     run = run or _wevtutil
     day_start = datetime(day.year, day.month, day.day)
     day_end = day_start + timedelta(days=1)
     oldest = _system_time(run(system_root, "/q:" + OLDEST_QUERY.format(bound=_bound(day_end)), "/c:1", "/rd:false", "/f:xml"))
     newest = _system_time(run(system_root, "/q:" + NEWEST_QUERY.format(bound=_bound(day_start)), "/c:1", "/rd:true", "/f:xml"))
-    if oldest is None or newest is None or oldest >= day_end or newest < day_start:
-        return None                               # 系统日志没有覆盖这一天
+    if oldest is None or newest is None or oldest > day_start or newest < day_end:
+        return None                               # 系统日志没有覆盖这一整天
     page = run(system_root, "/q:" + DNS_QUERY.format(start=_bound(day_start), end=_bound(day_end)),
                f"/c:{DNS_CAP}", "/rd:true", "/f:xml")
     if page is None:
@@ -361,13 +367,14 @@ def load_calendar(path) -> dict[str, bool]:
     return {row["date"]: bool(row["trading"]) for row in data["days"]}
 
 
-def longest_silent_gap(start: datetime, end: datetime, marks) -> "float | None":
-    """[start, end) 内相邻两条日志行（含两端）最长的间隔；没有达到 GAP_MARK_S 的
-    间隔就是 None。一行都没有算整天。"""
-    inside = [mark for mark in marks if start < mark < end]
-    points = [start, *inside, end]
-    longest = max((b - a).total_seconds() for a, b in zip(points, points[1:]))
-    return longest if longest >= GAP_MARK_S else None
+def longest_silent_gap(start: datetime, end: datetime, gaps) -> "float | None":
+    """落进 [start, end) 的最长一段日志空档；没有达到 GAP_MARK_S 的空档就是 None。"""
+    longest = None
+    for before, after in gaps:
+        low, high = max(before, start), min(after, end)
+        if high > low and (longest is None or (high - low).total_seconds() > longest):
+            longest = (high - low).total_seconds()
+    return longest if longest is not None and longest >= GAP_MARK_S else None
 
 
 def _floor(seconds: float) -> float:
@@ -375,17 +382,39 @@ def _floor(seconds: float) -> float:
     return floor(seconds * 10 + 1e-6) / 10
 
 
+def _joined_runs(runs: list[tuple[datetime, float]]) -> list[tuple[datetime, float]]:
+    """首尾相接的两段（中断跨过两个相邻交易日的零点）接成一段。"""
+    out: list[tuple[datetime, float]] = []
+    for low, seconds in runs:
+        if out and out[-1][0] + timedelta(seconds=out[-1][1]) == low:
+            out[-1] = (out[-1][0], out[-1][1] + seconds)
+        else:
+            out.append((low, seconds))
+    return out
+
+
 def summarize(day: date, reading: Reading, dns: "int | None" = None,
               calendar: "dict[str, bool] | None" = None, *, absent_gap_s: float = ABSENT_GAP_S,
-              missing_log_days=()) -> dict:
+              missing_log_days=(), own_days=()) -> dict:
     """一个 UTC 日的链路统计。reading 须覆盖该日之前（回看期）到之后；
-    missing_log_days 是这一天的日志里缺了的本地日期。"""
+    missing_log_days 是这一天的日志里缺了的本地日期，own_days 是这一天的全部本地日期。"""
     start = datetime(day.year, day.month, day.day)
     end = start + timedelta(days=1)
-    limit = (reading.last_line if reading.last_line is not None    # 数据到这里为止
-             else end + timedelta(days=1))
-    is_trading = _trading(calendar)
+    first_line, data_end = reading.first_line, reading.last_line
+    limit = data_end if data_end is not None else end + timedelta(days=1)   # 数据到这里为止
     mark = timedelta(seconds=WINDOW_FAIL_S)
+    almost = timedelta(seconds=WINDOW_FAIL_S - NEAR_S)
+    missing = sorted(missing_log_days)
+    calendar_missing: set[str] = set()
+
+    def is_trading(moment: datetime) -> bool:
+        if not calendar:
+            return moment.weekday() < 5
+        key = moment.date().isoformat()
+        if key not in calendar:                  # 日历没覆盖这一天：按工作日算（偏严），记下来
+            calendar_missing.add(key)
+            return moment.weekday() < 5
+        return calendar[key]
 
     def span_measured(span_end) -> datetime:
         """能量到的终点：恢复时刻；没恢复的就是数据末尾。"""
@@ -394,11 +423,13 @@ def summarize(day: date, reading: Reading, dns: "int | None" = None,
     def counted_span(from_: datetime, to_: "datetime | None") -> float:
         """记到当天的秒数：当天开始的算整段，延续进来的只算落在当天的部分。"""
         upper = span_measured(to_)
-        return (upper - from_).total_seconds() if from_ >= start else (min(upper, end) - start).total_seconds()
+        if from_ >= start:
+            return max((upper - from_).total_seconds(), 0.0)
+        return max((min(upper, end) - start).total_seconds(), 0.0)
 
     def inside_span(from_: datetime, to_: "datetime | None") -> float:
         """落在当天之内的秒数。"""
-        return (min(span_measured(to_), end) - max(from_, start)).total_seconds()
+        return max((min(span_measured(to_), end) - max(from_, start)).total_seconds(), 0.0)
 
     def trading_runs(from_: datetime, to_: datetime) -> list[tuple[datetime, float]]:
         """[from_, to_) 在每个交易日里连续覆盖的部分：[(起点, 秒数)]。"""
@@ -416,7 +447,9 @@ def summarize(day: date, reading: Reading, dns: "int | None" = None,
     def counted(row) -> float:
         return counted_span(row["start"], row["end"])
 
-    rows, breach, near, tails, trading_longest, down_seconds = [], None, 0, 0, 0.0, 0.0
+    rows, breach, near, tails = [], None, 0, 0
+    trading_parts: list[float] = []
+    down_seconds = 0.0
     for parts in outages(segments(reading.events)):
         span_start, span_end, kind = parts[0][0], parts[-1][1], parts[0][2]
         if span_end is not None and span_end <= start:
@@ -427,40 +460,52 @@ def summarize(day: date, reading: Reading, dns: "int | None" = None,
         rows.append(row)
         down_seconds += sum(counted_span(part[0], part[1]) for part in parts if part[2] == "terminal_down")
         stop = span_measured(span_end)
-        runs = trading_runs(span_start, stop)      # [(交易日起点, 连续覆盖的秒数)]
-        lengths = [seconds for _, seconds in runs]
-        trading_longest = max(trading_longest, max(lengths, default=0.0))
-        exits = []
+        runs = trading_runs(span_start, stop)
+        for low, seconds in _joined_runs(runs):     # 交易时段最长：当天开始的算整段，延续的只算当天部分
+            if low < start:
+                inside_end = min(low + timedelta(seconds=seconds), end)
+                if inside_end > start:
+                    trading_parts.append((inside_end - start).total_seconds())
+            elif low < end:
+                trading_parts.append(seconds)
+        exits = []                                 # 这段中断会让进程以 78 退出的时刻
         if stop - span_start >= mark and is_trading(span_start + mark):
             exits.append(span_start + mark)        # 第一个进程累计满 900 秒退出
         exits += [low + mark for low, seconds in runs if low > span_start and seconds >= WINDOW_FAIL_S]
-        if exits:                                 # 跨进交易日的：落在交易日里满 900 秒
-            moment = min(exits)
-            if start <= moment < end:             # 失败记在退出时刻所在的那一天
-                breach = moment if breach is None else min(breach, moment)
-        elif (mark - timedelta(seconds=NEAR_S) <= stop - span_start < mark and is_trading(span_start + mark)
-              or any(low > span_start and WINDOW_FAIL_S - NEAR_S <= seconds < WINDOW_FAIL_S
-                     for low, seconds in runs)):
-            near += 1                             # 离 900 秒不到一分钟就恢复了
-        if any(start <= low < end and low > span_start and seconds < WINDOW_FAIL_S for low, seconds in runs):
-            tails += 1                            # 零点前开始，进了交易日不足 900 秒就恢复
+        exits = [moment for moment in exits if start <= moment < end]    # 每一天单独判
+        if exits:
+            breach = min(exits) if breach is None else min(breach, min(exits))
+        elif (start <= span_start + mark < end and almost <= stop - span_start < mark
+              and is_trading(span_start + mark)):
+            near += 1                              # 离 900 秒不到一分钟就恢复了
+        elif (is_trading(start) and span_start < start < stop
+              and (min(stop, end) - start).total_seconds() < WINDOW_FAIL_S):
+            tails += 1                             # 零点前开始，进了交易日不足 900 秒就恢复
     longest = max(rows, key=counted) if rows else None
     open_at_end = [row for row in rows if span_measured(row["end"]) >= end]
     unresolved = [row for row in rows if row["end"] is None]
     # 只在有数据的部分里找空档：数据到头了不算终端不在
-    silent = longest_silent_gap(start, min(end, limit), reading.marks) if limit > start else None
-    missing = sorted(missing_log_days)
+    gaps = list(reading.gaps)
+    if first_line is not None and start < first_line < min(end, limit):
+        gaps.append((start, first_line))           # 读到的数据从当天中途才开始
+    silent = longest_silent_gap(start, min(end, limit), gaps) if limit > start else None
     down_inside = [inside_span(part[0], part[1]) for row in rows for part in row["parts"]
                    if part[2] == "terminal_down"]
     absent = None if missing else ((silent or 0.0) >= absent_gap_s
                                    or max(down_inside, default=0.0) >= absent_gap_s)
-    complete = not missing and limit >= end
+    complete = bool(not missing and data_end is not None and data_end >= end
+                    and (first_line is None or first_line <= start))
     down = sum(1 for row in rows if row["kind"] == "terminal_down")
     on_day = [value for at, kind, value in reading.events if kind == "authorized" and start <= at < end]
+    pings = [value for value in on_day if value is not None]
+    accounts = set()
+    for own in own_days:
+        accounts |= reading.accounts_by_day.get(own, set())
     return {
         "date_utc": day.isoformat(),
         "trading_day": is_trading(start),
         "calendar": "file" if calendar else "weekday",
+        "calendar_missing_days": sorted(calendar_missing),
         "disconnect_segments": len(rows),
         "lost_segments": len(rows) - down,
         "terminal_down_segments": down,
@@ -469,7 +514,7 @@ def summarize(day: date, reading: Reading, dns: "int | None" = None,
         "whole_day_in_outage": any(row["start"] < start for row in open_at_end),
         "longest_s": _floor(counted(longest)) if longest else 0.0,
         "longest_is_lower_bound": bool(longest and longest["end"] is None),
-        "longest_trading_s": _floor(trading_longest),
+        "longest_trading_s": _floor(max(trading_parts, default=0.0)),
         "total_s": _floor(sum(counted(row) for row in rows)),
         "terminal_down_s": _floor(down_seconds),
         "open_segments": [{"start_utc": row["start"].isoformat(), "kind": row["kind"],
@@ -484,19 +529,20 @@ def summarize(day: date, reading: Reading, dns: "int | None" = None,
         "missing_log_days": missing,
         "observed_until": limit.isoformat(),
         "authorizations": len(on_day),
-        "ping_min_ms": min((v for v in on_day if v is not None), default=None),
-        "ping_max_ms": max((v for v in on_day if v is not None), default=None),
+        "ping_min_ms": min(pings, default=None),
+        "ping_max_ms": max(pings, default=None),
         "ap_switches": sum(1 for at, kind, _ in reading.events if kind == "ap_switch" and start <= at < end),
         "scans": sum(1 for at, kind, _ in reading.events if kind == "scan" and start <= at < end),
         "dns_timeouts": dns,
-        "accounts_seen": len(reading.accounts),
+        "accounts_seen": len(accounts),              # 这一天的日志里出现过的账号个数
         "unreadable_log_days": sorted(reading.unreadable),
-        "baseline_day": bool(is_trading(start) and complete and absent is False
-                             and breach is None and not unresolved),
+        # 偏严：临界段和跨零点的尾巴都可能是窗口失败，这样的日子不计入，要人逐条看
+        "baseline_day": bool(is_trading(start) and complete and absent is False and breach is None
+                             and not unresolved and near == 0 and tails == 0),
     }
 
 
-TABLE_HEAD = ("| UTC 日 | 交易日 | 断线段（终端不在） | 日末未恢复 | 最长秒 | 窗口判据 | 终端 | "
+TABLE_HEAD = ("| UTC 日 | 交易日 | 断线段（终端不在） | 日末未恢复 | 最长秒 | 窗口判据 | 临界/尾巴 | 终端 | "
               "ping 毫秒 | 接入点切换 | 扫描 | DNS 超时 | 基线 |")
 
 
@@ -511,12 +557,17 @@ def markdown_row(summary: dict) -> str:
         presence = "在（日志行相隔不到 5 分钟）"
     else:
         presence = f"在（最长空档 {summary['max_silent_gap_s'] / 3600:.1f} 小时）"
-    verdict = "**失败**" if summary["would_fail_window"] else ("临界" if summary["near_breach_segments"] else "不失败")
+    edges = (f"{summary['near_breach_segments']}/{summary['tails_into_trading_day']}"
+             if summary["near_breach_segments"] or summary["tails_into_trading_day"] else "—")
+    trading = "是" if summary["trading_day"] else "否"
+    if summary["calendar_missing_days"]:
+        trading += f"（日历缺 {len(summary['calendar_missing_days'])} 天）"
     dns = "未查" if summary["dns_timeouts"] is None else str(summary["dns_timeouts"])
-    return (f"| {summary['date_utc']} | {'是' if summary['trading_day'] else '否'} | "
+    return (f"| {summary['date_utc']} | {trading} | "
             f"{summary['disconnect_segments']}（{summary['terminal_down_segments']}） | "
-            f"{summary['unresolved_at_day_end']} | {longest} | {verdict} | {presence} | {ping} | "
-            f"{summary['ap_switches']} | {summary['scans']} | {dns} | "
+            f"{summary['unresolved_at_day_end']} | {longest} | "
+            f"{'**失败**' if summary['would_fail_window'] else '不失败'} | {edges} | "
+            f"{presence} | {ping} | {summary['ap_switches']} | {summary['scans']} | {dns} | "
             f"{'计入' if summary['baseline_day'] else '**不计入**'} |")
 
 
@@ -568,7 +619,7 @@ def main(argv=None) -> int:
 
     def emit_error(day: date, error: str) -> int:
         if args.format == "table":
-            print(f"| {day.isoformat()} | — | {error} | — | — | — | — | — | — | — | — | **不计入** |")
+            print(f"| {day.isoformat()} | — | {error} | " + "— | " * 9 + "**不计入** |")
         else:
             print(json.dumps({"date_utc": day.isoformat(), "error": error}), flush=True)
         return 3
@@ -587,23 +638,21 @@ def main(argv=None) -> int:
     status, header = 0, args.format == "table"
     for day in days:
         begin_day = datetime(day.year, day.month, day.day)
-        own = [file_day for file_day, path, _ in log_files(log_dir, begin_day, begin_day + timedelta(days=1), offset)
-               if path.is_file()]
-        if not own:
+        own_days = [file_day.isoformat() for file_day, _, _ in
+                    log_files(log_dir, begin_day, begin_day + timedelta(days=1), offset)]
+        if not any(own in reading.found for own in own_days):
             status = emit_error(day, "no_terminal_log")
             continue
-        if any(file_day.isoformat() in reading.unreadable for file_day in own):
+        if any(own in reading.unreadable for own in own_days):
             status = emit_error(day, "log_unreadable")
             continue
         dns = None if args.no_dns else dns_timeouts(day, system_root)
-        missing = [file_day.isoformat() for file_day, _, _ in
-                   log_files(log_dir, begin_day, begin_day + timedelta(days=1), offset)
-                   if file_day.isoformat() not in reading.found]
         summary = summarize(day, reading, dns, calendar, absent_gap_s=args.absent_gap_s,
-                            missing_log_days=missing)
+                            missing_log_days=[own for own in own_days if own not in reading.found],
+                            own_days=own_days)
         if header:
             print(TABLE_HEAD)
-            print("| --- " * 12 + "|")
+            print("| --- " * 13 + "|")
             header = False
         print(markdown_row(summary) if args.format == "table" else json.dumps(summary, ensure_ascii=True), flush=True)
     return status
