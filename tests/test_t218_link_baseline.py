@@ -691,3 +691,63 @@ def test_the_last_baseline_day_needs_the_next_local_date_file(mod, tmp_path, cap
     write_log(logs, date(2026, 12, 3), six_hourly(date(2026, 12, 3)))      # the second half of UTC 12-02 lives in this file
     summary = json.loads(run_main(mod, capsys, logs, "--date", "2026-12-02", calendar_file(tmp_path))[1])
     assert (summary["missing_log_days"], summary["terminal_absent"], summary["baseline_day"]) == ([], False, True)
+
+
+# ------------------------------------------------- 第三次复核（P-1、P-3）
+
+def test_days_after_an_unreadable_file_do_not_count_until_the_connection_is_seen_again(mod, tmp_path, capsys, monkeypatch):
+    """The unreadable file may hold an outage that runs on into the next day: invisible, so no day is
+    counted until an authorized line shows the connection is back."""
+    logs = tmp_path / "logs"
+    for day in (date(2026, 11, 23), date(2026, 11, 24), date(2026, 11, 28)):
+        write_log(logs, day, six_hourly(day))
+    write_log(logs, date(2026, 11, 25), lost("12:00:00.000") + six_hourly(date(2026, 11, 25)))   # 04:00 UTC, never recovered
+    write_log(logs, date(2026, 11, 26), six_hourly(date(2026, 11, 26)))
+    write_log(logs, date(2026, 11, 27), six_hourly(date(2026, 11, 27)))
+    calendar = calendar_file(tmp_path)
+    readable = [json.loads(text) for text in run_main(mod, capsys, logs, "--from", "2026-11-25", "--to", "2026-11-27", calendar)[1].splitlines()]
+    assert [row["would_fail_window"] for row in readable] == [True, True, True]
+    assert [row["uncertain_due_to_unreadable"] for row in readable] == [False, False, False]
+
+    real = Path.read_bytes
+    def denied(self):
+        if self.name == "20261125.log":
+            raise PermissionError(13, "Permission denied")
+        return real(self)
+    monkeypatch.setattr(Path, "read_bytes", denied)
+    code, out = run_main(mod, capsys, logs, "--from", "2026-11-25", "--to", "2026-11-27", calendar)
+    rows = [json.loads(text) for text in out.splitlines()]
+    assert code == 3 and rows[0] == {"date_utc": "2026-11-25", "error": "log_unreadable"}
+    assert [row["disconnect_segments"] for row in rows[1:]] == [0, 0]                 # the outage itself is invisible
+    assert [row["would_fail_window"] for row in rows[1:]] == [False, False]
+    assert [row["uncertain_due_to_unreadable"] for row in rows[1:]] == [True, True]
+    assert [row["baseline_day"] for row in rows[1:]] == [False, False]
+
+    # recovered at 06:00 UTC on the 26th: that day is still in the dark, the day after is an ordinary day
+    write_log(logs, date(2026, 11, 26), six_hourly(date(2026, 11, 26)) + authorized("14:00:00.000", 300))
+    write_log(logs, date(2026, 11, 27), six_hourly(date(2026, 11, 27)) + scan("10:00:00.000"))
+    code, out = run_main(mod, capsys, logs, "--from", "2026-11-25", "--to", "2026-11-27", calendar)
+    rows = [json.loads(text) for text in out.splitlines()]
+    assert code == 3 and [row["uncertain_due_to_unreadable"] for row in rows[1:]] == [True, False]
+    assert [row["baseline_day"] for row in rows[1:]] == [False, True]
+    out = run_main(mod, capsys, logs, "--date", "2026-11-26", calendar, "--format", "table")[1]
+    assert out.rstrip().endswith("| **不计入**（前面的日志读不了） |")
+
+    # the file can be read again: the same days are judged on what they hold
+    monkeypatch.undo()
+    rows = [json.loads(text) for text in run_main(mod, capsys, logs, "--from", "2026-11-25", "--to", "2026-11-27", calendar)[1].splitlines()]
+    assert [row["would_fail_window"] for row in rows] == [True, True, False]      # down 04:00 on the 25th → 06:00 on the 26th
+    assert [row["baseline_day"] for row in rows] == [False, False, True]
+
+
+def test_the_table_does_not_let_a_calendar_reason_hide_a_real_one(mod, tmp_path, capsys):
+    failing = mod.markdown_row(summary_for(mod, DAY, outage("11-24 10:00", "11-24 12:00")))        # no calendar, and it fails
+    assert "| **失败** |" in failing and failing.endswith("| **不计入** |")
+    closed = mod.markdown_row(summary_for(mod, date(2026, 11, 28), [], calendar=CAL))                 # a Saturday
+    assert closed.startswith("| 2026-11-28 | 否 |") and closed.endswith("| **不计入**（不是交易日） |")
+    # a healthy trading day without a calendar: the calendar is the only reason, and it is named
+    logs = tmp_path / "logs"
+    for day in (date(2026, 11, 23), date(2026, 11, 24), date(2026, 11, 25)):
+        write_log(logs, day, six_hourly(day))
+    out = run_main(mod, capsys, logs, "--date", "2026-11-24", "--format", "table")[1]
+    assert out.rstrip().endswith("| **不计入**（没有日历） |")

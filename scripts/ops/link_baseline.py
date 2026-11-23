@@ -29,6 +29,9 @@ JSON；表格格式每个日一行。一个 UTC 日要等它结束之后、终�
   文件），跨日、跨天的中断才量得出时长。
 - 读到数据末尾（最后一个有日志行的时刻）仍未恢复的段，时长是下界
   （open_segments 里的 at_least_s；表格里最长一栏前带 ≥）。
+- 读不了的文件：那一天出不了统计（退出码 3）。文件里可能记着一段延续到次日的
+  中断，读不到它，所以从那个文件覆盖的时段起、到其后第一条 authorized 为止的
+  日子也不计入基线（uncertain_due_to_unreadable）。
 
 窗口判据（与正式检查 scripts/demo_check.py 一致，不放宽）：进程连续断线
 900 秒以 78 退出；退出的时刻落在 UTC 日历的交易日就算窗口失败。
@@ -397,11 +400,42 @@ def _joined_runs(runs: list[tuple[datetime, float]]) -> list[tuple[datetime, flo
     return out
 
 
+def unreadable_shadow(reading: Reading, utc_offset_hours: float) -> list[tuple[datetime, "datetime | None"]]:
+    """读不了的日志文件留下的"不知道"：从那个文件覆盖的时段开始，到其后第一条
+    authorized 为止（一直没有就是 None）。文件里可能记着一段延续到次日的中断，
+    读不到它；这段时间里的日子不能计入基线。"""
+    windows = []
+    for text in reading.unreadable:
+        file_day = date.fromisoformat(text)
+        midnight = datetime(file_day.year, file_day.month, file_day.day) - timedelta(hours=utc_offset_hours)
+        windows.append((midnight, midnight + timedelta(days=1)))
+
+    def resumed(not_before: datetime) -> "datetime | None":
+        return next((at for at, kind, _ in reading.events if kind == "authorized" and at >= not_before), None)
+
+    shadows: list[tuple[datetime, "datetime | None"]] = []
+    pending: tuple[datetime, datetime] | None = None      # (起点, 读不了的文件覆盖到哪儿)
+    for begin, finish in sorted(windows):
+        if pending is None:
+            pending = (begin, finish)
+            continue
+        known_again = resumed(pending[1])
+        if known_again is not None and known_again < begin:
+            shadows.append((pending[0], known_again))     # 中间确定恢复过：两段分开
+            pending = (begin, finish)
+        else:
+            pending = (pending[0], max(pending[1], finish))   # 中间没有确定的恢复：接成一段
+    if pending is not None:
+        shadows.append((pending[0], resumed(pending[1])))
+    return shadows
+
+
 def summarize(day: date, reading: Reading, dns: "int | None" = None,
               calendar: "dict[str, bool] | None" = None, *, absent_gap_s: float = ABSENT_GAP_S,
-              missing_log_days=(), own_days=()) -> dict:
+              missing_log_days=(), own_days=(), uncertain=()) -> dict:
     """一个 UTC 日的链路统计。reading 须覆盖该日之前（回看期）到之后；
-    missing_log_days 是这一天的日志里缺了的本地日期，own_days 是这一天的全部本地日期。"""
+    missing_log_days 是这一天的日志里缺了的本地日期，own_days 是这一天的全部本地日期，
+    uncertain 是读不了的日志文件留下的"不知道"的时段（见 unreadable_shadow）。"""
     start = datetime(day.year, day.month, day.day)
     end = start + timedelta(days=1)
     first_line, data_end = reading.first_line, reading.last_line
@@ -410,6 +444,7 @@ def summarize(day: date, reading: Reading, dns: "int | None" = None,
     almost = timedelta(seconds=WINDOW_FAIL_S - NEAR_S)
     missing = sorted(missing_log_days)
     calendar_missing: set[str] = set()
+    shadowed = any(opened < end and (until is None or until > start) for opened, until in uncertain)
 
     def is_trading(moment: datetime) -> bool:
         if not calendar:
@@ -544,9 +579,10 @@ def summarize(day: date, reading: Reading, dns: "int | None" = None,
         "dns_timeouts": dns,
         "accounts_seen": len(accounts),              # 这一天的日志里出现过的账号个数
         "unreadable_log_days": sorted(reading.unreadable),
+        "uncertain_due_to_unreadable": shadowed,     # 读不了的日志文件留下的"不知道"罩着这一天
         # 偏严：临界段和跨零点的尾巴都可能是窗口失败；日历没覆盖到、或者日志里出现多个
         # 账号（中断可能被交叉配对），也都不下结论。这样的日子不计入，要人逐条看。
-        "baseline_day": bool(calendar is not None and calendar.get(day.isoformat()) is True
+        "baseline_day": bool(not shadowed and calendar is not None and calendar.get(day.isoformat()) is True
                              and not calendar_missing and len(accounts) <= 1 and complete and absent is False
                              and breach is None and not unresolved and near == 0 and tails == 0),
     }
@@ -576,11 +612,18 @@ def markdown_row(summary: dict) -> str:
     verdict = "计入"
     if not summary["baseline_day"]:
         verdict = "**不计入**"
-        for shown, why in ((summary["calendar"] == "weekday", "没有日历"),
+        elsewhere = (summary["would_fail_window"] or summary["terminal_absent"] is not False
+                     or not summary["data_complete"] or bool(summary["open_segments"])
+                     or summary["near_breach_segments"] or summary["tails_into_trading_day"])
+        # 属于日历和账号的原因只在别的栏都没报问题时写，不把那些原因盖住
+        for shown, why in ((summary.get("uncertain_due_to_unreadable"), "前面的日志读不了"),
+                           (elsewhere, ""),
+                           (summary["calendar"] == "weekday", "没有日历"),
+                           (not summary["trading_day"], "不是交易日"),
                            (bool(summary["calendar_missing_days"]), "日历没覆盖到"),
                            (summary["accounts_seen"] > 1, "日志里有多个账号")):
             if shown:
-                verdict += f"（{why}）"
+                verdict += f"（{why}）" if why else ""
                 break
     return (f"| {summary['date_utc']} | {trading} | "
             f"{summary['disconnect_segments']}（{summary['terminal_down_segments']}） | "
@@ -670,7 +713,7 @@ def main(argv=None) -> int:
         dns = None if args.no_dns else dns_timeouts(day, system_root)
         summary = summarize(day, reading, dns, calendar, absent_gap_s=args.absent_gap_s,
                             missing_log_days=[own for own in own_days if own not in reading.found],
-                            own_days=own_days)
+                            own_days=own_days, uncertain=unreadable_shadow(reading, offset))
         print(markdown_row(summary) if args.format == "table" else json.dumps(summary, ensure_ascii=True), flush=True)
     return status
 
