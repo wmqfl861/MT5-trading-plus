@@ -25,7 +25,9 @@ DAILY_REPORT_LOCAL = "05:57"
 
 
 def install_in_sandbox(tmp_path, mode=None, *, paper=False, config_name="gateway.json",
-                       with_config=True, include_data=False, with_ticks=False):
+                       with_config=True, include_data=False, with_ticks=False,
+                       with_python=True, with_sessions=True, paths=None):
+    """paths（T213）：显式参数 {参数名: 路径}，逐个变成 -参数名 '路径'。"""
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     shutil.copyfile(ROOT / "scripts" / "setup_scheduled_tasks.ps1",
@@ -37,12 +39,22 @@ def install_in_sandbox(tmp_path, mode=None, *, paper=False, config_name="gateway
         (tmp_path / "data" / "live" / "paper").mkdir(parents=True)
     if with_ticks:
         (tmp_path / "data" / "ticks" / "XAUUSD").mkdir(parents=True)
+    if with_python:
+        # T213：安装脚本要求任务命令里的解释器存在；沙箱里放一个空文件占位。
+        (tmp_path / ".venv" / "Scripts").mkdir(parents=True)
+        (tmp_path / ".venv" / "Scripts" / "python.exe").write_bytes(b"")
+    if with_sessions:
+        (tmp_path / "config").mkdir()
+        shutil.copyfile(ROOT / "config" / "sessions.toml",
+                        tmp_path / "config" / "sessions.toml")
     driver = tmp_path / "invoke.ps1"
     flags = ""
     if mode:
         flags += " -Mode " + mode
     if include_data:
         flags += " -IncludeDataTasks"
+    for name, value in (paths or {}).items():
+        flags += f" -{name} '{value}'"
     driver.write_text(
         "function global:schtasks { ($args -join '|') | Add-Content -LiteralPath $env:TASK_CALLS; $global:LASTEXITCODE = 0 }\n"
         "$env:TASK_CALLS = Join-Path $PSScriptRoot 'task-calls.txt'\n"
@@ -255,3 +267,73 @@ def test_daily_report_time_is_the_year_round_window_intersection():
         start, close = policy.rollover_window(ny_day)
         got = (_taipei_minutes(start), _taipei_minutes(close))
         assert got == want, f"{day} 换日窗本地分钟应为 {want}，实得 {got}"
+
+
+# ------------------------------------------------ T213：解释器与目录显式给出
+
+def _output(result):
+    return result.stdout.decode(errors="replace") + result.stderr.decode(errors="replace")
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
+def test_install_refuses_when_the_interpreter_is_missing(tmp_path):
+    """11-17 起日报和周检任务每次都以 rc=1 失败：命令指向部署树里不存在的 .venv。"""
+    result, wrapper = install_in_sandbox(tmp_path, "Demo", with_python=False)
+    assert result.returncode != 0
+    assert ".venv\\Scripts\\python.exe" in _output(result)
+    assert not wrapper.exists()
+    assert not (tmp_path / "scripts" / "task_demo_weekly_check.cmd").exists()
+    assert not (tmp_path / "task-calls.txt").exists()
+    assert not (tmp_path / "data").exists()          # nothing was created either
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
+def test_install_refuses_when_the_sessions_config_is_missing(tmp_path):
+    result, wrapper = install_in_sandbox(tmp_path, "Demo", with_sessions=False)
+    assert result.returncode != 0
+    assert "sessions.toml" in _output(result)
+    assert not wrapper.exists() and not (tmp_path / "task-calls.txt").exists()
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
+def test_explicit_locations_outside_the_repo_root_reach_the_task_commands(tmp_path):
+    """部署树是纯检出：解释器和运行数据在别处，包装器里只能写给出的路径。"""
+    runtime = tmp_path / "runtime"
+    python = runtime / "venv" / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"")
+    gateway = runtime / "gateway.json"
+    gateway.write_text(json.dumps({"allow_live_trading": False}), encoding="utf-8")
+    paths = {"PythonExe": python, "GatewayConfig": gateway,
+             "DataDir": runtime / "data", "RunnerLogDir": runtime / "demo",
+             "TaskLogDir": runtime / "tasklogs", "ReportsDir": runtime / "reports",
+             "SpreadModel": runtime / "costs" / "spread_model.json",
+             "SessionsConfig": tmp_path / "config" / "sessions.toml"}
+    result, wrapper = install_in_sandbox(tmp_path, "Demo", with_config=False, paths=paths)
+    assert result.returncode == 0, _output(result)
+    command = wrapper.read_text(encoding="ascii")
+    for name in paths:
+        assert str(paths[name]) in command, name
+    assert "--sessions-config" in command
+    assert str(tmp_path / "data") not in command        # not the old default location
+    weekly = (tmp_path / "scripts" / "task_demo_weekly_check.cmd").read_text(encoding="ascii")
+    assert str(python) in weekly and str(paths["DataDir"]) in weekly
+    assert (runtime / "tasklogs").is_dir()              # task output goes where told
+    assert not (tmp_path / "data").exists()
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
+def test_install_prints_the_task_parameters_for_the_deployment_record(tmp_path):
+    result, wrapper = install_in_sandbox(tmp_path, "Demo")
+    assert result.returncode == 0, _output(result)
+    lines = [line for line in result.stdout.decode(errors="replace").splitlines()
+             if line.startswith("TASK_PARAMETERS ")]
+    assert len(lines) == 1
+    parameters = json.loads(lines[0].removeprefix("TASK_PARAMETERS "))
+    assert parameters["mode"] == "Demo"
+    assert parameters["python"] == str(tmp_path / ".venv" / "Scripts" / "python.exe")
+    assert parameters["data_dir"] == str(tmp_path / "data")
+    assert parameters["gateway_config"] == str(tmp_path / "gateway.json")
+    assert parameters["sessions_config"] == str(tmp_path / "config" / "sessions.toml")
+    assert parameters["daily_report"] == {
+        "task": "MT5Quant\\live_daily_report", "local_time": "05:57", "wrapper": str(wrapper)}

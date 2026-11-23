@@ -41,6 +41,7 @@ import json
 import os
 import re
 import sys
+import time
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -49,9 +50,11 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mt5live.monitor import (  # noqa: E402
+    DAILY_REPORT_SUBDIR,
     HeartbeatStatus,
     SpreadSample,
     aggregate_by_magic,
+    append_alert,
     compare_spreads,
     heartbeat_files,
     heartbeat_status,
@@ -60,7 +63,12 @@ from mt5live.monitor import (  # noqa: E402
     render_daily_report,
     write_daily_report,
 )
-from mt5gw.errors import DataUnavailableError  # noqa: E402
+from mt5gw.errors import DataUnavailableError, NotConnectedError  # noqa: E402
+from mt5data.sessions import (  # noqa: E402
+    SessionConfigError,
+    SessionPolicy,
+    load_session_policy,
+)
 from mt5quant.costs.spread import (  # noqa: E402
     BUCKET_TZ,
     SpreadModel,
@@ -256,7 +264,74 @@ def build_gw(paper_state: str | None, gw_config: str | None, live_dir: str,
     return gw, True
 
 
-def main(argv=None, *, gw=None) -> int:
+# ---- T213：重试、补生成、失败告警 ----
+ALERT_DAILY_REPORT_FAILED = "DAILY_REPORT_FAILED"
+DEFAULT_ATTEMPTS = 3
+DEFAULT_RETRY_INTERVAL_S = 300
+DEFAULT_BACKFILL_DAYS = 3        # 含 --date 当天
+EXIT_INCOMPLETE = 3              # 重试之后仍有日报没有生成
+
+
+class FatalReportError(Exception):
+    """用法或配置问题：不重试，退出码 2。"""
+
+
+class RetryableFailure(Exception):
+    """连接或取数失败：下一次尝试仍在换日窗内时才重试。"""
+
+
+def report_path(reports_dir: str, day: date) -> str:
+    return os.path.join(reports_dir, DAILY_REPORT_SUBDIR, f"daily-{day.isoformat()}.md")
+
+
+def in_rollover_window(policy: SessionPolicy, t_utc: datetime) -> bool:
+    """t_utc（naive UTC）是否落在换日窗内。日报只许在窗内连终端（D82）；
+    窗的定义源与运行器相同（sessions.toml）。"""
+    local = t_utc.replace(tzinfo=timezone.utc).astimezone(ZoneInfo(policy.rollover_tz))
+    start, end = policy.rollover_window(local.date())
+    return start <= t_utc < end
+
+
+def generate_day(args, day: date, now: datetime, live_dir: str, gw=None) -> str:
+    """生成一天的日报，返回路径。生成时刻如实取 now（补生成的日报也一样）。"""
+    spread_rows = ()
+    if args.spread_model:
+        try:
+            model = load_spread_model_any(args.spread_model)
+        except ValueError as e:
+            raise FatalReportError(str(e)) from e
+        samples = spread_samples_from_logs([args.log_dir, live_dir], day)
+        if samples:
+            spread_rows = compare_spreads(samples, model)
+
+    owned = False
+    if gw is None:                          # 测试注入的替身不归本函数关闭
+        try:
+            gw, owned = build_gw(args.paper_state, args.gw_config, live_dir,
+                                 demo=args.demo)
+        except NotConnectedError as e:
+            raise RetryableFailure(f"终端未连接：{e}") from e
+        # build_gw 抛出的 DataUnavailableError 是用法或配置问题（含非 Demo 账户），原样上抛
+    try:
+        account = gw.account.state()
+        day_start = datetime(day.year, day.month, day.day)
+        day_end = day_start + timedelta(days=1)
+        deals = tuple(gw.account.deals(day_start, day_end))
+        text = render_daily_report(
+            day, generated_at=now, account=account,
+            heartbeat=heartbeat_overview(live_dir, now),
+            magic_pnl=aggregate_by_magic(deals),
+            spread_rows=spread_rows,
+            alert_counts=day_alert_counts(live_dir, day))
+    except (NotConnectedError, DataUnavailableError) as e:
+        raise RetryableFailure(f"取数失败：{type(e).__name__}: {e}") from e
+    finally:
+        if owned:
+            gw.shutdown()
+    return write_daily_report(args.reports_dir, day, text)
+
+
+def main(argv=None, *, gw=None, clock=None, sleep=None) -> int:
     ap = argparse.ArgumentParser(description="实盘日报（render_daily_report）")
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--reports-dir", default="data/reports")
@@ -276,51 +351,64 @@ def main(argv=None, *, gw=None) -> int:
     ap.add_argument("--log-dir", default="data/demo",
                     help="运行器日志目录（点差样本来源；另自动并入 "
                          "<data-dir>/live/*.log）")
+    ap.add_argument("--sessions-config", default=None, metavar="PATH",
+                    help="sessions.toml（换日窗的定义源）；不给就用 SessionPolicy 的缺省窗。"
+                         "重试只在换日窗内进行")
+    ap.add_argument("--attempts", type=int, default=DEFAULT_ATTEMPTS,
+                    help="连接或取数失败时最多的尝试次数（默认 3）")
+    ap.add_argument("--retry-interval-s", type=int, default=DEFAULT_RETRY_INTERVAL_S,
+                    help="重试间隔秒数（默认 300）")
+    ap.add_argument("--backfill-days", type=int, default=DEFAULT_BACKFILL_DAYS,
+                    help="顺带检查最近几天的日报、缺哪天补哪天（默认 3，含 --date 当天）")
     args = ap.parse_args(argv)
+    if args.attempts < 1 or args.retry_interval_s < 0 or args.backfill_days < 1:
+        ap.error("--attempts、--backfill-days 须不小于 1；--retry-interval-s 须不小于 0")
 
     day = parse_day(args.date)
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    tick = clock or (lambda: datetime.now(timezone.utc))
+    pause = sleep or time.sleep
     live_dir = os.path.join(args.data_dir, args.live_subdir)
-
-    spread_rows = ()
-    if args.spread_model:
-        try:
-            model = load_spread_model_any(args.spread_model)
-        except ValueError as e:
-            print(f"× {e}")
-            return 2
-        samples = spread_samples_from_logs(
-            [args.log_dir, live_dir], day)
-        if samples:
-            spread_rows = compare_spreads(samples, model)
-
-    if gw is None:
-        try:
-            gw, owned = build_gw(args.paper_state, args.gw_config, live_dir,
-                                 demo=args.demo)
-        except DataUnavailableError as e:   # 影子状态不可用：fail-closed
-            print(f"× {e}")
-            return 2
-    else:
-        owned = False                      # 测试注入的替身，不归本函数关闭
-
     try:
-        account = gw.account.state()
-        day_start = datetime(day.year, day.month, day.day)
-        day_end = day_start + timedelta(days=1)
-        deals = tuple(gw.account.deals(day_start, day_end))
-        text = render_daily_report(
-            day, generated_at=now, account=account,
-            heartbeat=heartbeat_overview(live_dir, now),
-            magic_pnl=aggregate_by_magic(deals),
-            spread_rows=spread_rows,
-            alert_counts=day_alert_counts(live_dir, day))
-    finally:
-        if owned:
-            gw.shutdown()
-    path = write_daily_report(args.reports_dir, day, text)
-    print(f"· 日报已写入 {path}")
-    return 0
+        policy = (load_session_policy(args.sessions_config) if args.sessions_config
+                  else SessionPolicy())
+    except SessionConfigError as e:
+        print(f"× {e}")
+        return 2
+
+    # --date 当天总是重新生成；更早的几天只在日报缺失时补。
+    targets = [day] + [day - timedelta(days=back) for back in range(1, args.backfill_days)]
+    failed = []
+    for target in targets:
+        if target != day and os.path.exists(report_path(args.reports_dir, target)):
+            continue
+        attempts = 0
+        while True:
+            attempts += 1
+            now = tick().replace(tzinfo=None)
+            try:
+                path = generate_day(args, target, now, live_dir, gw)
+            except RetryableFailure as e:
+                retry_at = now + timedelta(seconds=args.retry_interval_s)
+                if attempts < args.attempts and in_rollover_window(policy, retry_at):
+                    print(f"· {target} 第 {attempts} 次尝试失败，"
+                          f"{args.retry_interval_s} 秒后重试：{e}")
+                    pause(args.retry_interval_s)
+                    continue
+                print(f"× 日报 {target} 未生成（已尝试 {attempts} 次）：{e}")
+                failed.append((target, attempts, str(e)))
+                break
+            except (FatalReportError, DataUnavailableError) as e:
+                print(f"× {e}")
+                return 2
+            print(f"· 日报已写入 {path}")
+            break
+    if failed:
+        # One alert per run naming every day that is still missing.
+        days = "、".join(str(item[0]) for item in failed)
+        message = f"日报 {days} 未生成（各已尝试 {failed[0][1]} 次）：{failed[0][2]}"
+        if os.path.isdir(live_dir):
+            append_alert(live_dir, ALERT_DAILY_REPORT_FAILED, message, tick())
+    return EXIT_INCOMPLETE if failed else 0
 
 
 if __name__ == "__main__":

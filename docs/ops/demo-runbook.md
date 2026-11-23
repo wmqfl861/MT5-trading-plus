@@ -18,7 +18,9 @@
 ## 1. 启动（第 0 天）
 
 ```powershell
-# 一次性：在维护窗口显式指定模式安装每日/每周计划任务
+# 一次性：在维护窗口显式指定模式安装每日/每周计划任务。
+# 部署树与运行目录分离时，解释器和各目录要用参数显式给出（T213，见 §6.3.1）；
+# 解释器不存在时脚本拒绝安装。
 powershell -ExecutionPolicy Bypass -File scripts\setup_scheduled_tasks.ps1 -Mode Demo
 
 # 影子盘延长观察（PaperSoak；示例配置 demo-configs\MA-XAUUSD-M15.toml）
@@ -256,7 +258,7 @@ Calendar = {
   无法证明或发现，因此历史未核实/A5 未评估始终不变。
 
 #
-**部署核对单（T180 评审 F-8）**：①部署记录里只能出现**恰好一个**完整 SHA（写"从 8a80503 升级到 <新SHA>"含两个 SHA 会被生成器拒绝）；②留存步骤在 skipped_alive_runners（有存活进程未全量启动）时照样成功，但该 run 永不能作锚点——**部署必须先整树停机再启动**。
+**部署核对单（T180 评审 F-8）**：①部署记录里只能出现**恰好一个**完整 SHA（写"从 8a80503 升级到 <新SHA>"含两个 SHA 会被生成器拒绝）；②留存步骤在 skipped_alive_runners（有存活进程未全量启动）时照样成功，但该 run 永不能作锚点——**部署必须先整树停机再启动**；③装了计划任务的，把安装脚本最后打印的 `TASK_PARAMETERS` 行抄进部署记录（T213；里面只有路径和任务名，没有 SHA 和时刻）。
 
 ### 4.1.1 运行时自动留存的工件与描述符生成器（T180）
 
@@ -603,6 +605,39 @@ old_pid、new_pid、deployment_sha——恰好六字段，正式检查器按行�
 halt、风险 halt 从不自动删除。若 supervisor halt 已存在时又触发独立风险
 停机，保留首次原因/owner，同时写 `halt-risk-veto.json`；该 veto 只能经人工
 核对原因、确认风险消除后移除，不可为恢复自动开仓直接删它。
+
+### 6.3.1 日报与周检任务的安装和运行（T213）
+
+**安装**：部署树是纯检出，没有 `.venv`，也不放运行数据。`setup_scheduled_tasks.ps1`
+从部署树运行，解释器和各目录用参数显式给出，与 `demo_run.ps1` 的部署参数逐项一致
+（变量沿用 §6.2）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "$deploy\scripts\setup_scheduled_tasks.ps1" `
+  -Mode Demo -PythonExe $python -GatewayConfig $gateway `
+  -DataDir $data -RunnerLogDir $logs -ReportsDir "$data\reports" `
+  -SpreadModel $spread -SessionsConfig "$deploy\config\sessions.toml"
+```
+
+不给的参数沿用部署树下的旧位置。解释器、会话配置或网关配置不存在就拒绝安装，不写包装器、
+不建任务。不带 `-IncludeDataTasks`（D82）。安装脚本最后打印一行 `TASK_PARAMETERS {…}`，
+抄进部署记录（§4 部署核对单第③条）。
+
+11-17 到 11-23 的教训：任务命令写的是部署树里不存在的 `.venv\Scripts\python.exe`，日报和
+周检每次都以 rc=1 失败（`The system cannot find the path specified.`），Python 根本没有启动。
+
+**日报的运行**（`live_daily_report.py`）：
+
+- `--date` 当天总是重新生成；顺带检查它之前两天的日报（`--backfill-days`，默认 3），
+  缺哪天补哪天。补生成的日报写实际的生成时刻。
+- 连接失败或取数失败时重试，至多 3 次（`--attempts`），间隔 300 秒（`--retry-interval-s`）。
+  **只有下一次尝试仍落在换日窗内才重试**：日报只许在窗内连终端（D82），窗的定义源是
+  `--sessions-config`（`sessions.toml`）。换日窗全年的交集只有本机 05:55–06:00：冬令时窗到
+  07:00，05:57 启动可以重试到第 3 次；夏令时窗到 06:00，05:57 启动后放不下第二次，所以不重试。
+  这与第二十三轮施工计划 §2.4 写的"共 3 次、间隔 5 分钟、都在换日窗内"在夏令时不一致，
+  三者不能同时满足；这里以 D82 为准，待外部审核裁定。
+- 重试之后仍有日报没生成：发一条 `DAILY_REPORT_FAILED` 告警（记录类，列出所有缺的日期），
+  退出码 3。用法或配置错误不重试，退出码 2。日报是否齐全照旧由正式检查原有的规则判。
 
 ### 6.4 验收与部署边界
 

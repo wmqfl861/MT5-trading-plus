@@ -616,7 +616,10 @@ FORMAL_DRILL_ALERTS = frozenset({"RISK_HALT", "RISK_FLATTEN", "HEARTBEAT_TIMEOUT
                                "LINE_CAP"})   # T191：LINE_CAP 与 RISK_HALT 同类
 # T191 记录类：只记录不判失败（降级时长另计，见 formal_recorded_degradation）
 FORMAL_RECORDED_ALERTS = frozenset({"DISCONNECTED", "ACCOUNT_UNAVAILABLE",
-                                    "RECOVERABLE_FAILURE"})
+                                    "RECOVERABLE_FAILURE",
+                                    # T213（第二十三轮 §2.4）：日报在重试之后仍未生成；
+                                    # 日报是否齐全照旧由正式检查原有的规则判
+                                    "DAILY_REPORT_FAILED"})
 # T191 无效证据类：窗口内出现即 FormalInvalid
 FORMAL_INVALID_ALERTS = frozenset({"SUPERVISOR_EVIDENCE"})
 FORMAL_CLASSIFIED_ALERTS = (FORMAL_ANOMALY_ALERTS | FORMAL_DRILL_ALERTS
