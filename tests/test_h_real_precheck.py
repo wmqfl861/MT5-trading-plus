@@ -431,7 +431,7 @@ def run_cli(script, args, cwd=ROOT):
 
 
 def test_synthetic_cli_still_locks_mode_and_eligibility(tmp_path):
-    module = assembler()
+    assembler()
     root, _ = write_root(tmp_path)  # valid structure, but unbound synthetic hashes
     out = tmp_path / "never"
     proc = run_cli(SCRIPT, ["--data-root", str(root), "--candidate", str(CANDIDATE_DRAFT),

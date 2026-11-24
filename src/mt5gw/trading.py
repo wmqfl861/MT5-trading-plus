@@ -15,7 +15,7 @@ from mt5gw.account import AccountService
 from mt5gw.config import GatewayConfig, ensure_trade_allowed
 from mt5gw.connection import MT5Connection
 from mt5gw.errors import (
-    RETCode, DataUnavailableError, LiveTradingBlockedError,
+    RETCode, LiveTradingBlockedError,
     OrderResultUnknownError, TradeRejectedError,
 )
 from mt5gw.models import OrderResult, _epoch_seconds

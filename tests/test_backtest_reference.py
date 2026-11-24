@@ -17,7 +17,6 @@
 """
 import importlib.util
 import sys
-from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
@@ -269,7 +268,6 @@ def _bars_long_stop_reentry():
     bar16 开盘 101 入场（+点差 0.5 → 101.5），low 恰为 SL=入场−1×ATR(15)；
     bar17 起缓升（信号仍 +1 → immediate 重入；缓升避免 SMA2 收敛于 SMA4
     提前 signal 出场），到 bar20 末根强平。"""
-    n = 21
     opens = [100.0] * 15 + [100.0, 101.0] + [101.2, 101.3, 101.4, 101.5]
     closes = [100.0] * 15 + [101.0, 101.2] + [101.3, 101.4, 101.5, 101.6]
     highs = [100.5] * 15 + [101.5, 101.6] + [101.8, 101.9, 102.0, 102.1]
@@ -326,7 +324,6 @@ def _bars_short_take_profit():
     """空头止盈 + immediate 重入 + 期末强平：bar15 收盘 99 死叉；bar16 开盘
     99 入场空头（Bid−滑点 0），low 使 Ask 恰触 TP=入场−2×ATR(15)；bar17 起
     缓跌（仍 −1 → 重入空头；缓跌避免 SMA 收敛提前 signal 出场）持有到末根。"""
-    n = 21
     opens = [100.0] * 15 + [100.0, 99.0] + [97.0, 96.9, 96.8, 96.7]
     closes = [100.0] * 15 + [99.0, 97.0] + [96.9, 96.8, 96.7, 96.6]
     highs = [100.5] * 15 + [100.4, 99.4] + [97.4, 97.3, 97.2, 97.1]

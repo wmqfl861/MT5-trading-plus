@@ -5,7 +5,6 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from mt5quant.backtest.engine_a import atr_series
 from mt5quant.prob import counting
 from mt5quant.strategies.library.prob.actions import ActionParams
 from mt5quant.strategies.library.prob.situations import Approach

@@ -562,7 +562,6 @@ def test_strategy_files_exclude_outside_project():
     """指纹覆盖范围（X-05 修订）：策略类所在模块必进；**项目包外**的依赖
     （pandas/numpy 等真库外）不进指纹；项目内的 strategies.base 进指纹
     （绝对导入按项目包边界收录——buy_hold 的 base.py 是实际基类依赖）。"""
-    from pathlib import Path
     main = cards._module_file(f"{_LIB}.buy_hold")
     base = cards._module_file("mt5quant.strategies.base")
     files = cards.strategy_files(f"{_LIB}.buy_hold:BuyHold")

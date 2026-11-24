@@ -6,7 +6,6 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from mt5quant.backtest.engine_a import atr_series
 from mt5quant.validation.prob_mode import (
     CLUSTER_GAP_DAYS, MIN_CLUSTERS_PER_GROUP, cluster_permutation_test,
     brier_skill, delta_p_test, holm, plant_delta, randomize_triggers,

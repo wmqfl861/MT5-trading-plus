@@ -9,7 +9,6 @@ from mt5gw.market import MarketData
 from mt5gw.symbols import SymbolCatalog
 from mt5data import downloader
 from mt5data.downloader import ALL_TIMEFRAMES, backfill_series, refresh_series
-from mt5data.store import save_bars
 
 from tests.fakes import FakeMT5
 

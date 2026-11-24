@@ -523,7 +523,6 @@ def test_daily_break_starting_mid_history_uses_window_denominator():
     """真实案例回归：Exness 的 NY17:00 维护窗 2017 年才开始、且只在周一至周四
     （周五那次并入 weekend）——全局分母下频率只有约 48% 而全部误报 unexpected；
     窗口分母（首末出现日内的交易日）必须把它判成 daily_break。"""
-    import itertools
     days = [date(2026, 3, 2) + timedelta(days=i) for i in range(40)]  # 含周末
     times = []
     for i, d in enumerate(days):

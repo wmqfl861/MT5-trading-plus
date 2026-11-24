@@ -1,3 +1,41 @@
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+# T217（第二十三轮 C23-2）：ruff 只查错误类规则，不查风格，也不跑 format。
+# 规则集只定在这一处：CI 的 lint job（.github/workflows/tests.yml）、
+# tests/test_t217_static_gate.py、本地 `python -m ruff check .` 读的是同一份配置。
+[tool.ruff]
+# CI 只在 Python 3.12 上测；按 3.12 解析，比它新的语法算语法错误
+target-version = "py312"
+# docs/ 下的脚本是历次评审和研究留下的材料，按原样保存，不在检查范围里：评审记录按路径、提交号和
+# 运行输出引用它们，其中有的明文规定不得改动（例如 docs/superpowers/plans/ 里的 p 线计划写着
+# "不改 codex 审计探针 2026-10-29-global-audit.py"）。不为清掉没用的导入去改它们。
+# "docs/**" 只排除仓库根目录下的 docs，别处叫 docs 的目录照常检查（ruff 0.17.6 不把前导斜杠当
+# 锚点，写成 "/docs" 什么都不排除）。
+extend-exclude = ["docs/**"]
+
+[tool.ruff.lint]
+# E9   语法错误
+# F401 导入了没用到的名字
+# F821 用到了没定义的名字
+# F841 赋值后没用到的局部变量
+select = ["E9", "F401", "F821", "F841"]
+
+# 研究侧的 5 个文件各豁免一条规则，精确到文件。它们各有没用到的一处导入或变量，
+# T217 清存量时留下没有改，文件本身一个字节不动：
+[tool.ruff.lint.per-file-ignores]
+# 源文件的 sha256 被 src/mt5quant/research/gate.py 的
+# EXPECTED_ACCEPTANCE_SOURCE_SHA256 钉住；改一个字节（加 noqa 注释也算），
+# acceptance_snapshot() 就报快照漂移。
+"src/mt5quant/validation/prob_mode.py" = ["F841"]
+"src/mt5quant/strategies/library/prob/level_decision.py" = ["F401"]
+# 在卡的策略代码指纹闭包里（cards.strategy_files 实算）。改一个字节就会换掉这些
+# 策略的 strategy_sha，首跑时登记过的卡版本不能再重跑（scripts/bt.py 的
+# _bind_strategy_sha）：
+#   b6_vol_target_long.py：H007（VolTargetLong），LevelDecisionV1 / LevelDecisionS1Demo
+#   situations.py：LevelDecisionV1 / LevelDecisionS1Demo
+#   events.py：H101、H101-v2（MonthEndHedgeRebalance），H102（PreFomcAnnouncementDrift）
+"src/mt5quant/strategies/library/b6_vol_target_long.py" = ["F401"]
+"src/mt5quant/strategies/library/prob/situations.py" = ["F401"]
+"src/mt5quant/validation/events.py" = ["F401"]

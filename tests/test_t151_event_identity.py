@@ -86,7 +86,6 @@ def _v1_calendar_dict(days) -> dict:
 
 def _fomc_events(bars):
     """合成冻结工件 → fomc_calendar_events 事件窗（研究装配同一链路）。"""
-    import os
     import tempfile
     from mt5quant.validation.events import fomc_calendar_events
     meetings = []
@@ -305,9 +304,6 @@ def _b7_world():
     """C002 研究装配形状的合成世界：EURUSD（成交）+ USTEC（信号）H1，
     伦敦冬令期（GMT==UTC，14:00 UTC bar 即伦敦本地 14:00 事件 bar）；
     USTEC 月度水平交替升降 → mtd_sign 方向逐月交替。"""
-    from mt5quant.strategies.library.b7_monthend_hedge_rebalance import (
-        LOOKBACK_BARS,
-    )
     days = pd.bdate_range("2023-07-01", "2024-03-29")      # 覆盖首事件的锚月
     hours = list(range(7, 21))                             # 07..20 UTC
     # 月度水平（Jul 2023..Mar 2024 交替升降 → mtd_sign 交替 ±1）
@@ -316,7 +312,6 @@ def _b7_world():
         (1.000, 1.010, 0.995, 1.008, 0.992, 1.006, 0.990, 1.004, 0.996))}
 
     def eur_rows():
-        rng = np.random.default_rng(7)
         rows, prev_close = [], 1.08
         for d in days:
             level = 1.08 * levels[d.to_period("M")]
@@ -540,7 +535,7 @@ def test_verdict_code_sha_is_trial_identity(tmp_path):
     （H16-2 的口子闭合）；LockboxTrial 匹配按指纹区分，None 只匹配旧行。"""
     from mt5quant.research.ledger import Ledger
     from mt5quant.validation.gates import LockboxTrial, _matching_gate_runs
-    mod = load_bt()
+    load_bt()
     path = tmp_path / "identity.sqlite"
     kw = dict(card_id="H102", card_version=1, strategy="s", params={},
               symbol="USTEC", timeframe="D1", data_first="", data_last="",
@@ -646,7 +641,6 @@ def test_screen_combo_strategy_holds_injected_event_windows(
     from tests.test_fomc_calendar_engine import (
         _setup_fomc_round, meeting, write_calendar,
     )
-    from mt5quant.research.ledger import Ledger
     mod = load_bt()
     root, cards_dir, ledger_path = _setup_fomc_round(tmp_path, monkeypatch, mod)
     cal_path, sha = write_calendar(

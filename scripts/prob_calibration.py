@@ -88,8 +88,6 @@ import argparse
 import hashlib
 import json
 import math
-import os
-import shutil
 import sys
 import time
 from pathlib import Path
@@ -106,7 +104,7 @@ from mt5quant.strategies.library.prob.actions import ActionParams
 from mt5quant.strategies.library.prob.situations import Approach
 from mt5quant.validation.prob_mode import (
     CLUSTER_GAP_DAYS, MIN_CLUSTERS_PER_GROUP, brier_skill,
-    cluster_permutation_test, delta_p_test, holm, plant_delta,
+    cluster_permutation_test, delta_p_test as delta_p_test, holm, plant_delta,
 )
 # 注：delta_p_test 自 T106 起不再被任何相位调用（保留导入——测试以其为
 # 桩断言"标定相位不再走旧方法"）；CLUSTER_GAP_DAYS/MIN_CLUSTERS_PER_
@@ -625,7 +623,7 @@ def _shifted_triggers(trig: pd.DataFrame, times_idx: pd.Index, *, weeks: int,
     mapped = np.asarray(bars_dt.to_numpy())[pos]
     # R1：有限容差（±1 bar），超出即丢（含内部洞/休市/两端之外）
     gap = np.abs(shifted.asi8 - mapped.astype("datetime64[ns]").astype(
-        "int64")) > SHIFT_MAP_TOLERANCE.value  # noqa: E501（asi8 已归一 ns）
+        "int64")) > SHIFT_MAP_TOLERANCE.value  # noqa: E501 （asi8 已归一 ns）
     # R2：NY 墙钟重证（只对容差内存活者算，避免 NaT 参与比较）
     cal_bad = np.zeros(n, dtype=bool)
     ci = np.flatnonzero(~gap)

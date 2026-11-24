@@ -69,7 +69,6 @@ from mt5live.reconcile import line_cap_pause_day, reconcile_pause_owned
 from mt5live.monitor import (
     ALERT_HEARTBEAT_TIMEOUT,
     ALERT_RISK_FLATTEN,
-    ALERT_RISK_HALT,
     TRADE_ENTRY_KINDS,
     append_alert,
     heartbeat_files,

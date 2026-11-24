@@ -252,7 +252,7 @@ def measure_symbol(symbol: str, bars: pd.DataFrame | None, *, years,
             summaries.append(summarize_window(gaps, w))
     votes, follows = _vote(summaries)
     res = SymbolResult(symbol, summaries, follows, votes)
-    res.dropped_lockbox_rows = dropped  # noqa: 属性式记录，供 CLI 打印
+    res.dropped_lockbox_rows = dropped  # 属性式记录，供 CLI 打印
     return res
 
 

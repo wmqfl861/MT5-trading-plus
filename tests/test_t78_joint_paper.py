@@ -29,7 +29,7 @@ from mt5quant.strategies.library.prob.level_decision import LevelDecisionS1Demo
 from tests.test_t78_line_caps import BASE_TOML, H, P, script
 from tests.test_t78_model_loading import (
     H_STRATEGY, NOW, frozen_model, make_config, offline_args, paper_inputs,
-    read_json, runner, snapshot, update_model, write, write_config,
+    read_json, runner as runner, snapshot, update_model, write, write_config,
 )
 
 

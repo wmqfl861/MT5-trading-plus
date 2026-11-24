@@ -755,7 +755,6 @@ def test_baseline_engine_vs_new_mt5_bitwise_and_external_context(direction, risk
 
 def test_h_only_candidates_p_functions_constants_and_sampler_unchanged():
     import ast
-    import inspect
     import subprocess
     repo = Path(__file__).resolve().parents[1]
     # 漂移守卫基线：candidates.py 自 f6c7b811（blob f288f197）不变；events.py 的
@@ -834,7 +833,6 @@ def test_g0_forces_b7_event_cutpoints_and_asynchronous_d1_windows():
     from mt5quant.backtest.truncation import signal_window
     times = pd.date_range("2024-01-01", "2024-04-30 23:00", freq="h")
     bars = disk_bars(times)
-    cal = calendar(end="2024-04-30", holidays=["2024-03-29"])
     signal = disk_bars(pd.bdate_range("2023-12-01", "2024-04-30").difference(pd.DatetimeIndex(["2024-03-29"])))
     signal["_research_source"] = "ext:fred:2024"
     signal["close"] = 100. + np.arange(len(signal))

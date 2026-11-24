@@ -33,7 +33,6 @@ from mt5gw.config import GatewayConfig
 from mt5gw.connection import MT5Connection
 from mt5gw.errors import NotConnectedError, TerminalNotConnectedError
 from mt5gw.terminal import _same_image, terminal_running
-from mt5live import terminal_guard
 from mt5live.terminal_guard import (ALERT_ALGO_TRADING_DISABLED, ALERT_ALGO_TRADING_RESTORED,
                                     ATTEMPT_MARGIN, AlgoTradingWatch, wait_for_gateway)
 from mt5live.monitor import DISCONNECT_EXIT_RC, DISCONNECT_LIMIT_S, read_alerts, write_role_heartbeat

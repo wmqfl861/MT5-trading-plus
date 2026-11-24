@@ -13,3 +13,9 @@ research/rounds/*.toml text eol=lf
 research/cards/*.toml text eol=lf
 research/candidates/*.toml text eol=lf
 .superpowers/h-new-candidates/** text eol=lf
+
+# PowerShell scripts: CRLF in the working tree (PS5.1; asserted by
+# tests/test_t205_drill_script.py). Until now this relied on core.autocrlf at
+# checkout time, so a checkout made with other settings changed the line endings
+# (round-20 review, O20-4).
+*.ps1 text eol=crlf

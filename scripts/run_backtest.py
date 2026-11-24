@@ -76,7 +76,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mt5data.clock import (  # noqa: E402
-    ClockMismatchError, check_server_offset, latest_valid_sample,
+    check_server_offset, latest_valid_sample,
 )
 from mt5data.lockbox import research_bars  # noqa: E402
 from mt5data.sessions import SessionPolicy, load_session_policy  # noqa: E402

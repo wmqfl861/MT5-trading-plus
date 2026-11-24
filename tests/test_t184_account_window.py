@@ -130,7 +130,7 @@ def test_t184_constants():
 
 def test_t184_watch_segment_alert_once_recovery_no_spam(tmp_path):
     """段首一条告警、恢复一条、段内不刷屏；恢复清零后不再累计。"""
-    from tests.test_t141_disconnect import VirtClock, _Mono
+    from tests.test_t141_disconnect import _Mono
     from mt5live.monitor import AccountUnavailableWatch
 
     mono = _Mono()

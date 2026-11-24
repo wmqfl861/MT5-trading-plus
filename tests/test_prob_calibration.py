@@ -1202,7 +1202,7 @@ def test_stage2_rows_merge_accepted_and_out_of_range_rejected(
     # 超出第二段预注册范围（下标 ≥ 首段+追加段）→ 拒绝
     bad = dict(s2[0])
     bad["seed"] = pc.NEG_SEEDS + pc.NEG_ESCALATION_SEEDS
-    stamp2 = _write_stamp_dir(pc, tmp_path, {"all-s0of1.json": rows + [bad]},
+    _write_stamp_dir(pc, tmp_path, {"all-s0of1.json": rows + [bad]},
                               stamp="st-bad")
     assert pc.cmd_merge(types.SimpleNamespace(stamp="st-bad",
                                               keep_pool=False)) == 1

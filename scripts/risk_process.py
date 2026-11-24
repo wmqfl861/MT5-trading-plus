@@ -61,8 +61,8 @@ from mt5live.monitor import (  # noqa: E402
     reset_watchdog,
     write_role_heartbeat,
 )
-from mt5live.paper import PaperStateGateway  # noqa: E402（T34 --paper-state）
-from mt5live.terminal_guard import wait_for_gateway  # noqa: E402（T209 启动等待）
+from mt5live.paper import PaperStateGateway  # noqa: E402 （T34 --paper-state）
+from mt5live.terminal_guard import wait_for_gateway  # noqa: E402 （T209 启动等待）
 from mt5live.riskproc import (  # noqa: E402
     AccountSnapshot,
     CycleResult,

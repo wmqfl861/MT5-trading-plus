@@ -286,7 +286,7 @@ def test_bt_screen_passes_swap_ref_price(tmp_path, monkeypatch):
     relref（点数模式隔夜费按参考价折相对口径）。"""
     mod = load_bt()
     closes = [USTEC_REF] * 12
-    root = write_research_store(tmp_path / "data_research", d1_bars(closes))
+    write_research_store(tmp_path / "data_research", d1_bars(closes))
     cards_dir = write_card(tmp_path)
     ledger = tmp_path / "ledger.sqlite"
     patch_bt_git(monkeypatch, mod)
@@ -346,7 +346,7 @@ def test_gate_calibration_assemble_passes_swap_ref(tmp_path, monkeypatch):
     """K5 失败测试：assemble_experiment（负/正对照臂的成本装配）的
     cost_version 带 relref——研究段 K 线最后收盘折相对口径。"""
     gc = load_gc()
-    root = write_research_store(tmp_path / "data_research",
+    write_research_store(tmp_path / "data_research",
                                 d1_bars([USTEC_REF] * 12))
     monkeypatch.chdir(tmp_path)
     out = gc.assemble_experiment("data_research", [f"{SYMBOL} D1"])

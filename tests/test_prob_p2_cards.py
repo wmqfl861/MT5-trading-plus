@@ -2,7 +2,6 @@
 probability 卡拒绝 screen/gate、卡/策略常量核对、G0 抓现场统计的坏策略、
 轮次假设登记交叉校验。全部合成数据。
 """
-import types
 
 import numpy as np
 import pandas as pd
@@ -18,16 +17,11 @@ BT = importlib.util.module_from_spec(_spec)
 sys.modules["bt_d1"] = BT
 _spec.loader.exec_module(BT)
 
-from mt5quant.backtest.engine_a import run_backtest          # noqa: E402
 from mt5quant.research import cards as rcards                # noqa: E402
 from mt5quant.strategies import BaseStrategy, ExitRules      # noqa: E402
 from mt5quant.strategies.library.prob.level_decision import (  # noqa: E402
     LevelDecisionS1Demo,
 )
-from mt5quant.strategies.library.prob.situations import (    # noqa: E402
-    Approach, find_level_events, s1_level_rows,
-)
-from mt5quant.backtest.engine_a import atr_series            # noqa: E402
 
 
 def p2_card_data(**over):
@@ -201,7 +195,7 @@ def test_g0_passes_frozen_model_strategy():
     """对照：冻结模型的拟合策略过 G0（T74 已有——此处绑定 D1 门（按
     segment）后仍成立）。"""
     from tests.test_strategies_prob_level_decision import (
-        DemoSmallGrid, FlatCosts, _strong_model, synth_bars as sb,
+        DemoSmallGrid, _strong_model, synth_bars as sb,
     )
     from mt5quant.validation import lookahead as vlook
     bars = sb(3000, seed=42)

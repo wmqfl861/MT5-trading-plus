@@ -9,7 +9,7 @@
 ## 安装
 
 ```bash
-py -3.12 -m venv .venv                 # 或任意 64 位 Python 3.11–3.13
+py -3.12 -m venv .venv                 # 用 Python 3.12：CI 只在 3.12 上测，其他版本没测过
 .venv/Scripts/python.exe -m pip install -r requirements-dev.txt
 ```
 

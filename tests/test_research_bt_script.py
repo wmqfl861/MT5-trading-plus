@@ -5,8 +5,7 @@ screen 端到端用临时数据根（parquet K 线 + specs 快照 + 零成本）
 """
 import importlib.util
 import json
-import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -1155,7 +1154,7 @@ def test_gate_specimen_actor_calibration(tmp_path, monkeypatch, capsys):
     write_candidate(tmp_path, "C900", "specimen", "H099")
     ledger_path = tmp_path / "ledger.sqlite"
     patch_card_git(monkeypatch, mod)
-    rc = mod.main(
+    mod.main(
         ["gate", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
@@ -1447,7 +1446,7 @@ def test_gate_g4_reports_three_trial_counts(tmp_path, monkeypatch, capsys):
     cards_dir = write_card(tmp_path)
     ledger_path = tmp_path / "ledger.sqlite"
     patch_card_git(monkeypatch, mod)
-    rc = mod.main(
+    mod.main(
         ["gate", "--card", "H099", "--allow-unbounded-data", "--allow-no-round", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
@@ -1508,7 +1507,7 @@ def test_gate_g4_round_n_when_card_in_round(tmp_path, monkeypatch, capsys):
             git_commit="0" * 40)
     patch_card_git(monkeypatch, mod,
                    committed=datetime(2026, 10, 27, tzinfo=timezone.utc))
-    rc = mod.main(
+    mod.main(
         ["gate", "--card", "H099", "--allow-unbounded-data", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",
@@ -1700,7 +1699,7 @@ def test_gate_v3_event_card_skips_buyhold_and_delay_vetoes(
 
     monkeypatch.setattr(mod.vgate, "v3_veto_buyhold", _must_not_run)
     monkeypatch.setattr(mod.vgate, "v3_veto_delay", _must_not_run)
-    rc = mod.main(
+    mod.main(
         ["gate", "--card", "H703", "--allow-unbounded-data", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "tests.test_research_bt_script:T86MonthEndEventStrategy",
@@ -1770,7 +1769,7 @@ def test_gate_v3_bar_card_n_composition_matches_ledger_declared_lineage(
         for i in range(5):                     # 其余谱系轮次外（只报告）
             led.record_run(card_id=f"H999-v{i + 1}", params={"x": i},
                            round_id=None, **common)
-    rc = mod.main(
+    mod.main(
         ["gate", "--card", "H703", "--allow-unbounded-data", "--cards-dir", str(cards_dir),
          "--data-root", str(root), "--ledger", str(ledger_path),
          "--strategy", "mt5quant.strategies.library.buy_hold:BuyHold",

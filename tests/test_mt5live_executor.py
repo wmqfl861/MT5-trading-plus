@@ -137,7 +137,7 @@ def test_hold_marks_decision_seen():
 def test_sltp_corrected_to_actual_fill_price():
     b = FakeBroker(fill_price=100.5)          # 成交价 ≠ 参考 Ask 100.2
     d = mk_decision(signal=1, volume_lots=0.01, atr=2.0, sl_atr=1.5, tp_atr=2.5)
-    rep = mk_adapter(b).execute(d)
+    mk_adapter(b).execute(d)
     # 随单提交的是报价参考口径
     assert b.market_orders[0]["sl"] == pytest.approx(100.2 - 3.0)
     # 成交后修正为实际成交价口径：100.5 − 1.5×2 / 100.5 + 2.5×2

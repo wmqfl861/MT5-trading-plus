@@ -262,7 +262,7 @@ def test_restart_round_that_cannot_verify_in_full_halts_and_defers(tmp_path, mon
 
 
 def test_supervisor_deferred_is_a_recorded_alert_and_stays_classified():
-    module = load()
+    load()
     spec = importlib.util.spec_from_file_location("t212_demo_check", ROOT / "scripts" / "demo_check.py")
     check = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = check

@@ -69,7 +69,7 @@ import pandas as pd  # noqa: E402
 from mt5data.ext import ExtDataError  # noqa: E402
 from mt5data.lockbox import cutoff_for, load_config  # noqa: E402
 from mt5data.schedule import series_inventory  # noqa: E402
-from mt5data.store import load_bars, read_watermark, save_bars  # noqa: E402
+from mt5data.store import load_bars, save_bars  # noqa: E402
 from mt5data.ticks import tick_watermark  # noqa: E402
 from mt5quant.backtest.report import data_sha256  # noqa: E402
 

@@ -26,7 +26,6 @@ import sys
 from pathlib import Path
 
 import pandas as pd
-import pytest
 
 from mt5data.ext.adapters import fred_daily_from_bytes
 

@@ -243,7 +243,7 @@ def test_script_append_samples_and_summarize(tmp_path):
 def test_measure_server_clock_stale_detection():
     """I5 回归：休市静默期的陈旧 tick（server_time 远落后 wall）必须被判 stale。"""
     mod = _load_script("measure_server_clock.py")
-    from datetime import datetime, timedelta
+    from datetime import datetime
     wall = datetime(2026, 10, 24, 14, 0, tzinfo=datetime.utcoffset(None) or None)         if False else datetime.fromisoformat("2026-10-24T14:00:00+00:00")
     stale = {"wall_utc": wall.isoformat(),
              "server_time": "2026-10-23T20:57:59",  # 周五收盘后 17 小时

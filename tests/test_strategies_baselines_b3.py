@@ -4,7 +4,6 @@
 2026-10-26 为 GMT（UTC+0，冬令时 10-25 01:00 UTC 起生效）。
 """
 import pandas as pd
-import pytest
 
 from mt5quant.strategies.library.b3_london_breakout import LondonAsianBreakout
 from mt5quant.validation.lookahead import (

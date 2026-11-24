@@ -53,7 +53,6 @@ from mt5live.reconcile import (
 from mt5live.riskproc import AccountSnapshot, RiskProcess, load_risk_config
 from mt5live.paper import PaperBroker, PaperStateGateway, paper_state_path
 from mt5live.runner import (
-    MarketClosedError,
     SignalRunner,
     TerminalBarsSource,
     default_heartbeat_path,

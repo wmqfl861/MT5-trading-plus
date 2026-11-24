@@ -8,7 +8,6 @@ import pandas as pd
 import pytest
 
 from mt5data.store import _COLUMNS
-from mt5quant.backtest import engine_a
 from mt5quant.backtest.engine_a import BacktestResult, Trade
 from mt5quant.backtest.report import (
     bars_per_year,
@@ -231,7 +230,6 @@ def test_write_report_manifest_repeatable(tmp_path, monkeypatch):
 
 def test_current_git_commit_marks_dirty(monkeypatch):
     """I6 回归：工作树脏时提交号必须带 +dirty（可复现性声称的前提）。"""
-    import subprocess as sp
     from mt5quant.backtest import report
 
     class R:

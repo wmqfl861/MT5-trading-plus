@@ -207,8 +207,6 @@ def test_cli_prob_test_end_to_end(cli_env, monkeypatch):
         assert r["params"]["prob"]["split"] == "2019-12-01"
         assert r["metrics"]["prob"]["p_value"] is not None
     # 同一输入重跑：去重口径下不增 N（runs 行可增，round_n_dedup 不变）
-    before = Ledger(cli_env["ledger"]).round_n_dedup("R2") \
-        if False else None
     with Ledger(cli_env["ledger"]) as led:
         n_before = led.round_n_dedup("R2")
     code2, _ = _run_prob_test(cli_env, monkeypatch)
@@ -357,7 +355,6 @@ def test_e6_report_uses_round_open_precheck_cost(cli_env, monkeypatch):
     """E6：开轮后预筛 JSON 被改写（磁盘），报告仍用**开轮时入账**的
     台账 candidate_checks 成本；候选号过滤生效。"""
     import contextlib, io as _io
-    from datetime import datetime, timezone, timedelta
     # 开轮前先入账一个"贵"成本预筛（记录即入链）
     with Ledger(cli_env["ledger"]) as led:
         led.record_candidate_check("C101", decision="pass", result={
@@ -1327,7 +1324,6 @@ def test_p06_per_symbol_swap_ref_price_and_identity(two_sym_env,
     """P-06：swap 参考价逐品种取各自全序列最后收盘（不循环尾变量复用）；
     params.prob 带全品种 data_sha/cost_version 映射与 sims。"""
     import contextlib, io as _io
-    from mt5quant.backtest.report import data_sha256 as _dsha
     xau_last = float(synth_bars(9000, seed=21)["close"].iloc[-1])
     btc_last = float(synth_bars(9000, seed=22, s0=50000.0)["close"].iloc[-1])
     assert abs(btc_last / xau_last) > 100      # 量级差足够大，混用必露馅

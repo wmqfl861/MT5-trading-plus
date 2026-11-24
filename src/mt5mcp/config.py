@@ -15,7 +15,6 @@ Bearer 令牌，令牌明文过公网/局域网会被链路窃听重放，因此
 from __future__ import annotations
 
 import json
-import os
 import secrets
 from dataclasses import dataclass
 from pathlib import Path

@@ -88,7 +88,7 @@ def test_heartbeat_permission_error_has_bounded_retry(tmp_path, monkeypatch):
 
 def test_completed_risk_cycle_publishes_heartbeat(tmp_path):
     gate, live = make_gate(tmp_path)
-    result = script("risk_process").run_one_cycle(gate._process, FakeGateway(gate._account))
+    script("risk_process").run_one_cycle(gate._process, FakeGateway(gate._account))
     data = json.loads((live / "heartbeat-risk.json").read_text())
     assert data["runner_alive"] is True
     assert data["component"] == "risk"

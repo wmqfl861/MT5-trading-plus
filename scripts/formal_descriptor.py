@@ -28,7 +28,7 @@ import importlib.util
 import json
 import re
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SHA_RE = re.compile(r"(?<![\w:.+-])[0-9a-f]{40}(?![\w:.+-])")

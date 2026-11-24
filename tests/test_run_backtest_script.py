@@ -80,7 +80,6 @@ def test_sessions_sha256_stable_and_recorded(tmp_path):
 
 
 def test_build_costs_annotates_sessions_sha_and_missing_hours(tmp_path):
-    from mt5data.sessions import load_session_policy
 
     mod = _load_script()
     root = _write_ticks(tmp_path / "data")
@@ -168,7 +167,6 @@ def test_entry_policy_for_zero_costs_returns_base(tmp_path):
 def test_missing_hour_forbid_defers_engine_entry_end_to_end(tmp_path):
     """T20 全链：点差模型缺统计的小时禁入（不抛错）——引擎把开仓推迟到
     下一个有统计的小时；出场照常（缺统计小时取全天最大 p90 的保守成本）。"""
-    import numpy as np
     import pandas as pd
     from mt5data.sessions import load_session_policy
     from mt5data.store import _COLUMNS
@@ -316,7 +314,6 @@ def test_build_costs_cache_mode_or_symbol_mismatch_rejected(tmp_path):
 
 def test_cli_missing_cache_errors_with_guidance(tmp_path, monkeypatch, capsys):
     """CLI --costs auto 缺缓存 → 明确报错并指路（不静默从 3.7GB tick 直建）。"""
-    import numpy as np
     import pandas as pd
     from mt5data.store import save_bars
 
@@ -347,7 +344,6 @@ def test_cli_build_cost_model_flag_builds_cache_and_runs(tmp_path, monkeypatch,
                                                          capsys):
     """--build-cost-model：本次运行内（重）建缓存再走缓存装配，回测成功；
     缓存文件带水位与 sha，事后可被 build_costs 直接命中。"""
-    import numpy as np
     import pandas as pd
     from mt5data.store import save_bars
 
@@ -619,7 +615,7 @@ def test_cli_research_store_switch_uses_data_research(tmp_path, monkeypatch,
     成本经缓存文件装配（无 tick），manifest 记录 research_store 与 data_root。
     cwd 下只有 data_research 没有 data——成功即证明读的是研究库。"""
     mod = _load_script()
-    root = _research_store(tmp_path)
+    _research_store(tmp_path)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("sys.argv", [
         "run_backtest.py", "--strategy",
@@ -725,7 +721,6 @@ def test_cli_main_store_ops_ack_gates_lockbox_period(tmp_path, monkeypatch,
     """T38/D24：读主库（--main-store）的锁箱期（--end 越过 cutoff）必须显式
     --ops-ack——不给 → LockboxError（沿用"显式请求不做静默截断"）；给了 →
     放行并在 manifest 记 main_store / ops_ack（审计线索）。"""
-    import pandas as pd
 
     mod = _load_script()
     _main_store_with_lockbox(tmp_path)

@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mt5gw import GatewayConfig, MT5Gateway, load  # noqa: E402
 from mt5gw.snapshot import (  # noqa: E402
-    SpecChange, diff_snapshots, load_snapshot, save_snapshot, take_snapshot,
+    diff_snapshots, load_snapshot, save_snapshot, take_snapshot,
 )
 
 
