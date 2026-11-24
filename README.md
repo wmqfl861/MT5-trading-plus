@@ -13,7 +13,7 @@ py -3.12 -m venv .venv                 # 用 Python 3.12：CI 只在 3.12 上测
 .venv/Scripts/python.exe -m pip install -r requirements-dev.txt
 ```
 
-唯一运行依赖是 MetaQuotes 官方的 `MetaTrader5` 包；测试另需 `pytest`。
+唯一运行依赖是 MetaQuotes 官方的 `MetaTrader5` 包；测试另需 `pytest` 和 `ruff`（都在 `requirements-dev.txt` 里）。`ruff` 给静态检查的守门测试用（语法错误、未定义名、没用到的导入和局部变量）：本机没有装它时那条测试是跳过的，CI 上真的跑。
 
 ## 最小用例
 
