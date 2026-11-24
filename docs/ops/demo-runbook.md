@@ -519,7 +519,8 @@ heartbeat open PermissionError 最多重试 3 次（间隔 50ms），
 RiskGate 在组装账户快照前检查 halt/killSwitch 与独立 risk 心跳；缺失、未来、
 损坏或超过 `max(120s, 3×interval)` 即拒开仓并告警，纯平仓不经开仓闸门。
 健康检查在读取心跳（supervisor 同时读取日志 mtime）后取观测时钟，与账户
-快照/决策截止时间分离；读取期间新写入的心跳不误判未来，真正未来仍拒绝。
+快照/决策截止时间分离；读取期间新写入的心跳不误判未来，真正未来仍拒绝（这句说的是心跳；
+日志的修改时间另有不超过 2 秒的容差，见 §6.3）。
 当前部署固定 risk interval=10s，reconcile=30s，runner=2s。risk/reconcile
 角色文件不计入策略登记。周末报价陈旧但循环完整执行时照常更新心跳和周期
 健康日志，不能用“无决策/无 tick/空 .err”判定冻结。
