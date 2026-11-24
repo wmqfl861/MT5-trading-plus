@@ -705,8 +705,12 @@ $action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
   -RepetitionInterval (New-TimeSpan -Minutes 1)
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew
+# 主体显式给出，和 §6.5 的安装脚本同一种写法：不给的话运行级别是 cmdlet 的缺省值，和看护任务不一致。
+$principal = New-ScheduledTaskPrincipal `
+  -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `
+  -LogonType Interactive -RunLevel Highest
 Register-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor2' `
-  -Action $action -Trigger $trigger -Settings $settings
+  -Action $action -Trigger $trigger -Settings $settings -Principal $principal
 
 # 部署记录要抄的（见下）：登录类型、运行级别、所在会话、启动器和包装脚本的 sha256。
 (Get-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor2').Principal |
@@ -1054,6 +1058,568 @@ supervisor 全程没有拒绝。取证时不要只看 supervisor 有没有拒绝
 6. 调度日检核对存活检查自己：最近一小时运行过，退出码是 0 或 3，`notified` 不是"没有渠道"，`notify_error`、`state_error` 为空。
 
 **维护时**：停机演练会触发生产级问题，先停用这个任务，或者接受通知；维护结束后会发"已恢复"。
+
+### 6.7 T215 对照实验：关闭 agent 桌面端，哪些进程会死（D112 的前置）
+
+**为什么要做**：11-21 01:24 UTC 有人从托盘退出 agent 桌面端，8 秒后又打开。四个生产进程活了下来，被连带结束的是交易终端，
+之后 supervisor 每分钟拒绝一次，持续 684 分钟（第二十三轮审核 O23-7、运维日志 11-23 一节的取证结论）。而 11-17 的记录是四个进程
+随桌面端退出整树死亡。生产必须在不依赖 agent 会话的载体上跑，而且要知道"关闭桌面端"到底按什么清理——按工作区关联，还是按会话。
+运维日志 11-23 一节要求把"一次性任务由 agent 会话触发"和"由调度器自行触发"分开测，所以是四组。四组都是只休眠的假角色，
+不碰生产、不 import MetaTrader5、不读写任何生产目录：
+
+| 组 | 谁触发 | 解释器 | 起始目录 | 进程 |
+| --- | --- | --- | --- | --- |
+| A | 计划任务：一次性的时间触发，到点由任务计划程序自己启动 | `<工作区>\.venv\Scripts\pythonw.exe`（venv 的启动器） | `<工作区>\data\ops-evidence\t215-<日期>\a\`（工作区里被忽略的路径下新建的空目录） | 两个：启动器和它拉起的基础解释器 |
+| B | 同 A | `<基础解释器目录>\pythonw.exe` | `<用户目录>\t215-<日期>\b\`（工作区之外新建的空目录） | 一个 |
+| C | 主会话的 shell 直接启动，起完那个 shell 就退出 | 同 B | `<用户目录>\t215-<日期>\c\` | 一个 |
+| D | 计划任务：一次性任务，注册之后由主会话当场触发（`Start-ScheduledTask`） | 同 B | `<用户目录>\t215-<日期>\d\` | 一个 |
+
+- A 和 B 只差"解释器和目录在哪"，D 和 B 只差"谁触发"。C 是阳性对照：关闭如果清到会话直接启动的进程，它应当死。
+- B、C、D 的目录不在 `<工作区>` 下，也不在 `<生产根>` 里。也不要放在 `<工作区父目录>` 下——那是 agent 的工作区根目录，
+  清理如果按它关联，三组会被一起带走，读法就分不出来了。
+- 正在跑的观察运行是现行方式的真实样本：解释器和目录都在工作区内，由一次性任务启动。运维日志 11-23 一节的补记 §2
+  记的是主会话注册了这个任务、13 秒后进程就起来了；是谁触发的，日志里没有记，所以这里不说它是 D 那一种启动方式。
+  它可能随这次关闭一起停，这正是要看的；单独记，不和假角色混在一起读。
+
+**怎么读**。先判这次实验算不算数：
+
+- 用户动手之前一刻复核过四组都在，记下了时刻。没有这一次复核，结果不算。
+- 关闭的时刻不晚于"假角色创建时刻加它的寿命"（4 小时）。假角色到点自己退出，晚于它的结果作废。
+- "活着"指 PID 还在，而且创建时刻和记录逐字相同；PID 被别的进程复用不算活着。
+
+算数的，分步读。A 对 B 和 D 对 B 回答的是两个各自独立的问题——清理按什么关联，触发方式有没有影响——各读各的；两个答案
+合起来才是结论，不要读到一句像的就停下。
+
+**第一步，A 对 B**（A 和 B 只差解释器和目录在不在工作区里）：
+
+| A 对 B | 清理按什么关联 |
+| --- | --- |
+| A 死、B 活 | 按工作区关联 |
+| A、B 都活 | 计划任务启动的进程不随桌面端死 |
+| A、B 都死 | 会话级的清理 |
+| A 活、B 死 | 说不通：不下结论，先取证 |
+
+**第二步，D 对 B**（D 和 B 只差谁触发）：
+
+| D 对 B | 触发方式有没有影响 |
+| --- | --- |
+| D 活、B 活 | 没有影响 |
+| D 死、B 活 | 有影响："由主会话当场触发的一次性任务"会随桌面端死 |
+| D 死、B 死 | 两组都死了，这一步分不出有没有影响，看第三步 |
+| D 活、B 死 | 说不通：不下结论，先取证 |
+
+**第三步，合起来**。每一种组合的结论（都以第四步的"C 死"为前提）：
+
+| A 对 B | D 对 B | 结论 |
+| --- | --- | --- |
+| A 死、B 活 | D 活 | 只按工作区关联，和谁触发无关：按 §6.8 迁出即可 |
+| A 死、B 活 | D 死 | 既按工作区关联，又按触发者关联：按 §6.8 迁出，而且载体任务只能用调度器自己触发的一次性任务（时间触发），不能由主会话当场启动。迁出之后宿主退出演练必须通过，才算解决 |
+| A 死、B 死 | D 死 | 会话级的清理，换目录、换触发方式都解决不了：不起算，转 U11 |
+| A 死、B 死 | D 活 | 第二步说不通：不下结论，先取证 |
+| A、B 都活 | D 活 | 11-17 的父进程记录有误——计划任务启动的进程不随桌面端死。把当时的实际启动方式查清、写明。§6.8 照做，宿主退出演练照做：迁出是起算前提（D112），不因这一次的结果免除 |
+| A、B 都活 | D 死 | 载体本身不死，死的只是"由主会话当场触发"的那一种。11-17 那四个进程如果就是这样起的，它们的死就有了说明——把当时的实际启动方式查清、写明；§6.8 的载体任务只能用时间触发。§6.8 照做，宿主退出演练照做 |
+| A 活、B 死 | D 活或 D 死 | 第一步说不通：不下结论，先取证 |
+
+**第四步，C（阳性对照）**。C 是主会话的 shell 直接启动的；关闭如果清到会话直接启动的进程，它应当死。C 死，上表的结论
+成立。**C 也活，这次关闭根本没清到会话直接启动的进程，上表都不算**：实验没有结论，查关闭方式（是不是从托盘退出、
+退干净没有），重做。
+
+C 这样设有一个盲区：它是"起完那个 shell 就退出"的，关闭时它的父 PID 指向一个已经不存在的 shell。清理如果是按进程树
+逐级找下去的，C 会活下来，读法就落到"C 也活"，重做还是这样。重做一次仍然"C 也活"，而 11-17、11-21 的死因还要查，
+就把 C 换成父进程还活着的形态再试一次：让那个 shell 只休眠、留在 agent 会话的进程树里，由它起假角色，关闭之后再退。
+那个 shell 不是假角色，不在记录清单里：用它的时候把它的 PID、创建时刻也记下，收尾时一并结束。
+这是对 C 组定义的补充，不是改动。
+
+三条补充：
+
+- **"A 死"只看启动器**：它的 PID 不在了，或者那个 PID 上的创建时刻变了，就是死。启动器死、解释器还活着，按"A 死"读，
+  解释器的生死另记。
+- 观察运行和假角色的结果相反——例如观察运行整棵活着而 A 死了，或者观察运行死了而 A 活着：不下结论，先取证。
+- 观察运行的生死不改变假角色的读法；它停了之后的事见下面"注意"。
+
+**做法**（主会话执行；第 1 步起需要用户在场，第 5 步是用户动手，第 6、7 步由重开之后的新会话按已推送的记录做）：
+
+1. **约时间**（主会话和用户）。和用户约好关闭桌面端的时刻，用户确认在场之后再起假角色——假角色的寿命从起它算起，
+   用户不在，寿命会在等的时候走完。约好的时刻要给第 2–4 步留出余量。前提：观察运行照常跑，不碰它；不碰 `\MT5Quant\`
+   下的任何任务。
+2. **保全现场**（主会话）。`data\live` 的快照和一份完整进程表，存进 `data\ops-evidence\t215-<日期>\`（不入库）。复制时被
+   进程独占的文件（单实例锁）复制失败是预期的，记下复制了哪些、各自的 sha256。
+3. **起四组**（主会话）。假角色都是 `pythonw.exe -c "import time; time.sleep(14400)"`，4 小时后自己退出。
+   - 先建目录：A 的起始目录，B、C、D 的起始目录，和任务文件夹 `\MT5Quant-Exp\`——按 cmdlet 的文档 `Register-ScheduledTask`
+     不会自建文件夹，这一点没有验证过；先建了再注册总是对的。
+   - C：在主会话的 shell 里 `Start-Process`。
+   - A、B：各注册一个一次性的计划任务，时间触发设在一两分钟之后，只触发一次，由任务计划程序自己启动。
+   - D：注册同样的一次性任务，触发时刻设在一个不会到的将来时刻（它不该自己触发），注册之后立刻 `Start-ScheduledTask`。
+   - 三个任务的设置：主体是当前用户，登录类型 `Interactive`、运行级别 `Highest`，和真的 supervisor 任务、看护任务一样
+     （§6.5 安装脚本里 `New-ScheduledTaskPrincipal` 的写法）；"不启动新实例"；**单次运行时间上限要大于假角色的寿命**。
+     照抄看护安装脚本的 2 分钟，假角色两分钟就被任务计划程序结束，读出来是"都死了"。
+   - 注册用的命令（占位符先替换）：
+
+   ```powershell
+   $life = 14400                                      # 假角色寿命（秒）
+   $code = '-c "import time; time.sleep(' + $life + ')"'
+   $principal = New-ScheduledTaskPrincipal `
+     -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `
+     -LogonType Interactive -RunLevel Highest
+   $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
+     -ExecutionTimeLimit (New-TimeSpan -Seconds (2 * $life))
+   $exp = '<用户目录>\t215-<日期>'
+   $outside = '<基础解释器目录>\pythonw.exe'
+   $groups = [ordered]@{
+     A = @{ Exe = '<工作区>\.venv\Scripts\pythonw.exe'; Cwd = '<工作区>\data\ops-evidence\t215-<日期>\a'
+           At = (Get-Date).AddMinutes(2) }
+     B = @{ Exe = $outside; Cwd = "$exp\b"; At = (Get-Date).AddMinutes(2) }
+     D = @{ Exe = $outside; Cwd = "$exp\d"; At = (Get-Date).AddYears(1) }
+   }
+   New-Item -ItemType Directory -Force -Path "$exp\c" | Out-Null
+   Start-Process -FilePath $outside -ArgumentList $code -WorkingDirectory "$exp\c"     # 组 C
+   # 任务文件夹不会自建：先建。已经在了会报错，那一种不用管
+   $svc = New-Object -ComObject 'Schedule.Service'; $svc.Connect()
+   try { $null = $svc.GetFolder('\').CreateFolder('MT5Quant-Exp') } catch { }
+   foreach ($g in $groups.Keys) {
+     $item = $groups[$g]
+     New-Item -ItemType Directory -Force -Path $item.Cwd | Out-Null
+     $action = New-ScheduledTaskAction -Execute $item.Exe -Argument $code -WorkingDirectory $item.Cwd
+     $trigger = New-ScheduledTaskTrigger -Once -At $item.At
+     Register-ScheduledTask -TaskPath '\MT5Quant-Exp\' -TaskName "T215-$g" `
+       -Action $action -Trigger $trigger -Settings $settings -Principal $principal | Out-Null
+   }
+   Start-ScheduledTask -TaskPath '\MT5Quant-Exp\' -TaskName 'T215-D'
+   ```
+
+   - 核对（两三分钟后取一次进程表）：四组都在。A 是两个进程，解释器的父 PID 是启动器；A、B、D 的父进程链往上到头，
+     中间没有 agent 桌面端的进程；C 的父 PID 通常已经是一个不存在的 PID（那个 shell 退出了）。哪一组不在：这一轮作废，
+     按第 7 步收尾之后重来。
+4. **用户动手之前一刻的记录**（主会话）。用户说可以关了，先做这一步，做完再请用户关：
+   - 复核四组都在，记下时刻（UTC）。
+   - 取一份完整进程表（只读，例如 `Get-CimInstance Win32_Process`；创建时刻记成 UTC 的 `o` 格式，和 supervisor 的进程表
+     同一种格式），从中抄出清单，每个进程都记 PID、创建时刻、会话 ID、父 PID、往上到头的父进程链（名字和 PID）：
+     - 四组假角色的每一个进程。**A 的启动器和解释器都记**，标明父子；
+     - 观察运行的四个角色：每棵树的启动器、解释器、conhost；
+     - **终端**：生产终端（按映像路径认；机器上还有第二个安装的终端，也记，分开标）的映像路径也要记。只读进程表，
+       不连终端。观察运行的 supervisor 是旧代码，拒绝时的告警只有一句 `process script/arguments mismatch`，不带角色和
+       PID——终端的记录要靠自己记全。
+   - 写进 phase-f-log 并推送。重开之后做核对的是新会话，它什么都没起过，只能按已推送的记录认进程。
+   - 再只读核对一次任务清单：`\MT5Quant-Exp\` 下三个任务都跑过；`\MT5Quant\` 下的没有动。
+5. **用户从托盘退出 ZCode 桌面端**，等至少 30 秒，再打开（用户）。关闭的时刻从桌面端自己的运行日志里取（11-21 的取证
+   用过），用户记得的话也记下来。
+6. **重新打开之后**（新会话）：
+   - 取一份完整进程表，和第 4 步的清单逐个比：PID 还在而且创建时刻相同才算活着。再拿整份表和关闭前的那一份对比——
+     成了孤儿的解释器只有这样才看得到。
+   - 另记：观察运行还活不活；终端是原来的那个进程，还是被重新拉起的（父进程是谁）；supervisor 任务有没有把缺的角色
+     拉起、有没有拒绝（`alerts.log` 里的 `SUPERVISOR`、`SUPERVISOR_REFUSED`，`supervisor-state.json`）；任务计划程序
+     操作日志里三个实验任务的事件。
+   - 结果和判读写进 phase-f-log。观察运行如果随关闭停了，先做完这一步的记录再谈处置，不为了"让它过"而手工重启（D109）。
+7. **收尾**（新会话）：
+   - 只结束第 4 步清单里标为假角色的进程，A 的解释器也在内；条件是 PID 相同、创建时刻逐值一致。不按映像名结束。
+     结束不了（运行级别是 Highest）的不换别的办法，等它自退。
+   - 注销三个实验任务，再删 `\MT5Quant-Exp\` 文件夹（`$svc.GetFolder('\').DeleteFolder('MT5Quant-Exp', 0)`；任务不先注销，
+     文件夹删不掉）。
+   - 进程都结束了再删目录，按确切路径删：A 的起始目录，和 `<用户目录>\t215-<日期>\`。证据目录
+     `data\ops-evidence\t215-<日期>\` 留着，不入库。
+
+**注意**：
+
+- **假角色和真角色有两处不一样**，读结果时记住。假角色是 `pythonw.exe`，没有控制台，所以没有 conhost 子进程；生产角色是
+  `python.exe`（隐藏窗口，带 conhost）。读到"A、B 都活"的时候，先排除"清理是按控制台进行的"。运行级别是 Highest 的进程，
+  没有提升的桌面端也结束不了——实验任务的主体必须和真 supervisor 任务一致，理由在这一条。
+- **终端可能被连带结束**（11-21 01:24 就是这样）。观察运行跑的是没有 T209 的旧代码（`cd6fc4a`）：终端没了，worker 重连时
+  `initialize()` 会把终端拉起来，终端从此挂在 worker 的进程树里，supervisor 随即每分钟拒绝一次（§6.3 失效模式表第 10 行），
+  写 halt、发告警。**这是证据，只记录、不处置**（D109）；处置留到 §6.8 的维护窗。候选的网关不拉起终端（§6.5）。
+- **"supervisor 会拉起缺的角色"只对整棵进程树都退出的情形成立**（`live_supervisor.py` 的 `process_missing` 分支）。
+  启动器没了而解释器还在，是拒绝（第 9 行），不重启。
+- D104 的"终端的父进程不能是工作进程"在第 4 步顺带核一次，第 6 步看它有没有变。
+
+### 6.8 迁出 agent 工作区（D112；T215 之后）
+
+**目标**：生产用的解释器、部署树、数据、配置、日志、包装脚本全部在 agent 工作区之外；任何包装脚本、计划任务的参数里都
+不出现工作区的路径。迁完做宿主退出演练（关闭桌面端后四角色、supervisor、终端存活 30 分钟以上，心跳连续），结果入
+phase-f-log。
+
+**先知道三件事**（都对着候选的代码核过）：
+
+1. **supervisor 只认 Demo。** `scripts\live_supervisor.py` 的 `_registered_trees` 对登记里 `mode` 不是 `Demo` 的条目一律拒绝
+   （`registry deployment/mode/arguments mismatch`），`--inspect`、`--stop` 和每分钟的 `supervise()` 都走它；
+   `scripts\demo_run.ps1` 在 PaperSoak 下也拒收 `-DeploymentSha`。所以 PaperSoak 上装不了 supervisor，也没有 `--stop` 可用。
+2. **两种模式不能共用数据目录。** `demo_run.ps1` 看到登记里有 mode 不同的条目直接拒绝（`mode conflict`）。
+3. **`demo_run.ps1` 的缺省参数是相对路径，按脚本自己所在的仓库解析。** 漏给一个，数据或配置就悄悄落进部署树；
+   `data\`、`gateway.json` 又被 `.gitignore` 忽略，干净检查发现不了。所以下面的命令每一个参数都显式写成绝对路径。
+
+**生产根目录**（工作区之外，纯 ASCII 的路径，不带 `%`、不带双引号，不以反斜杠结尾；位置由用户定，不定就选用户目录下
+一个专门的目录；不能经过符号链接或目录联接，见下表"部署树"一行）：
+
+```
+<生产根>\
+  deploy\          部署树：独立的一份仓库，detached 在候选的完整 SHA 上，干净
+  venv\            独立的虚拟环境；基础解释器也在工作区之外
+  gateway.json     内容是 {}（终端路径取默认值）
+  start-demo.ps1   Demo 的载体任务运行的包装脚本；start-paper.ps1 是 PaperSoak 的
+  data\            Demo 的数据目录
+    live\          登记、心跳、journal、证据
+    demo\          运行日志
+    specs\latest.json   costs\spread_model.json   demo-configs\*.toml
+  data-paper\      PaperSoak 专用的数据目录，结构同 data\，跑完归档
+  research\costs\spread_model.json     研究库缓存副本
+  archive\         归档：工作区的旧 data\、PaperSoak 的数据目录、旧任务的导出
+```
+
+运行和装任务之后 `data\` 下还会多出三个目录：`logs\`（日报和周检的任务日志）、`reports\`（日报）、`ops-evidence\`
+（supervisor、看护、存活检查的日志和状态）。它们是脚本自己建的，不用手工建。
+
+**每一项从哪里来、怎么核对**（`scripts\demo_run.ps1` 启动前检查的就是这些）：
+
+| 项 | 现在 | 迁出时 | 核对 |
+| --- | --- | --- | --- |
+| 部署树 | `<工作区父目录>\demo-deploy-cd6fc4a`，是工作区仓库的一个工作树 | 不用 `git worktree`：工作树的 `.git` 是一个指回工作区仓库的文件。单独克隆一份，再 `git checkout --detach <候选的完整 SHA>`。从本地仓库克隆要加 `--no-hardlinks`（缺省时对象是硬链接），克隆完把 `origin` 改指远端或者删掉——不然工作区的路径留在 `<部署树>\.git\config` 里 | `git -C <部署树> rev-parse HEAD` 等于候选的完整 SHA；`git -C <部署树> symbolic-ref -q HEAD` 没有输出、退出码 1；`git -C <部署树> status --porcelain --untracked-files=all` 是空的；`.git\config` 里没有工作区的路径。**不手工往部署树里放任何东西。**运行和装任务会在里面生成一些被 `.gitignore` 忽略的文件——`__pycache__\`、日报和周检的包装器 `scripts\task_*.cmd`、日报任务在网关期限时写下的 `data\live\` 标记——它们不会让干净检查判脏，也不要挪动或删除（挪了 `.cmd`，任务就跑不了） |
+| 解释器 | `<工作区>\.venv` | `<基础解释器目录>\python.exe -m venv <生产根>\venv`，再装 `requirements.txt` | 第 1 步的四条命令 |
+| 终端路径 | `<终端安装目录>\terminal64.exe`。网关配置是 `{}`，取的是 `src\mt5gw\config.py` 里 `terminal_path` 的缺省值 | 不变 | 看护任务的 `-TerminalPath` 和这个缺省值逐字一致（装之前用 `-DryRun` 核对，§6.5）；运行中的终端映像路径也是这一种拼写 |
+| 点差模型缓存 | `<工作区>\data\costs\spread_model.json` | 复制到 `<生产根>\data\costs\` | sha256 和原来的一样 |
+| 合约快照 | `<工作区>\data\specs\latest.json` | 复制到 `<生产根>\data\specs\`（脚本按数据目录找它） | 同上 |
+| 两个策略的配置 | `<工作区>\data\demo-configs-consolidated\` 下的两个 `.toml` | 复制到 `<生产根>\data\demo-configs\` | sha256 写进部署记录。部署树里受跟踪的 `demo-configs\` 是同名的示例目录，别拿错。预检：每个配置 `volume_lots` 是 0.01、magic 唯一 |
+| 研究库缓存副本 | `<工作区>\data_research\costs\spread_model.json` | 复制到 `<生产根>\research\costs\` | sha256 |
+| 风控、会话配置 | 部署树里的 `config\risk.toml`、`config\sessions.toml` | 直接用候选部署树里的 | `-RiskConfig` 是 `<部署树>\config\risk.toml`（`daily_loss_cap_usd = 500.0`）；`risk-demo.toml`（0.5 美元）只用于全平演练（O21-7）。两份的 sha256 和上限的值写进部署记录 |
+| 网关配置 | `<工作区>\gateway.json`（3 个字节） | 在 `<生产根>\` 里建同样的文件 | 内容是 `{}`；`allow_live_trading` 的缺省值是 False |
+| 日志 | `<工作区>\data\demo` | `<生产根>\data\demo` | supervisor 的包装脚本把输出落到 `<生产根>\data\ops-evidence\supervisor\supervisor.log`（§6.3） |
+| 数据目录 | `<工作区>\data`（观察运行在用） | 新的 `<生产根>\data\live`。旧的不搬，整体归档（第 3 步） | 新部署之前账户上两个 magic 零持仓、零挂单 |
+
+**顺序**（第 1、2 步不碰观察运行，也不连终端；第 3 步起是维护窗）：
+
+1. **建生产根目录**（主会话）。观察运行还在跑，这一步不碰它、不连终端、不动 `\MT5Quant\` 下的任务。克隆、建 venv、装包
+   有负载，避开换日窗。
+   - 做什么：按上面的布局建目录；克隆、`checkout --detach`；建 venv，
+     `<生产根>\venv\Scripts\python.exe -m pip install -r <部署树>\requirements.txt`；复制各项；建 `gateway.json`。
+   - 核对部署树：上表"部署树"一行的三条 git 命令，再加一句翻 `.git\config`。
+   - 核对路径：`<生产根>` 和它的每一级上级都不是符号链接，也不是目录联接——对每一级看一次
+     `(Get-Item -LiteralPath <那一级路径>).LinkType`，都应当是空的。代码只查符号链接（`live_supervisor.py` 的
+     `verify_deployment` 对九个路径和它们的每一级上级做 `is_symlink()`，查到按 `unsafe path` 拒绝）；目录联接它查不出来，
+     只能在这里核。
+   - 核对复制来的文件：源和目标的 sha256 相同（`Get-FileHash -LiteralPath <源>, <目标> -Algorithm SHA256`）。
+   - 核对新解释器，四条都要过：
+
+     ```powershell
+     $py = '<生产根>\venv\Scripts\python.exe'
+     & $py -c "import sys; print(sys.executable); print(sys.prefix); print(sys.base_prefix)"
+     & $py -m pip check
+     & $py -c "import MetaTrader5; print('MetaTrader5 import ok')"     # 只是导入，不连终端
+     & $py -c "import sys; sys.path.insert(0, r'<部署树>\src'); import mt5gw, mt5live; print('import ok')"
+     ```
+
+     第一条打出的三个路径都不在工作区里：`sys.executable`、`sys.prefix` 在 `<生产根>\venv` 下，`sys.base_prefix` 在
+     `<基础解释器目录>` 下。第三条必须有：`MetaTrader5` 在网关里是延迟导入的，下一步的预检证明不了它装上了。
+   - 出错了怎么办：哪一条不过就修哪一条，修好重跑，不带着问题往下走。
+2. **不连终端的预检**（主会话）。前提：第 1 步的核对都过了。观察运行还在用终端（D82），所以预检不能连终端。
+
+   ```powershell
+   $root = '<生产根>'
+   & "$root\deploy\scripts\demo_run.ps1" -Mode Demo -PrecheckOnly -SkipGatewayCheck `
+     -DeploymentSha '<候选的完整 SHA>' `
+     -PythonExe "$root\venv\Scripts\python.exe" -DataDir "$root\data" `
+     -ConfigDir "$root\data\demo-configs" -GatewayConfig "$root\gateway.json" `
+     -RiskConfig "$root\deploy\config\risk.toml" -SessionsConfig "$root\deploy\config\sessions.toml" `
+     -SpreadModel "$root\data\costs\spread_model.json" `
+     -ResearchCache "$root\research\costs\spread_model.json" `
+     -LogDir "$root\data\demo" -MinFreeGB 40
+   ```
+
+   - 跑的必须是 `<生产根>\deploy\scripts\demo_run.ps1`。它以自己所在的仓库为根；从工作区里的那一份跑，SHA 对不上，被拒。
+   - `-SkipGatewayCheck` 只能和 `-PrecheckOnly` 同用，单独用直接退出 1。这个分支对 DEMO 保险丝的源码只做语法解析和
+     sha256，不执行它；临时文件写在 `%TEMP%` 下，用完就删。生命周期检测走 `live_supervisor.py --inspect`（带了
+     `-DeploymentSha` 才做），那个脚本不 import MetaTrader5，只读。`--inspect` 顺带把部署树、九个路径、网关配置、风控和
+     会话配置、策略配置整体验证一遍——网关配置文件就是在这一步被读到的。
+   - 磁盘：脚本的门槛缺省是 5 GB，看的是数据目录所在盘的剩余空间。传 `-MinFreeGB 40`，让它替你核"磁盘余量不低于
+     40 GB"这一条起算前提。
+   - 核对：退出码 0，没有 `[X]` 行；最后一节是 `-PrecheckOnly：检查完成，不启动任何进程`，并且是"未发现存活实例"
+     （新的数据目录里还没有登记）。过了之后 `<生产根>\data\` 下会多出 `live\`、`demo\` 和一个锁文件，这是它建的，
+     没有启动任何进程，也不碰观察运行的登记。
+   - 出错了怎么办：按 `[X]` 行修，重跑到全过才往下走。
+3. **维护窗：停观察运行**（主会话；**需要用户**——其他 magic 的遗留仓位）。前提：第 1、2 步都过了；T215 做完、记录写完
+   （观察运行是它的真实样本）；在维护窗内。下面的顺序不能换——`--stop` 之后四个角色都没了，全平指令就没有人执行了：
+   1. **旧任务：先导出，再停用**。只读导出全部任务的 XML，存进 `<生产根>\archive\tasks-<日期>\`（里面有本机路径和
+      账户，不入库），然后按导出的清单逐个核、逐个停用。每个任务这一步做什么、哪一步注销，见下表。表是从文档里凑出来的，
+      以导出的为准；表里没有而动作指着工作区的任务照同样办——停用，之后注销。
+
+      | 任务 | 第 3 步 | 哪一步注销 |
+      | --- | --- | --- |
+      | `\MT5Quant\live_supervisor2`（树外 `host.py` 包装版，每分钟触发） | 停用 | 第 8 步第 1 项，装新的之前 |
+      | `\MT5Quant\terminal_keeper`（装过的话） | 停用 | 第 5 步，装新看护之前（`-Uninstall`） |
+      | `\emergency-restart-1123`、`\deploy-consolidated-20261117`（根目录下的一次性载体任务，没有用处了） | 停用 | 第 3 步，导出之后当场 |
+      | `\MT5Quant\live_supervisor`（树内直连版，11-19 起停用） | 核对仍是停用 | 第 8 步第 4 项 |
+      | `\MT5Quant\live_daily_report`、`\MT5Quant\demo_weekly_check` | 核对仍是停用 | 第 8 步第 2 项，安装脚本按名字覆盖 |
+      | `\MT5Quant\refresh_bars`、`refresh_ticks`、`snapshot_specs`（三个数据任务） | 核对仍是停用 | 第 8 步第 4 项 |
+      | `\MT5Quant\watch_swap`（10-27 的旧任务） | 核对仍是停用 | 第 8 步第 4 项 |
+      | 新的载体任务（跑 `start-paper.ps1`、`start-demo.ps1` 的两个一次性任务） | 不停用 | 用完就注销，脚本留着（第 6 步、第 7 步） |
+   2. **killSwitch**：在 `<工作区>\data\live\` 下建 `killSwitch`。风控下一轮写 `halt.json`，停开仓。
+   3. **写全平指令**：用观察运行的部署树里的 `mt5live.commands.write_flatten(<工作区>\data\live, reason="moveout-<日期>",
+      now=<当前 UTC>)`。只写文件，不碰终端；平仓由运行器经网关执行，halt 不挡平仓。killSwitch 只停机、不平仓，
+      代替不了这一步。
+   4. **等确认**：两个 magic 的 `flatten.ack-<magic>` 出现、风控把指令归档（`commands\archive\` 下多一个文件，归档之后
+      ack 被删掉）；从对账日志确认 902610、902501 零持仓、零挂单。
+   5. **其他 magic 的遗留仓位或挂单**（例如 902601 的）：记下 ticket，**请用户在终端界面里手工平掉**，写进 phase-f-log。
+      不写脚本调 MT5 接口去平（D82），主会话做不了界面操作。确认账户上所有 magic 零持仓、零挂单。
+   6. **`--inspect`**：**经 `host.py` 那条链做**。生产上的 supervisor 每分钟走的就是它（§6.3：撤除之前，观察运行继续用
+      包装链）。参数照留档的 `sup-wrapper.ps1`——留档副本在 `docs\ops\ops-patches\2026-11-19\`，和生产原件只差路径换成了
+      占位符；动手之前先核生产上 `host.py` 和 `sup-wrapper.ps1` 的 sha256 和留档 README 的表一致：
+
+      ```powershell
+      $w = '<工作区>'; $od = '<工作区父目录>\demo-deploy-cd6fc4a'
+      $chain = @('-u', "$w\data\ops-evidence\recovery-20261119A\host.py",
+        '--directory', $od, '--sha', 'cd6fc4aaac7d3886be0fbdfa4f437345b6b1b8c5',
+        '--data-dir', "$w\data", '--config-dir', "$w\data\demo-configs-consolidated",
+        '--python', "$w\.venv\Scripts\python.exe", '--gateway-config', "$w\gateway.json",
+        '--risk-config', "$od\config\risk.toml", '--sessions-config', "$od\config\sessions.toml",
+        '--spread-model', "$w\data\costs\spread_model.json", '--log-dir', "$w\data\demo")
+      & "$w\.venv\Scripts\python.exe" @chain --inspect      # 退出码 0 才做下一项
+      ```
+
+      **不要用部署树里那份原样的 `scripts\live_supervisor.py`，也不要用 `demo_run.ps1 -Stop`**——后者只是转发给前者。
+      `cd6fc4a` 那一版没有 conhost 的例外，进程树上挂着一个 `conhost.exe` 就报 `unexpected executable`。观察运行的两个
+      运行器和风控三棵树是带着 conhost 启动的（运维日志 11-23 的进程表），所以那份脚本对观察运行一定被拒，它完好的时候
+      也一样。`host.py` 调的是同一个 `main()`，改了三处：拉起进程时的启动标志（只在 supervisor 重启角色时起作用）、
+      `canonical()` 换成 pathlib 的归一化（影响路径比较）、把系统 conhost 的叶子从进程表里滤掉。对 `--inspect`、`--stop`
+      起作用的是后两处。这条链能在观察运行上走通，是照代码读下来的，没有试过；它也没有独立的评审和测试（留档
+      README）——所以先做 `--inspect`，它过了才做 `--stop`。退出码不是 0，先确认没有用错脚本，再走下面"被拒绝时"。
+   7. **`--stop`**：同一条链、同一组参数，把 `--inspect` 换成 `--stop`（第 2 项的 killSwitch 必须在）。被拒不等于没停：
+      这条链上多半是停到一半，照下面"被拒绝时"的第二种接着停，不要直接上人工。完成的标志是再跑一次 `--inspect`，
+      "存活"是空的；再取一次进程表核对四棵树（启动器、解释器、conhost）都不在。登记保留。
+   8. **保全现场**：`<工作区>\data\live` 的快照、`data\ops-evidence\`、`alerts.log`、supervisor 的日志。被独占的锁文件
+      复制不了，属正常，记进清单。
+   9. **旧数据目录归档**：只复制和运行有关的子目录——`<工作区>\data` 下的 `live\`、`demo\`、`costs\`、`specs\`、
+      `demo-configs-consolidated\`、`reports\`、`logs\` 和 `ops-evidence\`（生产的证据都在它下面）——到
+      `<生产根>\archive\workspace-data-<日期>\`。`data\` 下其余的（tick、K 线这类研究数据）不复制：整份复制、原件又不
+      删，占用的磁盘要翻倍。复制之前先看这几项加起来多大、`<生产根>` 所在的盘剩多少，不够就停下汇报。复制了什么列成
+      清单，对源和目标各出一份 sha256，两份逐行相同。**原件不删**——删除要用户确认（O21-6）。归档之前确认第 1 项做完
+      了：停用着的旧 supervisor 任务一旦被重新启用，会按登记缺失写 halt，或者去补进程。
+4. **D104：读两个字段的实测值**（主会话；单列一步，只在维护窗内做这一次）。前提：第 3 步做完了——没有任何业务进程
+   连着终端，PaperSoak 还没起；终端在运行。候选的网关在终端进程不在时不调 `initialize`，直接报"MT5 终端进程不在"
+   （§6.5）。终端不在的话**不从 agent 会话启动它**：先做第 5 步，由看护任务拉起；或者请用户从桌面手动启动（D111 允许
+   维护窗内的人工操作）。
+   - 方法：走仓库的 `MT5Gateway`（候选部署树里的），只读。加载 `<生产根>\gateway.json`，
+     `with MT5Gateway(cfg) as gw: info = gw.terminal_info()`，取 `trade_allowed`、`tradeapi_disabled`；记下终端的 build
+     和 MetaTrader5 包的版本（`requirements.txt` 钉的是 5.0.6231）。不取行情、不下单。
+   - 看读取进程下面有没有闪过 `terminal64.exe`：读之前取一次进程表（`Get-CimInstance Win32_Process`，只读），查父 PID
+     等于读取进程 PID 的进程。读取脚本在 `terminal_info()` 返回之后、关闭网关之前停上十几秒，这段时间里每秒查一次；
+     第二次必须在读取进程退出之前取。真实的 MetaTrader5 包在终端已经运行时调 `initialize()` 会不会生成一个短命的
+     `terminal64.exe` 子进程，还没有验证过，这是验证它的机会。
+   - 读取脚本放在 `<生产根>\` 下，不入库。
+   - 期望：`trade_allowed=True`、`tradeapi_disabled=False`（起算前提第 5 条）。`terminal_info()` 缺这两个字段时，运行器
+     按"不允许"处理，第一轮就发 `ALGO_TRADING_DISABLED`。不是期望值就停下汇报，不起业务进程。
+   - 结果——两个实测值、终端 build、包版本、读取进程下面有没有出现过终端、时刻——写进部署记录和 phase-f-log。
+5. **装看护任务**（主会话）。终端由看护任务启动。装之前先注销同名的旧任务：安装脚本遇到同名任务会拒绝，不覆盖（卸载
+   只用 `-Uninstall`）。命令见 §6.5"看护任务的安装"，路径给成：
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File "<生产根>\deploy\scripts\ops\install_terminal_keeper.ps1" `
+     -TerminalPath "<终端安装目录>\terminal64.exe" -DeployDir "<生产根>\deploy" -DataDir "<生产根>\data"
+   # 打印的计划核对无误之后，同一条命令加 -Install。装完用 -Status -DataDir "<生产根>\data" 查
+   ```
+
+   - 核对：打印的 `KEEPER_TASK_PARAMETERS` 里动作、主体（`Interactive`、`Highest`）、`-LogPath` 都对。`-LogPath` 所在的目录
+     就是看护状态文件所在的目录，在 `<生产根>\data\ops-evidence\` 下。这个目录的拼写这里不写死，以安装脚本打印的
+     `log_path` 为准，也别凭印象拼——第 8 步装小时任务时要拿它核对（见该步第 3 项）。终端运行着的时候，看护脚本自己的
+     `-DryRun` 输出 `running`。装完等一两分钟：`-Status` 里 `state` 是 `Ready`、`last_task_result` 是 0，`KEEPER_STATE`
+     的 `outcome` 是 `running`、`age_s` 只有一两分钟。
+   - 终端本来不在：一两分钟内被拉起，新终端的父进程是看护的 PowerShell，不是 agent 会话，也不是任何 worker。拉起之后
+     补做一次 `-DryRun`（必须输出 `running`），再回到第 4 步。
+   - 出错了怎么办：安装脚本把不对的地方一次列全，有不对的就什么都没做，改了再跑。看护被拒绝（退出码 1）没有告警
+     通道，只有任务的上次结果码，`-Status` 就是查它用的。
+6. **PaperSoak**（主会话；不需要用户）。前提：第 3–5 步都做完了；看护任务在位。
+   - **单独的数据目录** `<生产根>\data-paper\`。里面要有 `specs\latest.json`（脚本按数据目录找它）；策略配置、点差模型、
+     风控和会话配置都用参数指向，和 Demo 共用同一批只读的文件。
+   - 预检。不连终端——PaperSoak 没有网关预检；不带 `-DeploymentSha`，PaperSoak 拒收：
+
+     ```powershell
+     & "$root\deploy\scripts\demo_run.ps1" -Mode PaperSoak -PrecheckOnly `
+       -PythonExe "$root\venv\Scripts\python.exe" -DataDir "$root\data-paper" `
+       -ConfigDir "$root\data\demo-configs" -GatewayConfig "$root\gateway.json" `
+       -RiskConfig "$root\deploy\config\risk.toml" -SessionsConfig "$root\deploy\config\sessions.toml" `
+       -SpreadModel "$root\data\costs\spread_model.json" `
+       -ResearchCache "$root\research\costs\spread_model.json" `
+       -LogDir "$root\data-paper\demo" -MinFreeGB 40
+     ```
+
+   - **经计划任务载体启动**。一次性任务运行 `<生产根>\start-paper.ps1`；包装脚本调
+     `<生产根>\deploy\scripts\demo_run.ps1 -Mode PaperSoak`，参数就是上面这些去掉 `-PrecheckOnly`，全部是 `<生产根>` 里
+     的绝对路径；输出重定向到 `<生产根>\data-paper\demo\` 下的一个日志文件，退出码原样交回。载体任务的主体和 supervisor
+     任务一样（`Interactive`、`Highest`）。**触发方式用一次性的时间触发**（一两分钟之后，由任务计划程序自己启动）：
+     §6.7 里 D 死而 B 活的话只能用这一种；D 也活时仍然用它。
+   - 启动后核对：四个启动器的父进程链是计划任务的宿主，不是 agent 会话；四棵树都是"启动器 → 解释器 + conhost"。
+     父进程是 agent 会话的话停掉，改用计划任务重新部署。
+   - 载体任务用完就注销，脚本 `start-paper.ps1` 留着：启动核对过了，先把这个任务的 XML 导出留底（部署记录要抄动作），
+     再注销。
+   - **这一段没有 supervisor**（本节开头第 1 件事）：角色退出了不会有人拉起。任何角色退出、任何异常类告警，停下查根因，
+     不直接重试（D92）。`demo_run.ps1` 也不会在同一个数据目录里给 PaperSoak 补缺——登记还在，它以
+     `verified-tree-required` 拒绝。
+   - 至少一个完整交易日。每个交易日做一次日常档检查，结论写 phase-f-log。
+   - 这一段只做一项演练，是早期检查，不需要用户——**演练 C 里不需要 supervisor 的那部分**：结束终端 → 看护任务两分钟内
+     拉起终端 → 没有任何 worker 的进程树里出现过 `terminal64.exe` → 运行器自己恢复。PaperSoak 的两个运行器连终端取
+     行情，风控和对账读纸面状态、不连终端。取证按 §6.5 的验收段：用进程创建事件看 worker 的进程树，不要只看 supervisor
+     有没有拒绝（这一段本来也没有 supervisor）。结果入 phase-f-log。
+   - 这一段不做宿主退出演练。演练 A、演练 B、带 supervisor 的演练 C 和宿主退出演练都在 Demo 部署之后做，见第 8 步
+     第 5 项。
+7. **Demo 烧机**（主会话）。
+   - **停 PaperSoak**。PaperSoak 没有 `--stop` 可用（supervisor 和 `demo_run.ps1 -Stop` 都只认 Demo 的登记，见本节开头
+     第 1 件事），只能人工停，顺序照 §6.3 的停机序列：
+     1. 在 `<生产根>\data-paper\live\` 下建 `killSwitch`。
+     2. 取进程表，按命令行认出四个启动器和四个解释器，逐个记下 PID、创建时刻、父进程链。两级和 §6.7 的组 A 是同一种
+        形状：启动器的映像在 `<生产根>\venv\Scripts\` 下，解释器的映像在 `<基础解释器目录>\` 下；八个进程的命令行里
+        数据目录都是 `<生产根>\data-paper`。conhost 不去动。对不上的不碰。
+     3. 子先父后：先解释器，再启动器。每个进程结束之前再读一次创建时刻，和记下的一致才结束——用
+        `Stop-Process -InputObject <那个进程对象>`，不要拿 PID 再找一遍。创建时刻要同一个来源、同一种格式地记和比
+        （都在同一个进程对象上读 `StartTime`，或者都从 CIM 进程表读）：`StartTime` 和 CIM 的 `CreationDate` 是本地时间，
+        §6.7 那种 UTC 的 `o` 格式是另一种，混着比会全部对不上。
+     4. 再取一次进程表，核对这八个进程都不在。纸面仓位不平，随数据目录归档。
+     5. `Stop-Process` 被拒就停下：不按映像名结束，不换别的办法，报告用户，由用户处置。被拒的原因多半是会话没有提升
+        ——PaperSoak 的角色经载体任务启动，运行级别是 `Highest`；也可能是在提升的进程上读 `StartTime` 本身被拒。
+     6. 全过程写进 phase-f-log：认出的八个进程各自的 PID、创建时刻、父进程链，结束的顺序和时刻，核对的结果。
+   - **归档 PaperSoak 的数据目录**：复制到 `<生产根>\archive\data-paper-<日期>\`，数量和 sha256 清单对得上。原件不删，
+     删除要用户确认。
+   - **时点（D97）**：部署记录须在当日 12:00 UTC 前写成，赶不上就改到次日部署；从部署完成到当日 24:00 UTC 不少于
+     12 小时，并且含一次换日窗。
+   - 前提：账户上两个 magic 零持仓、零挂单（PaperSoak 不下单，第 3 步之后应当仍是零）；终端在运行、看护任务在位；
+     `<生产根>\data\live\` 是新的——没有登记，没有 halt、pause、killSwitch、全平指令。
+   - **经计划任务载体启动**。一次性任务运行 `<生产根>\start-demo.ps1`；包装脚本调
+     `<生产根>\deploy\scripts\demo_run.ps1 -Mode Demo`，参数同第 2 步、去掉 `-PrecheckOnly -SkipGatewayCheck`，输出重定向
+     到 `<生产根>\data\demo\` 下的一个日志文件——锚点证据的 sha256 只打印在这份输出里，部署记录要用。这次带 DEMO 保险丝
+     和网关预检：连终端，读账户状态、逐品种读一笔报价，不下单。触发方式和主体同第 6 步。
+   - 启动后核对：
+     - 四个启动器的父进程链是计划任务的宿主，不是 agent 会话（D98）。是 agent 会话的话停掉，改正后重新部署。
+     - 风控进程命令行里的 `--config` 是 `risk.toml`，不是 `risk-demo.toml`。不对就停掉，改正后重新部署。
+     - 四棵树是"启动器 → 解释器 + conhost"，没有 `terminal64.exe`；输出里证据留存那一段没有报错。
+   - **立刻写部署记录的启动部分**——完整 SHA、UTC 完成时刻、启动器 PID、各份配置的 sha256。D97 的 12:00 UTC 是硬线，
+     其余各项装完任务之后补齐。载体任务同样用完就注销：启动核对过了、它的 XML 导出留底之后注销，脚本 `start-demo.ps1`
+     留着。
+   - 烧机期的判据见第二十一轮增补 §3。
+8. **装其余任务**（主会话）。前提：第 7 步的核对都过了。
+   1. **supervisor**：先注销同名的旧任务 `\MT5Quant\live_supervisor2`——第 3 步已经停用；同名任务还在时，不带 `-Force`
+      的注册会被拒——再按 §6.3 的注册命令装，变量全部换成 `<生产根>` 里的：`$deploy` 是 `<部署树>`，`$python` 是
+      `<生产根>\venv\Scripts\python.exe`，`$data` 是 `<生产根>\data`，`$configs`、`$gateway`、`$risk`、`$sessions`、
+      `$spread`、`$logs`、`$sha` 同第 2 步。登录类型 `Interactive`、运行级别 `Highest` 写在命令里。等它连续健康 5 分钟
+      以上（`supervisor-state.json` 的 `healthy_since` 连续，`alerts.log` 没有 `SUPERVISOR_REFUSED`）；等到下一次触发，
+      确认交互桌面上没有窗口弹出。
+   2. **日报和周检**：§6.3.1 的命令，解释器和各目录用参数显式给出（`$deploy`、`$python`、`$gateway`、`$data`、
+      `$logs`、`$spread`、`$sessions` 同上）。不给的参数沿用数据目录或者部署树下的旧位置，所以都给。安装脚本按名字覆盖
+      旧任务，不用先注销；不带 `-IncludeDataTasks`。打印的 `TASK_PARAMETERS` 脱敏后抄进部署记录。
+   3. **小时级存活检查**（§6.6）：等 U10 定了渠道再装；装的时候带 `--expect-keeper`，全部用显式的绝对路径。存活检查的
+      缺省路径从修正提交 `21392e7` 起和安装脚本一致，都是 `ops-evidence\terminal_keeper\state.json`（评审记录
+      `docs/reviews/2026-11-25-keeper-state-path-review.md`）。动手之前先核对自己那一份部署树含这个修正：
+      `git -C <部署树> merge-base --is-ancestor 21392e7 HEAD` 退出码是 0；不是 0，`--keeper-state` 必须显式给。
+      装小时任务时仍核对一次，用 `-Status` 或计划输出核对存活
+      检查读的就是看护状态文件所在的目录（第 5 步）：`--keeper-state` 显式给到安装脚本打印的 `log_path` 所在目录下的
+      `state.json`，手工跑一次存活检查（带 `--no-notify`），看护那几项不是 `keeper_absent`，而 `-Status` 的
+      `KEEPER_STATE` 是新鲜的。
+   4. **停用着的旧任务注销**：三个数据任务（`refresh_bars`、`refresh_ticks`、`snapshot_specs`），和核对下来动作指着
+      工作区的其他停用任务（从文档看有 `\MT5Quant\live_supervisor`、`\MT5Quant\watch_swap`；以第 3 步导出的 XML 为准）。
+      都在停用状态下注销，依据是 D112——计划任务的参数里不出现工作区路径。三个数据任务不重装，A5 之后在第二终端上重装
+      （D82、T198）。注销之前把任务的 XML 导出留底，放进归档目录 `<生产根>\archive\tasks-<日期>\`（第 3 步第 1 项导出
+      过一份；那之后任务有过改动就再导出一次，以注销前的那一份为准）。部署记录里写一行，见下。
+   5. **演练**。四项都在 Demo 部署之后、烧机期内，紧接 supervisor 任务装好、连续健康之后做；每项的结果入 phase-f-log。
+      **每项之间等恢复**再做下一项：心跳新鲜、对账心跳里 `reconcile_clean` 是 True、halt 已经解除（supervisor 写的 halt
+      要连续健康 5 分钟才自动解除）。四项做完，4 个 `.log.err` 仍然必须全空。
+      - 演练 A（结束风控进程）和演练 B（结束一个运行器）：supervisor 拉起。每项之后核对（第二十一轮增补 §2 第 8 步）：
+        `ops-restarts.jsonl` 多一行，`instances.json` 里是新的 PID；重启前后的登记副本在 `evidence\instances\` 里，和
+        `evidence\instances\index.jsonl` 逐条对应（`seq` 相同、sha256 对得上）；`alerts.log` 里没有
+        `SUPERVISOR_EVIDENCE`；halt 自动解除。
+      - 演练 C（带 supervisor 的那一次）：结束终端 → 看护任务两分钟内拉起 → 没有任何 worker 的进程树里出现过
+        `terminal64.exe` → 运行器自己恢复，supervisor 全程没有拒绝。
+        - 前提：没有在途订单——对账心跳的 `reconcile_clean` 是 True（它为真的条件是没有差异、`expected-<magic>.json`
+          里的意图都是 confirmed）；避开换日禁入窗。
+        - 预期：已恢复的断线对；带 `NotConnectedError` 字样的 `BROKER_UNAVAILABLE`（记录类）；`.err` 仍然全空。`.err`
+          不空就停下，按 T209 的缺陷去查。告警的种类以实际出现的为准：PaperSoak 段那次演练做完，把实际出现的种类
+          记进日志，再核 Demo 段这一行——"断线对"这一项没有读到发出它的代码，两分钟的终端中断不一定产生这一对。
+      - 宿主退出演练（请用户关闭一次桌面端）：四角色、supervisor、终端存活 30 分钟以上，心跳连续。关闭前的记录和重开
+        后的核对，做法同 §6.7 第 4、6 步；supervisor 是每分钟触发的任务，它"活着"看 `supervisor-state.json` 的
+        `last_checked` 是不是每分钟都在更新。**不通过就不手工重启**：先保全现场（进程表、`instances.json`、
+        `supervisor-state.json`、`alerts.log`、退出标记），按第二十一轮增补 §3 停下修复、重新部署、重新烧机，第 1 天
+        顺延——也就是不起算。
+      这样排的依据：第二十一轮增补 §2 第 8 步本来就是装好 supervisor 之后做演练 A、B；§3 的烧机判据明写允许
+      "supervisor 演练造成的中断"和"演练产生的 supervisor 告警"。
+9. **核对没有残留的工作区路径，写部署记录**（主会话）。
+   - 只读导出全部计划任务（`Export-ScheduledTask`），连同包装脚本的内容一起搜工作区的路径，应当一处都没有。搜的
+     范围：任务的动词和参数；`<生产根>\` 下的包装脚本（`start-demo.ps1`、`start-paper.ps1`）；部署树里被任务调用的
+     脚本和生成的包装器（`scripts\ops\` 下的 `.ps1`、`.vbs`，`scripts\task_*.cmd`）；`<部署树>\.git\config`；
+     `<生产根>\venv\pyvenv.cfg`；`data\live\instances.json`、`run-manifest.json` 和 `data\demo\demo-run-*.json` 里记的路径。
+   - 生产进程的命令行和它们的父进程链里也没有；候选的进程树里没有工作区的解释器（映像路径都不在 `<工作区>` 下）。
+   - 搜到一处就停下来处理——改参数，重装那一个任务——不带病往下。
+   - 都过了，写部署记录，清单见下。
+
+**`--inspect` 或 `--stop` 被拒绝时**（第 3 步的第 6、7 项）。先确认不是用错了脚本：拿的是部署树里原样的
+`live_supervisor.py` 或者 `demo_run.ps1 -Stop`，被拒是常态（第 3 步第 6 项），换回 `host.py` 那条链重来。链没错还被拒，
+分两种，处置不同：
+
+- **还没开始停就被拒**。身份核验没过是其中的一种，原因是 `process script/arguments mismatch`、`unexpected executable`、
+  `missing launcher with surviving/duplicate worker` 这一类：它先核验全部四个角色的身份，有一个不过就什么都不结束，核验
+  过了才开始停。原因出在别处的（例如缺 killSwitch、参数和登记对不上、部署核验不过——部署树不干净、SHA 对不上、配置读不了），
+  照原因改正再跑；部署核验不过的先看清原因再改，不要为了过检查去动部署树。身份核验没过的，走下面的人工那一支。
+- **停到一半被拒**。只有 `--stop` 会这样，原因是 `cannot acquire process handle` 或 `termination failed` 这一类的。这条链上
+  平常就会发生，不是出了事，也不需要人工去结束任何进程。`cd6fc4a` 那一版是一棵树一棵树停的，每棵树里一个进程一个进程地
+  结束：解释器在前、启动器在后，每个都是结束、等它退出、再下一个。venv 的启动器在解释器一没时自己就退出，轮到它时多半
+  已经不在或正在退出，就报这两句里的一句。抛错的时候前面的角色已经停了，这一棵的解释器多半也已经停了（异常也可能出在它那一步），后面的角色还没碰；
+  输出里 `stopped` 列的是停完了的角色。处置：
+  1. 等几秒，取一次进程表，或者经同一条链再跑一次 `--inspect`：启动器和解释器都不在的角色，算停了。
+  2. 还整棵在着的，确认 killSwitch 在、supervisor 任务是停用的，再 `--stop` 一次。可能还要再来几次。
+  3. 取了进程表，`--inspect` 还是拒绝：还在着的树里形状不对的那一棵（启动器没了而解释器还在，或者 worker 下面挂着
+     别的东西），才走下面的人工那一支，只对它。那一棵处置完，其余完好的树再 `--inspect`、`--stop`，`--stop` 认得它们。
+  4. 最后以 `--inspect` 的"存活"为空作完成的标准。
+  5. 每一次被拒的原文都抄进 phase-f-log，每一次都保全进程表（理由见人工那一支的第一条）。
+
+  分不清是哪一种的，按停到一半处理——先取进程表。这样最坏也只是多核一遍，不会去手工结束本来再跑一次 `--stop` 就能停的
+  进程。
+
+**人工那一支**。身份核验没过，多半是 T215 把观察运行打成了核验不过的形状——启动器没了而解释器还在（§6.3 失效模式表
+第 9 行），或者终端挂在某个 worker 下面（第 10 行；`host.py` 只放过没有子进程的系统 conhost，别的后代一律照旧拒绝）。
+这时 §6.3 的停机序列在这一棵上走不下去。只处置这一棵；其余完好的树回到 `--inspect`、`--stop`：
+
+- **先保全现场**（D109）：进程表（PID、创建时刻、命令行、父 PID）、`instances.json`、`supervisor-state.json`、
+  `alerts.log`、退出标记，存 `<生产根>\archive\observe-<日期>\`，带 sha256 清单。拒绝的原文抄进 phase-f-log——`cd6fc4a`
+  那一版的拒绝只有一句原因，不带角色和 PID，所以进程表一定要保全。
+- **登记文件原样归档**。不清登记后满组重跑，不单杀启动器，不按历史 `pids.txt` 杀进程——§3"进程重启/停止"里的三条
+  禁令照旧。
+- **主会话人工逐个核对身份之后才处置**。每个进程的 PID、创建时刻（和登记里的相差不超过 1 秒）、命令行（脚本和全部
+  参数同登记里的一样）、父进程链，逐项对得上才算认出来；对不上的不结束，记下来。处置的顺序是子先父后：先解释器，
+  最后启动器。conhost 随它服务的进程自己退出，不用去结束它。
+- 终端挂在 worker 下面时先停 worker：旧代码的 worker 会在重连时把终端再拉起来，worker 都停了它才不会再拉。停完之后
+  终端是一个父 PID 已经不存在的进程。要不要重启它由主会话在维护窗里定——要重启，就请用户从桌面手动启动；或者等第 5 步
+  装好看护任务之后，停掉它让看护任务拉起（这一步看护任务还没装，现在停掉它没有人拉）。两种都是 D111 允许的方式，
+  新终端的父进程就不能再是工作进程。
+- 全过程写进 phase-f-log。
+
+**用户注销、远程桌面断开时各会发生什么**（施工计划 §3.1 第 3 条。登录类型是从安装命令读出来的；后果是按计划任务
+对 `Interactive` 的定义和代码推的，没有在这台机器上试过，也不要在窗口内试）：
+
+- 这一部署里的任务——supervisor、看护、一次性的载体任务、日报和周检、小时级存活检查——登录类型都是 `Interactive`
+  （只在用户登录时运行），跑在该用户的交互会话里。supervisor 和看护的运行级别是 `Highest`，由安装命令显式给出；日报和
+  周检是 `schtasks /Create` 建的，运行级别是缺省值。装完按 §6.3 那条命令把每个任务的 `Principal` 读一遍，以读到的为准。
+- **用户注销**：会话结束，会话里的进程全部结束——四个角色、终端、agent 桌面端自己。注销期间这些任务不再触发，持仓没有
+  任何进程管。重新登录之后，看护任务一分钟内把终端拉起来；supervisor 任务发现四棵树整棵缺失，把角色拉起（先写一条
+  halt，连续健康 5 分钟后自动解除）。**窗口内不得注销，不得让这个会话结束。**
+- **远程桌面断开而没有注销**：会话还在，只是断了连接；会话里的进程继续运行，`Interactive` 的任务照常触发。断开本身
+  不结束任何东西。要注意的是重连：11-17 10:43 用户侧的远程桌面重连之后一分多钟内，终端的算法交易开关被关、桌面端退出、
+  四个进程死亡，机理到 11-23 仍未查明（O23-7）。窗口内尽量不重连；重连之后立刻跑一次 §6.6 的存活检查。
+- 会话策略如果设了"断开多少分钟之后结束会话"，断开就等于注销。装任务之前只读地查一次，有这一项就请用户改掉。
+
+**部署记录要有的**（第二十二轮增补 §3 第 5 步，"包装脚本 sha256"一项换成"没有树外补丁"；加 D112 和施工计划 §3.1
+第 3 条的两项）：
+
+1. 候选的完整 SHA 恰好一个（40 位小写），一个显式的 UTC 完成时刻。D97：当日 12:00 UTC 之前写成。
+2. `instances.json` 里 4 个启动器 PID 逐字照录；解释器 PID 另列，注明口径（不算入锚点 PID）。
+3. 两份策略配置的 sha256；风控配置的路径、sha256 和 `daily_loss_cap_usd` 的值（500.0）；会话配置的 sha256。
+4. **没有树外补丁**：`host.py` 包装链已撤除，supervisor 走树内的 `scripts\ops\hidden_task.vbs` 和
+   `scripts\ops\supervisor_once.ps1`；两者的 sha256。
+5. 每个任务的登录类型、运行级别、所在会话，和动作的完整命令行——supervisor、看护、日报、周检、小时级存活检查、
+   一次性的载体任务。路径换成占位符，账户名不入库。载体任务的包装脚本（`<生产根>\start-demo.ps1`）的 sha256。
+6. `trade_allowed`、`tradeapi_disabled` 的实测值，终端的 PID 和父进程（父进程不能是工作进程），终端 build、
+   MetaTrader5 包的版本——维护窗内、业务进程启动之前读的那一次（第 4 步）。
+7. 核对结果：四个启动器的父进程链是计划任务的宿主；风控的 `--config` 是 `risk.toml`；交互桌面上没有弹窗；没有残留的
+   工作区路径（第 9 步）。
+8. 三个数据任务已停用状态下注销，导出留底于 `<生产根>\archive\tasks-<日期>\`。起算前提第 12 条写的是"停用"，没有任何
+   工具去查计划任务，这一条以后只能靠这一行记录来核。
+9. 演练 A、B、C 和宿主退出演练的结果——各自做完之后补记。
+
+**与施工计划的出入**。施工计划 §4 把演练 A、B、C 和宿主退出演练都排在 PaperSoak 阶段，并且都要看到 supervisor。但
+supervisor 只接受 Demo 模式的登记（`scripts\live_supervisor.py` 的 `_registered_trees`，本节开头第 1 件事），PaperSoak 下
+`demo_run.ps1` 也不收 `-DeploymentSha`。所以演练 A、演练 B、带 supervisor 的演练 C 和宿主退出演练（四角色、supervisor、
+终端）都在 Demo 部署之后、烧机期内、紧接 supervisor 任务装好之后做（第 8 步第 5 项）；PaperSoak 阶段只做演练 C 里不
+需要 supervisor 的那部分，作为早期检查（第 6 步）。用户一共关两次桌面端：T215 一次（§6.7），Demo 段的宿主退出演练一次。
 
 ## 7. 执行方分工（D63/D64，2026-11-07 第十六轮生效）
 
