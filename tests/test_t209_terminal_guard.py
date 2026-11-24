@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import time
+import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -71,8 +72,11 @@ def test_same_image_allows_for_case_and_separators_only():
 
 
 def test_the_probe_looks_for_the_file_name_as_spelled_and_as_resolved(monkeypatch, tmp_path):
-    """A path spelled with an 8.3 short name (TERMIN~1.EXE) is listed in the process table under
-    its long name: the name filter must look for both."""
+    """The configuration may spell the terminal's file with an 8.3 short name (TERMIN~1.EXE) while
+    the process table lists the name it was started under (terminal64.exe): the name filter must
+    look for the name as spelled and for the resolved one. The other direction -- a terminal that
+    was started through its short name -- is recognised by neither the probe nor the keeper; the
+    runbook says not to start it that way."""
     from mt5gw import terminal
 
     assert terminal._candidate_names(r"C:\MT5\terminal64.exe") == ["terminal64.exe"]
@@ -127,8 +131,22 @@ def test_probe_stays_inside_the_process_and_touches_no_terminal_api():
     assert not called & {"Popen", "system", "run", "check_output", "initialize"}, called
 
 
+def test_the_real_terminal_package_cannot_be_loaded_by_a_test(monkeypatch):
+    """tests/conftest.py 的守卫：装着真实 MetaTrader5 包的机器上，import 它的测试直接失败，
+    不是 skip（pytest.importorskip 只接 ImportError）。替身靠 sys.modules 或 mt5_module= 注入，
+    不走到这里。"""
+    import importlib
+    import importlib.machinery
+    if importlib.machinery.PathFinder.find_spec("MetaTrader5") is None:
+        pytest.skip("this machine has no real MetaTrader5 package to refuse")
+    monkeypatch.delitem(sys.modules, "MetaTrader5", raising=False)
+    with pytest.raises(RuntimeError, match="MetaTrader5"):
+        importlib.import_module("MetaTrader5")
+    assert "MetaTrader5" not in sys.modules                 # a refused import leaves no half-made module
+
+
 def test_no_test_builds_a_connection_without_saying_where_mt5_and_the_terminal_come_from():
-    """Three ways a test can pass only on a machine that happens to have a terminal64.exe running:
+    """Four ways a test can pass only on a machine that happens to have a terminal64.exe running:
 
     - In a child process: the suite's stand-in for the terminal probe cannot reach it, so a
       connection built in `sys.executable` source must pass `terminal_running=` (CI #389, shard 2:
@@ -137,20 +155,23 @@ def test_no_test_builds_a_connection_without_saying_where_mt5_and_the_terminal_c
       real probe the same way and must set `TERMINAL_PROBE` itself (CI #401: the daily report's
       deadline test exited 3 instead of 75).
     - Anywhere: a connection built without `mt5_module=` imports the real package in the venv; a
-      connect() on it would reach a real terminal.
+      connect() on it would reach a real terminal. `MT5Gateway.from_config_file` included.
     """
     offenders = []
     for path in sorted((ROOT / "tests").glob("*.py")):
         text = path.read_text(encoding="utf-8")
         spawns_children = "sys.executable" in text and "subprocess" in text and path != Path(__file__)
-        for node in ast.walk(ast.parse(text)):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)   # other files' child-process sources
+            tree = ast.parse(text)
+        for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 func = node.func
                 name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
-                if name in ("MT5Connection", "MT5Gateway"):
+                if name in ("MT5Connection", "MT5Gateway", "from_config_file"):
                     segment = ast.get_source_segment(text, node) or ""
                     if "mt5_module=" not in segment:
-                        offenders.append(f"{path.name}:{node.lineno} built without mt5_module=")
+                        offenders.append(f"{path.name}:{node.lineno} {name} without mt5_module=")
             elif spawns_children and isinstance(node, ast.Constant) and isinstance(node.value, str):
                 source = node.value
                 lines = source.splitlines()
@@ -162,7 +183,9 @@ def test_no_test_builds_a_connection_without_saying_where_mt5_and_the_terminal_c
                 if "TERMINAL_PROBE" in source or "terminal_running" in source or "import" not in source:
                     continue
                 try:
-                    inner = ast.parse(source)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", SyntaxWarning)
+                        inner = ast.parse(source)
                 except SyntaxError:
                     continue
                 entry_scripts = ("live_daily_report.py", "live_runner.py", "risk_process.py", "live_reconcile.py")
@@ -450,6 +473,32 @@ def test_runner_waits_for_the_terminal_at_startup_without_a_fatal_halt(tmp_path,
     assert not (live / "halt.json").exists()
 
 
+def test_the_startup_wait_uses_one_heartbeat_writer_however_many_attempts(tmp_path, monkeypatch):
+    """启动等待无论试多少次，心跳写入器只建两个：等待用一个，主循环用一个。以前每试一次新建一个。"""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "lockshome"))
+    mod = load_script("live_runner.py")
+    t1 = datetime(2026, 10, 28, 10, 0, 7)
+    broker = FakeBroker("XAUUSD")
+    broker.set_bars("XAUUSD", "M1", bars_from_df(grid_bars(boundary_open(t1, tf_seconds=60),
+                                                           tf_seconds=60, last="up")))
+    broker.quote_time = t1
+    gw = _LateGateway(broker, failures=5)
+    monkeypatch.setattr("mt5gw.MT5Gateway.from_config_file", staticmethod(lambda p: gw))
+    monkeypatch.setattr(mod, "now_utc", lambda: t1)
+    real_writer, built = mod.HeartbeatWriter, []
+    monkeypatch.setattr(mod, "HeartbeatWriter", lambda *a, **k: built.append(1) or real_writer(*a, **k))
+    env = _real_mode_env(tmp_path)
+    live = Path(env["live_dir"])
+    write_role_heartbeat(str(live), "risk", interval=600.0, now=t1)
+    monkeypatch.setattr(time, "sleep", _sleeper(VirtClock(t1), stop_after=6))   # 五次等待 + 第一轮
+    rc = mod.main(["--config", env["config"], "--loop", "--no-spread-gate",
+                   "--risk-config", env["risk"], "--sessions-config", env["sessions"],
+                   "--gateway-config", _write(tmp_path / "gw.json", "{}"), "--poll-interval", "0.1"])
+    assert rc == 0 and gw.connect_calls == 6
+    assert kinds(live)[0] == "DISCONNECTED"                     # 确实经过了启动等待
+    assert built == [1, 1]
+
+
 def test_runner_exits_with_78_when_the_terminal_never_comes_at_startup(tmp_path, monkeypatch):
     """耗尽的路径：返回 78 之前释放临时锁、关闭网关；留下断线退出的标记，不写 halt。"""
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "lockshome"))
@@ -559,6 +608,53 @@ def test_the_real_gateway_has_terminal_info_and_the_watch_reads_both_fields_thro
     assert len(reads) == 3                                # once per decision round, nothing else
     assert kinds(tmp_path) == [ALERT_ALGO_TRADING_DISABLED]
     gw.shutdown()
+
+
+def test_a_gateway_without_terminal_info_trades_nothing_and_writes_no_heartbeat(tmp_path, monkeypatch, capsys):
+    """网关问不到算法交易开关时，运行器每轮停在"决策侧异常"分支：不决策、不下单、一轮完整心跳也不写，
+    自己不发告警、不写 halt、不退出。失败关闭靠的正是"不写心跳"——风控按心跳超时发现并停机（那不在
+    运行器进程里）。将来若让决策异常轮也写心跳，就成了心跳新鲜、不下单、不告警。
+    真实的 MT5Gateway 有 terminal_info()（上一条测试）；替身的基类也有，这里把它拿掉。"""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "lockshome"))
+    mod = load_script("live_runner.py")
+    t1 = datetime(2026, 10, 28, 10, 0, 7)
+    clock = {"now": t1}
+    broker = FakeBroker("XAUUSD")
+    broker.set_bars("XAUUSD", "M1", bars_from_df(grid_bars(boundary_open(t1, tf_seconds=60),
+                                                           tf_seconds=60, last="up")))
+    broker.quote_time = t1
+    gw = _LateGateway(broker)
+    gw._connected = True
+    monkeypatch.delattr(_DownGateway, "terminal_info", raising=False)
+    monkeypatch.setattr("mt5gw.MT5Gateway.from_config_file", staticmethod(lambda p: gw))
+    monkeypatch.setattr(mod, "now_utc", lambda: clock["now"])
+    decided = []
+    monkeypatch.setattr(mod.SignalRunner, "decide", lambda self: decided.append(1))
+    env = _real_mode_env(tmp_path)
+    live = Path(env["live_dir"])
+    write_role_heartbeat(str(live), "risk", interval=600.0, now=t1)
+    beat = live / f"heartbeat-{MAGIC}.json"
+    beat.write_text('{"sentinel": 1}', encoding="utf-8")       # 预置一份：运行器一轮也不该改写它
+    real_sleep, step = time.sleep, {"n": 0}
+
+    def fake_sleep(seconds):
+        step["n"] += 1
+        if step["n"] == 3:
+            raise KeyboardInterrupt
+        real_sleep(0)
+
+    monkeypatch.setattr(time, "sleep", fake_sleep)
+    rc = mod.main(["--config", env["config"], "--loop", "--no-spread-gate",
+                   "--risk-config", env["risk"], "--sessions-config", env["sessions"],
+                   "--gateway-config", _write(tmp_path / "gw.json", "{}"), "--poll-interval", "0.1"])
+    assert rc == 0                                             # 不退出
+    assert decided == []                                       # 不决策
+    assert broker.market_orders == []                          # 不下单
+    assert beat.read_text(encoding="utf-8") == '{"sentinel": 1}'   # 一轮完整心跳也不写
+    assert not (live / "halt.json").exists()
+    assert kinds(live) == []                                   # 自己不发告警
+    out = capsys.readouterr().out
+    assert "决策异常：AttributeError" in out and "loop_completed" not in out
 
 
 class _AlgoGateway(_LateGateway):
