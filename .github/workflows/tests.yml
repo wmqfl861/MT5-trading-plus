@@ -153,10 +153,11 @@ jobs:
             Where-Object { $_ -match '^(All checks passed!|Found \d+ errors?\.)' } |
             Select-Object -Last 1
           Write-Output "::notice title=lint::$summary"
-          # 失败时每处发现写成一条 error 注解（免鉴权可经 API 读到名单）
+          # 失败时每处发现写成一条 error 注解（免鉴权可经 API 读到名单）。
+          # concise 一行一处：规则类的形如 "路径:行:列: F401 …"，语法错误是 "路径:行:列: invalid-syntax: …"
           if ($code -ne 0) {
             Get-Content ruff-output.txt |
-              Where-Object { $_ -match ':\d+:\d+: [A-Z]+\d+ ' } |
+              Where-Object { $_ -match ':\d+:\d+: ([A-Z]+\d+ |invalid-syntax)' } |
               Select-Object -First 30 |
               ForEach-Object { Write-Output "::error title=ruff::$($_.Trim())" }
           }
