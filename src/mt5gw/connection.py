@@ -89,6 +89,11 @@ class MT5Connection:
         self._monotonic = monotonic
         self._reconnect_failures = 0
         self._next_reconnect_at = 0.0
+        # 最近一次到点重连失败的原因。退避窗口内抛断线时带上它（任务 L，2026-11-25）：调用方把异常
+        # 文字写进心跳的 last_error，存活检查靠其中的"MT5 终端进程不在"认出"连上之后终端没了"；
+        # 只在到点的那一轮带原因的话，窗口内的每一轮都看不出来。重连成功、退避清零时清掉。
+        # 写在 _attempt_reconnect 的锁内、读在锁外，同 _next_reconnect_at。
+        self._last_reconnect_reason = ""
 
     def _fatal_timeout(self, name: str, started: float, timeout: float):
         if not _FATAL_LOCK.acquire(blocking=False):
@@ -262,7 +267,8 @@ class MT5Connection:
         才用 initialize 重建 IPC，且带不超过期限的 MT5 timeout。
 
         成功 → 重置退避并返回 (True, "")；失败 → 推进退避计数、安排下次
-        到点，返回 (False, 供上抛/日志的原因文案)。
+        到点，留下这个原因（_last_reconnect_reason，退避窗口内抛断线时用），
+        返回 (False, 供上抛/日志的原因文案)。
         """
         try:
             with self._serialized("reconnect"):
@@ -273,6 +279,7 @@ class MT5Connection:
                             # 服务器已自行恢复：视为成功，重置退避。
                             self._reconnect_failures = 0
                             self._next_reconnect_at = 0.0
+                            self._last_reconnect_reason = ""
                             return True, ""
                         # 终端在线、交易服务器未连接——不调 initialize，
                         # 保持 _initialized 不变，等待终端自行重连，
@@ -288,6 +295,7 @@ class MT5Connection:
                     if self._terminal_ok():
                         self._reconnect_failures = 0
                         self._next_reconnect_at = 0.0
+                        self._last_reconnect_reason = ""
                         return True, ""
                     self._initialized = False
                     reason = f"终端已初始化但交易服务器未连接：{self.last_error()}"
@@ -299,6 +307,7 @@ class MT5Connection:
         delay = RECONNECT_BACKOFF_S[
             min(self._reconnect_failures - 1, len(RECONNECT_BACKOFF_S) - 1)]
         self._next_reconnect_at = self._monotonic() + delay
+        self._last_reconnect_reason = reason
         return False, reason
 
     def reconnect(self) -> bool:
@@ -320,9 +329,11 @@ class MT5Connection:
                 # T141：退避窗口内不再重复 initialize——立即如实抛断线，
                 # 调用方（执行器/运行器）按 blocked_broker_unavailable 降级。
                 wait = self._next_reconnect_at - self._monotonic()
+                # 任务 L：带上最近一次到点重连失败的原因（里面有"MT5 终端进程不在"和异常类名）；
+                # 还没有失败过时沿用 MT5 自己的 last_error。
                 raise NotConnectedError(
                     f"终端与交易服务器断开，重连退避中（约 {max(wait, 0.0):.0f} "
-                    f"秒后再试）：{self.last_error()}")
+                    f"秒后再试）：{self._last_reconnect_reason or self.last_error()}")
             ok, reason = self._attempt_reconnect()
             if not ok:
                 raise NotConnectedError(reason)
@@ -331,6 +342,7 @@ class MT5Connection:
             # 不必等到点的重连尝试才清零。
             self._reconnect_failures = 0
             self._next_reconnect_at = 0.0
+            self._last_reconnect_reason = ""
 
     def __enter__(self) -> "MT5Connection":
         self.connect()
