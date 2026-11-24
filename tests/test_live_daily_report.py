@@ -39,6 +39,11 @@ from tests.fakes_live import FakeBroker, FakeGateway, QuoteMarket
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# T213 评审 K1（2026-11-23）起，连终端的模式每一次尝试开始之前都判换日窗。这里注入一个
+# 落在窗内的固定时钟（DAY 次日 21:57 UTC；冬令时的窗是 21:55–23:00 UTC），测试不依赖
+# 真实时刻；心跳的时间戳也相对它来写（晚于它的心跳会判成 future）。
+NOW = datetime(2026, 11, 3, 21, 57, tzinfo=timezone.utc)
+
 MAGIC = 20261101
 MAGIC_B = 20261102
 SYMBOL = "XAUUSD"
@@ -77,7 +82,8 @@ def run_main(mod, tmp_path, *extra, gw=None) -> tuple[int, str]:
     reports = tmp_path / "reports"
     rc = mod.main(["--data-dir", str(tmp_path / "data"),
                    "--reports-dir", str(reports),
-                   "--date", DAY_ISO, *extra], gw=gw)
+                   "--date", DAY_ISO, *extra],
+                  gw=gw, clock=lambda: NOW, sleep=lambda seconds: None)
     out = reports / "live" / f"daily-{DAY_ISO}.md"
     text = out.read_text(encoding="utf-8") if out.exists() else ""
     return rc, text
@@ -90,9 +96,8 @@ def test_report_key_lines_heartbeat_deals_alerts(tmp_path):
     mod = load_script("live_daily_report")
     live = tmp_path / "data" / "live"
     live.mkdir(parents=True)
-    now = datetime.now(timezone.utc)
-    write_magic_heartbeat(str(live), MAGIC, ts=now)
-    write_magic_heartbeat(str(live), MAGIC_B, ts=now)
+    write_magic_heartbeat(str(live), MAGIC, ts=NOW)
+    write_magic_heartbeat(str(live), MAGIC_B, ts=NOW)
     append_alert(str(live), "RISK_FLATTEN", "日亏全平", now=datetime(2026, 11, 2, 9, 30))
     append_alert(str(live), "RISK_HALT", "前一日告警", now=datetime(2026, 11, 1, 9, 0))
 
@@ -120,7 +125,7 @@ def test_report_heartbeat_abnormal_line(tmp_path):
     live = tmp_path / "data" / "live"
     live.mkdir(parents=True)
     write_magic_heartbeat(str(live), MAGIC,
-                          ts=datetime.now(timezone.utc) - timedelta(seconds=300))
+                          ts=NOW - timedelta(seconds=300))
     rc, text = run_main(mod, tmp_path, gw=FakeGateway(FakeBroker()))
     assert rc == 0
     assert "timeout" in text and "**异常" in text
@@ -143,8 +148,7 @@ def test_report_reads_paper_state(tmp_path):
     opened = paper.market_order(SYMBOL, "buy", 0.1, magic=MAGIC)   # 买按 Ask 100.2
     market.set_quote(101.0, 101.2)
     paper.close_position(opened.order_ticket)                     # 平按 Bid 101.0
-    write_magic_heartbeat(str(data / "live"), MAGIC,
-                          ts=datetime.now(timezone.utc))
+    write_magic_heartbeat(str(data / "live"), MAGIC, ts=NOW)
 
     rc, text = run_main(mod, tmp_path, "--paper-state", str(paper_dir))
     assert rc == 0

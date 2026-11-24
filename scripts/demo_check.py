@@ -621,6 +621,12 @@ FORMAL_DRILL_ALERTS = frozenset({"RISK_HALT", "RISK_FLATTEN", "HEARTBEAT_TIMEOUT
 # T191 记录类：只记录不判失败（降级时长另计，见 formal_recorded_degradation）
 FORMAL_RECORDED_ALERTS = frozenset({"DISCONNECTED", "ACCOUNT_UNAVAILABLE",
                                     "RECOVERABLE_FAILURE",
+                                    # T212（第二十三轮 §2.3）：git 没能回答，本轮不重启；
+                                    # 真正的身份或部署不符照旧是 SUPERVISOR_REFUSED（异常类）
+                                    "SUPERVISOR_DEFERRED",
+                                    # T213（第二十三轮 §2.4）：日报在重试之后仍未生成；
+                                    # 日报是否齐全照旧由正式检查原有的规则判
+                                    "DAILY_REPORT_FAILED",
                                     # T209：终端恢复允许算法交易（关闭时的告警是异常类）
                                     "ALGO_TRADING_RESTORED"})
 # T191 无效证据类：窗口内出现即 FormalInvalid

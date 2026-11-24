@@ -18,7 +18,9 @@
 ## 1. 启动（第 0 天）
 
 ```powershell
-# 一次性：在维护窗口显式指定模式安装每日/每周计划任务
+# 一次性：在维护窗口显式指定模式安装每日/每周计划任务。
+# 部署树与运行目录分离时，解释器和各目录要用参数显式给出（T213，见 §6.3.1）；
+# 任务命令要用的文件不在，或路径里有包装器写不了的字符时，脚本拒绝安装（见 §6.3.1）。
 powershell -ExecutionPolicy Bypass -File scripts\setup_scheduled_tasks.ps1 -Mode Demo
 
 # 影子盘延长观察（PaperSoak；示例配置 demo-configs\MA-XAUUSD-M15.toml）
@@ -116,6 +118,67 @@ type data\logs\task_live_daily_report.log      # 任务输出（排查用）
   `demo_check --summary` 全周汇总，落 `data\demo\weekly-check.md`（覆盖写）；
   平时手动：`.venv/Scripts/python.exe scripts/demo_check.py --summary`。
 
+### 2a. 链路基线（T218，第二十三轮；只读）
+
+```powershell
+# 一个 UTC 日（不给 --date：取 UTC 的前一天，不是本地日历的前一天）
+.venv/Scripts/python.exe scripts/ops/link_baseline.py --terminal-log-dir <终端数据目录>\logs --date 2026-11-24 --format table
+# 连续几天（一次最多 63 天）；表格只有计数和秒数，可以直接抄进 phase-f-log
+.venv/Scripts/python.exe scripts/ops/link_baseline.py --terminal-log-dir <终端数据目录>\logs --from 2026-11-24 --to 2026-11-28 --format table
+```
+
+- 只读终端日志文件和系统日志（DNS-Client 1014），不 import MetaTrader5、不连接
+  终端。输出不含账号、服务器名、接入点、IP、本机路径。
+- 读的是交易终端数据目录下的 `logs`。终端日志会被终端清理（保留多少天没有
+  核实），所以要留副本：每个本地日期过完之后（本地第二天），把那一天的
+  `YYYYMMDD.log` 复制到 `data\ops-evidence\` 下（不入库）。**副本要从前一个本地
+  日期开始留，最后一天之后再多留一个本地日期**：一个 UTC 日（本地 08:00 到次日
+  08:00）跨两个本地日期的文件，少一个就出不完整。
+- **怎么跑**：5 个交易日过完后，用留存的副本一次跑 `--from … --to …`，并给
+  `--calendar`。不要每天跑"昨天"：一个 UTC 日要等它结束、终端写下新日志之后才出
+  得完整，结果会随运行时刻变。
+- 一个 UTC 日**计入基线**（`baseline_day`）要同时满足：
+  - 给了日历，这一天是交易日，并且判定会用到的日子日历都覆盖到——就是这一天，
+    有中断从前一天延续进来或延续到后一天时，还有那两天（没覆盖到的按工作日算，
+    偏严，但这一天不计入）；
+  - 日志接得上：当天开始之前和当天结束之后都有日志行（没被截断）——这说的是
+    日志没缺，不是"全天都有日志"；
+  - 终端全程在：相邻两条日志行相隔不到 7 小时（终端在线时约每 6 小时写一条扫描
+    行；这个阈值只有 7 天样本，可以用 `--absent-gap-s` 调）；
+  - 没有让窗口失败的中断；没有到数据末尾仍未恢复的中断；
+  - `near_breach_segments` 和 `tails_into_trading_day` 都是 0；
+  - 当天的日志里至多一个账号（`accounts_seen` 不大于 1）；
+  - 不在"读不了的日志"的影子里（见下面退出码一条）。
+  连续 5 个交易日都计入才起算（D116）；任何一天 `would_fail_window` 为真就不起算。
+  后面几条取偏严：这些情形窗口可能失败、中断可能被交叉配对，脚本不下结论，这一天
+  不计入，要人逐条看。表格的"基线"一栏在不计入时写出原因：先看别的栏（窗口失败、
+  终端不在、数据不全……），那些都没问题时才写属于日历和账号的那一种。
+- 窗口判据与 `demo_check.py` 一致、不放宽，**每一天单独判**：中断开始后第 900 秒
+  还没恢复、那一刻是交易日，记失败；中断跨进后面的交易日，落在交易日里满 900 秒
+  按失败计。前一天晚上断线、次日恢复的，两天都不合格。
+  `near_breach_segments` 是离 900 秒不到一分钟就恢复的段（终端日志和进程的计时
+  起点相差约一分钟，窗口里可能已经触发了 78）；`tails_into_trading_day` 是零点前
+  开始、进了交易日不足 900 秒就恢复的尾巴。
+- 日历：`--calendar` 给正式检查的日历 JSON（`days: [{date, trading}]`）或日历源
+  文件（每行 `YYYY-MM-DD weekday|weekend|holiday [理由]`）。不给日历的日子一律不
+  计入。给了日历而日历没覆盖到的日子按周一至周五算（把节假日当交易日，偏严），
+  缺的日期列在 `calendar_missing_days` 里（只列会影响到这一天判定的前后三天），
+  这样的日子同样不计入。记 11-24 起的 5 个交易日时，日历要把 D83 的节假日
+  （11-26、11-27）标成休市。
+- 一段跨日的中断在两天里各出现一次（开始那天算整段，延续的那天只算落在当天的
+  部分，记为"延续"）：段数和合计秒数跨日相加会重复，不要跨日求和。
+- 退出码：0 出了统计；3 有日子出不了统计（`no_terminal_log`、`log_unreadable`、
+  `log_dir_unreadable`，stdout 一行 JSON）；2 参数错误。退出码 3 的日子一律按
+  不计入处理，不要当成"没有断线"。原因是 `log_unreadable` 的，**把那个文件重新复制
+  后重跑**。不修的话多半凑不满：读不了的文件里可能记着一段延续到次日的中断，脚本
+  把从它覆盖的时段起、到其后第一条 `authorized` 为止的日子都判成不计入
+  （`uncertain_due_to_unreadable`，表格的"窗口判据"写"不确定"）；连接很稳时终端不写
+  `authorized`，这段"不知道"会一直延伸到数据末尾。
+- 退出码 3、`terminal_absent` 为 null（当天的日志缺了一个本地日期）、`dns_timeouts`
+  为 null（系统日志不覆盖那一整天）都是"不知道"，不是"没问题"。
+- 已知限制：进程的计时起点和终端日志的 lost 时刻相差约一分钟；终端日志的时钟
+  按固定偏移换算（`--log-utc-offset-hours`，默认 8），换主机或换时区后要改。
+
 ## 3. 常见问题（恢复原则：只移除停机信号；仅重启已确认退出的进程）
 
 **killSwitch 一键停机后恢复**（演练项，预期会触发一次）：
@@ -140,24 +203,30 @@ Remove-Item data\live\killSwitch, data\live\halt.json -ErrorAction SilentlyConti
 确认整树及数据状态后迁移，不能自动补起。
 
 **日报缺失/内容异常排查**（`data\reports\live\daily-*.md` 没生成）：
-1. `type data\logs\task_live_daily_report.log`——最常见：影子状态不可用
+0. 先看 `data\live\alerts.log` 里当天的 `DAILY_REPORT_FAILED`：消息按日写了实际尝试了几次、
+   没有尝试的原因，以及是哪一类失败、退出码是多少（T213，见 §6.3.1）。启动或重试的时刻不在
+   换日窗内（D82）时日报不连终端、退出码 3——手工补跑或者在窗外补跑任务都会这样。
+1. `type data\logs\task_live_report.log`——最常见：影子状态不可用
    （退出码 2，fail-closed 不落半截日报）→ 确认运行器活着、
    `data\live\paper\state-*.json` 存在且非空；
 2. 点差比对报 `model_sha256` 不一致 → 重跑 `scripts/build_cost_model.py`
-   重建 `data\costs/spread_model.json`（日报拒绝用被动过的模型）；
-3. 手动补跑（保持已生成 `scripts/task_live_daily_report.cmd` 中的模式和配置路径；首次生成前使用与安装器相同的配置选择顺序）。Demo：
+   重建 `data\costs\spread_model.json`（日报拒绝用被动过的模型）；
+3. 手动补跑。计划任务每次顺带补最近三天的日报，缺得更多的要逐天指定 `--date`。**Demo 模式
+   同样只能在换日窗内做**（要连终端，D82）；窗外运行不连接、退出码 3。保持已生成
+   `scripts/task_live_daily_report.cmd` 中的模式和配置路径；首次生成前使用与安装器相同的
+   配置选择顺序。Demo：
 ```powershell
 $gwConfig = @("config.json", "gateway.json") | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $gwConfig) { throw "缺少 Demo 网关配置" }
 .venv/Scripts/python.exe scripts/live_daily_report.py --date 2026-11-10 `
-    --demo --gw-config $gwConfig `
+    --demo --gw-config $gwConfig --sessions-config config\sessions.toml `
     --spread-model data\costs\spread_model.json --log-dir data\demo
 ```
 
-PaperSoak 离线补跑不需要网关配置，直接使用影子状态：
+PaperSoak 离线补跑不需要网关配置，也不连终端、不受换日窗限制，直接使用影子状态：
 ```powershell
 .venv/Scripts/python.exe scripts/live_daily_report.py --date 2026-11-10 `
-    --paper-state data\live\paper `
+    --paper-state data\live\paper --sessions-config config\sessions.toml `
     --spread-model data\costs\spread_model.json --log-dir data\demo
 ```
 
@@ -256,7 +325,7 @@ Calendar = {
   无法证明或发现，因此历史未核实/A5 未评估始终不变。
 
 #
-**部署核对单（T180 评审 F-8）**：①部署记录里只能出现**恰好一个**完整 SHA（写"从 8a80503 升级到 <新SHA>"含两个 SHA 会被生成器拒绝）；②留存步骤在 skipped_alive_runners（有存活进程未全量启动）时照样成功，但该 run 永不能作锚点——**部署必须先整树停机再启动**。
+**部署核对单（T180 评审 F-8）**：①部署记录里只能出现**恰好一个**完整 SHA（写"从 8a80503 升级到 <新SHA>"含两个 SHA 会被生成器拒绝）；②留存步骤在 skipped_alive_runners（有存活进程未全量启动）时照样成功，但该 run 永不能作锚点——**部署必须先整树停机再启动**；③装了计划任务的，把安装脚本最后打印的 `TASK_PARAMETERS` 行抄进部署记录（T213）。这一行里是本机的绝对路径、任务名和两个时刻字段（`daily_report.local_time`、`weekly_check.utc`）；**抄进之前把路径换成占位符**（`<部署树>` 等），本机路径不入库。
 
 ### 4.1.1 运行时自动留存的工件与描述符生成器（T180）
 
@@ -568,6 +637,37 @@ PID 创建时间不符、未知子进程或缺 launcher 但 worker 仍活着的�
 `demo_run.ps1` 的 `Start-Process -WindowStyle Hidden`）在 `tests/test_t110_supervisor.py` 里，都先断言快照里
 确实有以该角色为父的 conhost，否则按失败处理并打印进程树。
 
+**"无法判定"不是拒绝（T212，2026-11-23）**：核验部署时 git 超时或起不来，这一轮记为无法判定——发
+`SUPERVISOR_DEFERRED`（记录类），不重启任何角色。只读的进程树和心跳检查照常：四个角色都健康就不写 halt；
+有角色缺失或失活照旧写 halt，重启留到核验成功的那一轮。无法判定期间也不解除已有的 halt。SHA 不符、工作树
+不干净、非 Demo 配置照旧是拒绝。角色缺失或失活、而部署不干净要到重启前的完整核验才发现时，halt 的原因是
+`risk_lost` 或 `component_lost`，"不干净"这个原因写在 `SUPERVISOR_REFUSED` 告警和 `supervisor-state.json` 的
+`last_refusal` 里。
+
+计数与升级：一轮里只要有一次核验无法判定——本轮开头那一次，或者重启前的完整核验——这一轮就计一次；连续
+三轮无法判定，第三轮升级为拒绝（发 `SUPERVISOR_REFUSED`，异常类）。`supervisor-state.json` 的
+`undeterminable` 记这个连续轮数：沿用缓存的"干净"结论本身既不计数也不清零，只有整轮都没有出现无法判定
+才归零。升级时如果还没有 halt，写 halt `supervisor_refused`；已经有 halt（不论是 supervisor 早先或这一轮
+写的，还是别的进程写的），保留它原有的原因、owner 和 token，不改写成 `supervisor_refused`。升级之后计数
+从 1 重新开始：git 一直不回答时，告警按"推迟、推迟、拒绝"每三轮循环一次，其中拒绝是异常类。
+
+开销与缓存：SHA 和 detached 状态每轮都查。`.git/HEAD` 的内容和索引文件的大小、修改时间都没变时，沿用上次
+"干净"的结论（链接工作树按 `.git` 文件里的 `gitdir:` 找到真正的 git 目录），不需要重启的轮次里完整的
+`git status` 至多 15 分钟一次。**要重启任何角色的那一轮，先做一次完整核验，不用缓存**。
+
+缓存的盲区：上一次完整核验之后的 15 分钟内，新增的未跟踪文件、已跟踪文件的未提交改动（包括删除）都不会被
+发现；要到下一次完整核验才发现，届时按拒绝处理（发 `SUPERVISOR_REFUSED`，之前没有 halt 时写
+halt `supervisor_refused`）。`git add` 会改写索引，指纹随之改变，下一轮就做完整核验并发现。这段时间里，
+已有 halt 的自动解除沿用的是缓存的"干净"结论。重启不受这个盲区影响：要重启角色的那一轮一定先做完整
+核验，部署不干净就拒绝，不重启。
+
+git 和 powershell 都按绝对路径调用。git 找不到按无法判定处理。powershell 找不到是**拒绝**：没有进程清点
+就不知道各角色是否健康，按拒绝处理才稳妥（发 `SUPERVISOR_REFUSED`，之前没有 halt 时写 halt
+`supervisor_refused`）。
+
+以上各段写于 2026-11-23；其中计数与升级的口径、缓存的盲区、powershell 找不到的处理，是同日独立评审
+（`docs/reviews/2026-11-23-t212-review.md`）之后修订的。
+
 **安装方式**：T211 合入后直接指向部署树的 `live_supervisor.py`，用下面的注册命令。11-19 到 11-23 用的树外
 `host.py` 包装是临时补丁，随新候选部署时撤除；留档见 `docs/ops/ops-patches/2026-11-19/`。撤除之前，
 生产上的观察运行继续用包装链，不对它热改。
@@ -621,6 +721,74 @@ halt、风险 halt 从不自动删除。若 supervisor halt 已存在时又触�
 核对原因、确认风险消除后移除，不可为恢复自动开仓直接删它。
 **清除 halt 时要一并核对 `halt-risk-veto.json`**：它留着，supervisor 以后写的任何 halt 都不会
 自动解除（`supervisor-state.json` 里出现 `clear_blocked`）；11-23 实测因此停了 3 小时 24 分。
+
+### 6.3.1 日报与周检任务的安装和运行（T213）
+
+**安装**：部署树是纯检出，没有 `.venv`，也不放运行数据。`setup_scheduled_tasks.ps1`
+从部署树运行，解释器和各目录用参数显式给出，与 `demo_run.ps1` 的部署参数逐项一致
+（变量沿用 §6.2，都给绝对路径：相对路径按启动安装脚本的那个进程的当前目录解析，既不是
+PowerShell 的当前位置，也不是部署树。会话配置用运行器同一个 `$sessions`——日报的换日窗
+必须和运行器同一个定义源）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "$deploy\scripts\setup_scheduled_tasks.ps1" `
+  -Mode Demo -PythonExe $python -GatewayConfig $gateway `
+  -DataDir $data -RunnerLogDir $logs -ReportsDir "$data\reports" `
+  -SpreadModel $spread -SessionsConfig $sessions
+```
+
+不给的参数沿用部署树下的旧位置。安装之前先核对任务命令要用的文件都在：解释器、会话配置、
+点差模型，Demo 模式还有网关配置（部署树下的 `config.json`、`gateway.json` 或
+`-GatewayConfig`）。缺哪一项就拒绝安装并说明缺什么，**不建目录、不写包装器、不建任务**。
+不带 `-IncludeDataTasks`（D82）。
+
+两份包装器（`.cmd`）由 cmd.exe 按控制台代码页读取，新开控制台的缺省值是系统 OEM 代码页。
+安装脚本在建目录之前读出系统的 ANSI 和 OEM 两个代码页，分两种情形，都在建目录、建任务之前
+判断：
+
+- 两个代码页相同：包装器按这个代码页写；任何路径里有它表示不了的字符，就拒绝安装并说明是
+  哪个路径。
+- 两个代码页不同：这台机器上带非 ASCII 字符的路径装出来的任务跑不起来，脚本不去猜哪种编码
+  对 cmd 有效——路径里只要有一个非 ASCII 字符就拒绝安装；纯 ASCII 路径照常安装。
+
+生产根目录的名字建议只用 ASCII 字符。
+
+安装脚本最后打印一行 `TASK_PARAMETERS {…}`，抄进部署记录（§4 部署核对单第③条；抄之前路径
+要换成占位符）。
+
+11-17 到 11-23 的教训：任务命令写的是部署树里不存在的 `.venv\Scripts\python.exe`，日报和
+周检每次都以 rc=1 失败（`The system cannot find the path specified.`），Python 根本没有启动。
+
+**日报的运行**（`live_daily_report.py`）：
+
+- `--date` 当天总是重新生成；顺带检查它之前两天的日报（`--backfill-days`，默认 3），
+  缺哪天补哪天，已有的不覆盖。补生成的日报写实际的生成时刻；它的"账户""心跳"两行也是
+  生成时刻的快照，不是所报告那一天的情况，正文里没有另外的标注。
+- **每一次尝试开始之前都判换日窗**，每个目标日的第一次尝试和补生成的日子都一样：开始的
+  时刻不在窗内就不连接，那一天的日报记为未生成（D82）。窗的定义源是 `--sessions-config`
+  （`sessions.toml`），不给就用 `SessionPolicy` 的缺省窗。`--paper-state` 只读影子状态、
+  不连终端，不受此限。用法和配置问题在判窗之前报告，所以窗外运行也照常看得到。
+- 连接失败或取数失败时重试，至多 3 次（`--attempts`），间隔 300 秒（`--retry-interval-s`）。
+  重试按它真正开始的时刻判窗：睡醒之后已在窗外，就不睡、不再试。
+- **夏令时不重试，这是已知的限制**。换日窗全年的交集只有本机 05:55–06:00：冬令时窗到
+  07:00，05:57 启动可以做满 3 次（05:57、06:02、06:07）；夏令时窗到 06:00，05:57 启动后距
+  关窗只剩 3 分钟，放不下间隔 5 分钟的第二次，只尝试 1 次。逐日核对 2026-11-01 至
+  2027-10-31：冬令时 133 天都能做满 3 次，夏令时 232 天只有 1 次——**每年约 232 天脚本内
+  不重试**，当天失败要等到次日 05:57 补生成。第二十三轮施工计划 §2.4 第 2 条写的"共 3 次、
+  间隔 5 分钟、都在换日窗内"，在夏令时只有"都在换日窗内"成立（间隔仍是 5 分钟，但用不上），
+  这一条只算部分完成。固定的任务时刻下三者不能同时满足；实现保持保守方案（以 D82 为准，
+  任务时刻和间隔都不改）。不改任务时刻、不放宽 D82 而要全年做满 3 次，只能把间隔缩到
+  89 秒以内（例如 60 秒），那要另行决定。
+- 一次运行结束时有日报没生成：发一条 `DAILY_REPORT_FAILED` 告警（记录类），退出码 3。
+  告警按日写实际尝试的次数，没有尝试的写原因（换日窗外）。**其他失败也发这一种告警**，
+  每次运行最多一条，消息里写明是哪一类和退出码：配置或用法错误（点差模型坏了、会话配置
+  缺失或读不了、缺网关配置、账户不是 Demo；退出码 2，不重试）；未预期异常和日报写盘失败
+  （退出码 1，照旧带回溯）；网关期限（退出码 75，进程由网关直接结束，告警在它退出之前
+  写）。`live` 目录不存在时不写告警，也不为写告警建目录。日报是否齐全照旧由正式检查原有
+  的规则判。
+- 网关期限（退出码 75）时，网关把标记文件 `gateway-stall.json`、`exit-gateway.json` 写到
+  当前目录的 `data\live` 下。日报包装器先 `cd` 到部署树，没有设 `MT5_LIVE_DIR`，所以部署树
+  和数据目录分开时，这两个文件落在部署树的 `data\live`，不在 `-DataDir` 里。
 
 ### 6.4 验收与部署边界
 
