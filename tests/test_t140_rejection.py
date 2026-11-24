@@ -29,6 +29,7 @@ from mt5gw.errors import (
     TradeRejectedError,
     describe_retcode,
 )
+from tests.fakes_live import FakeTerminalInfo
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MAGIC = 777
@@ -308,6 +309,9 @@ def _wire_gateway(monkeypatch, mod, broker, now):
 
         def connect(self):
             pass
+
+        def terminal_info(self):
+            return FakeTerminalInfo()                # T209：运行器每个决策轮读一次；替身的终端允许算法交易
 
         def shutdown(self):
             pass

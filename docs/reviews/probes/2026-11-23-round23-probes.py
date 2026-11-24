@@ -154,7 +154,15 @@ def p23_2() -> None:
             return {"symbol": symbol}
 
     fake = FakeMT5()
-    conn = MT5Connection(GatewayConfig(), mt5_module=fake)
+    # T209 之后网关在 initialize 之前先查终端进程在不在
+    # （mt5gw.terminal.terminal_running，可注入）。这里把探针接到替身的
+    # terminal_alive 上：替身里终端"退出"后，探针必须报不在。T209 之前的
+    # MT5Connection 没有这个参数，退回原来的构造，探针在旧代码上照常复现。
+    try:
+        conn = MT5Connection(GatewayConfig(), mt5_module=fake,
+                             terminal_running=lambda path: fake.terminal_alive)
+    except TypeError:
+        conn = MT5Connection(GatewayConfig(), mt5_module=fake)
     try:
         conn.connect()
     except NotConnectedError:

@@ -91,6 +91,7 @@ from mt5live.gate import LiveSizer, RiskGate, load_contract_sizes  # noqa: E402
 from mt5live.paper import PAPER_STATE_DIR_RELPATH, PAPER_STATE_RELPATH, \
     BarQuoteMarket, PaperAccountView, PaperBroker, paper_state_path  # noqa: E402（T34 影子券商）
 from mt5live.riskproc import RiskConfigError, RiskProcess, load_risk_config  # noqa: E402
+from mt5live.terminal_guard import AlgoTradingWatch, wait_for_gateway  # noqa: E402（T209）
 from mt5live.runner import (  # noqa: E402
     HeartbeatWriter,
     MagicInstanceLock,
@@ -773,7 +774,21 @@ def _run(args, cfg: LiveConfig, strategy) -> int:
 
         gw = MT5Gateway.from_config_file(
             find_gateway_config(args.gateway_config))
-        gw.connect()
+        # T209：启动时交易终端可能还没起来（全灭之后由看护任务拉起）。按断线处理：
+        # 每轮写心跳、有 DISCONNECTED 段，连续 15 分钟以 78 退出；不写 fatal halt。
+        # 心跳写入器只建一个：它的连续失败计数要跨多次写入累计，写不进去时才发得出告警。
+        waiting_writer = HeartbeatWriter(heartbeat, config=cfg, alert_dir=live_dir)
+        rc = wait_for_gateway(
+            gw, live_dir, f"runner-{cfg.magic}",
+            lambda: waiting_writer.write(error="waiting_for_terminal"),
+            retry_s=args.poll_interval)
+        if rc is not None:
+            for held in (temp_lock, lock):
+                if held is not None:
+                    held.release()
+            temp_lock = lock = None
+            gw.shutdown()
+            return rc
         if not args.dry_run and not args.paper:
             # H2-01（1C，R6）：连接后升级身份锁（server|login|magic）——
             # 不同数据目录的同账户同 magic 在此互斥；拿不到即拒绝启动。
@@ -925,6 +940,11 @@ def _run(args, cfg: LiveConfig, strategy) -> int:
     # T33/M1：心跳写入失败不退出（记日志下一轮重试，连续 3 次写告警）——
     # PermissionError 不再杀进程、随后心跳超时全局停机
     hb_writer = HeartbeatWriter(heartbeat, config=cfg, alert_dir=live_dir)
+    # T209：实跑模式每个决策轮读一次终端的算法交易开关（trade_allowed /
+    # tradeapi_disabled）。影子盘和干跑不下真实单，不检查。
+    algo = (AlgoTradingWatch(gw, live_dir)
+            if gw is not None and not args.paper and not args.dry_run and not args.offline
+            else None)
     try:
         skips_logged = runner.market_closed_skips
         while True:
@@ -933,6 +953,7 @@ def _run(args, cfg: LiveConfig, strategy) -> int:
             decision = None
             error = None
             cycle_complete = True
+            algo_blocked = False
             if paper is not None:
                 # T34：每轮先按实时 bid/ask 检查 SL/TP（触发即平、成交带
                 # reason），再进执行器轮——保护性出场同轮就被识别为
@@ -945,7 +966,10 @@ def _run(args, cfg: LiveConfig, strategy) -> int:
                               f"price={d.price} pnl={d.profit:+.2f}"
                               for d in protective), flush=True)
             try:
-                decision = runner.decide()
+                if algo is not None and not algo.allowed(now):
+                    algo_blocked = True     # T209：终端不允许算法交易——本轮不决策、不开仓
+                else:
+                    decision = runner.decide()
             except MarketClosedError:
                 pass   # 理论上 runner 已捕获；双保险不刷错误
             except NotConnectedError as exc:
@@ -974,7 +998,11 @@ def _run(args, cfg: LiveConfig, strategy) -> int:
                       f"bid={decision.quote_bid} ask={decision.quote_ask} "
                       f"atr={decision.atr} sl={decision.sl} tp={decision.tp}",
                       flush=True)
-            if executor is not None:
+            if executor is not None and algo_blocked:
+                # T209：不调用执行器（不开仓，也不发单）；心跳照写，恢复后下一轮照常。
+                error = "algo_trading_disabled: 终端不允许算法交易，本轮不开仓"
+                print(f"[{now.isoformat()}] {error}", flush=True)
+            elif executor is not None:
                 try:
                     rr = executor.poll(decision, now)
                 except TradeRejectedError as tre:
