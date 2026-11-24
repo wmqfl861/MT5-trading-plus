@@ -1348,15 +1348,16 @@ phase-f-log。
    # 打印的计划核对无误之后，同一条命令加 -Install。装完用 -Status -DataDir "<生产根>\data" 查
    ```
 
-   - 核对：打印的 `KEEPER_TASK_PARAMETERS` 里动作、主体（`Interactive`、`Highest`）、`-LogPath`（在
-     `<生产根>\data\ops-evidence\terminal_keeper\` 下）都对；终端运行着的时候，看护脚本自己的 `-DryRun` 输出 `running`。
-     装完等一两分钟：`-Status` 里 `state` 是 `Ready`、`last_task_result` 是 0，`KEEPER_STATE` 的 `outcome` 是 `running`、
-     `age_s` 只有一两分钟。
+   - 核对：打印的 `KEEPER_TASK_PARAMETERS` 里动作、主体（`Interactive`、`Highest`）、`-LogPath` 都对。`-LogPath` 所在的目录
+     就是看护状态文件所在的目录，在 `<生产根>\data\ops-evidence\` 下。这个目录的拼写这里不写死，以安装脚本打印的
+     `log_path` 为准，也别凭印象拼——第 8 步装小时任务时要拿它核对（见该步第 3 项）。终端运行着的时候，看护脚本自己的
+     `-DryRun` 输出 `running`。装完等一两分钟：`-Status` 里 `state` 是 `Ready`、`last_task_result` 是 0，`KEEPER_STATE`
+     的 `outcome` 是 `running`、`age_s` 只有一两分钟。
    - 终端本来不在：一两分钟内被拉起，新终端的父进程是看护的 PowerShell，不是 agent 会话，也不是任何 worker。拉起之后
      补做一次 `-DryRun`（必须输出 `running`），再回到第 4 步。
    - 出错了怎么办：安装脚本把不对的地方一次列全，有不对的就什么都没做，改了再跑。看护被拒绝（退出码 1）没有告警
      通道，只有任务的上次结果码，`-Status` 就是查它用的。
-6. **PaperSoak**（主会话；演练需要用户）。前提：第 3–5 步都做完了；看护任务在位。
+6. **PaperSoak**（主会话；不需要用户）。前提：第 3–5 步都做完了；看护任务在位。
    - **单独的数据目录** `<生产根>\data-paper\`。里面要有 `specs\latest.json`（脚本按数据目录找它）；策略配置、点差模型、
      风控和会话配置都用参数指向，和 Demo 共用同一批只读的文件。
    - 预检。不连终端——PaperSoak 没有网关预检；不带 `-DeploymentSha`，PaperSoak 拒收：
@@ -1382,13 +1383,12 @@ phase-f-log。
      不直接重试（D92）。`demo_run.ps1` 也不会在同一个数据目录里给 PaperSoak 补缺——登记还在，它以
      `verified-tree-required` 拒绝。
    - 至少一个完整交易日。每个交易日做一次日常档检查，结论写 phase-f-log。
-   - 这一段做的演练：
-     - **演练 C 里不需要 supervisor 的部分**：结束终端 → 看护任务两分钟内拉起终端 → 运行器自动恢复。PaperSoak 的两个
-       运行器连终端取行情，风控和对账读纸面状态、不连终端。取证按 §6.5 的验收段：用进程创建事件看 worker 的进程树里
-       有没有出现过 `terminal64.exe`。
-     - **宿主退出演练**（请用户关闭一次桌面端）：关闭前记下四个角色的启动器和解释器、终端的 PID、创建时刻、父进程链、
-       会话 ID，做法同 §6.7 第 4 步。30 分钟以上之后核对都活着、心跳连续、看护任务照常每分钟运行。结果入 phase-f-log。
-   - 演练 A、B 和带 supervisor 的演练排到第 8 步的末尾。
+   - 这一段只做一项演练，是早期检查，不需要用户——**演练 C 里不需要 supervisor 的那部分**：结束终端 → 看护任务两分钟内
+     拉起终端 → 没有任何 worker 的进程树里出现过 `terminal64.exe` → 运行器自己恢复。PaperSoak 的两个运行器连终端取
+     行情，风控和对账读纸面状态、不连终端。取证按 §6.5 的验收段：用进程创建事件看 worker 的进程树，不要只看 supervisor
+     有没有拒绝（这一段本来也没有 supervisor）。结果入 phase-f-log。
+   - 这一段不做宿主退出演练。演练 A、演练 B、带 supervisor 的演练 C 和宿主退出演练都在 Demo 部署之后做，见第 8 步
+     第 5 项。
 7. **Demo 烧机**（主会话）。
    - **停 PaperSoak**。PaperSoak 没有 `--stop` 可用（supervisor 和 `demo_run.ps1 -Stop` 都只认 Demo 的登记，见本节开头
      第 1 件事），只能人工停，顺序照 §6.3 的停机序列：
@@ -1398,6 +1398,7 @@ phase-f-log。
      3. 子先父后：先解释器，再启动器。每个进程结束之前再读一次创建时刻，和记下的一致才结束——用
         `Stop-Process -InputObject <那个进程对象>`，不要拿 PID 再找一遍。
      4. 再取一次进程表，核对这八个进程都不在。纸面仓位不平，随数据目录归档。
+     5. 全过程写进 phase-f-log：认出的八个进程各自的 PID、创建时刻、父进程链，结束的顺序和时刻，核对的结果。
    - **归档 PaperSoak 的数据目录**：复制到 `<生产根>\archive\data-paper-<日期>\`，数量和 sha256 清单对得上。原件不删，
      删除要用户确认。
    - **时点（D97）**：部署记录须在当日 12:00 UTC 前写成，赶不上就改到次日部署；从部署完成到当日 24:00 UTC 不少于
@@ -1425,13 +1426,26 @@ phase-f-log。
    2. **日报和周检**：§6.3.1 的命令，解释器和各目录用参数显式给出（`$deploy`、`$python`、`$gateway`、`$data`、
       `$logs`、`$spread`、`$sessions` 同上）。不给的参数沿用数据目录或者部署树下的旧位置，所以都给。安装脚本按名字覆盖
       旧任务，不用先注销；不带 `-IncludeDataTasks`。打印的 `TASK_PARAMETERS` 脱敏后抄进部署记录。
-   3. **小时级存活检查**（§6.6）：等 U10 定了渠道再装；装的时候带 `--expect-keeper`，全部用显式的绝对路径。
-   4. **三个数据任务**（`refresh_bars`、`refresh_ticks`、`snapshot_specs`）：不重装。它们的动作指着工作区，第 9 步要过，
-      就得在停用状态下注销，第 3 步导出的 XML 留着底；A5 之后在第二终端上重装（D82、T198）。
-   5. **PaperSoak 那一段做不了的演练在这里做**，supervisor 连续健康之后，每项的结果入 phase-f-log：演练 A（结束风控进程，
-      supervisor 拉起）；演练 B（结束一个运行器，supervisor 拉起）；演练 C 带 supervisor 的那一次核对（结束终端之后
-      supervisor 全程没有拒绝，`terminal64.exe` 没有出现在任何 worker 的进程树里）；宿主退出演练（请用户再关闭一次
-      桌面端：四角色、supervisor、终端存活 30 分钟以上，心跳连续）。
+   3. **小时级存活检查**（§6.6）：等 U10 定了渠道再装；装的时候带 `--expect-keeper`，全部用显式的绝对路径。装小时任务时
+      用 `-Status` 或计划输出核对存活检查读的就是看护状态文件所在的目录（第 5 步）：`--keeper-state` 显式给到那个目录
+      下的 `state.json`；手工跑一次存活检查（带 `--no-notify`），看护那几项不是 `keeper_absent`，而 `-Status` 的
+      `KEEPER_STATE` 是新鲜的。候选 `2a25802` 里存活检查的缺省路径是连字符的 `terminal-keeper`，安装脚本给看护的是
+      下划线的目录，两边对不上——不带 `--keeper-state` 就一直报看护任务没装。这是候选 `2a25802` 的已知缺陷；以后修没修，
+      都照这一句核。
+   4. **三个数据任务**（`refresh_bars`、`refresh_ticks`、`snapshot_specs`）：不重装，在停用状态下注销。依据是 D112——
+      计划任务的参数里不出现工作区路径，而它们的动作指着工作区。注销之前把这三个任务的 XML 导出留底，放进归档目录
+      `<生产根>\archive\tasks-<日期>\`（第 3 步第 1 项导出过一份；那之后任务有过改动就再导出一次，以注销前的那一份为准）。
+      A5 之后在第二终端上重装（D82、T198）。
+   5. **演练**。四项都在 Demo 部署之后、烧机期内，紧接 supervisor 任务装好、连续健康之后做；每项的结果入 phase-f-log：
+      - 演练 A：结束风控进程，supervisor 拉起。
+      - 演练 B：结束一个运行器，supervisor 拉起。
+      - 演练 C（带 supervisor 的那一次）：结束终端 → 看护任务两分钟内拉起 → 没有任何 worker 的进程树里出现过
+        `terminal64.exe` → 运行器自己恢复，supervisor 全程没有拒绝。
+      - 宿主退出演练（请用户关闭一次桌面端）：四角色、supervisor、终端存活 30 分钟以上，心跳连续。关闭前的记录和重开
+        后的核对，做法同 §6.7 第 4、6 步；supervisor 是每分钟触发的任务，它"活着"看 `supervisor-state.json` 的
+        `last_checked` 是不是每分钟都在更新。
+      这样排的依据：第二十一轮增补 §2 第 8 步本来就是装好 supervisor 之后做演练 A、B；§3 的烧机判据明写允许
+      "supervisor 演练造成的中断"和"演练产生的 supervisor 告警"。
 9. **核对没有残留的工作区路径，写部署记录**（主会话）。
    - 只读导出全部计划任务（`Export-ScheduledTask`），连同包装脚本的内容一起搜工作区的路径，应当一处都没有。搜的
      范围：任务的动词和参数；`<生产根>\` 下的包装脚本（`start-demo.ps1`、`start-paper.ps1`）；部署树里被任务调用的
@@ -1488,10 +1502,11 @@ phase-f-log。
    工作区路径（第 9 步）。
 8. 演练 A、B、C 和宿主退出演练的结果——各自做完之后补记。
 
-**与施工计划的出入**。施工计划 §4 把演练 A、B、C 和宿主退出演练都排在 PaperSoak 阶段，并且都要看到 supervisor。supervisor
-不认 PaperSoak 的登记（本节开头第 1 件事），所以演练 A、B、带 supervisor 的那次演练 C 和"supervisor 也存活"的宿主退出
-演练只能在 Demo 起来、supervisor 启用之后做，用户要多关闭一次桌面端。PaperSoak 阶段做的是演练 C 里不需要 supervisor 的
-部分，和"四角色加终端"的那一次宿主退出演练。
+**与施工计划的出入**。施工计划 §4 把演练 A、B、C 和宿主退出演练都排在 PaperSoak 阶段，并且都要看到 supervisor。但
+supervisor 只接受 Demo 模式的登记（`scripts\live_supervisor.py` 的 `_registered_trees`，本节开头第 1 件事），PaperSoak 下
+`demo_run.ps1` 也不收 `-DeploymentSha`。所以演练 A、演练 B、带 supervisor 的演练 C 和宿主退出演练（四角色、supervisor、
+终端）都在 Demo 部署之后、烧机期内、紧接 supervisor 任务装好之后做（第 8 步第 5 项）；PaperSoak 阶段只做演练 C 里不
+需要 supervisor 的那部分，作为早期检查（第 6 步）。用户一共关两次桌面端：T215 一次（§6.7），Demo 段的宿主退出演练一次。
 
 ## 7. 执行方分工（D63/D64，2026-11-07 第十六轮生效）
 
