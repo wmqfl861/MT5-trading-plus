@@ -72,9 +72,9 @@ def site(root, *, errors=None, started=None, heartbeat_age=None, alive=None):
 
 
 def keeper_state(root, record=None, *, text=None, age=30):
-    """看护脚本的状态文件：<数据目录>/ops-evidence/terminal-keeper/state.json（看护脚本的 -LogPath 所在
+    """看护脚本的状态文件：<数据目录>/ops-evidence/terminal_keeper/state.json（看护脚本的 -LogPath 所在
     目录）。record 是 None 且没有 text：文件不在。age 是 ts 距今多少秒（同时也是文件的修改时间）。"""
-    path = Path(root) / "data" / "ops-evidence" / "terminal-keeper" / "state.json"
+    path = Path(root) / "data" / "ops-evidence" / "terminal_keeper" / "state.json"
     if record is None and text is None:
         path.unlink(missing_ok=True)
         return path
