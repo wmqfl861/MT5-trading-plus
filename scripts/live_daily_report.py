@@ -287,23 +287,32 @@ def build_gw(paper_state: str | None, gw_config: str | None, live_dir: str,
     return gw, True
 
 
+def _shutdown_quietly(gw) -> None:
+    """关闭网关。关闭自己出错不上抛：调用方正要抛出的那个异常才是要紧的，不能被关闭的异常盖住
+    （定版前评审建议 S8）。关闭出错了打一行——类型和原文都在——调用方照常上抛原来的异常。"""
+    try:
+        gw.shutdown()
+    except Exception as error:
+        print(f"× 关闭网关时出错（原来的异常照常上抛）：{type(error).__name__}: {error}", flush=True)
+
+
 def _connect_demo_gateway(gw) -> None:
     """连接终端并核对 trade_mode=0。任何一步失败，都是先关闭网关再抛出。"""
     try:
         gw.connect()
     except Exception:
-        gw.shutdown()
+        _shutdown_quietly(gw)
         raise
     try:
         state = gw.account.state()
     except RETRYABLE_DATA_ERRORS as exc:
         # initialize 之后的第一笔取数取不到，和后面取数阶段的同类失败一样是取数失败
-        gw.shutdown()
+        _shutdown_quietly(gw)
         raise RetryableFailure(f"取数失败：{type(exc).__name__}: {exc}") from exc
     except BaseException:
         # 其余异常不重试，但同样先关闭网关再上抛（第二次复审 N1）：原来只接上面那几种，
         # 别的异常直接上抛，网关没有关闭（实测 initialize 1、shutdown 0）。
-        gw.shutdown()
+        _shutdown_quietly(gw)
         raise
     if state.trade_mode != 0:
         gw.shutdown()
@@ -550,10 +559,15 @@ def main(argv=None, *, gw=None, clock=None, sleep=None) -> int:
         raise
     if missing:
         if last_failure is None:
-            # 没有发生的失败时，缺的日子都是一次都没有尝试。整次运行一次都没开始，才说
-            # "没有一次尝试开始"；当天已生成、只有补生成日轮到时已在窗外的，另写一句
-            # （第二次复审 N4：原来这种情形也写"没有一次尝试开始"）。
-            if len(missing) == len(todo):
+            if not all(m.attempts == 0 for m in missing):
+                # 试过、却没有记下失败的只有一种：重试醒来的时刻判在窗内，真正开始时已在窗外
+                # （定版前评审 E1：原来按"缺的天数等于目标天数"判，这一天自己就前后矛盾——
+                # 逐日那一句写"已尝试 1 次"，尾句写"没有一次尝试开始"）。
+                reason = "有过尝试、没有记下失败：重试醒来时已落在换日窗外，没有再试"
+            elif len(missing) == len(todo):
+                # 一次都没有尝试的，整次运行也一次都没开始，才说"没有一次尝试开始"；当天
+                # 已生成、只有补生成日轮到时已在窗外的，另写一句（第二次复审 N4：原来这种
+                # 情形也写"没有一次尝试开始"）。
                 reason = "没有一次尝试开始：都不在换日窗内"
             else:
                 reason = "未生成的日子一次都没有尝试：轮到它们时不在换日窗内"

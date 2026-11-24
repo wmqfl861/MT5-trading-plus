@@ -583,3 +583,72 @@ def test_report_path_matches_where_the_report_is_written(tmp_path):
     rc, out = run(tmp_path, mod, Clock(TASK_TIME), FlakyGateway(0))
     assert rc == 0
     assert mod.report_path(str(tmp_path / "reports"), DAY) == str(out / f"daily-{DAY}.md")
+
+
+# ====================================== pre-freeze review (2026-11-24): E1 and S8
+
+def test_the_alert_does_not_call_a_day_untried_when_its_retry_fell_outside_the_window(tmp_path):
+    """Pre-freeze review E1. The first attempt fails at 22:54:40 UTC; the retry is due at
+    22:59:40, judged inside the window, so the run sleeps. The process oversleeps by 40
+    seconds: the retry starts at 23:00:20, outside the window, and is not made. The day is
+    missing with one attempt and no failure recorded. The last sentence of the alert used
+    to count missing days against target days and to say "no attempt started"."""
+    mod, clock = load(), Clock(datetime(2026, 12, 2, 22, 54, 40))
+
+    def overslept(seconds):
+        clock.sleep(seconds)
+        clock.now += timedelta(seconds=40)
+
+    data, reports = tmp_path / "data", tmp_path / "reports"
+    (data / "live").mkdir(parents=True)
+    rc = mod.main(["--data-dir", str(data), "--reports-dir", str(reports), "--date", DAY.isoformat()],
+                  gw=FlakyGateway(1), clock=clock.tick, sleep=overslept)
+    assert rc == mod.EXIT_INCOMPLETE and not (reports / "live").exists()
+    assert clock.sleeps == [300] and clock.now == datetime(2026, 12, 2, 23, 0, 20)
+    failed = failure_alerts(tmp_path)
+    assert len(failed) == 1
+    message = failed[0][2]
+    assert f"{DAY} 已尝试 1 次（重试落在换日窗外，没有再试）" in message
+    assert "有过尝试、没有记下失败：重试醒来时已落在换日窗外，没有再试" in message
+    assert "没有一次尝试开始" not in message and "一次都没有尝试" not in message
+
+
+def _gateway_whose_first_read_raises(error, shutdown_error):
+    """Connects; the first account read raises `error`; shutdown raises `shutdown_error`."""
+    def state():
+        raise error
+
+    def shutdown():
+        if shutdown_error is not None:
+            raise shutdown_error
+
+    return SimpleNamespace(connect=lambda: None, account=SimpleNamespace(state=state), shutdown=shutdown)
+
+
+@pytest.mark.parametrize("error, expected", [
+    pytest.param(KeyboardInterrupt("stop pressed"), KeyboardInterrupt, id="base-exception"),
+    pytest.param(KeyError("account"), KeyError, id="other-exception"),
+    pytest.param(NotConnectedError("terminal online, trade server not connected"), "RetryableFailure",
+                 id="retryable-data-failure"),
+])
+def test_a_failing_shutdown_does_not_hide_the_exception_that_caused_it(capsys, error, expected):
+    """Pre-freeze review S8. The gateway has to be closed before the exception goes up; when
+    closing fails too, what goes up is still the original exception (type and text) and the
+    closing failure is reported on its own line. A `try/finally: raise` would not do: the bare
+    raise in the finally re-raises the exception already propagating — the closing failure."""
+    mod = load()
+    with pytest.raises(BaseException) as caught:
+        mod._connect_demo_gateway(_gateway_whose_first_read_raises(error, RuntimeError("shutdown refused")))
+    kind = getattr(mod, expected) if isinstance(expected, str) else expected
+    assert type(caught.value) is kind
+    text = f"取数失败：{type(error).__name__}: {error}" if kind is mod.RetryableFailure else str(error)
+    assert str(caught.value) == text
+    assert caught.value.__cause__ is (error if kind is mod.RetryableFailure else None)
+    assert "× 关闭网关时出错（原来的异常照常上抛）：RuntimeError: shutdown refused" in capsys.readouterr().out
+
+
+def test_a_shutdown_that_works_is_not_reported(capsys):
+    mod = load()
+    with pytest.raises(KeyError):
+        mod._connect_demo_gateway(_gateway_whose_first_read_raises(KeyError("account"), None))
+    assert "关闭网关时出错" not in capsys.readouterr().out
