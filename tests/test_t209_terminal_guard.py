@@ -128,11 +128,14 @@ def test_probe_stays_inside_the_process_and_touches_no_terminal_api():
 
 
 def test_no_test_builds_a_connection_without_saying_where_mt5_and_the_terminal_come_from():
-    """Two ways a test can pass only on a machine that happens to have a terminal64.exe running:
+    """Three ways a test can pass only on a machine that happens to have a terminal64.exe running:
 
     - In a child process: the suite's stand-in for the terminal probe cannot reach it, so a
       connection built in `sys.executable` source must pass `terminal_running=` (CI #389, shard 2:
       nine tests in test_t110_deadline.py).
+    - A child-process source that loads an entry script, or imports mt5gw/mt5live, reaches the
+      real probe the same way and must set `TERMINAL_PROBE` itself (CI #401: the daily report's
+      deadline test exited 3 instead of 75).
     - Anywhere: a connection built without `mt5_module=` imports the real package in the venv; a
       connect() on it would reach a real terminal.
     """
@@ -149,12 +152,30 @@ def test_no_test_builds_a_connection_without_saying_where_mt5_and_the_terminal_c
                     if "mt5_module=" not in segment:
                         offenders.append(f"{path.name}:{node.lineno} built without mt5_module=")
             elif spawns_children and isinstance(node, ast.Constant) and isinstance(node.value, str):
-                lines = node.value.splitlines()
+                source = node.value
+                lines = source.splitlines()
                 for index, line in enumerate(lines):
                     if "MT5Connection(" in line or "MT5Gateway(" in line:
                         statement = line + (lines[index + 1] if index + 1 < len(lines) else "")
                         if "mt5_module=" not in statement and "terminal_running" not in statement:
                             offenders.append(f"{path.name}:{node.lineno} child-process source without the probe")
+                if "TERMINAL_PROBE" in source or "terminal_running" in source or "import" not in source:
+                    continue
+                try:
+                    inner = ast.parse(source)
+                except SyntaxError:
+                    continue
+                entry_scripts = ("live_daily_report.py", "live_runner.py", "risk_process.py", "live_reconcile.py")
+
+                def reaches_gateway(item):
+                    if isinstance(item, ast.ImportFrom):
+                        return (item.module or "").split(".")[0] in ("mt5gw", "mt5live")
+                    if isinstance(item, ast.Import):
+                        return any(alias.name.split(".")[0] in ("mt5gw", "mt5live") for alias in item.names)
+                    return isinstance(item, ast.Constant) and isinstance(item.value, str) \
+                        and item.value.endswith(entry_scripts)
+                if any(reaches_gateway(item) for item in ast.walk(inner)):
+                    offenders.append(f"{path.name}:{node.lineno} child-process source reaches the gateway without the probe")
     assert offenders == [], offenders
 
 
