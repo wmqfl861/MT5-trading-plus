@@ -315,7 +315,7 @@ def _connect_demo_gateway(gw) -> None:
         _shutdown_quietly(gw)
         raise
     if state.trade_mode != 0:
-        gw.shutdown()
+        _shutdown_quietly(gw)
         raise DataUnavailableError("Demo 日报要求 trade_mode=0，停止读取")
 
 

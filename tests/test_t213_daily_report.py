@@ -652,3 +652,28 @@ def test_a_shutdown_that_works_is_not_reported(capsys):
     with pytest.raises(KeyError):
         mod._connect_demo_gateway(_gateway_whose_first_read_raises(KeyError("account"), None))
     assert "关闭网关时出错" not in capsys.readouterr().out
+
+
+def test_a_non_demo_account_is_still_a_usage_error_when_closing_the_gateway_fails(capsys):
+    """Pre-freeze second review, suggestion 1: the fourth place where the gateway was closed before
+    an exception went up. A live account makes the run a usage error (exit code 2); when closing
+    the gateway failed too, that used to be replaced by the closing failure -- an unexpected
+    exception, exit code 1. The gateway is closed exactly once either way."""
+    mod = load()
+    closed = []
+    gateway = SimpleNamespace(connect=lambda: None,
+                              account=SimpleNamespace(state=lambda: SimpleNamespace(trade_mode=1)),
+                              shutdown=lambda: closed.append("closed"))
+    with pytest.raises(mod.DataUnavailableError, match="trade_mode=0"):
+        mod._connect_demo_gateway(gateway)
+    assert closed == ["closed"] and "关闭网关时出错" not in capsys.readouterr().out
+
+    def shutdown_refused():
+        closed.append("closed")
+        raise RuntimeError("shutdown refused")
+
+    gateway.shutdown = shutdown_refused
+    with pytest.raises(mod.DataUnavailableError, match="trade_mode=0"):
+        mod._connect_demo_gateway(gateway)
+    assert closed == ["closed", "closed"]
+    assert "× 关闭网关时出错（原来的异常照常上抛）：RuntimeError: shutdown refused" in capsys.readouterr().out
