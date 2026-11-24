@@ -54,8 +54,8 @@ def quote(text) -> str:
     return "'" + str(text).replace("'", "''") + "'"
 
 
-def run_keeper(work, terminal_path, log=None, *, dry_run=False, procs=(), prelude=FAKES, env=None):
-    """跑一次看护脚本。→ (退出码, 标准输出加标准错误, 调用记录)."""
+def run_keeper(work, terminal_path, log=None, *, dry_run=False, procs=(), prelude=FAKES, env=None, cwd=None):
+    """跑一次看护脚本（cwd 是它的当前目录）。→ (退出码, 标准输出加标准错误, 调用记录)."""
     trace = work / "trace.txt"
     trace.write_text("", encoding="utf-8")
     flags = ["-TerminalPath", quote(terminal_path)]
@@ -67,7 +67,7 @@ def run_keeper(work, terminal_path, log=None, *, dry_run=False, procs=(), prelud
     driver.write_text("\n".join([prelude, "& " + quote(KEEPER) + " " + " ".join(flags), "exit $LASTEXITCODE"]),
                       encoding="utf-8-sig")
     done = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
-                          capture_output=True, timeout=120, creationflags=NO_WINDOW,
+                          capture_output=True, timeout=120, creationflags=NO_WINDOW, cwd=cwd,
                           env=dict(os.environ, KEEPER_TRACE=str(trace), KEEPER_PROCS=";".join(procs), **(env or {})))
     said = done.stdout.decode("utf-8", errors="replace") + done.stderr.decode("utf-8", errors="replace")
     return done.returncode, said, trace.read_text(encoding="utf-8")
@@ -201,3 +201,20 @@ def test_a_state_file_that_cannot_be_written_only_warns(tmp_path, terminal, work
     assert "state write failed: " in said and "log write failed: " in said
     assert str(tmp_path) not in said                                   # 警告里只有异常类名，没有路径
     assert blocker.is_file()
+
+
+@requires_powershell
+def test_a_relative_log_path_puts_the_log_and_the_state_file_in_the_same_place(tmp_path, terminal, work):
+    """定版前第二次复核的建议 8：-LogPath 只有文件名时，日志一直落在当前目录，状态文件却因为"目录"是空串
+    写不出来（Join-Path 抛错，被接住，只警告）。同一个参数，两个文件落在同一个地方：相对的 -LogPath 按当前
+    目录算。"""
+    rc, said, _ = run_keeper(work, terminal, "terminal_keeper.log", cwd=work)
+    assert rc == 0 and "KEEPER started pid=4321" in said and "state write failed" not in said, said
+    assert (work / "terminal_keeper.log").is_file()
+    written = json.loads((work / "state.json").read_text(encoding="utf-8-sig"))
+    assert facts(written) == {"outcome": "started", "reason": "", "running": 0, "others": 0, "pid": 4321}
+    assert {path.name for path in work.iterdir() if path.suffix in (".log", ".json")} == {"terminal_keeper.log", "state.json"}
+
+    rc, said, _ = run_keeper(work, terminal, str(Path("logs") / "terminal_keeper.log"), cwd=work)   # 相对的子目录
+    assert rc == 0 and (work / "logs" / "terminal_keeper.log").is_file(), said
+    assert facts(json.loads((work / "logs" / "state.json").read_text(encoding="utf-8-sig")))["outcome"] == "started"

@@ -48,7 +48,8 @@
 
 .PARAMETER LogPath
     日志文件；缺省不写文件，只输出到标准输出（任务包装器会收）。状态文件 state.json
-    写在同一个目录：不给 -LogPath 就不写状态文件。
+    写在同一个目录：不给 -LogPath 就不写状态文件；相对的 -LogPath 按当前目录算，日志和状态
+    文件落在同一个地方。
 
 .EXAMPLE
     先看判断结果（不启动）：
@@ -97,7 +98,8 @@ function Write-State {
     if (-not $LogPath -or $DryRun) { return }
     try {
         $directory = [System.IO.Path]::GetDirectoryName($LogPath)
-        if ($directory -and -not (Test-Path -LiteralPath $directory)) {
+        if (-not $directory) { $directory = (Get-Location).Path }     # 只有文件名：和日志一样落在当前目录
+        if (-not (Test-Path -LiteralPath $directory)) {
             New-Item -ItemType Directory -Path $directory | Out-Null
         }
         $record = [ordered]@{

@@ -3,11 +3,16 @@
 **安装脚本在这份测试里从来到不了真的任务计划程序。两层保证：**
 
 1. 脚本自己的结构。不带 -Install / -Uninstall 时它只打印将要注册的内容（动作、触发器、
-   主体、设置），不查询、不注册、不注销；接触任务计划程序的四个命令各自在自己的开关
-   里面。有一条用例按语法树核对这一点。
+   主体、设置），不查询、不注册、不注销；接触任务计划程序的四个命令各自在自己的开关里面，
+   开关是脚本的顶层语句。按语法树核对：脚本里出现的每一个命令名、每一个类型、每一处静态
+   成员调用、Add-Type 的 C#、New-Object 的参数，都在一份允许清单上——清单之外的，不管是
+   别的 cmdlet、别名（ipmo、iex）、COM、子进程还是别的，一律不放。静态检查不过，这份文件里
+   没有任何一条用例运行安装脚本。
 2. 测试进程的沙箱。驱动脚本所在的 PowerShell 进程，PSModulePath 里**只有**沙箱里放模块的
-   那一个目录（沙箱模块装进来时自己核对这一条）：按名字找得到 ScheduledTasks 模块，只可能
-   是沙箱里的那个。沙箱模块里——
+   那一个目录（沙箱模块装进来时自己核对这一条）。这保证了按名字**导入**模块
+   （Import-Module ScheduledTasks）只找得到沙箱里的那一个。它不保证按名字**查找命令**：
+   Get-Command，或者调用一个还没解析过的命令，会从系统模块目录自动装入导出这个命令的真模块，
+   PSModulePath 里有没有它都一样（定版前第二次复核实测）。沙箱模块里——
    - New-* 是真的：按完整路径导入真模块，但只导入 New-*（它们只造内存对象，不碰任务计划
      程序），所以记下来的动作、触发器、主体、设置是真的 CIM 对象的属性；
    - 真模块导出的其余命令（Register-、Unregister-、Set-、Enable-、Disable-、Start-、
@@ -20,11 +25,14 @@
 少导出一个替身、不导出 New-*、用一个普通函数冒充 New-*）；变异的那几条用例给安装脚本的
 参数是 -Install -Uninstall：万一核对没拦住，安装脚本也因为两个开关互斥而拒绝。
 
-**不在那个进程里用 Get-Command 去查一个沙箱没有导出的名字。** 命令查找会按 PSModulePath
-自动装入导出这个命令的模块：沙箱里只有 New-* 的时候，查一下 Get-ScheduledTaskInfo 就把真
-模块整个装进了全局作用域，后来的导入盖过先前的，替身就全部失效。第一版测试真的注册过一次
-任务，起因相近——被调脚本自己 Import-Module，装进它脚本作用域的真 cmdlet 盖过了调用方
-事先定义的全局函数替身。所以核对先看模块的导出清单，清单齐了才按名字解析。
+**所以核对的次序不能动：先看沙箱模块的导出清单，清单齐了才按名字解析。** 命令查找会自动
+装入导出这个命令的模块，而且是从系统模块目录：沙箱少导出一个名字的时候，查一下这个名字，
+真模块就整个装进了全局作用域，后来的导入盖过先前的，替身全部失效；沙箱目录里没有模块的
+时候，Import-Module 报找不到，Get-Command 却照样把真模块装进来。先看导出清单，是为了在解析
+任何一个名字之前就知道每个名字都已经有沙箱的回答——这时再按名字解析，触发不了自动装入。
+第一版测试真的注册过一次任务，起因相近——被调脚本自己 Import-Module，装进它脚本作用域的真
+cmdlet 盖过了调用方事先定义的全局函数替身。（提交 2fbd2a8 的说明里"按名字找得到的
+ScheduledTasks 只可能是沙箱里的那个"只对导入这一半成立，以这里为准。）
 
 沙箱在临时目录里：部署树的副本（看护脚本、隐藏启动器、安装脚本）、一个空的
 terminal64.exe、一个数据目录。有一条用例把脚本打印出来的动作参数原样交给 cscript
@@ -37,6 +45,7 @@ import getpass
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -66,7 +75,11 @@ EXPORT = EXPORT_FUNCTIONS + " -Variable RealExports"
 STANDINS = r'''
 $ErrorActionPreference = 'Stop'
 # This module may live only in a process whose PSModulePath holds nothing but its own directory:
-# then a module named ScheduledTasks can be found by name nowhere else.
+# Import-Module ScheduledTasks then finds this module and nothing else. That does not keep the real
+# module out. Looking a command name up -- Get-Command, or calling a name that is not resolved yet --
+# auto-loads the module that exports it from the system module directory, whatever PSModulePath holds.
+# Hence the order the driver keeps: this module answers every name the real module exports, and the
+# driver reads this module's export list before it resolves a single name.
 $mine = (Split-Path -Parent $PSScriptRoot).TrimEnd('\')      # the directory PSModulePath must hold, and nothing else
 $others = @($env:PSModulePath -split ';' | Where-Object { $_ -and -not $_.TrimEnd('\').Equals($mine, [System.StringComparison]::OrdinalIgnoreCase) })
 if ($others.Count -gt 0) { throw "the sandbox module requires a PSModulePath that holds only its own directory" }
@@ -224,7 +237,8 @@ def entries(root):
     """root 下的全部文件和目录（相对路径集合，不算测试自己的驱动脚本和记录）：断言"拒绝或只打印
     时什么都没有新建"，也断言安装、卸载不建、不删任何文件。"""
     return {p.relative_to(root).as_posix() for p in root.rglob("*")
-            if p.name not in ("calls.jsonl", "invoke.ps1", "query.ps1")}
+            if "queries" not in p.relative_to(root).parts                 # 测试自己的一次性查询脚本
+            and p.name not in ("calls.jsonl", "invoke.ps1")}              # 和驱动脚本、调用记录
 
 
 def sandbox(tmp_path, name="deploy tree (x) & y", module_text=STANDINS):
@@ -322,51 +336,216 @@ def sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def powershell(script, env=None):
-    """跑一段测试自己的 PowerShell（不是安装脚本），用的是这个进程平常的环境。"""
-    path = Path(os.environ["TEMP"]) / f"keeper-test-{os.getpid()}-{id(script) % 1000000}.ps1"
-    try:
-        path.write_bytes(b"\xef\xbb\xbf" + script.replace("\r\n", "\n").replace("\n", "\r\n").encode("utf-8"))
-        done = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                               "-File", str(path)],
-                              capture_output=True, timeout=120, creationflags=NO_WINDOW, env=env or dict(os.environ))
-    finally:
-        path.unlink(missing_ok=True)
+def powershell(folder, script, env=None):
+    """跑一段测试自己的 PowerShell（不是安装脚本），用的是这个进程平常的环境。一次性的 .ps1 写在 folder
+    下面的 queries 里——测试自己的临时目录——不往系统临时目录的根上写。"""
+    queries = Path(folder) / "queries"
+    queries.mkdir(exist_ok=True)
+    path = queries / f"query-{1 + len(list(queries.iterdir()))}.ps1"
+    path.write_bytes(b"\xef\xbb\xbf" + script.replace("\r\n", "\n").replace("\n", "\r\n").encode("utf-8"))
+    done = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(path)],
+                          capture_output=True, timeout=120, creationflags=NO_WINDOW, env=env or dict(os.environ))
     return done.returncode, done.stdout.decode("utf-8", errors="replace"), done.stderr.decode("utf-8", errors="replace")
 
 
-def real_task_names():
-    """本机 \\MT5Quant\\ 下真实任务的名字（只读查询，和安装脚本不在一个进程）。安装、卸载、状态
-    三条用例在运行前后各取一次：必须相同——万一替身没有挡住，这里当场发现。"""
-    rc, out, err = powershell(r'''
-@(Get-ScheduledTask -TaskPath '\MT5Quant\' -ErrorAction SilentlyContinue) | ForEach-Object { $_.TaskName } | Sort-Object
-''')
+def real_tasks(folder):
+    """本机全部计划任务的路径加名字（只读查询，和安装脚本不在一个进程）。安装、卸载两条用例在运行前后各取
+    一次：必须相同——万一替身没有挡住，不管登记到了哪个路径下，这里当场发现。"""
+    rc, out, err = powershell(folder, "@(Get-ScheduledTask) | ForEach-Object { $_.TaskPath + $_.TaskName } | Sort-Object\n")
     assert rc == 0, err
     return sorted(line for line in out.splitlines() if line.strip())
 
 
-def code_without_comments():
-    raw = INSTALLER.read_bytes()
-    assert raw[:3] == b"\xef\xbb\xbf", "UTF-8 带 BOM（PowerShell 5.1 没有 BOM 读不好中文说明）"
-    code = raw.decode("utf-8-sig").split("#>", 1)[1]                       # 不看说明部分
-    return "\n".join(line for line in code.splitlines() if not line.lstrip().startswith("#"))
+# ---- the static check: what the installer may contain, by its syntax tree ---------------------------------
+# Every command the installer may run, by the name it is written with. Anything else is refused on
+# sight -- another cmdlet of the Task Scheduler, an alias (ipmo, iex), a shell, a program -- whether
+# or not anybody thought of that particular one. The script's own functions are allowed by name.
+# The list is an inventory: a command on it that the script no longer uses fails the check too.
+ALLOWED_COMMANDS = frozenset({
+    "Import-Module",
+    "Get-ScheduledTask", "Get-ScheduledTaskInfo", "Unregister-ScheduledTask", "Register-ScheduledTask",
+    "New-ScheduledTaskAction", "New-ScheduledTaskTrigger", "New-ScheduledTaskSettingsSet", "New-ScheduledTaskPrincipal",
+    "Write-Host", "Get-Variable", "Get-Command", "Where-Object", "Join-Path", "Test-Path", "Get-FileHash", "Get-Content",
+    "Out-Null", "ConvertTo-Json", "ConvertFrom-Json", "New-TimeSpan", "Add-Type", "New-Object",
+})
+# The commands whose arguments are part of the check: each is allowed exactly as written here, as often.
+# Import-Module by its bare name is what finds only the sandbox module; by a path it would find the real
+# one (and so would its alias ipmo, which is not on the list above). A command looked up by name loads the
+# module that exports it. Add-Type compiles whatever it is given. New-Object can make a COM object.
+CODE_PAGES = ("@'\n[DllImport(\"kernel32.dll\")] public static extern uint GetACP();\n"
+              "[DllImport(\"kernel32.dll\")] public static extern uint GetOEMCP();\n'@")
+ALLOWED_ARGUMENTS = {
+    "Import-Module": [["ScheduledTasks"]],
+    "Get-Command": [["Get-SystemCodePages", "-ErrorAction", "SilentlyContinue"]],
+    "Add-Type": [["-Namespace", "MT5Quant", "-Name", "KeeperInstallerCodePages", "-MemberDefinition", CODE_PAGES]],
+    "New-Object": [["System.Text.UTF8Encoding", "($false)"]],
+}
+# Every [type] the script may name, and every static member it may call on one. [Activator],
+# [type]::GetTypeFromProgID, [System.Runtime.InteropServices.Marshal] and the like are not on them.
+ALLOWED_TYPES = frozenset({
+    "CmdletBinding", "string", "switch", "ordered", "pscustomobject", "int", "long", "ref", "type", "DateTime",
+    "System.IO.Path", "System.Security.Principal.WindowsIdentity", "System.Globalization.CultureInfo",
+    "System.Globalization.DateTimeStyles", "System.Text.Encoding", "MT5Quant.KeeperInstallerCodePages",
+})
+ALLOWED_MEMBERS = frozenset({
+    ("string", "IsNullOrWhiteSpace"),
+    ("System.IO.Path", "GetPathRoot"), ("System.IO.Path", "GetFullPath"), ("System.IO.Path", "GetFileName"),
+    ("System.IO.Path", "IsPathRooted"), ("System.IO.Path", "DirectorySeparatorChar"),
+    ("System.IO.Path", "AltDirectorySeparatorChar"),
+    ("System.Security.Principal.WindowsIdentity", "GetCurrent"),
+    ("DateTime", "UtcNow"), ("DateTime", "MinValue"), ("DateTime", "TryParse"),
+    ("System.Globalization.CultureInfo", "InvariantCulture"), ("System.Globalization.DateTimeStyles", "RoundtripKind"),
+    ("System.Text.Encoding", "GetEncoding"),
+    ("MT5Quant.KeeperInstallerCodePages", "GetACP"), ("MT5Quant.KeeperInstallerCodePages", "GetOEMCP"),
+})
+# Members that make or run something else, refused on any object.
+REFUSED_MEMBERS = frozenset({"CreateInstance", "GetTypeFromProgID", "GetActiveObject", "InvokeMember",
+                             "InvokeCommand", "InvokeScript", "AddScript"})
+# The four commands that read or change tasks, and the switch each call sits directly in, in the order
+# the script has them. The switch's if has to be a top-level statement of the script: not inside a
+# function (from where it could be called at any time), not inside another branch.
+TOUCHING = frozenset({"Get-ScheduledTask", "Get-ScheduledTaskInfo", "Unregister-ScheduledTask", "Register-ScheduledTask"})
+EXPECTED_TOUCHING = [
+    ("Get-ScheduledTask", "$Status"), ("Get-ScheduledTaskInfo", "$Status"),
+    ("Get-ScheduledTask", "$Uninstall"), ("Unregister-ScheduledTask", "$Uninstall"),
+    ("Get-ScheduledTask", "$Install"), ("Register-ScheduledTask", "$Install"),
+]
+
+# Reads a script by its syntax tree and prints one line of JSON. The script is parsed, never run.
+SURVEY = r'''
+# Survey of a PowerShell script by its syntax tree: every command (name as written, invocation
+# operator, arguments, and the nearest branch or scope that contains it), every type named, every
+# static member called on a type, every function defined. Read-only: the script is parsed, never run.
+param([string]$Script)
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Script, [ref]$tokens, [ref]$errors)
+$broken = @($errors | Where-Object { $_ })
+if ($broken.Count -gt 0) {
+    @{ parse_errors = @($broken | ForEach-Object { $_.Message }); commands = @(); types = @(); members = @(); instance_members = @(); functions = @() } | ConvertTo-Json -Compress -Depth 5
+    exit 0
+}
+$language = 'System.Management.Automation.Language.'
+
+function Container($node) {
+    # What encloses the command, from the inside out: the first branch or scope. An if is
+    # "top-level" when the if statement itself sits directly in the script body; the condition
+    # reported is the one of the clause the command is in (an else block is "else-of").
+    $current, $below = $node.Parent, $node
+    while ($current) {
+        $kind = $current.GetType().Name
+        if ($kind -eq 'FunctionDefinitionAst') { return 'function:' + $current.Name }
+        if ($kind -eq 'IfStatementAst') {
+            # the clause block the command is directly under; not one of them: the else block, or the condition itself
+            $condition = $null
+            for ($i = 0; $i -lt $current.Clauses.Count; $i++) {
+                # reference equality: -eq between two AST objects compares their string forms
+                if ([object]::ReferenceEquals($current.Clauses[$i].Item2, $below)) { $condition = $current.Clauses[$i].Item1.Extent.Text }
+            }
+            if (-not $condition) { $condition = 'else-or-condition:' + $current.Clauses[0].Item1.Extent.Text }
+            $parent = $current.Parent
+            if ($parent.GetType().Name -eq 'NamedBlockAst' -and $parent.Parent -is ($language + 'ScriptBlockAst' -as [type]) -and $null -eq $parent.Parent.Parent) {
+                return 'top-level-if:' + $condition
+            }
+            return 'nested-if:' + $condition
+        }
+        if ($kind -match '^(For|ForEach|While|Do)StatementAst$') { return 'loop' }
+        if ($kind -in @('SwitchStatementAst', 'TryStatementAst', 'ScriptBlockExpressionAst', 'TrapStatementAst', 'DataStatementAst')) {
+            return ($kind -replace 'StatementAst$|ExpressionAst$', '').ToLower()
+        }
+        $below, $current = $current, $current.Parent
+    }
+    return 'top-level'
+}
+
+$commands = @($ast.FindAll({ param($node) $node -is ($language + 'CommandAst' -as [type]) }, $true) | ForEach-Object {
+    $elements = @($_.CommandElements)
+    [ordered]@{
+        name      = $_.GetCommandName()
+        operator  = $_.InvocationOperator.ToString()
+        line      = $_.Extent.StartLineNumber
+        arguments = @($elements | Select-Object -Skip 1 | ForEach-Object { $_.Extent.Text })
+        container = Container $_
+    }
+})
+# Types, wherever they are named: a member access or a literal type, an attribute, a cast, an
+# -is / -as operand (FindAll does not walk into casts), and -- as a cross-check -- every identifier
+# that follows an opening bracket in the token stream.
+$types = @($ast.FindAll({ param($node) $node -is ($language + 'TypeExpressionAst' -as [type]) }, $true) |
+    ForEach-Object { $_.TypeName.FullName })
+$types += @($ast.FindAll({ param($node) $node -is ($language + 'AttributeAst' -as [type]) }, $true) |
+    ForEach-Object { $_.TypeName.FullName })
+foreach ($cast in @($ast.FindAll({ param($node) $node -is ($language + 'ConvertExpressionAst' -as [type]) }, $true))) {
+    if ($cast.Type) { $types += $cast.Type.TypeName.FullName }
+}
+foreach ($test in @($ast.FindAll({ param($node) $node -is ($language + 'BinaryExpressionAst' -as [type]) -and $node.Operator.ToString() -in @('Is', 'As') }, $true))) {
+    foreach ($side in @($test.Left, $test.Right)) {
+        if ($side -is ($language + 'ConvertExpressionAst' -as [type]) -and $side.Type) { $types += $side.Type.TypeName.FullName }
+        if ($side -is ($language + 'TypeExpressionAst' -as [type])) { $types += $side.TypeName.FullName }
+    }
+}
+for ($i = 0; $i -lt $tokens.Count; $i++) {
+    if ($tokens[$i].Kind.ToString() -eq 'LBracket' -and $i + 1 -lt $tokens.Count -and $tokens[$i + 1].Kind.ToString() -eq 'Identifier') {
+        $types += $tokens[$i + 1].Text
+    }
+}
+$members = @($ast.FindAll({ param($node) $node -is ($language + 'MemberExpressionAst' -as [type]) -and $node.Static }, $true) |
+    ForEach-Object { $_.Expression.TypeName.FullName + '::' + $_.Member.Extent.Text } | Sort-Object -Unique)
+$instance_members = @($ast.FindAll({ param($node) $node -is ($language + 'MemberExpressionAst' -as [type]) -and -not $node.Static }, $true) |
+    ForEach-Object { $_.Member.Extent.Text } | Sort-Object -Unique)
+$functions = @($ast.FindAll({ param($node) $node -is ($language + 'FunctionDefinitionAst' -as [type]) }, $true) |
+    ForEach-Object { $_.Name })
+@{ commands = $commands; types = @($types | Sort-Object -Unique); members = $members; instance_members = $instance_members; functions = $functions } | ConvertTo-Json -Compress -Depth 5
+'''
 
 
-def test_installer_only_ever_creates_a_task_and_reaches_the_scheduler_through_the_module():
-    """不启动终端、不结束进程、不删文件、不调 schtasks，也不走 CIM、COM、子进程这些绕开模块的路；
-    时刻取系统时钟的 UTC；计划任务的模块只按名字导入一次；三个开关就是 -Install、-Uninstall、
-    -Status，没有 -DryRun。"""
-    code = code_without_comments()
-    for forbidden in ("MetaTrader5", "python", "Stop-Process", "taskkill", "Remove-", "schtasks",
-                      "New-NetFirewallRule", "Get-Date", "ScheduledTasks.psd1", "PSHOME", "DryRun",
-                      "Cim", "ComObject", "Start-Process", "Invoke-Expression", "Invoke-Command",
-                      "powershell", "pwsh", "cmd"):
-        assert forbidden not in code, forbidden
-    assert "[DateTime]::UtcNow" in code
-    assert code.count("Import-Module") == 1 and "Import-Module ScheduledTasks" in code
-    block = code.split("param(", 1)[1].split("\n)", 1)[0]
-    for switch in ("[switch]$Install", "[switch]$Uninstall", "[switch]$Status"):
-        assert switch in block, switch
+def survey(script, folder) -> dict:
+    """→ {commands: [{name, operator, line, arguments, container}], types, members, functions}。container 是命令
+    外面最近的分支或作用域：top-level-if:<条件>、nested-if:<条件>、function:<名字>、loop、try……"""
+    script_file = Path(folder) / "survey.ps1"
+    script_file.write_bytes(b"\xef\xbb\xbf" + SURVEY.replace("\n", "\r\n").encode("utf-8"))
+    rc, out, err = powershell(folder, "& " + quote(script_file) + " -Script " + quote(script) + "\n")
+    assert rc == 0, err
+    return json.loads(out.splitlines()[-1])
+
+
+def static_problems(report: dict) -> list:
+    """→ 不合允许清单的地方，一行一条；空列表就是过了。"""
+    if report.get("parse_errors"):
+        return [f"does not parse: {error}" for error in report["parse_errors"]]
+    bad, listed = [], {}
+    for command in report["commands"]:
+        name, operator = command["name"], command["operator"]
+        shown = f"line {command['line']}: {'' if operator == 'Unknown' else operator + ' '}{name or '<not a plain command name>'}"
+        if operator != "Unknown" or name not in ALLOWED_COMMANDS and name not in report["functions"]:
+            bad.append(f"command not on the allowed list: {shown}")
+        if name in ALLOWED_ARGUMENTS:
+            listed.setdefault(name, []).append([argument.replace("\r\n", "\n") for argument in command["arguments"]])
+    for name, allowed in ALLOWED_ARGUMENTS.items():
+        if sorted(listed.get(name, [])) != sorted(allowed):
+            bad.append(f"the arguments of {name} are not exactly the allowed ones: {listed.get(name, [])!r}")
+    bad += [f"type not on the allowed list: [{type_name}]" for type_name in report["types"] if type_name not in ALLOWED_TYPES]
+    for item in report["members"]:
+        type_name, member = item.split("::", 1)
+        if member in REFUSED_MEMBERS or (type_name, member) not in ALLOWED_MEMBERS:
+            bad.append(f"static member not on the allowed list: [{item}]")
+    bad += [f"a member that can make or run something else: .{member}" for member in report["instance_members"]
+            if member in REFUSED_MEMBERS]
+    touching = [(command["name"], command["container"]) for command in report["commands"] if command["name"] in TOUCHING]
+    if touching != [(name, "top-level-if:" + switch) for name, switch in EXPECTED_TOUCHING]:
+        bad.append("the commands that touch the Task Scheduler are not each directly in their own top-level switch: "
+                   f"{touching!r}")
+    return bad
+
+
+@pytest.fixture(scope="module", autouse=True)
+def the_installer_passes_the_static_checks(tmp_path_factory):
+    """这一份文件里每一条用例之前先过静态检查。不过：安装脚本一次也不运行——这份文件里的用例全部报错，
+    不是跳过。所以静态检查没过的时候，不存在安装、卸载的用例在真的任务计划程序上跑这回事。"""
+    if shutil.which("powershell") is None:
+        pytest.skip("requires PowerShell")
+    problems = static_problems(survey(INSTALLER, tmp_path_factory.mktemp("installer-static")))
+    assert problems == [], "安装脚本没有过静态检查，这份文件里没有一条用例运行它：\n" + "\n".join(problems)
 
 
 def test_the_keeper_script_does_not_use_the_task_scheduler_module():
@@ -376,46 +555,37 @@ def test_the_keeper_script_does_not_use_the_task_scheduler_module():
     assert "ScheduledTask" not in code and "schtasks" not in code and "Import-Module" not in code
 
 
+def test_the_installer_has_the_three_switches_and_no_dry_run():
+    """UTF-8 带 BOM（PowerShell 5.1 没有 BOM 读不好中文说明）；开关只有 -Install、-Uninstall、-Status，没有
+    -DryRun 这个名字（免得和"真的去查一遍"混在一起）。"""
+    raw = INSTALLER.read_bytes()
+    assert raw[:3] == b"\xef\xbb\xbf"
+    whole = raw.decode("utf-8-sig")
+    block = whole.split("param(", 1)[1].split("\n)", 1)[0]
+    assert re.findall(r"\[switch\]\$(\w+)", block) == ["Install", "Uninstall", "Status"]
+    assert "DryRun" not in whole.split("#>", 1)[1]
+
+
+@requires_powershell
+def test_the_installer_contains_only_what_is_on_the_allowed_lists(tmp_path):
+    """按语法树清点安装脚本：命令名、带参数的几个命令、类型、静态成员、接触命令的位置，每一项都过允许
+    清单。清单就是库存——脚本不再用到的，也要从清单上拿掉，清单才不会越积越大。"""
+    report = survey(INSTALLER, tmp_path)
+    assert static_problems(report) == []
+    assert {command["name"] for command in report["commands"] if command["name"] in ALLOWED_COMMANDS} == ALLOWED_COMMANDS
+    assert set(report["types"]) == ALLOWED_TYPES
+    assert set(report["members"]) == {"::".join(pair) for pair in ALLOWED_MEMBERS}
+
+
 @requires_powershell
 def test_only_the_three_mode_blocks_touch_the_task_scheduler(tmp_path):
     """结构保护：安装脚本里接触任务计划程序的命令只有 Get-ScheduledTask、Get-ScheduledTaskInfo、
-    Register-ScheduledTask、Unregister-ScheduledTask，每一个都在自己的开关（-Status / -Uninstall /
-    -Install）的 if 里面；不带开关时一步都走不到。按 PowerShell 自己的语法树核对。"""
-    rc, out, err = powershell(r'''
-$tokens = $null; $errors = $null
-$ast = [System.Management.Automation.Language.Parser]::ParseFile('__INSTALLER__', [ref]$tokens, [ref]$errors)
-if (@($errors | Where-Object { $_ }).Count -gt 0) { throw 'the installer does not parse' }
-$commands = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true))
-foreach ($command in $commands) {
-    $name = $command.GetCommandName()
-    if ($name -eq 'Import-Module') {
-        $arguments = @($command.CommandElements | Select-Object -Skip 1)
-        'import: ' + (($arguments | ForEach-Object { $_.Extent.Text }) -join ' ')
-    } elseif ($name -like '*-ScheduledTask*' -and $name -notlike 'New-*') {
-        $node = $command.Parent
-        $switch = ''
-        while ($node) {
-            if ($node -is [System.Management.Automation.Language.IfStatementAst]) { $switch = $node.Clauses[0].Item1.Extent.Text; break }
-            $node = $node.Parent
-        }
-        '{0} under {1}' -f $name, $switch
-    }
-}
-'''.replace("__INSTALLER__", str(INSTALLER).replace("'", "''")))
-    assert rc == 0, err
-    rows = [line for line in out.splitlines() if " under " in line]
-    seen = {}
-    for row in rows:
-        command, _, switch = row.rpartition(" under ")
-        seen.setdefault(command, []).append(switch)
-    assert seen == {
-        "Get-ScheduledTask": ["$Status", "$Uninstall", "$Install"],
-        "Get-ScheduledTaskInfo": ["$Status"],
-        "Unregister-ScheduledTask": ["$Uninstall"],
-        "Register-ScheduledTask": ["$Install"],
-    }
-    imports = [line for line in out.splitlines() if line.startswith("import: ")]
-    assert imports == ["import: ScheduledTasks"]
+    Register-ScheduledTask、Unregister-ScheduledTask；每一个外面最近的分支就是它自己的开关
+    （-Status / -Uninstall / -Install），而这个 if 是脚本的顶层语句——不在函数里，不在别的分支里。
+    不带开关时一步都走不到。按 PowerShell 自己的语法树核对。"""
+    report = survey(INSTALLER, tmp_path)
+    where = [(command["name"], command["container"]) for command in report["commands"] if command["name"] in TOUCHING]
+    assert where == [(name, "top-level-if:" + switch) for name, switch in EXPECTED_TOUCHING]
 
 
 @requires_powershell
@@ -466,10 +636,10 @@ def test_install_registers_one_task_that_runs_the_keeper_through_the_hidden_laun
     造出来的对象，替身记下它们的属性。安装不建任何东西，本机的任务清单不变。"""
     deploy, terminal, data, modules = sandbox(tmp_path)
     started = datetime.now(timezone.utc)
-    tasks_before = real_task_names()
+    tasks_before = real_tasks(tmp_path)
     done, before, calls = run(tmp_path, modules, *located(deploy, terminal, data), "-Install")
     assert done.returncode == 0, text(done)
-    assert real_task_names() == tasks_before
+    assert real_tasks(tmp_path) == tasks_before
     assert entries(tmp_path) == before                                  # 没有日志目录，部署树里没有新文件
     assert names(calls) == ["Get-ScheduledTask", "Register-ScheduledTask"]
     lookups, registered = calls[0]["parameters"], calls[1]["parameters"]
@@ -522,7 +692,7 @@ def test_the_action_it_would_register_runs_the_keeper_through_the_launcher(tmp_p
     assert chain.returncode == 1, (chain.stdout + chain.stderr).decode("mbcs", errors="replace")
     assert not missing.exists() and log.read_text(encoding="utf-8-sig").rstrip().endswith("refused reason=file_missing")
 
-    rc, out, err = powershell("& " + quote(deploy / "scripts" / "ops" / "terminal_keeper.ps1")
+    rc, out, err = powershell(tmp_path, "& " + quote(deploy / "scripts" / "ops" / "terminal_keeper.ps1")
                               + " -TerminalPath " + quote(terminal) + " -LogPath " + quote(log) + " -DryRun\n")
     assert rc == 0, out + err
     assert out.startswith("KEEPER would-start other_instances=")      # 只报告，不启动；不输出路径
@@ -657,7 +827,7 @@ def test_uninstall_only_unregisters_the_task_and_leaves_the_log(tmp_path):
     log.parent.mkdir(parents=True)
     log.write_text("2026-11-24T00:00:00.000Z\tstarted pid=1 other_instances=0\n", encoding="utf-8")
     kept = log.read_bytes()
-    tasks_before = real_task_names()
+    tasks_before = real_tasks(tmp_path)
     before = entries(tmp_path)
     done, _, calls = run(tmp_path, modules, "-Uninstall", *located(deploy, terminal, data))
     assert done.returncode == 4, text(done)
@@ -665,7 +835,7 @@ def test_uninstall_only_unregisters_the_task_and_leaves_the_log(tmp_path):
 
     done, before, calls = run(tmp_path, modules, "-Uninstall", *located(deploy, terminal, data), exists=True)
     assert done.returncode == 0, text(done)
-    assert real_task_names() == tasks_before
+    assert real_tasks(tmp_path) == tasks_before
     assert names(calls) == ["Get-ScheduledTask", "Unregister-ScheduledTask"]
     assert calls[1] == {"call": "Unregister-ScheduledTask",
                         "parameters": {"Confirm": False, "TaskName": "terminal_keeper", "TaskPath": "\\MT5Quant\\"},
