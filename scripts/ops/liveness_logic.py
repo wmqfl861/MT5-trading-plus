@@ -17,9 +17,11 @@ CONTROL_STUCK_S = 3600.0           # halt、pause、killSwitch、否决：超过
 DISK_MIN_GB = 10.0
 GB = 2 ** 30
 CLOCK_SKEW_S = 60.0                # 时间戳比现在晚这么多以上，就不算新鲜
-REPORT_DUE_UTC = (22, 30)          # 日报任务 21:57 UTC 才生成昨天的日报；22:30 起才要求它在
+REPORT_MADE_UTC = (21, 57)         # 日报任务在这个时刻（UTC）生成前一天的日报
+REPORT_DUE_UTC = (22, 30)          # 22:30 起才要求最近生成的那份日报在（给它的重试留出宽限）
 REMIND_AFTER_S = 86400.0           # 同一个生产级问题还在：两条通知至少隔这么久
-OWNER = re.compile(r"[a-z]{1,16}")  # halt 的 owner 只有长这样才照常输出
+IDENTIFIER = re.compile(r"[a-z]{1,16}")   # halt 的 owner、登记项的 kind：只有长这样才照常使用
+UNREADABLE = object()              # _read_json 读不到内容时的结果：文件不存在、读不出、解析不了
 
 
 def parse_utc(value) -> datetime | None:
@@ -49,13 +51,14 @@ def _file_age(now: datetime, path: Path) -> float | None:
 
 
 def _read_json(path: Path):
-    """→ (文件存在, 解析结果)。存在但读不出或解析不了时，第二个是 None。"""
+    """→ (文件存在, 解析结果)。文件不存在、存在但读不出或解析不了时，第二个是 UNREADABLE。
+    文件里写的是 null 时解析结果就是 None，和读不出分得开。"""
     try:
         return True, json.loads(path.read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
-        return False, None
+        return False, UNREADABLE
     except (OSError, ValueError):
-        return True, None
+        return True, UNREADABLE
 
 
 def _reason(value) -> dict:
@@ -66,7 +69,7 @@ def _reason(value) -> dict:
 
 def _owner(value) -> str:
     """halt 的 owner 只放行纯小写字母的标识（1 到 16 个字母）；其余（可能带路径、账号）一律写 other。"""
-    return value if isinstance(value, str) and OWNER.fullmatch(value) else "other"
+    return value if isinstance(value, str) and IDENTIFIER.fullmatch(value) else "other"
 
 
 def _control(now: datetime, doc: dict, path: Path, source: str, ahead: list) -> dict:
@@ -77,11 +80,12 @@ def _control(now: datetime, doc: dict, path: Path, source: str, ahead: list) -> 
 
 
 def _well_formed(entry) -> bool:
-    """登记项的形状：对象，pid 是 32 位以内的正整数，started_utc 是时间，kind 是非空字符串，
-    运行器带正整数 magic。形状不对的项没法核对身份。"""
+    """登记项的形状：对象，pid 是 32 位以内的正整数，started_utc 是时间，kind 是 1 到 16 个小写字母的
+    标识（它就是非运行器角色的键，会进问题代码、输出和通知），运行器带正整数 magic。
+    形状不对的项没法核对身份。"""
     return (isinstance(entry, dict) and type(entry.get("pid")) is int and 0 < entry["pid"] < 2 ** 32
             and parse_utc(entry.get("started_utc")) is not None
-            and isinstance(entry.get("kind"), str) and bool(entry["kind"])
+            and isinstance(entry.get("kind"), str) and IDENTIFIER.fullmatch(entry["kind"])
             and (entry["kind"] != "runner" or type(entry.get("magic")) is int and entry["magic"] > 0))
 
 
@@ -94,10 +98,10 @@ def observe(live_dir, reports_dir, disk_path, now: datetime, alive) -> dict:
            "risk_veto": False, "disk_known": True, "disk_free_gb": None, "due_report": None,
            "due_report_present": None}
     registry = _read_json(live / "instances.json")[1]
-    if registry is None:                        # 不存在、读不出、解析不了
+    if registry is UNREADABLE:                  # 不存在、读不出、解析不了
         obs["registry_readable"] = False
     elif not isinstance(registry, dict) or not isinstance(registry.get("instances"), list):
-        obs["registry_valid"] = False           # 顶层不成形状：和条目不成形状同样处理
+        obs["registry_valid"] = False           # 顶层不成形状（null 也是）：和条目不成形状同样处理
     else:
         starts = []
         for entry in registry["instances"]:
@@ -114,7 +118,9 @@ def observe(live_dir, reports_dir, disk_path, now: datetime, alive) -> dict:
             starts.append(parse_utc(entry["started_utc"]))
             obs["roles"][key] = {"launcher_alive": bool(alive(entry["pid"], entry["started_utc"])),
                                  "heartbeat_age_s": age}
-        if starts:
+        if not starts:                          # 登记表是空的：部署之后不该这样
+            obs["registry_valid"] = False
+        else:
             obs["earliest_start"] = min(starts).isoformat()
     state_path = live / "supervisor-state.json"
     exists, supervisor = _read_json(state_path)
@@ -154,10 +160,13 @@ def observe(live_dir, reports_dir, disk_path, now: datetime, alive) -> dict:
 
 
 def _owed(report_day: str, earliest) -> bool:
-    """那一天的日报只在那个 UTC 日开始之前部署已经在跑时才要求：以登记表里最早的 started_utc 为准。
-    没有登记项可依据时也不要求（新数据目录的第一天不会因此报缺）。"""
+    """那一天的日报只在它生成的时候部署已经在跑才要求：生成时刻是它的 UTC 日次日 21:57 UTC，
+    登记表里最早的 started_utc 得早于那个时刻。登记里的 started_utc 被写早了，这里只能信它：
+    会多报，不会漏报。没有登记项可依据时不要求（那时登记表自己另有发现）。"""
     started, midnight = parse_utc(earliest), parse_utc(report_day)
-    return started is not None and midnight is not None and started < midnight
+    made = None if midnight is None else midnight + timedelta(days=1, hours=REPORT_MADE_UTC[0],
+                                                             minutes=REPORT_MADE_UTC[1])
+    return started is not None and made is not None and started < made
 
 
 def _production(code: str, detail: dict, lasted: float) -> bool:
