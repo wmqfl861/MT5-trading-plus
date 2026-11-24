@@ -53,6 +53,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import CHILD_REPORT_ENV, powershell_report
+
 ROOT = Path(__file__).resolve().parents[1]
 OPS = ROOT / "scripts" / "ops"
 INSTALLER = OPS / "install_terminal_keeper.ps1"
@@ -508,17 +510,15 @@ $functions = @($ast.FindAll({ param($node) $node -is ($language + 'FunctionDefin
 def survey(script, folder) -> dict:
     """→ {commands: [{name, operator, line, arguments, container}], types, members, functions}。container 是命令
     外面最近的分支或作用域：top-level-if:<条件>、nested-if:<条件>、function:<名字>、loop、try……
-    结果从临时目录里的 UTF-8 文件读，不经标准输出：标准输出按控制台的代码页编码，CI 的机器上是 437，
-    安装脚本里的"§"会变成字节 0x15，JSON 就坏了（CI #420）。"""
+    结果经 conftest 的 powershell_report() 从临时目录里的 UTF-8 文件读，不经标准输出：标准输出按控制台
+    的代码页编码，CI 的机器上是 437，安装脚本里的"§"会变成字节 0x15，JSON 就坏了（CI #420）。"""
     folder = Path(folder)
     script_file = folder / "survey.ps1"
-    report_file = folder / "survey-report.json"
     script_file.write_bytes(b"\xef\xbb\xbf" + SURVEY.replace("\n", "\r\n").encode("utf-8"))
-    rc, out, err = powershell(folder, "& " + quote(script_file) + " -Script " + quote(script)
-                              + " -Out " + quote(report_file) + "\n")
-    assert rc == 0, err
-    assert report_file.is_file(), "the survey wrote no report\n" + (out + err)[-800:]
-    return json.loads(report_file.read_text(encoding="utf-8"))
+    report = powershell_report(                                  # 一次性的脚本和报告，和 powershell() 的放在一起
+        folder / "queries",
+        "& " + quote(script_file) + " -Script " + quote(script) + " -Out $env:" + CHILD_REPORT_ENV + "\n")
+    return json.loads(report)
 
 
 def static_problems(report: dict) -> list:
@@ -598,6 +598,30 @@ def test_only_the_three_mode_blocks_touch_the_task_scheduler(tmp_path):
     report = survey(INSTALLER, tmp_path)
     where = [(command["name"], command["container"]) for command in report["commands"] if command["name"] in TOUCHING]
     assert where == [(name, "top-level-if:" + switch) for name, switch in EXPECTED_TOUCHING]
+
+
+@requires_powershell
+def test_survey_fails_rather_than_returning_an_earlier_report(tmp_path, monkeypatch):
+    """同一个目录先后清点两次，后一次没有写出报告：survey() 必须报错，不能返回前一次的报告。报告文件的
+    路径按目录固定，不先删旧的，后一次没有报告时读到的就是前一次的（定版前第四次复核的建议 1）。这里
+    把清点脚本换成不写报告的一份：解析照旧，只是不落盘。"""
+    assert survey(INSTALLER, tmp_path)["commands"]                 # 前一次读到的确实是报告
+    silent = SURVEY.replace("function Emit($report) {", "function Emit($report) { return")
+    assert silent != SURVEY
+    monkeypatch.setitem(globals(), "SURVEY", silent)
+    with pytest.raises(AssertionError, match="wrote no report"):
+        survey(INSTALLER, tmp_path)
+
+
+@requires_powershell
+def test_a_report_comes_back_through_a_utf8_file_and_an_earlier_one_is_not_reused(tmp_path):
+    """conftest 的 powershell_report()（规矩写在那里）：报告是临时目录里的 UTF-8 文件，非 ASCII 字符原样
+    回来；子进程写到标准输出的不参与；后一次没有写出报告时报错，不返回前一次的。"""
+    write = ("[System.IO.File]::WriteAllText($env:" + CHILD_REPORT_ENV
+             + ", '§ 运行记录', (New-Object System.Text.UTF8Encoding($false)))\n")
+    assert powershell_report(tmp_path, write + "Write-Output 'not the report'\n") == "§ 运行记录"
+    with pytest.raises(AssertionError, match="wrote no report"):
+        powershell_report(tmp_path, "Write-Output 'no report this time'\n")
 
 
 @requires_powershell

@@ -38,7 +38,9 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import os
+import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from _pytest.outcomes import Skipped
@@ -159,6 +161,48 @@ def _terminal_assumed_running(request, monkeypatch):
     from mt5gw import connection
 
     monkeypatch.setattr(connection, "TERMINAL_PROBE", lambda terminal_path: True)
+
+
+# ---- 子进程把结果交回 Python：走文件，不走标准输出 --------------------------------
+#
+# 上面说测试的结果不应取决于这台机器。子进程（PowerShell 脚本、驱动脚本、别的解释器）把结构化的
+# 结果交给 Python 时，写进测试临时目录里的 UTF-8 文件，不经标准输出；经标准输出传的只放 ASCII。
+# 原因：Windows PowerShell 5.1 按控制台的代码页编码它被重定向的输出。CI 的机器是 437，"§"在其中
+# 是字节 0x15，一个控制字符；开发和生产的机器是 65001。同一段输出，本机读出来是对的，CI 上是
+# 坏的——定版前的 CI #420 就是这样：安装脚本的测试把一段含"§"的 JSON 经标准输出传回，本机通过，
+# CI 上解析失败。
+#
+# 在子进程里先把 [Console]::OutputEncoding 设成 UTF-8 也可以（tests/test_install_terminal_keeper.py
+# 的驱动脚本就是这么做的），但那要每写一个子进程都记得。PowerShell 脚本交回报告用下面的
+# powershell_report()，规矩由它来守；别的子进程照同样的规矩写。
+
+CHILD_REPORT_ENV = "MT5_CHILD_REPORT"
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def powershell_report(folder, script) -> str:
+    """跑一段测试自己的 PowerShell（不是被测的脚本），→ 它交回的报告文本（UTF-8）。
+
+    script 经 -File 运行（Windows PowerShell 5.1，不加载配置）；一次性的脚本写在 folder 下。报告
+    文件的路径在子进程的环境变量 MT5_CHILD_REPORT 里——folder 下的 report.txt，子进程这样写：
+    [System.IO.File]::WriteAllText($env:MT5_CHILD_REPORT, $text, (New-Object System.Text.UTF8Encoding($false)))
+    旧的报告先删掉：后一次没有写出报告时，读不到前一次的。子进程的退出码不是 0、或者没有写出
+    报告，都按失败处理，标准输出和标准错误贴在失败信息里。标准输出不是返回值：要断言的内容
+    都走报告。"""
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / "report.ps1"
+    report = folder / "report.txt"
+    path.write_bytes(b"\xef\xbb\xbf" + script.replace("\r\n", "\n").replace("\n", "\r\n").encode("utf-8"))
+    report.unlink(missing_ok=True)                 # 先删旧的：路径按目录固定
+    done = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                           "-File", str(path)],
+                          capture_output=True, timeout=120, creationflags=NO_WINDOW,
+                          env={**os.environ, CHILD_REPORT_ENV: str(report)})
+    shown = done.stdout.decode("utf-8", errors="replace") + done.stderr.decode("utf-8", errors="replace")
+    assert done.returncode == 0, shown[-800:]
+    assert report.is_file(), "the child wrote no report\n" + shown[-800:]
+    return report.read_text(encoding="utf-8-sig")
 
 
 # ---- T209：测试不得加载真实的 MetaTrader5 包 ----------------------------------
