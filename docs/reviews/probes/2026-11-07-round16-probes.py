@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
-import inspect
 import re
 import sys
 import time

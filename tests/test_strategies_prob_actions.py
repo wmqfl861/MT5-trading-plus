@@ -17,7 +17,7 @@ from mt5data.store import _COLUMNS, TIMEFRAME_SECONDS
 from mt5quant.backtest.engine_a import atr_series
 from mt5quant.strategies.library.prob.actions import ActionParams, action_triggers
 from mt5quant.strategies.library.prob.situations import (
-    Approach, LevelEvent, find_level_events, s1_level_rows,
+    Approach, find_level_events, s1_level_rows,
 )
 
 APPROACH = Approach(lookback_bars=6, min_distance_atr=5.0, touch_atr=0.3)

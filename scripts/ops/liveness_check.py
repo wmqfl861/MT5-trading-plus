@@ -54,7 +54,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from liveness_logic import (  # noqa: E402
-    assess, blank_state, evaluate, format_message, load_state, mark_sent, notify, observe, parse_utc)
+    assess, blank_state, evaluate as evaluate, format_message, load_state, mark_sent,
+    notify, observe, parse_utc)
+# evaluate 本脚本不调用（判定走 assess）；tests/test_t214_liveness_check.py 经本模块用它，
+# 所以显式保留这个名字。
 
 STEPS = ("observe", "evaluate", "notify", "state")     # 检查的四步；退出码 2 只带前两步
 

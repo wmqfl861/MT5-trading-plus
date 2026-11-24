@@ -4,7 +4,6 @@
 K+2 根）单独跑引擎 A；测试用同一规则切片、直接调 run_backtest 做独立参照，
 要求出场原因映射与 net_r（= 引擎 r_multiple）逐笔一致。
 """
-from datetime import timedelta
 
 import numpy as np
 import pandas as pd

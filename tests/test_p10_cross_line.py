@@ -30,10 +30,11 @@ sys.modules["bt_p10"] = BT
 _spec.loader.exec_module(BT)
 
 from mt5quant.research.ledger import (                        # noqa: E402
-    Ledger, RoundTrialBudgetExceededError,
+    Ledger,
 )
 
-from tests.test_prob_p2_e2e import _card_path, env as p2_env  # noqa: E402
+# p2_env 是 pytest 夹具（按参数名注入，本模块不按名调用）
+from tests.test_prob_p2_e2e import _card_path, env as p2_env  # noqa: E402, F401
 
 STRATEGY_REF = ("mt5quant.strategies.library.prob.level_decision:"
                 "LevelDecisionS1Demo")

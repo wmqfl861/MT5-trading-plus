@@ -57,7 +57,6 @@ from mt5quant.validation import gates as vgate  # noqa: E402
 from mt5quant.validation import robustness as vrob  # noqa: E402
 from mt5quant.validation import stats as vstats  # noqa: E402
 from mt5data.ext.merge import merged_research_series  # noqa: E402
-from mt5data.sessions import load_session_policy  # noqa: E402
 from mt5data.quality import read_known_gaps  # noqa: E402
 assert vstats.rng_seed("H102") == SEED
 

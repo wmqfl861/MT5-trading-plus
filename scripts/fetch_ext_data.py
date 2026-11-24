@@ -42,7 +42,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mt5data.ext import (  # noqa: E402
-    ExtDataError, ExtSeries, adapters, approved_sources, ext_inventory,
+    ExtDataError, ExtSeries, adapters, ext_inventory,
     load_ext_series, save_ext_series, utc_now_iso)
 from mt5data.resample import resample_bars  # noqa: E402
 

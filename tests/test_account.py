@@ -6,7 +6,7 @@ import pytest
 from mt5gw.account import AccountService
 from mt5gw.connection import MT5Connection
 from mt5gw.errors import DataUnavailableError
-from mt5gw.models import AccountState, Deal, HistoryOrder, PendingOrder, Position
+from mt5gw.models import AccountState, Deal, HistoryOrder
 
 from tests.fakes import FakeMT5
 

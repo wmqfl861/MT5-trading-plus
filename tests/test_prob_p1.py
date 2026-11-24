@@ -132,7 +132,6 @@ def test_run_p1_card_reports_total_usable_skipped(monkeypatch):
     card = fake_card()
     rnd = fake_round()
     calls = []
-    real_label = p1mod.label_triggers
 
     def stub_labels(b, trig, costs, **kw):
         times = pd.to_datetime(trig["time"])
@@ -238,7 +237,6 @@ class _LedgerStub:
 def test_preconditions_reject_each_failure(tmp_path):
     card = fake_card()
     ok_round = _write_round_file(tmp_path)
-    from mt5quant.research import cards as rcards
     card_path = tmp_path / "cards"
     card_path.mkdir(exist_ok=True)
     # 用假的卡文件路径（前置检查只用 path.parent.parent 找轮次）
@@ -286,7 +284,6 @@ def test_triggers_beyond_split_dropped():
 def test_round_report_holm_and_incomplete_reject(tmp_path):
     from mt5quant.research.ledger import Ledger
     db = tmp_path / "l.sqlite"
-    rnd = fake_round(hypotheses=("S1:A3:fade>base", "S1:A1:follow>base"))
     # 只跑了一条 → round-report 拒绝（用 runs_of_round 查空）
     with Ledger(db) as led:
         led.record_round_open(round_id="R2", candidates=["C101"],
@@ -387,7 +384,7 @@ def test_run_p1_card_gap_drop_reason_recorded():
     P2-03 起未来窗须 t+K+1 完整可观察（卡 K=24 → 触发根 ≤ 37），否则
     A1@28 会被 future_window 剔除而非'保留'。"""
     from tests.test_prob_t97_wiring import (
-        APPROACH as T97_APPROACH, PARAMS as T97_PARAMS, fake_card as t97_card,
+        fake_card as t97_card,
         make_bars_rows, s1_pattern_rows, hourly, PLAT,
     )
     bars = make_bars_rows(s1_pattern_rows() + [PLAT] * 30, hourly(63))
@@ -452,7 +449,6 @@ def test_run_p1_card_null_side_same_caliber_counts(monkeypatch):
     card = fake_card()
     rnd = fake_round()
     calls = []
-    real_label = p1mod.label_triggers
 
     def stub_labels(b, trig, costs, **kw):
         times = pd.to_datetime(trig["time"])

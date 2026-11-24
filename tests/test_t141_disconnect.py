@@ -19,7 +19,7 @@ import importlib.util
 import json
 import os
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -282,7 +282,6 @@ def test_t141_order_path_disconnect_journal_rejected_intent_confirmed(tmp_path):
 def test_t141_disconnect_does_not_touch_t140_rejection_semantics(tmp_path):
     """边界钉：断线轮不计入 T140 的连拒计数（不是服务器拒单）——断线后
     成功一轮，连拒暂停逻辑照旧由 TradeRejectedError 驱动。"""
-    from mt5gw.errors import TradeRejectedError
 
     b = FakeBroker()
     b.error_on_market_order = NotConnectedError("断线演练")
@@ -465,7 +464,6 @@ def _keep_runner_alive(live_dir, virt):
 def test_t141_risk_3min_disconnect_survives(tmp_path, monkeypatch, capsys):
     """风控进程：断线 3 分钟 → 降级轮（不查账户、文件级检查照常、角色心跳
     照写）不退出；恢复后照常轮询；无 halt、无专用退出标记。"""
-    from mt5live.monitor import write_role_heartbeat
 
     mod = _load_script("risk_process.py")
     live = tmp_path / "live"

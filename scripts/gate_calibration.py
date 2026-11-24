@@ -1859,7 +1859,7 @@ def run_v3_phase(args, log) -> dict:
                     oos_parts.append(out_by_symbol[sym]["oos_returns"])
                 if len(symbols) == 1:
                     only = out_by_symbol[symbols[0]]
-                    checks, verdict = only["checks"], only["verdict"]
+                    checks, _verdict = only["checks"], only["verdict"]
                 else:
                     pooled = pd.concat(oos_parts)
                     primary = v3_primary_suite(pooled, cfg, seed, n_trials=1)
@@ -1878,7 +1878,7 @@ def run_v3_phase(args, log) -> dict:
                                  for sym, s in out_by_symbol.items()
                                  for k in ("param_plateau", "yearly_segments",
                                            "drop_best_5pct")}}
-                    verdict = vgate.evaluate_v3(
+                    vgate.evaluate_v3(
                         g0={"passed": veto_all["G0"]},
                         primary=primary["dsr"],
                         cost_scale={"passed": veto_all["veto.cost_x15"]},

@@ -326,6 +326,6 @@ def test_validate_symbol_preserves_case():
     from mt5mcp.tools import _validate_symbol
     assert _validate_symbol("XAUUSDm") == "XAUUSDm"
     assert _validate_symbol("eurusd") == "eurusd"
-    out = get_bars(make_db(tmp_path := __import__("pathlib").Path(
+    out = get_bars(make_db(__import__("pathlib").Path(
         __import__("tempfile").mkdtemp())), "EURUSD", "M1", limit=1)
     assert out["symbol"] == "EURUSD"

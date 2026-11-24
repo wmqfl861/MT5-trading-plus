@@ -224,7 +224,6 @@ def test_monitor_data_unavailable_does_not_publish_new_health(tmp_path, monkeypa
 def test_windows_backend_verifies_fake_launcher_worker_tree(tmp_path):
     """Actual venv launcher shape, but only our sleeping fake is inspected/killed."""
     import subprocess
-    import time
     mod = load_supervisor()
     fake = tmp_path / "risk_process.py"
     fake.write_text("import time\ntime.sleep(60)\n")
@@ -250,11 +249,9 @@ def test_windows_backend_verifies_fake_launcher_worker_tree(tmp_path):
 
 
 def test_supervisor_uses_same_instances_lock_as_launcher(tmp_path):
-    import subprocess
     mod, cfg, p, live, entries = setup(tmp_path)
     # Windows exclusive sharing is the launcher's lock contract; emulate only
     # that file handle without touching any business process or scheduler.
-    from mt5live.fileio import file_lock
     with mod.registry_lock(str(live / "instances.lock")):
         result = run(mod, cfg, p)
     assert result["refused"] and not p.started
@@ -424,7 +421,6 @@ def test_old_parent_pid_link_is_not_a_descendant_of_reused_root(tmp_path):
 @pytest.mark.skipif(sys.platform != "win32", reason="PowerShell fixed deployment")
 def test_powershell_fixed_deployment_inspect_and_stop(tmp_path, monkeypatch):
     """Exercise the real PS1 route against a detached fake repo and sleeping fake role."""
-    import os
     import shutil
     import subprocess
     from tests import test_demo_run_ps1 as ps1

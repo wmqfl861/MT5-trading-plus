@@ -327,7 +327,6 @@ def test_short_stop_bid_trigger_flagged_old_1r_tolerance_missed_it():
     mod = _load_script()
     bars, t15, ticks = _short_stop_setup()
     real_engine = mod.run_backtest_ticks
-    t_bad = msc(t15 + timedelta(minutes=40))
 
     def bid_trigger_engine(strategy, bars_, loader, costs_, **kw):
         res = real_engine(strategy, bars_, loader, costs_, **kw)

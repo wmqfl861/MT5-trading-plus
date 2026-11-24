@@ -168,7 +168,7 @@ def bundle(tmp_path, monkeypatch, implementation_repo):
 
 
 def test_real_main_consumes_admitted_bytes_and_frozen_cost_kernel(bundle, monkeypatch):
-    adapter = load_adapter()
+    load_adapter()
     original = Path.read_bytes
     reads = {}
     data_paths = {bundle.directory / "input.json", bundle.directory / "sources.json", bundle.directory / "sessions.toml"}

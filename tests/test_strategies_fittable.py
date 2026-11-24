@@ -2,7 +2,7 @@
 import pandas as pd
 import pytest
 
-from mt5quant.strategies import BaseStrategy, BuyHold, ExitRules
+from mt5quant.strategies import BaseStrategy, BuyHold
 
 
 class PlainStrategy(BaseStrategy):

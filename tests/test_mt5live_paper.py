@@ -352,7 +352,7 @@ def test_state_restart_recovers_positions_balance_and_deals(tmp_path):
     已实现流水保留、成交序号接着发（不碰撞）。"""
     market = QuoteMarket()
     p1 = make_paper(tmp_path, market)
-    r1 = p1.market_order(SYMBOL, "buy", 0.1, sl=99.0, tp=102.0, magic=MAGIC)
+    p1.market_order(SYMBOL, "buy", 0.1, sl=99.0, tp=102.0, magic=MAGIC)
     r2 = p1.market_order(SYMBOL, "sell", 0.05, sl=101.0, magic=MAGIC + 1)
     p1.close_position(r2.order_ticket)            # 第二张已平（留已实现流水）
     before = p1.state()

@@ -228,7 +228,6 @@ def test_missing_no_reentry_after_stop_via_engine():
     trades = res.trades
     assert len(trades) >= 1
     sig = strat.generate_signals(bars, {}).to_numpy()
-    pos = np.flatnonzero(sig != 0)
     # 每笔交易的入场时刻必须落在信号归零之后重新出发的段里：
     # 同一段（连续同向非零）内的入场数 ≤ 1（止损后无立即同向重入）
     seg_id = np.zeros(len(sig), dtype=int)
@@ -296,7 +295,6 @@ def test_s8_fit_requires_sizes_and_policy():
     # 缺政策回退仓库 sessions.toml（不再按'不限制'）；仓库会话文件被
     # 指向不存在路径时才报错——用 monkeypatch 桩掉默认路径验证报错支路
     from mt5data import sessions as sess_mod
-    import pytest as _pytest
     orig = sess_mod.load_session_policy
     sess_mod.load_session_policy = lambda *a, **k: (_ for _ in ()).throw(
         sess_mod.SessionConfigError("桩：不可加载"))
@@ -378,7 +376,7 @@ def test_d2_same_action_opposite_directions_skip():
     bars["tick_volume"], bars["spread"], bars["real_volume"] = 10, 5, 0
     bars = bars[_COLUMNS]
     from mt5quant.strategies.library.prob.situations import (
-        Approach, find_level_events, s1_level_rows)
+        find_level_events, s1_level_rows)
     from mt5quant.backtest.engine_a import atr_series
     atr = atr_series(bars)
     ap = DemoSmallGrid.APPROACH
@@ -439,7 +437,6 @@ def test_e3_cross_situation_opposite_directions_skip():
 def test_e4_no_cost_key_excluded_from_decision():
     """E4：模型缺 (S3, A3) 成本键时该候选不参与决策（门槛不按 0 计）——
     与上一条同一构造，但成本只给 S1|A3：S3 空头被排除，S1 多头照常入场。"""
-    from mt5quant.strategies.library.prob.situations import s1_level_rows
 
     class S1S3(DemoSmallGrid):
         SITUATIONS = ("S1", "S3")

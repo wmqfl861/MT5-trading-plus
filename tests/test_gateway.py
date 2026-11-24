@@ -1,6 +1,5 @@
 import json
 
-import pytest
 
 import mt5gw
 from mt5gw.config import GatewayConfig

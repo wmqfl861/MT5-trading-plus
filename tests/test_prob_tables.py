@@ -297,7 +297,7 @@ class TestP13Observations:
         labels2 = self.mixed_labels(100, 0, 50, 50)
         tbl2 = ProbTable.fit(labels2, group_by=["trend_sma200"],
                              prior_strength=100, min_cell=10)
-        base = tbl2.base_rate("A3")                      # n=200，p=0.75
+        tbl2.base_rate("A3")                      # n=200，p=0.75
         est2 = tbl2.lookup("S1", "A3", {"trend_sma200": "above"})
         p = (100 + 100 * 0.75) / 200
         assert est2.p_win == pytest.approx(p)

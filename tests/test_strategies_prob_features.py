@@ -4,7 +4,6 @@
 收盘 bar。窗口未满 → None（该触发不进细粒度格，由概率表回退父级）。
 """
 import pandas as pd
-import pytest
 
 from mt5quant.strategies.library.prob.features import atr_pct_2000, trend_sma200
 

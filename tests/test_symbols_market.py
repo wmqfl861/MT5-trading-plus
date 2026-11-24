@@ -1,5 +1,5 @@
 from collections import namedtuple
-from datetime import datetime, timezone
+from datetime import datetime
 
 import pytest
 

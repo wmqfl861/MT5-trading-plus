@@ -3,7 +3,7 @@ import dataclasses
 
 import pytest
 
-from mt5live.config import LiveConfig, load
+from mt5live.config import load
 
 FULL_TOML = """
 symbol = "XAUUSD"

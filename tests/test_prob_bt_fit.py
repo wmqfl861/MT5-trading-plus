@@ -23,7 +23,6 @@ def load_bt():
 BT = load_bt()
 
 from mt5quant.research import cards as rcards  # noqa: E402
-from mt5quant.research import rounds as rounds_mod  # noqa: E402
 
 
 def write_repo_tree(tmp_path, *, segment="discovery", split="2019-12-01",

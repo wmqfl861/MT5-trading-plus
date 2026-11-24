@@ -342,7 +342,7 @@ def data_root_of(tmp_path):
 
 def test_q6_days_unit_and_per_hypothesis(data_root):
     """Q6：样本单位=触发日数；逐条判定（一条过候选即过，不足的列出）。"""
-    c = cand.validate_candidate(prob_data(), source="t")
+    cand.validate_candidate(prob_data(), source="t")
     days = pd.date_range("2018-01-01", periods=2200, freq="1D")
     a3_rows = [("TEST", "S1", "A3", 9, 20.0, 2000.0, str(d)) for d in days]
     # 同一天 300 次 A1 触发——按次计 300 次、按日计只有 1 日（远低于 2130）

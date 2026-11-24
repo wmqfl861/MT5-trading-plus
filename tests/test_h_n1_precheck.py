@@ -300,7 +300,7 @@ def _naive(value):
 
 
 def test_assembly_measures_main_window_and_registers_hole(tmp_path):
-    module = assembler()
+    assembler()
     out = assembled(tmp_path, drop=("2020-11-26",))
     inputs = out["inputs"][SERIES]
     bars = inputs["bars"]
@@ -326,7 +326,7 @@ def test_assembly_measures_main_window_and_registers_hole(tmp_path):
 
 
 def test_provenance_registers_costs_scenario_and_calendar(tmp_path):
-    module = assembler()
+    assembler()
     out = assembled(tmp_path)
     prov = out["provenance"]
     assert prov["status"] == "provisional"
@@ -360,7 +360,7 @@ def test_provenance_registers_costs_scenario_and_calendar(tmp_path):
 
 
 def test_calendar_registration_counts_window_events_and_anchors(tmp_path):
-    module = assembler()
+    assembler()
     out = assembled(tmp_path, drop=("2020-11-26",))  # holiday hole on 2020-11-26
     cal = out["calendar"]
     assert cal["total_meetings"] == 6
@@ -563,7 +563,7 @@ def run_cli(script, args, cwd=ROOT):
 
 
 def test_cli_fail_closed_on_synthetic_root_and_no_override_flags(tmp_path):
-    module = assembler()
+    assembler()
     root, _ = write_root(tmp_path)          # valid structure, unbound hashes
     calendar, _ = write_calendar(tmp_path)
     cand = tmp_path / "C005.toml"
@@ -640,7 +640,7 @@ def test_assemble_derives_ustec_trading_calendar_v1(tmp_path):
     """fix1 root cause 2: the assembly derives the {data-root}/calendars/USTEC.json
     v1 content from the bound FRED series (all delivered trading days, not just
     the main window) and the engine's trading_calendar() must accept it."""
-    module = assembler()
+    assembler()
     out = assembled(tmp_path)
     doc = out["trading_calendar"]
     assert doc["version"] == 1
@@ -656,7 +656,7 @@ def test_assemble_derives_ustec_trading_calendar_v1(tmp_path):
 def test_trading_calendar_counterexamples_rejected(tmp_path):
     """Counterexample guard: every malformed variant the engine's v1 validator
     refuses must differ from what the assembler exports."""
-    module = assembler()
+    assembler()
     out = assembled(tmp_path)
     doc = out["trading_calendar"]
     sessions = [dict(s) for s in doc["sessions"]]
@@ -684,7 +684,7 @@ def test_trading_calendar_counterexamples_rejected(tmp_path):
 
 
 def test_cli_export_calendar_flag_and_fail_closed_no_write(tmp_path):
-    module = assembler()
+    assembler()
     root, _ = write_root(tmp_path)          # valid structure, unbound hashes
     calendar, _ = write_calendar(tmp_path)
     cand = tmp_path / "C005.toml"
@@ -734,7 +734,7 @@ def test_used_gate_accepts_all_used_yearly_verification(tmp_path):
     """S5.4: with yearly_verification all used=true the used gate passes every
     touched year (no BindingError) and the year_handling / gap_rules
     registrations state the manifest's yearly reality truthfully."""
-    module = assembler()
+    assembler()
     yearly = {str(y): {"used": True, "verification": "fred_d1_v1"}
               for y in range(1994, 2022)}
     out = assembled(tmp_path, fred=fred_manifest(yearly=yearly))

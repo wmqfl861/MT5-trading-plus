@@ -14,7 +14,6 @@
 import importlib.util
 import itertools
 import json
-from collections import namedtuple
 from datetime import datetime
 from pathlib import Path
 

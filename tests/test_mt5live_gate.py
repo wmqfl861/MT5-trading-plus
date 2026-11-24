@@ -79,7 +79,7 @@ def _gate_with_spread(tmp_path, stats_by_hour, *, min_days=20):
     点差 0.03 ≤ 3×p90=0.15，正常点差下只考察覆盖天数判定）。"""
     from mt5data.sessions import load_session_policy
     from mt5live.riskproc import RiskProcess, load_risk_config
-    from mt5quant.costs.spread import SpreadModel, SpreadStat
+    from mt5quant.costs.spread import SpreadModel
 
     live = tmp_path / "live"
     live.mkdir(parents=True, exist_ok=True)

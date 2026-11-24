@@ -843,7 +843,7 @@ def test_gate_params_auto_selects_max_net_profit_run(tmp_path, monkeypatch,
     from mt5quant.backtest.report import data_sha256
     dsha = data_sha256(bars)
     with Ledger(ledger) as led:
-        r1 = record_screen_run(led, params={"entry_days": 10, "exit_days": 2},
+        record_screen_run(led, params={"entry_days": 10, "exit_days": 2},
                                data_sha256=dsha,
                                metrics={"net_profit": 10.0, "sharpe": 0.9})
         r2 = record_screen_run(led, params={"entry_days": 10, "exit_days": 4},
@@ -1362,7 +1362,7 @@ def test_gate_cli_g5_orchestration_started_then_done(tmp_path, monkeypatch,
                          {"train_range": [100, 150], "test_range": [150, 200],
                           "params": {}}]})
         led.record_gate(rid, "V3", True, {})
-    rc = mod.main(gate_argv(root, cards_dir, ledger, "G5", "--main-store",
+    mod.main(gate_argv(root, cards_dir, ledger, "G5", "--main-store",
                             "--approve", "--approved-by", "user",
                             "--params", "{}"))
     out = capsys.readouterr().out

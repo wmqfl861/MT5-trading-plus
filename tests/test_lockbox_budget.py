@@ -12,7 +12,7 @@
   （否则会把自己拒掉）。
 """
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime
 
 import pytest
 
@@ -211,8 +211,6 @@ def test_run_g5_does_not_recheck_budget_for_started_card(tmp_path):
 
 def test_run_g5_without_cutoff_skips_budget(tmp_path):
     """cutoff 未给（旧调用方/测试路径）→ 不做预算检查（向后兼容）。"""
-    import numpy as np
-    import pandas as pd
 
     with Ledger(tmp_path / "l.sqlite") as led:
         led.lockbox_budget(CUTOFF, 1)

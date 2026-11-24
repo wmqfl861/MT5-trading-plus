@@ -175,13 +175,12 @@ def test_fuse_immune_to_truthy_string_unlock():  # I1：非严格布尔解锁一
 
 def test_fuse_allows_real_when_unlocked_and_pinned():
     tr, fake = make(trade_mode=2, allow_live=True, expected_login=ACC.login)
-    box = capture_request(fake)
+    capture_request(fake)
     res = tr.market_order("EURUSD", "buy", 0.01)
     assert res.ok and fake.calls("order_send") == 1
 
 
 def test_pinned_login_mismatch_rejects():  # 解锁后被切到别的实盘账号 → 拒单
-    from mt5gw.config import GatewayConfig as C
     tr, fake = make(trade_mode=2, allow_live=True, expected_login=999999)
     capture_request(fake)
     with pytest.raises(LiveTradingBlockedError, match="expected_login"):

@@ -1,7 +1,6 @@
 """T121 offline rules: every input below is generated, never a research store."""
 import importlib
 import importlib.util
-import copy
 import hashlib
 import json
 

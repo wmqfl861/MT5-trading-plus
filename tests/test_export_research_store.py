@@ -237,7 +237,6 @@ def test_verify_clean_store_passes(tmp_path, main_store):
 def test_export_skips_series_with_empty_open_segment(tmp_path, main_store):
     """cutoff 之前一根都没有的序列（整段都在锁箱内）：跳过、不写空
     parquet，导出整体仍成功（该序列的研究库本就该没有）。"""
-    from mt5data.lockbox import write_global_cutoff
     from mt5data.store import read_watermark, save_bars
 
     mod = load_script("export_research_store_x", SCRIPT_PATH)

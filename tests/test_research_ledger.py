@@ -1099,7 +1099,7 @@ def test_ledger_events_content_rewrite_detected(tmp_path):
     """
     p = tmp_path / "l.sqlite"
     with Ledger(p) as led:
-        rid = record(led)
+        record(led)
         led.record_lockbox_start("H001", approved_by="u")
         led.finish_lockbox_use("H001", result={"passed": True})
         assert led.verify_chain() == []

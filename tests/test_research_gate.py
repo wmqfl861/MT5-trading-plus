@@ -337,12 +337,13 @@ def test_fingerprint_missing_required_component_rejected(over):
 # ------------------------------------------------- round-report 接线（bt.py）
 
 # 沿用现有 round-report 测试夹具（tests/test_prob_p1_cli.py 的
-# r4_open/_run_round_report——fixture 连同其依赖 round_env 一并引入）
+# r4_open/_run_round_report——fixture 连同其依赖 round_env 一并引入；
+# 两个夹具按参数名注入，本模块不按名调用，所以写成显式再导出）
 from tests.test_prob_p1_cli import (  # noqa: E402
     _record_r4_run,
     _run_round_report,
-    r4_open,
-    round_env,
+    r4_open as r4_open,
+    round_env as round_env,
 )
 
 
