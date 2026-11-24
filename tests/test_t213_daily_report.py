@@ -289,6 +289,33 @@ def test_the_alert_states_the_attempts_of_each_day(tmp_path):
     assert "各已尝试" not in message
 
 
+def test_the_alert_says_that_nothing_was_attempted_only_when_nothing_was(tmp_path):
+    """Second review (N4): started at 22:59:50 with a healthy gateway that takes 20
+    seconds a call. Today's report is written; the backfill days come due after the
+    window closed and are not attempted. The last sentence of the alert used to say
+    "no attempt started" for such a run as well."""
+    mod, clock = load(), Clock(datetime(2026, 12, 2, 22, 59, 50))
+    gateway = FlakyGateway(0, clock=clock, cost=20)
+    rc, out = run(tmp_path, mod, clock, gateway)
+    assert rc == mod.EXIT_INCOMPLETE and (out / f"daily-{DAY}.md").exists()
+    assert gateway.touched == [datetime(2026, 12, 2, 22, 59, 50)]   # today only: in the window
+    failed = failure_alerts(tmp_path)
+    assert len(failed) == 1
+    message = failed[0][2]
+    for day in (DAY - timedelta(days=1), DAY - timedelta(days=2)):
+        assert f"{day} 未尝试（换日窗外）" in message, day
+    assert str(DAY) not in message                         # today's report exists
+    assert "没有一次尝试开始" not in message
+    assert "未生成的日子一次都没有尝试：轮到它们时不在换日窗内" in message
+
+    # A run in which really no attempt started keeps the other sentence.
+    work = tmp_path / "outside"
+    rc, out = run(work, mod, Clock(datetime(2026, 12, 2, 23, 10)), FlakyGateway(0))
+    assert rc == mod.EXIT_INCOMPLETE and not out.exists()
+    failed = failure_alerts(work)
+    assert len(failed) == 1 and "没有一次尝试开始：都不在换日窗内" in failed[0][2]
+
+
 # ============================================== K2: the first account read is a data read
 
 class Terminal(FakeMT5):
@@ -369,6 +396,29 @@ def test_connect_failures_are_retried_and_reported_with_their_own_counts(tmp_pat
     failed = failure_alerts(tmp_path)
     assert len(failed) == 1
     assert f"{DAY} 已尝试 3 次" in failed[0][2] and f"{DAY - timedelta(days=1)} 已尝试 3 次" in failed[0][2]
+
+
+@pytest.mark.parametrize("where, error_type",
+                         [("the-call", RuntimeError), ("the-conversion", AttributeError)])
+def test_an_unretryable_exception_in_the_first_account_read_closes_the_gateway(
+        tmp_path, monkeypatch, where, error_type):
+    """Second review (N1): the first account read fails in a way that is not retried —
+    the call raises RuntimeError, or the row it returns is not a complete account
+    (AttributeError one line later, when the row is converted). The gateway used to
+    be left open (initialize 1, shutdown 0). It is closed exactly once before the
+    exception goes up; nothing is retried."""
+    mod, clock = load(), Clock(TASK_TIME)
+    if where == "the-call":
+        terminal = Terminal(failures=1, error=RuntimeError("account_info failed"))
+    else:
+        terminal = Terminal(failures=0)
+        terminal.set_behavior("account_info", value=SimpleNamespace(login=123456))
+    with pytest.raises(error_type):
+        run_terminal(tmp_path, monkeypatch, mod, clock, terminal)
+    assert terminal.calls("initialize") == 1 and terminal.calls("shutdown") == 1
+    assert clock.sleeps == []
+    failed = failure_alerts(tmp_path)
+    assert len(failed) == 1 and "未预期异常" in failed[0][2] and "退出码 1" in failed[0][2]
 
 
 # ============================================== K5: every failed run raises the alert
@@ -533,3 +583,97 @@ def test_report_path_matches_where_the_report_is_written(tmp_path):
     rc, out = run(tmp_path, mod, Clock(TASK_TIME), FlakyGateway(0))
     assert rc == 0
     assert mod.report_path(str(tmp_path / "reports"), DAY) == str(out / f"daily-{DAY}.md")
+
+
+# ====================================== pre-freeze review (2026-11-24): E1 and S8
+
+def test_the_alert_does_not_call_a_day_untried_when_its_retry_fell_outside_the_window(tmp_path):
+    """Pre-freeze review E1. The first attempt fails at 22:54:40 UTC; the retry is due at
+    22:59:40, judged inside the window, so the run sleeps. The process oversleeps by 40
+    seconds: the retry starts at 23:00:20, outside the window, and is not made. The day is
+    missing with one attempt and no failure recorded. The last sentence of the alert used
+    to count missing days against target days and to say "no attempt started"."""
+    mod, clock = load(), Clock(datetime(2026, 12, 2, 22, 54, 40))
+
+    def overslept(seconds):
+        clock.sleep(seconds)
+        clock.now += timedelta(seconds=40)
+
+    data, reports = tmp_path / "data", tmp_path / "reports"
+    (data / "live").mkdir(parents=True)
+    rc = mod.main(["--data-dir", str(data), "--reports-dir", str(reports), "--date", DAY.isoformat()],
+                  gw=FlakyGateway(1), clock=clock.tick, sleep=overslept)
+    assert rc == mod.EXIT_INCOMPLETE and not (reports / "live").exists()
+    assert clock.sleeps == [300] and clock.now == datetime(2026, 12, 2, 23, 0, 20)
+    failed = failure_alerts(tmp_path)
+    assert len(failed) == 1
+    message = failed[0][2]
+    assert f"{DAY} 已尝试 1 次（重试落在换日窗外，没有再试）" in message
+    assert "有过尝试、没有记下失败：重试醒来时已落在换日窗外，没有再试" in message
+    assert "没有一次尝试开始" not in message and "一次都没有尝试" not in message
+
+
+def _gateway_whose_first_read_raises(error, shutdown_error):
+    """Connects; the first account read raises `error`; shutdown raises `shutdown_error`."""
+    def state():
+        raise error
+
+    def shutdown():
+        if shutdown_error is not None:
+            raise shutdown_error
+
+    return SimpleNamespace(connect=lambda: None, account=SimpleNamespace(state=state), shutdown=shutdown)
+
+
+@pytest.mark.parametrize("error, expected", [
+    pytest.param(KeyboardInterrupt("stop pressed"), KeyboardInterrupt, id="base-exception"),
+    pytest.param(KeyError("account"), KeyError, id="other-exception"),
+    pytest.param(NotConnectedError("terminal online, trade server not connected"), "RetryableFailure",
+                 id="retryable-data-failure"),
+])
+def test_a_failing_shutdown_does_not_hide_the_exception_that_caused_it(capsys, error, expected):
+    """Pre-freeze review S8. The gateway has to be closed before the exception goes up; when
+    closing fails too, what goes up is still the original exception (type and text) and the
+    closing failure is reported on its own line. A `try/finally: raise` would not do: the bare
+    raise in the finally re-raises the exception already propagating — the closing failure."""
+    mod = load()
+    with pytest.raises(BaseException) as caught:
+        mod._connect_demo_gateway(_gateway_whose_first_read_raises(error, RuntimeError("shutdown refused")))
+    kind = getattr(mod, expected) if isinstance(expected, str) else expected
+    assert type(caught.value) is kind
+    text = f"取数失败：{type(error).__name__}: {error}" if kind is mod.RetryableFailure else str(error)
+    assert str(caught.value) == text
+    assert caught.value.__cause__ is (error if kind is mod.RetryableFailure else None)
+    assert "× 关闭网关时出错（原来的异常照常上抛）：RuntimeError: shutdown refused" in capsys.readouterr().out
+
+
+def test_a_shutdown_that_works_is_not_reported(capsys):
+    mod = load()
+    with pytest.raises(KeyError):
+        mod._connect_demo_gateway(_gateway_whose_first_read_raises(KeyError("account"), None))
+    assert "关闭网关时出错" not in capsys.readouterr().out
+
+
+def test_a_non_demo_account_is_still_a_usage_error_when_closing_the_gateway_fails(capsys):
+    """Pre-freeze second review, suggestion 1: the fourth place where the gateway was closed before
+    an exception went up. A live account makes the run a usage error (exit code 2); when closing
+    the gateway failed too, that used to be replaced by the closing failure -- an unexpected
+    exception, exit code 1. The gateway is closed exactly once either way."""
+    mod = load()
+    closed = []
+    gateway = SimpleNamespace(connect=lambda: None,
+                              account=SimpleNamespace(state=lambda: SimpleNamespace(trade_mode=1)),
+                              shutdown=lambda: closed.append("closed"))
+    with pytest.raises(mod.DataUnavailableError, match="trade_mode=0"):
+        mod._connect_demo_gateway(gateway)
+    assert closed == ["closed"] and "关闭网关时出错" not in capsys.readouterr().out
+
+    def shutdown_refused():
+        closed.append("closed")
+        raise RuntimeError("shutdown refused")
+
+    gateway.shutdown = shutdown_refused
+    with pytest.raises(mod.DataUnavailableError, match="trade_mode=0"):
+        mod._connect_demo_gateway(gateway)
+    assert closed == ["closed", "closed"]
+    assert "× 关闭网关时出错（原来的异常照常上抛）：RuntimeError: shutdown refused" in capsys.readouterr().out

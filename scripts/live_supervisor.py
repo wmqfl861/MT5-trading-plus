@@ -19,7 +19,7 @@ import shutil
 import subprocess
 import sys
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -98,6 +98,13 @@ class DeploymentUndeterminable(Exception):
 
 UNDETERMINABLE_LIMIT = 3         # consecutive rounds; the third escalates to a refusal
 CLEAN_REUSE_S = 15 * 60          # a full "git status" runs at most this often
+_PID_GONE = 87                   # ERROR_INVALID_PARAMETER: no process has this pid any more
+# A role's log cannot really be newer than "now", but right after the role wrote it the
+# file's last write time can read a little ahead of the clock taken later: for up to one
+# step of the clock, about a millisecond here. Requiring "0 <=" called a healthy role
+# stale whenever a check fell in that moment. This much "from the future" is tolerated;
+# beyond it the role is still unhealthy.
+LOG_AGE_TOLERANCE_S = 2.0
 
 
 def _absolute(program: str, preferred=()) -> str:
@@ -524,11 +531,19 @@ def terminate_verified_tree(entry, processes, argv, role=None):
 
     The tree is looked at again from a fresh snapshot, so it can differ from the
     one that passed the registry check; a refusal raised here carries the role.
+    The whole tree is verified before the first member is ended, and each member
+    once more through its handle right before it is terminated: nothing that did
+    not pass is ever terminated. A member that has left by itself since counts as
+    ended; the last look at the tree is what says whether anything survived.
     """
     try:
         tree = verified_tree(entry, processes.snapshot(), argv)
-        for process in tree:
-            processes.terminate(process)
+        # The Windows backend sends TerminateProcess to the whole tree before it waits
+        # for any of it (WindowsProcesses.terminate_without_waiting); stand-ins end each
+        # process as it comes.
+        with getattr(processes, "terminate_without_waiting", nullcontext)():
+            for process in tree:
+                processes.terminate(process)
         if verified_tree(entry, processes.snapshot(), argv):
             raise ValueError("worker tree did not terminate")
     except IdentityError as exc:
@@ -639,8 +654,9 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
                     seen.append(f"heartbeat_not_before_registry={not_before}")
                     age = observed.timestamp() - log_mtime
                     seen.append(f"log_age_s={age:.1f}")
+                    # A negative log age is recorded as it is; see LOG_AGE_TOLERANCE_S.
                     healthy = (status.ok and in_tree and sha_ok and not_before
-                               and 0 <= age <= health_timeout(role["interval"]))
+                               and -LOG_AGE_TOLERANCE_S <= age <= health_timeout(role["interval"]))
                 except (OSError, ValueError, TypeError, KeyError) as exc:
                     healthy = False
                     seen.append(f"read_error={type(exc).__name__}")
@@ -794,6 +810,46 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
 
 class WindowsProcesses:
     """No shell-interpolated input; terminate by a creation-time-bound OS handle."""
+
+    def __init__(self):
+        # (kernel32, handle) of the TerminateProcess calls that nobody has waited for yet
+        self._issued = None
+
+    @contextmanager
+    def terminate_without_waiting(self):
+        """Inside the block terminate() sends TerminateProcess and returns at once; the
+        handles are waited for when the block ends.
+
+        A tree is ended this way so that each member is still the process that was
+        verified when its turn comes. A launcher whose worker has died starts leaving
+        by itself within a fraction of a millisecond; waiting for the worker first
+        meant the launcher was already on its way out when TerminateProcess reached it.
+        """
+        previous, self._issued = self._issued, []
+        issued = self._issued
+        try:
+            yield
+        except BaseException:
+            self._issued = previous
+            for kernel, handle in issued:
+                try:
+                    self._wait_ended(kernel, handle)
+                except RuntimeError:
+                    pass  # the refusal on its way up is what the caller must see
+            raise
+        self._issued = previous
+        failure = None
+        for kernel, handle in issued:
+            try:
+                self._wait_ended(kernel, handle)
+            except RuntimeError as error:
+                # A member that has not ended is a refusal, but the members after it are
+                # still waited for and their handles closed (pre-freeze review S1): the first
+                # failing wait used to raise at once and leave the rest with handles open.
+                failure = failure or error
+        if failure is not None:
+            raise failure
+
     def snapshot(self):
         source = ("Get-CimInstance Win32_Process | ForEach-Object { "
                   "[pscustomobject]@{pid=$_.ProcessId;parent_pid=$_.ParentProcessId;"
@@ -831,6 +887,14 @@ class WindowsProcesses:
         return table
 
     def terminate(self, process):
+        """End `process` and wait until it has exited; inside terminate_without_waiting()
+        only the first half.
+
+        A process that has already left by itself counts as ended: it has exited, or
+        its process object is gone. It is still recognised first, by its creation time
+        read through the handle: a pid that now belongs to another process, or a process
+        that cannot be opened at all, is refused and nothing is terminated.
+        """
         from ctypes import wintypes as w
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel.OpenProcess.restype = w.HANDLE
@@ -841,6 +905,9 @@ class WindowsProcesses:
         kernel.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
         handle = kernel.OpenProcess(0x1000 | 0x1 | 0x100000, False, process["pid"])
         if not handle:
+            # pid 0 gets the same answer although the System Idle Process is always there
+            if process["pid"] > 0 and ctypes.get_last_error() == _PID_GONE:
+                return
             raise RuntimeError("cannot acquire process handle")
         try:
             created, exited, kern, user = (w.FILETIME() for _ in range(4))
@@ -850,8 +917,21 @@ class WindowsProcesses:
             expected = parse_iso(process["started_utc"]).replace(tzinfo=timezone.utc).timestamp()
             if abs(seconds - expected) > 0.01:
                 raise RuntimeError("PID reused before terminate")
-            if not kernel.TerminateProcess(handle, 75):
-                raise RuntimeError("termination failed")
+        except BaseException:
+            kernel.CloseHandle(handle)
+            raise
+        # FALSE means the process is already on its way out. This is the process verified
+        # a moment ago and the handle carries PROCESS_TERMINATE; the wait decides whether
+        # it ended.
+        kernel.TerminateProcess(handle, 75)
+        if self._issued is None:
+            self._wait_ended(kernel, handle)
+        else:
+            self._issued.append((kernel, handle))
+
+    @staticmethod
+    def _wait_ended(kernel, handle):
+        try:
             if kernel.WaitForSingleObject(handle, 10000) != 0:
                 raise RuntimeError("termination incomplete")
         finally:

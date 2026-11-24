@@ -206,7 +206,7 @@ Remove-Item data\live\killSwitch, data\live\halt.json -ErrorAction SilentlyConti
 0. 先看 `data\live\alerts.log` 里当天的 `DAILY_REPORT_FAILED`：消息按日写了实际尝试了几次、
    没有尝试的原因，以及是哪一类失败、退出码是多少（T213，见 §6.3.1）。启动或重试的时刻不在
    换日窗内（D82）时日报不连终端、退出码 3——手工补跑或者在窗外补跑任务都会这样。
-1. `type data\logs\task_live_report.log`——最常见：影子状态不可用
+1. `type data\logs\task_live_daily_report.log`——最常见：影子状态不可用
    （退出码 2，fail-closed 不落半截日报）→ 确认运行器活着、
    `data\live\paper\state-*.json` 存在且非空；
 2. 点差比对报 `model_sha256` 不一致 → 重跑 `scripts/build_cost_model.py`
@@ -519,7 +519,8 @@ heartbeat open PermissionError 最多重试 3 次（间隔 50ms），
 RiskGate 在组装账户快照前检查 halt/killSwitch 与独立 risk 心跳；缺失、未来、
 损坏或超过 `max(120s, 3×interval)` 即拒开仓并告警，纯平仓不经开仓闸门。
 健康检查在读取心跳（supervisor 同时读取日志 mtime）后取观测时钟，与账户
-快照/决策截止时间分离；读取期间新写入的心跳不误判未来，真正未来仍拒绝。
+快照/决策截止时间分离；读取期间新写入的心跳不误判未来，真正未来仍拒绝（这句说的是心跳；
+日志的修改时间另有不超过 2 秒的容差，见 §6.3）。
 当前部署固定 risk interval=10s，reconcile=30s，runner=2s。risk/reconcile
 角色文件不计入策略登记。周末报价陈旧但循环完整执行时照常更新心跳和周期
 健康日志，不能用“无决策/无 tick/空 .err”判定冻结。
@@ -637,6 +638,12 @@ PID 创建时间不符、未知子进程或缺 launcher 但 worker 仍活着的�
 `demo_run.ps1` 的 `Start-Process -WindowStyle Hidden`）在 `tests/test_t110_supervisor.py` 里，都先断言快照里
 确实有以该角色为父的 conhost，否则按失败处理并打印进程树。
 
+**日志年龄的 2 秒容差（2026-11-24）**：第 13 行里"日志年龄"这一条原来是 `0 <= age <= 超时`。角色刚写完日志时，
+文件的最后写入时间可以比 supervisor 紧随其后读到的时钟略微超前（最多一个时钟步长，本机约 1 毫秒；量到的幅度约
+1 微秒），`age` 是一个很小的负数，健康的角色就被判成陈旧：写 halt、重启。现在的条件是 `-2 秒 <= age <= 超时`
+（`LOG_AGE_TOLERANCE_S`）——日志时间"来自未来"不超过 2 秒算健康，超过照旧按不健康处理。`checks=` 里的
+`log_age_s=` 照实记，负值也记。心跳那一侧"来自未来"的判定没有动。
+
 **"无法判定"不是拒绝（T212，2026-11-23）**：核验部署时 git 超时或起不来，这一轮记为无法判定——发
 `SUPERVISOR_DEFERRED`（记录类），不重启任何角色。只读的进程树和心跳检查照常：四个角色都健康就不写 halt；
 有角色缺失或失活照旧写 halt，重启留到核验成功的那一轮。无法判定期间也不解除已有的 halt。SHA 不符、工作树
@@ -668,28 +675,48 @@ git 和 powershell 都按绝对路径调用。git 找不到按无法判定处理
 以上各段写于 2026-11-23；其中计数与升级的口径、缓存的盲区、powershell 找不到的处理，是同日独立评审
 （`docs/reviews/2026-11-23-t212-review.md`）之后修订的。
 
-**安装方式**：T211 合入后直接指向部署树的 `live_supervisor.py`，用下面的注册命令。11-19 到 11-23 用的树外
-`host.py` 包装是临时补丁，随新候选部署时撤除；留档见 `docs/ops/ops-patches/2026-11-19/`。撤除之前，
-生产上的观察运行继续用包装链，不对它热改。
+**安装方式**：任务经树内的隐藏启动器 `scripts\ops\hidden_task.vbs` 和包装脚本 `scripts\ops\supervisor_once.ps1` 调用
+部署树的 `live_supervisor.py`，用下面的注册命令。11-19 到 11-23 用的树外 `host.py` 包装是临时补丁，随新候选部署时
+撤除；留档见 `docs/ops/ops-patches/2026-11-19/`。撤除之前，生产上的观察运行继续用包装链，不对它热改。
 
 沿用 §6.2 的变量，仅在维护窗口明确批准后安装。任务只运行一次 supervisor，
 由 Windows 每分钟触发；不要在本次开发验证中安装或执行真实业务动作。
+§6.2 的变量不能以反斜杠结尾（启动器以退出码 5 拒绝），也不能含 `%`（退出码 4）。也不能含双引号：它到不了启动器（WSH 解析命令行时就把引号吃掉了，参数会变样），所以任务参数里的路径不带双引号，见 §6.3 里启动器的退出码那一条。
 
 ```powershell
+# 手工的 --inspect / --stop 直接调解释器；任务走下面的隐藏启动器。
 $supervisor = Join-Path $deploy 'scripts\live_supervisor.py'
 $argv = @('-u', $supervisor, '--directory', $deploy, '--sha', $sha,
   '--data-dir', $data, '--config-dir', $configs, '--python', $python,
   '--gateway-config', $gateway, '--risk-config', $risk,
   '--sessions-config', $sessions, '--spread-model', $spread, '--log-dir', $logs)
-$quoted = ($argv | ForEach-Object { '"' + $_ + '"' }) -join ' '
-$action = New-ScheduledTaskAction -Execute $python -Argument $quoted -WorkingDirectory $deploy
+
+# 注册：wscript.exe → scripts\ops\hidden_task.vbs → scripts\ops\supervisor_once.ps1
+# → 解释器跑 live_supervisor.py。包装脚本的参数和 supervisor 的选项一一对应。
+$launcher = Join-Path $deploy 'scripts\ops\hidden_task.vbs'
+$once = Join-Path $deploy 'scripts\ops\supervisor_once.ps1'
+$named = [ordered]@{ Directory = $deploy; Sha = $sha; DataDir = $data; ConfigDir = $configs
+  Python = $python; GatewayConfig = $gateway; RiskConfig = $risk
+  SessionsConfig = $sessions; SpreadModel = $spread; LogDir = $logs }
+$arguments = "//B //Nologo `"$launcher`" `"$once`"" +
+  (($named.GetEnumerator() | ForEach-Object { " -$($_.Key) `"$($_.Value)`"" }) -join '')
+$action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\wscript.exe') `
+  -Argument $arguments -WorkingDirectory $deploy
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
   -RepetitionInterval (New-TimeSpan -Minutes 1)
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew
 Register-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor2' `
   -Action $action -Trigger $trigger -Settings $settings
 
-# 计划内停止业务前先停用 supervisor，防它按职责补回缺失进程。
+# 部署记录要抄的（见下）：登录类型、运行级别、所在会话、启动器和包装脚本的 sha256。
+(Get-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor2').Principal |
+  Select-Object LogonType, RunLevel, UserId
+"session of this PowerShell: $((Get-Process -Id $PID).SessionId)"
+Get-FileHash -LiteralPath $launcher, $once -Algorithm SHA256 | Select-Object Hash, Path
+
+# 计划内停机：先停用两个任务，防 supervisor 按职责补回缺失进程，防看护把要关的终端拉起来。
+# 顺序是先停用看护任务，再停 supervisor，最后才关终端（下面）。
+Disable-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'terminal_keeper'
 Disable-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor2'
 # 然后设置 killSwitch，核验并停止整个父子树；仅杀 venv launcher 不够。
 New-Item -ItemType File -Force (Join-Path $data 'live\killSwitch')
@@ -702,6 +729,39 @@ if ($LASTEXITCODE -ne 0) { throw 'tree stop incomplete; preserve registry and in
 # 卸载（不改变业务进程、halt、killSwitch 或历史证据）
 Unregister-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor2' -Confirm:$false
 ```
+
+**为什么经启动器**（2026-11-24）：任务的动作如果是控制台程序（`python.exe`、`powershell.exe`，哪怕带
+`-WindowStyle Hidden`），每分钟触发一次就在交互桌面上弹一次控制台窗口。`wscript.exe` 没有控制台；
+`hidden_task.vbs` 用 `WScript.Shell.Run` 以隐藏窗口启动 PowerShell、等它结束、把退出码原样交回，所以任务的
+"上次运行结果"就是 supervisor 的退出码，"不启动新实例"（IgnoreNew）看到的也是真正的运行时间。11-19 到 11-23
+的树外包装就是为这件事加的；现在启动器和包装脚本都在部署树里，随定版 SHA 一起固定，包装脚本和任务参数里
+不需要工作区路径（D112）。
+
+- **包装脚本**（`scripts\ops\supervisor_once.ps1`）：参数和 `live_supervisor.py` 的选项一一对应，原样传过去；
+  自己切到部署目录再调解释器（任务的工作目录经 wscript 之后不再保证）。
+- **日志**：supervisor 的标准输出和标准错误按解释器写出的字节追加到
+  `<数据目录>\ops-evidence\supervisor\supervisor.log`，每次运行是一行 `start`、输出（先标准输出、后标准错误）、
+  一行 `exit <退出码>`。超过 5 MB 转成 `supervisor.log.1`，只留一代。编码是解释器重定向输出时自己用的那一种
+  （系统 ANSI 代码页；本机是 UTF-8），包装脚本不转码。告警照旧在 `alerts.log`，这个日志是补充；崩溃回溯走标准
+  错误，只有在这里看得到。
+- **退出码**：0 和 2 是 supervisor 自己的（2 是拒绝，原因在 `alerts.log` 的 `SUPERVISOR_REFUSED` 和
+  `supervisor-state.json`）；其他非零值多半是它自己崩溃，回溯在 `supervisor.log`。3 是包装脚本没能运行
+  supervisor，原因也在 `supervisor.log`。启动器自己的：2 没有参数，3 脚本不存在，4 参数里有 `%`，5 参数以反斜杠
+  结尾，6 启动器自己的语句失败或脚本没能启动。带 `%` 或以反斜杠结尾的参数一律不传：`WScript.Shell.Run` 会展开
+  `%名字%`，末尾的反斜杠会让收尾的引号被当成转义。双引号没有退出码：它到不了启动器——WSH 解析命令行时就把引号
+  吃掉了，参数传过去会被截断或变样（实测 `a"b` 到了脚本里是 `ab`）。所以任务参数里的路径不能带双引号，要拒在
+  引号还看得见的地方：装任务的入口（§6.5 的安装脚本拒绝带双引号的路径）。
+- **部署记录里要抄的**（D112）：任务的登录类型、运行级别和所在会话，动作（`wscript.exe`、启动器和包装脚本的
+  路径，抄之前换成占位符），两者的 sha256。sha256 是 64 位十六进制，描述符生成器找的是恰好 40 位的 SHA，
+  不会被数成第二个；记录行里照旧只写一个完整的 UTC 时刻。上面那条命令还会把账户名（`UserId`）打在屏幕上：
+  **账户名只在本机核对，不抄进入库的部署记录**（卫生扫描的口径），要在本机留档就放进不入库的文件。
+- **计划内停机期间这两类通知是预期的**：停机先停用看护任务，再停 supervisor，最后才关终端（上面代码块
+  里的顺序）。装了带 `--expect-keeper` 的小时任务（§6.6）之后，停机期间存活检查会报 `keeper_stale`——
+  状态文件超过 10 分钟就是生产级，第一次看到就通知；终端关着、运行器在等它的时候，还会报
+  `terminal_absent:<运行器>`。看到这两条，先核对是不是计划内停机。
+- **解释器路径**（`-Python`）是显式参数，现在指向工作区里的 `.venv`。D112 要求正式窗口起算前把生产的解释器、
+  部署树、数据、配置、日志全部移出 agent 工作区（T215）；移出之后重新注册任务。
+- **不弹窗要人工确认一次**：装完之后等下一次触发，确认交互桌面上没有窗口出现，结论写进部署记录。
 
 supervisor 发现 risk 丢失时先写自己所有的 halt 与告警；发现缺失/停止推进的
 角色时仅重启该角色，追加 `ops-restarts.jsonl`（utc、component、reason_code、
@@ -753,6 +813,12 @@ powershell -ExecutionPolicy Bypass -File "$deploy\scripts\setup_scheduled_tasks.
 
 生产根目录的名字建议只用 ASCII 字符。
 
+路径参数末尾的分隔符（`\` 或 `/`）在写进包装器之前去掉：包装器里的路径都带引号，
+写成 `"…\data\"` 时 Python 解析命令行把 `\"` 当成转义的引号，这个参数和下一个并成一个。
+作为参数的三个目录（`-DataDir`、`-RunnerLogDir`、`-ReportsDir`）不能是磁盘根目录
+（根目录的分隔符去不掉）。**路径里有 `%` 的拒绝安装**：cmd 读 `.cmd` 时把两个 `%`
+之间的内容当成变量展开，装出来的任务跑不起来。
+
 安装脚本最后打印一行 `TASK_PARAMETERS {…}`，抄进部署记录（§4 部署核对单第③条；抄之前路径
 要换成占位符）。
 
@@ -768,6 +834,10 @@ powershell -ExecutionPolicy Bypass -File "$deploy\scripts\setup_scheduled_tasks.
   时刻不在窗内就不连接，那一天的日报记为未生成（D82）。窗的定义源是 `--sessions-config`
   （`sessions.toml`），不给就用 `SessionPolicy` 的缺省窗。`--paper-state` 只读影子状态、
   不连终端，不受此限。用法和配置问题在判窗之前报告，所以窗外运行也照常看得到。
+- **任务不设"错过后尽快运行"**（`schtasks /Create` 不带 `/Z`；安装脚本就是这么写的，
+  不要手工加）。任务晚启动时脚本照样按换日窗判：窗外不连接终端，这几天的日报记为
+  未尝试，以未完成退出（退出码 3）并发一条 `DAILY_REPORT_FAILED`；缺的日报由次日
+  窗内的运行补生成。
 - 连接失败或取数失败时重试，至多 3 次（`--attempts`），间隔 300 秒（`--retry-interval-s`）。
   重试按它真正开始的时刻判窗：睡醒之后已在窗外，就不睡、不再试。
 - **夏令时不重试，这是已知的限制**。换日窗全年的交集只有本机 05:55–06:00：冬令时窗到
@@ -868,14 +938,58 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\terminal_keeper.ps1 -Termin
   `KEEPER …`，不含本机路径。状态变化（启动、拒绝）写进 `-LogPath`。
 - 互斥量按终端的最终路径命名：同一个终端一次只有一个看护实例在判断和启动；
   给另一个终端另装的看护互不影响。
-- **维护时要关终端，先禁用看护任务**，否则一分钟内它会把终端拉起来。装任务时
-  把这一步补进 §6.3 的人工停机序列。
+- **维护时要关终端，先停用看护任务**，否则一分钟内它会把终端拉起来；§6.3 的人工停机序列
+  里有这一步（先停用看护任务，再关终端）。装了带 `--expect-keeper` 的小时任务之后，停机期间
+  存活检查报 `keeper_stale`（以及运行器等终端时的 `terminal_absent`）是预期的。
 - **经网关的一次性脚本不再自动拉起各自的终端**。研究用的第二个终端（如果有）
   需要人工启动。
-- **看护任务的安装还没有做**：每分钟一次的独立任务、安装脚本、任务设置
-  （"不启动新实例"、单次运行的时间上限）、运行账户、登录类型写进部署记录。
-  下一次部署的前置；在那之前不手工装任务。装之前在终端运行时用 `-DryRun`
-  核对一次，必须输出 `running`。
+- **看护任务的安装**：每分钟一次的独立任务，由 `scripts\ops\install_terminal_keeper.ps1`
+  注册，经通用的隐藏启动器 `scripts\ops\hidden_task.vbs` 调用看护脚本——和 supervisor
+  任务（§6.3）同一个启动器，同样的原因：wscript 没有控制台，动作是控制台程序的任务
+  每分钟会在交互桌面上弹一次窗口。
+
+  ```powershell
+  # 1. 终端运行着的时候先核对看护脚本的判断，必须输出 running（上面那一条命令）
+  # 2. 只打印将要注册的内容：这条路径不查询、不注册、不注销
+  powershell -ExecutionPolicy Bypass -File scripts\ops\install_terminal_keeper.ps1 `
+    -TerminalPath "<终端安装目录>\terminal64.exe" -DeployDir "<部署树>" -DataDir "<数据目录>"
+  # 3. 动作、触发器、主体、设置核对无误后，同一条命令加 -Install 才注册
+  # 4. 看任务现在的状态（只读）。装完等一两分钟查一次：看护脚本状态文件里最近的一条也在里面
+  powershell -ExecutionPolicy Bypass -File scripts\ops\install_terminal_keeper.ps1 `
+    -Status -DataDir "<数据目录>"
+  ```
+
+  - 不带 `-Install` / `-Uninstall` 时脚本只做检查、只打印，不碰任务计划程序。打印的
+    `KEEPER_TASK_PARAMETERS {…}` 里 `mode` 是 `plan`，注册之后打印的同一行里是
+    `install`。这一行是本机的绝对路径和账户：**抄进入库的部署记录之前要脱敏**，
+    账户名只在本机核对。
+  - 任务的设置：每分钟一次，第一次在一分钟之后；"不启动新实例"（`IgnoreNew`）——看护
+    一次只要一两秒，上一次没跑完就不再起一个；单次运行的时间上限 2 分钟；主体是当前
+    用户，登录类型 `Interactive`、运行级别 `Highest`——和 supervisor 任务一样：终端要在
+    交互桌面上启动，看护要读得到同一个用户的进程的映像路径。
+  - 安装只注册任务：不往部署树里写文件（supervisor 要求部署树是干净的），不建日志目录。
+    检查全在注册之前，任何一项不对都拒绝并一次列全：路径不是完整路径、`terminal64.exe`
+    不在或名字不对、部署树里没有看护脚本或启动器、路径带 `%`（启动器以退出码 4 拒绝）或双引号（启动器看不到它：WSH 解析命令行时就把引号吃掉了，参数传过去会变样——所以在这里拒）、路径含系统
+    ANSI 代码页表示不了的字符（和 §6.3 的安装脚本同一条规矩）。同名的任务已经在了就
+    拒绝，不覆盖：换参数先 `-Uninstall`。
+  - `-Status` 只读：打印 `KEEPER_TASK_STATUS {…}`——状态、上次运行的时刻和上次结果，
+    时刻是 UTC。上面"看护被拒绝没有告警通道"那一条要核对的上次结果码，就用它查。给了
+    `-DataDir` 时还打印一行 `KEEPER_STATE {…}`：看护脚本状态文件里最近的一条（`ts`、`outcome`、
+    `reason`、`age_s`）。装完等一两分钟查一次：`outcome` 是 `running` 或 `started`、`age_s` 只有
+    一两分钟，看护就跑成了；`KEEPER_TASK_STATUS` 里 `state` 是 `Ready`、`last_task_result` 是 0。
+  - 退出码：0 做完了；1 拒绝或出错，原因在错误输出里；4 是 `-Status` 或 `-Uninstall`
+    时任务没有安装。
+  - **状态文件**：看护脚本每一次做过判断的运行，把结果写进 `-LogPath` 所在目录下的
+    `state.json`（任务的动作里就是 `<数据目录>/ops-evidence/terminal-keeper/state.json`）：
+    `ts`、`outcome`（`running` / `started` / `refused` / `start_failed`）、`reason`（拒绝和启动
+    失败的原因代码）、`running`、`others`、`pid`，不含路径和账户。只在给了 `-LogPath` 且不是
+    `-DryRun` 时写；`busy` 的那个实例不写（它没有做判断）；写不进去只警告，不改退出码。
+    小时级存活检查读它（§6.6）。
+  - **不要手工拼 `Register-ScheduledTask`**：任务的动作、触发器、主体、设置只在安装
+    脚本里定义一份。部署记录里抄的是打印出来的那一行（路径和账户脱敏）：任务的路径和
+    名字、`start_boundary`、`repeat_interval`、`multiple_instances`、
+    `execution_time_limit`、`logon_type`、`run_level`、启动器和看护脚本的 SHA-256。
+  - 不在安装脚本之外另装同名的任务；卸载只用 `-Uninstall`（只注销，不删日志）。
 
 **验收**（第二十三轮计划 §2.2 第 7 条）：P23-2 的网关一半已翻转——探针在
 T209 上报 NOT-REPRODUCED（终端退出后 `initialize` 被调 0 次）。演练 C 在
@@ -887,11 +1001,12 @@ supervisor 全程没有拒绝。取证时不要只看 supervisor 有没有拒绝
 
 ### 6.6 小时级只读存活检查（T214，第二十三轮）
 
-`scripts/ops/liveness_check.py` 设计为由一个独立的计划任务每小时运行一次，不依赖任何 agent 会话。**任务还没有安装**（装之前要做的事见本节末）。它不 import MetaTrader5、不连接交易终端：只读登记表、心跳、supervisor 状态、控制文件和磁盘余量，唯一的写是它自己的状态文件。判级和排通知的纯逻辑在 `scripts/ops/liveness_logic.py`。
+`scripts/ops/liveness_check.py` 设计为由一个独立的计划任务每小时运行一次，不依赖任何 agent 会话。**任务还没有安装**（装之前要做的事见本节末）。它不 import MetaTrader5、不连接交易终端：只读登记表、心跳、supervisor 状态、控制文件和磁盘余量（带了 `--expect-keeper` 时还读看护脚本的状态文件），唯一的写是它自己的状态文件。判级和排通知的纯逻辑在 `scripts/ops/liveness_logic.py`。
 
 ```powershell
 # 手工跑一次：输出一行 JSON。退出码 0 没有生产级问题，3 有，2 是检查自己出错
 .venv/Scripts/python.exe scripts/ops/liveness_check.py --live-dir <数据目录>/live --reports-dir <数据目录>/reports --disk-path <数据目录> --no-notify
+# 装了看护任务（§6.5）的部署加 --expect-keeper；每小时的任务把它写进命令行
 ```
 
 带 `--no-notify` 只判定、不发通知；去掉它之前先读下面"通知"一段。
@@ -901,12 +1016,19 @@ supervisor 全程没有拒绝。取证时不要只看 supervisor 有没有拒绝
 | 代码 | 什么时候算生产级 |
 | --- | --- |
 | `role_missing:<角色>`、`heartbeat_stale:<角色>`、`supervisor_state_stale`、`registry_unreadable` | 持续满 10 分钟 |
+| `terminal_absent:<运行器>`、`keeper_absent`、`keeper_stale`、`keeper_refused`（后三个只在带了 `--expect-keeper` 时评） | 持续满 10 分钟；`keeper_stale` 和启动等待的 `terminal_absent` 用现场自己的年龄，满了 10 分钟的第一次看到就是生产级 |
 | `halt`、`pause:<magic>`、`kill_switch`、`risk_veto` | 持续满 1 小时 |
 | `disk_low`（低于 10 GB）、`disk_unknown`、`report_missing`、`registry_invalid`、`clock_ahead:<来源>` | 一出现就是 |
 
 - 时长取"检查器第一次看到至今"和现场自己的年龄（心跳年龄、文件修改时间）里大的那个。心跳已经停了 10 分钟的角色，第一次看到就算生产级。
 - 有生产级问题退出码是 3；只有不算生产级的发现时退出码是 0，`ok` 是 false。
 - 登记表不存在、读不出、解析不了是 `registry_unreadable`；顶层不成形状、空的、条目对不上身份是 `registry_invalid`。
+
+**看护任务和终端**（看护脚本见 §6.5）：
+
+- `--expect-keeper` 表示这个部署装了看护任务。为什么要明说：看护的状态文件是看护脚本自己写的，"装了任务但一次也没跑成"和"根本没装"在文件系统上一样，都还没有文件；而现在的观察运行没有装看护任务，定版前也不该因为这一条每 24 小时收到一次通知。所以由小时任务的命令行带这个开关，不带给三类看护发现都不评，输出的 `keeper` 是 `not_checked`。带了：状态文件不在是 `keeper_absent`；10 分钟没有更新是 `keeper_stale`（看护每分钟运行一次，状态文件自己的年龄满了 10 分钟，第一次看到就是生产级）；最近一次是 `refused` 或 `start_failed` 是 `keeper_refused`。状态文件读不出、不是对象、没有 `ts` 的按文件修改时间算年龄；`ts` 来自未来记 `clock_ahead:keeper`。`outcome`、`reason` 只有长得像标识符的才进输出。
+- `terminal_absent:<运行器>` **不受这个开关管**，永远评：万一装小时任务的人漏了开关，"终端不在、交易停着"这一条最要紧的仍然有人看。信号来自运行器自己的心跳：等终端的时候心跳照写，`role_missing`、`heartbeat_stale` 都不会触发。两种说法都算——启动等待（心跳的 `last_error` 是 `waiting_for_terminal`）；连上之后终端进程没了（网关的 `TerminalNotConnectedError` 带着类名进了 `last_error`）。启动等待的时长取"检查器第一次看到至今"和"现在减去登记里的 `started_utc`"里大的那个——启动等待的运行器从启动起就在等，这个数是下界：已经等了 10 分钟以上的，当次就是生产级，不用再等一个小时。丢了终端没有可信的起点（它每等 15 分钟以 78 退出、被 supervisor 重启，`started_utc` 也会归零），只靠检查器自己的时钟。
+- 这一类只覆盖运行器：对账、风控两个角色等终端和断线时写的心跳不带这类标记。部署之后如果要它们也被看到，得先让它们写（改生产代码，另议）。
 
 **日报的口径**：22:30 UTC 之前要求前天的日报在，22:30 起要求昨天的（日报任务 21:57 UTC 生成前一天的日报，留 33 分钟宽限）。某一天的日报只在它生成的那一刻（次日 21:57 UTC）部署已经在跑才要求，依据是登记表里最早的 `started_utc` 早于那一刻。所以：部署在 21:57 UTC 之后的，当晚的日报不要求；四个角色同一天全部重启之后，生成时刻早于新登记的日报都不要求；在 21:57 UTC 之前启动的，当晚 22:30 起就要求。这条规则只信登记里的 `started_utc`：被写早了会多报，不会漏报。日报任务晚启动 33 分钟以上，当小时的检查先报缺，下一小时报"已恢复"。
 
@@ -926,7 +1048,7 @@ supervisor 全程没有拒绝。取证时不要只看 supervisor 有没有拒绝
 
 1. U10 定通知渠道，接收地址只放本机。**U10 没有答复时不起算（D113）。** 渠道定了再定 N-4：消息里带不带停机原因的代码。
 2. 日报任务（§6.3.1）先装好、启用。观察运行期间 `live_daily_report` 是停用的（11-21 起，运维日志 11-23 一节的第 8 项）；现在装存活检查，当晚 22:30 UTC 起就会报缺日报。
-3. 安装小时级任务：在工作区之外，显式的绝对路径；运行账户能打开生产进程；登录类型和会话写进部署记录。
+3. 安装小时级任务：在工作区之外，显式的绝对路径；运行账户能打开生产进程；登录类型和会话写进部署记录。装了看护任务（§6.5）的部署，命令行带 `--expect-keeper`，和看护任务在同一个维护窗里生效。
 4. 通知演练：停一个假角色，一小时内收到；再加一条反向的，健康现场 24 小时零通知。
 5. 施工计划 §3.2 第 5 条：把"主会话缺位"写进调度指令。
 6. 调度日检核对存活检查自己：最近一小时运行过，退出码是 0 或 3，`notified` 不是"没有渠道"，`notify_error`、`state_error` 为空。

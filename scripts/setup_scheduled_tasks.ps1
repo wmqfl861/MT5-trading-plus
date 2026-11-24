@@ -79,6 +79,12 @@
 #（不建目录、不写包装器、不建任务）——11-17 起日报和周检任务因为命令指向部署树里
 # 不存在的 .venv，每次都以 rc=1 失败，Python 根本没有启动。安装结束打印一行
 # TASK_PARAMETERS {…}，任务参数随部署形态写进部署记录。
+#
+# T213 第二次复审 N3（定版前的补提交）：路径参数末尾的分隔符（"…\"、"…/"）先去掉
+# 再写——包装器里的路径都带引号，写成 "…\data\" 时 Python 解析命令行把 \" 当成转义
+# 的引号，--data-dir 和 --reports-dir 并成一个参数；路径里有 % 就拒绝安装——cmd 把
+# 两个 % 之间的内容当成变量展开，两份包装器都跑不起来。两种都在建目录、建任务之前
+# 处理。
 
 [CmdletBinding()]
 param(
@@ -102,9 +108,19 @@ if ($Mode -notin @("Demo", "PaperSoak")) {
 
 $scriptsDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot   = Split-Path -Parent $scriptsDir
+function Remove-TrailingSeparator([string]$path) {
+    # 去掉路径末尾的分隔符（第二次复审 N3）。盘符根目录（C:\）的 GetPathRoot 自带末尾的分隔符，原样返回；
+    # UNC 共享根目录（\\主机\共享\）的 GetPathRoot 不带末尾的分隔符（Windows PowerShell 5.1 和 PowerShell 7
+    # 都是这样），返回的是去掉它的 \\主机\共享。两种结果都由下面的检查按根目录拒绝。
+    $root = [System.IO.Path]::GetPathRoot($path)
+    $trimmed = $path.TrimEnd([System.IO.Path]::DirectorySeparatorChar,
+                             [System.IO.Path]::AltDirectorySeparatorChar)
+    if ($trimmed.Length -lt $root.Length) { return $root }
+    return $trimmed
+}
 function Resolve-Location([string]$given, [string]$fallback) {
     if ([string]::IsNullOrWhiteSpace($given)) { return $fallback }
-    return [System.IO.Path]::GetFullPath($given)
+    return Remove-TrailingSeparator ([System.IO.Path]::GetFullPath($given))
 }
 $dataDir      = Resolve-Location $DataDir (Join-Path $repoRoot "data")
 $python       = Resolve-Location $PythonExe (Join-Path $repoRoot ".venv\Scripts\python.exe")
@@ -117,7 +133,7 @@ $sessionsPath = Resolve-Location $SessionsConfig (Join-Path $repoRoot "config\se
 # 配置文件统一为 config.json（README 约定）；兼容旧名 gateway.json；T213 起可用 -GatewayConfig 指定。
 $cfgPath = $null
 if (-not [string]::IsNullOrWhiteSpace($GatewayConfig)) {
-    $cfgPath = [System.IO.Path]::GetFullPath($GatewayConfig)
+    $cfgPath = Remove-TrailingSeparator ([System.IO.Path]::GetFullPath($GatewayConfig))
 } else {
     foreach ($name in @("config.json", "gateway.json")) {
         $candidate = Join-Path $repoRoot $name
@@ -181,11 +197,24 @@ if ($acp -eq 65001) {
 }
 foreach ($location in @($python, $repoRoot, $dataDir, $logsDir, $runnerLogs, $reportsDir, $spreadPath, $sessionsPath, $cfgPath)) {
     if ($null -eq $location) { continue }
+    if ($location.Contains('%')) {
+        # 第二次复审 N3：cmd 读 .cmd 时把两个 % 之间的内容当成变量展开，路径被改掉；
+        # 安装照样成功，两份包装器都跑不起来。
+        throw ("路径里有百分号（%），cmd 读 .cmd 包装器时把它当成变量展开，路径被改掉，装出来的任务跑不起来，拒绝安装：$location。请把 % 从路径里去掉。")
+    }
     if ($acp -ne $oemcp -and $location -match '[^\x00-\x7F]') {
         throw ("这台机器的控制台代码页（OEM $oemcp）和系统 ANSI 代码页（$acp）不同，带非 ASCII 字符的路径装出来的任务跑不起来，拒绝安装：$location。请把项目放在纯 ASCII 路径下。")
     }
     if ($wrapperEncoding.GetString($wrapperEncoding.GetBytes($location)) -cne $location) {
         throw ("路径含系统 ANSI 代码页（$acp）表示不了的字符，写出的 .cmd 包装器跑不起来，拒绝安装：$location。请改用这个代码页能表示的路径（建议只用 ASCII 字符）。")
+    }
+}
+# 第二次复审 N3：作为参数写进包装器的三个目录不能还是文件系统的根目录——末尾的
+# 分隔符去不掉，带引号写进去这个参数会和下一个并成一个。部署树（cd 的目标）和
+# 任务日志目录（输出重定向的位置）不作为参数，不在此列。
+foreach ($location in @($dataDir, $runnerLogs, $reportsDir)) {
+    if ($location -eq [System.IO.Path]::GetPathRoot($location)) {
+        throw ("路径是文件系统的根目录（$location），不能作为参数写进 .cmd 包装器：末尾的分隔符去不掉，带引号写进去会和下一个参数并成一个。拒绝安装，请给出它下面的一个子目录。")
     }
 }
 New-Item -ItemType Directory -Force -Path $logsDir | Out-Null

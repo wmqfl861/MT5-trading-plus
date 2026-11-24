@@ -579,3 +579,440 @@ def test_launch_path_demo_run_start_process_hidden_is_verified_and_terminated(tm
                              backend.snapshot()[launcher_pid]["started_utc"], argv)
     finally:
         subprocess.run(["taskkill", "/PID", str(launcher_pid), "/T", "/F"], capture_output=True)
+
+
+# ---- C2 (2026-11-24): a tree whose launcher leaves by itself
+#
+# A role is two processes: the venv's python.exe (the launcher), which waits for its worker
+# and exits the moment the worker dies, and the interpreter running the role. Ending the
+# worker first and the launcher right after worked only when the backend reached the
+# launcher within a fraction of a millisecond. Otherwise the launcher was already on its
+# way out, TerminateProcess failed, and the round was refused ("termination failed").
+#
+# The trees here are built by the tests, not by the interpreter: on CI sys.executable is
+# the plain python.exe, with no launcher in front of it. (A first version of these tests
+# relied on the venv's launcher and failed on CI for that reason.)
+
+def launcher_with_worker(tmp_path):
+    """The risk role as a real tree with a launcher that leaves by itself, whatever the
+    interpreter is. The registered script is the launcher: it starts the same script
+    again, with the same arguments, as the worker (which only sleeps), waits for it, and
+    exits when it has gone -- what the venv's python.exe does with a role. The same
+    arguments are what let the worker pass the identity check. Where sys.executable is
+    itself such a launcher the tree just has one level more."""
+    mod, cfg, _, live, entries = setup(tmp_path)
+    entry = next(e for e in entries if e["kind"] == "risk")
+    script = Path(entry["argv"][2])
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(
+        "import os, subprocess, sys, time\n"
+        "if os.environ.get('T110_ROLE_WORKER'):\n"
+        "    time.sleep(120)\n"
+        "else:\n"
+        "    worker = subprocess.Popen([sys._base_executable, '-u', *sys.argv],\n"
+        "                              env={**os.environ, 'T110_ROLE_WORKER': '1'})\n"
+        "    sys.exit(worker.wait())\n")
+    return mod, cfg, live, entry
+
+
+def start_role(entry):
+    import subprocess
+    return subprocess.Popen(entry["argv"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def verified_real_tree(mod, backend, entry, launcher, seconds=15):
+    """The registry entry of a real launcher, and its tree once verified_tree has seen
+    the worker too (the launcher starts it a fraction of a second after it comes up)."""
+    import time
+    deadline = time.monotonic() + seconds
+    while True:
+        table = backend.snapshot()
+        entry = dict(entry, pid=launcher, started_utc=table[launcher]["started_utc"])
+        tree = mod.verified_tree(entry, table, entry["argv"])
+        if len(tree) >= 2:
+            return entry, tree
+        if time.monotonic() > deadline:
+            pytest.fail(f"the tree under pid {launcher} never came up whole: {tree}")
+        time.sleep(0.1)
+
+
+def late_for_the_launcher(backend, launcher, seconds=0.1):
+    """Make the backend reach the launcher only after a pause, so that it has left by
+    itself by then. Returns the backend's own terminate, for the clean-up."""
+    import time
+    original = backend.terminate
+
+    def terminate(process):
+        if process["pid"] == launcher:
+            time.sleep(seconds)
+        original(process)
+
+    backend.terminate = terminate
+    return original
+
+
+def end_fake(terminate, tree):
+    for item in tree:
+        try:
+            terminate(item)
+        except RuntimeError:
+            pass  # already gone
+
+
+def kernel32_as_the_supervisor_sees_it(monkeypatch, mod, wrap):
+    """Replace the ctypes module as live_supervisor names it: WinDLL gives the real
+    library, except that kernel32 is wrap(real library)."""
+    import ctypes
+    import types
+    real = ctypes.WinDLL
+    namespace = types.SimpleNamespace(**vars(ctypes))
+    namespace.WinDLL = lambda name, *args, **kwargs: (
+        wrap(real(name, *args, **kwargs)) if name.lower() == "kernel32"
+        else real(name, *args, **kwargs))
+    monkeypatch.setattr(mod, "ctypes", namespace)
+
+
+def record_kernel_calls(monkeypatch, mod, calls):
+    """kernel32 with TerminateProcess and WaitForSingleObject reporting every call. The
+    real call is made as well."""
+
+    def wrap(real):
+        class Function:
+            def __init__(self, name, fn):
+                self._name, self._fn = name, fn
+
+            def __getattr__(self, attr):
+                return getattr(self._fn, attr)
+
+            def __setattr__(self, attr, value):    # restype and argtypes go to the real function
+                if attr.startswith("_"):
+                    object.__setattr__(self, attr, value)
+                else:
+                    setattr(self._fn, attr, value)
+
+            def __call__(self, *args):
+                calls.append(self._name)
+                return self._fn(*args)
+
+        class Kernel:
+            def __getattr__(self, name):
+                if name in ("TerminateProcess", "WaitForSingleObject"):
+                    return Function(name, getattr(real, name))
+                return getattr(real, name)
+
+        return Kernel()
+
+    kernel32_as_the_supervisor_sees_it(monkeypatch, mod, wrap)
+
+
+def refuse_to_open(monkeypatch, mod, error):
+    """kernel32 whose OpenProcess finds nothing and leaves `error` as the last error."""
+
+    def wrap(real):
+        class Kernel:
+            def __getattr__(self, name):
+                return (lambda access, inherit, pid: None) if name == "OpenProcess" else getattr(real, name)
+
+        return Kernel()
+
+    kernel32_as_the_supervisor_sees_it(monkeypatch, mod, wrap)
+    monkeypatch.setattr(mod.ctypes, "get_last_error", lambda: error)
+
+
+def wait_until_gone(pid, seconds=30):
+    """Wait until no process object has this pid any more: OpenProcess then fails with 87."""
+    import ctypes
+    import time
+    from ctypes import wintypes as w
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.restype = w.HANDLE
+    kernel.OpenProcess.argtypes = [w.DWORD, w.BOOL, w.DWORD]
+    kernel.CloseHandle.argtypes = [w.HANDLE]
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        handle = kernel.OpenProcess(0x1000 | 0x100000, False, pid)   # query and wait only
+        if not handle:
+            assert ctypes.get_last_error() == 87
+            return
+        kernel.CloseHandle(handle)
+        time.sleep(0.05)
+    pytest.fail(f"the process object of pid {pid} is still there after {seconds} s")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows fake process tree")
+def test_stop_ends_a_tree_whose_launcher_has_left_by_itself(tmp_path):
+    """C2, the stop path. The worker is ended first and the launcher follows at once; here
+    the backend reaches the launcher 0.1 s late, so that it has already left. The stop
+    used to be refused with RuntimeError("termination failed")."""
+    mod, cfg, live, entry = launcher_with_worker(tmp_path)
+    proc = start_role(entry)
+    backend = mod.WindowsProcesses()
+    original, tree = backend.terminate, []
+    try:
+        entry, tree = verified_real_tree(mod, backend, entry, proc.pid)
+        (live / "instances.json").write_text(json.dumps({"schema_version": 1, "instances": [entry]}))
+        (live / "killSwitch").touch()
+        # The tree is children first: tree[0] is the worker, tree[1] the launcher waiting for it.
+        original = late_for_the_launcher(backend, tree[1]["pid"])
+        stopped = mod.stop_deployment(cfg, backend, verify_deployment=lambda c: None)
+        assert stopped["refused"] is False, stopped
+        assert stopped["stopped"] == ["risk"]
+        assert not mod.verified_tree(entry, backend.snapshot(), entry["argv"])
+    finally:
+        backend.terminate = original
+        end_fake(original, tree)
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows fake process tree")
+def test_supervise_restarts_a_role_whose_launcher_has_left_by_itself(tmp_path):
+    """C2, the restart path: the same tree under supervise(). The role is restarted because
+    its heartbeat names a pid that is not in the tree. The restart used to end the round
+    as a refusal (halt supervisor_refused, the alert SUPERVISOR_REFUSED) and nothing after
+    it was restarted. Roles are not really relaunched here: launch only answers."""
+    mod, cfg, live, entry = launcher_with_worker(tmp_path)
+    proc = start_role(entry)
+    backend = mod.WindowsProcesses()
+    launched = []
+
+    def launch(argv, cwd, log, env):
+        pid = 900 + len(launched)
+        launched.append(argv)
+        return dict(pid=pid, started_utc=NOW.isoformat(), argv=argv, executable=argv[0])
+
+    backend.launch = launch
+    original, tree = backend.terminate, []
+    try:
+        entry, tree = verified_real_tree(mod, backend, entry, proc.pid)
+        (live / "instances.json").write_text(json.dumps({"schema_version": 1, "instances": [entry]}))
+        # tree[0] is the worker, tree[1] the launcher waiting for it.
+        original = late_for_the_launcher(backend, tree[1]["pid"])
+        result = mod.supervise(cfg, backend, now=NOW, verify_deployment=lambda c: None)
+        assert result["refused"] is False, result.get("reason")
+        assert result["restarted"] == ["777", "risk", "reconcile"]
+        rows = [json.loads(line) for line in (live / "ops-restarts.jsonl").read_text().splitlines()]
+        assert [row["component"] for row in rows] == ["777", "risk", "reconcile"]
+        assert rows[1]["old_pid"] == proc.pid and rows[1]["new_pid"] == 901
+    finally:
+        backend.terminate = original
+        end_fake(original, tree)
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows fake process tree")
+def test_a_tree_is_terminated_in_full_before_any_member_is_waited_for(tmp_path, monkeypatch):
+    """C2: every member gets its TerminateProcess while it is still the process that was
+    verified, and only then is anything waited for. Waiting for the worker first is what
+    left the launcher already leaving when its turn came."""
+    mod, cfg, live, entry = launcher_with_worker(tmp_path)
+    proc = start_role(entry)
+    backend = mod.WindowsProcesses()
+    original, tree = backend.terminate, []
+    try:
+        entry, tree = verified_real_tree(mod, backend, entry, proc.pid)
+        calls = []
+        record_kernel_calls(monkeypatch, mod, calls)
+        mod.terminate_verified_tree(entry, backend, entry["argv"])
+        # Every member of the tree first, whichever interpreter built it; only then the waits.
+        assert calls == ["TerminateProcess"] * len(tree) + ["WaitForSingleObject"] * len(tree)
+        assert not mod.verified_tree(entry, backend.snapshot(), entry["argv"])
+    finally:
+        end_fake(original, tree)
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows fake process tree")
+def test_a_failed_wait_does_not_leave_the_rest_of_the_tree_unwaited(tmp_path, monkeypatch):
+    """Pre-freeze review S1: when the first wait after terminate-without-waiting reports
+    that its process has not ended, the refusal goes up, and the remaining members are
+    still waited for with every handle closed. The first failing wait used to raise at
+    once and leave the rest neither waited nor closed."""
+    mod, cfg, live, entry = launcher_with_worker(tmp_path)
+    proc = start_role(entry)
+    backend = mod.WindowsProcesses()
+    original, tree = backend.terminate, []
+    try:
+        entry, tree = verified_real_tree(mod, backend, entry, proc.pid)
+        seen = []                                   # ("wait" | "close", handle), in call order
+        refused = []
+
+        def wrap(real):
+            class Kernel:
+                def __getattr__(self, name):
+                    if name == "WaitForSingleObject":
+                        def wait(handle, milliseconds):
+                            seen.append(("wait", handle))
+                            if not refused:          # the first wait of this run: not ended in time
+                                refused.append(handle)
+                                return 258          # WAIT_TIMEOUT, and nothing is waited for
+                            return real.WaitForSingleObject(handle, milliseconds)
+                        return wait
+                    if name == "CloseHandle":
+                        def close(handle):
+                            seen.append(("close", handle))
+                            return real.CloseHandle(handle)
+                        return close
+                    return getattr(real, name)
+            return Kernel()
+
+        kernel32_as_the_supervisor_sees_it(monkeypatch, mod, wrap)
+        with pytest.raises(RuntimeError, match="termination incomplete"):
+            mod.terminate_verified_tree(entry, backend, entry["argv"])
+        waited = [handle for call, handle in seen if call == "wait"]
+        closed = [handle for call, handle in seen if call == "close"]
+        assert refused and len(waited) == len(tree) >= 2          # every member was waited for
+        assert len(set(waited)) == len(tree) and sorted(closed) == sorted(waited)   # every handle closed
+    finally:
+        end_fake(original, tree)
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows process handles")
+def test_terminate_counts_an_exited_process_as_ended(tmp_path):
+    """C2: a process that left by itself has nothing left to end. While some handle keeps
+    its process object alive OpenProcess still finds it; that used to be "termination failed"."""
+    import subprocess
+    mod = load_supervisor()
+    backend = mod.WindowsProcesses()
+    short = subprocess.Popen([sys._base_executable, "-I", "-c", "import sys; sys.stdin.readline()"],
+                             stdin=subprocess.PIPE)
+    try:
+        row = backend.snapshot()[short.pid]        # its creation time, read while it runs
+        short.stdin.close()                        # end of input: it leaves by itself
+        short.wait(timeout=30)                     # this handle keeps its process object
+        backend.terminate(row)
+    finally:
+        if short.poll() is None:
+            short.kill()
+        short.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows process handles")
+def test_terminate_counts_a_vanished_process_as_ended(tmp_path):
+    """C2: the same once the process object is gone and OpenProcess fails; that used to be
+    "cannot acquire process handle". The process was started by the backend itself and
+    ended by it; nothing holds a handle to it."""
+    import os
+    mod = load_supervisor()
+    backend = mod.WindowsProcesses()
+    argv = [sys._base_executable, "-I", "-c", "import time; time.sleep(120)"]    # one process
+    launched = backend.launch(argv, str(tmp_path), str(tmp_path / "role.log"), dict(os.environ))
+    backend.terminate(launched)
+    wait_until_gone(launched["pid"])
+    backend.terminate(launched)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows process handles")
+def test_terminate_still_refuses_a_pid_that_now_belongs_to_another_process(tmp_path):
+    """C2: "already gone" is not "somebody else is there now". The creation time is still
+    checked through the handle; when it differs nothing is terminated."""
+    import subprocess
+    mod = load_supervisor()
+    backend = mod.WindowsProcesses()
+    other = subprocess.Popen([sys._base_executable, "-I", "-c", "import time; time.sleep(60)"])
+    try:
+        row = dict(backend.snapshot()[other.pid])
+        row["started_utc"] = (mod.parse_iso(row["started_utc"]) + timedelta(seconds=1)).isoformat()
+        with pytest.raises(RuntimeError, match="PID reused before terminate"):
+            backend.terminate(row)
+        assert other.poll() is None                # left alone
+    finally:
+        other.kill()
+        other.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows process handles")
+def test_terminate_still_refuses_what_cannot_be_identified(tmp_path, monkeypatch):
+    """C2: "already gone" is not "could not be opened". A process that cannot be opened
+    (access denied here) is still a refusal and is left alone. So is pid 0, for which
+    OpenProcess answers 87 just as it does for a pid that no longer exists."""
+    import subprocess
+    mod = load_supervisor()
+    backend = mod.WindowsProcesses()
+    other = subprocess.Popen([sys._base_executable, "-I", "-c", "import time; time.sleep(60)"])
+    try:
+        row = backend.snapshot()[other.pid]
+        refuse_to_open(monkeypatch, mod, error=5)
+        with pytest.raises(RuntimeError, match="cannot acquire process handle"):
+            backend.terminate(row)
+        assert other.poll() is None                # left alone
+
+        refuse_to_open(monkeypatch, mod, error=87)
+        with pytest.raises(RuntimeError, match="cannot acquire process handle"):
+            backend.terminate(dict(row, pid=0))
+    finally:
+        other.kill()
+        other.wait(timeout=5)
+
+
+# ---- C3 (2026-11-24): the log age may read a little negative
+#
+# A role is called stale when its log is too old: 0 <= now - log_mtime <= timeout. The file's
+# last write time can read a little ahead of the clock taken right after it (Python's clock
+# moves in steps of about a millisecond), so for a moment after a role wrote its log the age
+# was a tiny negative number and a healthy role was called stale: halt, restart. The heartbeats
+# are written here with the same clock the supervisor reads, as in production: only the log
+# age is negative.
+
+def run_with_the_log_written_just_after_the_clock(tmp_path, early):
+    """setup(), the heartbeats stamped with the supervisor's clock, and supervise() with
+    that clock reading `early` seconds before the roles' logs were last written."""
+    import os
+    mod, cfg, p, live, entries = setup(tmp_path)
+    observed = datetime.fromtimestamp(os.stat(entries[0]["log"]).st_mtime - early, tz=timezone.utc)
+    for e in entries:
+        key = str(e["magic"]) if e["kind"] == "runner" else e["kind"]
+        fresh(live, key, e["pid"], cfg.sha, observed)
+    return mod, cfg, p, live, run(mod, cfg, p, now=observed)
+
+
+@pytest.mark.parametrize("early", [0.0005, 0.001, 1.5])
+def test_a_log_written_moments_after_the_clock_does_not_make_a_healthy_role_stale(tmp_path, early):
+    """C3: inside LOG_AGE_TOLERANCE_S a negative log age is not staleness. All three values
+    used to halt and restart every role."""
+    mod, cfg, p, live, result = run_with_the_log_written_just_after_the_clock(tmp_path, early)
+    assert result["restarted"] == [], result
+    assert result["refused"] is False and p.started == [] and p.killed == []
+    assert not (live / "halt.json").exists()
+    assert mod.LOG_AGE_TOLERANCE_S == 2.0
+
+
+@pytest.mark.parametrize("early", [2.5, 3.0])
+def test_a_log_from_farther_ahead_than_the_tolerance_still_makes_the_role_stale(tmp_path, early):
+    """C3: the tolerance is 2 seconds, not "any log time in the future will do". A log from
+    farther ahead is still unhealthy: halt and restart, as before."""
+    mod, cfg, p, live, result = run_with_the_log_written_just_after_the_clock(tmp_path, early)
+    assert result["restarted"] == ["777", "risk", "reconcile"]
+    assert (live / "halt.json").exists()
+
+
+def test_the_alert_records_a_negative_log_age_as_it_is(tmp_path):
+    """C3: `log_age_s=` in the alert's checks is the number that was computed. A negative one
+    stays negative, outside the tolerance and inside it."""
+    # Farther ahead than the tolerance: stale, and the check says by how much.
+    mod, cfg, p, live, result = run_with_the_log_written_just_after_the_clock(tmp_path, 3.0)
+    assert result["restarted"] == ["777", "risk", "reconcile"]
+    assert "log_age_s=-3.0" in (live / "alerts.log").read_text(encoding="utf-8")
+
+    # Inside the tolerance the log is not what makes the role stale; a stale heartbeat is,
+    # and the negative log age is still written as it was.
+    import os
+    work = tmp_path / "stale-heartbeat"
+    work.mkdir()
+    mod, cfg, p, live, entries = setup(work)
+    observed = datetime.fromtimestamp(os.stat(entries[0]["log"]).st_mtime - 1.0, tz=timezone.utc)
+    for e in entries:
+        key = str(e["magic"]) if e["kind"] == "runner" else e["kind"]
+        fresh(live, key, e["pid"], cfg.sha, observed - timedelta(seconds=300))
+    result = run(mod, cfg, p, now=observed)
+    assert result["restarted"] == ["777", "risk", "reconcile"]
+    alert = (live / "alerts.log").read_text(encoding="utf-8")
+    assert "log_age_s=-1.0" in alert and "heartbeat=timeout" in alert

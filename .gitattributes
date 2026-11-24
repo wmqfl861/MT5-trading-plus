@@ -19,3 +19,8 @@ research/candidates/*.toml text eol=lf
 # checkout time, so a checkout made with other settings changed the line endings
 # (round-20 review, O20-4).
 *.ps1 text eol=crlf
+
+# Windows Script Host files: a scheduled task runs the .vbs checked out on that machine,
+# whatever core.autocrlf says there. Pinned to CRLF so that scripts/ops/hidden_task.vbs has
+# the same bytes everywhere (it must not carry a BOM: wscript would take it for code).
+*.vbs text eol=crlf

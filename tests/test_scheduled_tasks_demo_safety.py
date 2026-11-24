@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -559,3 +560,108 @@ def test_installed_wrappers_start_under_non_ascii_paths(tmp_path):
         "--reports-dir", parameters["reports_dir"]]
     assert (Path(parameters["task_log_dir"]) / "task_live_daily_report.log").is_file()
     assert (Path(parameters["runner_log_dir"]) / "weekly-check.md").is_file()
+
+
+# ------------------------------------------ T213 second review (2026-11-23), N3: paths the wrappers cannot carry
+
+def wrapper_argv(deploy, out, task):
+    """Run an installed wrapper with cmd.exe and return the argv the stand-in script got."""
+    env = dict(os.environ, STANDIN_OUT=str(out))
+    done = subprocess.run(["cmd.exe", "/d", "/c", f"task_{task}.cmd"],
+                          cwd=deploy / "scripts", env=env, capture_output=True, timeout=60)
+    assert done.returncode == 0, done.stdout + done.stderr      # Python 启动并跑完
+    return json.loads(out.read_text(encoding="utf-8"))
+
+
+# -DataDir etc. as they are named in the TASK_PARAMETERS line
+PARAMETER_KEYS = {"DataDir": "data_dir", "ReportsDir": "reports_dir",
+                  "RunnerLogDir": "runner_log_dir", "TaskLogDir": "task_log_dir"}
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
+def test_path_arguments_ending_in_a_separator_reach_the_task_as_separate_arguments(tmp_path):
+    """Second review (N3): -DataDir and -ReportsDir given the way PowerShell users often write
+    them, with a trailing backslash (or slash). GetFullPath keeps it, so the wrappers said
+    --data-dir "…\\data\\" and Python took the closing quote as part of the argument:
+    --data-dir and --reports-dir arrived as one argument, and the install reported success.
+    The separators are removed before anything is written. Both wrappers are run here
+    with cmd.exe: every path arrives on its own, without a trailing separator."""
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    gateway = runtime / "gateway.json"
+    gateway.write_text(json.dumps({"allow_live_trading": False}), encoding="utf-8")
+    directories = {"DataDir": runtime / "data", "ReportsDir": runtime / "reports",
+                   "RunnerLogDir": runtime / "demo", "TaskLogDir": runtime / "tasklogs"}
+    paths = {name: str(path) + sep for (name, path), sep in
+             zip(directories.items(), ["\\", "/", "\\", "/"])}
+    paths.update({"PythonExe": sys.executable, "GatewayConfig": gateway,     # the wrappers are run below
+                  "SpreadModel": runtime / "costs" / "spread_model.json",
+                  "SessionsConfig": tmp_path / "config" / "sessions.toml"})
+    result, wrapper = install_in_sandbox(tmp_path, "Demo", with_config=False, paths=paths)
+    assert result.returncode == 0, _output(result)
+    lines = [line for line in result.stdout.decode(errors="replace").splitlines()
+             if line.startswith("TASK_PARAMETERS ")]
+    assert len(lines) == 1
+    parameters = json.loads(lines[0].removeprefix("TASK_PARAMETERS "))
+    for name, path in directories.items():
+        assert parameters[PARAMETER_KEYS[name]] == str(path), name     # no separator left
+    for script in ("live_daily_report", "demo_check"):
+        (tmp_path / "scripts" / f"{script}.py").write_text(STANDIN, encoding="utf-8")
+
+    assert wrapper_argv(tmp_path, tmp_path / "daily.argv.json", "live_daily_report") == [
+        str(tmp_path / "scripts" / "live_daily_report.py"),
+        "--date", "yesterday", "--data-dir", str(directories["DataDir"]),
+        "--reports-dir", str(directories["ReportsDir"]),
+        "--spread-model", str(paths["SpreadModel"]),
+        "--log-dir", str(directories["RunnerLogDir"]),
+        "--sessions-config", str(paths["SessionsConfig"]),
+        "--demo", "--gw-config", str(gateway)]
+    assert wrapper_argv(tmp_path, tmp_path / "weekly.argv.json", "demo_weekly_check") == [
+        str(tmp_path / "scripts" / "demo_check.py"), "--summary",
+        "--data-dir", str(directories["DataDir"]), "--log-dir", str(directories["RunnerLogDir"]),
+        "--reports-dir", str(directories["ReportsDir"])]
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
+def test_install_refuses_paths_containing_a_percent_sign(tmp_path):
+    """Second review (N3): cmd expands what lies between two % signs when it reads a .cmd,
+    so a path with a % in it is changed on the way and neither wrapper starts. The
+    install used to report success. Any path with a % is refused before anything is
+    created, and the path is named."""
+    before = {}
+    deploy = tmp_path / "100% deploy"
+    deploy.mkdir()
+    result, wrapper = install_in_sandbox(deploy, "Demo", before=before)
+    assert result.returncode != 0
+    assert "100% deploy" in _output(result)
+    assert entries(deploy) == before["entries"]            # 一个目录都没建
+    assert not wrapper.exists() and not (deploy / "task-calls.txt").exists()
+
+    # The deployment tree is plain; only the directory given for the reports has a %.
+    before = {}
+    result, wrapper = install_in_sandbox(tmp_path, "Demo", before=before,
+                                         paths={"ReportsDir": tmp_path / "re%ports"})
+    assert result.returncode != 0 and "re%ports" in _output(result)
+    assert entries(tmp_path) == before["entries"]
+    assert not wrapper.exists() and not (tmp_path / "task-calls.txt").exists()
+    assert not (tmp_path / "data" / "logs").exists()
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="requires PowerShell")
+def test_install_refuses_a_file_system_root_as_a_task_argument(tmp_path):
+    """The separator cannot be removed from a file system root, so -DataDir, -RunnerLogDir
+    and -ReportsDir given as a root would go into the wrapper as "C:\\" and swallow the
+    next argument, as in the test above. Refused before anything is created. (The path is
+    only ever written into the wrapper, so running this test against the old script
+    creates nothing outside the sandbox either.)"""
+    before = {}
+    root = tmp_path.anchor
+    result, wrapper = install_in_sandbox(tmp_path, "Demo", before=before,
+                                         paths={"ReportsDir": root})
+    assert result.returncode != 0
+    # The refusal names the root. The message is Chinese and the console code page may
+    # garble the words, so compare the ASCII path only: it is followed by punctuation,
+    # not by the rest of a longer path.
+    assert re.search(re.escape(root) + r"(?![\w.\\ -])", _output(result)), _output(result)
+    assert entries(tmp_path) == before["entries"]            # 一个目录都没建
+    assert not wrapper.exists() and not (tmp_path / "task-calls.txt").exists()
