@@ -35,9 +35,12 @@ PathFinder 先行解析，永远不会走到这里——行为零变化。
 """
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
 import os
 import sys
 
+import pytest
 from _pytest.outcomes import Skipped
 
 # 严格模式开关（T206/O19-6）：任何非空值开启；CI 的 pytest job 置 1。
@@ -124,3 +127,80 @@ def _register_skip_finder() -> None:
 
 
 _register_skip_finder()
+
+
+# ---- T209：测试默认假定交易终端进程在运行 ----------------------------------
+#
+# 真实的 MetaTrader5.initialize() 在终端进程不在时会把终端拉起来，终端从此是
+# 调用者的子进程（11-21 的根因）。网关因此在 initialize 之前先查终端进程在不在
+# （mt5gw.terminal.terminal_running，进程内探测），不在就不调 initialize。
+# 测试里的 MetaTrader5 全是替身，起不了任何进程；测试的结果不应取决于这台机器上
+# 恰好有没有 terminal64.exe 在运行（开发和生产的机器上就有）。所以除了标了
+# real_terminal_probe 的测试，这里把缺省探针换成"在运行"。真实探针由
+# tests/test_t209_terminal_guard.py 对真实进程验证。
+#
+# 这个替换够不到子进程：在子进程源码里构造 MT5Connection 或 MT5Gateway 的测试，
+# 必须显式传 terminal_running=（见 tests/test_t110_deadline.py 和钉住这一点的
+# tests/test_t209_terminal_guard.py），否则只会在有终端运行的机器上通过。
+
+REAL_TERMINAL_PROBE_MARKER = "real_terminal_probe"
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        f"{REAL_TERMINAL_PROBE_MARKER}: keep the real in-process terminal probe (T209)")
+
+
+@pytest.fixture(autouse=True)
+def _terminal_assumed_running(request, monkeypatch):
+    if request.node.get_closest_marker(REAL_TERMINAL_PROBE_MARKER) is not None:
+        return
+    from mt5gw import connection
+
+    monkeypatch.setattr(connection, "TERMINAL_PROBE", lambda terminal_path: True)
+
+
+# ---- T209：测试不得加载真实的 MetaTrader5 包 ----------------------------------
+#
+# 开发和生产的机器上装着真实的包，交易终端也常常在运行：测试里一次真实的
+# import 接着一次 connect()，就连到了交易终端（D82）。替身一律显式注入——构造
+# MT5Connection/MT5Gateway 时传 mt5_module=，或者把替身放进
+# sys.modules["MetaTrader5"]（那样 import 根本不问 meta_path）。这里把真实包的加载
+# 拦下来：包确实装着时，import 它的测试直接失败（不是 skip）；没装时不管，照旧交给
+# 后面的 finder（T190 的缺包跳过）。只管本进程：子进程不加载 conftest，那一半靠
+# tests/test_t209_terminal_guard.py 里的扫描和 CI。
+
+REAL_PACKAGE_ROOT = "MetaTrader5"
+
+
+class _RefusedRealPackage:
+    """一加载就失败的 loader。抛 RuntimeError 而不是 ImportError：pytest.importorskip
+    之类只接 ImportError，会把它变成一次不声不响的 skip。"""
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        raise RuntimeError(
+            f"测试加载了真实的 {module.__name__}（D82：交易终端专用）。用 tests/fakes.py 的替身，"
+            "构造 MT5Connection/MT5Gateway 时显式传 mt5_module=")
+
+
+class _RealPackageGuard:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split(".", 1)[0] != REAL_PACKAGE_ROOT or path is not None:
+            return None
+        if importlib.machinery.PathFinder.find_spec(fullname) is None:
+            return None                       # 包没装：不是这里的事
+        return importlib.util.spec_from_loader(fullname, _RefusedRealPackage())
+
+
+def _register_real_package_guard() -> None:
+    """幂等地把守卫放在 meta_path 最前面：sys.modules 里有替身时 import 不问 meta_path，
+    替身照常可用；没有替身而真实包被 import 时，先问到的是守卫。"""
+    if not any(isinstance(finder, _RealPackageGuard) for finder in sys.meta_path):
+        sys.meta_path.insert(0, _RealPackageGuard())
+
+
+_register_real_package_guard()

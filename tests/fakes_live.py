@@ -36,6 +36,14 @@ from mt5quant.strategies.base import BaseStrategy, ExitRules, RequiredData
 _T0 = datetime(2026, 10, 20, 18, 0)   # 造数基准时刻（naive，贴 UTC 标签）
 
 
+@dataclasses.dataclass(frozen=True)
+class FakeTerminalInfo:
+    """对齐 MetaTrader5 包的 terminal_info() 的三个字段：运行器每个决策轮读后两个（T209）。"""
+    connected: bool = True
+    trade_allowed: bool = True
+    tradeapi_disabled: bool = False
+
+
 class FakeGateway:
     """最小网关替身：account/market/trading 三个服务都指向同一个 FakeBroker。"""
 
@@ -43,6 +51,18 @@ class FakeGateway:
         self.account = broker
         self.market = broker
         self.trading = broker
+        self.terminal = FakeTerminalInfo()          # 测试可以换掉它来模拟"终端不允许算法交易"
+
+    def connect(self):
+        """对齐 MT5Gateway 接口（T209 起三个入口脚本在启动段调 connect）；替身没有终端，调用即连上。"""
+
+    @property
+    def connected(self) -> bool:
+        return True
+
+    def terminal_info(self) -> FakeTerminalInfo:
+        """对齐 MT5Gateway 接口（T209：AlgoTradingWatch 每个决策轮读一次）。"""
+        return self.terminal
 
     def shutdown(self):
         """对齐 MT5Gateway 接口（脚本 main 的 finally 会调用；替身无资源）。"""

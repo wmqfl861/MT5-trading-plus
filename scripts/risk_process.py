@@ -62,6 +62,7 @@ from mt5live.monitor import (  # noqa: E402
     write_role_heartbeat,
 )
 from mt5live.paper import PaperStateGateway  # noqa: E402（T34 --paper-state）
+from mt5live.terminal_guard import wait_for_gateway  # noqa: E402（T209 启动等待）
 from mt5live.riskproc import (  # noqa: E402
     AccountSnapshot,
     CycleResult,
@@ -85,13 +86,13 @@ _RECOVERABLE = (PermissionError, TimeoutError)
 
 
 def _open_gateway(gw_config_path: str) -> MT5Gateway:
-    """连接 MT5 终端（本进程只读账户，绝不下单）；配置缺失用默认网关配置。"""
+    """建 MT5 网关（本进程只读账户，绝不下单）；配置缺失用默认网关配置。
+
+    这里不连接（T209）：连接放进启动等待——终端进程不在时按断线处理，
+    不写 fatal halt，见 wait_for_gateway。"""
     if os.path.exists(gw_config_path):
-        gw = MT5Gateway.from_config_file(gw_config_path)
-    else:
-        gw = MT5Gateway(GatewayConfig())
-    gw.connect()
-    return gw
+        return MT5Gateway.from_config_file(gw_config_path)
+    return MT5Gateway(GatewayConfig())
 
 
 def build_snapshot(gw, now: datetime) -> AccountSnapshot:
@@ -217,6 +218,16 @@ def _run(args) -> int:
     acct_watch = AccountUnavailableWatch(risk.live_dir, "risk",
                                          limit_s=args.account_unavailable_limit_s,
                                          clock=_mono)
+
+    # T209：启动时交易终端可能还没起来（全灭之后由看护任务拉起）。按断线处理：
+    # 每轮写心跳、有 DISCONNECTED 段，连续 15 分钟以 78 退出；不写 fatal halt。
+    if not isinstance(gw, PaperStateGateway):
+        rc = wait_for_gateway(
+            gw, risk.live_dir, "risk",
+            lambda: write_role_heartbeat(risk.live_dir, "risk", interval=args.interval),
+            retry_s=args.interval, clock=_mono)
+        if rc is not None:
+            return rc
 
     # T142：已知可恢复异常（文件访问类）的连续失败轮计数——记录后继续，
     # 连续 5 轮或未知异常才以专用退出码 79 退出（loop-exit-risk.json +

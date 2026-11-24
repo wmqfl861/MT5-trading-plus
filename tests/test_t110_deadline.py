@@ -1,4 +1,10 @@
-"""T110 deadlines: every raw MT5 entry and lock wait must fail terminally."""
+"""T110 deadlines: every raw MT5 entry and lock wait must fail terminally.
+
+The child processes take the terminal process as present (``terminal_running``):
+these tests are about the deadline, not about T209's process probe, and the suite's
+autouse stand-in does not reach a child process. Without it they would pass only on a
+machine that happens to have a terminal64.exe running under the configured path.
+"""
 import json
 import os
 import subprocess
@@ -44,7 +50,7 @@ fake = Fake()
 if blocked != 'lock':
     stuck.__name__ = blocked
     setattr(fake, blocked, stuck)
-conn = MT5Connection(GatewayConfig(query_timeout_s=0.15, order_timeout_s=0.2), fake)
+conn = MT5Connection(GatewayConfig(query_timeout_s=0.15, order_timeout_s=0.2), fake, terminal_running=lambda path: True)
 if blocked == 'initialize': conn.connect()
 elif blocked == 'last_error': conn.last_error()
 elif blocked == 'shutdown':
@@ -92,7 +98,7 @@ class Fake:
     def account_info(self): return SimpleNamespace(trade_mode=0, login=123)
     def last_error(self): return (1, 'Success')
     def order_send(self, request): threading.Event().wait()
-conn = MT5Connection(GatewayConfig(query_timeout_s=0.2, order_timeout_s=0.15), Fake())
+conn = MT5Connection(GatewayConfig(query_timeout_s=0.2, order_timeout_s=0.15), Fake(), terminal_running=lambda path: True)
 class Broker(FakeBroker):
     def market_order(self, *args, **kwargs):
         conn.trade_send({}, lambda mode: None)
@@ -137,7 +143,7 @@ class Fake:
         entered.set()
         threading.Event().wait()
 fake = Fake()
-conn = MT5Connection(GatewayConfig(query_timeout_s=0.15, order_timeout_s=4.0), fake)
+conn = MT5Connection(GatewayConfig(query_timeout_s=0.15, order_timeout_s=4.0), fake, terminal_running=lambda path: True)
 class Broker(FakeBroker):
     def market_order(self, *args, **kwargs):
         conn.trade_send({}, lambda mode: None)
@@ -151,7 +157,7 @@ order = threading.Thread(target=lambda: exe.poll(mk_decision(signal=1), datetime
 order.start()
 assert entered.wait(3), 'order_send not entered'
 if sys.argv[2] == 'other_connection':
-    conn = MT5Connection(GatewayConfig(query_timeout_s=0.15, order_timeout_s=4.0), Fake())
+    conn = MT5Connection(GatewayConfig(query_timeout_s=0.15, order_timeout_s=4.0), Fake(), terminal_running=lambda path: True)
 # This thread has no journal ContextVar. Its shorter query deadline fires first.
 conn.call(fake.query)
 raise AssertionError('continued after query deadline')

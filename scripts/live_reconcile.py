@@ -65,6 +65,7 @@ from mt5live.monitor import (  # noqa: E402
     write_role_heartbeat,
 )
 from mt5live.paper import PaperStateGateway  # noqa: E402（T34 --paper-state）
+from mt5live.terminal_guard import wait_for_gateway  # noqa: E402（T209 启动等待）
 from mt5live.reconcile import (  # noqa: E402
     DEFAULT_GRACE_S,
     ExpectedStateError,
@@ -87,13 +88,13 @@ _RECOVERABLE = (PermissionError, TimeoutError)
 
 
 def _open_gateway(gw_config_path: str) -> MT5Gateway:
-    """连接 MT5 终端（只读持仓）；配置缺失用默认网关配置。"""
+    """建 MT5 网关（只读持仓）；配置缺失用默认网关配置。
+
+    这里不连接（T209）：连接放进启动等待——终端进程不在时按断线处理，
+    不写 fatal halt，见 wait_for_gateway。"""
     if os.path.exists(gw_config_path):
-        gw = MT5Gateway.from_config_file(gw_config_path)
-    else:
-        gw = MT5Gateway(GatewayConfig())
-    gw.connect()
-    return gw
+        return MT5Gateway.from_config_file(gw_config_path)
+    return MT5Gateway(GatewayConfig())
 
 
 def run_once(live_dir: str, gw, *,
@@ -190,6 +191,16 @@ def _run(args) -> int:
     # T141：连续断线计时——降级继续，连续 15 分钟才以专用退出码 78 退出
     #（disconnect-exit-reconcile.json 留痕，供 T143 supervisor 演练与取证）。
     watch = DisconnectWatch(live_dir, "reconcile", clock=_mono)
+
+    # T209：启动时交易终端可能还没起来（全灭之后由看护任务拉起）。按断线处理：
+    # 每轮写心跳、有 DISCONNECTED 段，连续 15 分钟以 78 退出；不写 fatal halt。
+    if not isinstance(gw, PaperStateGateway):
+        rc = wait_for_gateway(
+            gw, live_dir, "reconcile",
+            lambda: write_role_heartbeat(live_dir, "reconcile", interval=args.interval),
+            retry_s=args.interval, clock=_mono)
+        if rc is not None:
+            return rc
 
     # T184（O17-4）：持仓查询失败的连续时间窗——段首/恢复各一条告警、
     # 段内不刷屏，连续 --account-unavailable-limit-s（缺省 300 秒）才以

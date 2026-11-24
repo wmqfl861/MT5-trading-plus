@@ -460,7 +460,14 @@ from types import SimpleNamespace
 
 root, work = Path(sys.argv[1]), Path(sys.argv[2])
 sys.path.insert(0, str(root))
+sys.path.insert(0, str(root / "src"))
 from tests.fakes import FakeMT5
+import mt5gw.connection as connection
+
+# This is a child process: the suite's stand-in for the terminal probe does not reach it.
+# Without this line the gateway refuses to initialize on a machine with no terminal64.exe
+# running (CI) and the report exits 3 instead of reaching the deadline (T209).
+connection.TERMINAL_PROBE = lambda terminal_path: True
 
 
 class SlowTerminal(FakeMT5):

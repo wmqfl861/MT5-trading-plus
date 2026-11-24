@@ -47,6 +47,10 @@ class MT5Gateway:
         每次尝试仍受 T110 期限约束）——透传 MT5Connection.reconnect。"""
         return self._conn.reconnect()
 
+    def terminal_info(self):
+        """terminal_info()，受 T110 期限约束（T209：trade_allowed / tradeapi_disabled）。"""
+        return self._conn.call(self._mt5.terminal_info)
+
     @property
     def connected(self) -> bool:
         return self._conn.connected
