@@ -15,6 +15,10 @@
     - 不在就启动它：Start-Process，不带参数，工作目录是它所在的目录——和在
       资源管理器里双击一样。启动之后不连接、不登录、不核对。
     - -DryRun：只报告判断结果，不启动。
+    - 每次运行（busy 除外）把判断结果写进状态文件：-LogPath 所在目录下的 state.json
+      （ts、outcome、reason、running、others、pid，不含本机路径和账户）。小时级存活检查
+      和安装脚本的 -Status 读它：看护任务没在跑、看护被拒绝、终端一直不在，靠它发现。
+      只在给了 -LogPath 且不是 -DryRun 时写；写不进去只警告，不改退出码。
 
     不做什么：
     - 不 import MetaTrader5、不调用终端接口、不下单、不读写终端数据目录
@@ -31,7 +35,7 @@
 
     退出码：0 = 终端在运行、已启动、或 -DryRun；1 = 拒绝执行或启动失败。
     每次运行输出一行 KEEPER <动作> …，不含本机路径；状态变化（启动、拒绝）
-    另写进 -LogPath。
+    另写进 -LogPath；判断结果写进状态文件（见上）。
 
     时刻一律取系统时钟的 UTC（PS5.1 没有 -AsUTC，用 [DateTime]::UtcNow）。
 
@@ -43,7 +47,8 @@
     只报告，不启动。
 
 .PARAMETER LogPath
-    日志文件；缺省不写文件，只输出到标准输出（任务包装器会收）。
+    日志文件；缺省不写文件，只输出到标准输出（任务包装器会收）。状态文件 state.json
+    写在同一个目录：不给 -LogPath 就不写状态文件。
 
 .EXAMPLE
     先看判断结果（不启动）：
@@ -80,7 +85,36 @@ function Refuse {
     $text = "refused reason=" + $Reason
     if ($Detail) { $text += " " + $Detail }
     Write-Keeper $text -StateChange
+    Write-State -Outcome "refused" -Reason $Reason
     exit 1
+}
+
+function Write-State {
+    # 状态文件：给小时级存活检查和安装脚本的 -Status 看。每一次做过判断的运行覆盖写一次；
+    # busy 的那个实例没做判断，不写（写会把持锁那个实例刚写的结果盖掉）。先写临时文件再
+    # 换名，读的一方读不到半截。写不进去只警告：看护的结论不取决于它。
+    param([string]$Outcome, [string]$Reason = "", [int]$Running = 0, [int]$Others = 0, [int]$StartedPid = 0)
+    if (-not $LogPath -or $DryRun) { return }
+    try {
+        $directory = [System.IO.Path]::GetDirectoryName($LogPath)
+        if ($directory -and -not (Test-Path -LiteralPath $directory)) {
+            New-Item -ItemType Directory -Path $directory | Out-Null
+        }
+        $record = [ordered]@{
+            ts      = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+            outcome = $Outcome
+            reason  = $Reason
+            running = $Running
+            others  = $Others
+            pid     = $StartedPid
+        }
+        $temporary = Join-Path $directory ("state.json." + $PID + ".tmp")
+        [System.IO.File]::WriteAllText($temporary, ($record | ConvertTo-Json -Compress),
+            (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $temporary -Destination (Join-Path $directory "state.json") -Force -ErrorAction Stop
+    } catch {
+        Write-Warning ("state write failed: " + $_.Exception.GetType().Name)
+    }
 }
 
 function Resolve-Links {
@@ -146,6 +180,7 @@ try {
     $others = @($procs | Where-Object { -not (Same-Image $_.ExecutablePath $target) })
     if ($running.Count -gt 0) {
         Write-Keeper ("running pids=" + (($running | ForEach-Object { $_.ProcessId }) -join ',') + " other_instances=" + $others.Count)
+        Write-State -Outcome "running" -Running $running.Count -Others $others.Count
         exit 0
     }
 
@@ -157,10 +192,13 @@ try {
     try {
         $proc = Start-Process -FilePath $target -WorkingDirectory (Split-Path -Parent $target) -PassThru
     } catch {
-        Write-Keeper ("start-failed error=" + $_.Exception.GetType().Name) -StateChange
+        $name = $_.Exception.GetType().Name
+        Write-Keeper ("start-failed error=" + $name) -StateChange
+        Write-State -Outcome "start_failed" -Reason $name -Others $others.Count
         exit 1
     }
     Write-Keeper ("started pid=" + $proc.Id + " other_instances=" + $others.Count) -StateChange
+    Write-State -Outcome "started" -Others $others.Count -StartedPid $proc.Id
     exit 0
 } finally {
     if ($held) { $mutex.ReleaseMutex() }

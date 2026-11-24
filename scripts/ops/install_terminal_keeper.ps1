@@ -70,7 +70,9 @@
     KEEPER_TASK_PARAMETERS {…}：不带开关和 -Install 都打印，给部署记录抄用，mode 一项写明是
     plan 还是 install。里面是本机的绝对路径和账户：抄进入库的部署记录之前要脱敏
     （docs/ops/demo-runbook.md §6.5 写了要记什么）。
-    KEEPER_TASK_STATUS {…}：-Status 打印，时刻是 UTC。
+    KEEPER_TASK_STATUS {…}：-Status 打印，时刻是 UTC。给了 -DataDir 时 -Status 还打印一行
+    KEEPER_STATE {…}：看护脚本状态文件里最近的一条（ts、outcome、reason、age_s），只读——装完当场
+    就能看到看护有没有跑成。
     退出码：0 做完了（打印、注册、注销、查到了）；1 拒绝或出错，原因在错误输出里；
     4 -Status 或 -Uninstall 时任务没有安装。
 #>
@@ -133,6 +135,35 @@ function Get-KeeperLogLocation {
     return Join-Path (Strip-TrailingSeparator ([System.IO.Path]::GetFullPath($DataDir))) "ops-evidence\terminal_keeper\terminal_keeper.log"
 }
 
+function Get-KeeperStateLine {
+    # 看护脚本的状态文件（terminal_keeper.ps1 每次做过判断的运行写一次：-LogPath 所在目录下的
+    # state.json）。只读，而且只在 -Status 里打印：给了 -DataDir 才看。outcome、reason 只有长得
+    # 像标识符的才照原样打印，其余写 other——这个文件不是本脚本写的。
+    if ([string]::IsNullOrWhiteSpace($DataDir) -or -not [System.IO.Path]::IsPathRooted($DataDir)) { return $null }
+    $stateFile = Join-Path (Strip-TrailingSeparator ([System.IO.Path]::GetFullPath($DataDir))) "ops-evidence\terminal_keeper\state.json"
+    if (-not (Test-Path -LiteralPath $stateFile -PathType Leaf)) {
+        return "KEEPER_STATE " + (@{ state_file = "missing" } | ConvertTo-Json -Compress)
+    }
+    try {
+        $state = Get-Content -LiteralPath $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+        $shown = [ordered]@{ ts = $null; outcome = $null; reason = $null; age_s = $null }
+        $moment = [DateTime]::MinValue
+        if ([DateTime]::TryParse("$($state.ts)", [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$moment)) {
+            $shown.ts = $moment.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            $shown.age_s = [long]([DateTime]::UtcNow - $moment.ToUniversalTime()).TotalSeconds
+        }
+        foreach ($key in @("outcome", "reason")) {
+            $value = "$($state.$key)"
+            if ($value -cmatch '^[A-Za-z][A-Za-z0-9_]{0,63}$') { $shown[$key] = $value }
+            elseif ($value) { $shown[$key] = "other" }
+        }
+        return "KEEPER_STATE " + ($shown | ConvertTo-Json -Compress)
+    } catch {
+        return "KEEPER_STATE " + (@{ state_file = "unreadable" } | ConvertTo-Json -Compress)
+    }
+}
+
 # 任务路径：首尾各一个反斜杠（根路径就是单独一个反斜杠）。
 $taskFolder = "\" + $TaskPath.Trim("\") + "\"
 if ($taskFolder -eq "\\") { $taskFolder = "\" }
@@ -143,6 +174,8 @@ if ($modes.Count -gt 1) { throw "拒绝：-Install、-Uninstall、-Status 最多
 # -Status：只读。下面三段（Status、Uninstall、Install 的注册）是脚本里仅有的接触任务计划
 # 程序的地方，各自在自己的开关里面；不带开关时一步都走不到。
 if ($Status) {
+    $stateLine = Get-KeeperStateLine
+    if ($stateLine) { Write-Host $stateLine }
     $task = Get-ScheduledTask -TaskPath $taskFolder -TaskName $TaskName -ErrorAction SilentlyContinue
     if (-not $task) {
         Write-Host ("KEEPER_TASK_STATUS " + ([ordered]@{

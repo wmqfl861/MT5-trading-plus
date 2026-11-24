@@ -945,8 +945,9 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\terminal_keeper.ps1 -Termin
   powershell -ExecutionPolicy Bypass -File scripts\ops\install_terminal_keeper.ps1 `
     -TerminalPath "<终端安装目录>\terminal64.exe" -DeployDir "<部署树>" -DataDir "<数据目录>"
   # 3. 动作、触发器、主体、设置核对无误后，同一条命令加 -Install 才注册
-  # 4. 看任务现在的状态（只读）
-  powershell -ExecutionPolicy Bypass -File scripts\ops\install_terminal_keeper.ps1 -Status
+  # 4. 看任务现在的状态（只读）。装完等一两分钟查一次：看护脚本状态文件里最近的一条也在里面
+  powershell -ExecutionPolicy Bypass -File scripts\ops\install_terminal_keeper.ps1 `
+    -Status -DataDir "<数据目录>"
   ```
 
   - 不带 `-Install` / `-Uninstall` 时脚本只做检查、只打印，不碰任务计划程序。打印的
@@ -963,9 +964,18 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\terminal_keeper.ps1 -Termin
     ANSI 代码页表示不了的字符（和 §6.3 的安装脚本同一条规矩）。同名的任务已经在了就
     拒绝，不覆盖：换参数先 `-Uninstall`。
   - `-Status` 只读：打印 `KEEPER_TASK_STATUS {…}`——状态、上次运行的时刻和上次结果，
-    时刻是 UTC。上面"看护被拒绝没有告警通道"那一条要核对的上次结果码，就用它查。
+    时刻是 UTC。上面"看护被拒绝没有告警通道"那一条要核对的上次结果码，就用它查。给了
+    `-DataDir` 时还打印一行 `KEEPER_STATE {…}`：看护脚本状态文件里最近的一条（`ts`、`outcome`、
+    `reason`、`age_s`）。装完等一两分钟查一次：`outcome` 是 `running` 或 `started`、`age_s` 只有
+    一两分钟，看护就跑成了；`KEEPER_TASK_STATUS` 里 `state` 是 `Ready`、`last_task_result` 是 0。
   - 退出码：0 做完了；1 拒绝或出错，原因在错误输出里；4 是 `-Status` 或 `-Uninstall`
     时任务没有安装。
+  - **状态文件**：看护脚本每一次做过判断的运行，把结果写进 `-LogPath` 所在目录下的
+    `state.json`（任务的动作里就是 `<数据目录>/ops-evidence/terminal-keeper/state.json`）：
+    `ts`、`outcome`（`running` / `started` / `refused` / `start_failed`）、`reason`（拒绝和启动
+    失败的原因代码）、`running`、`others`、`pid`，不含路径和账户。只在给了 `-LogPath` 且不是
+    `-DryRun` 时写；`busy` 的那个实例不写（它没有做判断）；写不进去只警告，不改退出码。
+    小时级存活检查读它（§6.6）。
   - **不要手工拼 `Register-ScheduledTask`**：任务的动作、触发器、主体、设置只在安装
     脚本里定义一份。部署记录里抄的是打印出来的那一行（路径和账户脱敏）：任务的路径和
     名字、`start_boundary`、`repeat_interval`、`multiple_instances`、
@@ -982,11 +992,12 @@ supervisor 全程没有拒绝。取证时不要只看 supervisor 有没有拒绝
 
 ### 6.6 小时级只读存活检查（T214，第二十三轮）
 
-`scripts/ops/liveness_check.py` 设计为由一个独立的计划任务每小时运行一次，不依赖任何 agent 会话。**任务还没有安装**（装之前要做的事见本节末）。它不 import MetaTrader5、不连接交易终端：只读登记表、心跳、supervisor 状态、控制文件和磁盘余量，唯一的写是它自己的状态文件。判级和排通知的纯逻辑在 `scripts/ops/liveness_logic.py`。
+`scripts/ops/liveness_check.py` 设计为由一个独立的计划任务每小时运行一次，不依赖任何 agent 会话。**任务还没有安装**（装之前要做的事见本节末）。它不 import MetaTrader5、不连接交易终端：只读登记表、心跳、supervisor 状态、控制文件和磁盘余量（带了 `--expect-keeper` 时还读看护脚本的状态文件），唯一的写是它自己的状态文件。判级和排通知的纯逻辑在 `scripts/ops/liveness_logic.py`。
 
 ```powershell
 # 手工跑一次：输出一行 JSON。退出码 0 没有生产级问题，3 有，2 是检查自己出错
 .venv/Scripts/python.exe scripts/ops/liveness_check.py --live-dir <数据目录>/live --reports-dir <数据目录>/reports --disk-path <数据目录> --no-notify
+# 装了看护任务（§6.5）的部署加 --expect-keeper；每小时的任务把它写进命令行
 ```
 
 带 `--no-notify` 只判定、不发通知；去掉它之前先读下面"通知"一段。
@@ -996,12 +1007,19 @@ supervisor 全程没有拒绝。取证时不要只看 supervisor 有没有拒绝
 | 代码 | 什么时候算生产级 |
 | --- | --- |
 | `role_missing:<角色>`、`heartbeat_stale:<角色>`、`supervisor_state_stale`、`registry_unreadable` | 持续满 10 分钟 |
+| `terminal_absent:<运行器>`、`keeper_absent`、`keeper_stale`、`keeper_refused`（后三个只在带了 `--expect-keeper` 时评） | 持续满 10 分钟；`keeper_stale` 和启动等待的 `terminal_absent` 用现场自己的年龄，满了 10 分钟的第一次看到就是生产级 |
 | `halt`、`pause:<magic>`、`kill_switch`、`risk_veto` | 持续满 1 小时 |
 | `disk_low`（低于 10 GB）、`disk_unknown`、`report_missing`、`registry_invalid`、`clock_ahead:<来源>` | 一出现就是 |
 
 - 时长取"检查器第一次看到至今"和现场自己的年龄（心跳年龄、文件修改时间）里大的那个。心跳已经停了 10 分钟的角色，第一次看到就算生产级。
 - 有生产级问题退出码是 3；只有不算生产级的发现时退出码是 0，`ok` 是 false。
 - 登记表不存在、读不出、解析不了是 `registry_unreadable`；顶层不成形状、空的、条目对不上身份是 `registry_invalid`。
+
+**看护任务和终端**（看护脚本见 §6.5）：
+
+- `--expect-keeper` 表示这个部署装了看护任务。为什么要明说：看护的状态文件是看护脚本自己写的，"装了任务但一次也没跑成"和"根本没装"在文件系统上一样，都还没有文件；而现在的观察运行没有装看护任务，定版前也不该因为这一条每 24 小时收到一次通知。所以由小时任务的命令行带这个开关，不带给三类看护发现都不评，输出的 `keeper` 是 `not_checked`。带了：状态文件不在是 `keeper_absent`；10 分钟没有更新是 `keeper_stale`（看护每分钟运行一次，状态文件自己的年龄满了 10 分钟，第一次看到就是生产级）；最近一次是 `refused` 或 `start_failed` 是 `keeper_refused`。状态文件读不出、不是对象、没有 `ts` 的按文件修改时间算年龄；`ts` 来自未来记 `clock_ahead:keeper`。`outcome`、`reason` 只有长得像标识符的才进输出。
+- `terminal_absent:<运行器>` **不受这个开关管**，永远评：万一装小时任务的人漏了开关，"终端不在、交易停着"这一条最要紧的仍然有人看。信号来自运行器自己的心跳：等终端的时候心跳照写，`role_missing`、`heartbeat_stale` 都不会触发。两种说法都算——启动等待（心跳的 `last_error` 是 `waiting_for_terminal`）；连上之后终端进程没了（网关的 `TerminalNotConnectedError` 带着类名进了 `last_error`）。启动等待的时长取"检查器第一次看到至今"和"现在减去登记里的 `started_utc`"里大的那个——启动等待的运行器从启动起就在等，这个数是下界：已经等了 10 分钟以上的，当次就是生产级，不用再等一个小时。丢了终端没有可信的起点（它每等 15 分钟以 78 退出、被 supervisor 重启，`started_utc` 也会归零），只靠检查器自己的时钟。
+- 这一类只覆盖运行器：对账、风控两个角色等终端和断线时写的心跳不带这类标记。部署之后如果要它们也被看到，得先让它们写（改生产代码，另议）。
 
 **日报的口径**：22:30 UTC 之前要求前天的日报在，22:30 起要求昨天的（日报任务 21:57 UTC 生成前一天的日报，留 33 分钟宽限）。某一天的日报只在它生成的那一刻（次日 21:57 UTC）部署已经在跑才要求，依据是登记表里最早的 `started_utc` 早于那一刻。所以：部署在 21:57 UTC 之后的，当晚的日报不要求；四个角色同一天全部重启之后，生成时刻早于新登记的日报都不要求；在 21:57 UTC 之前启动的，当晚 22:30 起就要求。这条规则只信登记里的 `started_utc`：被写早了会多报，不会漏报。日报任务晚启动 33 分钟以上，当小时的检查先报缺，下一小时报"已恢复"。
 
@@ -1021,7 +1039,7 @@ supervisor 全程没有拒绝。取证时不要只看 supervisor 有没有拒绝
 
 1. U10 定通知渠道，接收地址只放本机。**U10 没有答复时不起算（D113）。** 渠道定了再定 N-4：消息里带不带停机原因的代码。
 2. 日报任务（§6.3.1）先装好、启用。观察运行期间 `live_daily_report` 是停用的（11-21 起，运维日志 11-23 一节的第 8 项）；现在装存活检查，当晚 22:30 UTC 起就会报缺日报。
-3. 安装小时级任务：在工作区之外，显式的绝对路径；运行账户能打开生产进程；登录类型和会话写进部署记录。
+3. 安装小时级任务：在工作区之外，显式的绝对路径；运行账户能打开生产进程；登录类型和会话写进部署记录。装了看护任务（§6.5）的部署，命令行带 `--expect-keeper`，和看护任务在同一个维护窗里生效。
 4. 通知演练：停一个假角色，一小时内收到；再加一条反向的，健康现场 24 小时零通知。
 5. 施工计划 §3.2 第 5 条：把"主会话缺位"写进调度指令。
 6. 调度日检核对存活检查自己：最近一小时运行过，退出码是 0 或 3，`notified` 不是"没有渠道"，`notify_error`、`state_error` 为空。

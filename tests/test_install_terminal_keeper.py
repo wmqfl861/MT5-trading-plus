@@ -309,6 +309,11 @@ def status(done):
             for line in lines_starting_with(done, "KEEPER_TASK_STATUS ")]
 
 
+def state_lines(done):
+    return [json.loads(line.removeprefix("KEEPER_STATE "))
+            for line in lines_starting_with(done, "KEEPER_STATE ")]
+
+
 def names(calls):
     return [call["call"] for call in calls]
 
@@ -675,8 +680,13 @@ def test_status_reads_and_changes_nothing(tmp_path):
     assert done.returncode == 4, text(done)
     assert names(calls) == ["Get-ScheduledTask"]
     assert status(done) == [{"task_path": "\\MT5Quant\\", "task_name": "terminal_keeper", "state": "not-installed"}]
+    assert state_lines(done) == []                                 # 没给 -DataDir：不看状态文件
 
-    done, _, calls = run(tmp_path, modules, "-Status", exists=True, last_result=267009)
+    done, _, calls = run(tmp_path, modules, "-Status", *located(deploy, terminal, data))
+    assert done.returncode == 4, text(done)
+    assert state_lines(done) == [{"state_file": "missing"}]
+
+    done, _, calls = run(tmp_path, modules, "-Status", *located(deploy, terminal, data), exists=True, last_result=267009)
     assert done.returncode == 0, text(done)
     assert names(calls) == ["Get-ScheduledTask", "Get-ScheduledTaskInfo"]
     assert calls[1]["parameters"] == {"TaskName": "terminal_keeper", "TaskPath": "\\MT5Quant\\"}
@@ -685,6 +695,34 @@ def test_status_reads_and_changes_nothing(tmp_path):
                     "last_run_time": "2026-11-24T12:00:00Z", "last_task_result": 267009,
                     "next_run_time": "2026-11-24T12:01:00Z", "missed_runs": 0}
     assert entries(tmp_path) == before
+
+
+@requires_powershell
+def test_status_also_shows_the_keeper_s_latest_state_line_without_touching_it(tmp_path):
+    """给了 -DataDir，-Status 多打印一行 KEEPER_STATE：看护脚本状态文件里最近的一条——装完当场就能看到
+    看护有没有跑成。只读：文件原样。outcome、reason 只有长得像标识符的才照原样打印，其余写 other。"""
+    deploy, terminal, data, modules = sandbox(tmp_path)
+    path = data / "ops-evidence" / "terminal_keeper" / "state.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"ts": "2026-11-24T12:00:00.000Z", "outcome": "started", "reason": "",
+                                "running": 0, "others": 0, "pid": 4321}), encoding="utf-8")
+    kept = path.read_bytes()
+    done, _, calls = run(tmp_path, modules, "-Status", *located(deploy, terminal, data), exists=True)
+    assert done.returncode == 0, text(done)
+    assert names(calls) == ["Get-ScheduledTask", "Get-ScheduledTaskInfo"] and path.read_bytes() == kept
+    (line,) = state_lines(done)
+    assert line == {"ts": "2026-11-24T12:00:00Z", "outcome": "started", "reason": None,
+                    "age_s": line["age_s"]} and isinstance(line["age_s"], int) and line["age_s"] >= 0
+
+    path.write_text(json.dumps({"ts": "2026-11-24T12:00:00.000Z", "outcome": "refused", "reason": str(terminal)}),
+                    encoding="utf-8")
+    done, _, calls = run(tmp_path, modules, "-Status", *located(deploy, terminal, data), exists=True)
+    (line,) = state_lines(done)
+    assert line["outcome"] == "refused" and line["reason"] == "other" and str(terminal) not in text(done)
+
+    path.write_text("{not json", encoding="utf-8")
+    done, _, calls = run(tmp_path, modules, "-Status", *located(deploy, terminal, data), exists=True)
+    assert state_lines(done) == [{"state_file": "unreadable"}] and done.returncode == 0
 
 
 @requires_powershell

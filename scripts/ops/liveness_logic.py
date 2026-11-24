@@ -2,6 +2,10 @@
 
 不 import MetaTrader5、不连交易终端、不起子进程、不联网、不写任何文件。进程探针由
 调用方注入；状态文件的写入和通知的发送都在 liveness_check.py 里。
+
+看护任务和终端（定版前跟进 D）：给了 --expect-keeper 才看护任务的状态文件，得 keeper_absent、
+keeper_stale、keeper_refused 三类发现；terminal_absent:<运行器> 不受这个开关管，信号来自运行器
+自己的心跳——等终端的时候心跳照写，role_missing、heartbeat_stale 都不会触发。
 """
 from __future__ import annotations
 
@@ -13,6 +17,11 @@ from pathlib import Path
 
 HEARTBEAT_MAX_AGE_S = 120.0        # 与 supervisor 的 health_timeout 下限相同
 NOT_REVIVED_S = 600.0              # 角色消失 / 心跳停 / supervisor 不检查 / 登记表读不出：超过即生产级
+KEEPER_STALE_S = NOT_REVIVED_S     # 看护每分钟运行一次：状态文件 10 分钟没有更新，就是 10 次没有跑
+WAITING_FOR_TERMINAL = "waiting_for_terminal"   # 运行器启动后等终端时心跳的 last_error（live_runner.py）
+TERMINAL_GONE = "MT5 终端进程不在"                 # 网关在终端进程不在时的报错原文开头（mt5gw/connection.py）
+STATE_CODE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")   # 看护状态文件里的 outcome、reason：只有长得像标识符才照常输出
+                                                  # （reason 是拒绝的代码，或启动失败时 .NET 异常的类名）
 CONTROL_STUCK_S = 3600.0           # halt、pause、killSwitch、否决：超过即生产级
 DISK_MIN_GB = 10.0
 GB = 2 ** 30
@@ -72,6 +81,41 @@ def _owner(value) -> str:
     return value if isinstance(value, str) and IDENTIFIER.fullmatch(value) else "other"
 
 
+def _keeper(now: datetime, path: Path, ahead: list) -> dict:
+    """看护任务的状态文件（terminal_keeper.ps1 每次做过判断的运行写一次）。不在 → present 是 False。
+    在：ts 读得出就按 ts 算年龄（比 now 晚 60 秒以上记 clock_ahead:keeper）；读不出、不是对象、
+    没有 ts 的按文件修改时间算——supervisor-state 同一个做法。outcome、reason 只有长得像标识符
+    （字母开头，字母、数字、下划线）才照常记，其余记 None：文件里可能写着别的东西，不往输出和通知里带。"""
+    exists, state = _read_json(path)
+    if not exists:
+        return {"present": False}
+    if isinstance(state, dict) and parse_utc(state.get("ts")) is not None:
+        age = _age(now, state.get("ts"))
+        if age is None:
+            ahead.append("keeper")
+    else:
+        age = _file_age(now, path)
+    return {"present": True, "age_s": age,
+            "outcome": _state_code(state.get("outcome") if isinstance(state, dict) else None),
+            "reason": _state_code(state.get("reason") if isinstance(state, dict) else None)}
+
+
+def _state_code(value):
+    return value if isinstance(value, str) and STATE_CODE.fullmatch(value) else None
+
+
+def _terminal_wait(error) -> str | None:
+    """运行器的心跳在说它没有终端时的两种说法（心跳的 last_error）。启动等待是一个固定的标记；
+    连上之后终端进程没了，是网关的 TerminalNotConnectedError 带着类名进了 last_error——运行器把它
+    写成 "broker_unavailable: NotConnectedError: MT5 终端进程不在：未调用 initialize（…）"。IPC 不通
+    而终端进程还在是另一句报错，不在这里。"""
+    if error == WAITING_FOR_TERMINAL:
+        return "startup"
+    if isinstance(error, str) and TERMINAL_GONE in error and "NotConnectedError" in error:
+        return "lost"
+    return None
+
+
 def _control(now: datetime, doc: dict, path: Path, source: str, ahead: list) -> dict:
     """halt / pause 文件：持续时间按文件修改时间算；文件里的 ts 只用来查时钟。"""
     if parse_utc(doc.get("ts")) is not None and _age(now, doc.get("ts")) is None:
@@ -89,14 +133,16 @@ def _well_formed(entry) -> bool:
             and (entry["kind"] != "runner" or type(entry.get("magic")) is int and entry["magic"] > 0))
 
 
-def observe(live_dir, reports_dir, disk_path, now: datetime, alive) -> dict:
-    """只读一次现场。任何一项读不到都如实记 None，不猜。alive(pid, started_utc) 是进程探针。"""
+def observe(live_dir, reports_dir, disk_path, now: datetime, alive, expect_keeper=False, keeper_state=None) -> dict:
+    """只读一次现场。任何一项读不到都如实记 None，不猜。alive(pid, started_utc) 是进程探针。
+    expect_keeper 为假时不看护任务的状态文件，obs["keeper"] 是 None；为真时读 keeper_state，
+    缺省是 <live 的上一级>/ops-evidence/terminal-keeper/state.json（看护脚本的 -LogPath 所在目录）。"""
     live, now = Path(live_dir), now.astimezone(timezone.utc)
     ahead: list[str] = []          # 比 now 晚 60 秒以上的时间戳，按来源
     obs = {"roles": {}, "registry_readable": True, "registry_valid": True, "clock_ahead": ahead,
            "earliest_start": None, "supervisor_age_s": None, "halt": None, "pauses": [], "kill_switch": False,
            "risk_veto": False, "disk_known": True, "disk_free_gb": None, "due_report": None,
-           "due_report_present": None}
+           "due_report_present": None, "keeper": None}
     registry = _read_json(live / "instances.json")[1]
     if registry is UNREADABLE:                  # 不存在、读不出、解析不了
         obs["registry_readable"] = False
@@ -115,9 +161,14 @@ def observe(live_dir, reports_dir, disk_path, now: datetime, alive) -> dict:
             age = _age(now, stamp)
             if parse_utc(stamp) is not None and age is None:
                 ahead.append(f"heartbeat-{key}")
-            starts.append(parse_utc(entry["started_utc"]))
+            started = parse_utc(entry["started_utc"])
+            starts.append(started)
+            waiting = _terminal_wait(heartbeat.get("last_error") if isinstance(heartbeat, dict) else None)
+            # 启动等待的角色从启动起就在等：现在减去 started_utc 是它等了多久的下界。
             obs["roles"][key] = {"launcher_alive": bool(alive(entry["pid"], entry["started_utc"])),
-                                 "heartbeat_age_s": age}
+                                 "heartbeat_age_s": age, "terminal": waiting,
+                                 "waiting_s": max((now - started).total_seconds(), 0.0)
+                                 if waiting == "startup" and started is not None else None}
         if not starts:                          # 登记表是空的：部署之后不该这样
             obs["registry_valid"] = False
         else:
@@ -156,6 +207,10 @@ def observe(live_dir, reports_dir, disk_path, now: datetime, alive) -> dict:
     obs["due_report"] = due.isoformat()
     obs["due_report_present"] = ((Path(reports_dir) / "live" / f"daily-{due.isoformat()}.md").is_file()
                                  if Path(reports_dir).is_dir() else None)
+    if expect_keeper:
+        state_path = (Path(keeper_state) if keeper_state is not None
+                      else live.resolve().parent / "ops-evidence" / "terminal-keeper" / "state.json")
+        obs["keeper"] = _keeper(now, state_path, ahead)
     return obs
 
 
@@ -172,7 +227,10 @@ def _owed(report_day: str, earliest) -> bool:
 def _production(code: str, detail: dict, lasted: float) -> bool:
     age = detail.get("age_s")
     lasted = max(lasted, age if isinstance(age, (int, float)) else lasted)
-    if code.startswith(("role_missing:", "heartbeat_stale:", "supervisor_state_stale", "registry_unreadable")):
+    if code.startswith(("role_missing:", "heartbeat_stale:", "terminal_absent:", "supervisor_state_stale",
+                        "registry_unreadable", "keeper_absent", "keeper_stale", "keeper_refused")):
+        # 年龄来自现场自己的（心跳年龄、看护状态文件的年龄、启动等待的下界）：现场已经持续了
+        # 这么久的，第一次看到就是生产级
         return lasted >= NOT_REVIVED_S
     if code.startswith("pause:") or code in ("halt", "kill_switch", "risk_veto"):
         return lasted >= CONTROL_STUCK_S
@@ -197,6 +255,19 @@ def evaluate(obs: dict, now: datetime, since: dict) -> tuple[list[dict], dict]:
             present[f"role_missing:{key}"] = {"role": key, "age_s": role["heartbeat_age_s"]}
         elif role["heartbeat_age_s"] is None or role["heartbeat_age_s"] > HEARTBEAT_MAX_AGE_S:
             present[f"heartbeat_stale:{key}"] = {"role": key, "age_s": role["heartbeat_age_s"]}
+        elif role.get("terminal"):
+            # 进程在、心跳新鲜，心跳自己说没有终端：启动等待带"从启动起等了多久"的下界，
+            # 连上之后丢了终端没有可信的起点，只靠检查器自己的时钟。
+            present[f"terminal_absent:{key}"] = {"role": key, "kind": role["terminal"], "age_s": role["waiting_s"]}
+    keeper = obs.get("keeper")
+    if keeper is not None:                     # None：没有 --expect-keeper，不看护任务
+        if not keeper["present"]:
+            present["keeper_absent"] = {}
+        else:
+            if keeper["age_s"] is None or keeper["age_s"] > KEEPER_STALE_S:
+                present["keeper_stale"] = {"age_s": keeper["age_s"]}
+            if keeper["outcome"] in ("refused", "start_failed"):
+                present["keeper_refused"] = {"outcome": keeper["outcome"], "reason": keeper["reason"]}
     if obs["supervisor_age_s"] is None or obs["supervisor_age_s"] > HEARTBEAT_MAX_AGE_S:
         present["supervisor_state_stale"] = {"age_s": obs["supervisor_age_s"]}
     if obs["halt"]:
@@ -231,9 +302,10 @@ def _shown(lasted: float) -> str:
 def _duration(item: dict) -> float:
     """消息里的时长。halt、pause 取"文件修改时间距今"（age_s）和"检查器第一次看到至今"（lasted_s）里大的
     那个，和判级用的是同一个数：对账进程每 30 秒重写自己的 pause 文件，只看文件时间会一直像刚出现。
-    其余只有检查器自己的时钟。"""
+    terminal_absent（启动等待的下界）、keeper_stale（状态文件的年龄）同样取大的那个。其余只有检查器
+    自己的时钟。"""
     age = item.get("age_s")
-    from_file = item["code"] == "halt" or item["code"].startswith("pause:")
+    from_file = item["code"] == "halt" or item["code"].startswith(("pause:", "terminal_absent:", "keeper_"))
     return max(item["lasted_s"], age) if from_file and isinstance(age, (int, float)) else item["lasted_s"]
 
 

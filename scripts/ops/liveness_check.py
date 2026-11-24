@@ -16,6 +16,20 @@
 对象的都按文件修改时间算年龄。检查都不因此出错。
 halt.json、pause-<magic>.json 存在但读不出的按存在处理（生产对它们是 fail-closed）。
 
+看护任务和终端（定版前跟进 D）：--expect-keeper 表示这个部署装了终端看护任务（runbook §6.5），
+每小时任务的命令行里带上它。带了才看看护脚本的状态文件（缺省
+<数据目录>/ops-evidence/terminal-keeper/state.json，--keeper-state 可改）：文件不在是 keeper_absent；
+10 分钟没有更新是 keeper_stale（状态文件自己的年龄满了 10 分钟，第一次看到就是生产级）；最近一次是
+refused 或 start_failed 是 keeper_refused（持续满 10 分钟升生产级）。不带给这三类都不评，输出的
+keeper 是 not_checked。状态文件读不出、不是对象、没有 ts 的按文件修改时间算年龄；ts 来自未来记
+clock_ahead:keeper。outcome、reason 只有长得像标识符的（字母开头，字母、数字、下划线）才进输出。
+terminal_absent:<运行器> 不受 --expect-keeper 管：运行器的进程在、心跳新鲜，心跳的 last_error 说它
+没有终端——启动等待（waiting_for_terminal），或者连上之后终端进程没了（网关的
+TerminalNotConnectedError 带着类名进了 last_error）。启动等待的时长取"检查器第一次看到至今"和
+"现在减去登记里的 started_utc"里大的那个：已经等了 10 分钟以上的，当次就是生产级；丢了终端没有
+可信的起点，只用前者。两类都是持续满 10 分钟升生产级。对账、风控两个角色的心跳不带这类标记，
+这一类只覆盖运行器。
+
 通知：同一个生产级问题第一次发现时发一条；还在的话每 24 小时最多再发一条；消失时发一条
 "已恢复"。消息里只有问题代码和时长，不带账号、路径、服务器名。halt、pause 的时长取"文件
 修改时间距今"和"检查器第一次看到至今"里大的那个。
@@ -175,12 +189,15 @@ def main(argv=None, *, now=None, alive=process_alive, send=None) -> int:
     ap.add_argument("--state-file", default=None, help="默认 <live 的上一级>/ops-evidence/liveness/state.json")
     ap.add_argument("--notify-config", default="notify.local.json")
     ap.add_argument("--no-notify", action="store_true")
+    ap.add_argument("--expect-keeper", action="store_true",
+                    help="这个部署装了终端看护任务：看它的状态文件（缺省 <数据目录>/ops-evidence/terminal-keeper/state.json）")
+    ap.add_argument("--keeper-state", default=None, help="看护状态文件的路径（缺省见 --expect-keeper）")
     args = ap.parse_args(argv)
     now = now or datetime.now(timezone.utc)
     state_path = Path(args.state_file) if args.state_file else (
         Path(args.live_dir).resolve().parent / "ops-evidence" / "liveness" / "state.json")
     observed, failure = _attempt("observe", lambda: observe(
-        args.live_dir, args.reports_dir, args.disk_path, now, alive))
+        args.live_dir, args.reports_dir, args.disk_path, now, alive, args.expect_keeper, args.keeper_state))
     if failure is None:
         # 状态文件读不出、形状不对：当空状态重新起算，不让检查因此退出码 2
         loaded, lost = _attempt("state", lambda: load_state(state_path))
@@ -204,6 +221,7 @@ def main(argv=None, *, now=None, alive=process_alive, send=None) -> int:
     said = _say(json.dumps({"ts": now.isoformat(), "ok": not findings, "production": production,
                             "notified": notified, "notify_error": notify_error,
                             "state_error": failure["error"] if failure else None, "state_reset": reset,
+                            "keeper": "checked" if args.expect_keeper else "not_checked",
                             "findings": findings}, ensure_ascii=True))
     if not said and not production:
         return 2            # 那一行没写出去：没有生产级问题也不能报正常
