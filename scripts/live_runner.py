@@ -89,9 +89,9 @@ from mt5live.executor import ExecutionAdapter, LiveExecutor, \
     validate_live_strategy  # noqa: E402
 from mt5live.gate import LiveSizer, RiskGate, load_contract_sizes  # noqa: E402
 from mt5live.paper import PAPER_STATE_DIR_RELPATH, PAPER_STATE_RELPATH, \
-    BarQuoteMarket, PaperAccountView, PaperBroker, paper_state_path  # noqa: E402（T34 影子券商）
+    BarQuoteMarket, PaperAccountView, PaperBroker, paper_state_path  # noqa: E402 （T34 影子券商）
 from mt5live.riskproc import RiskConfigError, RiskProcess, load_risk_config  # noqa: E402
-from mt5live.terminal_guard import AlgoTradingWatch, wait_for_gateway  # noqa: E402（T209）
+from mt5live.terminal_guard import AlgoTradingWatch, wait_for_gateway  # noqa: E402 （T209）
 from mt5live.runner import (  # noqa: E402
     HeartbeatWriter,
     MagicInstanceLock,

@@ -120,7 +120,6 @@ def heartbeat_overview(live_dir: str, now: datetime,
         statuses.append((os.path.basename(path), st))
     if not statuses:
         return None
-    ok = all(st.ok for _, st in statuses)
     bad = next(((name, st) for name, st in statuses if not st.ok), None)
     if bad is None:
         age = min(st.age_s for _, st in statuses if st.age_s is not None)

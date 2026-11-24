@@ -40,7 +40,6 @@ from mt5live.monitor import append_alert, iso_utc, naive_utc  # noqa: E402
 from mt5live.reconcile import (  # noqa: E402
     INTENT_FILE_FMT,
     STATUS_CONFIRMED,
-    ExpectedStateError,
     Intent,
     load_intents,
     write_intent,

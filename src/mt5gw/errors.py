@@ -72,7 +72,7 @@ class RETCode:
     # 10021 等码，11-05 14:45:06 的 "10021 No prices" 拒单只能按"未知
     # 返回码"落日志/告警。
     INVALID_REQUEST = 10013     # TRADE_RETCODE_INVALID：请求无效
-    INVALID_PRICE = 10015  # noqa: 保留语义映射（部分券商市价单要求参考价）
+    INVALID_PRICE = 10015  # 保留语义映射（部分券商市价单要求参考价）
     INVALID_VOLUME = 10014
     INVALID_STOPS = 10016
     TRADE_DISABLED = 10017
