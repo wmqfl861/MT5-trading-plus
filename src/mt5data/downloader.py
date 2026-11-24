@@ -13,7 +13,6 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-import time
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -117,7 +116,9 @@ def backfill_series(root, market: MarketData, symbol: str, timeframe: str,
     序列写锁内完成——并发写者新增的段不会被本次的旧快照覆盖丢。
     """
     now = server_now(market, symbol)
-    old = load_bars_checked(root, symbol, timeframe)
+    # 返回值不参与合并（合并用的是 update_bars 锁内重读的最新表）。调用保留：
+    # load_bars_checked 在库内序列撕裂时抛 StoreConsistencyError，抓取之前就拒绝。
+    load_bars_checked(root, symbol, timeframe)
     _lineage_guard(_read_meta(root, symbol, timeframe), meta_info, symbol, timeframe)
     merged, chunks = _fetch_pages(market, symbol, timeframe, chunk, max_chunks,
                                   stop_before=None)
