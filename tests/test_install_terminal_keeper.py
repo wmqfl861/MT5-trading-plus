@@ -411,18 +411,24 @@ EXPECTED_TOUCHING = [
     ("Get-ScheduledTask", "$Install"), ("Register-ScheduledTask", "$Install"),
 ]
 
-# Reads a script by its syntax tree and prints one line of JSON. The script is parsed, never run.
+# Reads a script by its syntax tree and writes one line of JSON to a UTF-8 file. The script is parsed, never run.
 SURVEY = r'''
 # Survey of a PowerShell script by its syntax tree: every command (name as written, invocation
 # operator, arguments, and the nearest branch or scope that contains it), every type named, every
 # static member called on a type, every function defined. Read-only: the script is parsed, never run.
-param([string]$Script)
+# The report goes to the file named by -Out, not to standard output: Windows PowerShell 5.1 encodes
+# redirected output with the console's code page -- 437 on the CI runner, where the section sign alone
+# becomes byte 0x15, a control character that breaks the JSON (CI #420).
+param([string]$Script, [string]$Out)
 $ErrorActionPreference = 'Stop'
+function Emit($report) {
+    [System.IO.File]::WriteAllText($Out, ($report | ConvertTo-Json -Compress -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+}
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($Script, [ref]$tokens, [ref]$errors)
 $broken = @($errors | Where-Object { $_ })
 if ($broken.Count -gt 0) {
-    @{ parse_errors = @($broken | ForEach-Object { $_.Message }); commands = @(); types = @(); members = @(); instance_members = @(); functions = @() } | ConvertTo-Json -Compress -Depth 5
+    Emit @{ parse_errors = @($broken | ForEach-Object { $_.Message }); commands = @(); types = @(); members = @(); instance_members = @(); functions = @() }
     exit 0
 }
 $language = 'System.Management.Automation.Language.'
@@ -495,18 +501,24 @@ $instance_members = @($ast.FindAll({ param($node) $node -is ($language + 'Member
     ForEach-Object { $_.Member.Extent.Text } | Sort-Object -Unique)
 $functions = @($ast.FindAll({ param($node) $node -is ($language + 'FunctionDefinitionAst' -as [type]) }, $true) |
     ForEach-Object { $_.Name })
-@{ commands = $commands; types = @($types | Sort-Object -Unique); members = $members; instance_members = $instance_members; functions = $functions } | ConvertTo-Json -Compress -Depth 5
+@{ commands = $commands; types = @($types | Sort-Object -Unique); members = $members; instance_members = $instance_members; functions = $functions } | ForEach-Object { Emit $_ }
 '''
 
 
 def survey(script, folder) -> dict:
     """→ {commands: [{name, operator, line, arguments, container}], types, members, functions}。container 是命令
-    外面最近的分支或作用域：top-level-if:<条件>、nested-if:<条件>、function:<名字>、loop、try……"""
-    script_file = Path(folder) / "survey.ps1"
+    外面最近的分支或作用域：top-level-if:<条件>、nested-if:<条件>、function:<名字>、loop、try……
+    结果从临时目录里的 UTF-8 文件读，不经标准输出：标准输出按控制台的代码页编码，CI 的机器上是 437，
+    安装脚本里的"§"会变成字节 0x15，JSON 就坏了（CI #420）。"""
+    folder = Path(folder)
+    script_file = folder / "survey.ps1"
+    report_file = folder / "survey-report.json"
     script_file.write_bytes(b"\xef\xbb\xbf" + SURVEY.replace("\n", "\r\n").encode("utf-8"))
-    rc, out, err = powershell(folder, "& " + quote(script_file) + " -Script " + quote(script) + "\n")
+    rc, out, err = powershell(folder, "& " + quote(script_file) + " -Script " + quote(script)
+                              + " -Out " + quote(report_file) + "\n")
     assert rc == 0, err
-    return json.loads(out.splitlines()[-1])
+    assert report_file.is_file(), "the survey wrote no report\n" + (out + err)[-800:]
+    return json.loads(report_file.read_text(encoding="utf-8"))
 
 
 def static_problems(report: dict) -> list:
