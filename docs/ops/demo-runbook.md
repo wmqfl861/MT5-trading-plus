@@ -715,6 +715,8 @@ Get-FileHash -LiteralPath $launcher, $once -Algorithm SHA256 | Select-Object Has
 
 # 计划内停止业务前先停用 supervisor，防它按职责补回缺失进程。
 Disable-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor2'
+# 要关终端的话，看护任务（§6.5）也要先停用，否则一分钟内它会把终端拉起来。
+Disable-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'terminal_keeper'
 # 然后设置 killSwitch，核验并停止整个父子树；仅杀 venv launcher 不够。
 New-Item -ItemType File -Force (Join-Path $data 'live\killSwitch')
 # $argv 已含解释器之后的脚本及全部固定部署参数。
@@ -932,10 +934,43 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\terminal_keeper.ps1 -Termin
   把这一步补进 §6.3 的人工停机序列。
 - **经网关的一次性脚本不再自动拉起各自的终端**。研究用的第二个终端（如果有）
   需要人工启动。
-- **看护任务的安装还没有做**：每分钟一次的独立任务、安装脚本、任务设置
-  （"不启动新实例"、单次运行的时间上限）、运行账户、登录类型写进部署记录。
-  下一次部署的前置；在那之前不手工装任务。装之前在终端运行时用 `-DryRun`
-  核对一次，必须输出 `running`。
+- **看护任务的安装**：每分钟一次的独立任务，由 `scripts\ops\install_terminal_keeper.ps1`
+  注册，经通用的隐藏启动器 `scripts\ops\hidden_task.vbs` 调用看护脚本——和 supervisor
+  任务（§6.3）同一个启动器，同样的原因：wscript 没有控制台，动作是控制台程序的任务
+  每分钟会在交互桌面上弹一次窗口。
+
+  ```powershell
+  # 1. 终端运行着的时候先核对看护脚本的判断，必须输出 running（上面那一条命令）
+  # 2. 只打印将要注册的内容：这条路径不查询、不注册、不注销
+  powershell -ExecutionPolicy Bypass -File scripts\ops\install_terminal_keeper.ps1 `
+    -TerminalPath "<终端安装目录>\terminal64.exe" -DeployDir "<部署树>" -DataDir "<数据目录>"
+  # 3. 动作、触发器、主体、设置核对无误后，同一条命令加 -Install 才注册
+  # 4. 看任务现在的状态（只读）
+  powershell -ExecutionPolicy Bypass -File scripts\ops\install_terminal_keeper.ps1 -Status
+  ```
+
+  - 不带 `-Install` / `-Uninstall` 时脚本只做检查、只打印，不碰任务计划程序。打印的
+    `KEEPER_TASK_PARAMETERS {…}` 里 `mode` 是 `plan`，注册之后打印的同一行里是
+    `install`。这一行是本机的绝对路径和账户：**抄进入库的部署记录之前要脱敏**，
+    账户名只在本机核对。
+  - 任务的设置：每分钟一次，第一次在一分钟之后；"不启动新实例"（`IgnoreNew`）——看护
+    一次只要一两秒，上一次没跑完就不再起一个；单次运行的时间上限 2 分钟；主体是当前
+    用户，登录类型 `Interactive`、运行级别 `Highest`——和 supervisor 任务一样：终端要在
+    交互桌面上启动，看护要读得到同一个用户的进程的映像路径。
+  - 安装只注册任务：不往部署树里写文件（supervisor 要求部署树是干净的），不建日志目录。
+    检查全在注册之前，任何一项不对都拒绝并一次列全：路径不是完整路径、`terminal64.exe`
+    不在或名字不对、部署树里没有看护脚本或启动器、路径带 `%`（启动器拒绝）、路径含系统
+    ANSI 代码页表示不了的字符（和 §6.3 的安装脚本同一条规矩）。同名的任务已经在了就
+    拒绝，不覆盖：换参数先 `-Uninstall`。
+  - `-Status` 只读：打印 `KEEPER_TASK_STATUS {…}`——状态、上次运行的时刻和上次结果，
+    时刻是 UTC。上面"看护被拒绝没有告警通道"那一条要核对的上次结果码，就用它查。
+  - 退出码：0 做完了；1 拒绝或出错，原因在错误输出里；4 是 `-Status` 或 `-Uninstall`
+    时任务没有安装。
+  - **不要手工拼 `Register-ScheduledTask`**：任务的动作、触发器、主体、设置只在安装
+    脚本里定义一份。部署记录里抄的是打印出来的那一行（路径和账户脱敏）：任务的路径和
+    名字、`start_boundary`、`repeat_interval`、`multiple_instances`、
+    `execution_time_limit`、`logon_type`、`run_level`、启动器和看护脚本的 SHA-256。
+  - 不在安装脚本之外另装同名的任务；卸载只用 `-Uninstall`（只注销，不删日志）。
 
 **验收**（第二十三轮计划 §2.2 第 7 条）：P23-2 的网关一半已翻转——探针在
 T209 上报 NOT-REPRODUCED（终端退出后 `initialize` 被调 0 次）。演练 C 在
