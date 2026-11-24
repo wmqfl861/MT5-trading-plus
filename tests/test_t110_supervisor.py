@@ -592,15 +592,30 @@ def test_launch_path_demo_run_start_process_hidden_is_verified_and_terminated(tm
 # worker first and the launcher right after worked only when the backend reached the
 # launcher within a fraction of a millisecond. Otherwise the launcher was already on its
 # way out, TerminateProcess failed, and the round was refused ("termination failed").
+#
+# The trees here are built by the tests, not by the interpreter: on CI sys.executable is
+# the plain python.exe, with no launcher in front of it. (A first version of these tests
+# relied on the venv's launcher and failed on CI for that reason.)
 
 def launcher_with_worker(tmp_path):
-    """The risk role as a real two-level tree: the venv's launcher and an interpreter
-    that runs a script doing nothing but sleep."""
+    """The risk role as a real tree with a launcher that leaves by itself, whatever the
+    interpreter is. The registered script is the launcher: it starts the same script
+    again, with the same arguments, as the worker (which only sleeps), waits for it, and
+    exits when it has gone -- what the venv's python.exe does with a role. The same
+    arguments are what let the worker pass the identity check. Where sys.executable is
+    itself such a launcher the tree just has one level more."""
     mod, cfg, _, live, entries = setup(tmp_path)
     entry = next(e for e in entries if e["kind"] == "risk")
     script = Path(entry["argv"][2])
     script.parent.mkdir(parents=True, exist_ok=True)
-    script.write_text("import time\ntime.sleep(120)\n")
+    script.write_text(
+        "import os, subprocess, sys, time\n"
+        "if os.environ.get('T110_ROLE_WORKER'):\n"
+        "    time.sleep(120)\n"
+        "else:\n"
+        "    worker = subprocess.Popen([sys._base_executable, '-u', *sys.argv],\n"
+        "                              env={**os.environ, 'T110_ROLE_WORKER': '1'})\n"
+        "    sys.exit(worker.wait())\n")
     return mod, cfg, live, entry
 
 
@@ -741,7 +756,8 @@ def test_stop_ends_a_tree_whose_launcher_has_left_by_itself(tmp_path):
         entry, tree = verified_real_tree(mod, backend, entry, proc.pid)
         (live / "instances.json").write_text(json.dumps({"schema_version": 1, "instances": [entry]}))
         (live / "killSwitch").touch()
-        original = late_for_the_launcher(backend, proc.pid)
+        # The tree is children first: tree[0] is the worker, tree[1] the launcher waiting for it.
+        original = late_for_the_launcher(backend, tree[1]["pid"])
         stopped = mod.stop_deployment(cfg, backend, verify_deployment=lambda c: None)
         assert stopped["refused"] is False, stopped
         assert stopped["stopped"] == ["risk"]
@@ -775,7 +791,8 @@ def test_supervise_restarts_a_role_whose_launcher_has_left_by_itself(tmp_path):
     try:
         entry, tree = verified_real_tree(mod, backend, entry, proc.pid)
         (live / "instances.json").write_text(json.dumps({"schema_version": 1, "instances": [entry]}))
-        original = late_for_the_launcher(backend, proc.pid)
+        # tree[0] is the worker, tree[1] the launcher waiting for it.
+        original = late_for_the_launcher(backend, tree[1]["pid"])
         result = mod.supervise(cfg, backend, now=NOW, verify_deployment=lambda c: None)
         assert result["refused"] is False, result.get("reason")
         assert result["restarted"] == ["777", "risk", "reconcile"]
@@ -804,7 +821,8 @@ def test_a_tree_is_terminated_in_full_before_any_member_is_waited_for(tmp_path, 
         calls = []
         record_kernel_calls(monkeypatch, mod, calls)
         mod.terminate_verified_tree(entry, backend, entry["argv"])
-        assert calls == ["TerminateProcess", "TerminateProcess", "WaitForSingleObject", "WaitForSingleObject"]
+        # Every member of the tree first, whichever interpreter built it; only then the waits.
+        assert calls == ["TerminateProcess"] * len(tree) + ["WaitForSingleObject"] * len(tree)
         assert not mod.verified_tree(entry, backend.snapshot(), entry["argv"])
     finally:
         end_fake(original, tree)
@@ -836,16 +854,14 @@ def test_terminate_counts_an_exited_process_as_ended(tmp_path):
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows process handles")
 def test_terminate_counts_a_vanished_process_as_ended(tmp_path):
     """C2: the same once the process object is gone and OpenProcess fails; that used to be
-    "cannot acquire process handle". Nothing here holds a handle: the launcher was started
-    by the backend itself and left when its worker did."""
+    "cannot acquire process handle". The process was started by the backend itself and
+    ended by it; nothing holds a handle to it."""
     import os
     mod = load_supervisor()
     backend = mod.WindowsProcesses()
-    argv = sleeping_role(tmp_path)
-    launched = backend.launch(argv, str(tmp_path), str(tmp_path / "role.log"),
-                               {**os.environ, "PYTHONUNBUFFERED": "1"})
-    _, tree = verified_real_tree(mod, backend, dict(launched, argv=argv), launched["pid"])
-    backend.terminate(tree[0])                    # the worker
+    argv = [sys._base_executable, "-I", "-c", "import time; time.sleep(120)"]    # one process
+    launched = backend.launch(argv, str(tmp_path), str(tmp_path / "role.log"), dict(os.environ))
+    backend.terminate(launched)
     wait_until_gone(launched["pid"])
     backend.terminate(launched)
 
