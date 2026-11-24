@@ -8,6 +8,7 @@ The original three P-line probes and their fixtures remain unchanged.
 """
 from __future__ import annotations
 import contextlib
+import importlib.util
 import json
 from pathlib import Path
 import sys

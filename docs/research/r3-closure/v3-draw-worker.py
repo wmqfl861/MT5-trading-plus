@@ -41,6 +41,7 @@ from mt5quant.research import cards  # noqa: E402
 from mt5quant.research import ledger as ledger_mod  # noqa: E402
 from mt5quant.validation import events as vevents  # noqa: E402
 from mt5data.ext.merge import merged_research_series  # noqa: E402
+from mt5data.sessions import load_session_policy  # noqa: E402
 
 tmp = Path(tempfile.mkdtemp(prefix=f"run5-w{k0}-"))
 shutil.copy2(RESEARCH / "data/research/ledger.sqlite", tmp / "ledger.sqlite")

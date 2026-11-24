@@ -8,6 +8,9 @@ testpaths = ["tests"]
 [tool.ruff]
 # CI 只在 Python 3.12 上测；按 3.12 解析，比它新的语法算语法错误
 target-version = "py312"
+# docs/ 下的脚本是历次评审和研究留下的材料，按原样保存，不在检查范围里：
+# 评审记录按行号引用它们，不为清掉没用的导入去改它们。
+extend-exclude = ["docs"]
 
 [tool.ruff.lint]
 # E9   语法错误
