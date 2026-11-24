@@ -5,8 +5,9 @@
 1. 脚本自己的结构。不带 -Install / -Uninstall 时它只打印将要注册的内容（动作、触发器、
    主体、设置），不查询、不注册、不注销；接触任务计划程序的四个命令各自在自己的开关里面，
    开关是脚本的顶层语句。按语法树核对：脚本里出现的每一个命令名、每一个类型、每一处静态
-   成员调用、Add-Type 的 C#、New-Object 的参数，都在一份允许清单上——清单之外的，不管是
-   别的 cmdlet、别名（ipmo、iex）、COM、子进程还是别的，一律不放。静态检查不过，这份文件里
+   成员、每一处实例成员、Add-Type 的 C#、New-Object 的参数，都在一份允许清单上——清单之外的，
+   不管是别的 cmdlet、别名（ipmo、iex）、COM、子进程还是别的，一律不放；using 语句（using
+   module、using assembly、using namespace）一条也不放。静态检查不过，这份文件里
    没有任何一条用例运行安装脚本。
 2. 测试进程的沙箱。驱动脚本所在的 PowerShell 进程，PSModulePath 里**只有**沙箱里放模块的
    那一个目录（沙箱模块装进来时自己核对这一条）。这保证了按名字**导入**模块
@@ -52,6 +53,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+
+from tests.conftest import CHILD_REPORT_ENV, powershell_report
 
 ROOT = Path(__file__).resolve().parents[1]
 OPS = ROOT / "scripts" / "ops"
@@ -398,9 +401,26 @@ ALLOWED_MEMBERS = frozenset({
     ("System.Text.Encoding", "GetEncoding"),
     ("MT5Quant.KeeperInstallerCodePages", "GetACP"), ("MT5Quant.KeeperInstallerCodePages", "GetOEMCP"),
 })
-# Members that make or run something else, refused on any object.
-REFUSED_MEMBERS = frozenset({"CreateInstance", "GetTypeFromProgID", "GetActiveObject", "InvokeMember",
-                             "InvokeCommand", "InvokeScript", "AddScript"})
+# Every instance member the script may use, on whatever object (a property read or a method call): an
+# inventory like ALLOWED_MEMBERS. .GetType, .Assembly, .GetMethod, .Invoke and the like are not on it. A
+# member whose name is not written out ($object.$name) is recorded whole, marked "(dynamic)", and judged
+# by that text: one is allowed, the state file's fields read by key.
+ALLOWED_INSTANCE_MEMBERS = frozenset({
+    ".ACP", ".OEMCP",                                                       # what Get-SystemCodePages returns
+    ".AddMinutes", ".ToUniversalTime", ".ToString", ".TotalSeconds",       # DateTime
+    ".Contains", ".Trim", ".TrimEnd", ".Length",                           # strings
+    ".Count",                                                               # arrays
+    ".Hash", ".ToLower",                                                    # what Get-FileHash returns
+    ".GetBytes", ".GetString",                                              # Encoding: a path's round trip
+    ".Name",                                                                # WindowsIdentity
+    ".Value",                                                               # what Get-Variable returns
+    ".ts", ".age_s", "(dynamic) $state.$key",                               # the keeper's state file and the line shown from it
+    ".Repetition", ".Interval", ".StartBoundary",                           # what New-ScheduledTaskTrigger returns
+    ".MultipleInstances", ".ExecutionTimeLimit",                            # what New-ScheduledTaskSettingsSet returns
+    ".LogonType", ".RunLevel",                                              # what New-ScheduledTaskPrincipal returns
+    ".State",                                                               # what Get-ScheduledTask returns
+    ".LastRunTime", ".LastTaskResult", ".NextRunTime", ".NumberOfMissedRuns",   # Get-ScheduledTaskInfo
+})
 # The four commands that read or change tasks, and the switch each call sits directly in, in the order
 # the script has them. The switch's if has to be a top-level statement of the script: not inside a
 # function (from where it could be called at any time), not inside another branch.
@@ -415,7 +435,8 @@ EXPECTED_TOUCHING = [
 SURVEY = r'''
 # Survey of a PowerShell script by its syntax tree: every command (name as written, invocation
 # operator, arguments, and the nearest branch or scope that contains it), every type named, every
-# static member called on a type, every function defined. Read-only: the script is parsed, never run.
+# static member called on a type, every instance member, every function defined, every using statement.
+# Read-only: the script is parsed, never run.
 # The report goes to the file named by -Out, not to standard output: Windows PowerShell 5.1 encodes
 # redirected output with the console's code page -- 437 on the CI runner, where the section sign alone
 # becomes byte 0x15, a control character that breaks the JSON (CI #420).
@@ -428,7 +449,7 @@ $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($Script, [ref]$tokens, [ref]$errors)
 $broken = @($errors | Where-Object { $_ })
 if ($broken.Count -gt 0) {
-    Emit @{ parse_errors = @($broken | ForEach-Object { $_.Message }); commands = @(); types = @(); members = @(); instance_members = @(); functions = @() }
+    Emit @{ parse_errors = @($broken | ForEach-Object { $_.Message }); commands = @(); types = @(); members = @(); instance_members = @(); functions = @(); usings = @() }
     exit 0
 }
 $language = 'System.Management.Automation.Language.'
@@ -497,28 +518,34 @@ for ($i = 0; $i -lt $tokens.Count; $i++) {
 }
 $members = @($ast.FindAll({ param($node) $node -is ($language + 'MemberExpressionAst' -as [type]) -and $node.Static }, $true) |
     ForEach-Object { $_.Expression.TypeName.FullName + '::' + $_.Member.Extent.Text } | Sort-Object -Unique)
+# Instance members on whatever object, by name as written (.TrimEnd, .ToString()). One whose name is not
+# written out ($object.$name) cannot be judged by name: it is recorded whole and marked "(dynamic)".
 $instance_members = @($ast.FindAll({ param($node) $node -is ($language + 'MemberExpressionAst' -as [type]) -and -not $node.Static }, $true) |
-    ForEach-Object { $_.Member.Extent.Text } | Sort-Object -Unique)
+    ForEach-Object {
+        if ($_.Member -is ($language + 'StringConstantExpressionAst' -as [type])) { '.' + $_.Member.Extent.Text } else { '(dynamic) ' + $_.Extent.Text }
+    } | Sort-Object -Unique)
 $functions = @($ast.FindAll({ param($node) $node -is ($language + 'FunctionDefinitionAst' -as [type]) }, $true) |
     ForEach-Object { $_.Name })
-@{ commands = $commands; types = @($types | Sort-Object -Unique); members = $members; instance_members = $instance_members; functions = $functions } | ForEach-Object { Emit $_ }
+# using statements, wherever they are: a module by name or by path, an assembly, a namespace. None is allowed.
+$usings = @($ast.FindAll({ param($node) $node -is ($language + 'UsingStatementAst' -as [type]) }, $true) |
+    ForEach-Object { $_.Extent.Text })
+@{ commands = $commands; types = @($types | Sort-Object -Unique); members = $members; instance_members = $instance_members; functions = $functions; usings = $usings } | ForEach-Object { Emit $_ }
 '''
 
 
 def survey(script, folder) -> dict:
-    """→ {commands: [{name, operator, line, arguments, container}], types, members, functions}。container 是命令
-    外面最近的分支或作用域：top-level-if:<条件>、nested-if:<条件>、function:<名字>、loop、try……
-    结果从临时目录里的 UTF-8 文件读，不经标准输出：标准输出按控制台的代码页编码，CI 的机器上是 437，
-    安装脚本里的"§"会变成字节 0x15，JSON 就坏了（CI #420）。"""
+    """→ {commands: [{name, operator, line, arguments, container}], types, members, instance_members, usings,
+    functions}。container 是命令外面最近的分支或作用域：top-level-if:<条件>、nested-if:<条件>、function:<名字>、
+    loop、try……
+    结果经 conftest 的 powershell_report() 从临时目录里的 UTF-8 文件读，不经标准输出：标准输出按控制台
+    的代码页编码，CI 的机器上是 437，安装脚本里的"§"会变成字节 0x15，JSON 就坏了（CI #420）。"""
     folder = Path(folder)
     script_file = folder / "survey.ps1"
-    report_file = folder / "survey-report.json"
     script_file.write_bytes(b"\xef\xbb\xbf" + SURVEY.replace("\n", "\r\n").encode("utf-8"))
-    rc, out, err = powershell(folder, "& " + quote(script_file) + " -Script " + quote(script)
-                              + " -Out " + quote(report_file) + "\n")
-    assert rc == 0, err
-    assert report_file.is_file(), "the survey wrote no report\n" + (out + err)[-800:]
-    return json.loads(report_file.read_text(encoding="utf-8"))
+    report = powershell_report(                                  # 一次性的脚本和报告，和 powershell() 的放在一起
+        folder / "queries",
+        "& " + quote(script_file) + " -Script " + quote(script) + " -Out $env:" + CHILD_REPORT_ENV + "\n")
+    return json.loads(report)
 
 
 def static_problems(report: dict) -> list:
@@ -539,10 +566,11 @@ def static_problems(report: dict) -> list:
     bad += [f"type not on the allowed list: [{type_name}]" for type_name in report["types"] if type_name not in ALLOWED_TYPES]
     for item in report["members"]:
         type_name, member = item.split("::", 1)
-        if member in REFUSED_MEMBERS or (type_name, member) not in ALLOWED_MEMBERS:
+        if (type_name, member) not in ALLOWED_MEMBERS:
             bad.append(f"static member not on the allowed list: [{item}]")
-    bad += [f"a member that can make or run something else: .{member}" for member in report["instance_members"]
-            if member in REFUSED_MEMBERS]
+    bad += [f"instance member not on the allowed list: {member}" for member in report["instance_members"]
+            if member not in ALLOWED_INSTANCE_MEMBERS]
+    bad += [f"a using statement, whichever kind: {text}" for text in report["usings"]]
     touching = [(command["name"], command["container"]) for command in report["commands"] if command["name"] in TOUCHING]
     if touching != [(name, "top-level-if:" + switch) for name, switch in EXPECTED_TOUCHING]:
         bad.append("the commands that touch the Task Scheduler are not each directly in their own top-level switch: "
@@ -580,13 +608,15 @@ def test_the_installer_has_the_three_switches_and_no_dry_run():
 
 @requires_powershell
 def test_the_installer_contains_only_what_is_on_the_allowed_lists(tmp_path):
-    """按语法树清点安装脚本：命令名、带参数的几个命令、类型、静态成员、接触命令的位置，每一项都过允许
-    清单。清单就是库存——脚本不再用到的，也要从清单上拿掉，清单才不会越积越大。"""
+    """按语法树清点安装脚本：命令名、带参数的几个命令、类型、静态成员、实例成员、using 语句、接触命令的
+    位置，每一项都过允许清单。清单就是库存——脚本不再用到的，也要从清单上拿掉，清单才不会越积越大。"""
     report = survey(INSTALLER, tmp_path)
     assert static_problems(report) == []
     assert {command["name"] for command in report["commands"] if command["name"] in ALLOWED_COMMANDS} == ALLOWED_COMMANDS
     assert set(report["types"]) == ALLOWED_TYPES
     assert set(report["members"]) == {"::".join(pair) for pair in ALLOWED_MEMBERS}
+    assert set(report["instance_members"]) == ALLOWED_INSTANCE_MEMBERS
+    assert report["usings"] == []
 
 
 @requires_powershell
@@ -598,6 +628,82 @@ def test_only_the_three_mode_blocks_touch_the_task_scheduler(tmp_path):
     report = survey(INSTALLER, tmp_path)
     where = [(command["name"], command["container"]) for command in report["commands"] if command["name"] in TOUCHING]
     assert where == [(name, "top-level-if:" + switch) for name, switch in EXPECTED_TOUCHING]
+
+
+@requires_powershell
+def test_survey_fails_rather_than_returning_an_earlier_report(tmp_path, monkeypatch):
+    """同一个目录先后清点两次，后一次没有写出报告：survey() 必须报错，不能返回前一次的报告。报告文件的
+    路径按目录固定，不先删旧的，后一次没有报告时读到的就是前一次的（定版前第四次复核的建议 1）。这里
+    把清点脚本换成不写报告的一份：解析照旧，只是不落盘。"""
+    assert survey(INSTALLER, tmp_path)["commands"]                 # 前一次读到的确实是报告
+    silent = SURVEY.replace("function Emit($report) {", "function Emit($report) { return")
+    assert silent != SURVEY
+    monkeypatch.setitem(globals(), "SURVEY", silent)
+    with pytest.raises(AssertionError, match="wrote no report"):
+        survey(INSTALLER, tmp_path)
+
+
+@requires_powershell
+def test_a_report_comes_back_through_a_utf8_file_and_an_earlier_one_is_not_reused(tmp_path):
+    """conftest 的 powershell_report()（规矩写在那里）：报告是临时目录里的 UTF-8 文件，非 ASCII 字符原样
+    回来；子进程写到标准输出的不参与；后一次没有写出报告时报错，不返回前一次的。"""
+    write = ("[System.IO.File]::WriteAllText($env:" + CHILD_REPORT_ENV
+             + ", '§ 运行记录', (New-Object System.Text.UTF8Encoding($false)))\n")
+    assert powershell_report(tmp_path, write + "Write-Output 'not the report'\n") == "§ 运行记录"
+    with pytest.raises(AssertionError, match="wrote no report"):
+        powershell_report(tmp_path, "Write-Output 'no report this time'\n")
+
+
+# Ways around the sandbox that the installer does not use, for the static check to refuse: each is a few
+# lines added to a copy of the installer -- at its top, right after the BOM, or at its end -- and what the
+# check must say about them (each fragment in some problem). The copies are parsed, never run, and are not
+# kept. The using statements, the COM object, the alias import and the reflection chain are shapes the
+# reviewers found (docs/reviews/2026-11-24-prefreeze-review.md, 9.4 and 10.3-10.4).
+WAYS_AROUND = [
+    pytest.param("top", ["using module ScheduledTasks"],
+                 ["a using statement, whichever kind: using module ScheduledTasks"], id="using-module-by-name"),
+    pytest.param("top", [r"using module .\modules\ScheduledTasks\ScheduledTasks.psm1"],
+                 [r"a using statement, whichever kind: using module .\modules"], id="using-module-by-path"),
+    pytest.param("top", ["using assembly System.Web"],
+                 ["a using statement, whichever kind: using assembly"], id="using-assembly"),
+    pytest.param("top", ["using namespace System.Runtime.InteropServices"],
+                 ["a using statement, whichever kind: using namespace"], id="using-namespace"),
+    pytest.param("end", ["$service = [Activator]::CreateInstance([type]::GetTypeFromProgID('Schedule.Service'))"],
+                 ["type not on the allowed list: [Activator]",
+                  "static member not on the allowed list: [Activator::CreateInstance]",
+                  "static member not on the allowed list: [type::GetTypeFromProgID]"], id="com-object"),
+    pytest.param("end", [r"ipmo (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules\ScheduledTasks')"],
+                 ["command not on the allowed list", "ipmo"], id="alias-import-by-path"),
+    # A reflection chain that names no command, no [type] and no static member: every step is an instance member.
+    pytest.param("end", ["$type = ''.GetType().Assembly.GetType('System.Type').GetMethod('GetTypeFromProgID')"
+                         ".Invoke($null, @('Schedule.Service'))"],
+                 ["instance member not on the allowed list: .GetType", "instance member not on the allowed list: .Assembly",
+                  "instance member not on the allowed list: .GetMethod",
+                  "instance member not on the allowed list: .Invoke"], id="reflection-chain"),
+    pytest.param("end", ["$member = 'Invoke'", "$x.$member"],
+                 ["instance member not on the allowed list: (dynamic) $x.$member"], id="member-name-in-a-variable"),
+    pytest.param("end", ["$service.Connect()"],
+                 ["instance member not on the allowed list: .Connect"], id="instance-method"),
+]
+
+
+def installer_with(where, lines) -> bytes:
+    """安装脚本的字节，开头（BOM 之后）或者末尾加上几行：给静态检查解析的副本，从不运行。"""
+    raw = INSTALLER.read_bytes()
+    added = "".join(line + "\r\n" for line in lines).encode("utf-8")
+    return raw[:3] + added + raw[3:] if where == "top" else raw + added
+
+
+@requires_powershell
+@pytest.mark.parametrize("where, lines, expected", WAYS_AROUND)
+def test_the_static_check_refuses_ways_around_the_sandbox(tmp_path, where, lines, expected):
+    """静态检查的变异验证：安装脚本的副本加几行，只让静态检查解析（副本从不运行，也不保留）。每一种
+    都是绕开沙箱去碰任务计划程序的路——现在的安装脚本没有用，以后的改动要用，静态检查必须当场拒绝。"""
+    mutant = tmp_path / "mutant.ps1"
+    mutant.write_bytes(installer_with(where, lines))
+    problems = static_problems(survey(mutant, tmp_path))
+    missing = [fragment for fragment in expected if not any(fragment in problem for problem in problems)]
+    assert not missing, f"not refused: {missing}\n" + "\n".join(problems)
 
 
 @requires_powershell

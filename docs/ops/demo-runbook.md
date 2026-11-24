@@ -984,7 +984,7 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\terminal_keeper.ps1 -Termin
   - 退出码：0 做完了；1 拒绝或出错，原因在错误输出里；4 是 `-Status` 或 `-Uninstall`
     时任务没有安装。
   - **状态文件**：看护脚本每一次做过判断的运行，把结果写进 `-LogPath` 所在目录下的
-    `state.json`（任务的动作里就是 `<数据目录>/ops-evidence/terminal-keeper/state.json`）：
+    `state.json`（任务的动作里就是 `<数据目录>/ops-evidence/terminal_keeper/state.json`）：
     `ts`、`outcome`（`running` / `started` / `refused` / `start_failed`）、`reason`（拒绝和启动
     失败的原因代码）、`running`、`others`、`pid`，不含路径和账户。只在给了 `-LogPath` 且不是
     `-DryRun` 时写；`busy` 的那个实例不写（它没有做判断）；写不进去只警告，不改退出码。

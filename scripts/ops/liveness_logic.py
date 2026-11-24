@@ -136,7 +136,7 @@ def _well_formed(entry) -> bool:
 def observe(live_dir, reports_dir, disk_path, now: datetime, alive, expect_keeper=False, keeper_state=None) -> dict:
     """只读一次现场。任何一项读不到都如实记 None，不猜。alive(pid, started_utc) 是进程探针。
     expect_keeper 为假时不看护任务的状态文件，obs["keeper"] 是 None；为真时读 keeper_state，
-    缺省是 <live 的上一级>/ops-evidence/terminal-keeper/state.json（看护脚本的 -LogPath 所在目录）。"""
+    缺省是 <live 的上一级>/ops-evidence/terminal_keeper/state.json（看护脚本的 -LogPath 所在目录）。"""
     live, now = Path(live_dir), now.astimezone(timezone.utc)
     ahead: list[str] = []          # 比 now 晚 60 秒以上的时间戳，按来源
     obs = {"roles": {}, "registry_readable": True, "registry_valid": True, "clock_ahead": ahead,
@@ -209,7 +209,7 @@ def observe(live_dir, reports_dir, disk_path, now: datetime, alive, expect_keepe
                                  if Path(reports_dir).is_dir() else None)
     if expect_keeper:
         state_path = (Path(keeper_state) if keeper_state is not None
-                      else live.resolve().parent / "ops-evidence" / "terminal-keeper" / "state.json")
+                      else live.resolve().parent / "ops-evidence" / "terminal_keeper" / "state.json")
         obs["keeper"] = _keeper(now, state_path, ahead)
     return obs
 
