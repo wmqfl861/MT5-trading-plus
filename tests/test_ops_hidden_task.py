@@ -278,6 +278,10 @@ def test_wrapper_appends_to_the_log_and_rotates_it_once_it_is_over_five_megabyte
     ({"GatewayConfig": 'C:\\a"b.json'}, "-gateway-config contains a double quote"),
     ({"Directory": "<nowhere>"}, "deployment directory not found"),
     ({"Python": "<no interpreter here>"}, "interpreter not found"),
+    # pre-freeze review S5: live_supervisor.py refuses relative paths (verify_deployment)
+    ({"ConfigDir": "configs"}, "-config-dir is not an absolute path"),
+    ({"SpreadModel": "spread_model.json"}, "-spread-model is not an absolute path"),
+    ({"LogDir": "logs"}, "-log-dir is not an absolute path"),
 ])
 def test_wrapper_refuses_what_it_cannot_run_and_says_why_in_the_log(tmp_path, change, reason):
     """Under the launcher nobody sees the wrapper's error stream, so the reason goes to the
@@ -293,6 +297,22 @@ def test_wrapper_refuses_what_it_cannot_run_and_says_why_in_the_log(tmp_path, ch
     assert rc == 3, noise
     assert reason in fake.log.read_bytes().decode("ascii")
     assert not fake.record.exists()                      # nothing was started
+
+
+@windows_only
+def test_wrapper_refuses_a_relative_data_dir_and_logs_nothing_anywhere(tmp_path):
+    """Pre-freeze review S5: a relative -DataDir does not say where the log is. It used to be
+    taken: the reason was logged under the directory that happened to be current, and after
+    Set-Location the supervisor's output would have gone under the deployment directory."""
+    fake = FakeDeployment(tmp_path)
+    done = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ONCE),
+                           *flattened({**fake.options(), "DataDir": "relative-data"})],
+                          capture_output=True, timeout=60, cwd=tmp_path, creationflags=NO_WINDOW,
+                          env=wrapper_environment(tmp_path))
+    noise = (done.stdout + done.stderr).decode("mbcs", "replace")
+    assert done.returncode == 3 and "-data-dir is not an absolute path" in noise, noise
+    assert not (tmp_path / "relative-data").exists()      # no log under the current directory
+    assert not fake.log.exists() and not fake.record.exists()
 
 
 @windows_only

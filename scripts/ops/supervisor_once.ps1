@@ -22,6 +22,10 @@
 # The interpreter is an explicit parameter and is not looked up. It currently lives in the
 # agent workspace; D112 requires production to leave the workspace before the formal
 # window starts. That move is not made here.
+#
+# Every parameter except -Sha has to be an absolute path. live_supervisor.py refuses a
+# relative one (verify_deployment: unsafe path); refusing it here first keeps the log where
+# the absolute -DataDir says and nothing is started.
 
 param(
     [string]$Directory = "",
@@ -55,7 +59,10 @@ $options = [ordered]@{
 }
 $limit = 5MB
 $log = ""
-if ($DataDir) { $log = Join-Path $DataDir "ops-evidence\supervisor\supervisor.log" }
+# Only an absolute -DataDir says where the log is: a relative one would be relative to whatever
+# the current directory is at the moment, and that changes at Set-Location below. It is refused
+# below like every other relative path, and nothing is logged for it.
+if ($DataDir -and [System.IO.Path]::IsPathRooted($DataDir)) { $log = Join-Path $DataDir "ops-evidence\supervisor\supervisor.log" }
 
 function Append-Bytes([string]$path, [byte[]]$bytes) {
     $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write)
@@ -96,6 +103,7 @@ foreach ($name in @($options.Keys)) {
     if ([string]::IsNullOrWhiteSpace($value)) { Refuse "-$name was not given" }
     if ($value.Contains('"')) { Refuse "-$name contains a double quote" }
     if ($value.EndsWith("\")) { Refuse "-$name ends with a backslash" }
+    if ($name -ne "sha" -and -not [System.IO.Path]::IsPathRooted($value)) { Refuse "-$name is not an absolute path" }
 }
 $supervisor = Join-Path $Directory "scripts\live_supervisor.py"
 if (-not (Test-Path -LiteralPath $Directory -PathType Container)) { Refuse "deployment directory not found: $Directory" }
