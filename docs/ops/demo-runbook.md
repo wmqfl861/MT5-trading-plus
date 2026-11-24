@@ -681,8 +681,7 @@ git 和 powershell 都按绝对路径调用。git 找不到按无法判定处理
 
 沿用 §6.2 的变量，仅在维护窗口明确批准后安装。任务只运行一次 supervisor，
 由 Windows 每分钟触发；不要在本次开发验证中安装或执行真实业务动作。
-§6.2 的变量不能以反斜杠结尾（启动器以退出码 5 拒绝），也不能含 `%`（退出码 4）。也不能含双引号：它到不了启动器（WSH 解析命令行时就把引号吃掉了，参数会变样），"
-     "所以任务参数里的路径不带双引号，见 §6.3"启动器的退出码"那一条。
+§6.2 的变量不能以反斜杠结尾（启动器以退出码 5 拒绝），也不能含 `%`（退出码 4）。也不能含双引号：它到不了启动器（WSH 解析命令行时就把引号吃掉了，参数会变样），所以任务参数里的路径不带双引号，见 §6.3 里启动器的退出码那一条。
 
 ```powershell
 # 手工的 --inspect / --stop 直接调解释器；任务走下面的隐藏启动器。
@@ -715,10 +714,10 @@ Register-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor2' `
 "session of this PowerShell: $((Get-Process -Id $PID).SessionId)"
 Get-FileHash -LiteralPath $launcher, $once -Algorithm SHA256 | Select-Object Hash, Path
 
-# 计划内停止业务前先停用 supervisor，防它按职责补回缺失进程。
-Disable-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor2'
-# 要关终端的话，看护任务（§6.5）也要先停用，否则一分钟内它会把终端拉起来。
+# 计划内停机：先停用两个任务，防 supervisor 按职责补回缺失进程，防看护把要关的终端拉起来。
+# 顺序是先停用看护任务，再停 supervisor，最后才关终端（下面）。
 Disable-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'terminal_keeper'
+Disable-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor2'
 # 然后设置 killSwitch，核验并停止整个父子树；仅杀 venv launcher 不够。
 New-Item -ItemType File -Force (Join-Path $data 'live\killSwitch')
 # $argv 已含解释器之后的脚本及全部固定部署参数。
@@ -756,6 +755,10 @@ Unregister-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor2' -Co
   路径，抄之前换成占位符），两者的 sha256。sha256 是 64 位十六进制，描述符生成器找的是恰好 40 位的 SHA，
   不会被数成第二个；记录行里照旧只写一个完整的 UTC 时刻。上面那条命令还会把账户名（`UserId`）打在屏幕上：
   **账户名只在本机核对，不抄进入库的部署记录**（卫生扫描的口径），要在本机留档就放进不入库的文件。
+- **计划内停机期间这两类通知是预期的**：停机先停用看护任务，再停 supervisor，最后才关终端（上面代码块
+  里的顺序）。装了带 `--expect-keeper` 的小时任务（§6.6）之后，停机期间存活检查会报 `keeper_stale`——
+  状态文件超过 10 分钟就是生产级，第一次看到就通知；终端关着、运行器在等它的时候，还会报
+  `terminal_absent:<运行器>`。看到这两条，先核对是不是计划内停机。
 - **解释器路径**（`-Python`）是显式参数，现在指向工作区里的 `.venv`。D112 要求正式窗口起算前把生产的解释器、
   部署树、数据、配置、日志全部移出 agent 工作区（T215）；移出之后重新注册任务。
 - **不弹窗要人工确认一次**：装完之后等下一次触发，确认交互桌面上没有窗口出现，结论写进部署记录。
@@ -935,8 +938,9 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\terminal_keeper.ps1 -Termin
   `KEEPER …`，不含本机路径。状态变化（启动、拒绝）写进 `-LogPath`。
 - 互斥量按终端的最终路径命名：同一个终端一次只有一个看护实例在判断和启动；
   给另一个终端另装的看护互不影响。
-- **维护时要关终端，先禁用看护任务**，否则一分钟内它会把终端拉起来。装任务时
-  把这一步补进 §6.3 的人工停机序列。
+- **维护时要关终端，先停用看护任务**，否则一分钟内它会把终端拉起来；§6.3 的人工停机序列
+  里有这一步（先停用看护任务，再关终端）。装了带 `--expect-keeper` 的小时任务之后，停机期间
+  存活检查报 `keeper_stale`（以及运行器等终端时的 `terminal_absent`）是预期的。
 - **经网关的一次性脚本不再自动拉起各自的终端**。研究用的第二个终端（如果有）
   需要人工启动。
 - **看护任务的安装**：每分钟一次的独立任务，由 `scripts\ops\install_terminal_keeper.ps1`
@@ -965,8 +969,7 @@ powershell -ExecutionPolicy Bypass -File scripts\ops\terminal_keeper.ps1 -Termin
     交互桌面上启动，看护要读得到同一个用户的进程的映像路径。
   - 安装只注册任务：不往部署树里写文件（supervisor 要求部署树是干净的），不建日志目录。
     检查全在注册之前，任何一项不对都拒绝并一次列全：路径不是完整路径、`terminal64.exe`
-    不在或名字不对、部署树里没有看护脚本或启动器、路径带 `%`（启动器以退出码 4 拒绝）或双引号（启动器看不到它：WSH 解析命令行时就把引号吃掉了，"
-     "参数传过去会变样——所以在这里拒）、路径含系统
+    不在或名字不对、部署树里没有看护脚本或启动器、路径带 `%`（启动器以退出码 4 拒绝）或双引号（启动器看不到它：WSH 解析命令行时就把引号吃掉了，参数传过去会变样——所以在这里拒）、路径含系统
     ANSI 代码页表示不了的字符（和 §6.3 的安装脚本同一条规矩）。同名的任务已经在了就
     拒绝，不覆盖：换参数先 `-Uninstall`。
   - `-Status` 只读：打印 `KEEPER_TASK_STATUS {…}`——状态、上次运行的时刻和上次结果，
