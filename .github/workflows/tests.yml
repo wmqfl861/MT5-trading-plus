@@ -13,8 +13,11 @@ name: tests
 # 而非静默 skip；并在跑测试前逐个导入 OPTIONAL_HEAVY_DEPS 里的可选
 # 依赖（缺哪个红哪个）。本地不设该变量，行为不变。
 # 触发规则、fetch-depth、退出码处理与注解逻辑保持不变。
+# T217（C23-2）：另有独立的 lint job 跑 ruff，只查错误类规则（E9、
+# F401、F821、F841），不查风格，不跑 format。规则集在 pyproject.toml 的
+# [tool.ruff.lint]，与 tests/test_t217_static_gate.py 读的是同一份配置。
 # 注意：若日后按 docs/p6/permissions.md §9 配置分支保护 required checks，
-# 检查名由单个 pytest 变为 pytest (0)…(3) 与 hygiene。
+# 检查名由单个 pytest 变为 pytest (0)…(3)、hygiene 与 lint。
 on:
   push:
     branches: [main]
@@ -121,5 +124,40 @@ jobs:
               Where-Object { $_ -match '^(FAILED|ERROR)' } |
               Select-Object -First 30 |
               ForEach-Object { Write-Output "::error title=failing-test::$($_.Trim())" }
+          }
+          exit $code
+  lint:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run ruff (error-class rules only)
+        shell: pwsh
+        run: |
+          # 规则集在 pyproject.toml 的 [tool.ruff.lint]（E9、F401、F821、F841），
+          # 与 tests/test_t217_static_gate.py 读的是同一份配置；非零退出码即失败。
+          # concise 一行一处，下面的注解直接取这些行
+          python -m ruff check . --output-format concise | Tee-Object -FilePath ruff-output.txt
+          $code = $LASTEXITCODE
+          # 把汇总行（"All checks passed!" 或 "Found N errors."）写成注解
+          $summary = Get-Content ruff-output.txt |
+            Where-Object { $_ -match '^(All checks passed!|Found \d+ errors?\.)' } |
+            Select-Object -Last 1
+          Write-Output "::notice title=lint::$summary"
+          # 失败时每处发现写成一条 error 注解（免鉴权可经 API 读到名单）
+          if ($code -ne 0) {
+            Get-Content ruff-output.txt |
+              Where-Object { $_ -match ':\d+:\d+: [A-Z]+\d+ ' } |
+              Select-Object -First 30 |
+              ForEach-Object { Write-Output "::error title=ruff::$($_.Trim())" }
           }
           exit $code

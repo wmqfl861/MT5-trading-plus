@@ -1,3 +1,17 @@
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+# T217（第二十三轮 C23-2）：ruff 只查错误类规则，不查风格，也不跑 format。
+# 规则集只定在这一处：CI 的 lint job（.github/workflows/tests.yml）、
+# tests/test_t217_static_gate.py、本地 `python -m ruff check .` 读的是同一份配置。
+[tool.ruff]
+# CI 只在 Python 3.12 上测；按 3.12 解析，比它新的语法算语法错误
+target-version = "py312"
+
+[tool.ruff.lint]
+# E9   语法错误
+# F401 导入了没用到的名字
+# F821 用到了没定义的名字
+# F841 赋值后没用到的局部变量
+select = ["E9", "F401", "F821", "F841"]
