@@ -838,8 +838,17 @@ class WindowsProcesses:
                     pass  # the refusal on its way up is what the caller must see
             raise
         self._issued = previous
+        failure = None
         for kernel, handle in issued:
-            self._wait_ended(kernel, handle)
+            try:
+                self._wait_ended(kernel, handle)
+            except RuntimeError as error:
+                # A member that has not ended is a refusal, but the members after it are
+                # still waited for and their handles closed (pre-freeze review S1): the first
+                # failing wait used to raise at once and leave the rest with handles open.
+                failure = failure or error
+        if failure is not None:
+            raise failure
 
     def snapshot(self):
         source = ("Get-CimInstance Win32_Process | ForEach-Object { "

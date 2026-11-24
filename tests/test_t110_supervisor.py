@@ -831,6 +831,54 @@ def test_a_tree_is_terminated_in_full_before_any_member_is_waited_for(tmp_path, 
         proc.wait(timeout=5)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows fake process tree")
+def test_a_failed_wait_does_not_leave_the_rest_of_the_tree_unwaited(tmp_path, monkeypatch):
+    """Pre-freeze review S1: when the first wait after terminate-without-waiting reports
+    that its process has not ended, the refusal goes up, and the remaining members are
+    still waited for with every handle closed. The first failing wait used to raise at
+    once and leave the rest neither waited nor closed."""
+    mod, cfg, live, entry = launcher_with_worker(tmp_path)
+    proc = start_role(entry)
+    backend = mod.WindowsProcesses()
+    original, tree = backend.terminate, []
+    try:
+        entry, tree = verified_real_tree(mod, backend, entry, proc.pid)
+        seen = []                                   # ("wait" | "close", handle), in call order
+        refused = []
+
+        def wrap(real):
+            class Kernel:
+                def __getattr__(self, name):
+                    if name == "WaitForSingleObject":
+                        def wait(handle, milliseconds):
+                            seen.append(("wait", handle))
+                            if not refused:          # the first wait of this run: not ended in time
+                                refused.append(handle)
+                                return 258          # WAIT_TIMEOUT, and nothing is waited for
+                            return real.WaitForSingleObject(handle, milliseconds)
+                        return wait
+                    if name == "CloseHandle":
+                        def close(handle):
+                            seen.append(("close", handle))
+                            return real.CloseHandle(handle)
+                        return close
+                    return getattr(real, name)
+            return Kernel()
+
+        kernel32_as_the_supervisor_sees_it(monkeypatch, mod, wrap)
+        with pytest.raises(RuntimeError, match="termination incomplete"):
+            mod.terminate_verified_tree(entry, backend, entry["argv"])
+        waited = [handle for call, handle in seen if call == "wait"]
+        closed = [handle for call, handle in seen if call == "close"]
+        assert refused and len(waited) == len(tree) >= 2          # every member was waited for
+        assert len(set(waited)) == len(tree) and sorted(closed) == sorted(waited)   # every handle closed
+    finally:
+        end_fake(original, tree)
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows process handles")
 def test_terminate_counts_an_exited_process_as_ended(tmp_path):
     """C2: a process that left by itself has nothing left to end. While some handle keeps
