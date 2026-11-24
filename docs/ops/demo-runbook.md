@@ -705,8 +705,12 @@ $action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
   -RepetitionInterval (New-TimeSpan -Minutes 1)
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew
+# 主体显式给出，和 §6.5 的安装脚本同一种写法：不给的话运行级别是 cmdlet 的缺省值，和看护任务不一致。
+$principal = New-ScheduledTaskPrincipal `
+  -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `
+  -LogonType Interactive -RunLevel Highest
 Register-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor2' `
-  -Action $action -Trigger $trigger -Settings $settings
+  -Action $action -Trigger $trigger -Settings $settings -Principal $principal
 
 # 部署记录要抄的（见下）：登录类型、运行级别、所在会话、启动器和包装脚本的 sha256。
 (Get-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor2').Principal |
