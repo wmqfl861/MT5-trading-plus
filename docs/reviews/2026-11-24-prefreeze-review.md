@@ -369,3 +369,252 @@
 - **清理**：六个临时分离工作树（检出 `18041e5`、`03c0d40`、`106ebc9`、`3a98a8c`、`b736712`、`caf0bc4`）在 12:57:50–12:57:54Z 用 `git worktree remove --force` 删除——其中三个带着反事实时拷进去的测试文件、一个带着本文件的草稿，`--force` 只丢弃评审自己拷进去的这几份；删完 `git worktree list` 里不再有它们。评审自建的临时目录（探针、实验的副本、pytest 的 basetemp、日志）在 12:59:10–12:59:21Z 按确切路径删除；放 import 守卫的另一个小目录在终检之后按确切路径删除。没有按前缀或时间批量删除任何东西。删之前做过一次只读的清点，没有残留的假进程。
 - **共享工作树的状态**：本文件是未跟踪的新文件，本人没有 `git add`，没有提交、检出、暂存、推送或重置。定稿时的 HEAD 是 `69e37bd`；`git status --short` 见本节最后一条。
 - **定稿后的终检**（13:01:08–13:01:18Z，共享工作树，HEAD `69e37bd`）：扫描器直接扫本文件 0 处；`tests/test_repo_hygiene.py` 11 通过；`tests/test_p6_docs.py` 75 通过；MetaTrader5 没有被加载。`git status --short` 是三行未跟踪文件：`docs/reviews/2026-11-24-prefreeze-review.md`（本文件），`scripts/ops/install_terminal_keeper.ps1` 和 `tests/test_install_terminal_keeper.py`（实现方的，B 那一半正在做，不是本人的）。之后本人只往本文件里加了这一条。
+
+---
+
+## 9. 第二次复核（到 b33650c；2026-11-24）
+
+§1–§8 是第一次评审的原文（提交 `e4e1648` 入库，blob 与本人交付的内容逐字节相同：sha256 的前 16 位相同，371 行），一个字没有改。本节只追加。
+
+### 9.1 评审对象、方式、时间
+
+- **评审对象**：分支 `pre-freeze-followups`，HEAD `b33650c9d6d50f5e9650ccd7a55e1f38967ce693`（远端尖端相同，工作树干净）。`caf0bc4` 之后共 13 个提交（主会话的消息里说 12 个，含 `03b99ef` 是 13 个），按先后：
+
+  | 提交 | 内容 |
+  | --- | --- |
+  | `03b99ef10affa78f581d8e7f675d0477e0714a73` | T211 补记追加"更正"一节（第一次评审已经核过内容） |
+  | `69e37bdad77f7e8a53cb5472314beff52d117681` | 并入 main `bf46bca`（T209、T214、T218 及其间的文档） |
+  | `e4e1648cffa2f13b8cf04256754aae3c5086c0f1` | 第一次评审的记录入库 |
+  | `2fbd2a84e7009d7108d756d30ee53a3cf650a0b2` | B：看护任务的安装脚本、27 条测试、runbook §6.5、§6.3 |
+  | `701faed5d0510ce78ca76fa4c8bb7c83f58c00c5` | D：看护脚本写状态文件；存活检查新增四类发现 |
+  | `06cc074fbb0dd2ca11a0d319949ced679b0a3bb7` | E1、S8：日报告警尾句的判据；关闭网关出错不盖住原异常 |
+  | `223caf0cf331aa6cb49fb503aec3894d5e64c59a` | T211 补记追加"更正三"（27/32） |
+  | `c4512081bdbdbd32e711e36b6d2caa31bd2a33fe` | S1：先发后等时第一个等待失败后其余成员照样等、照样关句柄 |
+  | `738897a2c336f3fe204d6a640d7f361c8e8f9dd4` | S3：runbook §6.1 补半句 |
+  | `5613b4f8f959487e026429102fa77b4c92b798a4` | S7：runbook §6.3 写明账户名只在本机核对 |
+  | `f90e12599f7d2f5424424416511897606fce23d5` | S4：两处注释改准 |
+  | `8bea36ca766b6094a90b101dc1c0cdcaf90b901d` | S5：包装脚本的九个路径参数必须是绝对路径 |
+  | `b33650c9d6d50f5e9650ccd7a55e1f38967ce693` | S6：安装脚本在入口拒绝带双引号的路径 |
+
+  T209 本身已另行评审通过，这里只看合并有没有改坏东西。
+- **评审者**：同一位独立的评审子代理（第一次评审之后的新一轮，没有参与这 13 个提交的实现）。
+- **依据**：主会话的复核任务（五项重点、硬约束、收尾要交的证明）；§4 的应改和建议；`docs/reviews/2026-11-23-t209-review.md` §12 里 D2 的决定（看护被拒绝时谁来发现）和 §13.2；各提交的说明。
+- **评审方式**：只读。在评审自建临时目录里的分离工作树（检出 `b33650c`、`701faed`、`06cc074`）上跑点名的测试文件；对 `06cc074`、`c451208` 做反事实；另写小脚本做探针和变异实验，都在临时目录里。
+- **时间**：2026-11-24T16:42:15Z 起，取系统时钟的 UTC。
+- **硬约束的遵守**：没有连接、启动或结束终端，没有 import MetaTrader5（每一次 pytest 和探针结束都核对了 `sys.modules`，全部是 False；探针是一行 Python 加 import 守卫，同样核对过）；没有读写 `data\live`、`data\ops-evidence\` 和任何生产目录；**没有做任何计划任务操作**——没有注册、注销、启用、停用、运行任何任务，对任务计划程序只做过只读查询（列任务、读一个任务的信息、读操作日志和系统日志）；没有往共享的 venv 里装东西；没有跑全量，所有运行串行，没有加负载；磁盘上只多占了评审自己的一个临时目录（最大时约 40 MB）。证明见 §9.7。
+- **证据标注**：同 §0。分支 CI 的结果（`e4e1648` 的 #413、`2fbd2a8` 的 #415、`701faed` 的 #416、`b33650c` 的 #418 全绿）是主会话转告的。
+
+### 9.2 结论
+
+**PASS**（到 `b33650c`）。没有阻断项。应改 3 条、建议 8 条，都是小的文本修正和测试保护，定版前补一个小提交即可；没有哪一条影响现在的行为。
+
+- **B 的隔离成立**（已验证，§9.4）。安装脚本的 30 条测试在干净的检出上全部通过，运行前后本机 `\MT5Quant\` 的任务清单和操作日志相同。入库的四种变异和实现方手做的那一种本人都复现了：核对拦下时以 99 退出、安装脚本一步没跑；核对被拿掉时，安装脚本因为 `-Install -Uninstall` 互斥在第一步被拒，事后的核对拦下。实现方关于"按名字查命令会自动装入真模块"的发现属实，而且比它写的更强（§9.4）；保护靠的是"先看导出清单、清单齐了才按名字解析"这一次序，沙箱在这一点上做对了。
+- **D 与实现相符**（已验证，§9.4）。四类发现的判级和时长、`--expect-keeper` 的范围、状态文件的写法，主会话列的几条都和代码一致，本人的探针逐条核过。与 T209 §12 的 D2 决定有三处出入，以代码为准，见 §9.5 第 2 条。
+- **D118 成立**（已验证）。`06cc074` 只做了声明的两处改动，新增 5 条里 4 条在父提交 `701faed` 上行为失败；`c451208` 只改了一处，新增 1 条在父提交上行为失败。
+- **离 PASS 差什么**：不差阻断项。应改的三条是：runbook 里两处多余的引号和断行（`b33650c` 带进来的）；沙箱说明里一句不准确的话；三条静态测试看不到的四条别的路、动态用例也不依赖静态用例先过。
+
+### 9.3 测试与反事实
+
+**各个文件在干净的 `b33650c` 上**（全部通过，MetaTrader5 始终没有被加载）：
+
+| 文件 | 结果 | 时刻（UTC） |
+| --- | --- | --- |
+| `tests/test_install_terminal_keeper.py` | 30 通过 | 16:51:09–16:52:40 |
+| `tests/test_keeper_state.py` | 5 通过 | 17:12:27–17:12:44 |
+| `tests/test_liveness_keeper.py` | 11 通过 | 17:12:45 |
+| `tests/test_t214_liveness_check.py` | 49 通过 | 17:12:47–17:12:59 |
+| `tests/test_t209_terminal_keeper.py` | 13 通过 | 17:12:59–17:13:34 |
+| `tests/test_t213_daily_report.py` | 35 通过 | 17:13:34 |
+| `tests/test_live_daily_report.py` | 7 通过 | 17:13:42 |
+| `tests/test_ops_hidden_task.py` | 22 通过 | 17:13:46–17:14:02 |
+| `tests/test_t110_supervisor.py` | 44 通过 | 17:14:03–17:15:04 |
+
+安装脚本的测试文件在 `2fbd2a8` 是 27 条，`701faed` 加了 `-Status` 的状态文件那一条，`b33650c` 加了两个参数化用例，现在是 30 条。
+
+**反事实**（把提交里的测试文件拷到父提交的检出，`cmp` 相同、`scripts/` 和 `src/` 与父提交相同）：
+
+| 组合 | 结果 | 失败原因 |
+| --- | --- | --- |
+| `701faed` ＋ `06cc074` 的 `tests/test_t213_daily_report.py` | 4 失败，31 通过（17:19:08Z） | 尾句里没有"有过尝试、没有记下失败…"；关闭网关抛的 `RuntimeError` 盖住了原来的 `KeyboardInterrupt`、`KeyError`、`RetryableFailure`（三个参数）。通过的那一条守的是"关闭正常时没有那一行" |
+| `223caf0`（与 `06cc074` 只差一个文档文件）＋ `c451208` 的 `tests/test_t110_supervisor.py` | 1 失败，43 通过（17:19–17:20Z） | `assert ([1400] and 1 == 3)`：三个成员的树只等了第一个 |
+
+与实现方报的数字逐条一致。实现方给 D（`2fbd2a8` 上 18 条里 16 失败、2 通过）和 S5、S6 做的反事实本人没有重跑。
+
+### 9.4 重点一：B 的隔离
+
+**只读核对**（清单和操作日志，前后各一次；查询按每个事件的 UTC 时刻比较）：
+
+| 时刻（UTC） | `\MT5Quant\` 下的任务 | 名字或路径带 keeper 的任务 | 开工（16:42:15Z）之后操作日志里 106、140、141、142 |
+| --- | --- | --- | --- |
+| 16:43:32–16:45:54（基线） | 8 个：`demo_weekly_check`、`live_daily_report`、`live_supervisor`、`live_supervisor2`（Ready，其余 7 个 Disabled）、`refresh_bars`、`refresh_ticks`、`snapshot_specs`、`watch_swap` | 0 | 0 条 |
+| 16:51:05–16:51:09（安装脚本的测试之前） | 同上 | 0 | 0 条 |
+| 16:52:40–16:52:43（之后） | 同上 | 0 | 0 条 |
+| 16:56:26–16:56:29（探针之后） | 同上 | 0 | **1 条**：16:52:55Z，id 140，主体是机器账户，对象是 Windows 自己的 `\Microsoft\Windows\SoftwareProtectionPlatform\SvcRestartTask` |
+| 17:22:30–17:22:33（全部测试和探针之后、清理之前） | 同上 | 0 | 1 条，同上 |
+| 17:22:36–17:22:39（分离工作树删除之后） | 同上 | 0 | 1 条，同上 |
+
+那一条 140 事件本人查清了（17:08:47–17:08:54Z，只读）：`SvcRestartTask` 是 Windows 自己的日任务（每日触发、间隔 1 天，以 NETWORK SERVICE 运行，动作是软件保护平台自己的 COM 处理器）。操作日志里它在 2026-11-23 的 16:52:23Z 运行、16:53:09Z 被机器账户更新；2026-11-24 在 16:52:09Z 运行（那时安装脚本的测试正在跑）、16:52:55Z 被更新——每天同一分钟，运行之后系统自己更新它。和评审的运行没有关系：实现方下午三次跑同一份测试（14:37、15:34、16:16Z）之后也没有这种事件。`\MT5Quant\` 下自开工以来没有任何变更；`terminal_keeper` 自 12:59:00Z 注销之后没有任何事件。
+
+**安装脚本的接触点**（读码，`b33650c` 的 `scripts/ops/install_terminal_keeper.ps1`）：`Import-Module ScheduledTasks`（`:93`）；`-Status` 里 `Get-ScheduledTask`（`:179`）、`Get-ScheduledTaskInfo`（`:187`）；`-Uninstall` 里 `Get-ScheduledTask`（`:201`）、`Unregister-ScheduledTask`（`:206`）；`-Install` 里 `Get-ScheduledTask`（`:336`）、`Register-ScheduledTask`（`:340`）；`New-ScheduledTask*` 四个（`:302-309`，只造内存对象）。没有 `schtasks`、CIM、COM、子进程。三个开关最多给一个（`:172`），这条检查在除 `Import-Module` 和函数定义之外的所有语句之前。
+
+**语法树那条测试覆盖了什么**（`test_only_the_three_mode_blocks_touch_the_task_scheduler`）：安装脚本里每一个名字像 `*-ScheduledTask*` 的命令（`New-*` 除外）都必须是那四个之一，各自在 `$Status`、`$Uninstall`、`$Install` 的 `if` 下面，顺序不变；`Import-Module` 恰好一次、参数恰好是 `ScheduledTasks`。所以**在模块的命令这一条路上**它覆盖了全部接触点：多一个别的 cmdlet、把接触命令挪出开关、按路径导入，都会失败。另一条静态测试按词拒绝 `schtasks`、`Cim`、`ComObject`、`Start-Process`、`Invoke-Expression`、`Invoke-Command`、`powershell`、`pwsh`、`cmd`、`PSHOME`、`ScheduledTasks.psd1` 等。
+
+**它看不到的四条路**（只跑三条静态测试，副本从不执行，16:58:32–16:58:52Z）：
+
+| 往安装脚本的副本里加什么 | 结果 |
+| --- | --- |
+| 开关里多一个 `Disable-ScheduledTask`（对照） | 被抓住 |
+| 调 `schtasks`（对照） | 被抓住 |
+| 把导入改成按路径导入真模块（对照） | 被抓住（两条静态测试都失败） |
+| 在开关里加 `Set-ScheduledTask`（对照） | 被抓住 |
+| 保留按名字的那次导入，另加一行 `ipmo (Join-Path $env:SystemRoot '…\Modules\ScheduledTasks')` | 三条全过 |
+| 加 `$service = [Activator]::CreateInstance([type]::GetTypeFromProgID('Schedule.Service'))` | 三条全过 |
+| 加 `& $wscript //B //Nologo (Join-Path $deploy 'scripts\ops\hidden_task.vbs')` | 三条全过 |
+| 把注册命令包进一个函数、函数里再写一层 `if ($Install)` | 三条全过（它只看命令外面最近的一层 `if`） |
+
+现装的安装脚本里没有这四样。它们只有以后的改动才会碰到，见应改-3。
+
+**实现方那条发现**（16:54:42–16:54:58Z 这一次运行的前一半，本人的小驱动进程，PSModulePath 里只有沙箱目录；只做命令查找和模块导入，没有调用真模块的任何命令）：
+
+| 进程里是什么 | 按名字查一个命令的结果 |
+| --- | --- |
+| 沙箱模块完好（和提交的测试一样） | `Get-Command Get-ScheduledTask` 解析到沙箱的替身；`Get-Module` 里只有沙箱这一个 ScheduledTasks（真模块按完整路径装在沙箱模块里面，`Get-Module -All` 才看得到） |
+| 沙箱少导出 `Start-ScheduledTask`，驱动去查这个名字 | **真模块被整个自动装进全局作用域**；之后 `Get-ScheduledTask`、`Register-ScheduledTask` 也都解析到真模块，替身全部失效 |
+| 沙箱目录里没有模块 | `Get-Command Get-ScheduledTask` 同样把系统模块目录里的真模块自动装进来；而同一进程里 `Import-Module ScheduledTasks` 报"找不到模块" |
+| PSModulePath 里只有一个空目录，查一个和任务计划程序无关的命令（`Get-WinSystemLocale`） | 系统模块 `International` 被自动装入；`Import-Module International` 报找不到 |
+
+所以发现属实，机理比提交说明写的更强：**按名字导入模块（`Import-Module`）只找得到沙箱；按名字查找命令却会从系统模块目录自动装入真模块**，不管真模块此前有没有装进进程。提交说明里"PSModulePath 里只有那一个目录，按名字找得到的 ScheduledTasks 只可能是沙箱里的那个"只对前一半成立。真正的保护是驱动里那一次序：先看沙箱模块的导出清单，清单覆盖真模块导出的每一个命令，齐了才按名字解析（`GUARD` 的第 171–173 行在前、第 191 行在后）。沙箱在这一点上做对了；说明的文字要改准（应改-2）。
+
+**变异自己做**（同一次运行的后一半，经测试文件自己的辅助函数，安装脚本的参数都是 `-Install -Uninstall`）：
+
+| 沙箱 | 有安装脚本之前的核对 | 把那一次核对拿掉 |
+| --- | --- | --- |
+| 完好 | 退出码 1（互斥拒绝），前后两次核对都通过 | 同左 |
+| 模块被从路径上拿掉 | **99**，"ScheduledTasks cannot be imported from the sandbox"，安装脚本没跑 | 安装脚本跑了：它自己的 `Import-Module` 报找不到模块；事后的核对以 99 退出 |
+| 少导出 `Start-ScheduledTask` | **99**，"nothing from the sandbox answers for Start-ScheduledTask"，没跑 | 跑了，互斥拒绝；事后核对 99 |
+| 不导出 `New-*` | **99**，"nothing from the sandbox answers for New-ScheduledTask"，没跑 | 跑了，互斥拒绝；事后核对 99 |
+| 用普通函数冒充 `New-ScheduledTaskAction` | **99**，"New-ScheduledTaskAction is not the real cmdlet"，没跑 | 跑了，互斥拒绝；事后核对 99 |
+
+十次运行里替身记录到的调用都是 0。前四种就是入库的那四条用例所断言的；后四种复现了实现方说的"手做的一次变异（未入库）"：第二道防线（互斥）和事后的核对都起了作用。
+
+**本人对隔离的判断**：在现装的安装脚本上，测试到不了真的任务计划程序——四个接触命令都被沙箱的替身接住，`New-*` 是真的但不碰任务计划程序，`-Status`、`-Uninstall`、`-Install` 的用例还各自在运行前后比对本机的任务清单。它挡不住的是以后的改动走别的路（上面四条），那要靠静态测试和评审；现在的静态测试有一半没盖到。
+
+### 9.5 重点二到五
+
+**1. B 的隔离**：见 §9.4。结论成立。
+
+**2. D（`701faed`）**。读了 `scripts/ops/terminal_keeper.ps1`、`liveness_logic.py`、`liveness_check.py`、安装脚本的 `-Status`，以及运行器写心跳的三处（`scripts/live_runner.py:783`、`:981`、`:1024`）和对账、风控写心跳的地方。本人的探针（17:17:22Z，纯逻辑，合成的现场文件在临时目录里）：
+
+| 情形 | 结果 |
+| --- | --- |
+| 状态文件年龄 599 秒、600 秒 | 没有发现 |
+| 年龄 600.5 秒、700 秒，第一次看到 | `keeper_stale`，**直接是生产级**（年龄取状态文件自己的） |
+| `ts` 比检查器的时钟早 30 秒（在 60 秒容差内） | 没有发现 |
+| `ts` 比检查器的时钟晚 120 秒 | `keeper_stale`（不升级）加 `clock_ahead:keeper`（一出现就是生产级） |
+| 最近一次 `refused`，文件年龄 590 秒 | `keeper_refused`，第一次看到不是生产级（只靠检查器的时钟） |
+| 最近一次 `refused`，文件年龄 700 秒 | `keeper_stale`（生产级）和 `keeper_refused`（不升级）都报，通知的只有前者 |
+| 最近一次 `start_failed` | 也算 `keeper_refused` |
+| 没有状态文件，不带 `--expect-keeper` | 没有发现 |
+| 运行器心跳的 `last_error` 是决策阶段那句（`NotConnectedError: MT5 终端进程不在：…`）、执行阶段那句（`broker_unavailable: NotConnectedError: …`）、或者把类名写全（`TerminalNotConnectedError: …`） | 都是 `terminal_absent:<运行器>`，丢了终端那一种，不带开关也评 |
+| `NotConnectedError: MT5 终端初始化失败…`、IPC 不通的那句 | 不算 |
+| `waiting_for_terminal`，登记的 `started_utc` 在 700 秒前 | `terminal_absent`，**直接是生产级**（时长取"现在减去 `started_utc`"这个下界） |
+| `waiting_for_terminal (retry)`（多了一个后缀） | 不算（标记要完全相等） |
+
+对账、风控写心跳时确实不带 `last_error`（`live_reconcile.py:200`、`:224`，`risk_process.py:246`；`last_error` 只进了退出码的证据），所以这一类只覆盖运行器，文档写得对。启动等待的角色会被 supervisor 每 15 分钟重启一次、`started_utc` 归零，但检查器的"第一次看到"按问题代码记，重启不会让它重新计时（提交的测试里有这一条）。
+
+**规格与实现的出入（以代码为准）**：
+
+- T209 §12 的 D2 写"状态文件（时刻、结论、退出码）"：实现写的是 `ts`、`outcome`、`reason`、`running`、`others`、`pid`，**没有退出码**；退出码由 `outcome` 决定（`running`、`started` 是 0，`refused`、`start_failed` 是 1）。
+- D2 写"看护连续被拒绝"：实现的 `keeper_refused` 把 `start_failed` 也算进去。
+- D2 写"运行器的心跳里一直写着'终端进程不在'"：实现多认了启动等待那一种（`waiting_for_terminal`），而且不受 `--expect-keeper` 管。
+- D2 的第三句"调度日检同时核对看护任务的上次结果码（装任务的时候改调度指令）"不在这批提交里，runbook §6.6 只写了小时任务的命令行带 `--expect-keeper`——按"装任务的时候"另做，不算缺。
+
+主会话在复核任务里列的几条（`keeper_stale` 用状态文件自己的年龄、`keeper_refused` 只靠检查器时钟、`terminal_absent` 两种信号和两种时长、`--expect-keeper` 只管三类、状态文件只在给了 `-LogPath` 且不是 `-DryRun` 时写、busy 不写、先写临时文件再换名、不带路径和账户）都与代码一致。
+
+**3. D118（`06cc074`、`c451208`）**：
+- `06cc074` 对 `scripts/live_daily_report.py` 只做了两处：新增 `_shutdown_quietly` 并把 `_connect_demo_gateway` 里三处 `gw.shutdown()` 换成它；`main` 里尾句的判据改成先看缺的日子里有没有尝试过的。反事实 4 条行为失败（§9.3）。
+- `c451208` 对 `scripts/live_supervisor.py` 只改了 `terminate_without_waiting` 的正常出口：逐个等待，每个用自己的 `try/except RuntimeError` 接住，全部走完再把第一个失败抛出去。块内抛异常的那条出口、`terminate()`、`_wait_ended()` 没有动。反事实 1 条行为失败。
+- **S8 的异常语义**：传出去的仍是原来的异常，关闭的异常打一行到标准输出（类型和原文）。本人量了：第一次评审建议的写法 `try: gw.shutdown() finally: raise` 在 Python 3.12.10 上是**错的**——关闭自己抛异常时，`finally` 里的裸 `raise` 重抛的是关闭的异常（`RuntimeError('shutdown failed')`），原来的异常只留在 `__context__` 里。实现方的说法对，它的写法（关闭放进自己的 `try/except`、打一行、内层块结束之后再裸 `raise`）传出去的是 `KeyboardInterrupt`，关闭只调用了一次。
+- 一处没有换：`:317-319` 账户不是 Demo 时仍是 `gw.shutdown()` 之后直接 `raise DataUnavailableError`，关闭在这里出错会把这个"配置或用法错误"（退出码 2）变成"未预期异常"（退出码 1）。同一类的小处，见建议-1。
+
+**4. S3–S7 与代码一致**：
+- S3（`738897a`）：§6.1 那半句"日志的修改时间另有不超过 2 秒的容差，见 §6.3"与 `LOG_AGE_TOLERANCE_S` 一致。
+- S4（`f90e125`）：两处注释现在与 §2.4 的实测一致。
+- S5（`8bea36c`）：`supervisor_once.ps1` 里除 `-Sha` 之外的参数不是绝对路径就以 3 拒绝，理由写进日志；`-DataDir` 自己是相对路径时不写日志。`test_ops_hidden_task.py` 多了 4 条，通过。
+- S6（`b33650c`）：安装脚本在解析路径之前看三个路径参数的原文，带 `%` 或双引号的列入拒绝的理由。**启动器那一半"做不到"属实**：本人用 cscript 和一个把自己的参数写进文件的 `.vbs` 量了三条原始命令行（17:18:53Z），`a"b` 到了脚本里是 `ab`；`"C:\x"y\z.ps1"` 是 `C:\xy\z.ps1`；`-Name "a"b"` 是两个参数 `-Name`、`ab`——WSH 解析命令行时就把引号吃掉了，启动器里的检查永远为假。顺带看到：这个 `.vbs` 运行出错时 cscript 的退出码是 0，和 §3.6 记的一样。
+- S7（`5613b4f`）：§6.3 写明了账户名只在本机核对、不抄进入库的部署记录。
+- S6 带进来的文档毛病见应改-1。
+
+**5. 实现方自己报的几件事**：
+- 12:58:31Z 真的注册过 `\MT5Quant\terminal_keeper`、12:59:00Z 注销、从未运行：**属实**。操作日志里它的全部事件就是这两条（id 106 和 141），没有触发、启动、动作的事件。
+- 有一轮测试（16:00Z 前后）没做运行前的任务清单：**从日志看没有藏住东西**。12:59:01Z 之后所有任务的 106、140、141、142 一共 3 条：14:27:46Z 两条（Windows 自己的 .NET Framework NGEN 任务被更新）和上面那条 `SvcRestartTask`；16:00Z 前后没有任何变更。
+- 一次调试里有个一次性 PowerShell 进程装了真模块、没有调用任何命令：**任务计划程序的日志里看不出来**（装模块不产生事件），能核实的只是那段时间没有任何变更事件。
+- 它更正了自己此前两次事件日志查询（UTC 和本地时刻直接比较）：本人的查询把每个事件的时间先换成 UTC 再比较，给 `Get-WinEvent` 的 `StartTime` 换成本地时刻，结果如上。
+
+**合并提交 `69e37bd`**（只读核对）：与两个父提交都不同的文件只有 `docs/ops/demo-runbook.md` 和 `tests/test_t213_daily_report.py`。runbook 里 main 那一侧的增删（+196 −0）等于合并结果相对本分支的增删，本分支那一侧（+66 −6）等于合并结果相对 main 的增删；测试文件同样对得上（+7 −0 和 +50 −0）。合并基是 `18041e5`；`scripts/live_supervisor.py`、`scripts/live_daily_report.py`、`scripts/setup_scheduled_tasks.ps1` 和两个启动器脚本在 main 上自分叉以来没有改过，合并之后与本分支的版本相同。合并差异里没有两边都不等于的手工改动。没有改坏东西。
+
+### 9.6 发现清单
+
+**阻断**：无。
+
+**应改（3 条，都小）**
+
+1. **（文档）runbook 里两处多余的引号和断行。** 位置：`docs/ops/demo-runbook.md:684-685`、`:968-969`（`b33650c` 带进来的，父提交上没有）。第 684 行以 `，"` 结尾，第 968 行也是；紧接着的第 685 行、第 969 行以五个空格和一个双引号开头（`"所以任务参数里的路径不带双引号…`、`"参数传过去会变样——所以在这里拒）…`）。像是拼接字符串时的引号和缩进漏进了正文，渲染出来是两个多余的引号加一处不该有的换行。把这两处的引号去掉、接回一行。
+2. **（说明的文字）沙箱的说明里有一句只对了一半。** 位置：`tests/test_install_terminal_keeper.py` 的模块说明和沙箱模块里的注释（`STANDINS` 的第 68–69 行："then a module named ScheduledTasks can be found by name nowhere else"），提交 `2fbd2a8` 的说明里也是这句。`Import-Module ScheduledTasks` 确实只找得到沙箱；但按名字**查找命令**会从系统模块目录自动装入真模块（§9.4 实测）。说明的后半段已经写了"不要用 `Get-Command` 查沙箱没有导出的名字"，把前半句改准，读的人才知道那一次序为什么不能动。
+3. **（测试保护）三条静态测试看不到四条别的路，动态用例也不依赖静态用例先过。** 位置：`tests/test_install_terminal_keeper.py` 的 `test_installer_only_ever_creates_a_task…`、`test_only_the_three_mode_blocks_touch_the_task_scheduler`。依据：§9.4 的表——用别名 `ipmo` 按路径导入真模块、经 `[Activator]::CreateInstance([type]::GetTypeFromProgID('Schedule.Service'))` 走 COM、用 `& $wscript` 直接跑启动器、把注册命令包进函数，四种都通过。现在的安装脚本里没有这些，所以不影响现在的行为；但以后谁加了一句，安装和卸载的用例就会在真的任务计划程序上跑，只有运行前后的任务清单比对能在事后发现。建议：静态测试改成按语法树列**允许**的命令名（现在是按词拒绝），把 `ipmo` 一类别名和 `Activator`、`GetTypeFromProgID`、`CreateInstance` 拒掉，并断言接触命令外面最近的 `if` 直接在脚本的顶层；让跑安装脚本的用例先过静态检查，不过就整文件不跑。
+
+**建议（8 条）**
+
+1. `scripts/live_daily_report.py:317-319`（S8 没有换到的第四处）：账户不是 Demo 时先 `gw.shutdown()` 再 `raise DataUnavailableError`，关闭出错会盖住原异常。换成 `_shutdown_quietly` 即可。
+2. `docs/ops/demo-runbook.md` §6.3、§6.5：计划内停机要先停用看护任务、再关终端。装了小时任务并带了 `--expect-keeper` 之后，这段时间里存活检查会报 `keeper_stale`（状态文件超过 10 分钟就是生产级，第一次看到就通知），运行器在等终端时还会报 `terminal_absent`。写一句"计划内停机期间这两条通知是预期的"，免得当成故障。
+3. D2 的三处出入（§9.5 第 2 条）：状态文件没有退出码、`start_failed` 并进了 `keeper_refused`、启动等待那一种不受开关管。都不需要改代码；在 T209 评审记录的 D2 下面记一句"实现以 `701faed` 为准"。
+4. `tests/test_install_terminal_keeper.py` 的 `real_task_names()` 只比对 `\MT5Quant\` 下的任务名。万一登记到了别的路径下，它发现不了；改成比对全部任务（路径加名字），实现方手工做的核对就是这个口径。
+5. 同一个文件的 `powershell()` 把一次性的 `.ps1` 写进系统临时目录的根下（`keeper-test-<pid>-<n>.ps1`），`finally` 里删除；进程被杀的时候会留下一个。写进 `tmp_path` 更干净。
+6. 今后做"运行前后核对"时，除了 `\MT5Quant\` 的清单，把变更事件按任务路径过滤：Windows 自己的任务每天会产生 140 事件（这次评审就撞上一条），只数事件条数会被它搅乱。
+7. 第一次评审的建议-2（给"退出途中"补一条确定性的测试）这次没有做，按主会话的处置交实现方判断、不做就记在案；这里是记在案。
+8. `scripts/ops/terminal_keeper.ps1` 的 `Write-State`：`-LogPath` 给的是只有文件名的相对路径时，目录是空串，`Join-Path` 抛错（Windows PowerShell 5.1 上实测："Cannot bind argument to parameter 'Path' because it is an empty string"），被接住后只警告，状态文件写不出来，而同一个参数下 `Write-Keeper` 照样把日志写进当前目录。安装脚本给的是绝对路径，碰不到；手工运行时会给。要么按当前目录处理，要么拒绝相对的 `-LogPath`。`tests/test_keeper_state.py` 只用了绝对路径。
+
+### 9.7 没有越界的证明
+
+**建过、删过的东西**：
+
+- 评审自建的临时目录一个（`<用户目录>\AppData\Local\Temp\` 下）：import 守卫两个文件、只读核对用的四个 `.ps1`、三个探针 `.py`、提交说明和 diff 的导出、pytest 的 basetemp、探针的副本（沙箱模块、安装脚本的八个变异副本、合成的心跳和状态文件、一个回显参数的 `.vbs`）。最大时约 40 MB（分离工作树删掉之后是 14.8 MB），17:27:09Z 起按确切路径删除，17:27:20Z 之前删完。
+- 分离工作树三个（`b33650c`、`701faed`、`06cc074`，都在上面的临时目录里）：`701faed` 和 `06cc074` 里各拷进过一个测试文件（反事实用），17:22Z 前后用 `git worktree remove --force` 删除；删完 `git worktree list` 里没有评审的工作树。
+- 提交的测试文件自己的 `powershell()` 往系统临时目录的根下写过一次性的 `.ps1`，每次用完即删。
+- 共享工作树里只改了本文件（追加本节）；没有 `git add`、commit、checkout、stash、push、reset；没有往共享的 venv 里装东西。
+- 没有按前缀或时间批量删除任何东西。
+
+**没有残留进程**：17:22Z 的只读清点里，命令行提到评审临时目录的进程只剩当时的那一个 shell。评审中途有一个读事件日志的 PowerShell 跑了 9 分多钟没出来，本人把它停掉了（16:59:58Z 起、17:08:29Z 止），确认没有留下进程，改用两个一分钟的窗口重查。
+
+**开工之后操作日志里 106、140、141、142 的查询结果**（`Microsoft-Windows-TaskScheduler/Operational`，日志是开着的，最早一条记录在 2026-11-23T04:45Z 前后——它满了会往前滚）：
+
+- 16:42:15Z 之后到 17:22:39Z：**1 条**。16:52:55Z，id 140，主体是机器账户（`<主机名>$`），对象 `\Microsoft\Windows\SoftwareProtectionPlatform\SvcRestartTask`——Windows 自己的日任务，§9.4 查清了。
+- 其中对象在 `\MT5Quant\` 下的：0 条；提到 `terminal_keeper` 的：0 条。
+- 12:59:01Z（实现方那次注销之后）之后一共 3 条：上面那一条，加 14:27:46Z 的两条 id 140（Windows 自己的 .NET Framework NGEN 任务）。
+- `terminal_keeper` 在日志里的全部事件：12:58:31Z id 106（注册）、12:59:00Z id 141（注销），没有别的。
+- 清理之后、写这一节之前又核对了一遍（17:27:20–17:27:23Z）：16:42:15Z 之后仍是那 1 条（不在 `\MT5Quant\` 下）；`\MT5Quant\` 下 8 个任务；名字或路径带 keeper 的 0 个。之后本人只往本文件里写了字、跑了卫生和文档两个测试文件。
+
+**任务清单**：每次核对 `\MT5Quant\` 下都是同样的 8 个任务（名字见 §9.4），名字或路径带 keeper 的任务 0 个。
+
+### 9.8 未验证事项
+
+- CI 本人看不到；#413、#415、#416、#418 全绿是主会话转告的。全量套件本人没有跑。
+- 真的任务计划程序上：安装脚本的 `-Install`、`-Uninstall`、`-Status` 对真任务的行为没有跑（按约束不碰）；任务装上之后"不弹窗"没有验证。
+- D 在生产形态下：看护脚本真的写状态文件、小时任务读它，没有跑（看护任务和小时任务都还没有装）。
+- 实现方给 D、S5、S6 做的反事实本人没有重跑；`2fbd2a8` 的 27 条在它的父提交上 26 失败本人也没有重跑。
+- "一个一次性的 PowerShell 进程装了真模块、没有调用任何命令"：日志里无法核实。
+- 本人那次读事件日志的查询为什么报"查询无效"（把时间下界设在更早的时刻时）、后来全量扫描为什么 9 分钟不出结果：没有查明，都换成了小窗口的查询。
+- Windows PowerShell 5.1 的命令自动装入选到系统模块目录的内部机理：只量了现象。
+- 变异后的安装脚本（别名导入真模块那一种）在沙箱里实际会怎样：只按读码推断——真模块装进它自己的脚本作用域，驱动的全局作用域里看不到，事后的核对发现不了，只剩任务清单的比对。本人没有执行它。
+- S8 没换到的第四处（建议-1）是读码结论。
+- 负载下的表现没有试。
+
+### 9.9 评审过程披露
+
+1. 开工之后操作日志里出现的那条 140 事件（16:52:55Z）落在第一次跑安装脚本的测试期间和之后 15 秒之内，本人起初不能排除是测试引起的，已经先报给主会话。查了历史才确定是 Windows 自己的日任务：前一天同一分钟也运行、也被更新。本人的测试运行（16:51:09–16:52:40Z）和它的运行（16:52:09Z）在时间上重叠，这是巧合。
+2. 为了核实实现方那条发现，本人的三个探针进程让真的 ScheduledTasks 模块被装了进来（两个是按名字查命令时自动装入的，一个是按完整路径）；三个进程都只做了命令查找和模块导入，没有调用真模块的任何命令，也没有查询任务。这是主会话点名要核的那一条；写在这里是因为它和实现方自己报的"一个进程装了真模块"是同一类事。提交的测试本身在每一个驱动进程里都按完整路径装入真模块（只导入 `New-*`）。
+3. 本人写的脚本出了几处错，都在当次改正：只读核对脚本里一处引号配错、一个带类型的参数被重新赋值后仍是字符串；静态变异的副本第一遍忘了让 `conftest` 找得到 `src`，八个变体全部报 3 个 ERROR（不是代码的问题）；D 的探针里格式化的优先级和参数顺序各错一处；回显参数的 `.vbs` 写错了三次（把输出路径和待测参数混在一起、用了不存在的 `WScript.Environment`）；两条带反斜杠的 `sed` 表达式把输出吞掉。
+4. 一个读事件日志的查询跑得过长，本人把它停掉后换成了两个一分钟的窗口；那 9 分钟里机器上多了一个只读的 PowerShell。
+5. `git merge-tree` 的重算本人没有做（它要往仓库的对象库里写一个树对象）；合并的核对用的是各文件相对两个父提交和合并基的增删行数。
+6. 结论的形成：B 的隔离本人起初担心的是"沙箱模块被拿掉时按名字导入会不会找到真模块"——实测找不到（`Import-Module` 报错），担心的那一条不成立；真正的风险在命令查找那一边，实现方先看到了，本人把它量得更清楚。四条静态测试看不到的路不影响现在的安装脚本，所以记为应改而不是阻断。
+7. 建议-8（`-LogPath` 只有文件名时状态文件写不出来）是读码后在一个一次性的 PowerShell 里只调了一次 `Join-Path` 核的，没有运行看护脚本；临时目录那时候已经删了。
