@@ -13,3 +13,8 @@ research/rounds/*.toml text eol=lf
 research/cards/*.toml text eol=lf
 research/candidates/*.toml text eol=lf
 .superpowers/h-new-candidates/** text eol=lf
+
+# Windows Script Host files: a scheduled task runs the .vbs checked out on that machine,
+# whatever core.autocrlf says there. Pinned to CRLF so that scripts/ops/hidden_task.vbs has
+# the same bytes everywhere (it must not carry a BOM: wscript would take it for code).
+*.vbs text eol=crlf

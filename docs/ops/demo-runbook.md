@@ -613,26 +613,44 @@ git 和 powershell 都按绝对路径调用。git 找不到按无法判定处理
 以上各段写于 2026-11-23；其中计数与升级的口径、缓存的盲区、powershell 找不到的处理，是同日独立评审
 （`docs/reviews/2026-11-23-t212-review.md`）之后修订的。
 
-**安装方式**：T211 合入后直接指向部署树的 `live_supervisor.py`，用下面的注册命令。11-19 到 11-23 用的树外
-`host.py` 包装是临时补丁，随新候选部署时撤除；留档见 `docs/ops/ops-patches/2026-11-19/`。撤除之前，
-生产上的观察运行继续用包装链，不对它热改。
+**安装方式**：任务经树内的隐藏启动器 `scripts\ops\hidden_task.vbs` 和包装脚本 `scripts\ops\supervisor_once.ps1` 调用
+部署树的 `live_supervisor.py`，用下面的注册命令。11-19 到 11-23 用的树外 `host.py` 包装是临时补丁，随新候选部署时
+撤除；留档见 `docs/ops/ops-patches/2026-11-19/`。撤除之前，生产上的观察运行继续用包装链，不对它热改。
 
 沿用 §6.2 的变量，仅在维护窗口明确批准后安装。任务只运行一次 supervisor，
 由 Windows 每分钟触发；不要在本次开发验证中安装或执行真实业务动作。
+§6.2 的变量不能以反斜杠结尾（启动器以退出码 5 拒绝），也不能含 `%`（退出码 4）。
 
 ```powershell
+# 手工的 --inspect / --stop 直接调解释器；任务走下面的隐藏启动器。
 $supervisor = Join-Path $deploy 'scripts\live_supervisor.py'
 $argv = @('-u', $supervisor, '--directory', $deploy, '--sha', $sha,
   '--data-dir', $data, '--config-dir', $configs, '--python', $python,
   '--gateway-config', $gateway, '--risk-config', $risk,
   '--sessions-config', $sessions, '--spread-model', $spread, '--log-dir', $logs)
-$quoted = ($argv | ForEach-Object { '"' + $_ + '"' }) -join ' '
-$action = New-ScheduledTaskAction -Execute $python -Argument $quoted -WorkingDirectory $deploy
+
+# 注册：wscript.exe → scripts\ops\hidden_task.vbs → scripts\ops\supervisor_once.ps1
+# → 解释器跑 live_supervisor.py。包装脚本的参数和 supervisor 的选项一一对应。
+$launcher = Join-Path $deploy 'scripts\ops\hidden_task.vbs'
+$once = Join-Path $deploy 'scripts\ops\supervisor_once.ps1'
+$named = [ordered]@{ Directory = $deploy; Sha = $sha; DataDir = $data; ConfigDir = $configs
+  Python = $python; GatewayConfig = $gateway; RiskConfig = $risk
+  SessionsConfig = $sessions; SpreadModel = $spread; LogDir = $logs }
+$arguments = "//B //Nologo `"$launcher`" `"$once`"" +
+  (($named.GetEnumerator() | ForEach-Object { " -$($_.Key) `"$($_.Value)`"" }) -join '')
+$action = New-ScheduledTaskAction -Execute (Join-Path $env:SystemRoot 'System32\wscript.exe') `
+  -Argument $arguments -WorkingDirectory $deploy
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
   -RepetitionInterval (New-TimeSpan -Minutes 1)
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew
 Register-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor2' `
   -Action $action -Trigger $trigger -Settings $settings
+
+# 部署记录要抄的（见下）：登录类型、运行级别、所在会话、启动器和包装脚本的 sha256。
+(Get-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor2').Principal |
+  Select-Object LogonType, RunLevel, UserId
+"session of this PowerShell: $((Get-Process -Id $PID).SessionId)"
+Get-FileHash -LiteralPath $launcher, $once -Algorithm SHA256 | Select-Object Hash, Path
 
 # 计划内停止业务前先停用 supervisor，防它按职责补回缺失进程。
 Disable-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor2'
@@ -647,6 +665,32 @@ if ($LASTEXITCODE -ne 0) { throw 'tree stop incomplete; preserve registry and in
 # 卸载（不改变业务进程、halt、killSwitch 或历史证据）
 Unregister-ScheduledTask -TaskPath '\MT5Quant\' -TaskName 'live_supervisor2' -Confirm:$false
 ```
+
+**为什么经启动器**（2026-11-24）：任务的动作如果是控制台程序（`python.exe`、`powershell.exe`，哪怕带
+`-WindowStyle Hidden`），每分钟触发一次就在交互桌面上弹一次控制台窗口。`wscript.exe` 没有控制台；
+`hidden_task.vbs` 用 `WScript.Shell.Run` 以隐藏窗口启动 PowerShell、等它结束、把退出码原样交回，所以任务的
+"上次运行结果"就是 supervisor 的退出码，"不启动新实例"（IgnoreNew）看到的也是真正的运行时间。11-19 到 11-23
+的树外包装就是为这件事加的；现在启动器和包装脚本都在部署树里，随定版 SHA 一起固定，包装脚本和任务参数里
+不需要工作区路径（D112）。
+
+- **包装脚本**（`scripts\ops\supervisor_once.ps1`）：参数和 `live_supervisor.py` 的选项一一对应，原样传过去；
+  自己切到部署目录再调解释器（任务的工作目录经 wscript 之后不再保证）。
+- **日志**：supervisor 的标准输出和标准错误按解释器写出的字节追加到
+  `<数据目录>\ops-evidence\supervisor\supervisor.log`，每次运行是一行 `start`、输出（先标准输出、后标准错误）、
+  一行 `exit <退出码>`。超过 5 MB 转成 `supervisor.log.1`，只留一代。编码是解释器重定向输出时自己用的那一种
+  （系统 ANSI 代码页；本机是 UTF-8），包装脚本不转码。告警照旧在 `alerts.log`，这个日志是补充；崩溃回溯走标准
+  错误，只有在这里看得到。
+- **退出码**：0 和 2 是 supervisor 自己的（2 是拒绝，原因在 `alerts.log` 的 `SUPERVISOR_REFUSED` 和
+  `supervisor-state.json`）；其他非零值多半是它自己崩溃，回溯在 `supervisor.log`。3 是包装脚本没能运行
+  supervisor，原因也在 `supervisor.log`。启动器自己的：2 没有参数，3 脚本不存在，4 参数里有 `%`，5 参数以反斜杠
+  结尾，6 启动器自己的语句失败或脚本没能启动。带 `%` 或以反斜杠结尾的参数一律不传：`WScript.Shell.Run` 会展开
+  `%名字%`，末尾的反斜杠会让收尾的引号被当成转义。
+- **部署记录里要抄的**（D112）：任务的登录类型、运行级别和所在会话，动作（`wscript.exe`、启动器和包装脚本的
+  路径，抄之前换成占位符），两者的 sha256。sha256 是 64 位十六进制，描述符生成器找的是恰好 40 位的 SHA，
+  不会被数成第二个；记录行里照旧只写一个完整的 UTC 时刻。
+- **解释器路径**（`-Python`）是显式参数，现在指向工作区里的 `.venv`。D112 要求正式窗口起算前把生产的解释器、
+  部署树、数据、配置、日志全部移出 agent 工作区（T215）；移出之后重新注册任务。
+- **不弹窗要人工确认一次**：装完之后等下一次触发，确认交互桌面上没有窗口出现，结论写进部署记录。
 
 supervisor 发现 risk 丢失时先写自己所有的 halt 与告警；发现缺失/停止推进的
 角色时仅重启该角色，追加 `ops-restarts.jsonl`（utc、component、reason_code、
