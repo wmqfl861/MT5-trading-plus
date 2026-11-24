@@ -891,3 +891,68 @@ def test_terminate_still_refuses_what_cannot_be_identified(tmp_path, monkeypatch
     finally:
         other.kill()
         other.wait(timeout=5)
+
+
+# ---- C3 (2026-11-24): the log age may read a little negative
+#
+# A role is called stale when its log is too old: 0 <= now - log_mtime <= timeout. The file's
+# last write time can read a little ahead of the clock taken right after it (Python's clock
+# moves in steps of about a millisecond), so for a moment after a role wrote its log the age
+# was a tiny negative number and a healthy role was called stale: halt, restart. The heartbeats
+# are written here with the same clock the supervisor reads, as in production: only the log
+# age is negative.
+
+def run_with_the_log_written_just_after_the_clock(tmp_path, early):
+    """setup(), the heartbeats stamped with the supervisor's clock, and supervise() with
+    that clock reading `early` seconds before the roles' logs were last written."""
+    import os
+    mod, cfg, p, live, entries = setup(tmp_path)
+    observed = datetime.fromtimestamp(os.stat(entries[0]["log"]).st_mtime - early, tz=timezone.utc)
+    for e in entries:
+        key = str(e["magic"]) if e["kind"] == "runner" else e["kind"]
+        fresh(live, key, e["pid"], cfg.sha, observed)
+    return mod, cfg, p, live, run(mod, cfg, p, now=observed)
+
+
+@pytest.mark.parametrize("early", [0.0005, 0.001, 1.5])
+def test_a_log_written_moments_after_the_clock_does_not_make_a_healthy_role_stale(tmp_path, early):
+    """C3: inside LOG_AGE_TOLERANCE_S a negative log age is not staleness. All three values
+    used to halt and restart every role."""
+    mod, cfg, p, live, result = run_with_the_log_written_just_after_the_clock(tmp_path, early)
+    assert result["restarted"] == [], result
+    assert result["refused"] is False and p.started == [] and p.killed == []
+    assert not (live / "halt.json").exists()
+    assert mod.LOG_AGE_TOLERANCE_S == 2.0
+
+
+@pytest.mark.parametrize("early", [2.5, 3.0])
+def test_a_log_from_farther_ahead_than_the_tolerance_still_makes_the_role_stale(tmp_path, early):
+    """C3: the tolerance is 2 seconds, not "any log time in the future will do". A log from
+    farther ahead is still unhealthy: halt and restart, as before."""
+    mod, cfg, p, live, result = run_with_the_log_written_just_after_the_clock(tmp_path, early)
+    assert result["restarted"] == ["777", "risk", "reconcile"]
+    assert (live / "halt.json").exists()
+
+
+def test_the_alert_records_a_negative_log_age_as_it_is(tmp_path):
+    """C3: `log_age_s=` in the alert's checks is the number that was computed. A negative one
+    stays negative, outside the tolerance and inside it."""
+    # Farther ahead than the tolerance: stale, and the check says by how much.
+    mod, cfg, p, live, result = run_with_the_log_written_just_after_the_clock(tmp_path, 3.0)
+    assert result["restarted"] == ["777", "risk", "reconcile"]
+    assert "log_age_s=-3.0" in (live / "alerts.log").read_text(encoding="utf-8")
+
+    # Inside the tolerance the log is not what makes the role stale; a stale heartbeat is,
+    # and the negative log age is still written as it was.
+    import os
+    work = tmp_path / "stale-heartbeat"
+    work.mkdir()
+    mod, cfg, p, live, entries = setup(work)
+    observed = datetime.fromtimestamp(os.stat(entries[0]["log"]).st_mtime - 1.0, tz=timezone.utc)
+    for e in entries:
+        key = str(e["magic"]) if e["kind"] == "runner" else e["kind"]
+        fresh(live, key, e["pid"], cfg.sha, observed - timedelta(seconds=300))
+    result = run(mod, cfg, p, now=observed)
+    assert result["restarted"] == ["777", "risk", "reconcile"]
+    alert = (live / "alerts.log").read_text(encoding="utf-8")
+    assert "log_age_s=-1.0" in alert and "heartbeat=timeout" in alert

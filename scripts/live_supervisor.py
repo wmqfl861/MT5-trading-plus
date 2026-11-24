@@ -99,6 +99,12 @@ class DeploymentUndeterminable(Exception):
 UNDETERMINABLE_LIMIT = 3         # consecutive rounds; the third escalates to a refusal
 CLEAN_REUSE_S = 15 * 60          # a full "git status" runs at most this often
 _PID_GONE = 87                   # ERROR_INVALID_PARAMETER: no process has this pid any more
+# A role's log cannot really be newer than "now", but right after the role wrote it the
+# file's last write time can read a little ahead of the clock taken later: for up to one
+# step of the clock, about a millisecond here. Requiring "0 <=" called a healthy role
+# stale whenever a check fell in that moment. This much "from the future" is tolerated;
+# beyond it the role is still unhealthy.
+LOG_AGE_TOLERANCE_S = 2.0
 
 
 def _absolute(program: str, preferred=()) -> str:
@@ -648,8 +654,9 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
                     seen.append(f"heartbeat_not_before_registry={not_before}")
                     age = observed.timestamp() - log_mtime
                     seen.append(f"log_age_s={age:.1f}")
+                    # A negative log age is recorded as it is; see LOG_AGE_TOLERANCE_S.
                     healthy = (status.ok and in_tree and sha_ok and not_before
-                               and 0 <= age <= health_timeout(role["interval"]))
+                               and -LOG_AGE_TOLERANCE_S <= age <= health_timeout(role["interval"]))
                 except (OSError, ValueError, TypeError, KeyError) as exc:
                     healthy = False
                     seen.append(f"read_error={type(exc).__name__}")
