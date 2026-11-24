@@ -114,6 +114,24 @@ def test_launcher_refuses_what_it_cannot_pass_and_starts_nothing(tmp_path):
     assert refused(script, "-DataDir", "D:\\") == 5
 
 
+@windows_only
+def test_a_quote_on_the_command_line_never_reaches_the_script_so_the_launcher_cannot_refuse_it(tmp_path):
+    """Pre-freeze review S6, as measured: WSH takes a quote on the command line for a delimiter and
+    hands the script the argument without it -- a"b arrives as ab, a quoted path with a quote inside it
+    arrives shortened. The launcher therefore cannot refuse a double quote: it never sees one. Such a
+    path has to be refused where it is still visible, by the installer
+    (tests/test_install_terminal_keeper.py)."""
+    folder = tmp_path / "probe"
+    folder.mkdir()
+    show = folder / "show.vbs"
+    show.write_bytes(b'For i = 0 To WScript.Arguments.Count - 1\r\n  WScript.Echo "[" & WScript.Arguments(i) & "]"\r\nNext\r\n')
+    for tail in ('a"b', '"C:\\x"y\\z.ps1"', '-Name "a"b"'):
+        done = subprocess.run(f'cscript.exe //Nologo "{show}" {tail}', capture_output=True, timeout=60,
+                              creationflags=NO_WINDOW)
+        received = done.stdout.decode("mbcs", "replace").split()
+        assert received and all('"' not in argument for argument in received), (tail, received)
+
+
 def test_launcher_is_plain_ascii_with_crlf_lines_and_no_bom():
     """wscript reads the file in the system ANSI code page and would take a BOM for code.
     The line endings are pinned in .gitattributes, so the file is the same on every machine."""

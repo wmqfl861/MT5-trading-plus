@@ -129,7 +129,7 @@ function Format-Utc($moment) {
 }
 
 function Get-KeeperLogLocation {
-    if ([string]::IsNullOrWhiteSpace($DataDir) -or -not [System.IO.Path]::IsPathRooted($DataDir)) {
+    if ([string]::IsNullOrWhiteSpace($DataDir) -or $DataDir.Contains('"') -or -not [System.IO.Path]::IsPathRooted($DataDir)) {
         return "<数据目录>\ops-evidence\terminal_keeper\terminal_keeper.log"
     }
     return Join-Path (Strip-TrailingSeparator ([System.IO.Path]::GetFullPath($DataDir))) "ops-evidence\terminal_keeper\terminal_keeper.log"
@@ -139,7 +139,7 @@ function Get-KeeperStateLine {
     # 看护脚本的状态文件（terminal_keeper.ps1 每次做过判断的运行写一次：-LogPath 所在目录下的
     # state.json）。只读，而且只在 -Status 里打印：给了 -DataDir 才看。outcome、reason 只有长得
     # 像标识符的才照原样打印，其余写 other——这个文件不是本脚本写的。
-    if ([string]::IsNullOrWhiteSpace($DataDir) -or -not [System.IO.Path]::IsPathRooted($DataDir)) { return $null }
+    if ([string]::IsNullOrWhiteSpace($DataDir) -or $DataDir.Contains('"') -or -not [System.IO.Path]::IsPathRooted($DataDir)) { return $null }
     $stateFile = Join-Path (Strip-TrailingSeparator ([System.IO.Path]::GetFullPath($DataDir))) "ops-evidence\terminal_keeper\state.json"
     if (-not (Test-Path -LiteralPath $stateFile -PathType Leaf)) {
         return "KEEPER_STATE " + (@{ state_file = "missing" } | ConvertTo-Json -Compress)
@@ -214,11 +214,26 @@ foreach ($name in @("TerminalPath", "DeployDir", "DataDir")) {
     if ([string]::IsNullOrWhiteSpace((Get-Variable -Name $name).Value)) { $problems += "-$name 没有给" }
 }
 if ($problems.Count -gt 0) { throw ("拒绝，什么都没有做：" + ($problems -join "；")) }
+foreach ($pair in @(@("TerminalPath", $TerminalPath), @("DeployDir", $DeployDir), @("DataDir", $DataDir))) {
+    $name, $supplied = $pair
+    # %：启动器以退出码 4 拒绝（WScript.Shell.Run 会展开 %名字%）。双引号：到不了启动器——WSH 解析
+    # 命令行时就把引号吃掉了，参数传过去会被截断或变样（a"b 到了脚本里是 ab），装上去的任务一分钟也
+    # 跑不了，所以趁引号还看得见，在这里拒。看给的原文，不等解析：带双引号的路径 IsPathRooted、
+    # GetFullPath 都解析不了。
+    if ($supplied.Contains("%")) {
+        $problems += "-$name 里有百分号（%），看护任务的动作经 hidden_task.vbs 传不下去：$supplied"
+    }
+    if ($supplied.Contains('"')) {
+        $problems += "-$name 里有双引号，看护任务的动作经 hidden_task.vbs 传不下去：$supplied"
+    }
+}
 
 $terminal = $null
 $deploy = $null
 $data = $null
-if (-not [System.IO.Path]::IsPathRooted($TerminalPath)) {
+if ($TerminalPath.Contains('"')) {
+    # 上面已经列了：这样的路径连 IsPathRooted 都解析不了
+} elseif (-not [System.IO.Path]::IsPathRooted($TerminalPath)) {
     $problems += "-TerminalPath 不是完整路径：$TerminalPath"
 } else {
     $terminal = Strip-TrailingSeparator ([System.IO.Path]::GetFullPath($TerminalPath))
@@ -230,6 +245,7 @@ if (-not [System.IO.Path]::IsPathRooted($TerminalPath)) {
 }
 foreach ($pair in @(@("DeployDir", $DeployDir), @("DataDir", $DataDir))) {
     $name, $supplied = $pair
+    if ($supplied.Contains('"')) { continue }     # 上面已经列了：这样的路径连 IsPathRooted 都解析不了
     if (-not [System.IO.Path]::IsPathRooted($supplied)) {
         $problems += "-$name 不是完整路径：$supplied"
         continue
@@ -255,13 +271,6 @@ if ($deploy) {
 $wscript = Join-Path $env:SystemRoot "System32\wscript.exe"
 if (-not (Test-Path -LiteralPath $wscript -PathType Leaf)) {
     $problems += "找不到 wscript.exe：$wscript"
-}
-foreach ($location in @($terminal, $deploy, $data)) {
-    if ($null -eq $location) { continue }
-    if ($location.Contains("%")) {
-        # 启动器遇到 % 就拒绝（WScript.Shell.Run 会展开 %名字%），装上去的任务一分钟也跑不了。
-        $problems += "路径里有百分号（%），看护任务的动作经 hidden_task.vbs 传不下去：$location"
-    }
 }
 if ($problems.Count -gt 0) { throw ("拒绝，什么都没有做：" + ($problems -join "；")) }
 

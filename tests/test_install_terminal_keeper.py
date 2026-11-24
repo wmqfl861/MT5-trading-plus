@@ -570,6 +570,10 @@ def test_the_three_switches_cannot_be_combined(tmp_path):
     pytest.param("no-launcher", ["scripts\\ops\\hidden_task.vbs"], id="launcher-missing"),
     pytest.param("root", ["根目录"], id="data-dir-is-a-drive-root"),
     pytest.param("percent", ["百分号"], id="percent-in-a-path"),
+    # 定版前评审 S6：双引号到不了启动器（WSH 解析命令行时就把引号吃掉了，参数会变样），
+    # 所以安装脚本在入口拒——引号还看得见的地方
+    pytest.param("quote", ["-DeployDir 里有双引号"], id="double-quote-in-the-deploy-dir"),
+    pytest.param("quote-terminal", ["-TerminalPath 里有双引号"], id="double-quote-in-the-terminal-path"),
 ])
 def test_install_refuses_what_it_cannot_install_and_creates_nothing(tmp_path, break_it, expected):
     """带 -Install 跑：任何一项不对都拒绝——任务计划程序一次都没有被碰（连查询都没有），不建目录、
@@ -601,6 +605,10 @@ def test_install_refuses_what_it_cannot_install_and_creates_nothing(tmp_path, br
     elif break_it == "percent":
         (tmp_path / "100% deploy").mkdir()
         flags[1] = f"-DeployDir {quote(tmp_path / '100% deploy')}"
+    elif break_it == "quote":
+        flags[1] = f"-DeployDir {quote(str(tmp_path / 'a') + chr(34) + 'b')}"
+    elif break_it == "quote-terminal":
+        flags[0] = f"-TerminalPath {quote(str(terminal) + chr(34))}"
     done, before, calls = run(tmp_path, modules, *flags, "-Install")
     assert done.returncode == 1, text(done)
     assert calls == [] and entries(tmp_path) == before
