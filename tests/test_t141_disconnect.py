@@ -28,7 +28,7 @@ from mt5gw.config import GatewayConfig
 from mt5gw.errors import NotConnectedError
 
 from tests.fakes import FakeMT5
-from tests.fakes_live import FakeBroker, bars_from_df, boundary_open, \
+from tests.fakes_live import FakeBroker, FakeTerminalInfo, bars_from_df, boundary_open, \
     grid_bars, mk_decision
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -439,6 +439,9 @@ class _DownGateway:
     @property
     def state(self):
         return self._state
+
+    def terminal_info(self):
+        return FakeTerminalInfo()                    # T209：运行器每个决策轮读一次；替身的终端允许算法交易
 
     def connect(self):
         pass

@@ -1,26 +1,26 @@
 """T209 终端看护脚本：终端进程不在就启动它，别的什么都不做。
 
 多数用例在 PowerShell 驱动脚本里把 Get-CimInstance 和 Start-Process 换成记录
-调用的函数：不启动任何进程，也不查真实的进程表。最后两个用例看真实情况：
-一个只做 -DryRun（脚本结构上不可能启动）；一个用 python.exe 的副本冒充
-terminal64.exe，真的启动一次、再认出它在运行，结束时只结束这个副本——
-先核对映像路径，再动它。
+调用的函数：不启动任何进程，也不查真实的进程表。最后几条用例看真实情况：
+一条只做 -DryRun（脚本结构上不可能启动）；两条用 python.exe 的副本冒充
+terminal64.exe，真的启动一次（其中一条经目录联接启动）、再认出它在运行，
+结束时只结束这个副本——先核对映像路径，再动它；一条让第一个看护停在"正在
+启动"里，看同一个终端的第二个看护会不会退让。
 """
 from __future__ import annotations
 
-import ctypes
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 KEEPER = ROOT / "scripts" / "ops" / "terminal_keeper.ps1"
-MUTEX = "Local\\MT5Quant_terminal_keeper"
 DEFAULT_INSTALL = Path(r"C:\Program Files\MetaTrader 5\terminal64.exe")     # GatewayConfig 的缺省值
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -176,21 +176,38 @@ def test_state_changes_go_to_the_log_and_no_path_is_ever_printed(tmp_path, termi
     assert len(log.read_text(encoding="utf-8-sig").splitlines()) == 1     # "在运行"不是状态变化，不记
 
 
+SLOW_START = FAKES.replace("    [pscustomobject]@{ Id = 4321 }",
+                           "    Start-Sleep -Seconds 10; [pscustomobject]@{ Id = 4321 }   # hold the lock while starting")
+
+
+@requires_powershell
 @pytest.mark.skipif(os.name != "nt", reason="Windows named mutex")
-def test_a_second_instance_backs_off_instead_of_starting_twice(tmp_path, terminal):
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.CreateMutexW.restype = ctypes.c_void_p
-    kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
-    kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-    kernel.ReleaseMutex.argtypes = kernel.CloseHandle.argtypes = [ctypes.c_void_p]
-    handle = ctypes.c_void_p(kernel.CreateMutexW(None, False, MUTEX))
-    assert handle.value and kernel.WaitForSingleObject(handle, 0) in (0, 0x80)   # WAIT_OBJECT_0 / WAIT_ABANDONED
+def test_the_lock_is_per_terminal_and_a_second_keeper_of_the_same_terminal_backs_off(tmp_path, terminal):
+    other = tmp_path / "Other" / "terminal64.exe"
+    other.parent.mkdir()
+    other.write_bytes(b"")
+    work = tmp_path / "work"
+    work.mkdir()
+    slow_trace = work / "slow-trace.txt"
+    slow_trace.write_text("", encoding="utf-8")
+    driver = work / "slow.ps1"
+    driver.write_text("\n".join([SLOW_START, "& " + quote(KEEPER) + " -TerminalPath " + quote(terminal),
+                                 "exit $LASTEXITCODE"]), encoding="utf-8-sig")
+    slow = subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=NO_WINDOW,
+                            env=dict(os.environ, KEEPER_TRACE=str(slow_trace), KEEPER_PROCS=""))
     try:
-        rc, out, trace = run_keeper(tmp_path, terminal)
-        assert rc == 0 and "KEEPER busy" in out and "START" not in trace
+        deadline = time.monotonic() + 30
+        while "START " not in slow_trace.read_text(encoding="utf-8"):      # the first keeper is starting the terminal
+            assert time.monotonic() < deadline and slow.poll() is None, "the slow keeper never reached Start-Process"
+            time.sleep(0.1)
+        rc, out, _ = run_keeper(work, terminal)                              # the same terminal, meanwhile
+        assert rc == 0 and "KEEPER busy" in out
+        rc, out, _ = run_keeper(work, other)                                 # another terminal has a lock of its own
+        assert rc == 0 and "KEEPER started pid=4321" in out
     finally:
-        kernel.ReleaseMutex(handle)
-        kernel.CloseHandle(handle)
+        started, _ = slow.communicate(timeout=60)
+    assert b"KEEPER started pid=4321" in started
 
 
 @requires_powershell
@@ -222,12 +239,18 @@ def _stand_in_runs(exe, env) -> bool:
     return done.returncode == 0
 
 
-def _stand_in_processes(work, exe):
-    """映像路径就是 exe 的进程：[(pid, 命令行)]。只找这一个替身，不碰别的。"""
+def _stand_in_processes(work, *images):
+    """映像路径是 images 之一的进程：[(pid, 命令行)]。只找这些替身，不碰别的。"""
+    spelled = ",".join(quote(str(image)) for image in images)
     out = powershell(work, (
         "Get-CimInstance Win32_Process -Filter \"Name='terminal64.exe'\" | ForEach-Object {"
-        f" if ($_.ExecutablePath -ieq {quote(exe)}) {{ \"$($_.ProcessId)|$($_.CommandLine)\" }} }}\n"))
-    return [(int(line.split("|", 1)[0]), line.split("|", 1)[1]) for line in out.splitlines() if "|" in line]
+        f" if (@({spelled}) -contains $_.ExecutablePath) {{ \"$($_.ProcessId)|$($_.ExecutablePath)|$($_.CommandLine)\" }} }}\n"))
+    found = []
+    for line in out.splitlines():
+        if line.count("|") >= 2:
+            pid, image, command = line.split("|", 2)
+            found.append((int(pid), image, command))
+    return found
 
 
 @requires_powershell
@@ -243,13 +266,48 @@ def test_it_really_starts_the_terminal_with_no_arguments_and_then_leaves_it_alon
         found = re.search(r"KEEPER started pid=(\d+)", out)
         assert rc == 0 and found, out
         started = _stand_in_processes(work, exe)
-        assert [pid for pid, _ in started] == [int(found.group(1))]
-        assert started[0][1].strip().strip('"').lower() == str(exe).lower()     # 不带任何参数
+        assert [pid for pid, _, _ in started] == [int(found.group(1))]
+        assert started[0][2].strip().strip('"').lower() == str(exe).lower()     # 不带任何参数
         rc, out, _ = run_keeper(work, exe, prelude="", env=env)                 # 真实的进程表，没有替身
         assert rc == 0 and f"KEEPER running pids={found.group(1)} other_instances=" in out
     finally:
-        for pid, _ in _stand_in_processes(work, exe):                           # 只结束映像路径核对过的替身
+        for pid, _, _ in _stand_in_processes(work, exe):                        # 只结束映像路径核对过的替身
             try:
                 os.kill(pid, 9)
             except OSError:
                 pass
+
+
+@requires_powershell
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory junctions")
+def test_a_terminal_started_through_a_directory_junction_counts_as_running(tmp_path):
+    """The gateway probe resolves links on both sides; the keeper must too. Started through a
+    junction, the process is listed under the junction spelling: a keeper that compared spellings
+    would start a second copy every minute and report `started` each time."""
+    exe, env = _stand_in(tmp_path)
+    if not _stand_in_runs(exe, env):
+        pytest.skip("python.exe 的副本在这里换一个目录跑不起来")
+    link = tmp_path / "junction"
+    made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(exe.parent)],
+                          capture_output=True, timeout=60, creationflags=NO_WINDOW)
+    assert made.returncode == 0 and (link / exe.name).is_file(), made.stdout.decode(errors="replace")
+    work = tmp_path / "work"
+    work.mkdir()
+    via_link = link / exe.name
+    try:
+        rc, out, _ = run_keeper(work, via_link, prelude=HIDDEN_START, env=env)  # started through the junction
+        found = re.search(r"KEEPER started pid=(\d+)", out)
+        assert rc == 0 and found, out
+        for spelled in (via_link, exe):
+            rc, out, _ = run_keeper(work, spelled, prelude="", env=env)         # either spelling: it is running
+            assert rc == 0 and f"KEEPER running pids={found.group(1)} other_instances=" in out, (spelled, out)
+        rc, out, _ = run_keeper(work, exe, "-DryRun", prelude="", env=env)
+        assert rc == 0 and "would-start" not in out
+    finally:
+        for pid, _, _ in _stand_in_processes(work, exe, via_link):              # 只结束映像路径核对过的替身
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+        os.rmdir(link)                                                           # the junction only, not what it points to
+    assert exe.is_file() and not link.exists()

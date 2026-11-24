@@ -6,8 +6,11 @@ parent; the supervisor then refuses the worker's tree for as long as the termina
 lives (11-21), and the terminal dies with the worker. So the gateway asks here
 first and never calls ``initialize()`` while the terminal is absent.
 
-The lookup stays inside the calling process (ctypes only). A worker must not
-start any child process: the supervisor refuses unknown descendants.
+The lookup stays inside the calling process and starts no child process: the
+process table is read with ctypes, and the image paths are compared with
+``os.path.realpath`` (which opens the files read-only to resolve links and short
+names). A worker must not start any child process: the supervisor refuses unknown
+descendants.
 """
 from __future__ import annotations
 
@@ -32,6 +35,25 @@ def _same_image(left: str, right: str) -> bool:
             pass
         return ntpath.normpath(path).lower()
     return bool(left) and bool(right) and spell(left) == spell(right)
+
+
+def _resolved(path: str) -> str:
+    try:
+        return os.path.realpath(path)
+    except (OSError, ValueError):
+        return path
+
+
+def _candidate_names(terminal_path: str) -> list[str]:
+    """File names a candidate process may carry: the one as spelled and the one
+    after resolving the path (a short name such as TERMIN~1.EXE is spelled one way
+    and listed in the process table the other way)."""
+    spelled = ntpath.basename(str(terminal_path))
+    names = [spelled]
+    resolved = ntpath.basename(_resolved(str(terminal_path)))
+    if resolved.lower() != spelled.lower():
+        names.append(resolved)
+    return names
 
 
 def _kernel():
@@ -99,14 +121,22 @@ def _pids_named(image_name: str) -> list[int]:
 def terminal_running(terminal_path: str) -> bool:
     """True only when a process whose image is exactly terminal_path is running.
 
-    False whenever it cannot be told (not Windows, no path, snapshot failed):
-    the cost of a wrong False is one refused initialize call, the cost of a
-    wrong True is a terminal launched under a worker.
+    False whenever it cannot be told (not Windows, no path, snapshot failed, the
+    terminal's own process cannot be opened). That is the conservative answer,
+    but it does not heal by itself: while it lasts every connect and reconnect is
+    refused, and after 15 minutes the role exits with 78 and is restarted. So a
+    False here that the keeper script contradicts ("running") means the probe
+    could not read the process, not that the terminal is gone. A wrong True would
+    launch a terminal under a worker, which is the worse error.
     """
     if os.name != "nt" or not terminal_path:
         return False
     try:
-        candidates = _pids_named(ntpath.basename(str(terminal_path)))
+        candidates: list[int] = []
+        for name in _candidate_names(terminal_path):
+            for pid in _pids_named(name):
+                if pid not in candidates:
+                    candidates.append(pid)
         if not candidates:
             return False
         kernel, wintypes = _kernel()

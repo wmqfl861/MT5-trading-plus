@@ -17,6 +17,7 @@ from mt5live.monitor import DisconnectWatch, append_alert, iso_utc
 ALERT_ALGO_TRADING_DISABLED = "ALGO_TRADING_DISABLED"     # 正式检查：异常类
 ALERT_ALGO_TRADING_RESTORED = "ALGO_TRADING_RESTORED"     # 正式检查：记录类
 STARTUP_RETRY_S = 5.0
+ATTEMPT_MARGIN = 2                 # 次数上限比"上限时长 / 间隔"多出来的余量
 
 
 def wait_for_gateway(gw, live_dir: str, component: str, heartbeat, *,
@@ -31,11 +32,15 @@ def wait_for_gateway(gw, live_dir: str, component: str, heartbeat, *,
 
     只把 NotConnectedError 当作"终端还没起来"：其余异常照旧上抛，调用方的
     启动失败路径不变。第一次就连上时不写任何告警。
+    除了时钟，还有次数上限（上限时长 / 间隔 + 2 次）：时钟不走时也会以同一个
+    退出码停下来。生产时钟会走，到不了次数上限。
     sleep 缺省在调用时取 time.sleep（测试替换它才生效）。
     """
     sleep = sleep or time.sleep
     watch = None
+    attempts = 0
     while True:
+        attempts += 1
         try:
             gw.connect()
         except NotConnectedError as exc:
@@ -50,6 +55,8 @@ def wait_for_gateway(gw, live_dir: str, component: str, heartbeat, *,
                 f"{watch.limit_s:.0f} 秒）：{type(exc).__name__}: {exc}")
             if watch.expired():
                 return watch.exit_code(last_error=f"{type(exc).__name__}: {exc}")
+            if attempts > int(watch.limit_s / max(retry_s, 1e-3)) + ATTEMPT_MARGIN:
+                return watch.exit_code(last_error=f"{type(exc).__name__}: {exc}（时钟不走，按次数上限停止）")
             sleep(retry_s)
         else:
             if watch is not None:
@@ -68,18 +75,18 @@ class AlgoTradingWatch:
     def allowed(self, now: datetime) -> bool:
         """本决策轮是否允许开仓。False = 终端不允许算法交易。
 
+        网关必须有 terminal_info()（MT5Gateway 有）。没有就是接错了网关，照旧抛
+        AttributeError——不为没有这个方法的替身放行，否则方法一旦被改名或删掉，
+        这道检查会无声地消失。
         终端 IPC 不通时抛 NotConnectedError：交给调用方的断线分支（本轮同样不开仓），
         不把它误报成"算法交易被关"。
         """
-        terminal_info = getattr(self._gw, "terminal_info", None)
-        if not callable(terminal_info):
-            return True                      # 替身网关没有这个方法：不拦截（MT5Gateway 一定有）
         try:
-            info = terminal_info()
-        except NotConnectedError:
-            raise
-        except Exception:
-            info = None
+            info = self._gw.terminal_info()
+        except (NotConnectedError, AttributeError):
+            raise                                   # 断线交给调用方的断线分支；网关没有这个方法是接错了网关，照旧上抛
+        except Exception as exc:                    # 其余异常也按 IPC 不通处理，带上原来的类名
+            raise NotConnectedError(f"terminal_info 读取失败（{type(exc).__name__}）：终端 IPC 不通") from exc
         if info is None:
             raise NotConnectedError("terminal_info 无返回：终端 IPC 不通")
         allowed = (bool(getattr(info, "trade_allowed", False))

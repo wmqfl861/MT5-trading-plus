@@ -34,8 +34,8 @@ from mt5gw.errors import NotConnectedError, TerminalNotConnectedError
 from mt5gw.terminal import _same_image, terminal_running
 from mt5live import terminal_guard
 from mt5live.terminal_guard import (ALERT_ALGO_TRADING_DISABLED, ALERT_ALGO_TRADING_RESTORED,
-                                    AlgoTradingWatch, wait_for_gateway)
-from mt5live.monitor import DISCONNECT_EXIT_RC, read_alerts, write_role_heartbeat
+                                    ATTEMPT_MARGIN, AlgoTradingWatch, wait_for_gateway)
+from mt5live.monitor import DISCONNECT_EXIT_RC, DISCONNECT_LIMIT_S, read_alerts, write_role_heartbeat
 
 from tests.fakes import FakeMT5, TerminalInfo
 from tests.fakes_live import FakeBroker, bars_from_df, boundary_open, grid_bars
@@ -62,11 +62,30 @@ def kinds(live_dir) -> list[str]:
 
 # --------------------------------------------------------------- 进程内探针
 
-def test_same_image_allows_for_case_separators_and_short_names_only():
+def test_same_image_allows_for_case_and_separators_only():
+    # (short names and links are resolved on disk: covered by the real-probe tests below)
     assert _same_image(r"C:\MT5 Demo\terminal64.exe", r"c:\mt5 demo\TERMINAL64.EXE")
     assert _same_image(r"C:\MT5 Demo\terminal64.exe", "C:/MT5 Demo/./terminal64.exe")
     assert not _same_image(r"C:\MT5\terminal64.exe", r"C:\MT5_B1\terminal64.exe")
     assert not _same_image("", r"C:\MT5\terminal64.exe") and not _same_image(None, "x")
+
+
+def test_the_probe_looks_for_the_file_name_as_spelled_and_as_resolved(monkeypatch, tmp_path):
+    """A path spelled with an 8.3 short name (TERMIN~1.EXE) is listed in the process table under
+    its long name: the name filter must look for both."""
+    from mt5gw import terminal
+
+    assert terminal._candidate_names(r"C:\MT5\terminal64.exe") == ["terminal64.exe"]
+    real = tmp_path / "MetaTrader 5" / "terminal64.exe"
+    real.parent.mkdir()
+    real.write_bytes(b"x")
+    monkeypatch.setattr(terminal.os.path, "realpath", lambda path, *a, **k: str(real))
+    assert terminal._candidate_names(r"C:\MT5~1\TERMIN~1.EXE") == ["TERMIN~1.EXE", "terminal64.exe"]
+    seen = []
+    monkeypatch.setattr(terminal, "_pids_named", lambda name: seen.append(name) or [])
+    monkeypatch.setattr(terminal, "_kernel", lambda: (_ for _ in ()).throw(OSError("no kernel32")))
+    assert terminal_running(r"C:\MT5~1\TERMIN~1.EXE") is False
+    assert seen == ["TERMIN~1.EXE", "terminal64.exe"]
 
 
 @pytest.mark.real_terminal_probe
@@ -83,12 +102,16 @@ def test_real_probe_recognizes_this_process_and_no_other_path(tmp_path):
     assert terminal_running("") is False and terminal_running(None) is False
 
 
-def test_probe_says_no_when_it_cannot_tell(monkeypatch):
+def test_probe_says_no_off_windows(monkeypatch):
     from mt5gw import terminal
 
     monkeypatch.setattr(terminal.os, "name", "posix")
     assert terminal_running(sys.executable) is False   # not Windows
-    monkeypatch.undo()
+
+
+def test_probe_says_no_when_the_query_itself_fails(monkeypatch):
+    from mt5gw import terminal
+
     monkeypatch.setattr(terminal, "_pids_named", lambda name: [1, 2])
     monkeypatch.setattr(terminal, "_kernel", lambda: (_ for _ in ()).throw(OSError("no kernel32")))
     assert terminal_running(sys.executable) is False   # the query itself failed
@@ -102,6 +125,37 @@ def test_probe_stays_inside_the_process_and_touches_no_terminal_api():
     called = {node.func.attr for node in ast.walk(tree) if isinstance(node, ast.Call)
               and isinstance(node.func, ast.Attribute)}
     assert not called & {"Popen", "system", "run", "check_output", "initialize"}, called
+
+
+def test_no_test_builds_a_connection_without_saying_where_mt5_and_the_terminal_come_from():
+    """Two ways a test can pass only on a machine that happens to have a terminal64.exe running:
+
+    - In a child process: the suite's stand-in for the terminal probe cannot reach it, so a
+      connection built in `sys.executable` source must pass `terminal_running=` (CI #389, shard 2:
+      nine tests in test_t110_deadline.py).
+    - Anywhere: a connection built without `mt5_module=` imports the real package in the venv; a
+      connect() on it would reach a real terminal.
+    """
+    offenders = []
+    for path in sorted((ROOT / "tests").glob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        spawns_children = "sys.executable" in text and "subprocess" in text and path != Path(__file__)
+        for node in ast.walk(ast.parse(text)):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+                if name in ("MT5Connection", "MT5Gateway"):
+                    segment = ast.get_source_segment(text, node) or ""
+                    if "mt5_module=" not in segment:
+                        offenders.append(f"{path.name}:{node.lineno} built without mt5_module=")
+            elif spawns_children and isinstance(node, ast.Constant) and isinstance(node.value, str):
+                lines = node.value.splitlines()
+                for index, line in enumerate(lines):
+                    if "MT5Connection(" in line or "MT5Gateway(" in line:
+                        statement = line + (lines[index + 1] if index + 1 < len(lines) else "")
+                        if "mt5_module=" not in statement and "terminal_running" not in statement:
+                            offenders.append(f"{path.name}:{node.lineno} child-process source without the probe")
+    assert offenders == [], offenders
 
 
 # ------------------------------------------------- 网关：终端不在就不 initialize
@@ -130,13 +184,15 @@ def test_initialize_is_called_once_with_the_configured_path_when_the_terminal_is
     assert fake.calls("initialize") == 1 and conn.connected is True
 
 
-def test_a_failing_probe_counts_as_absent():
+def test_a_failing_probe_counts_as_absent_and_says_that_the_probe_failed():
     def broken(path):
         raise OSError("snapshot failed")
     conn, fake = make_conn(broken)
-    with pytest.raises(TerminalNotConnectedError):
+    with pytest.raises(TerminalNotConnectedError) as stopped:
         conn.connect()
     assert fake.calls("initialize") == 0
+    # "the terminal is absent" and "the probe itself failed" do not read the same: the second does not heal
+    assert "探测出错：OSError" in str(stopped.value) and "snapshot failed" not in str(stopped.value)
 
 
 @pytest.mark.real_terminal_probe
@@ -220,6 +276,22 @@ def test_startup_wait_gives_up_with_the_dedicated_exit_code_and_no_halt(tmp_path
     assert marker["duration_s"] >= 900 and "TerminalNotConnectedError" in marker["last_error"]
     assert not (tmp_path / "halt.json").exists()
     assert "退出码" in read_alerts(str(tmp_path))[-1].message
+
+
+def test_startup_wait_also_stops_on_the_number_of_attempts_when_the_clock_does_not_move(tmp_path):
+    """900 秒 / 60 秒 + 2 = 17 次是上限；时钟不走时第 18 次尝试之后停下来，同一个退出码、同一个标记。"""
+    gw = _LateGateway(FakeBroker("XAUUSD"), failures=10 ** 6)
+
+    def sleep(seconds):
+        pass                                            # the injected clock never advances
+
+    rc = wait_for_gateway(gw, str(tmp_path), "risk", lambda: None, retry_s=60,
+                          clock=lambda: 1000.0, sleep=sleep, log=lambda line: None)
+    assert rc == DISCONNECT_EXIT_RC and gw.connect_calls == 18
+    marker = json.loads((tmp_path / "disconnect-exit-risk.json").read_text(encoding="utf-8"))
+    assert (marker["rc"], marker["duration_s"]) == (78, 0.0)
+    assert "按次数上限停止" in marker["last_error"]
+    assert not (tmp_path / "halt.json").exists()
 
 
 def test_startup_wait_connects_once_and_writes_nothing_when_the_terminal_is_there(tmp_path):
@@ -357,6 +429,37 @@ def test_runner_waits_for_the_terminal_at_startup_without_a_fatal_halt(tmp_path,
     assert not (live / "halt.json").exists()
 
 
+def test_runner_exits_with_78_when_the_terminal_never_comes_at_startup(tmp_path, monkeypatch):
+    """耗尽的路径：返回 78 之前释放临时锁、关闭网关；留下断线退出的标记，不写 halt。"""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "lockshome"))
+    mod = load_script("live_runner.py")
+    t1 = datetime(2026, 10, 28, 10, 0, 7)
+    broker = FakeBroker("XAUUSD")
+    gw = _LateGateway(broker, failures=10 ** 6)
+    monkeypatch.setattr("mt5gw.MT5Gateway.from_config_file", staticmethod(lambda p: gw))
+    monkeypatch.setattr(mod, "now_utc", lambda: t1)
+    env = _real_mode_env(tmp_path)
+    live = Path(env["live_dir"])
+    write_role_heartbeat(str(live), "risk", interval=600.0, now=t1)
+    sleeps = []
+    monkeypatch.setattr(time, "sleep", lambda seconds: sleeps.append(seconds))
+    rc = mod.main(["--config", env["config"], "--loop", "--no-spread-gate",
+                   "--risk-config", env["risk"], "--sessions-config", env["sessions"],
+                   "--gateway-config", _write(tmp_path / "gw.json", "{}"), "--poll-interval", "60"])
+    assert rc == DISCONNECT_EXIT_RC and len(sleeps) == int(DISCONNECT_LIMIT_S / 60) + ATTEMPT_MARGIN   # the clock is the real one: the cap stops it
+    marker = json.loads((live / f"disconnect-exit-runner-{MAGIC}.json").read_text(encoding="utf-8"))
+    assert (marker["rc"], marker["component"]) == (78, f"runner-{MAGIC}")
+    assert json.loads((live / f"exit-runner-{MAGIC}.json").read_text(encoding="utf-8"))["rc"] == 78
+    assert not (live / "halt.json").exists() and broker.market_orders == []
+    # the lock given up before returning: the same runner can start again in the same data directory
+    again = _LateGateway(FakeBroker("XAUUSD"), failures=0)
+    monkeypatch.setattr("mt5gw.MT5Gateway.from_config_file", staticmethod(lambda p: again))
+    monkeypatch.setattr(time, "sleep", _sleeper(VirtClock(t1), stop_after=1))
+    assert mod.main(["--config", env["config"], "--loop", "--no-spread-gate",
+                     "--risk-config", env["risk"], "--sessions-config", env["sessions"],
+                     "--gateway-config", _write(tmp_path / "gw.json", "{}"), "--poll-interval", "60"]) == 0
+
+
 # --------------------------------------------- 终端不允许算法交易：本轮不开仓
 
 class _InfoGateway:
@@ -391,19 +494,50 @@ def test_algo_trading_watch_announces_a_terminal_that_starts_forbidden(tmp_path)
     assert kinds(tmp_path) == [ALERT_ALGO_TRADING_DISABLED, ALERT_ALGO_TRADING_RESTORED]
 
 
-@pytest.mark.parametrize("dead", [None, NotConnectedError("terminal_info 无返回")])
+@pytest.mark.parametrize("dead", [None, RuntimeError("ipc broke"), TimeoutError("ipc timed out")])
 def test_algo_trading_watch_hands_a_dead_ipc_to_the_caller_as_not_connected(tmp_path, dead):
     watch = AlgoTradingWatch(_InfoGateway([dead, _terminal()]), str(tmp_path))
-    with pytest.raises(NotConnectedError):
+    with pytest.raises(NotConnectedError) as stopped:
         watch.allowed(NOW)
+    if isinstance(dead, Exception):
+        assert type(dead).__name__ in str(stopped.value)   # 原来的类名要留下，不换成一句固定文案
     assert kinds(tmp_path) == []                         # 不误报成"算法交易被关"
 
 
-def test_algo_trading_watch_lets_a_gateway_without_terminal_info_pass(tmp_path):
+def test_a_gateway_without_terminal_info_is_not_passed(tmp_path):
+    """No stand-in branch: a gateway that lacks the method is the wrong gateway, and the check
+    must not vanish silently if MT5Gateway.terminal_info is ever renamed or dropped."""
     class Bare:
         pass
-    assert AlgoTradingWatch(Bare(), str(tmp_path)).allowed(NOW) is True
+    with pytest.raises(AttributeError):
+        AlgoTradingWatch(Bare(), str(tmp_path)).allowed(NOW)
     assert kinds(tmp_path) == []
+
+
+def test_the_real_gateway_has_terminal_info_and_the_watch_reads_both_fields_through_it(tmp_path, monkeypatch):
+    from mt5gw import MT5Gateway
+
+    assert callable(getattr(MT5Gateway, "terminal_info", None))       # the method the watch relies on
+    fake = FakeMT5()
+    gw = MT5Gateway(GatewayConfig(terminal_path=str(tmp_path / "terminal64.exe")), mt5_module=fake)
+    gw.connect()                                          # the suite's stand-in takes the terminal as present
+    reads, real = [], gw.terminal_info
+    monkeypatch.setattr(gw, "terminal_info", lambda: reads.append(1) or real())
+    watch = AlgoTradingWatch(gw, str(tmp_path))
+
+    def terminal(*, trade_allowed=True, tradeapi_disabled=False):
+        fake.terminal_info_value = SimpleNamespace(connected=True, trade_allowed=trade_allowed,
+                                                   tradeapi_disabled=tradeapi_disabled)
+
+    terminal()
+    assert watch.allowed(NOW) is True                    # read through the real gateway, under its deadline
+    terminal(trade_allowed=False)
+    assert watch.allowed(NOW) is False                   # the button is off
+    terminal(tradeapi_disabled=True)
+    assert watch.allowed(NOW) is False                   # the broker disabled the API
+    assert len(reads) == 3                                # once per decision round, nothing else
+    assert kinds(tmp_path) == [ALERT_ALGO_TRADING_DISABLED]
+    gw.shutdown()
 
 
 class _AlgoGateway(_LateGateway):

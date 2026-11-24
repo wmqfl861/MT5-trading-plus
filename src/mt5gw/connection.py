@@ -222,15 +222,19 @@ class MT5Connection:
         # T209：终端进程不在就不调 initialize——真实的 MetaTrader5 包会在这里把
         # 终端拉起来，成为本进程的子进程。启动的 connect() 和重连走的都是这一条路。
         probe = self._terminal_running or TERMINAL_PROBE
+        detail = ""
         try:
             running = probe(self.config.terminal_path)
-        except Exception:
-            running = False                      # 探测本身出错：按不在处理
+        except Exception as exc:
+            # 探测本身出错：按不在处理（偏保守）。带上异常的类名——这种"不在"不会
+            # 自愈：每次连接和重连都被拒，15 分钟后以 78 退出，看护脚本报的却是"在运行"。
+            running = False
+            detail = f"；探测出错：{type(exc).__name__}"
         if not running:
             self._initialized = False
             raise TerminalNotConnectedError(
                 "MT5 终端进程不在：未调用 initialize"
-                "（终端只由看护任务或维护窗内的人工操作启动，T209）")
+                "（终端只由看护任务或维护窗内的人工操作启动，T209）" + detail)
         init = functools.partial(self._mt5.initialize, self.config.terminal_path,
                                  timeout=self.config.initialize_timeout_ms)
         ok = self._invoke("initialize", init)

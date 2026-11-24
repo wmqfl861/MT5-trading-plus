@@ -776,10 +776,11 @@ def _run(args, cfg: LiveConfig, strategy) -> int:
             find_gateway_config(args.gateway_config))
         # T209：启动时交易终端可能还没起来（全灭之后由看护任务拉起）。按断线处理：
         # 每轮写心跳、有 DISCONNECTED 段，连续 15 分钟以 78 退出；不写 fatal halt。
+        # 心跳写入器只建一个：它的连续失败计数要跨多次写入累计，写不进去时才发得出告警。
+        waiting_writer = HeartbeatWriter(heartbeat, config=cfg, alert_dir=live_dir)
         rc = wait_for_gateway(
             gw, live_dir, f"runner-{cfg.magic}",
-            lambda: HeartbeatWriter(heartbeat, config=cfg, alert_dir=live_dir).write(
-                error="waiting_for_terminal"),
+            lambda: waiting_writer.write(error="waiting_for_terminal"),
             retry_s=args.poll_interval)
         if rc is not None:
             for held in (temp_lock, lock):

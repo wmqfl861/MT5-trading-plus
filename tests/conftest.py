@@ -132,9 +132,14 @@ _register_skip_finder()
 # 真实的 MetaTrader5.initialize() 在终端进程不在时会把终端拉起来，终端从此是
 # 调用者的子进程（11-21 的根因）。网关因此在 initialize 之前先查终端进程在不在
 # （mt5gw.terminal.terminal_running，进程内探测），不在就不调 initialize。
-# 测试里的 MetaTrader5 全是替身，起不了任何进程，测试机上也没有 terminal64.exe
-# 在运行；所以除了标了 real_terminal_probe 的测试，这里把缺省探针换成"在运行"。
-# 真实探针由 tests/test_t209_terminal_guard.py 对真实进程验证。
+# 测试里的 MetaTrader5 全是替身，起不了任何进程；测试的结果不应取决于这台机器上
+# 恰好有没有 terminal64.exe 在运行（开发和生产的机器上就有）。所以除了标了
+# real_terminal_probe 的测试，这里把缺省探针换成"在运行"。真实探针由
+# tests/test_t209_terminal_guard.py 对真实进程验证。
+#
+# 这个替换够不到子进程：在子进程源码里构造 MT5Connection 或 MT5Gateway 的测试，
+# 必须显式传 terminal_running=（见 tests/test_t110_deadline.py 和钉住这一点的
+# tests/test_t209_terminal_guard.py），否则只会在有终端运行的机器上通过。
 
 REAL_TERMINAL_PROBE_MARKER = "real_terminal_probe"
 
