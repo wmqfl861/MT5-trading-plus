@@ -18,7 +18,7 @@ halt.json、pause-<magic>.json 存在但读不出的按存在处理（生产对�
 
 看护任务和终端（定版前跟进 D）：--expect-keeper 表示这个部署装了终端看护任务（runbook §6.5），
 每小时任务的命令行里带上它。带了才看看护脚本的状态文件（缺省
-<数据目录>/ops-evidence/terminal-keeper/state.json，--keeper-state 可改）：文件不在是 keeper_absent；
+<数据目录>/ops-evidence/terminal_keeper/state.json，--keeper-state 可改）：文件不在是 keeper_absent；
 10 分钟没有更新是 keeper_stale（状态文件自己的年龄满了 10 分钟，第一次看到就是生产级）；最近一次是
 refused 或 start_failed 是 keeper_refused（持续满 10 分钟升生产级）。不带给这三类都不评，输出的
 keeper 是 not_checked。状态文件读不出、不是对象、没有 ts 的按文件修改时间算年龄；ts 来自未来记
@@ -193,7 +193,7 @@ def main(argv=None, *, now=None, alive=process_alive, send=None) -> int:
     ap.add_argument("--notify-config", default="notify.local.json")
     ap.add_argument("--no-notify", action="store_true")
     ap.add_argument("--expect-keeper", action="store_true",
-                    help="这个部署装了终端看护任务：看它的状态文件（缺省 <数据目录>/ops-evidence/terminal-keeper/state.json）")
+                    help="这个部署装了终端看护任务：看它的状态文件（缺省 <数据目录>/ops-evidence/terminal_keeper/state.json）")
     ap.add_argument("--keeper-state", default=None, help="看护状态文件的路径（缺省见 --expect-keeper）")
     args = ap.parse_args(argv)
     now = now or datetime.now(timezone.utc)
