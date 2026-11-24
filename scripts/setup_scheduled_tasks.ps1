@@ -109,8 +109,9 @@ if ($Mode -notin @("Demo", "PaperSoak")) {
 $scriptsDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot   = Split-Path -Parent $scriptsDir
 function Remove-TrailingSeparator([string]$path) {
-    # 去掉路径末尾的分隔符（第二次复审 N3）。文件系统的根目录（C:\、\\主机\共享\）
-    # 去掉就不再是绝对路径，原样返回，由下面的检查拒绝。
+    # 去掉路径末尾的分隔符（第二次复审 N3）。盘符根目录（C:\）的 GetPathRoot 自带末尾的分隔符，原样返回；
+    # UNC 共享根目录（\\主机\共享\）的 GetPathRoot 不带末尾的分隔符（Windows PowerShell 5.1 和 PowerShell 7
+    # 都是这样），返回的是去掉它的 \\主机\共享。两种结果都由下面的检查按根目录拒绝。
     $root = [System.IO.Path]::GetPathRoot($path)
     $trimmed = $path.TrimEnd([System.IO.Path]::DirectorySeparatorChar,
                              [System.IO.Path]::AltDirectorySeparatorChar)

@@ -93,8 +93,8 @@ $ErrorActionPreference = "Stop"
 Import-Module ScheduledTasks
 
 function Strip-TrailingSeparator([string]$path) {
-    # 去掉路径末尾的分隔符（和 setup_scheduled_tasks.ps1 同一个做法）。文件系统的根目录去掉
-    # 之后就不是绝对路径了，原样返回，由下面的检查拒绝。
+    # 去掉路径末尾的分隔符（和 setup_scheduled_tasks.ps1 同一个做法）。盘符根目录（C:\）原样返回；UNC 共享
+    # 根目录返回的是去掉末尾分隔符的 \\主机\共享。两种结果都由下面的检查按根目录拒绝。
     $root = [System.IO.Path]::GetPathRoot($path)
     $trimmed = $path.TrimEnd([System.IO.Path]::DirectorySeparatorChar,
                              [System.IO.Path]::AltDirectorySeparatorChar)
