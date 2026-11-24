@@ -15,3 +15,21 @@ target-version = "py312"
 # F821 用到了没定义的名字
 # F841 赋值后没用到的局部变量
 select = ["E9", "F401", "F821", "F841"]
+
+# 研究侧的 5 个文件各豁免一条规则，精确到文件。它们各有没用到的一处导入或变量，
+# T217 清存量时留下没有改，文件本身一个字节不动：
+[tool.ruff.lint.per-file-ignores]
+# 源文件的 sha256 被 src/mt5quant/research/gate.py 的
+# EXPECTED_ACCEPTANCE_SOURCE_SHA256 钉住；改一个字节（加 noqa 注释也算），
+# acceptance_snapshot() 就报快照漂移。
+"src/mt5quant/validation/prob_mode.py" = ["F841"]
+"src/mt5quant/strategies/library/prob/level_decision.py" = ["F401"]
+# 在卡的策略代码指纹闭包里（cards.strategy_files 实算）。改一个字节就会换掉这些
+# 策略的 strategy_sha，首跑时登记过的卡版本不能再重跑（scripts/bt.py 的
+# _bind_strategy_sha）：
+#   b6_vol_target_long.py：H007（VolTargetLong），LevelDecisionV1 / LevelDecisionS1Demo
+#   situations.py：LevelDecisionV1 / LevelDecisionS1Demo
+#   events.py：H101、H101-v2（MonthEndHedgeRebalance），H102（PreFomcAnnouncementDrift）
+"src/mt5quant/strategies/library/b6_vol_target_long.py" = ["F401"]
+"src/mt5quant/strategies/library/prob/situations.py" = ["F401"]
+"src/mt5quant/validation/events.py" = ["F401"]
