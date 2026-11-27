@@ -1020,22 +1020,23 @@ def test_the_alert_records_a_negative_log_age_as_it_is(tmp_path):
 
 # ---- T220-C: an ordinary restart is registered, and the unhealthy alert is as before ----
 #
-# The restart record and the restart cap itself are in test_t220_restart_cap.py. What
-# changes for an ordinary round is pinned here: the restart is registered under its role
-# in supervisor-state.json, and the SUPERVISOR alert has no `restart_capped=` as long as
-# no restart is withheld.
+# The restart record and the latch itself are in test_t220_restart_cap.py. What changes
+# for an ordinary round is pinned here: the restart is registered under its role in
+# supervisor-state.json and latches nobody, and the SUPERVISOR alert has no
+# `restart_latched=` as long as no restart is withheld.
 
 def test_an_ordinary_restart_is_registered_and_the_unhealthy_alert_is_as_before(tmp_path):
     mod, cfg, p, live, entries = setup(tmp_path)
     old = next(e for e in entries if e["kind"] == "risk")
     del p.items[old["pid"]]
     result = run(mod, cfg, p)
-    assert result["restarted"] == ["risk"] and result["restart_capped"] == []
+    assert result["restarted"] == ["risk"] and result["restart_latched"] == []
     assert result["restart_cap_released"] == []
     cap = json.loads((live / "supervisor-state.json").read_text(encoding="utf-8"))["restart_cap"]
     assert cap["sha"] == cfg.sha
     assert cap["roles"]["risk"]["restarts"] == [NOW.isoformat()]     # the round's time, as the journal row's
     assert cap["roles"]["reconcile"]["restarts"] == [] and cap["roles"]["777"]["restarts"] == []
+    assert all("latched_since" not in record for record in cap["roles"].values())
     assert json.loads((live / "ops-restarts.jsonl").read_text())["utc"] == NOW.isoformat()
     line = (live / "alerts.log").read_text(encoding="utf-8").splitlines()[-1]
-    assert "\tSUPERVISOR\t" in line and "restart_capped" not in line
+    assert "\tSUPERVISOR\t" in line and "restart_latched" not in line
