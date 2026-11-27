@@ -800,7 +800,7 @@ def resumed_m15_broker(m1_opens):
 ])
 def test_m1_history_that_does_not_reach_the_last_trusted_bar_is_not_a_verification(
         m1_opens):
-    """【父提交上红】【闭合 R1 之前红】一分钟历史太短，或者停报前的那段断了：最新
+    """【闭合 R1 之前红】一分钟历史太短，或者停报前的那段断了：最新
     一根很新，可上一根可信 bar（21:45–22:00 那根）的区间里一根都没有。这根 M15
     明明存在，那段时间却没有一分钟 bar，只能说明历史没同步到那里，证明不了后面
     没有行情——不算核实，照旧"数据滞后"。"""
@@ -914,7 +914,7 @@ def test_other_symbols_do_not_get_the_exception(symbol):
     pytest.param("M30", 1800, T(21, 30), id="M30"),
 ])
 def test_other_timeframes_do_not_get_the_exception(timeframe, tf_s, last_closed_open):
-    """【父提交上红】【闭合 R3 之前红】别的周期不适用。M5、M30 在同一个停报段里冷
+    """【闭合 R3 之前红】别的周期不适用。M5、M30 在同一个停报段里冷
     启动：上一根已收盘 bar 的收盘时刻是 22:00，缺口 (22:00, 23:00] 整段落在停报段
     内，形态和 M15 一模一样——但这两个周期没有核实过。"""
     broker = recovery_broker(last_closed_open=last_closed_open, blackout_end=T(23, 0),
