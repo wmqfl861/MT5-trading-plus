@@ -29,6 +29,14 @@
   等不到预期 bar 在 max_wait_s 内重试，仍无才报"数据滞后"）。parquet 只用于
   `--dry-run --offline`（影子离线冒烟同样读 parquet，报价由 BarQuoteMarket
   按最新 bar 收盘价合成——T34）。
+- 换日停报段内的缺口（T220）：运行器和取数源对着同一个收盘网格 B。报价是
+  新的、重试后期望的 bar 仍然没有时，只有所缺的一整段都落在已核实的换日
+  停报段里（sessions.toml 的换日锚点起 post_minutes 分钟；只限 XAUUSD 的
+  M15 和 H1）、且一分钟 bar 反证不了那段有行情，才跳过这个网格点：不产生
+  策略决策和策略订单，执行器照常轮询，完整走完一轮才写心跳；一个缺口网格
+  记一行"换日停报段缺口跳过"日志和一条记录类告警 ROLLOVER_GAP_SKIP。其余
+  情形照旧报"数据滞后"、本轮不写心跳。换日配置用不了（读不到或内容非法）
+  时这个例外不启用，干跑照常运行，实跑照旧在执行器装配处以同一个错误启动失败。
 - 执行（C1）：LiveExecutor 每轮先查 commands/flatten.json（全平+确认），
   开仓/加仓腿先过 RiskGate.check_open（拒绝 → 不下单，原因写心跳
   last_error 与 alerts.log），平仓不受限；每次执行后写
@@ -81,7 +89,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mt5data.store import load_bars  # noqa: E402
 from mt5gw.errors import NotConnectedError, TradeRejectedError  # noqa: E402
-from mt5live.monitor import guarded_main, reset_watchdog  # noqa: E402
+from mt5live.monitor import append_alert, guarded_main, reset_watchdog  # noqa: E402
 from mt5live.config import (  # noqa: E402
     LiveConfig, ModelConfigError, ParsedConfigError, load as load_config,
 )
@@ -93,9 +101,11 @@ from mt5live.paper import PAPER_STATE_DIR_RELPATH, PAPER_STATE_RELPATH, \
 from mt5live.riskproc import RiskConfigError, RiskProcess, load_risk_config  # noqa: E402
 from mt5live.terminal_guard import AlgoTradingWatch, wait_for_gateway  # noqa: E402 （T209）
 from mt5live.runner import (  # noqa: E402
+    ALERT_ROLLOVER_GAP_SKIP,
     HeartbeatWriter,
     MagicInstanceLock,
     MarketClosedError,
+    RolloverGap,
     SignalRunner,
     TerminalBarsSource,
     default_compute_window_bars,
@@ -536,6 +546,32 @@ class GatewayReconnectWatch:
         return _TrackedMarket()
 
 
+# ---- T220：换日停报段内的缺口跳过（一个缺口网格记一次） ----
+
+def note_rollover_gap(live_dir: str, gap: RolloverGap, *, magic: int,
+                      now: datetime) -> str:
+    """一个缺口网格的一行日志 + 一条记录类告警（ROLLOVER_GAP_SKIP）。
+
+    返回日志文本（调用方加轮次时间戳打印）并写告警。告警通道写不进去时只
+    返回日志文本，不让一条记录把运行器打崩（同 HeartbeatWriter）。措辞里
+    不出现"决策异常"这类字样：正式检查把它们当 runner 日志异常。
+    """
+    window = f"[{gap.window[0].isoformat()}, {gap.window[1].isoformat()})"
+    text = (f"换日停报段缺口跳过 magic={magic}：{gap.symbol} {gap.timeframe} "
+            f"收盘网格={gap.close_time.isoformat()} 期望bar="
+            f"{gap.expected_open.isoformat()}（停报段内没有行情，这根 bar 不存在）"
+            f" 最新已收盘bar={gap.latest_bar.isoformat()} "
+            f"报价时刻={gap.quote_time.isoformat()} 停报段={window}"
+            "——只跳过这个网格点，不产生策略信号和策略订单；"
+            "执行器照常轮询，本轮照常收尾")
+    try:
+        append_alert(live_dir, ALERT_ROLLOVER_GAP_SKIP,
+                     f"runner-{magic} {text}", now)
+    except OSError as exc:
+        return f"{text}（告警写入失败：{type(exc).__name__}: {exc}）"
+    return text
+
+
 def build_executor_stack(trading, account, market, *, cfg: LiveConfig,
                          strategy, args, live_dir: str, specs_path: str,
                          gw, gate_account=None) -> LiveExecutor | None:
@@ -852,9 +888,25 @@ def _run(args, cfg: LiveConfig, strategy) -> int:
             q = market.quote(symbol)
             return q.bid, q.ask
 
+        # T220：换日停报段内的缺口跳过——停报段的锚点和风控闸门读同一份换日配置、
+        # 用同一个装载函数（load_default_session_policy：先看 --sessions-config 指的
+        # 路径，不存在就退回仓库的 config/sessions.toml，再退回当前目录下的同名文件）。
+        # 这份配置用不了——三个候选都不存在（RiskConfigError），或者内容非法
+        # （SessionConfigError）——就不启用缺口跳过，缺 bar 照旧报"数据滞后"：干跑
+        # 没有执行器和风控闸门，之后不再读这份配置，照常运行；实跑模式的执行器装配
+        # 随后会以同一个错误启动失败（与改动前一样）。
+        from mt5data.sessions import SessionConfigError
+        from mt5live.riskproc import load_default_session_policy
+        try:
+            session_policy = load_default_session_policy(args.sessions_config)
+        except (RiskConfigError, SessionConfigError) as exc:
+            session_policy = None
+            print_red(f'⚠ 换日配置用不了，停报段内缺 bar 的例外不启用'
+                      f'（缺 bar 照旧按"数据滞后"处理）：{exc}')
         source = TerminalBarsSource(
             market, stale_quote_s=args.stale_quote_s,
-            max_wait_s=args.max_wait_s, clock=now_utc)
+            max_wait_s=args.max_wait_s, clock=now_utc,
+            session_policy=session_policy)
         runner = SignalRunner(
             cfg, strategy,
             bars_loader=terminal_bars_loader(
@@ -947,6 +999,9 @@ def _run(args, cfg: LiveConfig, strategy) -> int:
             else None)
     try:
         skips_logged = runner.market_closed_skips
+        # T220：同一进程里同一缺口网格只记一次。运行器本身只消费一个网格点
+        # 一次；这里再兜一道——墙钟回拨让同一个网格点被重新评估时也不重复告警
+        gap_noted: set[datetime] = set()
         while True:
             reset_watchdog(args.poll_interval)
             now = now_utc()
@@ -990,6 +1045,11 @@ def _run(args, cfg: LiveConfig, strategy) -> int:
                 print(f"[{now.isoformat()}] 休市跳过 {skips_logged}："
                       f"{getattr(runner, '_last_market_closed', '')}",
                       flush=True)
+            gap = runner.last_gap_skip
+            if gap is not None and gap.close_time not in gap_noted:
+                gap_noted.add(gap.close_time)
+                print(f"[{now.isoformat()}] " + note_rollover_gap(
+                    live_dir, gap, magic=cfg.magic, now=now), flush=True)
             if decision is not None:
                 print(f"[{decision.decided_at.isoformat()}] 决策 "
                       f"{decision.decision_id}：signal={decision.signal} "

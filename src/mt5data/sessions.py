@@ -193,6 +193,8 @@ class SessionPolicy:
     missing_hour_policy 供成本侧与实盘点差闸门（T24）读取；
     min_days_per_hour（T36）供点差模型消费方（SpreadModel.missing_hours /
     spread_p90 的 min_days_per_hour 参数）——某小时覆盖天数不足即缺统计。
+    rollover_blackout（T220）是换日锚点起的停报段，不含 pre_minutes、扩展窗、
+    豁免与统计禁入小时；只供实盘运行器判断"换日缺 bar"，与开仓禁入无关。
     """
 
     rollover_local: str = "17:00"
@@ -272,6 +274,17 @@ class SessionPolicy:
         end = (local_to_utc_naive(day, self.rollover_tz, self.rollover_local)
                + timedelta(minutes=self.post_minutes))
         return start, end
+
+    def rollover_blackout(self, day: date) -> tuple[datetime, datetime]:
+        """该本地日的换日停报段（naive UTC）：[换日时刻, 换日时刻 + post_minutes)。
+
+        T220：换日锚点起的 post_minutes 分钟，**不含**禁入窗的 pre_minutes、
+        品种扩展窗、豁免品种和按点差统计禁入的小时——它回答的是"换日时刻
+        起这一段没有报价"，不是"何时禁止开仓"（那是 entry_allowed 的事）。
+        日期按 rollover_tz 换算，夏冬令时逐日生效。
+        """
+        anchor = local_to_utc_naive(day, self.rollover_tz, self.rollover_local)
+        return anchor, anchor + timedelta(minutes=self.post_minutes)
 
     def entry_allowed(self, symbol: str, t_utc: datetime) -> bool:
         """t_utc（naive UTC，或 aware）时刻 symbol 是否允许**开新仓**。
