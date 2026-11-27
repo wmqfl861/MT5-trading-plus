@@ -18,6 +18,16 @@
   （store.load_bars）只用于 `--dry-run --offline`——**锁箱（lockbox）豁免**
   ——锁箱约束的是研究侧防前视，实盘决策本来就该用最新已收盘数据，不适用；
   与定时刷新进程（唯一写者）之间只存在原子文件读，无写冲突（R14）。
+- 触发网格只有一个（T220）：decide() 用一次 _due_close(now) 选出收盘网格 B，
+  按 [B − 周期, B) 判断，并把 B 交给加载器（认这个参数的加载器用它，不认的
+  照旧按三个位置参数调用）。运行器和取数源因此对着同一个 B：重试跨过下一
+  网格时，下一根 bar 不拿来处置旧的网格。trigger_delay_s 只决定何时开始
+  评估，不加到 bar 上。
+- 换日停报段内的缺口跳过（T220，只走 TerminalBarsSource 这一路）：报价是
+  新的、期望的 bar 重试后仍然没有时，只有所缺的一整段都落在已核实的换日
+  停报段里（sessions.toml 的换日锚点起 post_minutes 分钟，限 XAUUSD），且
+  一分钟 bar 反证不了那段有行情，才按 RolloverGapSkipError 跳过本网格点
+  ——只消费这一个 B，不产生决策。其余一切情形照旧抛"数据滞后"。
 - 信号语义与 engine_a 相同：s[i] 为 bar i 收盘时的目标仓位 ∈ {-1,0,1}，
   取窗口末位（= 刚收盘那根）。
 - SL/TP 价位口径与 engine_a 相同：入场成交价 ± k × ATR14（ATR 取**信号
@@ -30,11 +40,13 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import math
 import os
 import time as _time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -49,6 +61,17 @@ ATR_PERIOD = 14   # 与 engine_a 默认一致（Wilder ATR）
 # T25（M3）：计算窗口缺省值——远大于声明的 lookback（H1 计算很便宜）
 COMPUTE_WINDOW_MIN_BARS = 1000          # 下限：至少 1000 根
 COMPUTE_WINDOW_LOOKBACK_MULTIPLE = 3    # 倍数：3 × lookback_bars
+
+# ---- T220：换日停报段内的缺口跳过（只走终端取数这一路） ----
+
+# 已核实"换日时刻起 post_minutes 分钟没有报价"的品种。只列 XAUUSD：依据是
+# 这家券商的 XAUUSD（docs/ops/phase-f-log.md 2026-11-27 条 §3.2，三个夜晚的
+# 对照）。别的品种、带后缀的同名品种都不适用——要放行须先有该品种的时段依据。
+ROLLOVER_GAP_SYMBOLS = frozenset({"XAUUSD"})
+ALERT_ROLLOVER_GAP_SKIP = "ROLLOVER_GAP_SKIP"   # 换日停报段缺口跳过（记录类）
+
+# 一分钟反证最多取多少根（缺口本身不超过停报段长度，正常远用不到这个上限）
+_ROLLOVER_GAP_M1_MAX_BARS = 2000
 
 # 内核字节锁（H-05 同 magic 单实例；与 mt5live.fileio 同款选择——
 # Windows msvcrt.locking / POSIX flock，互斥由内核强制）
@@ -66,6 +89,54 @@ class MarketClosedError(RuntimeError):
     抛出；SignalRunner.decide 捕获后返回 None（周末、每日维护时段都走
     这条路，不报"数据滞后"）。
     """
+
+
+@dataclass(frozen=True)
+class RolloverGap:
+    """换日停报段里的一次缺口跳过（T220；日志与告警用）。时间一律 naive UTC。"""
+
+    symbol: str
+    timeframe: str
+    close_time: datetime                 # 本次评估的收盘网格 B（只消费这一个）
+    expected_open: datetime              # 触发网格期望的 bar 开盘时刻（= B − 周期）
+    latest_bar: datetime                 # 上一根可信的已收盘 bar 开盘时刻
+    quote_time: datetime                 # 判定时的最新报价时刻
+    window: tuple[datetime, datetime]    # 命中的停报段 [换日时刻, 换日时刻 + post_minutes)
+
+
+class RolloverGapSkipError(RuntimeError):
+    """触发网格期望的 bar 因券商换日停报而不存在——跳过本网格点，不是故障。
+
+    与 MarketClosedError 同样处置（SignalRunner.decide 记下 _last_close、返回
+    None），成因不同：报价是新的，只是停报段里没有行情、成不了 bar。只有
+    TerminalBarsSource 在本模块的全部核实条件都成立时才抛；任何一条拿不准
+    都照旧抛"数据滞后"（ValueError）。
+    """
+
+    def __init__(self, gap: RolloverGap):
+        super().__init__(
+            f"换日停报段缺口：{gap.symbol} {gap.timeframe} 网格 "
+            f"{gap.close_time.isoformat()} 期望的 bar "
+            f"{gap.expected_open.isoformat()} 不存在（最新已收盘 bar "
+            f"{gap.latest_bar.isoformat()}，报价 {gap.quote_time.isoformat()}），"
+            f"停报段 [{gap.window[0].isoformat()}, {gap.window[1].isoformat()}) "
+            "内没有一分钟 bar——跳过本网格点")
+        self.gap = gap
+
+
+def _accepts_keyword(func, name: str) -> bool:
+    """加载器是否接收 name 这个关键字参数（不认的照旧按三个位置参数调用）。"""
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):        # 无法内省的可调用对象：按不认处理
+        return False
+    for param in params.values():
+        if param.kind is param.VAR_KEYWORD:
+            return True
+        if (param.name == name and param.kind in (
+                param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY)):
+            return True
+    return False
 
 
 class MagicInstanceLock:
@@ -247,7 +318,9 @@ class SignalRunner:
                  compute_window_bars: int | None = None):
         """
         - bars_loader(root, symbol, timeframe) -> DataFrame | None：默认
-          store.load_bars 直读（锁箱豁免，见模块 docstring）；
+          store.load_bars 直读（锁箱豁免，见模块 docstring）；可以另收一个
+          关键字参数 close_time（T220：运行器选定的收盘网格 B，naive UTC），
+          认它的加载器按 B 判断，不认的照旧按三个位置参数调用；
         - quote_fn(symbol) -> (bid, ask)：现价来源（实盘接 gw.market.quote；
           None = 无行情源，Decision 报价与建议 SL/TP 为 None）；
         - clock() -> naive UTC datetime：默认墙钟 UTC。
@@ -296,6 +369,11 @@ class SignalRunner:
         self._last_close: datetime | None = None   # 已决策过的最新网格点
         self.market_closed_skips = 0               # 休市静默跳过的网格点数（日志用）
         self._last_market_closed: str | None = None
+        # T220：换日停报段内的缺口跳过（最近一次的记录；调用方据此记日志/告警）
+        self.gap_skips = 0
+        self.last_gap_skip: RolloverGap | None = None
+        # 加载器认不认 close_time（T220：把运行器选定的网格 B 交给取数源）
+        self._loader_takes_close_time = _accepts_keyword(bars_loader, "close_time")
 
     # ---- 触发网格 ----
 
@@ -314,7 +392,9 @@ class SignalRunner:
         """到期则对刚收盘的 bar 产出 Decision；未到点/本 bar 已决策返回 None。
 
         fail-fast：库内无数据、滞后于网格、窗口不足、策略返回非法信号都抛错
-        （由调用方决定重试/告警），绝不带病下单。
+        （由调用方决定重试/告警），绝不带病下单。两个例外由这里消费、返回
+        None：休市（MarketClosedError）和换日停报段内的缺口（RolloverGapSkipError，
+        T220）——都只消费本次选定的那一个网格点。
         """
         if now is None:
             now = self._clock()
@@ -324,13 +404,26 @@ class SignalRunner:
         cfg = self.config
         tf = self._tf_seconds
         try:
-            bars = self._loader(cfg.data_root, cfg.symbol, cfg.timeframe)
+            if self._loader_takes_close_time:
+                # T220：两层对着同一个 B——取数源按运行器选定的网格判断，
+                # 重试跨过下一网格时不得拿下一根 bar 处置旧的网格
+                bars = self._loader(cfg.data_root, cfg.symbol, cfg.timeframe,
+                                    close_time=close_time)
+            else:
+                bars = self._loader(cfg.data_root, cfg.symbol, cfg.timeframe)
         except MarketClosedError as exc:
             # 休市（周末/每日维护，报价陈旧）：静默跳过本网格点（计数的
             # 日志由调用方负责），绝不当"数据滞后"报错
             self._last_close = close_time     # 该网格点已处置，不再重试
             self.market_closed_skips += 1
             self._last_market_closed = str(exc)
+            return None
+        except RolloverGapSkipError as exc:
+            # T220：期望的 bar 因换日停报不存在——只消费这一个网格点，
+            # 不产生决策；日志与记录类告警由调用方按 last_gap_skip 写
+            self._last_close = close_time
+            self.gap_skips += 1
+            self.last_gap_skip = exc.gap
             return None
         if bars is None or len(bars) == 0:
             raise ValueError(
@@ -423,12 +516,16 @@ class TerminalBarsSource:
       多取 1 根把正在形成的 bar 剔掉；
     - 有行情但等不到预期 bar（终端/行情服务滞后）：在 max_wait_s 内以
       poll_interval_s 重试，仍没有 → ValueError（"数据滞后"——真故障，
-      由运行器记录 last_error，绝不静默跳过）。
+      由运行器记录 last_error，绝不静默跳过）；
+    - 唯一的例外（T220）：调用方给了收盘网格 B（close_time）、报价是新的、
+      所缺的一整段落在已核实的换日停报段里、一分钟 bar 反证不了那段有行情
+      → 抛 RolloverGapSkipError（调用方只消费这一个网格点，不产生决策）。
+      需要 session_policy；没有装配就永远不走这个例外。
     """
 
     def __init__(self, market, *, stale_quote_s: float = 120.0,
                  max_wait_s: float = 10.0, poll_interval_s: float = 0.5,
-                 clock=None):
+                 clock=None, session_policy=None):
         if stale_quote_s <= 0 or max_wait_s < 0 or poll_interval_s <= 0:
             raise ValueError(
                 f"stale_quote_s/max_wait_s/poll_interval_s 须为正（max_wait_s "
@@ -439,21 +536,37 @@ class TerminalBarsSource:
         self._poll_interval_s = float(poll_interval_s)
         self._clock = clock or (lambda: datetime.now(timezone.utc)
                                 .replace(tzinfo=None))
+        self._session_policy = session_policy     # None = 不启用缺口跳过
 
-    def closed_bars(self, symbol: str, timeframe: str,
-                    n: int) -> pd.DataFrame | None:
+    def closed_bars(self, symbol: str, timeframe: str, n: int,
+                    *, close_time: datetime | None = None) -> pd.DataFrame | None:
+        """最近 n 根已收盘 bar；休市返回 None；等不到期望的 bar 抛错。
+
+        close_time（T220）：运行器选定的收盘网格 B（naive UTC）。给了就对
+        着这个 B 判断 [B − 周期, B)——重试跨过下一网格时，下一根 bar 不算数，
+        也不拿来处置旧的网格；缺口整体落在已核实的换日停报段里时抛
+        RolloverGapSkipError。不给（直接调用）则沿用取数源自己的时钟选网格，
+        也永远不走缺口跳过。
+        """
         now = self._clock()
         quote = self._market.quote(symbol)
         if (now - quote.time).total_seconds() > self._stale_quote_s:
             return None                       # 休市：静默跳过的信号
         tf = TIMEFRAME_SECONDS[timeframe.upper()]
-        epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
-        boundary = epoch - epoch % tf         # 最近网格点（= 应已收盘的收盘时刻）
+        if close_time is None:
+            epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+            boundary = epoch - epoch % tf     # 最近网格点（= 应已收盘的收盘时刻）
+            as_of = now
+        else:
+            boundary = int(close_time.replace(tzinfo=timezone.utc).timestamp())
+            as_of = close_time               # 只认收盘不晚于 B 的 bar
         expected_open = boundary - tf
         expected_ts = pd.Timestamp(expected_open, unit="s")
+        boundary_ts = pd.Timestamp(boundary, unit="s")
         # 重试预算按"次数"封顶（≈ max_wait_s / poll_interval_s 轮）：注入的
         # clock 可以是冻结的模拟钟，不能拿它当日程表的死线。
         attempts = max(1, int(self._max_wait_s / self._poll_interval_s) + 1)
+        closed = pd.DataFrame()
         for attempt in range(attempts):
             rows = self._market.bars(symbol, timeframe, n + 1)
             df = pd.DataFrame([{
@@ -461,27 +574,98 @@ class TerminalBarsSource:
                 "low": b.low, "close": b.close, "tick_volume": b.tick_volume,
                 "spread": b.spread, "real_volume": b.real_volume,
             } for b in rows])
-            closed = drop_unclosed(df, timeframe, now)
+            if close_time is not None and len(df):
+                # 开盘不早于 B 的是下一根 bar（重试跨过网格后终端已经交出
+                # 它）：不属于本次评估的网格，不得拿来处置旧的网格
+                df = df[pd.to_datetime(df["time"]) < boundary_ts]
+            closed = drop_unclosed(df, timeframe, as_of)
             if len(closed) and pd.Timestamp(closed["time"].iloc[-1]) >= expected_ts:
                 return closed
             if attempt < attempts - 1:
                 _time.sleep(self._poll_interval_s)
         latest = (pd.Timestamp(closed["time"].iloc[-1]).isoformat()
                   if len(closed) else "无")
+        if close_time is not None and len(closed):
+            gap = self._rollover_gap(symbol, timeframe, closed, boundary,
+                                     expected_ts)
+            if gap is not None:
+                raise RolloverGapSkipError(gap)
         raise ValueError(
             f"数据滞后：{symbol} {timeframe} 终端最新已收盘 bar "
             f"{latest}，触发网格期望 {expected_ts.isoformat()}"
             f"——已重试 {self._max_wait_s:.1f}s 仍无（行情服务/终端滞后）")
+
+    def _rollover_gap(self, symbol: str, timeframe: str, closed: pd.DataFrame,
+                      boundary: int, expected_ts: pd.Timestamp
+                      ) -> RolloverGap | None:
+        """T220：期望的 bar 缺失是不是因为换日停报（是 → 缺口记录；否 → None）。
+
+        逐条都要成立；任何一条拿不准都返回 None，调用方照旧抛"数据滞后"：
+        1. 品种在 ROLLOVER_GAP_SYMBOLS 里，且装配了 sessions 策略；
+        2. 从上一根可信的已收盘 bar 的收盘时刻到 B 这一整段落在停报段
+           [换日时刻, 换日时刻 + post_minutes) 里（B 等于窗尾也算在内）；
+        3. 此刻重新读的报价与墙钟相差不超过 stale_quote_s——不陈旧，也不
+           超前（券商时钟与本机有秒级偏差是常态，按同一个阈值容忍）；报价
+           时刻不早于 B。报价落在所缺区间里，它本身就是有行情的证据；
+        4. 反证：最近的一分钟 bar 里，[上一根 bar 收盘, B) 一根都没有，并且
+           历史覆盖到了上一根可信 bar。取不到、为空或没覆盖到，都算无法判断。
+        """
+        policy = self._session_policy
+        if policy is None or symbol not in ROLLOVER_GAP_SYMBOLS:
+            return None
+        tf = TIMEFRAME_SECONDS[timeframe.upper()]
+        latest_ts = pd.Timestamp(closed["time"].iloc[-1])
+        gap_start = latest_ts + pd.Timedelta(seconds=tf)   # 上一根 bar 的收盘时刻
+        close_time = _from_epoch(boundary)
+        try:
+            local_day = close_time.replace(tzinfo=timezone.utc).astimezone(
+                ZoneInfo(policy.rollover_tz)).date()
+            window = policy.rollover_blackout(local_day)
+        except Exception:
+            return None                       # 时区/配置算不出停报段：不算核实
+        if not (window[0] <= gap_start.to_pydatetime()
+                and close_time <= window[1]):
+            return None                       # 缺口伸进了正常交易段，或不在停报段里
+        try:
+            now = self._clock()
+            quote = self._market.quote(symbol)
+        except Exception:
+            return None                       # 报价读不到：不算核实
+        if (abs((now - quote.time).total_seconds()) > self._stale_quote_s
+                or quote.time < close_time):
+            return None
+        # 一分钟 bar 从"现在"往前数：B 之后的分钟也占根数（重试跨网格时最多
+        # 一整个周期），取少了会看不到缺口里的 bar，所以按到缺口起点的时长取
+        minutes = int((now - gap_start.to_pydatetime()).total_seconds() // 60) + 2
+        try:
+            m1 = self._market.bars(
+                symbol, "M1", max(1, min(minutes, _ROLLOVER_GAP_M1_MAX_BARS)))
+            if not m1:
+                return None                   # 返回空证明不了没有行情（刚重连的终端会返回空）
+            m1_open = pd.to_datetime(pd.Series([b.time for b in m1]))
+        except Exception:
+            return None                       # 接口失败或数据读不了：不算核实
+        if m1_open.max() < latest_ts:
+            return None                       # 一分钟历史没覆盖到上一根可信 bar：无法判断
+        if ((m1_open >= gap_start) & (m1_open < pd.Timestamp(close_time))).any():
+            return None                       # 所缺区间里有行情：照旧"数据滞后"
+        return RolloverGap(
+            symbol=symbol, timeframe=timeframe.upper(),
+            close_time=close_time, expected_open=expected_ts.to_pydatetime(),
+            latest_bar=latest_ts.to_pydatetime(), quote_time=quote.time,
+            window=window)
 
 
 def terminal_bars_loader(source: TerminalBarsSource, *, n: int):
     """把 TerminalBarsSource 适配成 SignalRunner 的 bars_loader 签名。
 
     closed_bars 返回 None（休市）→ 抛 MarketClosedError（runner 捕获后
-    静默跳过本网格点）。
+    静默跳过本网格点）。收 close_time（T220：运行器选定的收盘网格 B）并
+    交给取数源；换日停报段里的缺口由取数源抛 RolloverGapSkipError，这里
+    原样上抛，runner 捕获后同样只消费本网格点。
     """
-    def load(root, symbol, timeframe):
-        df = source.closed_bars(symbol, timeframe, n)
+    def load(root, symbol, timeframe, close_time=None):
+        df = source.closed_bars(symbol, timeframe, n, close_time=close_time)
         if df is None:
             raise MarketClosedError(
                 f"{symbol} 休市（最新报价陈旧超过阈值），跳过本网格点")

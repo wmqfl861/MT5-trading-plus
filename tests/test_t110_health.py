@@ -128,7 +128,7 @@ def test_runner_data_dir_override_and_completed_idle_health(tmp_path, monkeypatc
     cfg = tmp_path / "live.toml"
     cfg.write_text('symbol="XAUUSD"\ntimeframe="M15"\nstrategy="tests.fakes_live:ClosingSignal"\nmagic=777\nlookback_bars=30\nvolume_lots=0.01\ndata_root="wrong"\nheartbeat_path="wrong/hb.json"\n')
     monkeypatch.setattr(mod, "SignalRunner", lambda *a, **k: SimpleNamespace(
-        market_closed_skips=0, decide=lambda: None))
+        market_closed_skips=0, last_gap_skip=None, decide=lambda: None))
     monkeypatch.setenv("MT5_DEPLOYMENT_SHA", "a" * 40)
     data = tmp_path / "shared"
     rc = mod.main(["--config", str(cfg), "--once", "--offline", "--dry-run",
@@ -190,7 +190,7 @@ def test_failed_runner_read_preserves_completed_heartbeat(tmp_path, monkeypatch)
     def missing():
         raise DataUnavailableError("no snapshot")
     monkeypatch.setattr(mod, "SignalRunner", lambda *a, **k: SimpleNamespace(
-        market_closed_skips=0, decide=missing))
+        market_closed_skips=0, last_gap_skip=None, decide=missing))
     assert mod.main(["--config", str(cfg), "--once", "--offline", "--dry-run",
                      "--data-dir", str(tmp_path)]) == 0
     assert hb.read_bytes() == before

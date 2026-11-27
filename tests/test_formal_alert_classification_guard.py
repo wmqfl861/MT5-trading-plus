@@ -6,7 +6,10 @@
 FORMAL_*_ALERTS 分类集合里定类，否则本测试失败。"""
 from __future__ import annotations
 
+import importlib.util
 import re
+import sys
+from datetime import date, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,3 +67,81 @@ def test_classification_sets_are_pairwise_disjoint():
     for i, a in enumerate(names):
         for b in names[i + 1:]:
             assert not sets[a] & sets[b], f"{a} 与 {b} 重复定类：{sorted(sets[a] & sets[b])}"
+
+
+# ---- T220：换日停报段缺口跳过（ROLLOVER_GAP_SKIP）——记录类，不判失败 ----
+
+GAP_MESSAGE = ("runner-777 magic=777 换日停报段缺口跳过 magic=777：XAUUSD M15 "
+               "收盘网格=2026-11-25T23:00:00 期望bar=2026-11-25T22:45:00"
+               "（停报段内没有行情，这根 bar 不存在） 最新已收盘bar=2026-11-25T21:45:00 "
+               "报价时刻=2026-11-25T23:02:11 停报段=[2026-11-25T22:00:00, "
+               "2026-11-25T23:00:00)——只跳过这个网格点，不产生策略信号和策略订单；"
+               "执行器照常轮询，本轮照常收尾")
+
+
+def demo_check_module():
+    spec = importlib.util.spec_from_file_location(
+        "t220_demo_check_guard", ROOT / "scripts" / "demo_check.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_rollover_gap_skip_is_a_recorded_alert_written_by_the_runner():
+    sets = checker_sets()
+    assert "ROLLOVER_GAP_SKIP" in sets["FORMAL_RECORDED_ALERTS"]
+    for name in ("FORMAL_ANOMALY_ALERTS", "FORMAL_DRILL_ALERTS",
+                 "FORMAL_INVALID_ALERTS"):
+        assert "ROLLOVER_GAP_SKIP" not in sets[name], name
+    assert runtime_alert_kinds().get("ROLLOVER_GAP_SKIP") == {"live_runner.py"}
+
+
+def test_rollover_gap_skip_is_counted_per_day_and_opens_no_degradation_segment():
+    """预期中的缺口只逐日计数：不开降级段（跳过的网格点照常收尾、心跳照写），
+    也不进"窗口内异常"。"""
+    from mt5live.monitor import Alert
+    mod = demo_check_module()
+    assert mod._recorded_role("ROLLOVER_GAP_SKIP", GAP_MESSAGE) == ("recorded", None)
+    events = [Alert(datetime(2026, 11, 25, 23, 2, 12), "ROLLOVER_GAP_SKIP", GAP_MESSAGE),
+              Alert(datetime(2026, 11, 25, 23, 17, 12), "ROLLOVER_GAP_SKIP", GAP_MESSAGE),
+              Alert(datetime(2026, 11, 26, 0, 2, 12), "ROLLOVER_GAP_SKIP", GAP_MESSAGE)]
+    now = datetime(2026, 11, 26, 0, 30)
+    segments, daily_events = mod._recorded_degradation(events, now)
+    assert segments == []
+    assert daily_events == {date(2026, 11, 25): 2, date(2026, 11, 26): 1}
+    # 它不属于异常类，也不需要按消息或日历改判——本来就不在"窗口内异常"的筛选里
+    assert not mod._alert_is_recorded_class(events[0])
+    assert "ROLLOVER_GAP_SKIP" not in mod.FORMAL_ANOMALY_ALERTS
+
+
+def test_rollover_gap_log_line_is_not_a_runner_log_anomaly(tmp_path):
+    """运行器打的缺口日志带时间戳、不含正式检查当作日志异常的字样；同一条内容进
+    alerts.log，正式检查读得出 magic、认得出种类。"""
+    from types import SimpleNamespace
+    from mt5live.monitor import read_alerts
+    script = importlib.util.spec_from_file_location(
+        "t220_live_runner_guard", ROOT / "scripts" / "live_runner.py")
+    runner = importlib.util.module_from_spec(script)
+    script.loader.exec_module(runner)
+    now = datetime(2026, 11, 25, 23, 2, 12)
+    line = f"[{now.isoformat()}] " + runner.note_rollover_gap(
+        str(tmp_path), SimpleNamespace(
+            symbol="XAUUSD", timeframe="M15", close_time=datetime(2026, 11, 25, 23, 0),
+            expected_open=datetime(2026, 11, 25, 22, 45),
+            latest_bar=datetime(2026, 11, 25, 21, 45), quote_time=now,
+            window=(datetime(2026, 11, 25, 22, 0), datetime(2026, 11, 25, 23, 0))),
+        magic=777, now=now)
+    check = demo_check_module()
+    assert check._formal_log_time(line) is not None
+    assert not any(mark in line for mark in (
+        "Traceback", "执行异常", "决策异常", "CRITICAL", "ERROR"))
+    assert "决策 " not in line
+    for text in ("magic=777", "XAUUSD M15", "收盘网格=2026-11-25T23:00:00",
+                 "期望bar=2026-11-25T22:45:00", "最新已收盘bar=2026-11-25T21:45:00",
+                 "报价时刻=", "停报段=[2026-11-25T22:00:00, 2026-11-25T23:00:00)"):
+        assert text in line, text
+    check._alert_magics(line, {777})            # 正式检查读得出 magic，且在登记的 magic 里
+    alerts = read_alerts(str(tmp_path))
+    assert [(a.kind, a.time) for a in alerts] == [("ROLLOVER_GAP_SKIP", now)]
+    assert alerts[0].message == f"runner-777 {line.split('] ', 1)[1]}"
