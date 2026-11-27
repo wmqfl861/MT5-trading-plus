@@ -631,7 +631,13 @@ FORMAL_RECORDED_ALERTS = frozenset({"DISCONNECTED", "ACCOUNT_UNAVAILABLE",
                                     # 日报是否齐全照旧由正式检查原有的规则判
                                     "DAILY_REPORT_FAILED",
                                     # T209：终端恢复允许算法交易（关闭时的告警是异常类）
-                                    "ALGO_TRADING_RESTORED"})
+                                    "ALGO_TRADING_RESTORED",
+                                    # T220（docs/reviews/2026-11-27-t220-design-codex-ruling.md）：
+                                    # XAUUSD 换日停报段里本应不存在的 bar，跳过了一个
+                                    # 网格点。预期中的缺口：逐日计数、不开降级段（运行器
+                                    # 照常收尾、心跳照写）。停报段之外的缺 bar 没有告警，
+                                    # 仍是 runner 日志里的"决策异常"，由日志规则判异常
+                                    "ROLLOVER_GAP_SKIP"})
 # T191 无效证据类：窗口内出现即 FormalInvalid
 FORMAL_INVALID_ALERTS = frozenset({"SUPERVISOR_EVIDENCE"})
 FORMAL_CLASSIFIED_ALERTS = (FORMAL_ANOMALY_ALERTS | FORMAL_DRILL_ALERTS
@@ -1085,9 +1091,13 @@ def _recorded_role(kind, message):
     - ACCOUNT_UNAVAILABLE："账户取数失败"= 段首、"账户取数恢复"= 恢复
       （退出时生产端写的是 LOOP_EXIT，已归异常类）；
     - RECOVERABLE_FAILURE：只有段首（生产端恢复静默清零，无恢复告警）；
-    - LOOP_EXIT：一律退出类。"""
+    - LOOP_EXIT：一律退出类；
+    - T220 ROLLOVER_GAP_SKIP（换日停报段缺口跳过）：只逐日计数，不开降级段——
+      跳过的网格点照常收尾、心跳照写，不算降级。"""
     if kind == "LOOP_EXIT":
         return "exit", None
+    if kind == "ROLLOVER_GAP_SKIP":
+        return "recorded", None
     if kind == "DISCONNECTED":
         if DISCONNECT_EXIT_MARK in message:
             return "exit", None
