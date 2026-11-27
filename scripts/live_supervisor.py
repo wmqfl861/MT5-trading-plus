@@ -5,6 +5,13 @@ Registry/process ambiguity halts and requires an operator; it never authorizes a
 kill or a duplicate worker. Process-table access and termination live in
 WindowsProcesses for offline state-machine tests; identity checks resolve paths
 on disk (``canonical()``) exactly as the launcher does.
+
+One role is restarted at most RESTART_CAP times inside a rolling window of
+RESTART_WINDOW_S (T220-C). The restarts the supervisor itself issued are
+registered in supervisor-state.json, under the supervisor lock, before the
+process is touched; the next one is withheld before anything is ended and is
+named in one SUPERVISOR_RESTART_CAP alert. Only an operator lifts it, with
+restart-cap-release-<role>.json (see _lift_restart_cap).
 """
 from __future__ import annotations
 
@@ -29,7 +36,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from mt5gw.config import load as load_gateway
 from mt5live.config import load as load_live
 from mt5live.fileio import append_jsonl, file_lock, write_json_atomic
-from mt5live.monitor import (append_alert, health_timeout, heartbeat_status,
+from mt5live.monitor import (DISCONNECT_EXIT_FILE_FMT, DISCONNECT_EXIT_RC, DISCONNECT_LIMIT_S,
+                             append_alert, health_timeout, heartbeat_status,
                              iso_utc, naive_utc, parse_iso, read_heartbeat_path,
                              read_json_retry, write_halt_once)
 from mt5live.riskproc import load_risk_config
@@ -105,6 +113,18 @@ _PID_GONE = 87                   # ERROR_INVALID_PARAMETER: no process has this 
 # stale whenever a check fell in that moment. This much "from the future" is tolerated;
 # beyond it the role is still unhealthy.
 LOG_AGE_TOLERANCE_S = 2.0
+
+# T220-C: on 11-25 a runner that could not complete one loop wrote no heartbeat, and the
+# supervisor restarted it every minute for twelve minutes (docs/ops/phase-f-log.md,
+# 2026-11-27, sections 1 and 3.2). One role may now be restarted at most RESTART_CAP times
+# inside RESTART_WINDOW_S; the next restart is withheld before anything is ended.
+RESTART_CAP = 3
+RESTART_WINDOW_S = 10 * 60       # a registered restart counts until it is older than this
+ALERT_RESTART_CAP = "SUPERVISOR_RESTART_CAP"
+# What an operator writes to lift the cap: <live>/restart-cap-release-<role>.json holding
+# {"confirm": "release-restart-cap"}.
+RESTART_CAP_RELEASE = "restart-cap-release-{}.json"
+RESTART_CAP_CONFIRM = "release-restart-cap"
 
 
 def _absolute(program: str, preferred=()) -> str:
@@ -581,13 +601,176 @@ def stop_deployment(cfg, processes, *, verify_deployment=verify_deployment):
     return result
 
 
+# ---- T220-C: the restart record ----
+#
+# In supervisor-state.json:
+#   "restart_cap": {"sha": <deployment sha>,
+#                   "roles": {"<role>": {"restarts": [<ISO UTC>, ...],
+#                                       "suppressed_since": <ISO UTC>,     # while withheld
+#                                       "released": {"utc": ..., "restarts": <n>},
+#                                       "unreadable": true},               # see _cap_record
+#                   "ignored_release": [<file name>, <its content>]}
+# Every round rewrites the file, so the record is carried through each of its writes:
+# the reset of a round with stale roles, the end of a healthy round, and a refusal.
+
+
+def _cap_record(state, sha, roles):
+    """The restart record of this deployment as the state file has it, one entry per role.
+
+    No record, or the record of another deployment (another SHA): every role starts with
+    nothing registered; so does a role the record has no entry for. A record that is there
+    but not of the expected shape says nothing about how many restarts were issued, and is
+    not taken as "none": the roles it covers are held at the cap until an operator
+    releases them.
+    """
+    record = {"sha": sha, "roles": {key: {"restarts": []} for key in roles}}
+    stored = state.get("restart_cap") if isinstance(state, dict) else None
+    if not isinstance(stored, dict) or stored.get("sha") != sha:
+        return record
+    ignored = stored.get("ignored_release")
+    if isinstance(ignored, list) and len(ignored) == 2 and all(isinstance(part, str) for part in ignored):
+        record["ignored_release"] = list(ignored)
+    stored_roles = stored.get("roles")
+    if not isinstance(stored_roles, dict):
+        for own in record["roles"].values():
+            own["unreadable"] = True
+        return record
+    for key, own in record["roles"].items():
+        kept = stored_roles.get(key)
+        restarts = kept.get("restarts") if isinstance(kept, dict) else None
+        if kept is not None and not (isinstance(kept, dict) and isinstance(restarts, list)
+                                     and all(isinstance(text, str) for text in restarts)):
+            own["unreadable"] = True
+            continue
+        if kept is None:
+            continue
+        own.update(restarts=list(restarts))
+        if kept.get("unreadable") is True:      # written by an earlier round of this kind
+            own["unreadable"] = True
+        since = kept.get("suppressed_since")
+        if isinstance(since, str):
+            try:
+                parse_iso(since)
+            except (ValueError, OverflowError):
+                pass                            # not a time: as if never set
+            else:
+                own["suppressed_since"] = since
+        if isinstance(kept.get("released"), dict):
+            own["released"] = kept["released"]
+    return record
+
+
+def _in_window(now, restarts):
+    """The registered restarts that still count at `now`: those at most RESTART_WINDOW_S old.
+    One whose time cannot be read, or that lies ahead of `now` (the clock went back), is
+    kept: it cannot be shown to be outside the window."""
+    kept = []
+    for text in restarts:
+        try:
+            age = (naive_utc(now) - parse_iso(text)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            kept.append(text)
+            continue
+        if age <= RESTART_WINDOW_S:
+            kept.append(text)
+    return kept
+
+
+def _left_with_78(live, key, kind, entry):
+    """The registered instance left by itself with the dedicated disconnect exit code
+    (T141, T209: the full DISCONNECT_LIMIT_S of waiting, heartbeats all along). Both
+    records of that exit are there, name one worker, say the disconnect lasted that long,
+    and were written after the instance was registered, so an older exit exempts nothing.
+    """
+    if entry is None:
+        return False
+    component = f"runner-{key}" if kind == "runner" else key
+    try:
+        marker = read_json_retry(str(live / DISCONNECT_EXIT_FILE_FMT.format(component=component)))
+        record = read_json_retry(str(live / f"exit-{component}.json"))
+    except (OSError, ValueError):
+        return False
+    if not (isinstance(marker, dict) and isinstance(record, dict)):
+        return False
+    pid = marker.get("pid")
+    lasted = marker.get("duration_s")
+    if (marker.get("component") != component or record.get("component") != component
+            or marker.get("rc") != DISCONNECT_EXIT_RC or record.get("rc") != DISCONNECT_EXIT_RC
+            or marker.get("reason") != "disconnect_timeout" or type(pid) is not int
+            or record.get("pid") != pid
+            or type(lasted) not in (int, float) or lasted < DISCONNECT_LIMIT_S):
+        return False
+    try:
+        started = parse_iso(entry["started_utc"])
+        return started <= parse_iso(marker["ts"]) and started <= parse_iso(record["ts"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+
+
+def _withheld(cap, stale, roles, mapped, live):
+    """(the roles whose restart is withheld this round and why, the roles whose missing
+    instance left with exit code 78). A role at the cap is withheld; the first restart
+    after such an exit is neither withheld nor counted."""
+    withheld, took_over = {}, set()
+    for key, reason in stale.items():
+        if reason == "process_missing" and _left_with_78(live, key, roles[key]["kind"], mapped.get(key)):
+            took_over.add(key)
+            continue
+        record = cap["roles"][key]
+        if record.get("unreadable"):
+            withheld[key] = "its restart record cannot be read"
+        elif len(record["restarts"]) >= RESTART_CAP:
+            withheld[key] = f"{len(record['restarts'])} in the last {RESTART_WINDOW_S:.0f} s"
+    return withheld, took_over
+
+
+def _lift_restart_cap(live, state_path, state, cap, roles, now, result):
+    """An operator's release: <live>/restart-cap-release-<role>.json, a JSON object holding
+    confirm="release-restart-cap", written after the cause was checked.
+
+    It forgets that role's restarts and nothing else: no halt, veto or killSwitch is
+    touched, each keeps its own rules. The file is removed first and the cleared record
+    put on disk next, so that a crash leaves the cap in force rather than lifting it
+    without a trace. A file that is not a valid request is not the supervisor's to
+    remove: it stays where it is and is named in one alert per content.
+    """
+    head, _, tail = RESTART_CAP_RELEASE.partition("{}")
+    for path in sorted(live.glob(RESTART_CAP_RELEASE.format("*"))):
+        key = path.name[len(head):-len(tail)]
+        try:
+            request = read_json_retry(str(path))
+        except (OSError, ValueError) as exc:
+            request = f"unreadable: {type(exc).__name__}"
+        if key in roles and isinstance(request, dict) and request.get("confirm") == RESTART_CAP_CONFIRM:
+            try:
+                path.unlink()
+            except OSError as exc:
+                append_alert(str(live), ALERT_RESTART_CAP,
+                             f"release request for {key} not consumed ({type(exc).__name__}): the cap stays", now)
+                continue
+            forgotten = len(cap["roles"][key]["restarts"])
+            cap["roles"][key] = {"restarts": [], "released": {"utc": iso_utc(now), "restarts": forgotten}}
+            write_json_atomic(str(state_path), {**state, "restart_cap": cap})
+            append_alert(str(live), ALERT_RESTART_CAP,
+                         f"restart cap released for {key} by {path.name}: {forgotten} restarts forgotten; "
+                         "a role that still needs it is restarted in this round", now)
+            result["restart_cap_released"].append(key)
+        else:
+            seen = [path.name, json.dumps(request, sort_keys=True)]
+            if cap.get("ignored_release") != seen:
+                cap["ignored_release"] = seen
+                append_alert(str(live), ALERT_RESTART_CAP,
+                             f"release request ignored: {path.name} is not a JSON object holding "
+                             f"confirm={RESTART_CAP_CONFIRM} for a role of this deployment; it was left in place", now)
+
+
 def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_deployment):
     observe = clock or ((lambda: now) if now is not None else lambda: datetime.now(timezone.utc))
     now = observe()
     live = Path(cfg.data_dir) / "live"
     live.mkdir(parents=True, exist_ok=True)
     result = {"restarted": [], "refused": False, "cleared": False, "evidence_failures": [],
-              "deferred": []}
+              "deferred": [], "restart_capped": [], "restart_cap_released": []}
     state_path = live / "supervisor-state.json"
     # Test doubles take only cfg; the real verifier also takes the remembered state.
     real_verifier = verify_deployment is globals()["verify_deployment"]
@@ -629,6 +812,7 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
                 if verified:
                     state["clean"] = verified
             roles, mapped, trees = _registered_trees(cfg, processes)
+            cap = _cap_record(state, cfg.sha, roles)     # T220-C: read before anything below
             stale, checks = {}, {}
             clean = False
             for key, role in roles.items():
@@ -663,20 +847,31 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
                 if not healthy:
                     stale[key] = "heartbeat_or_log_stale"
                     checks[key] = " ".join(seen)
+                else:
+                    # T220-C: a restart need that was withheld is over once the role is healthy.
+                    cap["roles"][key].pop("suppressed_since", None)
                 if key == "reconcile" and healthy:
                     clean = data.get("reconcile_clean") is True
             now = observe()
             signature = sorted((k, e["pid"], e["started_utc"]) for k, e in mapped.items())
             signature = json.loads(json.dumps(signature))
+            # T220-C: what has left the window is dropped; an operator's release is applied
+            # before anything is decided, so a role it frees is restarted in this very round.
+            for record in cap["roles"].values():
+                record["restarts"] = _in_window(now, record["restarts"])
+            _lift_restart_cap(live, state_path, state, cap, roles, now, result)
             if stale:
+                withheld, took_over = _withheld(cap, stale, roles, mapped, live)
                 write_halt_once(str(live), "risk_lost" if "risk" in stale else "component_lost", now,
                                 owner="supervisor", token=uuid.uuid4().hex)
                 append_alert(str(live), "SUPERVISOR",
-                             f"unhealthy={stale}" + (f" checks={checks}" if checks else ""), now)
+                             f"unhealthy={stale}" + (f" checks={checks}" if checks else "")
+                             + (f" restart_capped={sorted(withheld)}" if withheld else ""), now)
                 # Persist reset BEFORE any process mutation/crash. The count is
                 # written as known so far: a reused verdict has not cleared it.
                 reset = {"healthy_since": None, "signature": signature,
-                         "undeterminable": carried + undeterminable, "clean": state.get("clean")}
+                         "undeterminable": carried + undeterminable, "clean": state.get("clean"),
+                         "restart_cap": cap}
                 if checks:
                     reset["stale_checks"] = checks   # same sub-conditions as the alert, for forensics
                 write_json_atomic(str(state_path), reset)
@@ -708,6 +903,29 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
                 write_json_atomic(str(state_path), reset)
                 for key, reason in stale.items():
                     entry = mapped.get(key)
+                    record = cap["roles"][key]
+                    if key in withheld:
+                        # T220-C: at the cap. Nothing is ended and nothing is started, and
+                        # the halt written above stays. One alert per stretch of withheld
+                        # restarts; the state file names the role for as long as it lasts.
+                        if "suppressed_since" not in record:
+                            append_alert(str(live), ALERT_RESTART_CAP, f"restarts capped for {key}: "
+                                         f"{withheld[key]}; restart withheld before anything was ended, halt "
+                                         "kept, the other roles are watched as before; after checking the "
+                                         f"cause write {RESTART_CAP_RELEASE.format(key)} holding "
+                                         f"confirm={RESTART_CAP_CONFIRM} to lift the cap", now)
+                            record["suppressed_since"] = iso_utc(now)
+                            write_json_atomic(str(state_path), reset)
+                        result["restart_capped"].append(key)
+                        continue
+                    record.pop("suppressed_since", None)
+                    if key not in took_over:
+                        # T220-C: registered, and on disk, before anything is done to the
+                        # process. A crash from here on leaves it counted: the restart was
+                        # issued. A round that restarts nothing (refused, deferred, held)
+                        # never comes here and registers nothing.
+                        record["restarts"].append(iso_utc(now))
+                    write_json_atomic(str(state_path), reset)
                     # T180: retain pre-restart registry bytes inside the same lock.
                     # The journal row itself keeps the checker's exact 6-field
                     # schema; the copy paths/digests go to the runtime evidence
@@ -783,7 +1001,7 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
             state = {"healthy_since": since, "last_checked": iso_utc(now),
                      "signature": signature, "halt_token": token,
                      "undeterminable": carried + undeterminable if undeterminable else 0,
-                     "clean": state.get("clean")}
+                     "clean": state.get("clean"), "restart_cap": cap}
             if token and not result["cleared"]:
                 # _clear_owned refuses silently; name the blocker so a halt that
                 # cannot clear by itself is visible without reading the directory.
@@ -803,8 +1021,18 @@ def supervise(cfg, processes, *, now=None, clock=None, verify_deployment=verify_
             append_alert(str(live), "SUPERVISOR_TERMINAL_CHILD",
                          f"terminal64.exe pid={detail['pid']} parent_pid={detail['parent_pid']} "
                          f"runs under the {detail['role']} worker tree", now)
-        write_json_atomic(str(state_path), {"healthy_since": None, "last_refusal": {
-            "utc": iso_utc(now), "reason": result["reason"], **(detail or {})}})
+        # T220-C: a refusal says nothing about how many restarts were issued. What the file
+        # holds now is what this round last put there (a registration is written before the
+        # process is touched, so a refusal while ending a tree comes after it); it is kept.
+        refused_state = {"healthy_since": None, "last_refusal": {
+            "utc": iso_utc(now), "reason": result["reason"], **(detail or {})}}
+        try:
+            kept = read_json_retry(str(state_path))
+        except (OSError, ValueError):
+            kept = None
+        if isinstance(kept, dict) and isinstance(kept.get("restart_cap"), dict):
+            refused_state["restart_cap"] = kept["restart_cap"]
+        write_json_atomic(str(state_path), refused_state)
     return result
 
 

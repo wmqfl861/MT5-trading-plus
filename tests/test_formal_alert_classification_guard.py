@@ -64,3 +64,14 @@ def test_classification_sets_are_pairwise_disjoint():
     for i, a in enumerate(names):
         for b in names[i + 1:]:
             assert not sets[a] & sets[b], f"{a} 与 {b} 重复定类：{sorted(sets[a] & sets[b])}"
+
+
+def test_the_restart_cap_alert_is_an_anomaly():
+    """T220-C：重启封顶归异常类——同一角色 10 分钟里已自动重启 3 次，第 4 次被压住不发，
+    窗口内出现即"窗口内异常"。它不是拒绝（SUPERVISOR_REFUSED），也不是无法判定
+    （SUPERVISOR_DEFERRED，记录类）。"""
+    sets = checker_sets()
+    assert "SUPERVISOR_RESTART_CAP" in sets["FORMAL_ANOMALY_ALERTS"]
+    assert "SUPERVISOR_RESTART_CAP" not in (sets["FORMAL_DRILL_ALERTS"] | sets["FORMAL_RECORDED_ALERTS"]
+                                            | sets["FORMAL_INVALID_ALERTS"])
+    assert "live_supervisor.py" in runtime_alert_kinds().get("SUPERVISOR_RESTART_CAP", set())
