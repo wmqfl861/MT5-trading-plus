@@ -612,7 +612,8 @@ PID 创建时间不符、未知子进程或缺 launcher 但 worker 仍活着的�
 
 **身份校验的失效模式表（T211，2026-11-23）**。supervisor 只重启"干净、钉死"的部署里的角色；
 进程树里有它不认识的进程就拒绝，并且不结束任何没有通过校验的进程。下表每一行对应
-`tests/test_t211_supervisor_identity.py` 里的一个用例（第 12、13 行对应其中走 `supervise()` 的用例）：
+`tests/test_t211_supervisor_identity.py` 里的一个用例（第 12、13 行对应其中走 `supervise()` 的用例；第 14 行对应
+`tests/test_t220_restart_cap.py` 里的用例）：
 
 | # | 进程形态 | 结果 |
 | --- | --- | --- |
@@ -629,6 +630,7 @@ PID 创建时间不符、未知子进程或缺 launcher 但 worker 仍活着的�
 | 11 | 登记之外有参数相符的 worker | 拒绝 |
 | 12 | supervisor 的 halt 在场，同时有 `halt-risk-veto.json` 或 killSwitch | 不自动解除；`supervisor-state.json` 记 `clear_blocked`，人工核对后移除 |
 | 13 | 角色被判 `heartbeat_or_log_stale` | 写 halt 并重启；`SUPERVISOR` 告警的 `checks=` 和 `supervisor-state.json` 的 `stale_checks` 列出该角色每条子条件的取值（通过的也在内） |
+| 14 | 同一角色在滚动 10 分钟里的自动重启已到 3 次，又需要重启（需求在 T212 延后的轮次到来也算） | 第 4 次压住并给这个角色上闩：不结束现有进程、不拉起，保留 halt，发 `SUPERVISOR_RESTART_CAP`（异常类）；之后这个角色的自动重启一直压住，人工核对后写解除文件（见本节"连续自动重启上限"） |
 
 "系统 conhost"指映像的完整路径等于 `<SystemRoot>\System32\conhost.exe`（按 `ntpath` 归一大小写和分隔符后
 比较）；系统根目录取不到时不放过任何进程。第 7 行的孤儿判断：`parent_pid` 等于该 PID、创建时间落在
@@ -829,6 +831,52 @@ halt、风险 halt 从不自动删除。若 supervisor halt 已存在时又触�
 核对原因、确认风险消除后移除，不可为恢复自动开仓直接删它。
 **清除 halt 时要一并核对 `halt-risk-veto.json`**：它留着，supervisor 以后写的任何 halt 都不会
 自动解除（`supervisor-state.json` 里出现 `clear_blocked`）；11-23 实测因此停了 3 小时 24 分。
+
+**连续自动重启上限（T220-C，2026-11-27）**。supervisor 原来没有重启次数上限：角色被判过期就重启，一直起不来的
+角色每分钟重启一次（11-25 23:02–23:14 UTC 连续 13 次，运维日志 11-27 条）。现在同一部署、同一角色，在滚动 10 分钟
+（600 秒，恰好 600 秒也算）里最多自动重启 3 次（`RESTART_CAP = 3`、`RESTART_WINDOW_S = 600`）。计的是 supervisor
+自己发出的重启：过期判定后的重启和整棵进程树缺失后的补起都算；每发一次先登记进 `supervisor-state.json` 的
+`restart_cap`，再去动进程。各角色各算各的。
+
+- **第 4 次**：某个角色又需要重启，而窗口里已登记 3 次——这一次不执行，并给这个角色上闩
+  （`restart_cap.roles.<角色>.latched_since`）。第 3 次启动的进程不被结束，也不拉起新的；`ops-restarts.jsonl` 不多
+  出行；halt 保留；发一条异常类告警 `SUPERVISOR_RESTART_CAP`。需求在 T212 延后的轮次到来，或者在重启前的完整核验里
+  才被拒的轮次到来，也同样上闩（那一轮照旧不重启、不登记），告警等到之后第一个能核验、而且角色仍然陈旧的轮次才
+  发；角色在那之前就恢复健康的话，这条异常告警不会发，闩留着，到下一次需要重启时才告警。
+- **闩上之后**：这个角色的一切自动重启都被压住，直到人工解除；窗口过了不会恢复。被压住的进程如果自己恢复健康，
+  系统照常运行，supervisor 自己的 halt 照原有规则在连续健康 5 分钟后自动解除，但这个角色的自动重启仍然是压住的。
+  期间每分钟的 `SUPERVISOR` 告警带 `restart_latched=['<角色>']`；角色恢复健康之后再出一次重启需求，会再告警一条。
+  其它角色照常看护。角色整棵树缺失又没有 78 的退出记录时，它会一直缺位到人工解除。存活检查不认闩，照常报
+  `role_missing:<角色>` 或 `heartbeat_stale:<角色>`，通知里不提闩；要知道原因看 `alerts.log`。
+- **不登记、也不上闩的**：T211 的拒绝（整轮）、T212 的延后（那一轮不重启）、角色活着在写心跳等终端的轮次。正常满
+  15 分钟以 78 退出后的首次接管不受闩限制，也不登记；闩本身留着。到结束进程树那一步才发现的 T211 拒绝，算一次
+  重启。
+- **窗口只决定何时上闩**：被重启 3 次的角色如果之后一直健康、过了窗口才又需要重启，从零起算。
+- **同一部署 SHA 下，人工 `--stop` 和重新启动都不清闩**，换 SHA 才从零起算。所以计划内停机一定先停用 supervisor
+  任务（本节上面的停机序列）：不停用的话，它会把每个角色重启三次并全部上闩。
+- **时钟**：闩不受时钟前跳或回拨影响。回拨的时候，既有的"心跳不早于登记"检查会把角色判成陈旧，那是原有行为。
+- **读不懂的记录**：`restart_cap` 形状不对的角色（包括 `latched_since` 读不懂）按已上闩处理，告警里写明，直到人工
+  解除。
+
+**到上限时的处置**（不要自动做，不要为了恢复开仓直接解除）：
+
+1. 先保全现场：`alerts.log` 里该角色最近几条 `SUPERVISOR` 的 `checks=`、`supervisor-state.json`、`ops-restarts.jsonl`、
+   该角色几次启动的日志。
+2. 查清连续重启的原因并确认已消除。同时看有没有 `halt-risk-veto.json`、killSwitch、人工 halt：它们各自的解除条件
+   不变，解除闩不会动它们（失效模式表第 12 行）。
+3. 写 `<数据目录>\live\restart-cap-release-<角色>.json`，内容是 `{"confirm": "release-restart-cap"}`（运行器用
+   magic，风控、对账用 `risk`、`reconcile`）。
+4. 下一轮 supervisor（只要不是被 T211 整轮拒绝）在锁内消费，角色健康的时候也一样消费：删掉该文件，清空该角色的
+   计数和闩（只清这一个角色，不动 `halt.json`、`halt-risk-veto.json`、killSwitch），写一条
+   `SUPERVISOR_RESTART_CAP` 的 `released` 告警。角色若仍需要重启，在之后第一个能重启的轮次重启。核对三处：
+   `alerts.log` 里的 released；`supervisor-state.json` 的 `restart_cap.roles.<角色>.released`；`supervisor.log` 那轮
+   输出里的 `restart_cap_released`。
+5. 把核对经过和解除时刻记进 phase-f-log。
+
+留痕：`alerts.log`（latched 与 released）、`supervisor-state.json` 的 `released`、`ops-restarts.jsonl`（只记实际发生的
+重启）、`supervisor.log`（`restart_latched`、`restart_cap_released`）。不合法的请求文件留在原地，supervisor 对每个
+文件的每种内容各告警一次 `ignored`，改对即可。被拒绝的那一轮如果拿不到 `supervisor.lock`（另一轮 supervisor 正
+持有），不写 `supervisor-state.json`；拒绝照旧写 halt 和 `SUPERVISOR_REFUSED`。
 
 ### 6.3.1 日报与周检任务的安装和运行（T213）
 
@@ -1518,7 +1566,8 @@ phase-f-log。
    - **归档 PaperSoak 的数据目录**：复制到 `<生产根>\archive\data-paper-<日期>\`，数量和 sha256 清单对得上。原件不删，
      删除要用户确认。
    - **时点（D97）**：部署记录须在当日 12:00 UTC 前写成，赶不上就改到次日部署；从部署完成到当日 24:00 UTC 不少于
-     12 小时，并且含一次换日窗。
+     12 小时，并且含一次换日窗。启动、重启和维护避开周末复市后的窗口，以及每天行情恢复后、第一根新 bar 收盘
+     之前的窗口（§6.3"换日停报段的缺口跳过"）。
    - 前提：账户上两个 magic 零持仓、零挂单（PaperSoak 不下单，第 3 步之后应当仍是零）；终端在运行、看护任务在位；
      `<生产根>\data\live\` 是新的——没有登记，没有 halt、pause、killSwitch、全平指令。
    - **经计划任务载体启动**。一次性任务运行 `<生产根>\start-demo.ps1`；包装脚本调
@@ -1532,6 +1581,11 @@ phase-f-log。
    - **立刻写部署记录的启动部分**——完整 SHA、UTC 完成时刻、启动器 PID、各份配置的 sha256。D97 的 12:00 UTC 是硬线，
      其余各项装完任务之后补齐。载体任务同样用完就注销：启动核对过了、它的 XML 导出留底之后注销，脚本 `start-demo.ps1`
      留着。
+   - **换日验收**（烧机含一次换日窗，D97）：换日之后按 §6.3"换日停报段的缺口跳过"核对。换日之后、第一根新
+     bar 收盘之前没有发生过重启的话，不会有缺口日志，这是正常的；发生过的话，M15 和 H1 各在自己的缺口网格上记一条
+     `ROLLOVER_GAP_SKIP`，同一轮有 `loop_completed`，心跳连续，没有 `SUPERVISOR`、`HEARTBEAT_TIMEOUT`、
+     `SUPERVISOR_RESTART_CAP`，没有新写的 `halt.json`；下一根 bar 收盘后有且只有一条该网格的 `决策`。换日禁入窗
+     里没有开仓（判据见第二十一轮增补 §3）。
    - 烧机期的判据见第二十一轮增补 §3。
 8. **装其余任务**（主会话）。前提：第 7 步的核对都过了。
    1. **supervisor**：先注销同名的旧任务 `\MT5Quant\live_supervisor2`——第 3 步已经停用；同名任务还在时，不带 `-Force`

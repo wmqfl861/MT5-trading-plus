@@ -614,6 +614,9 @@ FORMAL_ANOMALY_ALERTS = frozenset({
     "SUPERVISOR_TERMINAL_CHILD",
     # T209（第二十三轮 §2.2）：终端不允许算法交易（算法交易按钮被关、API 被禁）
     "ALGO_TRADING_DISABLED",
+    # T220-C：同一角色 10 分钟里已自动重启 3 次，第 4 次在结束进程之前被压住不发，
+    # 要人工核对原因后解除抑制；人工解除的留痕是同一个种类
+    "SUPERVISOR_RESTART_CAP",
 })
 FORMAL_DRILL_ALERTS = frozenset({"RISK_HALT", "RISK_FLATTEN", "HEARTBEAT_TIMEOUT",
                                "RECONCILE_MISMATCH", "RISK_REJECT", "SUPERVISOR",
