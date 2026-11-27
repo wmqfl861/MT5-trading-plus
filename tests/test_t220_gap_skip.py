@@ -17,6 +17,12 @@ scripts/live_runner.py 的真实 main() 跑实跑模式（有执行器，不下�
 每条用例第一行标明它在父提交（修复之前）上应当是红还是绿（D118）：正向用例
 【父提交上红】，反向回归【改前改后都绿】。所以这份文件在父提交上也要能原样运行：
 父提交上还没有的名字用 getattr 取，取数源的换日配置只在它认这个参数时才传。
+
+评审（docs/reviews/2026-11-27-t220-s-review.md）要求闭合的 R1、R2、R3 另有第二个
+标记，例如【闭合 R1 之前红】：那条用例在 c630d23 的代码上是红的，闭合之后才绿。
+其中几条在最初的父提交上也是绿的——它们钉的是 c630d23 新引入、评审要求收回去的
+行为（把历史不完整的一分钟 bar 当成了核实、干跑多出一个会写 halt 的失败点、别的
+周期也被跳过）。
 """
 from __future__ import annotations
 
@@ -135,7 +141,7 @@ def flat_bars(open_times):
     return [flat_bar(t) for t in open_times]
 
 
-TIMEFRAME_OF = {60: "M1", 900: "M15", 3600: "H1"}
+TIMEFRAME_OF = {60: "M1", 300: "M5", 900: "M15", 1800: "M30", 3600: "H1"}
 
 
 # ================================================================ 主循环重放的装配
@@ -200,13 +206,14 @@ class World:
     """
 
     def __init__(self, *, broker, terminal, live_dir, risk, magic, interval,
-                 start, stop_at):
+                 start, stop_at, with_risk=True):
         self.broker = broker
         self.terminal = terminal
         self.live_dir = live_dir
         self.risk = risk
         self.magic = magic
         self.interval = interval
+        self.with_risk = with_risk   # 干跑没有执行器和闸门，用例可以不带风控角色
         self.wall = start
         self.started = start
         self.stop_at = stop_at
@@ -237,6 +244,8 @@ class World:
             raise KeyboardInterrupt     # 经 main 的 KeyboardInterrupt 分支正常退出
 
     def _other_roles(self):
+        if not self.with_risk:
+            return
         # 风控进程的角色心跳每 30 秒写一次就够（闸门按 120 秒阈值读它）；每个假
         # sleep 都写一遍只是给磁盘添负载
         if (self._last_role_beat is None
@@ -308,11 +317,12 @@ def old_process_heartbeat(env, ts):
                     config=cfg, now=ts, pid=4242)
 
 
-def run_runner(monkeypatch, world, env):
+def run_runner(monkeypatch, world, env, *, dry_run=False):
     """经 scripts/live_runner.py 的真实 main() 跑主循环，直到虚拟墙钟到点。
 
     三处注入：运行器的时钟（now_utc）、sleep（推进虚拟墙钟）、心跳写入器的时间戳
     （主循环写心跳时不传时刻，缺省读真实墙钟；这里让它读同一座虚拟钟）。
+    dry_run=True 跑干跑（连终端、不下单，没有执行器）。
     """
     monkeypatch.setenv("LOCALAPPDATA", str(env["home"] / "lockshome"))
     monkeypatch.setenv("MT5_DEPLOYMENT_SHA", SHA)
@@ -336,13 +346,14 @@ def run_runner(monkeypatch, world, env):
                    "--risk-config", env["risk"],
                    "--sessions-config", env["sessions"],
                    "--gateway-config", env["gw"],
-                   "--poll-interval", str(world.interval)])
+                   "--poll-interval", str(world.interval)]
+                  + (["--dry-run"] if dry_run else []))
     return rc, made
 
 
 def build(tmp_path, *, timeframe="M15", tf_s=900, last_closed_open,
           blackout_end=None, start, stop_at, interval, resume_delay_s=6.0,
-          last_tick_before=None, old_heartbeat_at=None):
+          last_tick_before=None, old_heartbeat_at=None, with_risk=True):
     """一次重放的现场：终端停在 blackout_end（缺省 23:00 UTC）之前，运行器在 start
     启动；live 目录里有上一个进程 2 秒前留下的心跳（old_heartbeat_at 可改）。"""
     env = make_env(tmp_path, timeframe=timeframe)
@@ -354,7 +365,7 @@ def build(tmp_path, *, timeframe="M15", tf_s=900, last_closed_open,
                         last_tick_before=last_tick_before)
     world = World(broker=broker, terminal=terminal, live_dir=env["live"],
                   risk=make_risk(env), magic=env["magic"], interval=interval,
-                  start=start, stop_at=stop_at)
+                  start=start, stop_at=stop_at, with_risk=with_risk)
     old_process_heartbeat(env, old_heartbeat_at or start - timedelta(seconds=2))
     return SimpleNamespace(env=env, broker=broker, terminal=terminal, world=world)
 
@@ -772,6 +783,42 @@ def test_unusable_m1_history_is_not_a_verification(how):
     assert runner_gap_skips(runner) == 0
 
 
+def resumed_m15_broker(m1_opens):
+    """行情已恢复、下一根还没收盘的 M15 终端，一分钟 bar 由用例逐根给定。形态与
+    评审探针 P2 一致：上一根已收盘 21:45，报价 23:02:00，期望的是 22:45 那根。"""
+    broker = FakeBroker(SYMBOL)
+    broker.set_bars(SYMBOL, "M15", flat_bars(opens(T(21, 45), 40, 900) + [T(23, 0)]))
+    broker.set_bars(SYMBOL, "M1", flat_bars(m1_opens))
+    broker.quote_time = T(23, 2, 0)
+    return broker
+
+
+@pytest.mark.parametrize("m1_opens", [
+    pytest.param([T(23, 0), T(23, 1), T(23, 2)], id="only_after_resume"),
+    pytest.param([T(23, 2)], id="one_after_resume"),
+    pytest.param([T(20, 30), T(23, 0), T(23, 1), T(23, 2)], id="stopped_at_2030"),
+])
+def test_m1_history_that_does_not_reach_the_last_trusted_bar_is_not_a_verification(
+        m1_opens):
+    """【父提交上红】【闭合 R1 之前红】一分钟历史太短，或者停报前的那段断了：最新
+    一根很新，可上一根可信 bar（21:45–22:00 那根）的区间里一根都没有。这根 M15
+    明明存在，那段时间却没有一分钟 bar，只能说明历史没同步到那里，证明不了后面
+    没有行情——不算核实，照旧"数据滞后"。"""
+    runner = runner_at(resumed_m15_broker(m1_opens), T(23, 2, 0))
+    with pytest.raises(ValueError, match="数据滞后"):
+        runner.decide(T(23, 2, 0))
+    assert runner_gap_skips(runner) == 0
+
+
+def test_one_m1_bar_inside_the_last_trusted_bar_is_enough_coverage():
+    """【父提交上红】覆盖的判据是"上一根可信 bar 的区间里至少有一根"，不是"连续到
+    它的末尾"：停报前只剩 21:59 一根，也照常跳过。"""
+    runner = runner_at(resumed_m15_broker([T(21, 59), T(23, 0), T(23, 1), T(23, 2)]),
+                       T(23, 2, 0))
+    assert runner.decide(T(23, 2, 0)) is None
+    assert runner_gap_skips(runner) == 1
+
+
 def test_a_quote_inside_the_gap_is_evidence_of_trading():
     """【改前改后都绿】报价落在所缺区间里（22:59:30，年龄 30 秒是新的）：它本身就是有行情的证据。"""
     broker = recovery_broker(last_closed_open=T(21, 45), blackout_end=T(23, 0),
@@ -826,6 +873,30 @@ def test_a_quote_slightly_ahead_of_the_wall_clock_is_tolerated():
     assert runner_gap_skips(runner) == 1 and last_gap(runner).quote_time == T(23, 2, 2)
 
 
+def test_a_quote_exactly_120s_ahead_of_the_wall_clock_is_still_accepted():
+    """【父提交上红】超前方向的边界（评审建议 S1）：恰好 120 秒，与陈旧方向是同一个
+    数，算"新的"，照常跳过。"""
+    broker = recovery_broker(last_closed_open=T(21, 45), blackout_end=T(23, 0),
+                             m1_last_before=T(21, 59))
+    broker.quote_time = T(23, 4, 0)                     # 对 23:02:00 超前恰好 120 秒
+    runner = runner_at(broker, T(23, 2, 0))
+    assert runner.decide(T(23, 2, 0)) is None
+    assert runner_gap_skips(runner) == 1
+    assert last_gap(runner).quote_time == T(23, 4, 0)
+
+
+def test_a_quote_more_than_120s_ahead_of_the_wall_clock_is_refused():
+    """【改前改后都绿】超前方向的边界（评审建议 S1）：120.001 秒，过了同一个阈值，
+    照旧"数据滞后"。"""
+    broker = recovery_broker(last_closed_open=T(21, 45), blackout_end=T(23, 0),
+                             m1_last_before=T(21, 59))
+    broker.quote_time = T(23, 4, 0) + timedelta(milliseconds=1)
+    runner = runner_at(broker, T(23, 2, 0))
+    with pytest.raises(ValueError, match="数据滞后"):
+        runner.decide(T(23, 2, 0))
+    assert runner_gap_skips(runner) == 0
+
+
 @pytest.mark.parametrize("symbol", ["XAUUSDm", "EURUSD"])
 def test_other_symbols_do_not_get_the_exception(symbol):
     """【改前改后都绿】别的品种（包括带后缀的同名品种）不适用，哪怕形态一模一样。"""
@@ -835,6 +906,27 @@ def test_other_symbols_do_not_get_the_exception(symbol):
     runner = runner_at(broker, T(23, 2, 0), symbol=symbol)
     with pytest.raises(ValueError, match="数据滞后"):
         runner.decide(T(23, 2, 0))
+    assert runner_gap_skips(runner) == 0
+
+
+@pytest.mark.parametrize("timeframe, tf_s, last_closed_open", [
+    pytest.param("M5", 300, T(21, 55), id="M5"),
+    pytest.param("M30", 1800, T(21, 30), id="M30"),
+])
+def test_other_timeframes_do_not_get_the_exception(timeframe, tf_s, last_closed_open):
+    """【父提交上红】【闭合 R3 之前红】别的周期不适用。M5、M30 在同一个停报段里冷
+    启动：上一根已收盘 bar 的收盘时刻是 22:00，缺口 (22:00, 23:00] 整段落在停报段
+    内，形态和 M15 一模一样——但这两个周期没有核实过。"""
+    broker = recovery_broker(last_closed_open=last_closed_open, blackout_end=T(23, 0),
+                             m1_last_before=T(21, 59), tf_s=tf_s)
+    broker.quote_time = T(23, 2, 0)
+    runner = runner_at(broker, T(23, 2, 0), timeframe=timeframe)
+    expected_open = T(23, 0) - timedelta(seconds=tf_s)
+    with pytest.raises(ValueError, match="数据滞后") as caught:
+        runner.decide(T(23, 2, 0))
+    # 报的正是停报段里那一根（M5 是 22:55，M30 是 22:30）：缺口本身没有问题，
+    # 拦住它的只有"这个周期没有核实过"
+    assert f"触发网格期望 {expected_open.isoformat()}" in str(caught.value)
     assert runner_gap_skips(runner) == 0
 
 
@@ -1059,3 +1151,62 @@ def test_the_executor_still_runs_in_a_skip_cycle_external_exit(
     decisions = [ln for ln in out.splitlines() if "] 决策 " in ln]
     assert len(decisions) == 1
     assert len(run.broker.market_orders) == 1             # 23:15 照常重新开仓
+
+
+# ================== 换日配置的内容非法：干跑不受影响，实跑照旧启动失败
+
+# --sessions-config 指的那份文件，内容非法的两种形态
+BAD_SESSIONS = {
+    "syntax": 'version = 1\n[rollover\nlocal_time = "17:00"\n',       # TOML 本身读不懂
+    "value": ('version = 1\n[rollover]\nlocal_time = "25:99"\n'
+              'tz = "America/New_York"\n[forbidden]\npre_minutes = 5\n'
+              'post_minutes = 60\n[costs]\nspread_gate_multiplier = 3.0\n'
+              'missing_hour_policy = "forbid"\n'),                      # 读得懂，值不合法
+}
+
+
+def with_bad_sessions(run, how):
+    """把 --sessions-config 指的那份文件换成内容非法的。路径还在，所以装载函数不会退回
+    仓库里的配置，而是读到它、读不懂，抛 SessionConfigError。"""
+    _write(Path(run.env["home"]) / "sessions.toml", BAD_SESSIONS[how])
+    return run
+
+
+@pytest.mark.parametrize("how", sorted(BAD_SESSIONS))
+def test_dry_run_with_an_unusable_sessions_config_still_runs(
+        tmp_path, monkeypatch, capsys, how):
+    """【父提交上红】【闭合 R2 之前红】干跑 + 换日配置的内容非法。干跑没有执行器和
+    闸门，改动前根本不读这份配置。现在读了，读不懂也只能是"例外不启用"：rc 0、
+    不写 halt；缺 bar 照旧报"数据滞后"，23:15 起照常决策、照常收尾。"""
+    run = with_bad_sessions(build(tmp_path, last_closed_open=T(21, 45),
+                                  start=T(23, 2, 12), stop_at=T(23, 15, 40),
+                                  interval=5, with_risk=False), how)
+    rc, _ = run_runner(monkeypatch, run.world, run.env, dry_run=True)
+    out = capsys.readouterr().out
+    live = run.env["live"]
+    exit_doc = read_json(os.path.join(live, f"exit-runner-{MAGIC}.json"))
+    assert rc == 0 and exit_doc["rc"] == 0 and exit_doc["reason"] == "completed"
+    assert not os.path.exists(os.path.join(live, "halt.json"))
+    assert "例外不启用" in out and GAP_LINE not in out   # 提示语不与缺口日志行混同
+    assert "决策异常：ValueError: 数据滞后" in out       # 例外没有启用：缺 bar 照旧报错
+    decisions = [ln for ln in out.splitlines() if "] 决策 " in ln]
+    assert len(decisions) == 1 and "23:15:00" in decisions[0]
+    assert "[dry-run] 不下单" in out and out.count("loop_completed") >= 5
+    hb = read_json(os.path.join(live, f"heartbeat-{MAGIC}.json"))
+    assert hb["pid"] == os.getpid() and hb["dry_run"] is True
+    assert hb["last_error"] is None
+
+
+def test_real_mode_with_an_unusable_sessions_config_still_fails_to_start(
+        tmp_path, monkeypatch):
+    """【改前改后都绿】实跑 + 换日配置的内容非法：照旧启动失败（rc 2、fatal halt，原因
+    里是 SessionConfigError），没有被"例外不启用"掩盖。"""
+    run = with_bad_sessions(build(tmp_path, last_closed_open=T(21, 45),
+                                  start=T(23, 2, 12), stop_at=T(23, 15, 40),
+                                  interval=5, with_risk=False), "value")
+    rc, _ = run_runner(monkeypatch, run.world, run.env)
+    live = run.env["live"]
+    assert rc == 2
+    assert "SessionConfigError" in read_json(os.path.join(live, "halt.json"))["reason"]
+    exit_doc = read_json(os.path.join(live, f"exit-runner-{MAGIC}.json"))
+    assert exit_doc["rc"] == 2 and "SessionConfigError" in exit_doc["reason"]

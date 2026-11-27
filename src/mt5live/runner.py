@@ -25,8 +25,8 @@
   评估，不加到 bar 上。
 - 换日停报段内的缺口跳过（T220，只走 TerminalBarsSource 这一路）：报价是
   新的、期望的 bar 重试后仍然没有时，只有所缺的一整段都落在已核实的换日
-  停报段里（sessions.toml 的换日锚点起 post_minutes 分钟，限 XAUUSD），且
-  一分钟 bar 反证不了那段有行情，才按 RolloverGapSkipError 跳过本网格点
+  停报段里（sessions.toml 的换日锚点起 post_minutes 分钟，限 XAUUSD 的 M15 和
+  H1），且一分钟 bar 反证不了那段有行情，才按 RolloverGapSkipError 跳过本网格点
   ——只消费这一个 B，不产生决策。其余一切情形照旧抛"数据滞后"。
 - 信号语义与 engine_a 相同：s[i] 为 bar i 收盘时的目标仓位 ∈ {-1,0,1}，
   取窗口末位（= 刚收盘那根）。
@@ -64,10 +64,13 @@ COMPUTE_WINDOW_LOOKBACK_MULTIPLE = 3    # 倍数：3 × lookback_bars
 
 # ---- T220：换日停报段内的缺口跳过（只走终端取数这一路） ----
 
-# 已核实"换日时刻起 post_minutes 分钟没有报价"的品种。只列 XAUUSD：依据是
-# 这家券商的 XAUUSD（docs/ops/phase-f-log.md 2026-11-27 条 §3.2，三个夜晚的
-# 对照）。别的品种、带后缀的同名品种都不适用——要放行须先有该品种的时段依据。
+# 已核实"换日时刻起 post_minutes 分钟没有报价"的品种和周期。只列 XAUUSD 的 M15 和
+# H1：依据是这家券商的 XAUUSD（docs/ops/phase-f-log.md 2026-11-27 条 §3.2，三个夜晚
+# 的对照），三个夜晚出问题的和对照过的只有这两个周期。别的品种、带后缀的同名品种、
+# 别的周期都不适用——"缺口整体落在停报段里"本来就隐含地约束了周期，这里按裁决第 2 条
+# 再显式写明（评审 R3）。要放行须先有该品种、该周期的时段依据。
 ROLLOVER_GAP_SYMBOLS = frozenset({"XAUUSD"})
+ROLLOVER_GAP_TIMEFRAMES = frozenset({"M15", "H1"})
 ALERT_ROLLOVER_GAP_SKIP = "ROLLOVER_GAP_SKIP"   # 换日停报段缺口跳过（记录类）
 
 # 一分钟反证最多取多少根（缺口本身不超过停报段长度，正常远用不到这个上限）
@@ -517,10 +520,10 @@ class TerminalBarsSource:
     - 有行情但等不到预期 bar（终端/行情服务滞后）：在 max_wait_s 内以
       poll_interval_s 重试，仍没有 → ValueError（"数据滞后"——真故障，
       由运行器记录 last_error，绝不静默跳过）；
-    - 唯一的例外（T220）：调用方给了收盘网格 B（close_time）、报价是新的、
-      所缺的一整段落在已核实的换日停报段里、一分钟 bar 反证不了那段有行情
-      → 抛 RolloverGapSkipError（调用方只消费这一个网格点，不产生决策）。
-      需要 session_policy；没有装配就永远不走这个例外。
+    - 唯一的例外（T220）：调用方给了收盘网格 B（close_time）、品种和周期在
+      已核实的集合里、报价是新的、所缺的一整段落在已核实的换日停报段里、
+      一分钟 bar 反证不了那段有行情 → 抛 RolloverGapSkipError（调用方只消费
+      这一个网格点，不产生决策）。需要 session_policy；没有装配就永远不走。
     """
 
     def __init__(self, market, *, stale_quote_s: float = 120.0,
@@ -601,17 +604,27 @@ class TerminalBarsSource:
         """T220：期望的 bar 缺失是不是因为换日停报（是 → 缺口记录；否 → None）。
 
         逐条都要成立；任何一条拿不准都返回 None，调用方照旧抛"数据滞后"：
-        1. 品种在 ROLLOVER_GAP_SYMBOLS 里，且装配了 sessions 策略；
+        1. 品种在 ROLLOVER_GAP_SYMBOLS 里，周期在 ROLLOVER_GAP_TIMEFRAMES 里，
+           且装配了 sessions 策略；
         2. 从上一根可信的已收盘 bar 的收盘时刻到 B 这一整段落在停报段
            [换日时刻, 换日时刻 + post_minutes) 里（B 等于窗尾也算在内）；
-        3. 此刻重新读的报价与墙钟相差不超过 stale_quote_s——不陈旧，也不
-           超前（券商时钟与本机有秒级偏差是常态，按同一个阈值容忍）；报价
-           时刻不早于 B。报价落在所缺区间里，它本身就是有行情的证据；
-        4. 反证：最近的一分钟 bar 里，[上一根 bar 收盘, B) 一根都没有，并且
-           历史覆盖到了上一根可信 bar。取不到、为空或没覆盖到，都算无法判断。
+        3. 此刻重新读的报价与墙钟相差不超过 stale_quote_s，报价时刻不早于 B。
+           陈旧方向沿用休市分支的口径（恰好 120 秒仍算新）。超前方向没有另设
+           阈值，用的是同一个数：券商的 tick 时间比本机墙钟略快是常态（评审
+           实测约 1 秒，docs/reviews/2026-11-27-t220-s-review.md §6），严格按
+           "不晚于墙钟"判，行情越活跃越判不过。这比仓库里针对"时间戳来自未来"
+           的既有容差（存活检查的 CLOCK_SKEW_S = 60 秒）宽；跳过是否成立主要靠
+           另外三条支撑，这里只用来排除"此刻仍在停报"。报价落在所缺区间里，
+           它本身就是有行情的证据；
+        4. 反证：取回的一分钟 bar 里，[上一根 bar 收盘, B) 一根都没有，并且一
+           分钟历史确实到了上一根可信 bar——它的区间 [开盘, 开盘 + 周期) 里至
+           少有一根。上一根 bar 存在就说明那段时间有行情，一分钟历史同步到了
+           那里就应当有这一根；只看最新一根挡不住历史太短或停报前断档（评审
+           R1）。取不到、为空或区间里一根都没有，都算无法判断。
         """
         policy = self._session_policy
-        if policy is None or symbol not in ROLLOVER_GAP_SYMBOLS:
+        if (policy is None or symbol not in ROLLOVER_GAP_SYMBOLS
+                or timeframe.upper() not in ROLLOVER_GAP_TIMEFRAMES):
             return None
         tf = TIMEFRAME_SECONDS[timeframe.upper()]
         latest_ts = pd.Timestamp(closed["time"].iloc[-1])
@@ -645,8 +658,13 @@ class TerminalBarsSource:
             m1_open = pd.to_datetime(pd.Series([b.time for b in m1]))
         except Exception:
             return None                       # 接口失败或数据读不了：不算核实
-        if m1_open.max() < latest_ts:
-            return None                       # 一分钟历史没覆盖到上一根可信 bar：无法判断
+        # 覆盖看的是上一根可信 bar 自己的区间，不是最新一根有多新：一分钟历史是从
+        # "现在"往回按根数取的，取回的根数不够、或停报前的那段没同步回来时，最新
+        # 一根照样很新，可上一根可信的 bar 明明存在——它那段时间没有一分钟 bar，
+        # 只能说明历史没到那里，证明不了后面没有行情
+        last_close_ts = latest_ts + pd.Timedelta(seconds=tf)
+        if not ((m1_open >= latest_ts) & (m1_open < last_close_ts)).any():
+            return None                       # 一分钟历史没到上一根可信 bar：无法判断
         if ((m1_open >= gap_start) & (m1_open < pd.Timestamp(close_time))).any():
             return None                       # 所缺区间里有行情：照旧"数据滞后"
         return RolloverGap(

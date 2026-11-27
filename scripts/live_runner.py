@@ -31,11 +31,12 @@
   按最新 bar 收盘价合成——T34）。
 - 换日停报段内的缺口（T220）：运行器和取数源对着同一个收盘网格 B。报价是
   新的、重试后期望的 bar 仍然没有时，只有所缺的一整段都落在已核实的换日
-  停报段里（sessions.toml 的换日锚点起 post_minutes 分钟；只限 XAUUSD）、
-  且一分钟 bar 反证不了那段有行情，才跳过这个网格点：不产生策略决策和
-  策略订单，执行器照常轮询，完整走完一轮才写心跳；一个缺口网格记一行
-  "换日停报段缺口跳过"日志和一条记录类告警 ROLLOVER_GAP_SKIP。其余情形
-  照旧报"数据滞后"、本轮不写心跳。
+  停报段里（sessions.toml 的换日锚点起 post_minutes 分钟；只限 XAUUSD 的
+  M15 和 H1）、且一分钟 bar 反证不了那段有行情，才跳过这个网格点：不产生
+  策略决策和策略订单，执行器照常轮询，完整走完一轮才写心跳；一个缺口网格
+  记一行"换日停报段缺口跳过"日志和一条记录类告警 ROLLOVER_GAP_SKIP。其余
+  情形照旧报"数据滞后"、本轮不写心跳。换日配置用不了（读不到或内容非法）
+  时这个例外不启用，干跑照常运行，实跑照旧在执行器装配处以同一个错误启动失败。
 - 执行（C1）：LiveExecutor 每轮先查 commands/flatten.json（全平+确认），
   开仓/加仓腿先过 RiskGate.check_open（拒绝 → 不下单，原因写心跳
   last_error 与 alerts.log），平仓不受限；每次执行后写
@@ -887,16 +888,21 @@ def _run(args, cfg: LiveConfig, strategy) -> int:
             q = market.quote(symbol)
             return q.bid, q.ask
 
-        # T220：换日停报段内的缺口跳过——停报段的锚点取 sessions.toml 的换日
-        # 时刻（与风控闸门同一个定义源 --sessions-config）。读不到就不启用，
-        # 照旧"数据滞后"：实跑模式的执行器装配随后会以同一个错误启动失败
-        # （与改动前一样）；干跑不依赖换日配置，不受影响。
+        # T220：换日停报段内的缺口跳过——停报段的锚点和风控闸门读同一份换日配置、
+        # 用同一个装载函数（load_default_session_policy：先看 --sessions-config 指的
+        # 路径，不存在就退回仓库的 config/sessions.toml，再退回当前目录下的同名文件）。
+        # 这份配置用不了——三个候选都不存在（RiskConfigError），或者内容非法
+        # （SessionConfigError）——就不启用缺口跳过，缺 bar 照旧报"数据滞后"：干跑
+        # 没有执行器和风控闸门，之后不再读这份配置，照常运行；实跑模式的执行器装配
+        # 随后会以同一个错误启动失败（与改动前一样）。
+        from mt5data.sessions import SessionConfigError
         from mt5live.riskproc import load_default_session_policy
         try:
             session_policy = load_default_session_policy(args.sessions_config)
-        except RiskConfigError as exc:
+        except (RiskConfigError, SessionConfigError) as exc:
             session_policy = None
-            print_red(f"⚠ 换日停报段缺口跳过未启用（读不到换日配置）：{exc}")
+            print_red(f'⚠ 换日配置用不了，停报段内缺 bar 的例外不启用'
+                      f'（缺 bar 照旧按"数据滞后"处理）：{exc}')
         source = TerminalBarsSource(
             market, stale_quote_s=args.stale_quote_s,
             max_wait_s=args.max_wait_s, clock=now_utc,
