@@ -21,10 +21,11 @@ bar。这两处保留 M1，其余抽成 15 分钟一根。闸门读到的 bar �
 M1 样本是同一组，判定相同（test_thinned_sample_matches_full_m1_record
 钉住这一点）；一次闸门从十几秒降到一秒多。
 
-在父提交 a122c78 上，凡是以新币对为参数的用例都失败：四个新币对的
-inconsistent 年被启用（锚点闸没有执行），记录里没有 fix_anchor_month_end
-和 anchor_note。EURUSD 和清单外品种的用例在父提交上本来就通过，留作
-回归护栏。
+在父提交 a122c78 上，本文件 31 条里 25 条失败：清单常量还不存在（1 条）；
+以新币对为参数的用例全部失败（24 条）——四个新币对的 inconsistent 年被
+启用，锚点闸没有执行，记录里没有 fix_anchor_month_end 和 anchor_note。
+其余 6 条（样本比对、EURUSD 三种结果、清单外两种）在父提交上本来就
+通过，留作回归护栏。
 """
 import functools
 import io
