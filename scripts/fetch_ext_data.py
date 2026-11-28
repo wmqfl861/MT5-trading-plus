@@ -16,10 +16,14 @@
 - **fred/cdd/histdata 批准**入研究库（export_research_store
   --include-ext 白名单放行；manifest 自带使用限定 usage_restriction；
   histdata 为第十三轮 §5 有条件批准：只作个人研究、不再分发、低频
-  下载、只启用逐年时间口径验证通过的年份——T94 起 EURUSD 定盘锚点
+  下载、只启用逐年时间口径验证通过的年份——T94 起定盘锚点闸
   **只有 inconsistent（尖峰在错的小时）才排除**，undetermined 以标签
   规则检测为准、manifest 注明（L4）；年判 inconsistent/undetermined
-  的过渡年**按月分段回收**能判定的月份（L9））；
+  的过渡年**按月分段回收**能判定的月份（L9）。T221 起锚点闸按显式
+  币对清单 HISTDATA_FIX_ANCHOR_PAIRS 执行（EURUSD 与 F3 的四个新币对
+  GBPUSD、USDJPY、USDCHF、AUDUSD），清单外品种只过口径闸；批准
+  文本是否覆盖四个新币对，待外部审核裁定（F3 预注册草案 §10.1
+  第 9 项），本脚本不就此作结论）；
 - **yahoo 不批准**，已从可选来源移除；Stooq 不用（拒服务）。
 
 行为：
@@ -80,6 +84,12 @@ def _store(ext_root: str, series: ExtSeries, *, resample_to=()) -> None:
 
 HISTDATA_SUPPORTED_RULES = {"eu_calendar": 3, "us_wall": 4}
 
+# 定盘锚点闸的币对清单（T221/D117；F3 预注册草案 §3.3 第 1 条）：
+# EURUSD 加 F3 的四个新币对。伦敦 16:00 WMR 定盘窗对这些币对同一时刻，
+# 锚点函数与参数不变；清单外品种（如 XAUUSD）只过口径闸
+HISTDATA_FIX_ANCHOR_PAIRS = frozenset(
+    {"EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD"})
+
 # either_supported 月两支持规则换算逐分钟等价（整月美欧 DST 状态一致），
 # 回收时确定性地用 v3 转换（结果与 v4 相同）
 _SALVAGE_EITHER_RULE = "eu_calendar"
@@ -112,8 +122,10 @@ def _histdata_year_gate(raw: bytes, *, pair: str,
        **按月回收**（L9，consistency.monthly_label_calendar）：能判定的
        月份（规则明确或 either_supported）分月转换入库，无可回收月份
        才登记后不用；
-    2. **EURUSD 另加定盘锚点**（consistency.fix_window_vol_spike，
-       月末口径——C002 的事件总体；回收年用回收后的子集测）。**T94/
+    2. **定盘锚点币对清单另加定盘锚点**（HISTDATA_FIX_ANCHOR_PAIRS，
+       T221 起 EURUSD 加 GBPUSD、USDJPY、USDCHF、AUDUSD；
+       consistency.fix_window_vol_spike，月末口径——C002 的事件总体；
+       回收年用回收后的子集测）。**T94/
        R14-L4：只有 inconsistent（尖峰出现在错的小时 = 标签口径错一
        小时证据）才排除**；undetermined（余量不足分不出位置）**不
        排除**——锚点用的是月末定盘窗的波动强度，与 C002 机制（月末
@@ -169,7 +181,7 @@ def _histdata_year_gate(raw: bytes, *, pair: str,
         rec["salvaged_months"] = assignment
         rec["converter_version"] = max(
             HISTDATA_SUPPORTED_RULES[r] for r in set(assignment.values()))
-    if pair.upper() == "EURUSD":
+    if pair.upper() in HISTDATA_FIX_ANCHOR_PAIRS:
         anchor = cons.fix_window_vol_spike(s.df, month_end_only=True)
         rec["fix_anchor_month_end"] = anchor.get(year)
         status = anchor.get(year, {}).get("status")
@@ -192,9 +204,11 @@ def cmd_histdata(args) -> int:
 
     failures = 0
     print("ℹ HistData 有条件批准入研究库（R13 §5：只作个人研究、不再分发；"
-          "低频下载不并发不绕限；只入库逐年口径验证通过的年份，EURUSD "
-          "另加定盘锚点月末口径——T94/R14-L4：锚点 inconsistent 才排除，"
-          "undetermined 以标签规则检测为准、manifest 注明）")
+          "低频下载不并发不绕限；只入库逐年口径验证通过的年份，"
+          "定盘锚点币对（"
+          + "/".join(sorted(HISTDATA_FIX_ANCHOR_PAIRS))
+          + "）另加定盘锚点月末口径——T94/R14-L4：锚点 inconsistent 才"
+          "排除，undetermined 以标签规则检测为准、manifest 注明）")
     for pair in args.pairs.split(","):
         pair = pair.strip().upper()
         for i, year in enumerate([int(y) for y in args.years.split(",")]):
